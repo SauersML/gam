@@ -1,8 +1,7 @@
 use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{
-    StableSolver, boundary_hit_step_fraction, default_slq_parameters,
-    stochastic_lanczos_logdet_spd,
+    StableSolver, boundary_hit_step_fraction, default_slq_parameters, stochastic_lanczos_logdet_spd,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -13,8 +12,7 @@ use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
 use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
-    Tolerance,
+    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
 use thiserror::Error;
 
@@ -1134,8 +1132,7 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
         }
 
         // Zero-weight observations are semantically excluded and must stay inactive.
-        let w_clamped =
-            floor_positiveworking_weights(self.working_weights, ctx.options.minweight);
+        let w_clamped = floor_positiveworking_weights(self.working_weights, ctx.options.minweight);
 
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
@@ -5005,85 +5002,86 @@ pub fn fit_custom_family<F: CustomFamily>(
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
     let objective = CachedSecondOrderObjective::new(
         |x: &Array1<f64>| {
-        let cached = warm_cache.lock().ok().and_then(|g| g.clone());
-        let warm_start = if include_exact_newton_logdet_h(family) {
-            None
-        } else {
-            cached.as_ref()
-        };
-        let (obj, grad, hess_opt) = match outerobjectivegradienthessian(
-            family,
-            specs,
-            options,
-            &penalty_counts,
-            x,
-            warm_start,
-            true,
-        ) {
-            Ok((obj, grad, hess_opt, warm))
-                if obj.is_finite()
-                    && grad.iter().all(|v| v.is_finite())
-                    && hess_opt
-                        .as_ref()
-                        .map(|h| h.iter().all(|v| v.is_finite()))
-                        .unwrap_or(true) =>
-            {
-                if let Ok(mut guard) = warm_cache.lock() {
-                    let seed_ok = cached
-                        .as_ref()
-                        .map(|c| {
-                            c.rho.len() == x.len()
-                                && c.rho
-                                    .iter()
-                                    .zip(x.iter())
-                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                        })
-                        .unwrap_or(true);
-                    if seed_ok {
-                        *guard = Some(warm);
-                    } else {
+            let cached = warm_cache.lock().ok().and_then(|g| g.clone());
+            let warm_start = if include_exact_newton_logdet_h(family) {
+                None
+            } else {
+                cached.as_ref()
+            };
+            let (obj, grad, hess_opt) = match outerobjectivegradienthessian(
+                family,
+                specs,
+                options,
+                &penalty_counts,
+                x,
+                warm_start,
+                true,
+            ) {
+                Ok((obj, grad, hess_opt, warm))
+                    if obj.is_finite()
+                        && grad.iter().all(|v| v.is_finite())
+                        && hess_opt
+                            .as_ref()
+                            .map(|h| h.iter().all(|v| v.is_finite()))
+                            .unwrap_or(true) =>
+                {
+                    if let Ok(mut guard) = warm_cache.lock() {
+                        let seed_ok = cached
+                            .as_ref()
+                            .map(|c| {
+                                c.rho.len() == x.len()
+                                    && c.rho
+                                        .iter()
+                                        .zip(x.iter())
+                                        .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                            })
+                            .unwrap_or(true);
+                        if seed_ok {
+                            *guard = Some(warm);
+                        } else {
+                            *guard = None;
+                        }
+                    }
+                    if let Ok(mut guard) = last_outer_error.lock() {
                         *guard = None;
                     }
+                    (obj, grad, hess_opt)
                 }
-                if let Ok(mut guard) = last_outer_error.lock() {
-                    *guard = None;
+                Ok((_, _, _, _)) => {
+                    if let Ok(mut guard) = last_outer_error.lock() {
+                        *guard = Some(
+                            "custom-family outer objective/derivatives became non-finite"
+                                .to_string(),
+                        );
+                    }
+                    if include_exact_newton_logdet_h(family)
+                        && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
+                        && x_prev.len() == x.len()
+                    {
+                        return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
+                    }
+                    return Err(ObjectiveEvalError::recoverable(
+                        "custom-family outer objective/derivatives became non-finite",
+                    ));
                 }
-                (obj, grad, hess_opt)
-            }
-            Ok((_, _, _, _)) => {
-                if let Ok(mut guard) = last_outer_error.lock() {
-                    *guard = Some(
-                        "custom-family outer objective/derivatives became non-finite".to_string(),
-                    );
+                Err(e) => {
+                    if let Ok(mut guard) = last_outer_error.lock() {
+                        *guard = Some(e);
+                    }
+                    if include_exact_newton_logdet_h(family)
+                        && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
+                        && x_prev.len() == x.len()
+                    {
+                        return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
+                    }
+                    return Err(ObjectiveEvalError::recoverable(
+                        "custom-family outer objective/gradient evaluation failed",
+                    ));
                 }
-                if include_exact_newton_logdet_h(family)
-                    && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
-                    && x_prev.len() == x.len()
-                {
-                    return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
-                }
-                return Err(ObjectiveEvalError::recoverable(
-                    "custom-family outer objective/derivatives became non-finite",
-                ));
-            }
-            Err(e) => {
-                if let Ok(mut guard) = last_outer_error.lock() {
-                    *guard = Some(e);
-                }
-                if include_exact_newton_logdet_h(family)
-                    && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
-                    && x_prev.len() == x.len()
-                {
-                    return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
-                }
-                return Err(ObjectiveEvalError::recoverable(
-                    "custom-family outer objective/gradient evaluation failed",
-                ));
-            }
-        };
-        last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
-        Ok((obj, grad, hess_opt))
-    },
+            };
+            last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
+            Ok((obj, grad, hess_opt))
+        },
         1e-4,
     );
     let outer_max_iter = if include_exact_newton_logdet_h(family) {
@@ -6000,11 +5998,7 @@ mod tests {
 
     #[test]
     fn slq_determinant_mode_tracks_exact_full_logdet_policy() {
-        let h = array![
-            [6.0, 0.8, 0.1],
-            [0.8, 4.5, 0.4],
-            [0.1, 0.4, 3.2]
-        ];
+        let h = array![[6.0, 0.8, 0.1], [0.8, 4.5, 0.4], [0.1, 0.4, 3.2]];
         let exact = stable_logdet_with_ridge_policy(
             &h,
             1e-8,
@@ -6695,14 +6689,9 @@ mod tests {
             b: array![0.0, -0.1],
         };
 
-        let (beta, active) = solve_quadraticwith_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            None,
-        )
-        .expect("constrained quadratic solve should succeed");
+        let (beta, active) =
+            solve_quadraticwith_linear_constraints(&hessian, &rhs, &beta_start, &constraints, None)
+                .expect("constrained quadratic solve should succeed");
 
         assert!(
             (beta[0] - 0.1).abs() <= 1e-10,
@@ -6722,14 +6711,9 @@ mod tests {
             b: array![-1.0],
         };
 
-        let (beta, active) = solve_quadraticwith_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            None,
-        )
-        .expect("near-tangential inactive row should not block the quadratic step");
+        let (beta, active) =
+            solve_quadraticwith_linear_constraints(&hessian, &rhs, &beta_start, &constraints, None)
+                .expect("near-tangential inactive row should not block the quadratic step");
 
         assert!(
             (beta[0] - 1.0).abs() <= 1e-12,

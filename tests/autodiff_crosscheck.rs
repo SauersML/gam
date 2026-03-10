@@ -107,7 +107,7 @@ impl<T: AD> SigmaFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SigmaFn<T> {
     const NAME: &'static str = "SigmaFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         vec![inputs[0].exp()]
     }
 
@@ -145,7 +145,7 @@ impl<T: AD> E2EFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
     const NAME: &'static str = "E2EFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         let theta = inputs[0];
         let mut acc = T::zero();
 
@@ -213,7 +213,7 @@ fn sigma_manual_matches_ad_trait_forward_mode_first_derivative() {
 
     for eta in points {
         let (_, d1, _, _) = exp_sigma_derivs_up_to_third_scalar(eta);
-        let (value, jac) = engine.derivative(&[eta]);
+        let (_, jac) = engine.derivative(&[eta]);
         assert_manual_ad_band!("sigma_ad_trait", eta, "d1", d1, "ad_trait" => jac[(0, 0)]);
     }
 }
@@ -237,10 +237,8 @@ fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
         let (v_manual, d1_manual, d2_manual, d3_manual) = e2e_manual_derivatives(theta, &data);
 
         let (v_nd, d1_nd) = first_derivative(|t| e2eobjective_numdual(t, &data), theta);
-        let (v_nd2, d1_nd2, d2_nd) =
-            second_derivative(|t| e2eobjective_numdual(t, &data), theta);
-        let (v_nd3, d1_nd3, d2_nd3, d3_nd) =
-            third_derivative(|t| e2eobjective_numdual(t, &data), theta);
+        let (_, _, d2_nd) = second_derivative(|t| e2eobjective_numdual(t, &data), theta);
+        let (_, _, _, d3_nd) = third_derivative(|t| e2eobjective_numdual(t, &data), theta);
 
         let d1_autodiff = diff(
             |x: F1| {

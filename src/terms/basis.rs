@@ -1762,12 +1762,23 @@ impl Default for BSplineIdentifiability {
 pub enum CenterStrategy {
     UserProvided(Array2<f64>),
     /// Joint multidimensional equal-mass partitioning in the full smooth space.
-    EqualMass { num_centers: usize },
+    EqualMass {
+        num_centers: usize,
+    },
     /// Covariate-representative equal-mass partitioning along one selected axis.
-    EqualMassCovarRepresentative { num_centers: usize },
-    FarthestPoint { num_centers: usize },
-    KMeans { num_centers: usize, max_iter: usize },
-    UniformGrid { points_per_dim: usize },
+    EqualMassCovarRepresentative {
+        num_centers: usize,
+    },
+    FarthestPoint {
+        num_centers: usize,
+    },
+    KMeans {
+        num_centers: usize,
+        max_iter: usize,
+    },
+    UniformGrid {
+        points_per_dim: usize,
+    },
 }
 
 /// Thin-plate basis configuration.
@@ -2018,10 +2029,7 @@ fn select_equal_mass_centers(
     // in a single buffer and sort subranges in-place so center selection stays exact
     // without allocating fresh index vectors at every split.
     let mut order: Vec<usize> = (0..n).collect();
-    let mut leaves = vec![Leaf {
-        start: 0,
-        end: n,
-    }];
+    let mut leaves = vec![Leaf { start: 0, end: n }];
 
     let choose_split_dim = |slice: &[usize]| -> usize {
         let mut best_dim = 0usize;
@@ -3402,8 +3410,7 @@ fn spatial_identifiability_transform_from_design(
         SpatialIdentifiability::None => Ok(None),
         SpatialIdentifiability::OrthogonalToParametric => {
             let c = spatial_parametric_constraint_block(data);
-            let (_, z) =
-                applyweighted_orthogonality_constraint(design, c.view(), None)?;
+            let (_, z) = applyweighted_orthogonality_constraint(design, c.view(), None)?;
             Ok(Some(z))
         }
         SpatialIdentifiability::FrozenTransform { .. } => {
@@ -5160,13 +5167,8 @@ fn build_duchon_operator_penalty_psi_derivatives(
                     d2_raw_psi_psi[[k, col]] += lap_psi_psi * z_jc;
                 }
             } else {
-                let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = duchonphi_rr_collision_psi_triplet(
-                    length_scale,
-                    p_order,
-                    s_order,
-                    d,
-                    &coeffs,
-                )?;
+                let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
+                    duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, d, &coeffs)?;
                 let (_, lap_collision) = duchon_collision_operator_core_fromphi_rr(
                     phi_rr,
                     phi_rr_psi,
@@ -5474,11 +5476,7 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
             spec.include_intercept,
             z_opt.as_ref(),
         )?;
-        active_operator_penalty_derivatives(
-            &base.penaltyinfo,
-            &all_penaltysecond_deriv,
-            "Matérn",
-        )?
+        active_operator_penalty_derivatives(&base.penaltyinfo, &all_penaltysecond_deriv, "Matérn")?
     };
 
     Ok(BasisPsiSecondDerivativeResult {
@@ -5663,7 +5661,7 @@ fn duchon_maternsecond_collision_psi_triplet(
     let n = n_order as f64;
     let nu = n - 0.5 * k_dim as f64;
     let scale = 2.0 - 2.0 * nu;
-        Ok((second, scale * second, scale * scale * second))
+    Ok((second, scale * second, scale * scale * second))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -6251,11 +6249,8 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
         identifiability_transform,
         workspace,
     )?;
-    let penaltiessecond_derivative = active_operator_penalty_derivatives(
-        &base.penaltyinfo,
-        &all_penaltysecond_deriv,
-        "Duchon",
-    )?;
+    let penaltiessecond_derivative =
+        active_operator_penalty_derivatives(&base.penaltyinfo, &all_penaltysecond_deriv, "Duchon")?;
     Ok(BasisPsiSecondDerivativeResult {
         designsecond_derivative,
         penaltiessecond_derivative,

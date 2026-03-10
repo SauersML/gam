@@ -252,7 +252,7 @@ impl<T: AD> PdfFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for PdfFn<T> {
     const NAME: &'static str = "PdfFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         vec![normal_pdf_ad(inputs[0])]
     }
 
@@ -285,7 +285,7 @@ impl<T: AD> LogitFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for LogitFn<T> {
     const NAME: &'static str = "LogitFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         vec![logistic_ad(inputs[0])]
     }
 
@@ -318,7 +318,7 @@ impl<T: AD> WeightFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for WeightFn<T> {
     const NAME: &'static str = "WeightFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         vec![weight_ad(inputs[0])]
     }
 
@@ -342,11 +342,11 @@ fn mixture_probit_jet_matches_three_autodiff_engines() {
     for eta in points {
         let j = component_inverse_link_jet(LinkComponent::Probit, eta);
 
-        let (d1_nd, d2_nd) = first_derivative(normal_pdf_numdual, eta);
-        let (v2, d1_2, d3_nd) = second_derivative(normal_pdf_numdual, eta);
+        let (_, d2_nd) = first_derivative(normal_pdf_numdual, eta);
+        let (_, _, d3_nd) = second_derivative(normal_pdf_numdual, eta);
 
         let d2_autodiff = diff(normal_pdf_f1, eta);
-        let (v, jac) = engine.derivative(&[eta]);
+        let (_, jac) = engine.derivative(&[eta]);
         let d2_ad_trait = jac[(0, 0)];
 
         assert!(j.d1.is_finite() && j.d1 > 0.0);
@@ -378,11 +378,11 @@ fn mixture_logit_jet_matches_three_autodiff_engines() {
         let j = component_inverse_link_jet(LinkComponent::Logit, eta);
 
         let (mu_nd, d1_nd) = first_derivative(logistic_numdual, eta);
-        let (mu_nd2, d1_nd2, d2_nd) = second_derivative(logistic_numdual, eta);
-        let (mu_nd3, d1_nd3, d2_nd3, d3_nd) = third_derivative(logistic_numdual, eta);
+        let (_, _, d2_nd) = second_derivative(logistic_numdual, eta);
+        let (_, _, _, d3_nd) = third_derivative(logistic_numdual, eta);
 
         let d1_autodiff = diff(logistic_f1, eta);
-        let (v, jac) = engine.derivative(&[eta]);
+        let (_, jac) = engine.derivative(&[eta]);
         let d1_ad_trait = jac[(0, 0)];
 
         assert_manual_ad_band!("logit_jet", eta, "mu", j.mu, "num_dual" => mu_nd);
@@ -404,8 +404,8 @@ fn firth_logisticweight_derivatives_match_three_autodiff_engines() {
     let h4 = 1e-3;
     for eta in points {
         let (w, w1_nd) = first_derivative(weight_numdual, eta);
-        let (w2val, w1_nd2, w2_nd) = second_derivative(weight_numdual, eta);
-        let (w3val, w1_nd3, w2_nd3, w3_nd) = third_derivative(weight_numdual, eta);
+        let (_, _, w2_nd) = second_derivative(weight_numdual, eta);
+        let (_, _, _, w3_nd) = third_derivative(weight_numdual, eta);
 
         let m = logistic_numdual(eta);
         let t = 1.0 - 2.0 * m;
@@ -415,11 +415,11 @@ fn firth_logisticweight_derivatives_match_three_autodiff_engines() {
         let w4_manual = w * t * t * t * t - 22.0 * w * w * t * t + 16.0 * w * w * w;
 
         let d1_autodiff = diff(weight_f1, eta);
-        let (v, jac) = engine.derivative(&[eta]);
+        let (_, jac) = engine.derivative(&[eta]);
         let d1_ad_trait = jac[(0, 0)];
 
         let w3_at = |x: f64| {
-            let (ww, _, _, w3x) = third_derivative(weight_numdual, x);
+            let (_, _, _, w3x) = third_derivative(weight_numdual, x);
             w3x
         };
         let w4fd_h = (w3_at(eta + h4) - w3_at(eta - h4)) / (2.0 * h4);
@@ -460,12 +460,10 @@ fn firth_tau_manual_matches_autodiff_band() {
     let beta = array![0.1, -0.25, 0.2];
 
     let (phi_tau_manual, gphi_tau_manual) = firth_tau_manual(&x, &x_tau, &beta);
-    let (phi0, phi_tau_nd) =
-        first_derivative(|tau| firthphi_numdual(tau, &x, &x_tau, &beta), 0.0);
+    let (_, phi_tau_nd) = first_derivative(|tau| firthphi_numdual(tau, &x, &x_tau, &beta), 0.0);
 
     let h = 1e-6;
-    let phifd = (firthphi_numdual(h, &x, &x_tau, &beta)
-        - firthphi_numdual(-h, &x, &x_tau, &beta))
+    let phifd = (firthphi_numdual(h, &x, &x_tau, &beta) - firthphi_numdual(-h, &x, &x_tau, &beta))
         / (2.0 * h);
 
     assert_manual_ad_band!("firth_tau", 0.0, "phi_tau", phi_tau_manual,
@@ -473,7 +471,7 @@ fn firth_tau_manual_matches_autodiff_band() {
         "fd" => phifd);
 
     for j in 0..3 {
-        let (gj0, gj_nd) =
+        let (_, gj_nd) =
             first_derivative(|tau| firthgradphi_numdual(tau, &x, &x_tau, &beta)[j], 0.0);
         let gjfd = (firthgradphi_numdual(h, &x, &x_tau, &beta)[j]
             - firthgradphi_numdual(-h, &x, &x_tau, &beta)[j])

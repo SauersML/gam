@@ -1302,7 +1302,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     formula_rhs = rust_formula_survival(spec)
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
-    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "probit-location-scale"
+    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "location-scale"
     fit_cmd = [
         str(rust_bin), "fit",
         "--survival-likelihood", likelihood_mode,

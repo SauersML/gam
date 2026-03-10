@@ -19,9 +19,8 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
-    FittedLinkParameters,
-    compute_external_joint_hypercostgradienthessian, fit_gamwith_heuristic_lambdas,
-    reml::DirectionalHyperParam,
+    FittedLinkParameters, compute_external_joint_hypercostgradienthessian,
+    fit_gamwith_heuristic_lambdas, reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
@@ -547,6 +546,7 @@ impl TwoBlockExactJointHyperSetup {
     }
 }
 
+#[rustfmt::skip]
 pub type TwoBlockMaternKappaOptimizationResult<FitOut> = TwoBlockSpatialLengthScaleOptimizationResult<FitOut>;
 
 #[derive(Debug, Clone)]
@@ -4653,8 +4653,8 @@ impl SpatialAdaptiveExactFamily {
                 let lambda = params.lambda[0];
                 let beta_mixed_local = lambda
                     * scalar_operatorgradient(&cache.d0, &state.magnitude.betagradient_coeff());
-                let betahessian_local = lambda
-                    * scalar_operatorhessian(&cache.d0, &state.magnitude.betahessian_diag());
+                let betahessian_local =
+                    lambda * scalar_operatorhessian(&cache.d0, &state.magnitude.betahessian_diag());
                 beta_mixed
                     .slice_mut(s![cache.coeff_global_range.clone()])
                     .assign(&beta_mixed_local);
@@ -4735,8 +4735,8 @@ impl SpatialAdaptiveExactFamily {
                 let lambda = params.lambda[2];
                 let beta_mixed_local = lambda
                     * scalar_operatorgradient(&cache.d2, &state.curvature.betagradient_coeff());
-                let betahessian_local = lambda
-                    * scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag());
+                let betahessian_local =
+                    lambda * scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag());
                 beta_mixed
                     .slice_mut(s![cache.coeff_global_range.clone()])
                     .assign(&beta_mixed_local);
@@ -4971,11 +4971,9 @@ impl SpatialAdaptiveExactFamily {
             let d0_u = cache.d0.dot(&direction_local);
             let d1_u = cache.d1.dot(&direction_local);
             let d2_u = cache.d2.dot(&direction_local);
-            let h0 = scalar_operatorhessian(
-                &cache.d0,
-                &state.magnitude.directionalhessian_diag(&d0_u),
-            )
-            .mapv(|v| params.lambda[0] * v);
+            let h0 =
+                scalar_operatorhessian(&cache.d0, &state.magnitude.directionalhessian_diag(&d0_u))
+                    .mapv(|v| params.lambda[0] * v);
             let hg = grouped_operatorhessian(
                 &cache.d1,
                 cache.dimension,
@@ -4986,11 +4984,9 @@ impl SpatialAdaptiveExactFamily {
             )
             .map_err(|e| e.to_string())?
             .mapv(|v| params.lambda[1] * v);
-            let hc = scalar_operatorhessian(
-                &cache.d2,
-                &state.curvature.directionalhessian_diag(&d2_u),
-            )
-            .mapv(|v| params.lambda[2] * v);
+            let hc =
+                scalar_operatorhessian(&cache.d2, &state.curvature.directionalhessian_diag(&d2_u))
+                    .mapv(|v| params.lambda[2] * v);
             let range = cache.coeff_global_range.clone();
             let mut local = total.slice_mut(s![range.clone(), range]);
             local += &h0;
@@ -5187,8 +5183,7 @@ impl BoundedLinearFamily {
     }
 
     fn user_beta_and_jacobian(&self, latent_beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let (beta_user, jac_diag, _, _, _) =
-            self.bounded_term_derivative_data(latent_beta);
+        let (beta_user, jac_diag, _, _, _) = self.bounded_term_derivative_data(latent_beta);
         (beta_user, jac_diag)
     }
 
@@ -5319,8 +5314,7 @@ impl CustomFamily for BoundedLinearFamily {
                 block_states.len()
             ));
         }
-        let (_, hessian, _, _) =
-            self.evaluation_from_latent(&block_states[0].beta)?;
+        let (_, hessian, _, _) = self.evaluation_from_latent(&block_states[0].beta)?;
         Ok(Some(hessian))
     }
 
@@ -5361,8 +5355,7 @@ impl CustomFamily for BoundedLinearFamily {
         let (obs, _, _, _, second_diag, third_diag, priorthird) =
             self.exacthessian_andgradient(latent_beta)?;
 
-        let (_, jac_diag, _, _, _) =
-            self.bounded_term_derivative_data(latent_beta);
+        let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(latent_beta);
         let x_eff = self.effective_design_for_latent(&jac_diag);
         let deta = x_eff.dot(d_beta_flat);
         let d_neghess_eta = &obs.neghessian_eta_derivative * &deta;
@@ -5460,8 +5453,7 @@ impl CustomFamily for BoundedLinearFamily {
                 spec.design.ncols()
             ));
         }
-        let (_, jac_diag, _, _, _) =
-            self.bounded_term_derivative_data(&block_states[0].beta);
+        let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(&block_states[0].beta);
         let mut d_offset = Array1::<f64>::zeros(self.offset.len());
         let has_drift = self
             .bounded_terms
@@ -6133,12 +6125,8 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
 ) -> Result<Option<Vec<SpatialPsiDerivative>>, EstimationError> {
     let mut out = Vec::with_capacity(spatial_terms.len());
     for &term_idx in spatial_terms {
-        let Some(info) = try_build_spatial_term_log_kappa_derivativeinfo(
-            data,
-            resolvedspec,
-            design,
-            term_idx,
-        )?
+        let Some(info) =
+            try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
         else {
             return Ok(None);
         };
@@ -6284,18 +6272,12 @@ fn try_build_spatial_log_kappa_hyper_dirs(
     // three operator penalties. The joint outer vector is therefore
     //   theta = (rho_0, ..., rho_{K-1}, psi_1, ..., psi_q)
     // for q spatial terms participating in exact joint optimization.
-    let Some(info_list) = try_build_spatial_log_kappa_derivativeinfo_list(
-        data,
-        resolvedspec,
-        design,
-        spatial_terms,
-    )?
+    let Some(info_list) =
+        try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, spatial_terms)?
     else {
         return Ok(None);
     };
-    Ok(Some(spatial_log_kappa_hyper_dirs_frominfo_list(
-        info_list,
-    )?))
+    Ok(Some(spatial_log_kappa_hyper_dirs_frominfo_list(info_list)?))
 }
 
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
@@ -6606,7 +6588,7 @@ where
     });
 
     let mut evalvalue = |hyper_state: &mut SpatialHyperState<FitOut>,
-                          theta: &Array1<f64>|
+                         theta: &Array1<f64>|
      -> Result<
         (f64, TermCollectionSpec, TermCollectionDesign, FitOut),
         EstimationError,
@@ -6667,25 +6649,16 @@ where
 
             if leftcost.is_finite() && rightcost.is_finite() {
                 if let Some(interiorvalue) = quadratic_coordinate_minimizer(
-                    leftvalue,
-                    leftcost,
-                    basevalue,
-                    basecost,
-                    rightvalue,
-                    rightcost,
+                    leftvalue, leftcost, basevalue, basecost, rightvalue, rightcost,
                 ) {
                     let interiorvalue = interiorvalue.clamp(lower[coord], upper[coord]);
                     if interiorvalue > leftvalue.min(rightvalue) + 1e-12
                         && interiorvalue < leftvalue.max(rightvalue) - 1e-12
                     {
-                        let interior_theta =
-                            coordinate_probe(&current_theta, coord, interiorvalue);
+                        let interior_theta = coordinate_probe(&current_theta, coord, interiorvalue);
                         let interiorcost = evalvalue(&mut hyper_state, &interior_theta)?.0;
-                        if spatial_score_improves(
-                            interiorcost,
-                            current_cost,
-                            kappa_options.rel_tol,
-                        ) {
+                        if spatial_score_improves(interiorcost, current_cost, kappa_options.rel_tol)
+                        {
                             current_theta = interior_theta;
                             current_cost = interiorcost;
                             best_eval = hyper_state.best().ok_or_else(|| {
@@ -6894,13 +6867,12 @@ where
     };
 
     let (mut bestmean_design, mut bestnoise_design) = build_pair(meanspec, noisespec)?;
-    let mut best_meanspec = freeze_spatial_length_scale_terms_from_design(
-        meanspec,
-        &bestmean_design,
-    )
-    .map_err(|e| {
-        format!("failed to freeze mean spatial basis centers during κ optimization bootstrap: {e}")
-    })?;
+    let mut best_meanspec =
+        freeze_spatial_length_scale_terms_from_design(meanspec, &bestmean_design).map_err(|e| {
+            format!(
+                "failed to freeze mean spatial basis centers during κ optimization bootstrap: {e}"
+            )
+        })?;
     let mut best_noisespec = freeze_spatial_length_scale_terms_from_design(
         noisespec,
         &bestnoise_design,
@@ -6993,9 +6965,8 @@ where
                 apply_spatial_log_length_scales(&best_meanspec, &mean_terms, &mean_theta)?;
             let cand_noisespec =
                 apply_spatial_log_length_scales(&best_noisespec, &noise_terms, &noise_theta)?;
-            let (candmean_design, candnoise_design) =
-                build_pair(&cand_meanspec, &cand_noisespec)
-                    .map_err(EstimationError::InvalidInput)?;
+            let (candmean_design, candnoise_design) = build_pair(&cand_meanspec, &cand_noisespec)
+                .map_err(EstimationError::InvalidInput)?;
             let cand_fit = fit_fn(&candmean_design, &candnoise_design)
                 .map_err(EstimationError::InvalidInput)?;
             let cand_score = score_fn(&cand_fit);
@@ -7062,12 +7033,7 @@ where
 
                 if leftcost.is_finite() && rightcost.is_finite() {
                     if let Some(interiorvalue) = quadratic_coordinate_minimizer(
-                        leftvalue,
-                        leftcost,
-                        basevalue,
-                        basecost,
-                        rightvalue,
-                        rightcost,
+                        leftvalue, leftcost, basevalue, basecost, rightvalue, rightcost,
                     ) {
                         let interiorvalue = interiorvalue.clamp(lower[coord], upper[coord]);
                         if interiorvalue > leftvalue.min(rightvalue) + 1e-12
@@ -7277,11 +7243,8 @@ where
     };
 
     let (bootmean_design, bootnoise_design) = build_pair(meanspec, noisespec)?;
-    let best_meanspec = freeze_spatial_length_scale_terms_from_design(
-        meanspec,
-        &bootmean_design,
-    )
-    .map_err(|e| {
+    let best_meanspec = freeze_spatial_length_scale_terms_from_design(meanspec, &bootmean_design)
+        .map_err(|e| {
         format!("failed to freeze mean spatial basis centers during exact joint κ bootstrap: {e}")
     })?;
     let best_noisespec = freeze_spatial_length_scale_terms_from_design(

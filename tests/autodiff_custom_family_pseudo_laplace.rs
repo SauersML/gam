@@ -39,24 +39,24 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        d_beta: &Array1<f64>,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        d_beta_flat: &Array1<f64>,
+        _: &[ParameterBlockState],
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
@@ -89,24 +89,24 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        d_beta: &Array1<f64>,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        d_beta_flat: &Array1<f64>,
+        _: &[ParameterBlockState],
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
@@ -114,9 +114,9 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
+        _: &[ParameterBlockSpec],
+        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let beta = block_states
             .first()
@@ -252,8 +252,7 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
             false,
         )
         .expect("pseudo-laplace psi hyper eval");
-        let (value_nd, grad_nd) =
-            first_derivative(scalar_pseudo_laplace_psiobjective_numdual, psi);
+        let (value_nd, grad_nd) = first_derivative(scalar_pseudo_laplace_psiobjective_numdual, psi);
         let value_f64 = scalar_pseudo_laplace_psiobjective_f64(psi);
         let h = 1e-6;
         let gradfd = (scalar_pseudo_laplace_psiobjective_f64(psi + h)

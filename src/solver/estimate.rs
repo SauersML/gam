@@ -33,8 +33,7 @@ use crate::construction::{
 };
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
-    KahanSum, RidgePlanner, StableSolver, addridge, matrix_inversewith_regularization,
-    max_abs_diag,
+    KahanSum, RidgePlanner, StableSolver, addridge, matrix_inversewith_regularization, max_abs_diag,
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
@@ -140,9 +139,7 @@ fn signed_xtv_x(
         }
         DesignMatrix::Sparse(xs) => {
             let csr = xs.to_csr_arc().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "signed_xtv_x: failed to obtain CSR view".to_string(),
-                )
+                EstimationError::InvalidInput("signed_xtv_x: failed to obtain CSR view".to_string())
             })?;
             let sym = csr.symbolic();
             let row_ptr = sym.row_ptr();
@@ -457,8 +454,10 @@ impl ParametricColumnConditioning {
                 .beta_covariance_corrected
                 .take()
                 .map(|cov| self.backtransform_covariance(&cov));
-            inf.beta_standard_errors_corrected =
-                inf.beta_covariance_corrected.as_ref().map(se_from_covariance);
+            inf.beta_standard_errors_corrected = inf
+                .beta_covariance_corrected
+                .as_ref()
+                .map(se_from_covariance);
             inf.smoothing_correction = inf
                 .smoothing_correction
                 .take()
@@ -1025,9 +1024,9 @@ fn resolved_external_inverse_link(
     sas_link: Option<SasLinkSpec>,
 ) -> Result<InverseLink, EstimationError> {
     if let Some(spec) = mixture_link {
-        return Ok(InverseLink::Mixture(state_fromspec(spec).map_err(
-            |e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")),
-        )?));
+        return Ok(InverseLink::Mixture(state_fromspec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+        })?));
     }
     if let Some(spec) = sas_link {
         return Ok(match link {
@@ -1419,257 +1418,260 @@ where
         } else {
             Vec::new()
         };
-        let outer_result = crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient_andhessian(
-            theta_dim,
-            heuristic_theta_ref,
-            |theta: &Array1<f64>| {
-                let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
-                rho_buf.assign(&theta.slice(s![..k]));
-                let mut cfg_eval = cfg.clone();
-                if use_mixture {
-                    let mix_rho_arr = mix_rho_buf.as_mut().ok_or_else(|| {
-                        EstimationError::InvalidInput(
-                            "missing reusable mixture rho buffer".to_string(),
-                        )
-                    })?;
-                    mix_rho_arr.assign(&theta.slice(s![k..(k + mixture_dim)]));
-                    let spec_eval = MixtureLinkSpec {
-                        components: mixspec.components.clone(),
-                        initial_rho: mix_rho_arr.clone(),
-                    };
-                    cfg_eval.link_kind = InverseLink::Mixture(
-                        state_fromspec(&spec_eval).map_err(|e| {
-                            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
-                        })?,
-                    );
-                }
-                if use_sas {
-                    let epsilon = if use_beta_logistic {
-                        theta[k]
-                    } else {
-                        let (v, _) = sas_effective_epsilon(theta[k]);
-                        v
-                    };
-                    let delta_like = theta[k + 1];
-                    cfg_eval.link_kind = if use_beta_logistic {
-                        InverseLink::BetaLogistic(
-                            state_from_beta_logisticspec(SasLinkSpec {
-                                initial_epsilon: epsilon,
-                                initial_log_delta: delta_like,
-                            })
-                            .map_err(|e| {
+        let outer_result =
+            crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient_andhessian(
+                theta_dim,
+                heuristic_theta_ref,
+                |theta: &Array1<f64>| {
+                    let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
+                    rho_buf.assign(&theta.slice(s![..k]));
+                    let mut cfg_eval = cfg.clone();
+                    if use_mixture {
+                        let mix_rho_arr = mix_rho_buf.as_mut().ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "missing reusable mixture rho buffer".to_string(),
+                            )
+                        })?;
+                        mix_rho_arr.assign(&theta.slice(s![k..(k + mixture_dim)]));
+                        let spec_eval = MixtureLinkSpec {
+                            components: mixspec.components.clone(),
+                            initial_rho: mix_rho_arr.clone(),
+                        };
+                        cfg_eval.link_kind =
+                            InverseLink::Mixture(state_fromspec(&spec_eval).map_err(|e| {
                                 EstimationError::InvalidInput(format!(
-                                    "invalid Beta-Logistic link: {e}"
+                                    "invalid blended inverse link: {e}"
                                 ))
-                            })?,
-                        )
-                    } else {
-                        InverseLink::Sas(
-                            state_from_sasspec(SasLinkSpec {
-                                initial_epsilon: epsilon,
-                                initial_log_delta: delta_like,
-                            })
-                            .map_err(|e| {
-                                EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
-                            })?,
-                        )
-                    };
-                }
-                reml_eval
-                    .set_link_states(
+                            })?);
+                    }
+                    if use_sas {
+                        let epsilon = if use_beta_logistic {
+                            theta[k]
+                        } else {
+                            let (v, _) = sas_effective_epsilon(theta[k]);
+                            v
+                        };
+                        let delta_like = theta[k + 1];
+                        cfg_eval.link_kind = if use_beta_logistic {
+                            InverseLink::BetaLogistic(
+                                state_from_beta_logisticspec(SasLinkSpec {
+                                    initial_epsilon: epsilon,
+                                    initial_log_delta: delta_like,
+                                })
+                                .map_err(|e| {
+                                    EstimationError::InvalidInput(format!(
+                                        "invalid Beta-Logistic link: {e}"
+                                    ))
+                                })?,
+                            )
+                        } else {
+                            InverseLink::Sas(
+                                state_from_sasspec(SasLinkSpec {
+                                    initial_epsilon: epsilon,
+                                    initial_log_delta: delta_like,
+                                })
+                                .map_err(|e| {
+                                    EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                                })?,
+                            )
+                        };
+                    }
+                    reml_eval.set_link_states(
                         cfg_eval.link_kind.mixture_state().cloned(),
                         cfg_eval.link_kind.sas_state().copied(),
                     );
-                let tcost = Instant::now();
-                let mut cost = reml_eval.compute_cost(&rho_buf)?;
-                let sasridge = if use_sas && !use_beta_logistic {
-                    sasridgeweight
-                } else {
-                    0.0
-                };
-                if use_sas && sasridge > 0.0 {
-                    let log_delta = theta[k + 1];
-                    cost += 0.5 * sasridge * log_delta * log_delta;
-                    if !use_beta_logistic {
-                        let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
-                        cost += barriercost;
+                    let tcost = Instant::now();
+                    let mut cost = reml_eval.compute_cost(&rho_buf)?;
+                    let sasridge = if use_sas && !use_beta_logistic {
+                        sasridgeweight
+                    } else {
+                        0.0
+                    };
+                    if use_sas && sasridge > 0.0 {
+                        let log_delta = theta[k + 1];
+                        cost += 0.5 * sasridge * log_delta * log_delta;
+                        if !use_beta_logistic {
+                            let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+                            cost += barriercost;
+                        }
                     }
-                }
-                let cost_sec = tcost.elapsed().as_secs_f64();
+                    let cost_sec = tcost.elapsed().as_secs_f64();
 
-                let tgrad = Instant::now();
-                let mut grad = Array1::<f64>::zeros(theta_dim);
-                let grad_rho = reml_eval.compute_gradient(&rho_buf)?;
-                grad.slice_mut(s![..k]).assign(&grad_rho);
-                let (pirls_mix, h_posw) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
-                if cfg_eval.firth_bias_reduction {
-                    return Err(EstimationError::InvalidInput(
+                    let tgrad = Instant::now();
+                    let mut grad = Array1::<f64>::zeros(theta_dim);
+                    let grad_rho = reml_eval.compute_gradient(&rho_buf)?;
+                    grad.slice_mut(s![..k]).assign(&grad_rho);
+                    let (pirls_mix, h_posw) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
+                    if cfg_eval.firth_bias_reduction {
+                        return Err(EstimationError::InvalidInput(
                         "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
                             .to_string(),
                     ));
-                }
-                let eta = &pirls_mix.final_eta;
-                let x_t = &pirls_mix.x_transformed;
-                let nobs = eta.len();
-                let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                debug_assert_eq!(nobs, leverage_buf.len());
-                score_beta_jacobian_diag_buf.fill(0.0);
-                leverage_buf.fill(0.0);
-                if h_posw.ncols() > 0 {
-                    match x_t {
-                        DesignMatrix::Dense(x_dense) => {
-                            let xw = x_dense.dot(h_posw.as_ref());
-                            for i in 0..xw.nrows() {
-                                leverage_buf[i] = xw.row(i).iter().map(|v| v * v).sum();
+                    }
+                    let eta = &pirls_mix.final_eta;
+                    let x_t = &pirls_mix.x_transformed;
+                    let nobs = eta.len();
+                    let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
+                    debug_assert_eq!(nobs, leverage_buf.len());
+                    score_beta_jacobian_diag_buf.fill(0.0);
+                    leverage_buf.fill(0.0);
+                    if h_posw.ncols() > 0 {
+                        match x_t {
+                            DesignMatrix::Dense(x_dense) => {
+                                let xw = x_dense.dot(h_posw.as_ref());
+                                for i in 0..xw.nrows() {
+                                    leverage_buf[i] = xw.row(i).iter().map(|v| v * v).sum();
+                                }
+                            }
+                            DesignMatrix::Sparse(_) => {
+                                for col in 0..h_posw.ncols() {
+                                    let w_col = h_posw.column(col).to_owned();
+                                    let xw_col = x_t.matrixvectormultiply(&w_col);
+                                    Zip::from(&mut leverage_buf)
+                                        .and(&xw_col)
+                                        .for_each(|h, &v| *h += v * v);
+                                }
                             }
                         }
-                        DesignMatrix::Sparse(_) => {
-                            for col in 0..h_posw.ncols() {
-                                let w_col = h_posw.column(col).to_owned();
-                                let xw_col = x_t.matrixvectormultiply(&w_col);
-                                Zip::from(&mut leverage_buf)
-                                    .and(&xw_col)
-                                    .for_each(|h, &v| *h += v * v);
+                    }
+                    for j in 0..aux_dim {
+                        direct_ll_buf[j] = 0.0;
+                        du_by_j_buf[j].fill(0.0);
+                        dw_explicit_by_j_buf[j].fill(0.0);
+                    }
+                    if use_mixture {
+                        let mix_state = cfg_eval.link_kind.mixture_state().ok_or_else(|| {
+                            EstimationError::InvalidInput("missing mixture state".to_string())
+                        })?;
+                        for i in 0..nobs {
+                            let jet = mixture_inverse_link_jetwith_rho_partials_into(
+                                mix_state,
+                                eta[i],
+                                &mut mix_partials_buf_reuse,
+                            );
+                            let mu = jet.mu;
+                            let d1 = jet.d1;
+                            let d2 = jet.d2;
+                            let yi = y_o[i];
+                            let wi = w_o[i].max(0.0);
+                            let aux = stabilized_binomial_aux_terms(yi, wi, mu);
+                            score_beta_jacobian_diag_buf[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
+                            for j in 0..aux_dim {
+                                let dj = mix_partials_buf_reuse[j];
+                                let dmu = dj.mu;
+                                let dd1 = dj.d1;
+                                direct_ll_buf[j] += aux.a1 * dmu;
+                                du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
+                                let variance_param = aux.variancemu_scale * dmu;
+                                let numerator = d1 * d1;
+                                let numerator_param = 2.0 * d1 * dd1;
+                                dw_explicit_by_j_buf[j][i] = wi
+                                    * (numerator_param * aux.variance - numerator * variance_param)
+                                    / (aux.variance * aux.variance);
                             }
                         }
-                    }
-                }
-                for j in 0..aux_dim {
-                    direct_ll_buf[j] = 0.0;
-                    du_by_j_buf[j].fill(0.0);
-                    dw_explicit_by_j_buf[j].fill(0.0);
-                }
-                if use_mixture {
-                    let mix_state = cfg_eval.link_kind.mixture_state().ok_or_else(|| {
-                        EstimationError::InvalidInput("missing mixture state".to_string())
-                    })?;
-                    for i in 0..nobs {
-                        let jet = mixture_inverse_link_jetwith_rho_partials_into(
-                            mix_state,
-                            eta[i],
-                            &mut mix_partials_buf_reuse,
-                        );
-                        let mu = jet.mu;
-                        let d1 = jet.d1;
-                        let d2 = jet.d2;
-                        let yi = y_o[i];
-                        let wi = w_o[i].max(0.0);
-                        let aux = stabilized_binomial_aux_terms(yi, wi, mu);
-                        score_beta_jacobian_diag_buf[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
-                        for j in 0..aux_dim {
-                            let dj = mix_partials_buf_reuse[j];
-                            let dmu = dj.mu;
-                            let dd1 = dj.d1;
-                            direct_ll_buf[j] += aux.a1 * dmu;
-                            du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                            let variance_param = aux.variancemu_scale * dmu;
-                            let numerator = d1 * d1;
-                            let numerator_param = 2.0 * d1 * dd1;
-                            dw_explicit_by_j_buf[j][i] = wi
-                                * (numerator_param * aux.variance - numerator * variance_param)
-                                / (aux.variance * aux.variance);
-                        }
-                    }
-                } else {
-                    let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
-                        EstimationError::InvalidInput("missing parameterized link state".to_string())
-                    })?;
-                    for i in 0..nobs {
-                        let eta_i = eta[i].clamp(-30.0, 30.0);
-                        let jets = if use_beta_logistic {
-                            beta_logistic_inverse_link_jetwith_param_partials(
-                                eta_i,
-                                sas.log_delta,
-                                sas.epsilon,
-                            )
-                        } else {
-                            sas_inverse_link_jetwith_param_partials(
-                                eta_i,
-                                sas.epsilon,
-                                sas.log_delta,
-                            )
-                        };
-                        let mu = jets.jet.mu;
-                        let d1 = jets.jet.d1;
-                        let d2 = jets.jet.d2;
-                        let yi = y_o[i];
-                        let wi = w_o[i].max(0.0);
-                        let aux = stabilized_binomial_aux_terms(yi, wi, mu);
-                        score_beta_jacobian_diag_buf[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
-                        for j in 0..aux_dim {
-                            let dj = if j == 0 {
-                                jets.djet_depsilon
-                            } else {
-                                jets.djet_dlog_delta
-                            };
-                            let dmu = dj.mu;
-                            let dd1 = dj.d1;
-                            direct_ll_buf[j] += aux.a1 * dmu;
-                            du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                            let variance_param = aux.variancemu_scale * dmu;
-                            let numerator = d1 * d1;
-                            let numerator_param = 2.0 * d1 * dd1;
-                            dw_explicit_by_j_buf[j][i] = wi
-                                * (numerator_param * aux.variance - numerator * variance_param)
-                                / (aux.variance * aux.variance);
-                        }
-                    }
-                }
-                let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
-                    x_t,
-                    &score_beta_jacobian_diag_buf,
-                    &pirls_mix.reparam_result.s_transformed,
-                    pirls_mix.ridge_used,
-                )?;
-                let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
-                let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
-                for j in 0..aux_dim {
-                    let rhs_j = x_t.transpose_vector_multiply(&du_by_j_buf[j]);
-                    let dbeta_j = solver
-                        .solvevectorwithridge_retries(
-                            &score_beta_jacobian,
-                            &rhs_j,
-                            jacobianridge_floor,
-                        )
-                        .ok_or_else(|| {
+                    } else {
+                        let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
                             EstimationError::InvalidInput(
-                                "failed to solve exact parametric beta sensitivity system"
-                                    .to_string(),
+                                "missing parameterized link state".to_string(),
                             )
                         })?;
-                    let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
-                    let mut trace_term = 0.0_f64;
-                    for i in 0..nobs {
-                        let dw_total =
-                            dw_explicit_by_j_buf[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
-                        trace_term += leverage_buf[i] * dw_total;
+                        for i in 0..nobs {
+                            let eta_i = eta[i].clamp(-30.0, 30.0);
+                            let jets = if use_beta_logistic {
+                                beta_logistic_inverse_link_jetwith_param_partials(
+                                    eta_i,
+                                    sas.log_delta,
+                                    sas.epsilon,
+                                )
+                            } else {
+                                sas_inverse_link_jetwith_param_partials(
+                                    eta_i,
+                                    sas.epsilon,
+                                    sas.log_delta,
+                                )
+                            };
+                            let mu = jets.jet.mu;
+                            let d1 = jets.jet.d1;
+                            let d2 = jets.jet.d2;
+                            let yi = y_o[i];
+                            let wi = w_o[i].max(0.0);
+                            let aux = stabilized_binomial_aux_terms(yi, wi, mu);
+                            score_beta_jacobian_diag_buf[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
+                            for j in 0..aux_dim {
+                                let dj = if j == 0 {
+                                    jets.djet_depsilon
+                                } else {
+                                    jets.djet_dlog_delta
+                                };
+                                let dmu = dj.mu;
+                                let dd1 = dj.d1;
+                                direct_ll_buf[j] += aux.a1 * dmu;
+                                du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
+                                let variance_param = aux.variancemu_scale * dmu;
+                                let numerator = d1 * d1;
+                                let numerator_param = 2.0 * d1 * dd1;
+                                dw_explicit_by_j_buf[j][i] = wi
+                                    * (numerator_param * aux.variance - numerator * variance_param)
+                                    / (aux.variance * aux.variance);
+                            }
+                        }
                     }
-                    grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
-                }
-                if use_sas && !use_beta_logistic {
-                    let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
-                    grad[k] *= d_eps_d_raw;
-                }
-                if use_sas && sasridge > 0.0 {
-                    let log_delta = theta[k + 1];
-                    grad[k + 1] += sasridge * log_delta;
-                    if !use_beta_logistic {
-                        let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
-                        grad[k + 1] += barriergrad;
+                    let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
+                        x_t,
+                        &score_beta_jacobian_diag_buf,
+                        &pirls_mix.reparam_result.s_transformed,
+                        pirls_mix.ridge_used,
+                    )?;
+                    let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
+                    let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
+                    for j in 0..aux_dim {
+                        let rhs_j = x_t.transpose_vector_multiply(&du_by_j_buf[j]);
+                        let dbeta_j = solver
+                            .solvevectorwithridge_retries(
+                                &score_beta_jacobian,
+                                &rhs_j,
+                                jacobianridge_floor,
+                            )
+                            .ok_or_else(|| {
+                                EstimationError::InvalidInput(
+                                    "failed to solve exact parametric beta sensitivity system"
+                                        .to_string(),
+                                )
+                            })?;
+                        let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
+                        let mut trace_term = 0.0_f64;
+                        for i in 0..nobs {
+                            let dw_total = dw_explicit_by_j_buf[j][i]
+                                + pirls_mix.solve_c_array[i] * eta_dot_j[i];
+                            trace_term += leverage_buf[i] * dw_total;
+                        }
+                        grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
                     }
-                }
-                let grad_sec = tgrad.elapsed().as_secs_f64();
-                log::info!(
-                    "[outer-eval {eval_idx}] theta_dim={} aux_dim={} hessian=false time_sec(cost={:.3}, grad={:.3})",
-                    theta_dim,
-                    aux_dim,
-                    cost_sec,
-                    grad_sec
-                );
-                Ok((cost, grad, None))
-            },
-            &smoothing_options_mix,
-        )?;
+                    if use_sas && !use_beta_logistic {
+                        let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
+                        grad[k] *= d_eps_d_raw;
+                    }
+                    if use_sas && sasridge > 0.0 {
+                        let log_delta = theta[k + 1];
+                        grad[k + 1] += sasridge * log_delta;
+                        if !use_beta_logistic {
+                            let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
+                            grad[k + 1] += barriergrad;
+                        }
+                    }
+                    let grad_sec = tgrad.elapsed().as_secs_f64();
+                    log::info!(
+                        "[outer-eval {eval_idx}] theta_dim={} aux_dim={} hessian=false time_sec(cost={:.3}, grad={:.3})",
+                        theta_dim,
+                        aux_dim,
+                        cost_sec,
+                        grad_sec
+                    );
+                    Ok((cost, grad, None))
+                },
+                &smoothing_options_mix,
+            )?;
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
@@ -2017,8 +2019,7 @@ where
             }
             _ => None,
         };
-        beta_standard_errors_corrected =
-            beta_covariance_corrected.as_ref().map(se_from_covariance);
+        beta_standard_errors_corrected = beta_covariance_corrected.as_ref().map(se_from_covariance);
     }
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
@@ -4057,11 +4058,7 @@ where
         for i in 0..nobs {
             let eta_i = eta[i].clamp(-30.0, 30.0);
             let jets = if use_beta_logistic {
-                beta_logistic_inverse_link_jetwith_param_partials(
-                    eta_i,
-                    sas.log_delta,
-                    sas.epsilon,
-                )
+                beta_logistic_inverse_link_jetwith_param_partials(eta_i, sas.log_delta, sas.epsilon)
             } else {
                 sas_inverse_link_jetwith_param_partials(eta_i, sas.epsilon, sas.log_delta)
             };
@@ -4174,9 +4171,7 @@ mod fd_policy_tests {
         for eval in 1..=GRAD_DIAG_FD_WARMUP_EVALS {
             assert!(should_samplegradient_diagfd(eval));
         }
-        assert!(!should_samplegradient_diagfd(
-            GRAD_DIAG_FD_WARMUP_EVALS + 1
-        ));
+        assert!(!should_samplegradient_diagfd(GRAD_DIAG_FD_WARMUP_EVALS + 1));
         assert!(!should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL - 1));
         assert!(should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL));
         assert!(should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL * 2));

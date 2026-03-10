@@ -543,13 +543,9 @@ fn build_block_spatial_psi_derivatives(
     // setup is typed in SpatialLogKappaCoords so these derivatives stay in the same
     // parameterization end-to-end.
     let spatial_terms = spatial_length_scale_term_indices(resolvedspec);
-    let Some(info_list) = try_build_spatial_log_kappa_derivativeinfo_list(
-        data,
-        resolvedspec,
-        design,
-        &spatial_terms,
-    )
-    .map_err(|e| e.to_string())?
+    let Some(info_list) =
+        try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, &spatial_terms)
+            .map_err(|e| e.to_string())?
     else {
         return Ok(None);
     };
@@ -849,16 +845,17 @@ fn append_binomial_log_sigma_shrinkage_penalty_input(block: &mut ParameterBlockI
     let p = block.design.ncols();
     block.penalties.push(identity_penalty(p));
     block.initial_log_lambdas = Some(match block.initial_log_lambdas.take() {
-        Some(log_lambdas) => append_log_lambdavalue(
-            &log_lambdas,
-            BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT,
-        ),
+        Some(log_lambdas) => {
+            append_log_lambdavalue(&log_lambdas, BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT)
+        }
         None => Array1::from_vec(vec![BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT]),
     });
 }
 
 fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
-    design.penalties.push(identity_penalty(design.design.ncols()));
+    design
+        .penalties
+        .push(identity_penalty(design.design.ncols()));
 }
 
 fn emit_binomial_alpha_betawarnings(
@@ -871,10 +868,7 @@ fn emit_binomial_alpha_betawarnings(
         return;
     }
     let beta_min = betavalues.iter().copied().fold(f64::INFINITY, f64::min);
-    let beta_max = betavalues
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let beta_max = betavalues.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
     if !beta_min.is_finite() || !beta_max.is_finite() || beta_min <= 0.0 {
         log::warn!(
@@ -1080,12 +1074,8 @@ fn try_binomial_alpha_betawarm_start(
     let log_sigma_target = Array1::from_elem(y.len(), eta_ls_target);
     // T = -alpha/beta is noisy when beta is small (large sigma). Weight the
     // projection by beta^2 (inverse variance of T under fixed alpha noise).
-    let t_projectionw = Array1::from_iter(
-        weights
-            .iter()
-            .zip(betaobs.iter())
-            .map(|(&w, &b)| w * b * b),
-    );
+    let t_projectionw =
+        Array1::from_iter(weights.iter().zip(betaobs.iter()).map(|(&w, &b)| w * b * b));
 
     let beta_t = solveweighted_projection(
         &threshold_block.design,
@@ -1602,12 +1592,7 @@ trait LocationScaleFamilyBuilder {
     fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         noise_design.penalties.len()
     }
-    fn augment_result_designs(
-        &self,
-        _: &mut TermCollectionDesign,
-        _: &mut TermCollectionDesign,
-    ) {
-    }
+    fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
@@ -1653,11 +1638,8 @@ fn compose_theta_from_hints(
     noise_log_lambda_hint: &Option<Array1<f64>>,
     extra_rho0: &Array1<f64>,
 ) -> Array1<f64> {
-    let layout = GamlssLambdaLayout::withwiggle(
-        mean_penalty_count,
-        noise_penalty_count,
-        extra_rho0.len(),
-    );
+    let layout =
+        GamlssLambdaLayout::withwiggle(mean_penalty_count, noise_penalty_count, extra_rho0.len());
     let mut theta = Array1::<f64>::zeros(layout.total());
     if let Some(v) = mean_log_lambda_hint
         && v.len() == layout.k_mean
@@ -2197,8 +2179,10 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         mean_beta_hint: Option<Array1<f64>>,
         noise_beta_hint: Option<Array1<f64>>,
     ) -> Result<Vec<ParameterBlockSpec>, String> {
-        let layout =
-            GamlssLambdaLayout::two_block(mean_design.penalties.len(), self.noise_penalty_count(noise_design));
+        let layout = GamlssLambdaLayout::two_block(
+            mean_design.penalties.len(),
+            self.noise_penalty_count(noise_design),
+        );
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
@@ -3927,9 +3911,8 @@ impl GaussianLocationScaleFamily {
         let ximuv = xmu.dot(&vmu);
         let xi_lsv = x_ls.dot(&v_ls);
         let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
-        let (d2hmumu, d2hmu_ls, d2h_ls_ls) = gaussian_jointsecond_directionalweights(
-            &rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv,
-        );
+        let (d2hmumu, d2hmu_ls, d2h_ls_ls) =
+            gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
 
         Ok(Some(gaussian_joint_hessian_from_coeffs(
             xmu, x_ls, &d2hmumu, &d2hmu_ls, &d2h_ls_ls,
@@ -4176,15 +4159,14 @@ impl GaussianLocationScaleFamily {
         else {
             return Ok(None);
         };
-        let (xmu_ab, x_ls_ab, zmu_ab, z_ls_ab) = self
-            .exact_newton_joint_psisecond_design_drifts(
-                block_states,
-                derivative_blocks,
-                &dir_i,
-                &dir_j,
-                xmu,
-                x_ls,
-            )?;
+        let (xmu_ab, x_ls_ab, zmu_ab, z_ls_ab) = self.exact_newton_joint_psisecond_design_drifts(
+            block_states,
+            derivative_blocks,
+            &dir_i,
+            &dir_j,
+            xmu,
+            x_ls,
+        )?;
         // Second fixed-beta psi objects for the same Gaussian location-scale
         // kernel. Using the notation from the first-order comment, the rowwise
         // second psi drifts are
@@ -8993,10 +8975,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
         let dd0 =
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
-        if b0.ncols() != betaw0.len()
-            || d0.ncols() != betaw0.len()
-            || dd0.ncols() != betaw0.len()
-        {
+        if b0.ncols() != betaw0.len() || d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
             return Err(format!(
                 "wiggle basis/beta mismatch in exact joint Hessian: B={} B'={} B''={} betaw={}",
                 b0.ncols(),
@@ -9486,8 +9465,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             let dq_lsv = dmv * q0.q_ls + m[i] * dq0_lsv;
 
             let d2q_t_uv = d2m_uv * q0.q_t + dm_u * dq0_tv + dmv * dq0_t_u + m[i] * d2q0_t_uv;
-            let d2q_ls_uv =
-                d2m_uv * q0.q_ls + dm_u * dq0_lsv + dmv * dq0_ls_u + m[i] * d2q0_ls_uv;
+            let d2q_ls_uv = d2m_uv * q0.q_ls + dm_u * dq0_lsv + dmv * dq0_ls_u + m[i] * d2q0_ls_uv;
 
             let dq_tt_u = dg2_u * q0.q_t * q0.q_t + g2[i] * (2.0 * q0.q_t * dq0_t_u);
             let dq_ttv = dg2v * q0.q_t * q0.q_t + g2[i] * (2.0 * q0.q_t * dq0_tv);
@@ -9540,8 +9518,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                 d2q_t_uv, d2q_t_uv, dq_tt_u, dq_ttv, d2q_tt_uv,
             );
             let coeff_tl = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_ls, q_tl, dq_t_u, dq_tv, dq_ls_u,
-                dq_lsv, d2q_t_uv, d2q_ls_uv, dq_tl_u, dq_tlv, d2q_tl_uv,
+                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_ls, q_tl, dq_t_u, dq_tv, dq_ls_u, dq_lsv,
+                d2q_t_uv, d2q_ls_uv, dq_tl_u, dq_tlv, d2q_tl_uv,
             );
             let coeff_ll = second_directionalhessian_coeff_fromobjective_q_terms(
                 m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, q_ls, q_ll, dq_ls_u, dq_lsv, dq_ls_u,
@@ -9585,8 +9563,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                     + dr[j] * d2q0_ls_uv;
 
                 let coeff_tw = second_directionalhessian_coeff_fromobjective_q_terms(
-                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, qw, q_tw, dq_t_u, dq_tv, dqw_u,
-                    dqwv, d2q_t_uv, d2qw_uv, dq_tw_u, dq_twv, d2q_tw_uv,
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, qw, q_tw, dq_t_u, dq_tv, dqw_u, dqwv,
+                    d2q_t_uv, d2qw_uv, dq_tw_u, dq_twv, d2q_tw_uv,
                 );
                 let coeff_lw = second_directionalhessian_coeff_fromobjective_q_terms(
                     m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, qw, q_lw, dq_ls_u, dq_lsv, dqw_u,
@@ -9612,8 +9590,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                     let dqwkv = dr[k] * dq0v;
                     let d2qwk_uv = ddr[k] * dq0_u * dq0v + dr[k] * d2q0_uv;
                     let coeffww = second_directionalhessian_coeff_fromobjective_q_terms(
-                        m1, m2, m3, m4, dq_u, dqv, d2q_uv, qwj, qwk, 0.0, dqwj_u, dqwjv,
-                        dqwk_u, dqwkv, d2qwj_uv, d2qwk_uv, 0.0, 0.0, 0.0,
+                        m1, m2, m3, m4, dq_u, dqv, d2q_uv, qwj, qwk, 0.0, dqwj_u, dqwjv, dqwk_u,
+                        dqwkv, d2qwj_uv, d2qwk_uv, 0.0, 0.0, 0.0,
                     );
                     d2_h[[pt + pls + j, pt + pls + k]] += coeffww;
                 }
@@ -9825,9 +9803,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != self.y.len()
-            || eta_ls.len() != self.y.len()
-            || etaw.len() != self.y.len()
+        if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() || etaw.len() != self.y.len()
         {
             return Err("BinomialLocationScaleWiggleFamily generative size mismatch".to_string());
         }
@@ -11676,11 +11652,11 @@ mod tests {
         ];
 
         let eval = family.evaluate(&states).expect("evaluate wiggle family");
-        let blockhessian =
-            match &eval.blockworking_sets[BinomialLocationScaleWiggleFamily::BLOCK_T] {
-                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
-                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton threshold block"),
-            };
+        let blockhessian = match &eval.blockworking_sets[BinomialLocationScaleWiggleFamily::BLOCK_T]
+        {
+            BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
+            BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton threshold block"),
+        };
         let (value_ad, grad_ad, hess_ad) = second_derivative(
             |bt| wiggle_negloglik_threshold_numdual(bt, beta_ls0, &betaw, &y, &weights, &knots, 3),
             beta_t0,
@@ -12039,11 +12015,7 @@ mod tests {
                     .evaluate(&rebuild_states(&beta_t_plus, &beta_ls_plus, &betaw_plus))
                     .expect("eval plus");
                 let eval_minus = family
-                    .evaluate(&rebuild_states(
-                        &beta_t_minus,
-                        &beta_ls_minus,
-                        &betaw_minus,
-                    ))
+                    .evaluate(&rebuild_states(&beta_t_minus, &beta_ls_minus, &betaw_minus))
                     .expect("eval minus");
 
                 let mut row_offset = 0usize;
@@ -12413,11 +12385,7 @@ mod tests {
                     .evaluate(&rebuild_states(&beta_t_plus, &beta_ls_plus, &betaw_plus))
                     .expect("eval plus");
                 let eval_minus = family
-                    .evaluate(&rebuild_states(
-                        &beta_t_minus,
-                        &beta_ls_minus,
-                        &betaw_minus,
-                    ))
+                    .evaluate(&rebuild_states(&beta_t_minus, &beta_ls_minus, &betaw_minus))
                     .expect("eval minus");
                 let grad_plus = extractgradient(&eval_plus, target_block);
                 let grad_minus = extractgradient(&eval_minus, target_block);
@@ -12589,7 +12557,7 @@ mod tests {
 
     #[test]
     fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference()
-     {
+    {
         let n = 8usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);

@@ -143,7 +143,7 @@ fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f6
         firth_bias_reduction: None,
     };
     let rho_arr = array![rho];
-    let (analytic_grad, fdgrad) = evaluate_externalgradients(
+    let (analytic_grad, _) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.clone(),

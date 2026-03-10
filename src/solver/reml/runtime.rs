@@ -150,11 +150,7 @@ impl<'a> RemlState<'a> {
     ///                = w * a² * (1 - tanh²(a * rho_i)).
     ///
     /// The prior is separable across coordinates, so off-diagonals are zero.
-    pub(super) fn add_soft_priorhessian_in_place(
-        &self,
-        rho: &Array1<f64>,
-        hess: &mut Array2<f64>,
-    ) {
+    pub(super) fn add_soft_priorhessian_in_place(&self, rho: &Array1<f64>, hess: &mut Array2<f64>) {
         let len = rho.len();
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
             return;
@@ -501,8 +497,7 @@ impl<'a> RemlState<'a> {
                     }
                 }
                 if worst > 0.0 {
-                    worstrow_msg =
-                        format!("; worstrow={} worstviolation={:.3e}", worstrow, worst);
+                    worstrow_msg = format!("; worstrow={} worstviolation={:.3e}", worstrow, worst);
                 }
             }
             return Err(EstimationError::ParameterConstraintViolation(format!(

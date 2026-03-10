@@ -981,8 +981,7 @@ impl FirthDenseOperator {
         let qv_tau = &etav * &kernel.dotw1.view().insert_axis(Axis(1))
             + &etav_tau * &self.w1.view().insert_axis(Axis(1));
         let m_qv = self.apply_pbar_to_matrix(&qv);
-        let m_qv_tau =
-            self.apply_mtau_to_matrix(kernel, &qv) + self.apply_pbar_to_matrix(&qv_tau);
+        let m_qv_tau = self.apply_mtau_to_matrix(kernel, &qv) + self.apply_pbar_to_matrix(&qv_tau);
         let rv = &(&etav * &self.w2.view().insert_axis(Axis(1)))
             * &self.h_diag.view().insert_axis(Axis(1))
             - &(&m_qv * &self.w1.view().insert_axis(Axis(1)));

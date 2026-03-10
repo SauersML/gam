@@ -397,9 +397,7 @@ where
 
     let rho = solution.final_point.clone();
     let mut grad_rho = match &last_eval {
-        Some((rho_cached, cost_cached, grad_cached))
-            if approx_same_rho_point(&rho, rho_cached) =>
-        {
+        Some((rho_cached, cost_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
             grad_cached.clone()
         }
         _ => {
@@ -455,13 +453,9 @@ where
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_stationarity_residual = f64::INFINITY;
     for (_, rho_seed) in screened_seeds.iter() {
-        let Some(candidate) = run_single_seed_bfgs(
-            context,
-            rho_seed,
-            reset_context,
-            evalcostgrad_rho,
-            options,
-        ) else {
+        let Some(candidate) =
+            run_single_seed_bfgs(context, rho_seed, reset_context, evalcostgrad_rho, options)
+        else {
             continue;
         };
         let stationarity_residual = candidate.final_stationarity_residual;
@@ -725,9 +719,7 @@ where
 
     let rho = solution.final_point.clone();
     let mut grad_rho = match &last_eval {
-        Some((rho_cached, cost_cached, grad_cached))
-            if approx_same_rho_point(&rho, rho_cached) =>
-        {
+        Some((rho_cached, cost_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
             grad_cached.clone()
         }
         _ => match evalcostgrad_rho(&rho) {
@@ -869,7 +861,7 @@ where
         SmoothingOptimizerKind::Arc => {
             let mut evalcost_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
             let mut evalcostgradhess_rho = |objective: &mut F,
-                                               rho: &Array1<f64>|
+                                            rho: &Array1<f64>|
              -> Result<
                 (f64, Array1<f64>, Option<Array2<f64>>),
                 EstimationError,
@@ -974,7 +966,7 @@ where
         ),
         SmoothingOptimizerKind::Arc => {
             let mut evalcostgradhess_rho = |objective: &mut F,
-                                               rho: &Array1<f64>|
+                                            rho: &Array1<f64>|
              -> Result<
                 (f64, Array1<f64>, Option<Array2<f64>>),
                 EstimationError,

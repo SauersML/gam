@@ -610,12 +610,9 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 LinkFunction::Identity,
                 priorweights,
             )),
-            GlmLikelihoodFamily::BinomialLogit => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::Logit,
-                priorweights,
-            )),
+            GlmLikelihoodFamily::BinomialLogit => {
+                Ok(calculate_deviance(y, mu, LinkFunction::Logit, priorweights))
+            }
             GlmLikelihoodFamily::BinomialProbit => Ok(calculate_deviance(
                 y,
                 mu,
@@ -637,12 +634,9 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 LinkFunction::BetaLogistic,
                 priorweights,
             )),
-            GlmLikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::Logit,
-                priorweights,
-            )),
+            GlmLikelihoodFamily::BinomialMixture => {
+                Ok(calculate_deviance(y, mu, LinkFunction::Logit, priorweights))
+            }
         }
     }
 
@@ -2763,8 +2757,8 @@ fn solve_newton_directionwith_linear_constraints(
         let compressedworking = compress_activeworking_set(&x, constraints, &active)?;
         let mut residualw = Array1::<f64>::zeros(compressedworking.constraints.a.nrows());
         for r in 0..compressedworking.constraints.a.nrows() {
-            residualw[r] = compressedworking.constraints.b[r]
-                - compressedworking.constraints.a.row(r).dot(&x);
+            residualw[r] =
+                compressedworking.constraints.b[r] - compressedworking.constraints.a.row(r).dot(&x);
         }
         let (d, lambdaw) = solve_kkt_direction(
             hessian,
@@ -2864,8 +2858,7 @@ fn solve_newton_directionwith_linear_constraints(
         &lastworking_lambda_true,
         m,
     )?;
-    let kkt =
-        compute_constraint_kkt_diagnostics(&lastworking_x, &lastworkinggradient, constraints);
+    let kkt = compute_constraint_kkt_diagnostics(&lastworking_x, &lastworkinggradient, constraints);
     let grad_inf = lastworkinggradient
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -3860,8 +3853,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let x_original: DesignMatrix = x.into();
     let ebrows = eb.nrows();
     let erows = reparam_result.e_transformed.nrows();
-    let mut workspace =
-        PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
+    let mut workspace = PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
     let solver_decision = should_use_sparse_native_pirls(
         &mut workspace,
         &x_original,
@@ -5214,25 +5206,26 @@ pub fn calculate_deviance(
         | LinkFunction::CLogLog
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
-            let total_residual = ndarray::Zip::from(y).and(mu).and(priorweights).fold(
-                0.0,
-                |acc, &yi, &mui, &wi| {
-                    let mui_c = mui;
-                    // More numerically stable formulation: use difference of logs instead of log of ratio
-                    let term1 = if yi > EPS {
-                        yi * (yi.ln() - mui_c.ln())
-                    } else {
-                        0.0
-                    };
-                    // More numerically stable formulation: use difference of logs instead of log of ratio
-                    let term2 = if yi < 1.0 - EPS {
-                        (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
-                    } else {
-                        0.0
-                    };
-                    acc + wi * (term1 + term2)
-                },
-            );
+            let total_residual =
+                ndarray::Zip::from(y)
+                    .and(mu)
+                    .and(priorweights)
+                    .fold(0.0, |acc, &yi, &mui, &wi| {
+                        let mui_c = mui;
+                        // More numerically stable formulation: use difference of logs instead of log of ratio
+                        let term1 = if yi > EPS {
+                            yi * (yi.ln() - mui_c.ln())
+                        } else {
+                            0.0
+                        };
+                        // More numerically stable formulation: use difference of logs instead of log of ratio
+                        let term2 = if yi < 1.0 - EPS {
+                            (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
+                        } else {
+                            0.0
+                        };
+                        acc + wi * (term1 + term2)
+                    });
             2.0 * total_residual
         }
         LinkFunction::Identity => {
@@ -5584,7 +5577,9 @@ pub fn compute_final_penalized_hessian(
     const MAX_ROWS: usize = 2048;
     const TARGET_BYTES: usize = 2 * 1024 * 1024;
     let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
-    let chunk_rows = (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS).min(n);
+    let chunk_rows = (TARGET_BYTES / bytes_per_row)
+        .clamp(MIN_ROWS, MAX_ROWS)
+        .min(n);
     let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
     let mut xtwx_mat = array2_to_matmut(&mut xtwx);
     for start in (0..n).step_by(chunk_rows) {

@@ -629,13 +629,13 @@ impl FittedModel {
                 .survival_likelihood
                 .as_deref()
                 .unwrap_or("transformation")
-                .eq_ignore_ascii_case("probit-location-scale")
+                .eq_ignore_ascii_case("location-scale")
             && (self.survival_beta_time.is_none()
                 || self.survival_beta_threshold.is_none()
                 || self.survival_beta_log_sigma.is_none())
         {
             return Err(
-                "saved probit-location-scale survival model is missing block coefficients; refit with current CLI"
+                "saved location-scale survival model is missing block coefficients; refit with current CLI"
                     .to_string(),
             );
         }
