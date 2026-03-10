@@ -62,6 +62,10 @@ num-dual = "0.13.4"
 autodiff = "0.7.0"
 ad_trait = "0.2.2"
 
+[build-dependencies]
+walkdir = "2"
+grep = "0.3"
+
 [[bin]]
 name = "gam"
 path = "src/main.rs"
