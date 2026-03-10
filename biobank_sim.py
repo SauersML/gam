@@ -1041,8 +1041,12 @@ def prepare_dataset_views(rows: list[dict[str, Any]], train_rows: list[dict[str,
     ] + [f"pc{i}" for i in range(1, 17)] + [f"{c}_std" for c in feature_cols]
     survival_fields = [
         "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
-        "pgs", "time", "event", "entry_year", "geo_prevalence", "portability_distance",
+        "pgs", "time0", "time", "event", "entry_year", "geo_prevalence", "portability_distance",
     ] + [f"pc{i}" for i in range(1, 17)] + [f"{c}_std" for c in feature_cols]
+    for row in train_copy:
+        row["time0"] = 0.0
+    for row in test_copy:
+        row["time0"] = 0.0
     write_csv_rows(prep_dir / "disease_train.csv", train_copy, disease_fields)
     write_csv_rows(prep_dir / "disease_test.csv", test_copy, disease_fields)
     write_csv_rows(prep_dir / "survival_train.csv", train_copy, survival_fields)
@@ -1295,7 +1299,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         "--ridge-lambda", "1e-6",
         "--out", str(model_path),
         str(train_csv),
-        f"Surv(time, event) ~ {formula_rhs}",
+        f"Surv(time0, time, event) ~ {formula_rhs}",
     ]
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
