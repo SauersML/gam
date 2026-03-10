@@ -2779,6 +2779,27 @@ def _finalize_cv_result(
     return result
 
 
+def _validate_result_metadata(results: list[dict]) -> None:
+    for result in results:
+        if result.get("status") != "ok":
+            continue
+        spec = str(result.get("model_spec", ""))
+        evaluation = str(result.get("evaluation", "")).lower()
+        spec_lower = spec.lower()
+        if evaluation == "holdout":
+            ok = "holdout" in spec_lower
+        elif "cv" in evaluation:
+            ok = "cv" in spec_lower
+        else:
+            ok = False
+        if not ok:
+            raise SystemExit(
+                "model result metadata/spec mismatch for "
+                f"{result.get('contender')} / {result.get('scenario_name')}: "
+                f"evaluation={result.get('evaluation')} spec={spec}"
+            )
+
+
 def _rust_fit_mapping(scenario_name):
     geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
     papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
@@ -7604,25 +7625,8 @@ def main():
             msgs.append(_format_blocking_failure(r))
         raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
 
-    # Hard guard: benchmark outputs must declare their evaluation mode.
-    for r in results:
-        if r.get("status") != "ok":
-            continue
-        spec = str(r.get("model_spec", ""))
-        evaluation = str(r.get("evaluation", "")).lower()
-        spec_lower = spec.lower()
-        if evaluation == "holdout":
-            ok = "holdout" in spec_lower
-        elif "cv" in evaluation:
-            ok = "cv" in spec_lower
-        else:
-            ok = False
-        if not ok:
-            raise SystemExit(
-                "model result metadata/spec mismatch for "
-                f"{r.get('contender')} / {r.get('scenario_name')}: "
-                f"evaluation={r.get('evaluation')} spec={spec}"
-            )
+    # Hard guard: benchmark outputs must declare an evaluation mode consistent with model_spec.
+    _validate_result_metadata(results)
 
     payload = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),

@@ -78,6 +78,33 @@ class RunSuiteMappingTests(unittest.TestCase):
                 extra_metrics={"evaluation": "broken"},
             )
 
+    def test_validate_result_metadata_accepts_matching_cv_spec(self) -> None:
+        _RUN_SUITE._validate_result_metadata(
+            [
+                {
+                    "status": "ok",
+                    "contender": "rust_gam",
+                    "scenario_name": "lidar_semipar",
+                    "evaluation": "5-fold CV",
+                    "model_spec": "logratio ~ s(range, type=ps, knots=24) via release binary [5-fold CV]",
+                }
+            ]
+        )
+
+    def test_validate_result_metadata_rejects_missing_evaluation(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "model result metadata/spec mismatch for rust_gam / lidar_semipar"):
+            _RUN_SUITE._validate_result_metadata(
+                [
+                    {
+                        "status": "ok",
+                        "contender": "rust_gam",
+                        "scenario_name": "lidar_semipar",
+                        "evaluation": None,
+                        "model_spec": "logratio ~ s(range, type=ps, knots=24) via release binary [5-fold CV]",
+                    }
+                ]
+            )
+
     def test_r_gamlss_sigma_formula_rejects_constant_sigma(self) -> None:
         ds = {
             "rows": [{"y": 1.0}],
