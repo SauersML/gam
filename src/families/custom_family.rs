@@ -1584,7 +1584,7 @@ fn stable_logdet_with_ridge_policy(
         a[[i, i]] += ridge;
     }
 
-    match ridge_policy.determinant_mode {
+    match resolved_ridge_determinant_mode(ridge_policy, p) {
         RidgeDeterminantMode::Full => {
             let chol = a.clone().cholesky(Side::Lower).map_err(|_| {
                 "cholesky failed while computing full ridge-aware logdet".to_string()
@@ -1595,6 +1595,7 @@ fn stable_logdet_with_ridge_policy(
             let (probes, steps) = default_slq_parameters(p);
             stochastic_lanczos_logdet_spd(&a, probes, steps, 42)
         }
+        RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
         RidgeDeterminantMode::PositivePart => {
             // Positive-part determinant policy for numerically hostile exact
             // Newton systems.
@@ -1683,7 +1684,9 @@ fn logdet_trace_inverse_with_ridge_policy(
 
     match ridge_policy.determinant_mode {
         // For the full determinant surface, d log|H| = tr(H^{-1} dH).
-        RidgeDeterminantMode::Full | RidgeDeterminantMode::StochasticLanczos => inverse_spdwith_retry(
+        RidgeDeterminantMode::Auto
+        | RidgeDeterminantMode::Full
+        | RidgeDeterminantMode::StochasticLanczos => inverse_spdwith_retry(
             matrix_on_logdet_surface,
             effective_solverridge(ridge_floor),
             8,
@@ -1706,6 +1709,18 @@ fn logdet_trace_inverse_with_ridge_policy(
             .max(1e-14);
             pinv_positive_part_with_floor(matrix_on_logdet_surface, positive_floor)
         }
+    }
+}
+
+const AUTO_SLQ_LOGDET_MIN_DIM: usize = 1024;
+
+fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
+    match ridge_policy.determinant_mode {
+        RidgeDeterminantMode::Auto if dim >= AUTO_SLQ_LOGDET_MIN_DIM => {
+            RidgeDeterminantMode::StochasticLanczos
+        }
+        RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
+        mode => mode,
     }
 }
 
@@ -5969,7 +5984,7 @@ mod tests {
         let exact = stable_logdet_with_ridge_policy(
             &h,
             1e-8,
-            RidgePolicy::explicit_stabilization_full(),
+            RidgePolicy::explicit_stabilization_full_exact(),
         )
         .expect("exact logdet");
         let slq = stable_logdet_with_ridge_policy(
