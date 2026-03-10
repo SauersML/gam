@@ -436,6 +436,20 @@ impl WorkingModelSurvival {
         Some(min_uniform_time_coef)
     }
 
+    pub fn into_structural_time_latent_model(
+        self,
+    ) -> Result<StructuralTimeLatentSurvivalModel, EstimationError> {
+        let lower_bounds = self
+            .structural_time_coefficient_lower_bounds()
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "structural survival latent model requires structural time lower bounds"
+                        .to_string(),
+                )
+            })?;
+        StructuralTimeLatentSurvivalModel::new(self, lower_bounds)
+    }
+
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
         // Structural monotone time bases are enforced through coefficient-space
         // lower bounds. Emitting per-row derivative constraints here would
@@ -2187,12 +2201,10 @@ mod tests {
         base_model
             .set_structural_monotonicity(true, 2)
             .expect("enable structural monotonicity");
-        let lower_bounds = base_model
-            .structural_time_coefficient_lower_bounds()
-            .expect("structural lower bounds");
-
         let latent_beta = array![-0.1, 0.3, 0.7];
-        let wrapper = StructuralTimeLatentSurvivalModel::new(base_model.clone(), lower_bounds)
+        let wrapper = base_model
+            .clone()
+            .into_structural_time_latent_model()
             .expect("construct latent structural model");
         let beta_user = wrapper
             .latent_to_user_coefficients(&latent_beta)
@@ -2242,12 +2254,10 @@ mod tests {
 
     fn solve_inner_mode(model: &WorkingModelSurvival, beta_init: &Array1<f64>) -> Array1<f64> {
         if model.structurally_monotonic {
-            let lower_bounds = model
-                .structural_time_coefficient_lower_bounds()
-                .expect("structural inner mode lower bounds");
-            let mut latent_model =
-                StructuralTimeLatentSurvivalModel::new(model.clone(), lower_bounds)
-                    .expect("structural inner latent survival model");
+            let mut latent_model = model
+                .clone()
+                .into_structural_time_latent_model()
+                .expect("structural inner latent survival model");
             let latent_beta0 = latent_model
                 .user_to_latent_coefficients(beta_init)
                 .expect("map structural beta init to latent coordinates");

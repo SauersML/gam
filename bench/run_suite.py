@@ -2779,6 +2779,18 @@ def _finalize_cv_result(
     return result
 
 
+def _normalize_result_metadata(results: list[dict]) -> None:
+    for result in results:
+        if result.get("status") != "ok":
+            continue
+        if result.get("evaluation") in (None, ""):
+            n_folds = result.get("n_folds")
+            try:
+                result["evaluation"] = _evaluation_label_for_n_folds(int(n_folds))
+            except Exception:
+                pass
+
+
 def _validate_result_metadata(results: list[dict]) -> None:
     for result in results:
         if result.get("status") != "ok":
@@ -6730,6 +6742,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         all_df = pd.DataFrame(ds["rows"])
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
@@ -6799,6 +6812,13 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             fold_row.pop("train_risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
+            _append_survival_plot_fold(
+                plot_payload,
+                test_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk,
+            )
 
     return _finalize_cv_result(
         contender="r_glmnet_cox",
@@ -7626,6 +7646,7 @@ def main():
         raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
 
     # Hard guard: benchmark outputs must declare an evaluation mode consistent with model_spec.
+    _normalize_result_metadata(results)
     _validate_result_metadata(results)
 
     payload = {

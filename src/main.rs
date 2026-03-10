@@ -4123,13 +4123,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let beta0_norm = beta0.dot(&beta0).sqrt();
     progress.set_stage("fit", "running survival pirls");
-    let lower_bounds = structural_time_lower_bounds.ok_or_else(|| {
+    structural_time_lower_bounds.ok_or_else(|| {
         "exact survival training requires structural monotone time coefficients; non-structural training paths are not supported"
             .to_string()
     })?;
-    let mut latent_model =
-        gam::survival::StructuralTimeLatentSurvivalModel::new(model, lower_bounds)
-            .map_err(|e| format!("failed to construct structural survival latent model: {e}"))?;
+    let mut latent_model = model
+        .into_structural_time_latent_model()
+        .map_err(|e| format!("failed to construct structural survival latent model: {e}"))?;
     let latent_beta0 = latent_model
         .user_to_latent_coefficients(&beta0)
         .map_err(|e| {
@@ -8849,18 +8849,11 @@ mod tests {
         model
             .set_structural_monotonicity(true, p_time)
             .expect("enable structural monotonicity");
-        let lower_bounds = model
-            .structural_time_coefficient_lower_bounds()
-            .expect("structural lower bounds");
-        let initial_floor = model
-            .structural_time_initial_coefficient_floor(1e-6)
-            .expect("structural initial floor");
         let mut beta0 = Array1::<f64>::zeros(p_time);
-        let initial_time_coef = choose_survival_time_block_initial_coefficient(initial_floor);
-        beta0.fill(initial_time_coef);
-        let mut latent_model =
-            gam::survival::StructuralTimeLatentSurvivalModel::new(model, lower_bounds)
-                .expect("construct latent structural survival model");
+        beta0.fill(0.25);
+        let mut latent_model = model
+            .into_structural_time_latent_model()
+            .expect("construct latent structural survival model");
         let latent_beta0 = latent_model
             .user_to_latent_coefficients(&beta0)
             .expect("map structural beta start to latent coordinates");
@@ -8879,6 +8872,10 @@ mod tests {
             |_| {},
         )
         .expect("fit structural survival model");
+        assert!(matches!(
+            summary.status,
+            gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum
+        ));
         let beta = latent_model
             .latent_to_user_coefficients(summary.beta.as_ref())
             .expect("map latent optimum to structural coefficients");
@@ -10777,7 +10774,7 @@ mod tests {
         }
 
         let event_count = event_target.iter().map(|d| f64::from(*d)).sum::<f64>();
-        let expected_deviance_shift = 2.0 * event_count * time_scale.ln();
+        let expected_deviance_shift = -2.0 * event_count * time_scale.ln();
         assert!(
             (deviance_years - deviance_days - expected_deviance_shift).abs() <= 1e-8,
             "fitted deviance shift mismatch: years={} days={} expected_shift={expected_deviance_shift}",

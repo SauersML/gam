@@ -2021,16 +2021,12 @@ mod survival_hmc {
             }
 
             let (sampler_mode, whitening_hessian, latent_model) = if structurally_monotonic {
-                let lower_bounds = base_model
-                    .structural_time_coefficient_lower_bounds()
-                    .ok_or_else(|| {
-                        "structural survival HMC requires structural time lower bounds".to_string()
+                let latent_model = base_model
+                    .clone()
+                    .into_structural_time_latent_model()
+                    .map_err(|e| {
+                        format!("failed to construct structural survival latent HMC model: {e}")
                     })?;
-                let latent_model =
-                    StructuralTimeLatentSurvivalModel::new(base_model.clone(), lower_bounds)
-                        .map_err(|e| {
-                            format!("failed to construct structural survival latent HMC model: {e}")
-                        })?;
                 let latent_mode = latent_model
                     .user_to_latent_coefficients(&mode.to_owned())
                     .map_err(|e| {
