@@ -32,6 +32,52 @@ _REQUIRED_BENCHMARK_DATASETS = {
 
 
 class RunSuiteMappingTests(unittest.TestCase):
+    def test_finalize_cv_result_keeps_evaluation_from_fold_count(self) -> None:
+        result = _RUN_SUITE._finalize_cv_result(
+            contender="rust_gam",
+            scenario_name="wine_temp_vs_year",
+            family="gaussian",
+            cv_rows=[
+                {
+                    "fit_sec": 0.1,
+                    "predict_sec": 0.01,
+                    "logloss": 1.0,
+                    "mse": 0.25,
+                    "rmse": 0.5,
+                    "mae": 0.4,
+                    "r2": 0.2,
+                    "n_test": 10,
+                }
+                for _ in range(5)
+            ],
+            plot_payload=None,
+            model_spec="s_temp ~ s(year, type=ps, knots=7) via release binary [5-fold CV]",
+        )
+        self.assertEqual(result["evaluation"], "5-fold CV")
+
+    def test_finalize_cv_result_rejects_reserved_metric_keys(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "reserved result keys: evaluation"):
+            _RUN_SUITE._finalize_cv_result(
+                contender="rust_gam",
+                scenario_name="wine_temp_vs_year",
+                family="gaussian",
+                cv_rows=[
+                    {
+                        "fit_sec": 0.1,
+                        "predict_sec": 0.01,
+                        "logloss": 1.0,
+                        "mse": 0.25,
+                        "rmse": 0.5,
+                        "mae": 0.4,
+                        "r2": 0.2,
+                        "n_test": 10,
+                    }
+                ],
+                plot_payload=None,
+                model_spec="s_temp ~ s(year, type=ps, knots=7) via release binary [holdout]",
+                extra_metrics={"evaluation": "broken"},
+            )
+
     def test_r_gamlss_sigma_formula_rejects_constant_sigma(self) -> None:
         ds = {
             "rows": [{"y": 1.0}],

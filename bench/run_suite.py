@@ -564,6 +564,14 @@ def _evaluation_label(folds: list[Fold]) -> str:
     return f"{len(folds)}-fold CV"
 
 
+def _evaluation_label_for_n_folds(n_folds: int) -> str:
+    if n_folds <= 0:
+        raise RuntimeError(f"cross-validation result requires at least one fold, got {n_folds}")
+    if n_folds == 1:
+        return "holdout"
+    return f"{n_folds}-fold CV"
+
+
 def auc_score(y: np.ndarray, p: np.ndarray) -> float:
     y_bin = (np.asarray(y) > 0.5).astype(int)
     n_pos = int(np.sum(y_bin == 1))
@@ -2741,17 +2749,34 @@ def _finalize_cv_result(
     if extra_metrics:
         metrics.update(extra_metrics)
     n_folds = len(cv_rows)
-    return {
+    reserved_keys = {
+        "contender",
+        "family",
+        "scenario_name",
+        "status",
+        "n_folds",
+        "evaluation",
+        "model_spec",
+        "plot_payload",
+    }
+    conflicting_keys = sorted(reserved_keys.intersection(metrics))
+    if conflicting_keys:
+        raise RuntimeError(
+            "aggregate_cv_rows/extra_metrics attempted to overwrite reserved result keys: "
+            + ", ".join(conflicting_keys)
+        )
+    result = {
         "contender": contender,
         "family": family,
         "scenario_name": scenario_name,
         "status": "ok",
         "n_folds": int(n_folds),
-        "evaluation": _evaluation_label([None] * n_folds),
-        **metrics,
         "model_spec": model_spec,
         "plot_payload": _finalize_plot_payload(plot_payload) if plot_payload is not None else None,
     }
+    result.update(metrics)
+    result["evaluation"] = _evaluation_label_for_n_folds(n_folds)
+    return result
 
 
 def _rust_fit_mapping(scenario_name):
