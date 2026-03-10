@@ -1762,7 +1762,10 @@ impl Default for BSplineIdentifiability {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CenterStrategy {
     UserProvided(Array2<f64>),
+    /// Joint multidimensional equal-mass partitioning in the full smooth space.
     EqualMass { num_centers: usize },
+    /// Covariate-representative equal-mass partitioning along one selected axis.
+    EqualMassCovarRepresentative { num_centers: usize },
     FarthestPoint { num_centers: usize },
     KMeans { num_centers: usize, max_iter: usize },
     UniformGrid { points_per_dim: usize },
@@ -2111,6 +2114,63 @@ fn select_equal_mass_centers(
     Ok(centers)
 }
 
+fn select_equal_mass_covar_representative_centers(
+    data: ArrayView2<'_, f64>,
+    num_centers: usize,
+) -> Result<Array2<f64>, BasisError> {
+    validate_center_count(num_centers)?;
+    let n = data.nrows();
+    let d = data.ncols();
+    if num_centers > n {
+        return Err(BasisError::InvalidInput(format!(
+            "equal-mass covariate-representative center selection requested {num_centers} centers but data has {n} rows"
+        )));
+    }
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "equal-mass covariate-representative center selection requires at least one column"
+                .to_string(),
+        ));
+    }
+
+    let mut split_dim = 0usize;
+    let mut best_span = f64::NEG_INFINITY;
+    for j in 0..d {
+        let mut minv = f64::INFINITY;
+        let mut maxv = f64::NEG_INFINITY;
+        for i in 0..n {
+            let v = data[[i, j]];
+            if v < minv {
+                minv = v;
+            }
+            if v > maxv {
+                maxv = v;
+            }
+        }
+        let span = maxv - minv;
+        if span > best_span {
+            best_span = span;
+            split_dim = j;
+        }
+    }
+
+    let mut sorted: Vec<usize> = (0..n).collect();
+    sorted.sort_by(|&a, &b| {
+        let ord = data[[a, split_dim]].total_cmp(&data[[b, split_dim]]);
+        if ord.is_eq() { a.cmp(&b) } else { ord }
+    });
+
+    let mut centers = Array2::<f64>::zeros((num_centers, d));
+    for c in 0..num_centers {
+        let lo = (c * n) / num_centers;
+        let hi = ((c + 1) * n) / num_centers;
+        let chunk = &sorted[lo..hi.max(lo + 1)];
+        let mid = chunk[chunk.len() / 2];
+        centers.row_mut(c).assign(&data.row(mid));
+    }
+    Ok(centers)
+}
+
 fn select_kmeans_centers(
     data: ArrayView2<'_, f64>,
     num_centers: usize,
@@ -2239,6 +2299,9 @@ fn select_centers_by_strategy(
             Ok(centers.clone())
         }
         CenterStrategy::EqualMass { num_centers } => select_equal_mass_centers(data, *num_centers),
+        CenterStrategy::EqualMassCovarRepresentative { num_centers } => {
+            select_equal_mass_covar_representative_centers(data, *num_centers)
+        }
         CenterStrategy::FarthestPoint { num_centers } => {
             select_thin_plate_knots(data, *num_centers)
         }

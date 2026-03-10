@@ -1160,7 +1160,14 @@ def rust_joint_term(basis: str, lat_col: str, lon_col: str, centers: int) -> str
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     linear_terms = ["linear(pgs_std)", "linear(age_entry_std)", "linear(sex)"]
     if spec.smooth_kind == "joint":
-        linear_terms.append(rust_joint_term(spec.spatial_basis, "lat_final_std", "lon_final_std", int(spec.centers or 60)))
+        linear_terms.append(
+            rust_joint_term(
+                spec.spatial_basis,
+                "lat_final_std",
+                "lon_final_std",
+                int(spec.centers or 60),
+            )
+        )
     else:
         basis = spec.spatial_basis
         centers = int(spec.centers or 60)
@@ -1192,7 +1199,6 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
                     "s(lon_final_std, type=ps, knots=10)",
                 ]
             )
-    linear_terms.extend(f"linear(pc{i}_std)" for i in range(1, 17))
     mean_formula = "phenotype ~ " + " + ".join(linear_terms) + " + link(type=logit)"
     sigma_terms = ["linear(pgs_std)", "linear(age_entry_std)", "linear(lat_final_std)", "linear(lon_final_std)"]
     sigma_formula = "phenotype ~ " + " + ".join(sigma_terms)
@@ -1299,7 +1305,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         "--ridge-lambda", "1e-6",
         "--out", str(model_path),
         str(train_csv),
-        f"Surv(time0, time, event) ~ {formula_rhs}",
+        f"Surv(time, event) ~ {formula_rhs}",
     ]
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
