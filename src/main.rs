@@ -7188,6 +7188,33 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
     };
     let t = v.trim().to_ascii_lowercase();
     if let Some(inner) = t
+        .strip_prefix("flexible(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        if let Some(components_inner) = inner
+            .strip_prefix("blended(")
+            .and_then(|s| s.strip_suffix(')'))
+            .or_else(|| {
+                inner
+                    .strip_prefix("mixture(")
+                    .and_then(|s| s.strip_suffix(')'))
+            })
+        {
+            let components = parse_link_component_list(components_inner)?;
+            return Ok(Some(LinkChoice {
+                mode: LinkMode::Flexible,
+                link: LinkFunction::Logit,
+                mixture_components: Some(components),
+            }));
+        }
+        let link = parse_linkname(inner)?;
+        return Ok(Some(LinkChoice {
+            mode: LinkMode::Flexible,
+            link,
+            mixture_components: None,
+        }));
+    }
+    if let Some(inner) = t
         .strip_prefix("blended(")
         .and_then(|s| s.strip_suffix(')'))
         .or_else(|| t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')))
@@ -7203,17 +7230,6 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
             mode: LinkMode::Strict,
             link: LinkFunction::Logit,
             mixture_components: Some(components),
-        }));
-    }
-    if let Some(inner) = t
-        .strip_prefix("flexible(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let link = parse_linkname(inner)?;
-        return Ok(Some(LinkChoice {
-            mode: LinkMode::Flexible,
-            link,
-            mixture_components: None,
         }));
     }
 
@@ -9960,6 +9976,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_link_choice_accepts_flexible_blended_link() {
+        let choice = parse_link_choice(Some("flexible(blended(logit,probit))"), false)
+            .expect("parse flexible blended link");
+        let choice = choice.expect("expected link choice");
+        assert!(matches!(choice.mode, LinkMode::Flexible));
+        assert_eq!(
+            choice.mixture_components,
+            Some(vec![LinkComponent::Logit, LinkComponent::Probit])
+        );
+    }
+
+    #[test]
     fn parse_survival_inverse_link_accepts_sas_init() {
         let mut args = base_survival_args_for_link_tests();
         args.link = Some("sas".to_string());
@@ -10092,6 +10120,21 @@ mod tests {
         args.link = Some("flexible(logit)".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible survival link");
         assert!(matches!(link, InverseLink::Standard(LinkFunction::Logit)));
+    }
+
+    #[test]
+    fn parse_survival_inverse_link_accepts_flexible_blended_links() {
+        let mut args = base_survival_args_for_link_tests();
+        args.link = Some("flexible(blended(logit,probit))".to_string());
+        args.mixture_rho = Some("0.2".to_string());
+        let link = parse_survival_inverse_link(&args).expect("flexible blended survival link");
+        match link {
+            InverseLink::Mixture(state) => {
+                assert_eq!(state.components, vec![LinkComponent::Logit, LinkComponent::Probit]);
+                assert_eq!(state.rho.len(), 1);
+            }
+            other => panic!("expected blended survival inverse link, got {other:?}"),
+        }
     }
 
     #[test]
