@@ -2904,7 +2904,7 @@ impl<'a> JointRemlState<'a> {
             Some(self.core.state.ridge_used),
         );
         self.visualizer
-            .update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
+            .update(cost, grad_norm, "optimizing", eval_num as f64, "eval", None);
         if !self.eval.last_converged {
             self.visualizer.push_diagnostic(&format!(
                 "inner backfit not converged (iterations={})",
@@ -2985,7 +2985,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
     }
     // Library code must not own terminal UI lifecycle implicitly.
     // Keep visualization disabled unless an explicit caller-provided session is wired in.
-    let mut visualizer_session = visualizer::VisualizerSession::default();
+    let mut visualizer_session = visualizer::VisualizerSession::new(true);
     visualizer_session.set_stage("joint", "initializing");
     if config.firth_bias_reduction && matches!(link, LinkFunction::Logit) {
         visualizer_session.push_diagnostic("firth bias reduction enabled (separation protection)");

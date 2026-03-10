@@ -487,6 +487,7 @@ fn main() {
 }
 
 fn run() -> CliResult<()> {
+    gam::visualizer::init_logging();
     let cli = Cli::parse();
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),
@@ -515,6 +516,9 @@ fn compact_fit_result_for_batch(fit: &mut FitResult) {
 }
 
 fn run_fit(args: FitArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
+    progress.start_workflow("Fit", fit_total_steps);
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
     let formula_link = parsed.linkspec.clone();
@@ -563,7 +567,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         };
         return run_survival(surv_args);
     }
+    progress.set_stage("fit", "parsing csv and inferring schema");
+    progress.set_secondary_progress("Data Loading", 0, Some(3));
     let ds = load_dataset(&args.data)?;
+    progress.set_secondary_progress("Data Loading", 1, Some(3));
+    progress.advance_workflow(1);
 
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -733,6 +741,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
     if let Some(noise_formula_raw) = &args.predict_noise {
         return run_fitwith_predict_noise(
+            &mut progress,
             &args,
             &ds,
             &col_map,
@@ -750,7 +759,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         );
     }
 
+    progress.set_stage("fit", "building term specification");
     let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    progress.set_secondary_progress("Data Loading", 2, Some(3));
+    progress.finish_secondary_progress("dataset parsed and terms resolved");
+    progress.advance_workflow(2);
     let mut spatial_usagewarnings =
         collect_spatial_smooth_usagewarnings(&spec, &ds.headers, "model");
     spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
@@ -764,9 +777,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if has_bounded_terms && args.firth {
         return Err("--firth is not yet supported with bounded() coefficients".to_string());
     }
+    progress.set_stage("fit", "building design matrices");
+    progress.set_secondary_progress("Design Matrices", 0, Some(2));
     let initial_design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
+    progress.set_secondary_progress("Design Matrices", 1, Some(2));
     let initial_frozenspec = freeze_term_collectionspec(&spec, &initial_design)?;
+    progress.finish_secondary_progress("design matrices assembled");
+    progress.advance_workflow(3);
 
     let fit_max_iter = 80usize;
     let fit_tol = 1e-6f64;
@@ -804,6 +822,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 n_link_knots: config.n_link_knots,
                 degree: 3,
             };
+            progress.teardown();
             let joint = fit_joint_model_engine(
                 y.view(),
                 weights.view(),
@@ -883,6 +902,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
+        progress.set_stage("fit", "optimizing penalized likelihood");
         let ext = optimize_external_design(
             y.view(),
             weights.view(),
@@ -930,6 +950,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             linear_constraints: None,
             adaptive_regularization: adaptive_opts,
         };
+        progress.set_stage("fit", "optimizing penalized likelihood");
         let fitted = match fit_term_collectionwith_spatial_length_scale_optimization(
             ds.values.view(),
             y.clone(),
@@ -982,12 +1003,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             fitted.adaptive_diagnostics,
         )
     };
+    progress.advance_workflow(4);
 
     compact_fit_result_for_batch(&mut fit);
 
     let frozenspec = freeze_term_collectionspec(&resolvedspec, &design)?;
 
     if let Some(out) = args.out {
+        progress.set_stage("fit", "writing fitted model");
         let mut payload = FittedModelPayload::new(
             MODEL_VERSION,
             formula_text,
@@ -1018,14 +1041,17 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.resolved_termspec = Some(frozenspec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
         write_payload_json(&out, payload)?;
+        progress.advance_workflow(5);
     }
 
     emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    progress.finish_progress("fit complete");
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_fitwith_predict_noise(
+    progress: &mut gam::visualizer::VisualizerSession,
     args: &FitArgs,
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
@@ -1041,6 +1067,7 @@ fn run_fitwith_predict_noise(
     noise_formula_raw: &str,
     formula_text: &str,
 ) -> Result<(), String> {
+    let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
     let noise_formula = normalizenoise_formula(noise_formula_raw, &parsed.response);
     let parsed_noise = parse_formula(&noise_formula)?;
     if parsed_noise.linkwiggle.is_some() {
@@ -1049,8 +1076,13 @@ fn run_fitwith_predict_noise(
                 .to_string(),
         );
     }
+    progress.set_stage("fit", "building mean/noise term specifications");
+    progress.set_secondary_progress("Mean/Noise Terms", 0, Some(2));
     let noisespec = build_termspec(&parsed_noise.terms, ds, col_map, inference_notes)?;
     let meanspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    progress.set_secondary_progress("Mean/Noise Terms", 2, Some(2));
+    progress.finish_secondary_progress("mean and noise terms resolved");
+    progress.advance_workflow(2);
     let mut spatial_usagewarnings =
         collect_spatial_smooth_usagewarnings(&meanspec, &ds.headers, "mean model");
     spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
@@ -1080,6 +1112,7 @@ fn run_fitwith_predict_noise(
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
         let options = blockwise_options_from_fit_args(args)?;
+        progress.set_stage("fit", "optimizing gaussian location-scale model");
         let solved = fit_gaussian_location_scale_terms(
             ds.values.view(),
             GaussianLocationScaleTermSpec {
@@ -1095,16 +1128,19 @@ fn run_fitwith_predict_noise(
             emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
             format!("fit_gaussian_location_scale_terms failed: {e}")
         })?;
+        progress.advance_workflow(3);
         let fit = solved.fit;
         let frozen_meanspec =
             freeze_term_collectionspec(&solved.meanspec_resolved, &solved.mean_design)?;
         let frozen_noisespec =
             freeze_term_collectionspec(&solved.noisespec_resolved, &solved.noise_design)?;
+        progress.advance_workflow(4);
         println!(
             "model fit complete | family={} | outer_iter={} | converged={}",
             FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
         );
         if let Some(out) = args.out.as_ref() {
+            progress.set_stage("fit", "writing gaussian location-scale model");
             let beta_mean = fit
                 .block_states
                 .first()
@@ -1154,8 +1190,10 @@ fn run_fitwith_predict_noise(
                 Some(response_scale),
             );
             write_model_json(out, &model)?;
+            progress.advance_workflow(fit_total_steps);
         }
         emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+        progress.finish_progress("gaussian location-scale fit complete");
         return Ok(());
     }
 
@@ -1197,6 +1235,7 @@ fn run_fitwith_predict_noise(
     };
 
     let options = blockwise_options_from_fit_args(args)?;
+    progress.set_stage("fit", "optimizing binomial location-scale model");
     let solved = fit_binomial_location_scale_termsworkflow(
         ds.values.view(),
         BinomialLocationScaleTermSpec {
@@ -1221,6 +1260,7 @@ fn run_fitwith_predict_noise(
         emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
         e
     })?;
+    progress.advance_workflow(3);
     if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
         let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit)?;
         let domain = summarizewiggle_domain(final_q0.view(), knots.view(), degree)?;
@@ -1244,11 +1284,13 @@ fn run_fitwith_predict_noise(
         freeze_term_collectionspec(&solved.fit.meanspec_resolved, &solved.fit.mean_design)?;
     let frozen_noisespec =
         freeze_term_collectionspec(&solved.fit.noisespec_resolved, &solved.fit.noise_design)?;
+    progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",
         FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
     );
     if let Some(out) = args.out.as_ref() {
+        progress.set_stage("fit", "writing binomial location-scale model");
         let beta_threshold = fit
             .block_states
             .first()
@@ -1320,12 +1362,16 @@ fn run_fitwith_predict_noise(
             model.betawiggle = Some(betawiggle);
         }
         write_model_json(out, &model)?;
+        progress.advance_workflow(fit_total_steps);
     }
     emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    progress.finish_progress("binomial location-scale fit complete");
     Ok(())
 }
 
 fn run_predict(args: PredictArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_stage("predict", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     let saved_mixture = model.saved_mixture_state()?;
     let saved_sas = model
@@ -1340,7 +1386,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         parse_optional_covariance(model.sas_param_covariance.as_ref(), "sas_param_covariance")?;
 
     let schema = model.require_data_schema()?;
+    progress.set_stage("predict", "loading new data");
+    progress.set_progress("Prediction", 0, Some(3));
     let ds = load_datasetwith_schema(&args.new_data, schema)?;
+    progress.set_progress("Prediction", 1, Some(3));
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -1348,8 +1397,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let training_headers = model.training_headers.as_ref();
-    match model.predict_model_class() {
+    progress.set_stage("predict", "building prediction matrices");
+    progress.set_progress("Prediction", 2, Some(3));
+    let result = match model.predict_model_class() {
         PredictModelClass::Survival => run_predict_survival(
+            &mut progress,
             &args,
             &model,
             ds.values.view(),
@@ -1362,6 +1414,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_sas_param_cov.as_ref(),
         ),
         PredictModelClass::GaussianLocationScale => run_predict_gaussian_location_scale(
+            &mut progress,
             &args,
             &model,
             ds.values.view(),
@@ -1369,6 +1422,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             training_headers,
         ),
         PredictModelClass::BinomialLocationScale => run_predict_binomial_location_scale(
+            &mut progress,
             &args,
             &model,
             ds.values.view(),
@@ -1381,6 +1435,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_sas_param_cov.as_ref(),
         ),
         PredictModelClass::Standard => run_predict_standard_or_flexible(
+            &mut progress,
             &args,
             &model,
             ds.values.view(),
@@ -1392,10 +1447,16 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_mixture_param_cov.as_ref(),
             saved_sas_param_cov.as_ref(),
         ),
+    };
+    if result.is_ok() {
+        progress.set_progress("Prediction", 3, Some(3));
+        progress.finish_progress("prediction complete");
     }
+    result
 }
 
 fn run_predict_survival(
+    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -1407,6 +1468,7 @@ fn run_predict_survival(
     _: Option<&Array2<f64>>,
     _: Option<&Array2<f64>>,
 ) -> Result<(), String> {
+    progress.set_stage("predict", "building survival prediction design");
     let entryname = model
         .survival_entry
         .as_ref()
@@ -1598,6 +1660,7 @@ fn run_predict_survival(
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             let (mean_lo, mean_hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+            progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
                 pred.eta.view(),
@@ -1607,6 +1670,7 @@ fn run_predict_survival(
                 Some(mean_hi.view()),
             )?;
         } else {
+            progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
                 pred.eta.view(),
@@ -1707,6 +1771,7 @@ fn run_predict_survival(
         mean_lo = Some(lo);
         mean_hi = Some(hi);
     }
+    progress.set_stage("predict", "writing survival predictions");
     write_survival_prediction_csv(
         &args.out,
         eta.view(),
@@ -1724,12 +1789,14 @@ fn run_predict_survival(
 }
 
 fn run_predict_gaussian_location_scale(
+    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<(), String> {
+    progress.set_stage("predict", "building gaussian location-scale prediction design");
     let specmu = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -1792,6 +1859,7 @@ fn run_predict_gaussian_location_scale(
     }
     // Gaussian location-scale predictions must always expose sigma as a
     // distribution parameter (not as generic estimator uncertainty).
+    progress.set_stage("predict", "writing gaussian location-scale predictions");
     write_gaussian_location_scale_prediction_csv(
         &args.out,
         etamu.view(),
@@ -1809,6 +1877,7 @@ fn run_predict_gaussian_location_scale(
 }
 
 fn run_predict_binomial_location_scale(
+    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -1820,6 +1889,7 @@ fn run_predict_binomial_location_scale(
     saved_mixture_param_cov: Option<&Array2<f64>>,
     saved_sas_param_cov: Option<&Array2<f64>>,
 ) -> Result<(), String> {
+    progress.set_stage("predict", "building binomial location-scale prediction design");
     let spec_t = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -2077,6 +2147,7 @@ fn run_predict_binomial_location_scale(
         mean_hi = Some(hi);
         se = Some(se_base.clone());
     }
+    progress.set_stage("predict", "writing binomial location-scale predictions");
     write_prediction_csv(
         &args.out,
         eta.view(),
@@ -2094,6 +2165,7 @@ fn run_predict_binomial_location_scale(
 }
 
 fn run_predict_standard_or_flexible(
+    progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -2105,6 +2177,7 @@ fn run_predict_standard_or_flexible(
     saved_mixture_param_cov: Option<&Array2<f64>>,
     saved_sas_param_cov: Option<&Array2<f64>>,
 ) -> Result<(), String> {
+    progress.set_stage("predict", "building prediction design");
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -2201,6 +2274,7 @@ fn run_predict_standard_or_flexible(
                 );
             }
         }
+        progress.set_stage("predict", "writing joint predictions");
         write_prediction_csv(
             &args.out,
             pred.eta.view(),
@@ -2315,6 +2389,7 @@ fn run_predict_standard_or_flexible(
         eta_se = se_opt.clone();
     }
 
+    progress.set_stage("predict", "writing predictions");
     write_prediction_csv(
         &args.out,
         eta.view(),
@@ -2333,14 +2408,19 @@ fn run_predict_standard_or_flexible(
 }
 
 fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
     if !args.alo {
         return Err("only --alo is currently implemented for diagnose".to_string());
     }
 
+    progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     let parsed = parse_formula(&model.formula)?;
     let schema = model.require_data_schema()?;
+    progress.set_progress("Diagnose", 0, Some(4));
+    progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_schema(&args.data, schema)?;
+    progress.set_progress("Diagnose", 1, Some(4));
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -2365,14 +2445,17 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
+    progress.set_stage("diagnose", "building diagnostic design");
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
+    progress.set_progress("Diagnose", 2, Some(4));
 
     let family = model.likelihood();
     let link = family_to_link(family);
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());
 
+    progress.set_stage("diagnose", "refitting model for alo");
     let fit = fit_gam(
         design.design.view(),
         y.view(),
@@ -2395,6 +2478,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     )
     .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
 
+    progress.set_progress("Diagnose", 3, Some(4));
     let alo = compute_alo_diagnostics_from_fit(&fit, y.view(), link)
         .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))?;
 
@@ -2419,6 +2503,8 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
 
     println!("ALO diagnostics (top leverage rows):");
     println!("{table}");
+    progress.set_progress("Diagnose", 4, Some(4));
+    progress.finish_progress("diagnostics complete");
     Ok(())
 }
 
@@ -3403,7 +3489,10 @@ fn saved_probitwiggle_derivative_q0(
 }
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_stage("fit", "loading survival data");
     let ds = load_dataset(&args.data)?;
+    progress.set_progress("Survival Fit", 1, Some(4));
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -3514,6 +3603,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         SurvivalLikelihoodMode::Weibull => SurvivalTimeBasisConfig::Linear,
     };
     let mut inference_notes = Vec::new();
+    progress.set_stage("fit", "building survival design matrices");
     let termspec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
@@ -3545,6 +3635,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
+    progress.set_progress("Survival Fit", 2, Some(4));
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
     }
@@ -3783,6 +3874,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         }
         let mut wiggle_knots: Option<Array1<f64>> = None;
+        progress.set_stage("fit", "running survival location-scale optimization");
         let fit = if learn_linkwiggle {
             let wiggle_cfg = effective_linkwiggle
                 .clone()
@@ -3824,7 +3916,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "survival location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
             fit.converged, fit.iterations, fit.log_likelihood, fit.penalizedobjective
         );
+        progress.set_progress("Survival Fit", 3, Some(4));
         if let Some(out) = args.out {
+            progress.set_stage("fit", "writing survival model");
             let mut lambdas = fit.lambdas_time.to_vec();
             lambdas.extend(fit.lambdas_threshold.iter().copied());
             lambdas.extend(fit.lambdas_log_sigma.iter().copied());
@@ -3917,6 +4011,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.resolved_termspec = Some(frozen_termspec);
             write_payload_json(&out, payload)?;
         }
+        progress.set_progress("Survival Fit", 4, Some(4));
+        progress.finish_progress("survival fit complete");
         return Ok(());
     }
 
@@ -3977,9 +4073,27 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
 
     let mut beta0 = Array1::<f64>::zeros(p);
-    beta0[0] = -3.0;
-    beta0[1] = 1.0;
-    let linear_constraints = None;
+    let linear_constraints = model.monotonicity_linear_constraints();
+    if let Some(constraints) = linear_constraints.as_ref() {
+        let mut min_uniform_time_coef = 0.0_f64;
+        for i in 0..constraints.a.nrows() {
+            let row = constraints.a.row(i);
+            let row_sum = row
+                .slice(s![0..p_time])
+                .iter()
+                .copied()
+                .fold(0.0_f64, |acc, v| acc + v);
+            if row_sum > 1e-12 {
+                min_uniform_time_coef =
+                    min_uniform_time_coef.max((constraints.b[i] / row_sum).max(0.0));
+            }
+        }
+        if min_uniform_time_coef > 0.0 {
+            beta0
+                .slice_mut(s![0..p_time])
+                .fill(min_uniform_time_coef * 1.05);
+        }
+    }
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -3989,6 +4103,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         coefficient_lower_bounds: None,
         linear_constraints,
     };
+    progress.set_stage("fit", "running survival pirls");
     let summary = gam::pirls::runworking_model_pirls(
         &mut model,
         gam::types::Coefficients::new(beta0),
@@ -4037,7 +4152,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         survival_baseline_targetname(baseline_cfg.target)
     );
 
+    progress.set_progress("Survival Fit", 3, Some(4));
     if let Some(out) = args.out {
+        progress.set_stage("fit", "writing survival model");
         let hessian = state.hessian.to_dense();
         let cov = match invert_symmetric_matrix(&hessian) {
             Ok(c) => Some(c),
@@ -4093,13 +4210,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.resolved_termspec = Some(frozen_termspec);
         write_payload_json(&out, payload)?;
     }
+    progress.set_progress("Survival Fit", 4, Some(4));
+    progress.finish_progress("survival fit complete");
     Ok(())
 }
 
 fn run_sample(args: SampleArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_stage("sample", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     let schema = model.require_data_schema()?;
+    progress.set_stage("sample", "loading sampling data");
+    progress.set_progress("Sampling", 0, Some(4));
     let ds = load_datasetwith_schema(&args.data, schema)?;
+    progress.set_progress("Sampling", 1, Some(4));
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -4115,9 +4239,19 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         ..NutsConfig::default()
     };
 
+    progress.set_stage("sample", "running posterior sampling");
+    progress.set_progress("Sampling", 2, Some(4));
+    progress.teardown();
     let nuts = match model.predict_model_class() {
         PredictModelClass::Survival => {
-            run_sample_survival(&model, ds.values.view(), &col_map, training_headers, &cfg)?
+            run_sample_survival(
+                &mut progress,
+                &model,
+                ds.values.view(),
+                &col_map,
+                training_headers,
+                &cfg,
+            )?
         }
         PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
             return Err(
@@ -4126,6 +4260,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             )
         }
         PredictModelClass::Standard => run_sample_standard(
+            &mut progress,
             &model,
             ds.values.view(),
             &col_map,
@@ -4138,7 +4273,12 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     let out = args
         .out
         .unwrap_or_else(|| PathBuf::from("posterior_samples.csv"));
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_progress("Sampling", 3, Some(4));
+    progress.set_stage("sample", "writing posterior draws");
     write_matrix_csv(&out, &nuts.samples, "beta")?;
+    progress.set_progress("Sampling", 4, Some(4));
+    progress.finish_progress("sampling complete");
     println!(
         "wrote posterior samples: {} (rows={}, cols={})",
         out.display(),
@@ -4149,12 +4289,14 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 }
 
 fn run_sample_survival(
+    progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
 ) -> Result<gam::hmc::NutsResult, String> {
+    progress.set_stage("sample", "building survival sampling design");
     let saved_likelihood_mode = parse_survival_likelihood_mode(
         model
             .survival_likelihood
@@ -4338,6 +4480,7 @@ fn run_sample_survival(
 }
 
 fn run_sample_standard(
+    progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
@@ -4345,6 +4488,7 @@ fn run_sample_standard(
     family: LikelihoodFamily,
     cfg: &NutsConfig,
 ) -> Result<gam::hmc::NutsResult, String> {
+    progress.set_stage("sample", "building sampling design");
     let parsed = parse_formula(&model.formula)?;
     let y_col = *col_map
         .get(&parsed.response)
@@ -4360,6 +4504,7 @@ fn run_sample_standard(
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
     let weights = Array1::ones(data.nrows());
     let offset = Array1::zeros(data.nrows());
+    progress.set_stage("sample", "refitting mode for hmc");
     let fit = fit_gam(
         design.design.view(),
         y.view(),
@@ -4405,6 +4550,8 @@ fn run_sample_standard(
 }
 
 fn run_generate(args: GenerateArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_stage("generate", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
 
     if matches!(model.model_kind, ModelKind::Survival) {
@@ -4415,7 +4562,10 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     }
 
     let schema = model.require_data_schema()?;
+    progress.set_stage("generate", "loading conditioning data");
+    progress.set_progress("Generation", 0, Some(4));
     let ds = load_datasetwith_schema(&args.data, schema)?;
+    progress.set_progress("Generation", 1, Some(4));
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -4423,21 +4573,31 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let training_headers = model.training_headers.as_ref();
+    progress.set_stage("generate", "building predictive state");
+    progress.set_progress("Generation", 2, Some(4));
     let spec = match model.predict_model_class() {
         PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
+            &mut progress,
             &model,
             ds.values.view(),
             &col_map,
             training_headers,
         )?,
         PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
+            &mut progress,
             &model,
             ds.values.view(),
             &col_map,
             training_headers,
         )?,
         PredictModelClass::Standard => {
-            run_generate_standard_or_flexible(&model, ds.values.view(), &col_map, training_headers)?
+            run_generate_standard_or_flexible(
+                &mut progress,
+                &model,
+                ds.values.view(),
+                &col_map,
+                training_headers,
+            )?
         }
         PredictModelClass::Survival => {
             return Err(
@@ -4448,11 +4608,16 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     };
 
     let mut rng = StdRng::seed_from_u64(42);
+    progress.set_stage("generate", "sampling synthetic observations");
+    progress.set_progress("Generation", 3, Some(4));
     let draws = sampleobservation_replicates(&spec, args.n_draws, &mut rng)
         .map_err(|e| format!("failed to sample synthetic observations: {e}"))?;
 
     let out = args.out.unwrap_or_else(|| PathBuf::from("synthetic.csv"));
+    progress.set_stage("generate", "writing synthetic draws");
     write_matrix_csv(&out, &draws, "draw")?;
+    progress.set_progress("Generation", 4, Some(4));
+    progress.finish_progress("generation complete");
     println!(
         "wrote synthetic draws: {} (draws={}, rows_per_draw={})",
         out.display(),
@@ -4463,11 +4628,13 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
 }
 
 fn run_generate_gaussian_location_scale(
+    progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
+    progress.set_stage("generate", "building gaussian location-scale generation design");
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -4522,11 +4689,13 @@ fn run_generate_gaussian_location_scale(
 }
 
 fn run_generate_binomial_location_scale(
+    progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
+    progress.set_stage("generate", "building binomial location-scale generation design");
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -4597,11 +4766,13 @@ fn run_generate_binomial_location_scale(
 }
 
 fn run_generate_standard_or_flexible(
+    progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
+    progress.set_stage("generate", "building generation design");
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -4657,6 +4828,8 @@ fn run_generate_standard_or_flexible(
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_stage("report", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
 
@@ -4721,8 +4894,11 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut continuousrows = String::new();
 
     if let Some(data_path) = args.data.as_ref() {
+        progress.set_progress("Report", 0, Some(4));
+        progress.set_stage("report", "loading report dataset");
         let schema = model.require_data_schema()?;
         let ds = load_datasetwith_schema(data_path, schema)?;
+        progress.set_progress("Report", 1, Some(4));
         let col_map: HashMap<String, usize> = ds
             .headers
             .iter()
@@ -4742,8 +4918,10 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     &col_map,
                     "resolved_termspec",
                 )?;
+                progress.set_stage("report", "building report diagnostics design");
                 let design = build_term_collection_design(ds.values.view(), &spec)
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
+                progress.set_progress("Report", 2, Some(4));
 
                 let family = model.likelihood();
                 let offset = Array1::<f64>::zeros(ds.values.nrows());
@@ -4906,6 +5084,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         }
     } else {
         diag_notes.push("No data provided: residual QQ, calibration, and ALO sections are omitted. Pass training/new data as second positional argument.".to_string());
+        progress.set_progress("Report", 3, Some(4));
     }
 
     let smooth_divs = if let Some(spec) = model.resolved_termspec.as_ref() {
@@ -4994,8 +5173,12 @@ th {{ background: #f6f8fa; }}
         scripts = plot_scripts.join("\n"),
     );
 
+    progress.set_progress("Report", 3, Some(4));
+    progress.set_stage("report", "writing html report");
     fs::write(&out, html)
         .map_err(|e| format!("failed to write report '{}': {e}", out.display()))?;
+    progress.set_progress("Report", 4, Some(4));
+    progress.finish_progress("report complete");
     println!("wrote report: {}", out.display());
     Ok(())
 }
