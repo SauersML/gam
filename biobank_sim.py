@@ -61,24 +61,6 @@ def survival_generation_params(cfg: dict[str, Any]) -> tuple[float, float]:
     return shape, scale
 
 
-def survival_anchor_from_prep(prep_dir: Path, cfg: dict[str, Any]) -> tuple[float, float]:
-    prep_meta_path = prep_dir / "prep_metadata.json"
-    if prep_meta_path.exists():
-        prep_meta = json.loads(prep_meta_path.read_text(encoding="utf-8"))
-        trait_meta = prep_meta.get("trait_meta")
-        if isinstance(trait_meta, dict):
-            shape = trait_meta.get("survival_weibull_shape")
-            scale = trait_meta.get("survival_weibull_scale")
-            if shape is not None and scale is not None:
-                return survival_generation_params(
-                    {
-                        "survival_weibull_shape": shape,
-                        "survival_weibull_scale": scale,
-                    }
-                )
-    return survival_generation_params(cfg)
-
-
 def dump_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
@@ -1331,8 +1313,6 @@ def run_rust_survival(
     train_csv: Path,
     test_csv: Path,
     out_dir: Path,
-    prep_dir: Path,
-    cfg: dict[str, Any],
 ) -> dict[str, Any]:
     rust_bin = load_or_build_rust_binary()
     formula_rhs = rust_formula_survival(spec)
@@ -1348,15 +1328,6 @@ def run_rust_survival(
         "--time-smooth-lambda", "0.01",
         "--ridge-lambda", "1e-6",
     ]
-    if spec.backend == "rust_survival_transform":
-        shape, scale = survival_anchor_from_prep(prep_dir, cfg)
-        fit_cmd.extend(
-            [
-                "--baseline-target", "weibull",
-                "--baseline-scale", f"{scale}",
-                "--baseline-shape", f"{shape}",
-            ]
-        )
     fit_cmd.extend(
         [
             "--out", str(model_path),
@@ -1492,7 +1463,7 @@ cat(toJSON(list(fit_sec=fit_sec, predict_sec=pred_sec), auto_unbox=TRUE))
     }
 
 
-def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any]:
     disease_train = prep_dir / "disease_train.csv"
     disease_test = prep_dir / "disease_test.csv"
     survival_train = prep_dir / "survival_train.csv"
@@ -1506,7 +1477,7 @@ def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path, cfg: dict[str, A
             raise RuntimeError(f"unsupported disease backend '{spec.backend}'")
     elif spec.dataset == "survival":
         if spec.backend in {"rust_survival", "rust_survival_transform", "rust_gamlss_survival"}:
-            result = run_rust_survival(spec, survival_train, survival_test, out_dir, prep_dir, cfg)
+            result = run_rust_survival(spec, survival_train, survival_test, out_dir)
         elif spec.backend == "r_mgcv_survival":
             result = run_r_mgcv_survival(spec, survival_train, survival_test, out_dir)
         else:
@@ -1530,7 +1501,7 @@ def do_run_method(args: argparse.Namespace) -> int:
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        result = run_method(spec, args.prep_dir.resolve(), out_dir, cfg)
+        result = run_method(spec, args.prep_dir.resolve(), out_dir)
         payload = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "status": "ok",

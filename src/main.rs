@@ -1371,8 +1371,10 @@ fn run_fitwith_predict_noise(
 
 fn run_predict(args: PredictArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.start_workflow("Predict", 5);
     progress.set_stage("predict", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
+    progress.advance_workflow(1);
     let saved_mixture = model.saved_mixture_state()?;
     let saved_sas = model
         .saved_sas_state()?
@@ -1387,9 +1389,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
 
     let schema = model.require_data_schema()?;
     progress.set_stage("predict", "loading new data");
-    progress.set_progress("Prediction", 0, Some(3));
     let ds = load_datasetwith_schema(&args.new_data, schema)?;
-    progress.set_progress("Prediction", 1, Some(3));
+    progress.advance_workflow(2);
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -1398,7 +1399,6 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("predict", "building prediction matrices");
-    progress.set_progress("Prediction", 2, Some(3));
     let result = match model.predict_model_class() {
         PredictModelClass::Survival => run_predict_survival(
             &mut progress,
@@ -1449,7 +1449,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         ),
     };
     if result.is_ok() {
-        progress.set_progress("Prediction", 3, Some(3));
+        progress.advance_workflow(5);
         progress.finish_progress("prediction complete");
     }
     result
@@ -1491,6 +1491,7 @@ fn run_predict_survival(
     )?;
     let cov_design = build_term_collection_design(data, &termspec)
         .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
+    progress.advance_workflow(3);
     let n = data.nrows();
     let p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
@@ -1660,6 +1661,7 @@ fn run_predict_survival(
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             let (mean_lo, mean_hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+            progress.advance_workflow(4);
             progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
@@ -1670,6 +1672,7 @@ fn run_predict_survival(
                 Some(mean_hi.view()),
             )?;
         } else {
+            progress.advance_workflow(4);
             progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
@@ -1771,6 +1774,7 @@ fn run_predict_survival(
         mean_lo = Some(lo);
         mean_hi = Some(hi);
     }
+    progress.advance_workflow(4);
     progress.set_stage("predict", "writing survival predictions");
     write_survival_prediction_csv(
         &args.out,
@@ -1822,6 +1826,7 @@ fn run_predict_gaussian_location_scale(
     )?;
     let design_noise = build_term_collection_design(data, &spec_noise)
         .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
+    progress.advance_workflow(3);
     let beta_noise = Array1::from_vec(
         model
             .beta_noise
@@ -1859,6 +1864,7 @@ fn run_predict_gaussian_location_scale(
     }
     // Gaussian location-scale predictions must always expose sigma as a
     // distribution parameter (not as generic estimator uncertainty).
+    progress.advance_workflow(4);
     progress.set_stage("predict", "writing gaussian location-scale predictions");
     write_gaussian_location_scale_prediction_csv(
         &args.out,
@@ -1915,6 +1921,7 @@ fn run_predict_binomial_location_scale(
     )?;
     let design_noise = build_term_collection_design(data, &spec_noise)
         .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
+    progress.advance_workflow(3);
     let beta_noise = Array1::from_vec(
         model
             .beta_noise
@@ -2147,6 +2154,7 @@ fn run_predict_binomial_location_scale(
         mean_hi = Some(hi);
         se = Some(se_base.clone());
     }
+    progress.advance_workflow(4);
     progress.set_stage("predict", "writing binomial location-scale predictions");
     write_prediction_csv(
         &args.out,
@@ -2186,6 +2194,7 @@ fn run_predict_standard_or_flexible(
     )?;
     let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
+    progress.advance_workflow(3);
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let beta = fit_saved.beta.clone();
@@ -2274,6 +2283,7 @@ fn run_predict_standard_or_flexible(
                 );
             }
         }
+        progress.advance_workflow(4);
         progress.set_stage("predict", "writing joint predictions");
         write_prediction_csv(
             &args.out,
@@ -2389,6 +2399,7 @@ fn run_predict_standard_or_flexible(
         eta_se = se_opt.clone();
     }
 
+    progress.advance_workflow(4);
     progress.set_stage("predict", "writing predictions");
     write_prediction_csv(
         &args.out,
@@ -2409,18 +2420,19 @@ fn run_predict_standard_or_flexible(
 
 fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.start_workflow("Diagnose", 5);
     if !args.alo {
         return Err("only --alo is currently implemented for diagnose".to_string());
     }
 
     progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
+    progress.advance_workflow(1);
     let parsed = parse_formula(&model.formula)?;
     let schema = model.require_data_schema()?;
-    progress.set_progress("Diagnose", 0, Some(4));
     progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_schema(&args.data, schema)?;
-    progress.set_progress("Diagnose", 1, Some(4));
+    progress.advance_workflow(2);
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -2448,7 +2460,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     progress.set_stage("diagnose", "building diagnostic design");
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
-    progress.set_progress("Diagnose", 2, Some(4));
+    progress.advance_workflow(3);
 
     let family = model.likelihood();
     let link = family_to_link(family);
@@ -2478,7 +2490,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     )
     .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
 
-    progress.set_progress("Diagnose", 3, Some(4));
+    progress.advance_workflow(4);
     let alo = compute_alo_diagnostics_from_fit(&fit, y.view(), link)
         .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))?;
 
@@ -2503,7 +2515,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
 
     println!("ALO diagnostics (top leverage rows):");
     println!("{table}");
-    progress.set_progress("Diagnose", 4, Some(4));
+    progress.advance_workflow(5);
     progress.finish_progress("diagnostics complete");
     Ok(())
 }
@@ -3490,9 +3502,11 @@ fn saved_probitwiggle_derivative_q0(
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
+    let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
+    progress.start_workflow("Survival Fit", survival_total_steps);
     progress.set_stage("fit", "loading survival data");
     let ds = load_dataset(&args.data)?;
-    progress.set_progress("Survival Fit", 1, Some(4));
+    progress.advance_workflow(1);
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -3635,7 +3649,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
-    progress.set_progress("Survival Fit", 2, Some(4));
+    progress.advance_workflow(2);
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
     }
@@ -3916,7 +3930,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "survival location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
             fit.converged, fit.iterations, fit.log_likelihood, fit.penalizedobjective
         );
-        progress.set_progress("Survival Fit", 3, Some(4));
+        progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival model");
             let mut lambdas = fit.lambdas_time.to_vec();
@@ -4010,8 +4024,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.training_headers = Some(ds.headers.clone());
             payload.resolved_termspec = Some(frozen_termspec);
             write_payload_json(&out, payload)?;
+            progress.advance_workflow(survival_total_steps);
         }
-        progress.set_progress("Survival Fit", 4, Some(4));
         progress.finish_progress("survival fit complete");
         return Ok(());
     }
@@ -4152,7 +4166,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         survival_baseline_targetname(baseline_cfg.target)
     );
 
-    progress.set_progress("Survival Fit", 3, Some(4));
+    progress.advance_workflow(3);
     if let Some(out) = args.out {
         progress.set_stage("fit", "writing survival model");
         let hessian = state.hessian.to_dense();
@@ -4209,8 +4223,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.training_headers = Some(ds.headers.clone());
         payload.resolved_termspec = Some(frozen_termspec);
         write_payload_json(&out, payload)?;
+        progress.advance_workflow(survival_total_steps);
     }
-    progress.set_progress("Survival Fit", 4, Some(4));
     progress.finish_progress("survival fit complete");
     Ok(())
 }
@@ -4551,8 +4565,10 @@ fn run_sample_standard(
 
 fn run_generate(args: GenerateArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.start_workflow("Generate", 5);
     progress.set_stage("generate", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
+    progress.advance_workflow(1);
 
     if matches!(model.model_kind, ModelKind::Survival) {
         return Err(
@@ -4563,9 +4579,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
 
     let schema = model.require_data_schema()?;
     progress.set_stage("generate", "loading conditioning data");
-    progress.set_progress("Generation", 0, Some(4));
     let ds = load_datasetwith_schema(&args.data, schema)?;
-    progress.set_progress("Generation", 1, Some(4));
+    progress.advance_workflow(2);
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -4574,7 +4589,6 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("generate", "building predictive state");
-    progress.set_progress("Generation", 2, Some(4));
     let spec = match model.predict_model_class() {
         PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
             &mut progress,
@@ -4606,17 +4620,18 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             )
         }
     };
+    progress.advance_workflow(3);
 
     let mut rng = StdRng::seed_from_u64(42);
     progress.set_stage("generate", "sampling synthetic observations");
-    progress.set_progress("Generation", 3, Some(4));
     let draws = sampleobservation_replicates(&spec, args.n_draws, &mut rng)
         .map_err(|e| format!("failed to sample synthetic observations: {e}"))?;
+    progress.advance_workflow(4);
 
     let out = args.out.unwrap_or_else(|| PathBuf::from("synthetic.csv"));
     progress.set_stage("generate", "writing synthetic draws");
     write_matrix_csv(&out, &draws, "draw")?;
-    progress.set_progress("Generation", 4, Some(4));
+    progress.advance_workflow(5);
     progress.finish_progress("generation complete");
     println!(
         "wrote synthetic draws: {} (draws={}, rows_per_draw={})",
@@ -4829,9 +4844,12 @@ fn run_generate_standard_or_flexible(
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
+    let report_total_steps = if args.data.is_some() { 5 } else { 3 };
+    progress.start_workflow("Report", report_total_steps);
     progress.set_stage("report", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    progress.advance_workflow(1);
 
     let out = args.out.unwrap_or_else(|| {
         let stem = args
@@ -4894,11 +4912,10 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut continuousrows = String::new();
 
     if let Some(data_path) = args.data.as_ref() {
-        progress.set_progress("Report", 0, Some(4));
         progress.set_stage("report", "loading report dataset");
         let schema = model.require_data_schema()?;
         let ds = load_datasetwith_schema(data_path, schema)?;
-        progress.set_progress("Report", 1, Some(4));
+        progress.advance_workflow(2);
         let col_map: HashMap<String, usize> = ds
             .headers
             .iter()
@@ -4921,7 +4938,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 progress.set_stage("report", "building report diagnostics design");
                 let design = build_term_collection_design(ds.values.view(), &spec)
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
-                progress.set_progress("Report", 2, Some(4));
+                progress.advance_workflow(3);
 
                 let family = model.likelihood();
                 let offset = Array1::<f64>::zeros(ds.values.nrows());
@@ -5084,7 +5101,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         }
     } else {
         diag_notes.push("No data provided: residual QQ, calibration, and ALO sections are omitted. Pass training/new data as second positional argument.".to_string());
-        progress.set_progress("Report", 3, Some(4));
+        progress.advance_workflow(2);
     }
 
     let smooth_divs = if let Some(spec) = model.resolved_termspec.as_ref() {
@@ -5173,11 +5190,11 @@ th {{ background: #f6f8fa; }}
         scripts = plot_scripts.join("\n"),
     );
 
-    progress.set_progress("Report", 3, Some(4));
+    progress.advance_workflow(report_total_steps.saturating_sub(1));
     progress.set_stage("report", "writing html report");
     fs::write(&out, html)
         .map_err(|e| format!("failed to write report '{}': {e}", out.display()))?;
-    progress.set_progress("Report", 4, Some(4));
+    progress.advance_workflow(report_total_steps);
     progress.finish_progress("report complete");
     println!("wrote report: {}", out.display());
     Ok(())
