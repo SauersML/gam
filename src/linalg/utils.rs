@@ -227,6 +227,76 @@ pub(crate) fn boundary_hit_step_fraction(
     None
 }
 
+pub(crate) fn solve_spd_pcg<F>(
+    apply: F,
+    rhs: &Array1<f64>,
+    preconditioner_diag: &Array1<f64>,
+    rel_tol: f64,
+    max_iter: usize,
+) -> Option<Array1<f64>>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    let p = rhs.len();
+    if p == 0 || preconditioner_diag.len() != p {
+        return None;
+    }
+    let rhs_norm = rhs.dot(rhs).sqrt();
+    if !rhs_norm.is_finite() {
+        return None;
+    }
+    if rhs_norm == 0.0 {
+        return Some(Array1::<f64>::zeros(p));
+    }
+
+    let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
+    let mut x = Array1::<f64>::zeros(p);
+    let mut r = rhs.clone();
+    let mut z = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
+    }
+    let mut p_dir = z.clone();
+    let mut rz_old = r.dot(&z);
+    if !rz_old.is_finite() || rz_old <= 0.0 {
+        return None;
+    }
+
+    for _ in 0..max_iter.max(1) {
+        let ap = apply(&p_dir);
+        let denom = p_dir.dot(&ap);
+        if !denom.is_finite() || denom <= 0.0 {
+            return None;
+        }
+        let alpha = rz_old / denom;
+        if !alpha.is_finite() {
+            return None;
+        }
+        x.scaled_add(alpha, &p_dir);
+        r.scaled_add(-alpha, &ap);
+        let r_norm = r.dot(&r).sqrt();
+        if r_norm.is_finite() && r_norm <= tol {
+            return x.iter().all(|v| v.is_finite()).then_some(x);
+        }
+        for i in 0..p {
+            z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
+        }
+        let rz_new = r.dot(&z);
+        if !rz_new.is_finite() || rz_new <= 0.0 {
+            return None;
+        }
+        let beta = rz_new / rz_old;
+        if !beta.is_finite() {
+            return None;
+        }
+        for i in 0..p {
+            p_dir[i] = z[i] + beta * p_dir[i];
+        }
+        rz_old = rz_new;
+    }
+    None
+}
+
 #[derive(Clone)]
 pub(crate) struct RidgePlanner {
     cond_estimate: Option<f64>,
@@ -322,7 +392,8 @@ impl RidgePlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::boundary_hit_step_fraction;
+    use super::{boundary_hit_step_fraction, solve_spd_pcg};
+    use ndarray::{Array1, array};
 
     #[test]
     fn boundary_hit_step_fraction_ignores_near_tangential_direction() {
@@ -340,5 +411,15 @@ mod tests {
     fn boundary_hit_step_fraction_rejects_non_finite_candidate() {
         let step = boundary_hit_step_fraction(1.0, f64::NEG_INFINITY, 1.0);
         assert_eq!(step, None);
+    }
+
+    #[test]
+    fn solve_spd_pcg_matches_reference_solution() {
+        let h = array![[4.0, 1.0], [1.0, 3.0]];
+        let b = array![1.0, 2.0];
+        let m = Array1::from_vec(vec![4.0, 3.0]);
+        let x = solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-10, 20).expect("pcg solve");
+        assert!((x[0] - 0.0909090909).abs() < 1e-8);
+        assert!((x[1] - 0.6363636363).abs() < 1e-8);
     }
 }
