@@ -18,7 +18,7 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
-    EstimationError, ExternalOptimOptions, FitOptions, FitResult,
+    EstimationError, ExternalOptimOptions, FitOptions, FitResult, FittedLinkParameters,
     compute_external_joint_hyper_cost_gradient_hessian, fit_gam_with_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
@@ -4166,6 +4166,28 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
         inv_lap_weight: w.inv_lap_weight,
     })
     .collect::<Vec<_>>();
+    let fitted_link_parameters = match family {
+        LikelihoodFamily::BinomialMixture => mixture_link_state
+            .clone()
+            .map(|state| FittedLinkParameters::Mixture {
+                state,
+                covariance: None,
+            })
+            .unwrap_or(FittedLinkParameters::Standard),
+        LikelihoodFamily::BinomialSas => sas_link_state
+            .map(|state| FittedLinkParameters::Sas {
+                state,
+                covariance: None,
+            })
+            .unwrap_or(FittedLinkParameters::Standard),
+        LikelihoodFamily::BinomialBetaLogistic => sas_link_state
+            .map(|state| FittedLinkParameters::BetaLogistic {
+                state,
+                covariance: None,
+            })
+            .unwrap_or(FittedLinkParameters::Standard),
+        _ => FittedLinkParameters::Standard,
+    };
     let fitted = FittedTermCollection {
         fit: FitResult {
             beta,
@@ -4208,7 +4230,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
             beta_covariance_corrected: None,
             beta_standard_errors_corrected: None,
             reml_score: final_fit.penalized_objective,
-            fitted_link_parameters: crate::estimate::FittedLinkParameters::Standard,
+            fitted_link_parameters,
         },
         design: baseline.design,
         adaptive_diagnostics: Some(AdaptiveRegularizationDiagnostics {
@@ -9995,6 +10017,85 @@ mod tests {
         assert_eq!(diag.maps.len(), 1);
         assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.reml_score.is_finite());
+    }
+
+    #[test]
+    fn exact_spatial_adaptive_binomial_sas_fit_preserves_link_state() {
+        let n = 36usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x0 = -1.0 + 2.0 * (i as f64 / (n as f64 - 1.0));
+            let x1 = (0.23 * i as f64).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            let eta = 0.55 * x0 - 0.2 * x1 + 0.1 * x0 * x1;
+            let p = 1.0 / (1.0 + (-eta).exp());
+            let u = ((i * 37 + 13) % 100) as f64 / 100.0;
+            y[i] = if u < p { 1.0 } else { 0.0 };
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
+                        length_scale: 0.7,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit = fit_term_collection_for_spec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodFamily::BinomialSas,
+            &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: Some(crate::types::SasLinkSpec {
+                    initial_epsilon: 0.1,
+                    initial_log_delta: -0.2,
+                }),
+                optimize_sas: false,
+                max_iter: 15,
+                tol: 1e-5,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                adaptive_regularization: Some(AdaptiveRegularizationOptions {
+                    enabled: true,
+                    max_mm_iter: 4,
+                    beta_rel_tol: 1e-4,
+                    max_epsilon_outer_iter: 2,
+                    epsilon_log_step: std::f64::consts::LN_2,
+                    min_epsilon: 1e-6,
+                    weight_floor: 1e-8,
+                    weight_ceiling: 1e8,
+                }),
+            },
+        )
+        .expect("exact adaptive SAS fit should succeed");
+
+        match fit.fit.fitted_link_parameters {
+            FittedLinkParameters::Sas { state, covariance } => {
+                assert!(state.epsilon.is_finite());
+                assert!(state.log_delta.is_finite());
+                assert!(state.delta.is_finite() && state.delta > 0.0);
+                assert!(covariance.is_none());
+            }
+            other => panic!("expected SAS link parameters, got {other:?}"),
+        }
     }
 
     #[test]

@@ -271,7 +271,6 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
     let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
     u *= &sqrt_w_col;
     let k = fit.penalized_hessian_transformed.clone();
-    let xtwx = u.t().dot(&u);
     let k_view = FaerArrayView::new(&k);
     let factor = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).unwrap();
     let mut naive_se = Array1::<f64>::zeros(n);
@@ -280,8 +279,7 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
         let rhs = FaerColView::new(&ui);
         let s = factor.solve(rhs.as_ref());
         let s_arr = Array1::from_shape_fn(p, |j| s[(j, 0)]);
-        let t = xtwx.dot(&s_arr);
-        let quad: f64 = s_arr.iter().zip(t.iter()).map(|(a, b)| a * b).sum();
+        let quad: f64 = ui.iter().zip(s_arr.iter()).map(|(a, b)| a * b).sum();
         let wi = fit.final_weights[i].max(1e-12);
         naive_se[i] = (quad / wi).max(0.0).sqrt();
     }
