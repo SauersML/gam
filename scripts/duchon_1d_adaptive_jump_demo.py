@@ -118,7 +118,6 @@ def fit_and_predict(
             formula,
             "--adaptive-regularization",
             label,
-            "--no-summary",
             "--out",
             model_path,
         ]
@@ -153,7 +152,6 @@ def fit_and_predict_rust_pspline(
             "fit",
             train_csv,
             formula,
-            "--no-summary",
             "--out",
             model_path,
         ]
@@ -187,7 +185,6 @@ def fit_and_predict_rust_tps(
             "fit",
             train_csv,
             formula,
-            "--no-summary",
             "--out",
             model_path,
         ]
@@ -221,7 +218,6 @@ def fit_and_predict_rust_matern(
             "fit",
             train_csv,
             formula,
-            "--no-summary",
             "--out",
             model_path,
         ]

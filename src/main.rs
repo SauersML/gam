@@ -257,9 +257,6 @@ struct FitArgs {
     adaptive_regularization: bool,
     #[arg(long = "out")]
     out: Option<PathBuf>,
-    /// Suppress fit summaries and informational fit-complete lines.
-    #[arg(long = "no-summary", default_value_t = false)]
-    no_summary: bool,
 }
 
 #[derive(Args, Debug)]
@@ -734,9 +731,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         "model",
     ));
     emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
-    if !args.no_summary {
-        print_inference_summary(&inference_notes);
-    }
+    print_inference_summary(&inference_notes);
     let has_bounded_terms = termspec_has_bounded_terms(&spec);
     if has_bounded_terms && args.firth {
         return Err("--firth is not yet supported with bounded() coefficients".to_string());
@@ -789,22 +784,20 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 format!("flexible-link fit failed: {e}")
             })?;
 
-            if !args.no_summary {
-                println!(
-                    "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
-                    family_to_string(family),
-                    linkname(choice.link),
-                    joint.converged,
-                    joint.backfit_iterations,
-                    joint.edf
-                );
-                println!(
-                    "flexible-link geometry | knots={} | degree={} | ridge={:.3e}",
-                    joint.knot_vector.len(),
-                    joint.degree,
-                    joint.ridge_used
-                );
-            }
+            println!(
+                "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
+                family_to_string(family),
+                linkname(choice.link),
+                joint.converged,
+                joint.backfit_iterations,
+                joint.edf
+            );
+            println!(
+                "flexible-link geometry | knots={} | degree={} | ridge={:.3e}",
+                joint.knot_vector.len(),
+                joint.degree,
+                joint.ridge_used
+            );
 
             if let Some(out) = args.out {
                 let fit_result = core_saved_fit_result(
@@ -868,6 +861,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 optimize_mixture: true,
                 sas_link: None,
                 optimize_sas: false,
+                compute_inference: false,
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -895,6 +889,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     effective_link,
                     LinkFunction::Sas | LinkFunction::BetaLogistic
                 ),
+            compute_inference: false,
             max_iter: fit_max_iter,
             tol: fit_tol,
             nullspace_dims: vec![],
@@ -954,22 +949,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         )
     };
 
-    if args.no_summary {
-        compact_fit_result_for_batch(&mut fit);
-    }
+    compact_fit_result_for_batch(&mut fit);
 
     let frozenspec = freeze_term_collectionspec(&resolvedspec, &design)?;
-
-    if !args.no_summary {
-        print_fit_summary(
-            &design,
-            &resolvedspec,
-            &fit,
-            family,
-            y.view(),
-            weights.view(),
-        );
-    }
 
     if let Some(out) = args.out {
         let mut payload = FittedModelPayload::new(
@@ -1053,9 +1035,7 @@ fn run_fitwith_predict_noise(
         "noise model",
     ));
     emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
-    if !args.no_summary {
-        print_inference_summary(inference_notes);
-    }
+    print_inference_summary(inference_notes);
     if family == LikelihoodFamily::GaussianIdentity {
         if formula_linkwiggle.is_some() {
             return Err(
@@ -1086,12 +1066,10 @@ fn run_fitwith_predict_noise(
             freeze_term_collectionspec(&solved.meanspec_resolved, &solved.mean_design)?;
         let frozen_noisespec =
             freeze_term_collectionspec(&solved.noisespec_resolved, &solved.noise_design)?;
-        if !args.no_summary {
-            println!(
-                "model fit complete | family={} | outer_iter={} | converged={}",
-                FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
-            );
-        }
+        println!(
+            "model fit complete | family={} | outer_iter={} | converged={}",
+            FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
+        );
         if let Some(out) = args.out.as_ref() {
             let beta_mean = fit
                 .block_states
@@ -1235,12 +1213,10 @@ fn run_fitwith_predict_noise(
         freeze_term_collectionspec(&solved.fit.meanspec_resolved, &solved.fit.mean_design)?;
     let frozen_noisespec =
         freeze_term_collectionspec(&solved.fit.noisespec_resolved, &solved.fit.noise_design)?;
-    if !args.no_summary {
-        println!(
-            "model fit complete | family={} | outer_iter={} | converged={}",
-            FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
-        );
-    }
+    println!(
+        "model fit complete | family={} | outer_iter={} | converged={}",
+        FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
+    );
     if let Some(out) = args.out.as_ref() {
         let beta_threshold = fit
             .block_states
@@ -2379,6 +2355,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
@@ -4365,6 +4342,7 @@ fn run_sample_standard(
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
@@ -7958,18 +7936,6 @@ fn build_model_summary(
         parametric_terms,
         smooth_terms,
     }
-}
-
-fn print_fit_summary(
-    design: &gam::smooth::TermCollectionDesign,
-    spec: &TermCollectionSpec,
-    fit: &gam::estimate::FitResult,
-    family: LikelihoodFamily,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) {
-    let summary = build_model_summary(design, spec, fit, family, y, weights);
-    println!("{summary}");
 }
 
 fn array2_to_nestedvec(a: &Array2<f64>) -> Vec<Vec<f64>> {

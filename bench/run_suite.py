@@ -3660,7 +3660,6 @@ def run_rust_scenario_cv(
 
             if rust_fit_extra_args:
                 fit_cmd.extend([str(x) for x in rust_fit_extra_args])
-            fit_cmd.extend(["--no-summary"])
             fit_cmd.extend([str(train_path), formula])
 
             t0 = perf_counter()
@@ -4084,7 +4083,6 @@ def _run_rust_gamlss_scenario_cv_variant(
                 "--out",
                 str(model_path),
             ]
-            fit_cmd.extend(["--no-summary"])
             fit_cmd.extend([str(train_path), mean_formula])
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
@@ -4320,7 +4318,6 @@ def run_rust_gamlss_survival_cv(
                 str(model_path),
             ]
             fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
-            fit_cmd.extend(["--no-summary"])
             fit_cmd.extend([str(train_path), fit_formula])
 
             t0 = perf_counter()

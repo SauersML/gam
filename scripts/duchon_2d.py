@@ -279,7 +279,6 @@ def fit_rust_surface(
             formula,
             "--adaptive-regularization",
             "true" if cfg.adaptive_regularization else "false",
-            "--no-summary",
             "--out",
             model_path,
         ]
