@@ -637,24 +637,6 @@ def _repeat_survival_curve(surv: np.ndarray, n_rows: int) -> np.ndarray:
     return np.repeat(curve, n_rows, axis=0)
 
 
-def _sksurv_survival_matrix(pred_survival_fns, grid: np.ndarray) -> np.ndarray:
-    rows = []
-    for fn in pred_survival_fns:
-        vals = np.asarray(fn(grid), dtype=float).reshape(-1)
-        rows.append(vals)
-    surv = np.asarray(rows, dtype=float)
-    surv[:, 0] = 1.0
-    surv = np.clip(surv, 1e-12, 1.0)
-    return np.minimum.accumulate(surv, axis=1)
-
-
-def _lifelines_survival_matrix(surv_df: pd.DataFrame) -> np.ndarray:
-    surv = surv_df.to_numpy(dtype=float).T
-    surv[:, 0] = 1.0
-    surv = np.clip(surv, 1e-12, 1.0)
-    return np.minimum.accumulate(surv, axis=1)
-
-
 def _survival_matrix_from_risk_calibration(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -1935,69 +1917,6 @@ def _synthetic_papuan_oce_dataset(n=6000, seed=20260315, n_pcs=16):
         "features": [f"pc{i}" for i in range(1, int(n_pcs) + 1)],
         "target": "y",
     }
-
-
-def _pairwise_dist(x):
-    s = np.sum(x * x, axis=1, keepdims=True)
-    d2 = s + s.T - 2.0 * (x @ x.T)
-    np.maximum(d2, 0.0, out=d2)
-    return np.sqrt(d2)
-
-
-def _path_length(path, d):
-    if len(path) <= 1:
-        return 0.0
-    return float(np.sum(d[path[:-1], path[1:]]))
-
-
-def _nearest_neighbor_path(d, start):
-    n = d.shape[0]
-    unused = set(range(n))
-    unused.remove(start)
-    path = [start]
-    while unused:
-        cur = path[-1]
-        nxt = min(unused, key=lambda j: d[cur, j])
-        path.append(nxt)
-        unused.remove(nxt)
-    return np.array(path, dtype=int)
-
-
-def _two_opt_open(path, d, max_passes=20):
-    n = len(path)
-    if n < 4:
-        return path.copy()
-    p = path.copy()
-    for _ in range(max_passes):
-        improved = False
-        for i in range(n - 3):
-            a, b = p[i], p[i + 1]
-            for j in range(i + 2, n - 1):
-                c, e = p[j], p[j + 1]
-                before = d[a, b] + d[c, e]
-                after = d[a, c] + d[b, e]
-                if after + 1e-12 < before:
-                    p[i + 1 : j + 1] = p[i + 1 : j + 1][::-1]
-                    improved = True
-        if not improved:
-            break
-    return p
-
-
-def _best_1d_order(d):
-    n = d.shape[0]
-    best = None
-    best_len = np.inf
-    for start in range(n):
-        p0 = _nearest_neighbor_path(d, start)
-        p1 = _two_opt_open(p0, d)
-        path_len = _path_length(p1, d)
-        if path_len < best_len:
-            best_len = path_len
-            best = p1
-    if best is None:
-        raise RuntimeError("failed to derive subpopulation 1D ordering")
-    return best
 
 
 def _geo_subpop16_scenario_cfg(name):
@@ -3727,8 +3646,11 @@ def run_rust_scenario_cv(
                 ds,
                 cfg_override=rust_cfg_override,
             )
-            if ds["family"] == "binomial" and binomial_link:
-                formula = _append_formula_link_term(formula, binomial_link)
+            formula = (
+                _append_formula_link_term(formula, binomial_link)
+                if ds["family"] == "binomial" and binomial_link
+                else formula
+            )
             fit_cmd = [
                 str(rust_bin),
                 "fit",
@@ -3802,6 +3724,7 @@ def run_rust_scenario_cv(
                 y_test = test_df[ds["target"]].to_numpy(dtype=float)
                 y_train = train_df[ds["target"]].to_numpy(dtype=float)
                 _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+                fitted_formula = formula
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -3811,11 +3734,7 @@ def run_rust_scenario_cv(
                         "logloss": log_loss_score(y_test, pred),
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train))),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": (
-                            f"gam fit/predict via release binary {eval_suffix}"
-                            if not binomial_link
-                            else f"gam fit/predict via release binary (link={binomial_link}) {eval_suffix}"
-                        ),
+                        "model_spec": f"{fitted_formula} via release binary {eval_suffix}",
                     }
                 )
                 if eval_ood and smooth_cols:
@@ -3892,6 +3811,7 @@ def run_rust_scenario_cv(
                             f"got {sigma_hat!r}"
                         ),
                     }
+                fitted_formula = formula
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -3902,7 +3822,7 @@ def run_rust_scenario_cv(
                         "mae": mae_score(y_test, pred),
                         "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": f"gam fit/predict via release binary {eval_suffix}",
+                        "model_spec": f"{fitted_formula} via release binary {eval_suffix}",
                     }
                 )
             else:
@@ -4094,8 +4014,6 @@ def _run_rust_gamlss_scenario_cv_variant(
     *,
     contender_name: str,
     binomial_cli_family: str,
-    binomial_model_spec_label: str,
-    binomial_extra_fit_args: list[str] | None = None,
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
@@ -4124,10 +4042,8 @@ def _run_rust_gamlss_scenario_cv_variant(
         }
 
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
-    cli_family = binomial_cli_family if family == "binomial" else "gaussian"
     if family == "binomial":
-        mean_formula = _append_formula_link_term(mean_formula, cli_family)
-    binom_extra = list(binomial_extra_fit_args or [])
+        mean_formula = _append_formula_link_term(mean_formula, binomial_cli_family)
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
     plot_payload = _init_plot_payload(ds)
@@ -4153,9 +4069,9 @@ def _run_rust_gamlss_scenario_cv_variant(
                 test_path = td_path / f"test_{fold_id}.csv"
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
-            sigma_rhs = _sigma_feature_rhs(ds, scenario_name, n_train=len(fold.train_idx))
-            noise_formula = f"{ds['target']} ~ " + (
-                " + ".join(f"linear({c})" for c in sigma_rhs.split(" + ")) if sigma_rhs != "1" else "1"
+            noise_formula = (
+                f"{ds['target']} ~ "
+                + " + ".join(_sigma_feature_terms(ds, scenario_name=scenario_name, backend="rust"))
             )
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
@@ -4168,8 +4084,6 @@ def _run_rust_gamlss_scenario_cv_variant(
                 "--out",
                 str(model_path),
             ]
-            if family == "binomial" and binom_extra:
-                fit_cmd.extend(binom_extra)
             fit_cmd.extend(["--no-summary"])
             fit_cmd.extend([str(train_path), mean_formula])
             t0 = perf_counter()
@@ -4241,7 +4155,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                         "logloss": log_loss_score(y_test, pred),
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train))),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": f"{binomial_model_spec_label} {eval_suffix}",
+                        "model_spec": f"mu: {mean_formula}; sigma: {noise_formula} via release binary {eval_suffix}",
                     }
                 )
             else:
@@ -4296,7 +4210,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                         "mae": mae_score(y_test, pred),
                         "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": f"gamlss gaussian location-scale via release binary {eval_suffix}",
+                        "model_spec": f"mu: {mean_formula}; sigma: {noise_formula} via release binary {eval_suffix}",
                     }
                 )
 
@@ -4330,7 +4244,6 @@ def run_rust_gamlss_scenario_cv(
         scenario,
         contender_name="rust_gamlss",
         binomial_cli_family="binomial-probit",
-        binomial_model_spec_label="gamlss binomial-probit location-scale mean-probability via release binary",
         ds=ds,
         folds=folds,
         shared_fold_artifacts=shared_fold_artifacts,
@@ -4490,9 +4403,9 @@ def run_rust_gamlss_survival_cv(
                     "logloss": surv_metrics["logloss"],
                     "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
                     "n_test": int(len(fold.test_idx)),
-                        "model_spec": (
-                            "survival probit-location-scale via release binary "
-                            f"(c-index on risk score from '{score_src}'; native survival curve scoring) {_evaluation_suffix(folds)}"
+                    "model_spec": (
+                        f"{fit_formula} [survival-likelihood=probit-location-scale; "
+                        f"risk_score={score_src}; native survival curve scoring] {_evaluation_suffix(folds)}"
                     ),
                 }
             )
@@ -4632,7 +4545,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
             "dataset": ds,
             "scenario_name": scenario_name,
             "mu_formula": mu_formula,
-            "sigma_formula": _sigma_feature_formula(ds, scenario_name),
+            "sigma_formula": _sigma_feature_formula(ds, scenario_name=scenario_name, backend="r_gamlss"),
         }
         data_path.write_text(json.dumps(payload))
 
@@ -5183,7 +5096,7 @@ def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list
             "dataset": ds,
             "scenario_name": scenario["name"],
             "mu_formula": mu_formula,
-            "sigma_rhs": _sigma_feature_rhs(ds),
+            "sigma_formula": _sigma_feature_formula(ds, scenario_name=scenario["name"], backend="mgcv"),
             "use_select": use_select,
         }
         data_path.write_text(json.dumps(payload))
@@ -5204,7 +5117,7 @@ payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
 mu_formula <- as.character(payload$mu_formula)
-sigma_rhs <- as.character(payload$sigma_rhs)
+sigma_formula <- as.character(payload$sigma_formula)
 use_select <- TRUE
 if (!is.null(payload$use_select)) {
   use_select <- isTRUE(payload$use_select)
@@ -5237,7 +5150,7 @@ mu_rhs <- trimws(rhs_parts[[2]])
 t0 <- proc.time()[["elapsed"]]
 fit <- tryCatch(
   gam(
-    list(as.formula(mu_formula), as.formula(paste("~", sigma_rhs))),
+    list(as.formula(mu_formula), as.formula(sigma_formula)),
     family=gaulss(),
     data=train_df,
     method="REML",
@@ -5305,7 +5218,7 @@ out <- list(
   rmse=rmse,
   mae=mae,
   r2=r2,
-  model_spec=paste0("gam(list(", target_name, " ~ ", mu_rhs, ", ~ ", sigma_rhs, "), family=gaulss())")
+  model_spec=paste0("gam(list(", target_name, " ~ ", mu_rhs, ", ", sigma_formula, "), family=gaulss())")
 )
 write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 '''
@@ -5409,8 +5322,7 @@ def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
         mu_terms = ["1"]
     mu_formula = f"{ds['target']} ~ " + " + ".join(mu_terms)
 
-    sigma_terms = [f"bols({c}, intercept=FALSE)" for c in ds["features"]]
-    sigma_formula = "~ " + (" + ".join(sigma_terms) if sigma_terms else "1")
+    sigma_formula = _sigma_feature_formula(ds, scenario_name=scenario_name, backend="gamboostlss")
     return mu_formula, sigma_formula
 
 
@@ -5666,7 +5578,17 @@ def _bamlss_formulas_for_scenario(scenario_name: str, ds):
     mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None, None
-    sigma_formula = _sigma_feature_formula(ds)
+    sigma_formula = _sigma_feature_formula(ds, scenario_name=scenario_name, backend="bamlss")
+    return mu_formula, sigma_formula
+
+
+def _brms_formulas_for_scenario(scenario_name: str, ds):
+    if ds["family"] != "gaussian":
+        return None, None
+    mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
+    if not mu_formula:
+        return None, None
+    sigma_formula = _sigma_feature_formula(ds, scenario_name=scenario_name, backend="brms")
     return mu_formula, sigma_formula
 
 
@@ -5902,7 +5824,7 @@ def run_external_r_brms_cv(scenario, *, ds: dict | None = None, folds: list[Fold
     scenario_name = scenario["name"]
     if folds is None:
         folds = folds_for_dataset(ds)
-    mu_formula, sigma_formula = _bamlss_formulas_for_scenario(scenario_name, ds)
+    mu_formula, sigma_formula = _brms_formulas_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None
 
@@ -6492,6 +6414,20 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
         test_df = df.iloc[fold.test_idx].copy()
         train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
         fit_feature_cols = feature_cols
+        model_spec = "CoxPHFitter(linear terms; train-fold z-score; penalizer=0.05; l1_ratio=0.5)"
+        if scenario["name"] == "icu_survival_death":
+            train_df, test_df, bmi_spline_cols = _apply_restricted_cubic_spline_train_test(
+                train_df,
+                test_df,
+                col="bmi",
+                n_knots=6,
+                prefix="bmi_rcs",
+            )
+            fit_feature_cols = [c for c in fit_feature_cols if c != "bmi"] + bmi_spline_cols
+            model_spec = (
+                "CoxPHFitter(train-fold z-score; bmi restricted cubic spline with 6 knots; "
+                "penalizer=0.05; l1_ratio=0.5)"
+            )
 
         fit_start = datetime.now(timezone.utc)
         cph = CoxPHFitter(penalizer=0.05, l1_ratio=0.5)
@@ -6529,7 +6465,7 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
                     if conv_warn
                     else None
                 ),
-                "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=0.05; l1_ratio=0.5)",
+                "model_spec": model_spec,
             }
         )
         _append_survival_plot_fold(

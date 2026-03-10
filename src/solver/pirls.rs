@@ -4370,7 +4370,7 @@ fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
             }
         }
     }
-    debug_assert!(
+    assert!(
         max_asym <= tol,
         "{} asymmetry too large: {:.3e} (tol {:.3e})",
         label,
@@ -5344,7 +5344,7 @@ pub fn solve_penalized_least_squares(
                 }
             }
         }
-        debug_assert!(
+        assert!(
             max_asym <= 1e-8,
             "penalized_hessian asymmetry too large: {}",
             max_asym

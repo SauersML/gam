@@ -259,7 +259,6 @@ impl FirthDenseOperator {
         //   Φ(β) = 0.5 log|I(β)|, I = Xᵀ W X.
         //
         // IMPORTANT IDENTIFIABILITY NOTE
-        // ------------------------------
         // For rank-deficient design matrices X, I = Xᵀ W X is singular for all β
         // (assuming w_i > 0). The mathematically coherent Jeffreys/Firth term is
         // therefore the identifiable-subspace form:

@@ -1652,7 +1652,6 @@ impl<'a> RemlState<'a> {
 
             let n = self.y.len() as f64;
 
-            // -------------------------------------------------------------------------
             // Derivation map:
             //   λ_k = exp(ρ_k), A_k = ∂S/∂ρ_k = λ_k S_k.
             //   By the envelope theorem at inner stationarity, the penalized-fit block
@@ -1662,7 +1661,6 @@ impl<'a> RemlState<'a> {
             //   H_k differs by family:
             //     Gaussian: H_k = A_k.
             //     Non-Gaussian: H_k = A_k + d(X^T W(η̂) X)/dρ_k (third-derivative path).
-            // -------------------------------------------------------------------------
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
 
             match self.config.link_function() {

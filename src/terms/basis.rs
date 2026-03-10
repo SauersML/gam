@@ -649,10 +649,8 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
     } else {
         x
     };
-    if num_basis > 0 {
-        // Linear extrapolation outside the domain uses the boundary slope, so
-        // first derivatives clamp to the nearest boundary derivative value.
-    }
+    // Linear extrapolation outside the domain uses the boundary slope, so
+    // first derivatives clamp to the nearest boundary derivative value.
 
     let start_col =
         internal::evaluate_splines_sparse_into(x_eval, degree, knot_view, values, basis_scratch);
@@ -3055,7 +3053,6 @@ fn duchon_kernel_radial_triplet(
     coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<(f64, f64, f64), BasisError> {
     // Generic Duchon decomposition derivatives
-    // ----------------------------------------
     // Partial-fraction representation:
     //   phi(r) = sum_{m>=1} a_m * Phi_m(r) + sum_{n>=1} b_n * M_n(r),
     // where:
@@ -3067,7 +3064,6 @@ fn duchon_kernel_radial_triplet(
     // summing derivatives of each block.
     //
     // Full Duchon derivative strategy
-    // -------------------------------
     // Kernel is represented by partial fractions:
     //   phi(r) = sum_m a_m * Phi_m(r) + sum_n b_n * M_n(r),
     // where Phi_m are polyharmonic blocks and M_n are Matérn-Bessel blocks.
@@ -3173,7 +3169,6 @@ where
     let mut d1 = Array2::<f64>::zeros((p * d, m));
     let mut d2 = Array2::<f64>::zeros((p, m));
     // Weighted collocation definition (operator quadrature)
-    // ----------------------------------------------------
     // For collocation points z_k with nonnegative weights w_k:
     //   int g(x) dx ~ sum_k w_k g(z_k).
     //
@@ -3840,7 +3835,7 @@ fn duchon_polyharmonic_block(r: f64, m: usize, k_dim: usize) -> f64 {
 
 #[inline(always)]
 fn duchon_polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
-    debug_assert!(k_dim % 2 == 0);
+    assert!(k_dim % 2 == 0);
     (-1.0_f64).powi(m as i32 - (k_dim as i32 / 2) + 1)
 }
 
@@ -4641,7 +4636,6 @@ fn matern_value_psi_triplet(
     nu: MaternNu,
 ) -> Result<(f64, f64, f64), BasisError> {
     // Exact value + hyper-derivatives for psi = log(kappa)
-    // ----------------------------------------------------
     // Half-integer Matérn kernels are represented as:
     //   phi(r) = p(a) * exp(-a),
     //   a = s r,   s = sqrt(2 nu) * kappa,   kappa = 1/length_scale.
@@ -5640,7 +5634,6 @@ fn scaled_log_kappa_derivatives(
     r: f64,
 ) -> (f64, f64) {
     // Scaling-law differentiation template
-    // ------------------------------------
     // For any radial quantity of the form
     //   F(r; kappa) = kappa^a G(kappa r),
     // with psi = log(kappa), one has d/dpsi = kappa d/dkappa.
@@ -5879,7 +5872,6 @@ fn duchon_radial_core_psi_triplet(
     coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<DuchonRadialCore, BasisError> {
     // Duchon spectral derivation
-    // --------------------------
     // Start from the isotropic spectrum
     //   K^(ω; kappa) ∝ 1 / (|ω|^(2p) * (kappa^2 + |ω|^2)^s),
     // with fixed integer orders p,s and continuous scale
@@ -5933,7 +5925,7 @@ fn duchon_radial_core_psi_triplet(
         #[cfg(test)]
         let (lap_psi, lap_psi_psi) =
             duchon_laplacian_psi_triplet_from_jets(&jets, p_order, s_order, k_dim, r);
-        debug_assert!(
+        assert!(
             ((delta * phi + r * jets.phi_r) - phi_psi).abs() < 1e-7_f64.max(1e-7_f64 * phi.abs())
         );
         return Ok(DuchonRadialCore {
@@ -5996,7 +5988,6 @@ fn duchon_phi_rr_collision_psi_triplet(
     coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<(f64, f64, f64), BasisError> {
     // Center-collision rule
-    // ---------------------
     // For a C^2 radial kernel one has
     //   lim_{r->0} phi_r(r)/r = phi_rr(0),
     //   lim_{r->0} Δphi(r)    = d * phi_rr(0).
@@ -6744,9 +6735,9 @@ pub fn create_thin_plate_spline_basis_with_workspace(
         &format!("thin_plate bending penalty (dimension={d})"),
         "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
     )?;
-    debug_assert!(omega_psd.min_eigenvalue >= -omega_psd.tolerance);
-    debug_assert!(omega_psd.max_abs_eigenvalue.is_finite());
-    debug_assert!(omega_psd.effective_rank <= omega_constrained.nrows());
+    assert!(omega_psd.min_eigenvalue >= -omega_psd.tolerance);
+    assert!(omega_psd.max_abs_eigenvalue.is_finite());
+    assert!(omega_psd.effective_rank <= omega_constrained.nrows());
 
     let kernel_cols = kernel_constrained.ncols();
     let total_cols = kernel_cols + poly_cols;

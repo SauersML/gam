@@ -5628,7 +5628,6 @@ impl BinomialLocationScaleFamily {
             return Ok(None);
         };
 
-        // -----------------------------------------------------------------
         // Joint fixed-beta psi terms for the coupled 2-block probit model.
         //
         // We work over the flattened coefficient vector beta = [beta_t; beta_ls]
@@ -5724,7 +5723,6 @@ impl BinomialLocationScaleFamily {
         //
         // Even when only one block moves explicitly, the resulting score and
         // Hessian objects are joint because q couples eta_t and eta_ls.
-        // -----------------------------------------------------------------
         let core = binomial_location_scale_core(
             &self.y,
             &self.weights,
@@ -5865,7 +5863,6 @@ impl BinomialLocationScaleFamily {
         let pls = x_ls.ncols();
         let total = pt + pls;
 
-        // -----------------------------------------------------------------
         // Exact fixed-beta psi/psi terms for the coupled non-wiggle probit
         // family.
         //
@@ -5979,7 +5976,6 @@ impl BinomialLocationScaleFamily {
         //
         // Differentiating X^T diag(h) X twice then gives the explicit joint
         // psi/psi Hessian blocks.
-        // -----------------------------------------------------------------
         let mut r_t = Array1::<f64>::zeros(n);
         let mut r_ls = Array1::<f64>::zeros(n);
         let mut dr_t_i = Array1::<f64>::zeros(n);
@@ -6172,7 +6168,6 @@ impl BinomialLocationScaleFamily {
         let xi_t = x_t.dot(&u_t);
         let xi_ls = x_ls.dot(&u_ls);
 
-        // -----------------------------------------------------------------
         // Mixed contraction T_a[u] = D_beta H_{psi_a}[u].
         //
         // In the non-wiggle family the realized design derivatives X_{psi_a}
@@ -6223,7 +6218,6 @@ impl BinomialLocationScaleFamily {
         // Since X_t, X_ls, X_{t,psi_a}, X_{ls,psi_a} are all beta-independent
         // here, the full matrix contraction is obtained by replacing the row
         // coefficient arrays in H_{psi_a} by their directional derivatives.
-        // -----------------------------------------------------------------
         let mut dh_tt_u = Array1::<f64>::zeros(n);
         let mut dh_tl_u = Array1::<f64>::zeros(n);
         let mut dh_ll_u = Array1::<f64>::zeros(n);
@@ -7222,7 +7216,6 @@ impl BinomialLocationScaleWiggleFamily {
         let mut score_psi = Array1::<f64>::zeros(total);
         let mut hessian_psi = Array2::<f64>::zeros((total, total));
 
-        // -----------------------------------------------------------------
         // Exact likelihood-only joint psi terms for the probit wiggle family.
         //
         // This helper is intentionally the same generic rowwise kernel as the
@@ -7265,7 +7258,6 @@ impl BinomialLocationScaleWiggleFamily {
         // The rowwise objects below are the wiggle specialization of the same
         // q_r = -a_r exp(-ell_r) kernel. All wiggle-specific complexity is
         // localized to the realized row B_r(q0) and its q0-derivatives.
-        // -----------------------------------------------------------------
         for row in 0..n {
             let q0 = base_core.q0[row];
             let q = q0 + eta_w[row];
@@ -7562,7 +7554,6 @@ impl BinomialLocationScaleWiggleFamily {
         let mut score_psi_psi = Array1::<f64>::zeros(total);
         let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
 
-        // -----------------------------------------------------------------
         // Likelihood-only exact psi/psi terms for the wiggle family.
         //
         // This is the same generic second-order kernel as the non-wiggle path,
@@ -7613,7 +7604,6 @@ impl BinomialLocationScaleWiggleFamily {
         //
         // The wiggle specialization enters only through the rowwise q-objects
         // built below from the combined location-side row z_r = [x_{t,r}; B_r(q0)].
-        // -----------------------------------------------------------------
         for row in 0..n {
             let q0 = base_core.q0[row];
             let q = q0 + eta_w[row];
@@ -8933,7 +8923,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        // ---------------------------------------------------------------------
         // Exact joint Hessian for the 3-block binomial location-scale wiggle family.
         //
         // Model:
@@ -8971,7 +8960,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         //   tt/tl/ll from (q_t,q_l,q_tt,q_tl,q_ll),
         //   tw/lw from (q_w,q_tw,q_lw),
         //   ww from q_ww=0 => H_ww = sum m2 * q_w q_w^T.
-        // ---------------------------------------------------------------------
         if block_states.len() != 3 {
             return Err(format!(
                 "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
@@ -9093,7 +9081,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // ---------------------------------------------------------------------
         // Exact directional derivative dH[u] for the same 3-block model.
         //
         // Direction:
@@ -9141,7 +9128,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         //   q_ww  = 0,         dq_ww  = 0
         //
         // Implementation below follows these formulas exactly block-by-block.
-        // ---------------------------------------------------------------------
         if block_states.len() != 3 {
             return Err(format!(
                 "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",

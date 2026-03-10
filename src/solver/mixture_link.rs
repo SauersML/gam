@@ -896,7 +896,7 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
 ) -> InverseLinkJet {
     let k = state.components.len().min(state.pi.len());
     let m = k.saturating_sub(1);
-    debug_assert!(
+    assert!(
         out.len() >= m,
         "rho-partial output buffer too small: got {}, need {}",
         out.len(),
