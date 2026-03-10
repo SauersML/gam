@@ -21,7 +21,7 @@ pub struct SmoothingBfgsOptions {
     pub finite_diff_step: f64,
     /// Retained for API compatibility.
     /// This setting is only used by finite-difference fallback paths.
-    pub fd_hessian_max_dim: usize,
+    pub fdhessian_max_dim: usize,
     pub optimizer_kind: SmoothingOptimizerKind,
     pub seed_config: SeedConfig,
 }
@@ -32,7 +32,7 @@ impl Default for SmoothingBfgsOptions {
             max_iter: 200,
             tol: 1e-5,
             finite_diff_step: 1e-3,
-            fd_hessian_max_dim: usize::MAX,
+            fdhessian_max_dim: usize::MAX,
             optimizer_kind: SmoothingOptimizerKind::Bfgs,
             seed_config: SeedConfig {
                 risk_profile: SeedRiskProfile::GeneralizedLinear,
@@ -47,9 +47,9 @@ pub struct SmoothingBfgsResult {
     pub rho: Array1<f64>,
     pub final_value: f64,
     pub iterations: usize,
-    pub final_grad_norm: f64,
+    pub finalgrad_norm: f64,
     pub final_stationarity_residual: f64,
-    pub final_bound_violation: f64,
+    pub final_boundviolation: f64,
     pub stationary: bool,
 }
 
@@ -96,7 +96,7 @@ fn no_smoothing_candidate_error(
     ))
 }
 
-fn sanitize_screening_cost(cost: f64) -> f64 {
+fn sanitize_screeningcost(cost: f64) -> f64 {
     if cost.is_finite() {
         cost
     } else {
@@ -104,7 +104,7 @@ fn sanitize_screening_cost(cost: f64) -> f64 {
     }
 }
 
-fn max_bound_violation(rho: &Array1<f64>, lower: &Array1<f64>, upper: &Array1<f64>) -> f64 {
+fn max_boundviolation(rho: &Array1<f64>, lower: &Array1<f64>, upper: &Array1<f64>) -> f64 {
     rho.iter()
         .zip(lower.iter())
         .zip(upper.iter())
@@ -144,15 +144,15 @@ fn unequal_central_difference(f0: f64, fp: f64, fm: f64, h_plus: f64, h_minus: f
         / (h_plus * h_minus * (h_plus + h_minus))
 }
 
-fn finite_diff_gradient_external<C, EvalCost, Reset>(
+fn finite_diffgradient_external<C, EvalCost, Reset>(
     rho: &Array1<f64>,
     step: f64,
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     context: &mut C,
     reset_context: &mut Reset,
-    eval_cost_rho: &mut EvalCost,
-    base_value: f64,
+    evalcost_rho: &mut EvalCost,
+    basevalue: f64,
 ) -> Result<Array1<f64>, EstimationError>
 where
     EvalCost: FnMut(&mut C, &Array1<f64>) -> Result<f64, EstimationError>,
@@ -168,21 +168,21 @@ where
         if use_central {
             rp[i] = rho[i] + h_plus;
             reset_context(context);
-            let fp = eval_cost_rho(context, &rp)?;
+            let fp = evalcost_rho(context, &rp)?;
             rm[i] = rho[i] - h_minus;
             reset_context(context);
-            let fm = eval_cost_rho(context, &rm)?;
-            grad[i] = unequal_central_difference(base_value, fp, fm, h_plus, h_minus);
+            let fm = evalcost_rho(context, &rm)?;
+            grad[i] = unequal_central_difference(basevalue, fp, fm, h_plus, h_minus);
         } else if h_plus >= h_minus && h_plus > 0.0 {
             rp[i] = rho[i] + h_plus;
             reset_context(context);
-            let fp = eval_cost_rho(context, &rp)?;
-            grad[i] = (fp - base_value) / h_plus;
+            let fp = evalcost_rho(context, &rp)?;
+            grad[i] = (fp - basevalue) / h_plus;
         } else if h_minus > 0.0 {
             rm[i] = rho[i] - h_minus;
             reset_context(context);
-            let fm = eval_cost_rho(context, &rm)?;
-            grad[i] = (base_value - fm) / h_minus;
+            let fm = evalcost_rho(context, &rm)?;
+            grad[i] = (basevalue - fm) / h_minus;
         } else {
             grad[i] = 0.0;
         }
@@ -192,18 +192,18 @@ where
     Ok(grad)
 }
 
-fn finite_diff_gradient_external_parallel<F>(
+fn finite_diffgradient_external_parallel<F>(
     rho: &Array1<f64>,
     step: f64,
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     objective: &F,
-    base_value: f64,
+    basevalue: f64,
 ) -> Result<Array1<f64>, EstimationError>
 where
     F: Fn(&Array1<f64>) -> Result<f64, EstimationError> + Sync,
 {
-    let grad_vals: Result<Vec<f64>, EstimationError> = (0..rho.len())
+    let gradvals: Result<Vec<f64>, EstimationError> = (0..rho.len())
         .into_par_iter()
         .map(|i| {
             let h_plus = (upper[i] - rho[i]).clamp(0.0, step);
@@ -218,24 +218,24 @@ where
                 let fp = fp_res?;
                 let fm = fm_res?;
                 Ok(unequal_central_difference(
-                    base_value, fp, fm, h_plus, h_minus,
+                    basevalue, fp, fm, h_plus, h_minus,
                 ))
             } else if h_plus >= h_minus && h_plus > 0.0 {
                 let mut rp = rho.clone();
                 rp[i] = rho[i] + h_plus;
                 let fp = objective(&rp)?;
-                Ok((fp - base_value) / h_plus)
+                Ok((fp - basevalue) / h_plus)
             } else if h_minus > 0.0 {
                 let mut rm = rho.clone();
                 rm[i] = rho[i] - h_minus;
                 let fm = objective(&rm)?;
-                Ok((base_value - fm) / h_minus)
+                Ok((basevalue - fm) / h_minus)
             } else {
                 Ok(0.0)
             }
         })
         .collect();
-    Ok(Array1::from_vec(grad_vals?))
+    Ok(Array1::from_vec(gradvals?))
 }
 
 fn approx_same_rho_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
@@ -257,8 +257,8 @@ fn should_replace_smoothing_candidate(
     match best {
         None => true,
         Some(current) => {
-            if candidate.final_bound_violation != current.final_bound_violation {
-                candidate.final_bound_violation < current.final_bound_violation
+            if candidate.final_boundviolation != current.final_boundviolation {
+                candidate.final_boundviolation < current.final_boundviolation
             } else if candidate.stationary != current.stationary {
                 candidate.stationary
             } else if candidate.stationary {
@@ -268,7 +268,7 @@ fn should_replace_smoothing_candidate(
             } else if candidate.final_value != current.final_value {
                 candidate.final_value < current.final_value
             } else {
-                candidate.final_grad_norm < current.final_grad_norm
+                candidate.finalgrad_norm < current.finalgrad_norm
             }
         }
     }
@@ -295,7 +295,7 @@ fn screened_seeds<C, EvalCost, Reset>(
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
     reset_context: &mut Reset,
-    eval_cost_rho: &mut EvalCost,
+    evalcost_rho: &mut EvalCost,
     options: &SmoothingBfgsOptions,
 ) -> Result<Vec<(usize, Array1<f64>)>, EstimationError>
 where
@@ -320,8 +320,8 @@ where
             .into_iter()
             .map(|(idx, rho)| {
                 reset_context(context);
-                let cost = match eval_cost_rho(context, &rho) {
-                    Ok(c) => sanitize_screening_cost(c),
+                let cost = match evalcost_rho(context, &rho) {
+                    Ok(c) => sanitize_screeningcost(c),
                     Err(_) => f64::INFINITY,
                 };
                 (idx, rho, cost)
@@ -344,7 +344,7 @@ fn run_single_seed_bfgs<C, Eval, Reset>(
     context: &mut C,
     rho_seed: &Array1<f64>,
     reset_context: &mut Reset,
-    eval_cost_grad_rho: &mut Eval,
+    evalcostgrad_rho: &mut Eval,
     options: &SmoothingBfgsOptions,
 ) -> Option<SmoothingBfgsResult>
 where
@@ -356,7 +356,7 @@ where
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
     let objective = CachedFirstOrderObjective::new(|rho: &Array1<f64>| {
         reset_context(context);
-        let (cost, grad_rho) = match eval_cost_grad_rho(context, rho) {
+        let (cost, grad_rho) = match evalcostgrad_rho(context, rho) {
             Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
                 (cost, grad_rho)
             }
@@ -397,14 +397,14 @@ where
 
     let rho = solution.final_point.clone();
     let mut grad_rho = match &last_eval {
-        Some((rho_cached, _cost_cached, grad_cached))
+        Some((rho_cached, cost_cached, grad_cached))
             if approx_same_rho_point(&rho, rho_cached) =>
         {
             grad_cached.clone()
         }
         _ => {
             reset_context(context);
-            match eval_cost_grad_rho(context, &rho) {
+            match evalcostgrad_rho(context, &rho) {
                 Ok((_, grad)) => grad,
                 Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
             }
@@ -416,26 +416,26 @@ where
         }
     }
     let grad_norm = grad_rho.dot(&grad_rho).sqrt();
-    let bound_violation = max_bound_violation(&rho, &lower, &upper);
+    let boundviolation = max_boundviolation(&rho, &lower, &upper);
     let stationarity_residual = projected_stationarity_residual(&rho, &grad_rho, &lower, &upper);
     Some(SmoothingBfgsResult {
         rho,
         final_value: solution.final_value,
         iterations: solution.iterations,
-        final_grad_norm: grad_norm,
+        finalgrad_norm: grad_norm,
         final_stationarity_residual: stationarity_residual,
-        final_bound_violation: bound_violation,
-        stationary: bound_violation <= 1e-6 && stationarity_residual <= options.tol.max(1e-6),
+        final_boundviolation: boundviolation,
+        stationary: boundviolation <= 1e-6 && stationarity_residual <= options.tol.max(1e-6),
     })
 }
 
-fn run_multistart_bfgs<C, EvalCost, EvalGrad, Reset>(
+fn runmultistart_bfgs<C, EvalCost, EvalGrad, Reset>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
     reset_context: &mut Reset,
-    eval_cost_rho: &mut EvalCost,
-    eval_cost_grad_rho: &mut EvalGrad,
+    evalcost_rho: &mut EvalCost,
+    evalcostgrad_rho: &mut EvalGrad,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
@@ -448,18 +448,18 @@ where
         heuristic_lambdas,
         context,
         reset_context,
-        eval_cost_rho,
+        evalcost_rho,
         options,
     )?;
     let mut best: Option<SmoothingBfgsResult> = None;
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_stationarity_residual = f64::INFINITY;
-    for (_seed_idx, rho_seed) in screened_seeds.iter() {
+    for (_, rho_seed) in screened_seeds.iter() {
         let Some(candidate) = run_single_seed_bfgs(
             context,
             rho_seed,
             reset_context,
-            eval_cost_grad_rho,
+            evalcostgrad_rho,
             options,
         ) else {
             continue;
@@ -485,7 +485,7 @@ fn run_single_seed_newton<C, Eval, Reset>(
     context: &mut C,
     rho_seed: &Array1<f64>,
     reset_context: &mut Reset,
-    eval_cost_grad_hess_rho: &mut Eval,
+    evalcostgradhess_rho: &mut Eval,
     options: &SmoothingBfgsOptions,
 ) -> Option<SmoothingBfgsResult>
 where
@@ -501,7 +501,7 @@ where
     let objective = CachedSecondOrderObjective::new(
         |rho: &Array1<f64>| {
             reset_context(context);
-            let (cost, grad, hess) = eval_cost_grad_hess_rho(context, rho).map_err(|e| {
+            let (cost, grad, hess) = evalcostgradhess_rho(context, rho).map_err(|e| {
                 ObjectiveEvalError::recoverable(format!("outer objective evaluation failed: {e}"))
             })?;
             if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
@@ -549,14 +549,14 @@ where
 
     let rho = solution.final_point.clone();
     let mut grad_rho = match &last_eval {
-        Some((rho_cached, _cost_cached, grad_cached, _h_cached))
+        Some((rho_cached, cost_cached, grad_cached, h_cached))
             if approx_same_rho_point(&rho, rho_cached) =>
         {
             grad_cached.clone()
         }
         _ => {
             reset_context(context);
-            match eval_cost_grad_hess_rho(context, &rho) {
+            match evalcostgradhess_rho(context, &rho) {
                 Ok((_, grad, _)) => grad,
                 Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
             }
@@ -568,26 +568,26 @@ where
         }
     }
     let grad_norm = grad_rho.dot(&grad_rho).sqrt();
-    let bound_violation = max_bound_violation(&rho, &lower, &upper);
+    let boundviolation = max_boundviolation(&rho, &lower, &upper);
     let stationarity_residual = projected_stationarity_residual(&rho, &grad_rho, &lower, &upper);
     Some(SmoothingBfgsResult {
         rho,
         final_value: solution.final_value,
         iterations: solution.iterations,
-        final_grad_norm: grad_norm,
+        finalgrad_norm: grad_norm,
         final_stationarity_residual: stationarity_residual,
-        final_bound_violation: bound_violation,
-        stationary: bound_violation <= 1e-6 && stationarity_residual <= options.tol.max(1e-6),
+        final_boundviolation: boundviolation,
+        stationary: boundviolation <= 1e-6 && stationarity_residual <= options.tol.max(1e-6),
     })
 }
 
-fn run_multistart_newton<C, EvalCost, Eval, Reset>(
+fn runmultistart_newton<C, EvalCost, Eval, Reset>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
     reset_context: &mut Reset,
-    eval_cost_rho: &mut EvalCost,
-    eval_cost_grad_hess_rho: &mut Eval,
+    evalcost_rho: &mut EvalCost,
+    evalcostgradhess_rho: &mut Eval,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
@@ -603,18 +603,18 @@ where
         heuristic_lambdas,
         context,
         reset_context,
-        eval_cost_rho,
+        evalcost_rho,
         options,
     )?;
     let mut best: Option<SmoothingBfgsResult> = None;
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_stationarity_residual = f64::INFINITY;
-    for (_seed_idx, rho_seed) in screened_seeds.iter() {
+    for (_, rho_seed) in screened_seeds.iter() {
         let Some(candidate) = run_single_seed_newton(
             context,
             rho_seed,
             reset_context,
-            eval_cost_grad_hess_rho,
+            evalcostgradhess_rho,
             options,
         ) else {
             continue;
@@ -639,7 +639,7 @@ where
 fn screened_seeds_parallel<EvalCost>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    eval_cost_rho: &EvalCost,
+    evalcost_rho: &EvalCost,
     options: &SmoothingBfgsOptions,
 ) -> Result<Vec<(usize, Array1<f64>)>, EstimationError>
 where
@@ -661,8 +661,8 @@ where
     let mut scored: Vec<(usize, Array1<f64>, f64)> = candidate_seeds
         .into_par_iter()
         .map(|(idx, rho)| {
-            let cost = eval_cost_rho(&rho)
-                .map(sanitize_screening_cost)
+            let cost = evalcost_rho(&rho)
+                .map(sanitize_screeningcost)
                 .unwrap_or(f64::INFINITY);
             (idx, rho, cost)
         })
@@ -674,7 +674,7 @@ where
 
 fn run_single_seed_bfgs_parallel<Eval>(
     rho_seed: &Array1<f64>,
-    eval_cost_grad_rho: &Eval,
+    evalcostgrad_rho: &Eval,
     options: &SmoothingBfgsOptions,
 ) -> Option<SmoothingBfgsResult>
 where
@@ -684,7 +684,7 @@ where
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
     let objective = CachedFirstOrderObjective::new(|rho: &Array1<f64>| {
-        let (cost, grad_rho) = match eval_cost_grad_rho(rho) {
+        let (cost, grad_rho) = match evalcostgrad_rho(rho) {
             Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
                 (cost, grad_rho)
             }
@@ -725,12 +725,12 @@ where
 
     let rho = solution.final_point.clone();
     let mut grad_rho = match &last_eval {
-        Some((rho_cached, _cost_cached, grad_cached))
+        Some((rho_cached, cost_cached, grad_cached))
             if approx_same_rho_point(&rho, rho_cached) =>
         {
             grad_cached.clone()
         }
-        _ => match eval_cost_grad_rho(&rho) {
+        _ => match evalcostgrad_rho(&rho) {
             Ok((_, grad)) => grad,
             Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
         },
@@ -741,23 +741,23 @@ where
         }
     }
     let grad_norm = grad_rho.dot(&grad_rho).sqrt();
-    let bound_violation = max_bound_violation(&rho, &lower, &upper);
+    let boundviolation = max_boundviolation(&rho, &lower, &upper);
     let stationarity_residual = projected_stationarity_residual(&rho, &grad_rho, &lower, &upper);
     Some(SmoothingBfgsResult {
         rho,
         final_value: solution.final_value,
         iterations: solution.iterations,
-        final_grad_norm: grad_norm,
+        finalgrad_norm: grad_norm,
         final_stationarity_residual: stationarity_residual,
-        final_bound_violation: bound_violation,
-        stationary: bound_violation <= 1e-6 && stationarity_residual <= options.tol.max(1e-6),
+        final_boundviolation: boundviolation,
+        stationary: boundviolation <= 1e-6 && stationarity_residual <= options.tol.max(1e-6),
     })
 }
 
-fn run_multistart_bfgs_parallel<Eval>(
+fn runmultistart_bfgs_parallel<Eval>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    eval_cost_grad_rho: &Eval,
+    evalcostgrad_rho: &Eval,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
@@ -766,14 +766,14 @@ where
     let screened_seeds = screened_seeds_parallel(
         num_penalties,
         heuristic_lambdas,
-        &|rho: &Array1<f64>| eval_cost_grad_rho(rho).map(|(c, _)| c),
+        &|rho: &Array1<f64>| evalcostgrad_rho(rho).map(|(c, _)| c),
         options,
     )?;
     let screened_seed_count = screened_seeds.len();
     let mut candidates: Vec<(usize, SmoothingBfgsResult)> = screened_seeds
         .into_par_iter()
         .filter_map(|(seed_idx, rho_seed)| {
-            let res = run_single_seed_bfgs_parallel(&rho_seed, eval_cost_grad_rho, options)?;
+            let res = run_single_seed_bfgs_parallel(&rho_seed, evalcostgrad_rho, options)?;
             Some((seed_idx, res))
         })
         .collect();
@@ -814,7 +814,7 @@ where
 /// This makes the direction field fully consistent with the exact scalar objective,
 /// which is particularly useful for complicated non-Gaussian/survival objectives where
 /// exact analytic outer derivatives are either expensive or error-prone.
-pub fn optimize_log_smoothing_with_multistart<F>(
+pub fn optimize_log_smoothingwithmultistart<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     mut objective: F,
@@ -829,73 +829,73 @@ where
             rho,
             final_value: objective(&Array1::<f64>::zeros(0))?,
             iterations: 0,
-            final_grad_norm: 0.0,
+            finalgrad_norm: 0.0,
             final_stationarity_residual: 0.0,
-            final_bound_violation: 0.0,
+            final_boundviolation: 0.0,
             stationary: true,
         });
     }
 
     let lower = Array1::<f64>::from_elem(num_penalties, -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(num_penalties, RHO_BOUND);
-    let mut reset_objective = |_objective: &mut F| {};
-    let mut eval_cost_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-    let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| {
+    let mut resetobjective = |_: &mut F| {};
+    let mut evalcost_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+    let mut evalcostgrad_rho = |objective: &mut F, rho: &Array1<f64>| {
         let cost = objective(rho)?;
-        let mut reset_fd_context = |_objective: &mut F| {};
-        let mut eval_cost_fd = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-        let grad_rho = finite_diff_gradient_external(
+        let mut resetfd_context = |_: &mut F| {};
+        let mut evalcostfd = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+        let grad_rho = finite_diffgradient_external(
             rho,
             options.finite_diff_step,
             &lower,
             &upper,
             objective,
-            &mut reset_fd_context,
-            &mut eval_cost_fd,
+            &mut resetfd_context,
+            &mut evalcostfd,
             cost,
         )?;
         Ok((cost, grad_rho))
     };
     match options.optimizer_kind {
-        SmoothingOptimizerKind::Bfgs => run_multistart_bfgs(
+        SmoothingOptimizerKind::Bfgs => runmultistart_bfgs(
             num_penalties,
             heuristic_lambdas,
             &mut objective,
-            &mut reset_objective,
-            &mut eval_cost_rho,
-            &mut eval_cost_grad_rho,
+            &mut resetobjective,
+            &mut evalcost_rho,
+            &mut evalcostgrad_rho,
             options,
         ),
         SmoothingOptimizerKind::Arc => {
-            let mut eval_cost_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-            let mut eval_cost_grad_hess_rho = |objective: &mut F,
+            let mut evalcost_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+            let mut evalcostgradhess_rho = |objective: &mut F,
                                                rho: &Array1<f64>|
              -> Result<
                 (f64, Array1<f64>, Option<Array2<f64>>),
                 EstimationError,
             > {
                 let cost = objective(rho)?;
-                let mut reset_fd_context = |_objective: &mut F| {};
-                let mut eval_cost_fd = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-                let grad_rho = finite_diff_gradient_external(
+                let mut resetfd_context = |_: &mut F| {};
+                let mut evalcostfd = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+                let grad_rho = finite_diffgradient_external(
                     rho,
                     options.finite_diff_step,
                     &lower,
                     &upper,
                     objective,
-                    &mut reset_fd_context,
-                    &mut eval_cost_fd,
+                    &mut resetfd_context,
+                    &mut evalcostfd,
                     cost,
                 )?;
                 Ok((cost, grad_rho, None))
             };
-            run_multistart_newton(
+            runmultistart_newton(
                 num_penalties,
                 heuristic_lambdas,
                 &mut objective,
-                &mut reset_objective,
-                &mut eval_cost_rho,
-                &mut eval_cost_grad_hess_rho,
+                &mut resetobjective,
+                &mut evalcost_rho,
+                &mut evalcostgradhess_rho,
                 options,
             )
         }
@@ -934,10 +934,10 @@ where
 /// should already have used the envelope theorem to eliminate explicit
 /// `d beta_hat / d rho` terms from the objective derivative and return the final
 /// exact `dV/drho` here.
-pub fn optimize_log_smoothing_with_multistart_with_gradient<F>(
+pub fn optimize_log_smoothingwithmultistartwithgradient<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    mut objective_with_gradient: F,
+    mut objectivewithgradient: F,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
@@ -945,35 +945,35 @@ where
 {
     if num_penalties == 0 {
         let rho = Array1::<f64>::zeros(0);
-        let (value, grad) = objective_with_gradient(&rho)?;
+        let (value, grad) = objectivewithgradient(&rho)?;
         let grad_norm = grad.dot(&grad).sqrt();
         return Ok(SmoothingBfgsResult {
             rho,
             final_value: value,
             iterations: 0,
-            final_grad_norm: grad_norm,
+            finalgrad_norm: grad_norm,
             final_stationarity_residual: grad_norm,
-            final_bound_violation: 0.0,
+            final_boundviolation: 0.0,
             stationary: grad_norm <= options.tol.max(1e-6),
         });
     }
 
-    let mut reset_objective = |_objective: &mut F| {};
-    let mut eval_cost_rho =
+    let mut resetobjective = |_: &mut F| {};
+    let mut evalcost_rho =
         |objective: &mut F, rho: &Array1<f64>| objective(rho).map(|(cost, _)| cost);
-    let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+    let mut evalcostgrad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
     match options.optimizer_kind {
-        SmoothingOptimizerKind::Bfgs => run_multistart_bfgs(
+        SmoothingOptimizerKind::Bfgs => runmultistart_bfgs(
             num_penalties,
             heuristic_lambdas,
-            &mut objective_with_gradient,
-            &mut reset_objective,
-            &mut eval_cost_rho,
-            &mut eval_cost_grad_rho,
+            &mut objectivewithgradient,
+            &mut resetobjective,
+            &mut evalcost_rho,
+            &mut evalcostgrad_rho,
             options,
         ),
         SmoothingOptimizerKind::Arc => {
-            let mut eval_cost_grad_hess_rho = |objective: &mut F,
+            let mut evalcostgradhess_rho = |objective: &mut F,
                                                rho: &Array1<f64>|
              -> Result<
                 (f64, Array1<f64>, Option<Array2<f64>>),
@@ -982,13 +982,13 @@ where
                 let (cost, grad) = objective(rho)?;
                 Ok((cost, grad, None))
             };
-            run_multistart_newton(
+            runmultistart_newton(
                 num_penalties,
                 heuristic_lambdas,
-                &mut objective_with_gradient,
-                &mut reset_objective,
-                &mut eval_cost_rho,
-                &mut eval_cost_grad_hess_rho,
+                &mut objectivewithgradient,
+                &mut resetobjective,
+                &mut evalcost_rho,
+                &mut evalcostgradhess_rho,
                 options,
             )
         }
@@ -999,10 +999,10 @@ where
 ///
 /// This variant runs seed screening and candidate BFGS probes concurrently.
 /// It requires a thread-safe objective callback.
-pub fn optimize_log_smoothing_with_multistart_with_gradient_parallel<F>(
+pub fn optimize_log_smoothingwithmultistartwithgradient_parallel<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    objective_with_gradient: F,
+    objectivewithgradient: F,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
@@ -1010,38 +1010,38 @@ where
 {
     if num_penalties == 0 {
         let rho = Array1::<f64>::zeros(0);
-        let (value, grad) = objective_with_gradient(&rho)?;
+        let (value, grad) = objectivewithgradient(&rho)?;
         let grad_norm = grad.dot(&grad).sqrt();
         return Ok(SmoothingBfgsResult {
             rho,
             final_value: value,
             iterations: 0,
-            final_grad_norm: grad_norm,
+            finalgrad_norm: grad_norm,
             final_stationarity_residual: grad_norm,
-            final_bound_violation: 0.0,
+            final_boundviolation: 0.0,
             stationary: grad_norm <= options.tol.max(1e-6),
         });
     }
     if options.optimizer_kind == SmoothingOptimizerKind::Arc {
-        return optimize_log_smoothing_with_multistart_with_gradient(
+        return optimize_log_smoothingwithmultistartwithgradient(
             num_penalties,
             heuristic_lambdas,
-            |rho| objective_with_gradient(rho),
+            |rho| objectivewithgradient(rho),
             options,
         );
     }
     if !should_parallelize_smoothing_candidates(num_penalties, options) {
-        return optimize_log_smoothing_with_multistart_with_gradient(
+        return optimize_log_smoothingwithmultistartwithgradient(
             num_penalties,
             heuristic_lambdas,
-            |rho| objective_with_gradient(rho),
+            |rho| objectivewithgradient(rho),
             options,
         );
     }
-    run_multistart_bfgs_parallel(
+    runmultistart_bfgs_parallel(
         num_penalties,
         heuristic_lambdas,
-        &objective_with_gradient,
+        &objectivewithgradient,
         options,
     )
 }
@@ -1050,7 +1050,7 @@ where
 ///
 /// This variant runs seed screening and candidate outer probes concurrently and
 /// computes each coordinate's central-difference gradient in parallel.
-pub fn optimize_log_smoothing_with_multistart_parallel_fd<F>(
+pub fn optimize_log_smoothingwithmultistart_parallelfd<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     objective: F,
@@ -1065,14 +1065,14 @@ where
             rho,
             final_value: objective(&Array1::<f64>::zeros(0))?,
             iterations: 0,
-            final_grad_norm: 0.0,
+            finalgrad_norm: 0.0,
             final_stationarity_residual: 0.0,
-            final_bound_violation: 0.0,
+            final_boundviolation: 0.0,
             stationary: true,
         });
     }
     if options.optimizer_kind == SmoothingOptimizerKind::Arc {
-        return optimize_log_smoothing_with_multistart(
+        return optimize_log_smoothingwithmultistart(
             num_penalties,
             heuristic_lambdas,
             |rho| objective(rho),
@@ -1080,21 +1080,21 @@ where
         );
     }
     if !should_parallelize_smoothing_candidates(num_penalties, options) {
-        return optimize_log_smoothing_with_multistart(
+        return optimize_log_smoothingwithmultistart(
             num_penalties,
             heuristic_lambdas,
             |rho| objective(rho),
             options,
         );
     }
-    run_multistart_bfgs_parallel(
+    runmultistart_bfgs_parallel(
         num_penalties,
         heuristic_lambdas,
         &|rho: &Array1<f64>| {
             let cost = objective(rho)?;
             let lower = Array1::<f64>::from_elem(num_penalties, -RHO_BOUND);
             let upper = Array1::<f64>::from_elem(num_penalties, RHO_BOUND);
-            let grad_rho = finite_diff_gradient_external_parallel(
+            let grad_rho = finite_diffgradient_external_parallel(
                 rho,
                 options.finite_diff_step,
                 &lower,
@@ -1117,10 +1117,10 @@ where
 /// adapter builds a symmetric finite-difference Hessian from exact gradients.
 /// That keeps the outer solver on the same `opt` path instead of maintaining a
 /// duplicate fallback optimizer API locally.
-pub fn optimize_log_smoothing_with_multistart_with_gradient_and_hessian<F>(
+pub fn optimize_log_smoothingwithmultistartwithgradient_andhessian<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    mut objective_with_gradient_hessian: F,
+    mut objectivewithgradienthessian: F,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
@@ -1128,41 +1128,41 @@ where
 {
     if num_penalties == 0 {
         let rho = Array1::<f64>::zeros(0);
-        let (value, grad, _) = objective_with_gradient_hessian(&rho)?;
+        let (value, grad, _) = objectivewithgradienthessian(&rho)?;
         let grad_norm = grad.dot(&grad).sqrt();
         return Ok(SmoothingBfgsResult {
             rho,
             final_value: value,
             iterations: 0,
-            final_grad_norm: grad_norm,
+            finalgrad_norm: grad_norm,
             final_stationarity_residual: grad_norm,
-            final_bound_violation: 0.0,
+            final_boundviolation: 0.0,
             stationary: grad_norm <= options.tol.max(1e-6),
         });
     }
 
     match options.optimizer_kind {
-        SmoothingOptimizerKind::Bfgs => optimize_log_smoothing_with_multistart_with_gradient(
+        SmoothingOptimizerKind::Bfgs => optimize_log_smoothingwithmultistartwithgradient(
             num_penalties,
             heuristic_lambdas,
             |rho| {
-                let (cost, grad, _) = objective_with_gradient_hessian(rho)?;
+                let (cost, grad, _) = objectivewithgradienthessian(rho)?;
                 Ok((cost, grad))
             },
             options,
         ),
         SmoothingOptimizerKind::Arc => {
-            let mut reset_objective = |_objective: &mut F| {};
-            let mut eval_cost_rho =
+            let mut resetobjective = |_: &mut F| {};
+            let mut evalcost_rho =
                 |objective: &mut F, rho: &Array1<f64>| objective(rho).map(|(cost, _, _)| cost);
-            let mut eval_cost_grad_hess_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-            run_multistart_newton(
+            let mut evalcostgradhess_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+            runmultistart_newton(
                 num_penalties,
                 heuristic_lambdas,
-                &mut objective_with_gradient_hessian,
-                &mut reset_objective,
-                &mut eval_cost_rho,
-                &mut eval_cost_grad_hess_rho,
+                &mut objectivewithgradienthessian,
+                &mut resetobjective,
+                &mut evalcost_rho,
+                &mut evalcostgradhess_rho,
                 options,
             )
         }
@@ -1174,7 +1174,7 @@ mod tests {
     use super::*;
     use ndarray::array;
 
-    fn convex_value(rho: &Array1<f64>) -> f64 {
+    fn convexvalue(rho: &Array1<f64>) -> f64 {
         let target = [0.7, -1.1, 0.3];
         let weight = [1.0, 2.0, 0.5];
         rho.iter()
@@ -1184,13 +1184,13 @@ mod tests {
     }
 
     #[test]
-    fn projected_stationarity_accepts_bound_optimum_with_nonzero_raw_gradient() {
+    fn projected_stationarity_accepts_bound_optimumwith_nonzero_rawgradient() {
         let options = SmoothingBfgsOptions {
             tol: 1e-8,
             max_iter: 80,
             ..SmoothingBfgsOptions::default()
         };
-        let res = optimize_log_smoothing_with_multistart_with_gradient(
+        let res = optimize_log_smoothingwithmultistartwithgradient(
             1,
             Some(&[1.0]),
             |rho: &Array1<f64>| {
@@ -1204,11 +1204,11 @@ mod tests {
         assert!((res.rho[0] - RHO_BOUND).abs() <= 1e-6);
         assert!(res.stationary);
         assert!(res.final_stationarity_residual <= options.tol.max(1e-6));
-        assert!(res.final_grad_norm > 1.0);
+        assert!(res.finalgrad_norm > 1.0);
     }
 
     #[test]
-    fn bound_aware_fd_gradient_never_steps_outside_rho_bounds() {
+    fn bound_awarefdgradient_never_steps_outside_rho_bounds() {
         let rho = array![RHO_BOUND];
         let lower = array![-RHO_BOUND];
         let upper = array![RHO_BOUND];
@@ -1220,8 +1220,8 @@ mod tests {
             }
             Ok(-x[0])
         };
-        let mut reset = |_objective: &mut _| {};
-        let grad = finite_diff_gradient_external(
+        let mut reset = |_: &mut _| {};
+        let grad = finite_diffgradient_external(
             &rho,
             1e-3,
             &lower,
@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn screening_drops_nan_costs() {
+    fn screening_drops_nancosts() {
         let mut options = SmoothingBfgsOptions::default();
         options.seed_config.max_seeds = 4;
         options.seed_config.screening_budget = 1;
@@ -1245,8 +1245,8 @@ mod tests {
             1,
             Some(&[1.0]),
             &mut unit,
-            &mut |_ctx: &mut ()| {},
-            &mut |_ctx: &mut (), rho: &Array1<f64>| {
+            &mut |ctx: &mut ()| {},
+            &mut |ctx: &mut (), rho: &Array1<f64>| {
                 if rho.iter().all(|v| v.abs() < 1e-12) {
                     Ok(f64::NAN)
                 } else {
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_gradient_parallel_matches_sequential() {
+    fn exactgradient_parallel_matches_sequential() {
         let mut options = SmoothingBfgsOptions {
             tol: 1e-8,
             max_iter: 120,
@@ -1270,7 +1270,7 @@ mod tests {
         options.seed_config.screening_budget = 4;
         let heur = [1.0, 1.0, 1.0];
 
-        let seq = optimize_log_smoothing_with_multistart_with_gradient(
+        let seq = optimize_log_smoothingwithmultistartwithgradient(
             3,
             Some(&heur),
             |rho: &Array1<f64>| {
@@ -1278,13 +1278,13 @@ mod tests {
                 g[0] = rho[0] - 0.7;
                 g[1] = 2.0 * (rho[1] + 1.1);
                 g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convex_value(rho), g))
+                Ok((convexvalue(rho), g))
             },
             &options,
         )
         .expect("sequential exact-gradient optimization should succeed");
 
-        let par = optimize_log_smoothing_with_multistart_with_gradient_parallel(
+        let par = optimize_log_smoothingwithmultistartwithgradient_parallel(
             3,
             Some(&heur),
             |rho: &Array1<f64>| {
@@ -1292,7 +1292,7 @@ mod tests {
                 g[0] = rho[0] - 0.7;
                 g[1] = 2.0 * (rho[1] + 1.1);
                 g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convex_value(rho), g))
+                Ok((convexvalue(rho), g))
             },
             &options,
         )
@@ -1316,18 +1316,18 @@ mod tests {
         options.seed_config.screening_budget = 4;
         let heur = [1.0, 1.0, 1.0];
 
-        let seq = optimize_log_smoothing_with_multistart(
+        let seq = optimize_log_smoothingwithmultistart(
             3,
             Some(&heur),
-            |rho: &Array1<f64>| Ok(convex_value(rho)),
+            |rho: &Array1<f64>| Ok(convexvalue(rho)),
             &options,
         )
         .expect("sequential FD optimization should succeed");
 
-        let par = optimize_log_smoothing_with_multistart_parallel_fd(
+        let par = optimize_log_smoothingwithmultistart_parallelfd(
             3,
             Some(&heur),
-            |rho: &Array1<f64>| Ok(convex_value(rho)),
+            |rho: &Array1<f64>| Ok(convexvalue(rho)),
             &options,
         )
         .expect("parallel FD optimization should succeed");
@@ -1340,9 +1340,9 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_kind_arc_and_bfgs_agree_on_exact_gradient_problem() {
+    fn optimizer_kind_arc_and_bfgs_agree_on_exactgradient_problem() {
         let heur = [1.0, 1.0, 1.0];
-        let bfgs = optimize_log_smoothing_with_multistart_with_gradient(
+        let bfgs = optimize_log_smoothingwithmultistartwithgradient(
             3,
             Some(&heur),
             |rho: &Array1<f64>| {
@@ -1350,7 +1350,7 @@ mod tests {
                 g[0] = rho[0] - 0.7;
                 g[1] = 2.0 * (rho[1] + 1.1);
                 g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convex_value(rho), g))
+                Ok((convexvalue(rho), g))
             },
             &SmoothingBfgsOptions {
                 tol: 1e-8,
@@ -1361,7 +1361,7 @@ mod tests {
         )
         .expect("bfgs exact-gradient optimization should succeed");
 
-        let arc = optimize_log_smoothing_with_multistart_with_gradient(
+        let arc = optimize_log_smoothingwithmultistartwithgradient(
             3,
             Some(&heur),
             |rho: &Array1<f64>| {
@@ -1369,7 +1369,7 @@ mod tests {
                 g[0] = rho[0] - 0.7;
                 g[1] = 2.0 * (rho[1] + 1.1);
                 g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convex_value(rho), g))
+                Ok((convexvalue(rho), g))
             },
             &SmoothingBfgsOptions {
                 tol: 1e-8,

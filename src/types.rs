@@ -184,7 +184,7 @@ pub struct RidgePolicy {
     /// Include ridge in penalty determinant term (e.g. `log|S_lambda + delta I|`).
     pub include_penalty_logdet: bool,
     /// Include ridge in Hessian used by Laplace term / implicit differentiation.
-    pub include_laplace_hessian: bool,
+    pub include_laplacehessian: bool,
     /// Determinant evaluation mode when ridge participates in logdet terms.
     pub determinant_mode: RidgeDeterminantMode,
 }
@@ -197,7 +197,7 @@ impl RidgePolicy {
             rho_independent: true,
             include_quadratic_penalty: true,
             include_penalty_logdet: true,
-            include_laplace_hessian: true,
+            include_laplacehessian: true,
             determinant_mode: RidgeDeterminantMode::Full,
         }
     }
@@ -248,8 +248,8 @@ impl RidgePassport {
     }
 
     #[inline]
-    pub fn laplace_hessian_ridge(self) -> f64 {
-        if self.policy.include_laplace_hessian {
+    pub fn laplacehessianridge(self) -> f64 {
+        if self.policy.include_laplacehessian {
             self.delta
         } else {
             0.0

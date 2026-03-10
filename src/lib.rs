@@ -1,4 +1,6 @@
+#![deny(warnings)]
 #![deny(dead_code)]
+#![deny(unused_variables)]
 #![deny(unused_imports)]
 
 pub mod families;
@@ -33,13 +35,13 @@ pub use families::gamlss::{
     BlockwiseTermFitResult, BlockwiseTermWiggleFitResult, FamilyMetadata, GammaLogFamily,
     GammaLogSpec, GaussianLocationScaleFamily, GaussianLocationScaleSpec,
     GaussianLocationScaleTermSpec, ParameterBlockInput, ParameterLink, PoissonLogFamily,
-    PoissonLogSpec, WiggleBlockConfig, build_wiggle_block_input_from_knots,
-    build_wiggle_block_input_from_seed, fit_binomial_location_scale,
-    fit_binomial_location_scale_terms, fit_binomial_location_scale_terms_workflow,
-    fit_binomial_location_scale_wiggle, fit_binomial_location_scale_wiggle_terms,
-    fit_binomial_location_scale_wiggle_terms_auto, fit_binomial_logit, fit_gamma_log,
+    PoissonLogSpec, WiggleBlockConfig, buildwiggle_block_input_from_knots,
+    buildwiggle_block_input_from_seed, fit_binomial_location_scale,
+    fit_binomial_location_scale_terms, fit_binomial_location_scale_termsworkflow,
+    fit_binomial_location_scalewiggle, fit_binomial_location_scalewiggle_terms,
+    fit_binomial_location_scalewiggle_terms_auto, fit_binomial_logit, fit_gamma_log,
     fit_gaussian_location_scale, fit_gaussian_location_scale_terms, fit_poisson_log,
-    initialize_wiggle_knots_from_seed,
+    initializewiggle_knots_from_seed,
 };
 pub use families::strategy::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
@@ -50,23 +52,23 @@ pub use families::survival_location_scale::{
     SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
     SurvivalLocationScaleSpec, TimeBlockInput, fit_survival_location_scale,
     predict_survival_location_scale, predict_survival_location_scale_posterior_mean,
-    predict_survival_location_scale_with_uncertainty,
+    predict_survival_location_scalewith_uncertainty,
 };
 pub use inference::alo::{
     AloDiagnostics, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
     compute_alo_diagnostics_from_pirls,
 };
 pub use inference::data::{
-    EncodedDataset, UnseenCategoryPolicy, encode_records_with_inferred_schema,
-    encode_records_with_schema, load_csv_with_inferred_schema, load_csv_with_schema,
+    EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
+    encode_recordswith_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
 pub use inference::formula_dsl::{
     CallArgSpec, FormulaDslParse, FunctionCallSpec, parse_formula_dsl, parse_function_call,
 };
 pub use inference::generative::{
-    CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generative_spec,
-    generative_spec_from_gam, generative_spec_from_predict, sample_observation_replicates,
-    sample_observations,
+    CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generativespec,
+    generativespec_from_gam, generativespec_from_predict, sampleobservation_replicates,
+    sampleobservations,
 };
 pub use inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, ModelKind, SchemaColumn,
@@ -74,9 +76,9 @@ pub use inference::model::{
 pub use solver::estimate::{
     CoefficientUncertaintyResult, FitArtifacts, FitOptions, FitResult, InferenceCovarianceMode,
     MeanIntervalMethod, PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions,
-    PredictUncertaintyResult, coefficient_uncertainty, coefficient_uncertainty_with_mode, fit_gam,
+    PredictUncertaintyResult, coefficient_uncertainty, coefficient_uncertaintywith_mode, fit_gam,
     optimize_external_design, predict_gam, predict_gam_posterior_mean,
-    predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
+    predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
@@ -98,8 +100,8 @@ pub use terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, TwoBlockMaternKappaOptimizationResult,
     TwoBlockSpatialLengthScaleOptimizationResult, build_smooth_design,
     build_term_collection_design, fit_term_collection,
-    fit_term_collection_with_matern_kappa_optimization,
-    fit_term_collection_with_spatial_length_scale_optimization, optimize_two_block_matern_kappa,
+    fit_term_collectionwith_matern_kappa_optimization,
+    fit_term_collectionwith_spatial_length_scale_optimization, optimize_two_block_matern_kappa,
     optimize_two_block_spatial_length_scale,
 };
 pub use types::{LikelihoodFamily, LinkFunction};

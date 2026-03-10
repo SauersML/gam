@@ -76,7 +76,7 @@ impl<'a> RemlState<'a> {
         F: FnMut(&Array2<f64>) -> Result<Array2<f64>, EstimationError>,
     {
         if let Some(sup) = support {
-            let mut workspace = sparse.trace_workspace.lock().unwrap();
+            let mut workspace = sparse.traceworkspace.lock().unwrap();
             self.trace_hinv_operator_sparse_exact(
                 &sparse.factor,
                 p,
@@ -110,7 +110,7 @@ impl<'a> RemlState<'a> {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
         })?;
         let pirls_result = bundle.pirls_result.as_ref();
-        let prior_cost = self.compute_soft_prior_cost(rho);
+        let priorcost = self.compute_soft_priorcost(rho);
         match self.sparse_exact_likelihood_structure() {
             SparseExactLikelihoodStructure::GaussianProfiledScale => {
                 let n = self.y.len() as f64;
@@ -123,7 +123,7 @@ impl<'a> RemlState<'a> {
                 let reml = dp_c / (2.0 * phi)
                     + 0.5 * (sparse.logdet_h - sparse.logdet_s_pos)
                     + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
-                Ok(reml + prior_cost)
+                Ok(reml + priorcost)
             }
             SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature => {
                 let mut penalised_ll =
@@ -138,7 +138,7 @@ impl<'a> RemlState<'a> {
                 let phi = 1.0;
                 let laml = penalised_ll + 0.5 * sparse.logdet_s_pos - 0.5 * sparse.logdet_h
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
-                Ok(-laml + prior_cost)
+                Ok(-laml + priorcost)
             }
         }
     }
@@ -193,10 +193,10 @@ impl<'a> RemlState<'a> {
         //
         // The code evaluates the same identity with the sign convention used
         // by the existing REML implementation:
-        //   trace_third = (X' (c ⊙ h))' v_k,
+        //   tracethird = (X' (c ⊙ h))' v_k,
         //   v_k = H^{-1} (S_k beta),
         // so that
-        //   lambda_k * (trace_s - trace_third)
+        //   lambda_k * (trace_s - tracethird)
         // reproduces tr(H^{-1} H_k) on the current sparse SPD surface.
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -229,16 +229,16 @@ impl<'a> RemlState<'a> {
                 let rss = pirls_result.deviance;
                 let penalty = pirls_result.stable_penalty_term;
                 let dp = rss + penalty;
-                let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
+                let (dp_c, dp_cgrad) = smooth_floor_dp(dp);
                 let scale = dp_c / (n - mp).max(LAML_RIDGE);
                 for block in sparse.penalty_blocks.iter() {
                     let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
                     let beta_term = lambdas[block.term_index] * beta.dot(&s_k_beta);
                     let trace_term = {
-                        let mut workspace = sparse.trace_workspace.lock().unwrap();
+                        let mut workspace = sparse.traceworkspace.lock().unwrap();
                         trace_hinv_sk(&sparse.factor, &mut workspace, block)?
                     };
-                    gradient[block.term_index] = dp_c_grad * (beta_term / (2.0 * scale))
+                    gradient[block.term_index] = dp_cgrad * (beta_term / (2.0 * scale))
                         + 0.5 * lambdas[block.term_index] * trace_term
                         - 0.5 * det1_values[block.term_index];
                 }
@@ -247,18 +247,18 @@ impl<'a> RemlState<'a> {
                 if let Some(op) = firth_op.as_ref() {
                     // Firth/logit sparse-exact gradient:
                     //   g_k = 0.5 β'A_kβ + 0.5 tr(H^{-1} H_k) - 0.5 tr(S_+^dag A_k),
-                    //   H_k = A_k + X' diag(c ⊙ X B_k) X - D(H_phi)[B_k].
+                    //   H_k = A_k + X' diag(c ⊙ X B_k) X - D(Hphi)[B_k].
                     let p_dim = self.p;
-                    let mut assembly_workspace = PirlsWorkspace::new(self.y.len(), p_dim, 0, 0);
+                    let mut assemblyworkspace = PirlsWorkspace::new(self.y.len(), p_dim, 0, 0);
                     for block in sparse.penalty_blocks.iter() {
                         let k = block.term_index;
                         let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
                         let a_kb = s_k_beta.mapv(|v| lambdas[k] * v);
                         let b_k = solve_sparse_spd(&sparse.factor, &a_kb.mapv(|v| -v))?;
-                        let z_k = self.x().matrix_vector_multiply(&b_k);
+                        let z_k = self.x().matrixvectormultiply(&b_k);
                         let mut h_k = self.s_full_list[k].mapv(|v| lambdas[k] * v);
                         let diag = &pirls_result.solve_c_array * &z_k;
-                        h_k += &self.xt_diag_x_original(&diag, &mut assembly_workspace)?;
+                        h_k += &self.xt_diag_x_original(&diag, &mut assemblyworkspace)?;
                         let dir_k = Self::firth_direction(op, &b_k);
                         h_k -= &Self::firth_hphi_direction(op, &dir_k);
                         let trace_hk = self.trace_hinv_operator_sparse_dispatch(
@@ -273,25 +273,25 @@ impl<'a> RemlState<'a> {
                 } else {
                     let leverages = leverages_from_factor(&sparse.factor, self.x())?;
                     let c_times_h = &pirls_result.solve_c_array * &leverages;
-                    let r_third = self.x().transpose_vector_multiply(&c_times_h);
+                    let rthird = self.x().transpose_vector_multiply(&c_times_h);
                     for block in sparse.penalty_blocks.iter() {
                         let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
                         let beta_term = lambdas[block.term_index] * beta.dot(&s_k_beta);
                         let v_k = solve_sparse_spd(&sparse.factor, &s_k_beta)?;
                         let trace_s = {
-                            let mut workspace = sparse.trace_workspace.lock().unwrap();
+                            let mut workspace = sparse.traceworkspace.lock().unwrap();
                             trace_hinv_sk(&sparse.factor, &mut workspace, block)?
                         };
-                        let trace_third = r_third.dot(&v_k);
+                        let tracethird = rthird.dot(&v_k);
                         gradient[block.term_index] = 0.5 * beta_term
-                            + 0.5 * lambdas[block.term_index] * (trace_s - trace_third)
+                            + 0.5 * lambdas[block.term_index] * (trace_s - tracethird)
                             - 0.5 * det1_values[block.term_index];
                     }
                 }
             }
         }
 
-        gradient += &self.compute_soft_prior_grad(rho);
+        gradient += &self.compute_soft_priorgrad(rho);
         Ok(gradient)
     }
 
@@ -363,7 +363,7 @@ impl<'a> RemlState<'a> {
                     block_cols
                 )));
             }
-            let solved = solve_sparse_spd_multi(factor, &direction_block)?;
+            let solved = solve_sparse_spdmulti(factor, &direction_block)?;
             for local_col in 0..block_cols {
                 let global_col = start + local_col;
                 trace += solved[[global_col, local_col]];
@@ -373,7 +373,7 @@ impl<'a> RemlState<'a> {
         Ok(trace)
     }
 
-    pub(super) fn sparse_exact_weighted_cross_trace_xtau(
+    pub(super) fn sparse_exactweighted_cross_trace_xtau(
         &self,
         factor: &SparseExactFactor,
         x_tau: &Array2<f64>,
@@ -401,7 +401,7 @@ impl<'a> RemlState<'a> {
         while start < n {
             let end = (start + batch).min(n);
             let rhs = x_tau.slice(s![start..end, ..]).t().to_owned();
-            let solved = solve_sparse_spd_multi(factor, &rhs)?;
+            let solved = solve_sparse_spdmulti(factor, &rhs)?;
             for local_col in 0..(end - start) {
                 let row = start + local_col;
                 let z_col = solved.column(local_col);
@@ -430,7 +430,7 @@ impl<'a> RemlState<'a> {
         Ok(total)
     }
 
-    pub(super) fn compute_directional_hyper_gradient_sparse_exact(
+    pub(super) fn compute_directional_hypergradient_sparse_exact(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -456,12 +456,12 @@ impl<'a> RemlState<'a> {
             && matches!(self.config.link_function(), LinkFunction::Logit);
 
         let beta = self.sparse_exact_beta_original(pirls_result);
-        let u = &pirls_result.solve_weights
-            * &(&pirls_result.solve_working_response - &pirls_result.final_eta);
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
 
         let x_tau_beta = hyper_dir.x_tau_original.dot(&beta);
         let s_tau_total = hyper_dir.penalty_total_at(rho, p)?;
-        let weighted_x_tau_beta = &pirls_result.solve_weights * &x_tau_beta;
+        let weighted_x_tau_beta = &pirls_result.solveweights * &x_tau_beta;
         let mut g_psi = hyper_dir.x_tau_original.t().dot(&u)
             - self.x().transpose_vector_multiply(&weighted_x_tau_beta)
             - s_tau_total.dot(&beta);
@@ -483,7 +483,7 @@ impl<'a> RemlState<'a> {
                 &beta,
                 need_tau_kernel,
             );
-            g_psi -= &tau_bundle.g_phi_tau;
+            g_psi -= &tau_bundle.gphi_tau;
             fit_firth_partial = tau_bundle.phi_tau_partial;
             if need_tau_kernel {
                 hphi_tau_kernel_opt = Some(tau_bundle.tau_kernel.expect(
@@ -494,7 +494,7 @@ impl<'a> RemlState<'a> {
         }
 
         let beta_tau = solve_sparse_spd(&sparse.factor, &g_psi)?;
-        let eta_tau = &x_tau_beta + &self.x().matrix_vector_multiply(&beta_tau);
+        let eta_tau = &x_tau_beta + &self.x().matrixvectormultiply(&beta_tau);
 
         let fit_block =
             -u.dot(&x_tau_beta) + 0.5 * beta.dot(&s_tau_total.dot(&beta)) + fit_firth_partial;
@@ -505,10 +505,10 @@ impl<'a> RemlState<'a> {
             None,
             |basis_block: &Array2<f64>| Ok(s_tau_total.dot(basis_block)),
         )?;
-        let cross = self.sparse_exact_weighted_cross_trace_xtau(
+        let cross = self.sparse_exactweighted_cross_trace_xtau(
             &sparse.factor,
             &hyper_dir.x_tau_original,
-            &pirls_result.solve_weights,
+            &pirls_result.solveweights,
         )?;
         let mut trace_h = trace_s_tau + 2.0 * cross;
 
@@ -537,11 +537,11 @@ impl<'a> RemlState<'a> {
             }
             SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature => {
                 let runtime_link = self.runtime_inverse_link();
-                let w_tau = crate::pirls::directional_working_curvature_from_eta_with_state(
+                let w_tau = crate::pirls::directionalworking_curvature_from_etawith_state(
                     &runtime_link,
                     &pirls_result.final_eta,
                     self.weights,
-                    &pirls_result.solve_weights,
+                    &pirls_result.solveweights,
                     &eta_tau,
                 )?;
                 let leverages = leverages_from_factor(&sparse.factor, self.x())?;
@@ -559,7 +559,7 @@ impl<'a> RemlState<'a> {
                 }
                 if let Some(op) = firth_op_opt.as_ref() {
                     // Fully matrix-free sparse trace for Firth curvature drift:
-                    //   tr(H^{-1}(H_{phi,tau}|beta + D(H_phi)[beta_tau])).
+                    //   tr(H^{-1}(H_{phi,tau}|beta + D(Hphi)[beta_tau])).
                     // We avoid dense p×p directional matrix materialization by
                     // applying both operators to identity blocks on demand.
                     let firth_dir = Self::firth_direction(op, &beta_tau);
@@ -618,7 +618,7 @@ impl<'a> RemlState<'a> {
                     "failed to build CSR cache for sparse exact Hessian".to_string(),
                 )
             })?;
-            workspace.compute_hessian_sparse_faer(csr.as_ref(), diag)
+            workspace.computehessian_sparse_faer(csr.as_ref(), diag)
         } else {
             let x_dense = self.x().as_dense().ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -630,7 +630,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn compute_laml_hessian_sparse_exact(
+    pub(super) fn compute_lamlhessian_sparse_exact(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -744,7 +744,7 @@ impl<'a> RemlState<'a> {
         }
 
         let p_dim = self.p;
-        let n_obs = self.y.len();
+        let nobs = self.y.len();
         let matrix_slots = (k_count as u128)
             .saturating_mul(p_dim as u128)
             .saturating_mul(p_dim as u128)
@@ -768,10 +768,10 @@ impl<'a> RemlState<'a> {
         // so they are exactly the information corresponding to -ℓ''' / -ℓ''''.
         let c = &pirls_result.solve_c_array;
         let d = &pirls_result.solve_d_array;
-        if c.len() != n_obs || d.len() != n_obs {
+        if c.len() != nobs || d.len() != nobs {
             return Err(EstimationError::InvalidInput(format!(
                 "Sparse exact outer Hessian derivative arrays size mismatch: n={}, c.len()={}, d.len()={}",
-                n_obs,
+                nobs,
                 c.len(),
                 d.len()
             )));
@@ -793,7 +793,7 @@ impl<'a> RemlState<'a> {
             None
         };
         let leverages = leverages_from_factor(&sparse.factor, self.x())?;
-        let mut trace_hinv_sk_values = vec![0.0_f64; k_count];
+        let mut trace_hinv_skvalues = vec![0.0_f64; k_count];
         let mut a_k_beta = Vec::with_capacity(k_count);
         let mut b_k = Vec::with_capacity(k_count);
         let mut z_k = Vec::with_capacity(k_count);
@@ -813,9 +813,9 @@ impl<'a> RemlState<'a> {
             let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
             let a_kb = s_k_beta.mapv(|v| lambdas[k] * v);
             let b = solve_sparse_spd(&sparse.factor, &a_kb.mapv(|v| -v))?;
-            let z = self.x().matrix_vector_multiply(&b);
+            let z = self.x().matrixvectormultiply(&b);
 
-            // H_k = A_k + X' diag(c ⊙ z_k) X - D(H_phi)[B_k].
+            // H_k = A_k + X' diag(c ⊙ z_k) X - D(Hphi)[B_k].
             let diag = &pirls_result.solve_c_array * &z;
             if let Some(op) = firth_op.as_ref() {
                 let dir_k = Self::firth_direction(op, &b);
@@ -828,8 +828,8 @@ impl<'a> RemlState<'a> {
             // tr(H^{-1} A_k) is the delta_{k,l} piece inside tr(H^{-1} H_{k,l}).
             q_diag[k] = beta.dot(&a_kb);
             {
-                let mut workspace = sparse.trace_workspace.lock().unwrap();
-                trace_hinv_sk_values[k] =
+                let mut workspace = sparse.traceworkspace.lock().unwrap();
+                trace_hinv_skvalues[k] =
                     lambdas[k] * trace_hinv_sk(&sparse.factor, &mut workspace, block)?;
             }
             a_k_beta.push(a_kb);
@@ -860,7 +860,7 @@ impl<'a> RemlState<'a> {
                     let v = basis_block.column(col).to_owned();
                     let mut col_out =
                         sparse_matvec_public(&block_k.s_k_sparse, &v).mapv(|x| lambdas[k_term] * x);
-                    let xv = self.x().matrix_vector_multiply(&v);
+                    let xv = self.x().matrixvectormultiply(&v);
                     let wxv = &xv * &s_diag[k_term];
                     col_out += &self.x().transpose_vector_multiply(&wxv);
                     out.column_mut(col).assign(&col_out);
@@ -907,7 +907,7 @@ impl<'a> RemlState<'a> {
                         rhs_bkl += &a_k_beta[k];
                     }
                     let b_kl = solve_sparse_spd(&sparse.factor, &rhs_bkl.mapv(|v| -v))?;
-                    let z_kl = self.x().matrix_vector_multiply(&b_kl);
+                    let z_kl = self.x().matrixvectormultiply(&b_kl);
 
                     // H_{k,l} = A_{k,l} + X' diag(d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}) X.
                     // The linear trace contribution is
@@ -947,13 +947,13 @@ impl<'a> RemlState<'a> {
                                 // Matrix-free X' diag(hkl_diag) X * basis_block
                                 for col in 0..basis_block.ncols() {
                                     let v = basis_block.column(col).to_owned();
-                                    let xv = self.x().matrix_vector_multiply(&v);
+                                    let xv = self.x().matrixvectormultiply(&v);
                                     let wxv = &xv * &hkl_diag;
                                     let col_out = self.x().transpose_vector_multiply(&wxv);
                                     out.column_mut(col).scaled_add(1.0, &col_out);
                                 }
                                 out -= &Self::firth_hphi_direction_apply(op, &dir_kl, basis_block);
-                                out -= &Self::firth_hphi_second_direction_apply(
+                                out -= &Self::firth_hphisecond_direction_apply(
                                     op,
                                     &dirs[k],
                                     &dirs[l],
@@ -963,7 +963,7 @@ impl<'a> RemlState<'a> {
                             },
                         )?
                     } else {
-                        (if k == l { trace_hinv_sk_values[k] } else { 0.0 })
+                        (if k == l { trace_hinv_skvalues[k] } else { 0.0 })
                             + leverages.dot(&hkl_diag)
                     };
 
@@ -977,7 +977,7 @@ impl<'a> RemlState<'a> {
                         None,
                         |basis_block| {
                             let hk_basis = apply_hk_block(k, basis_block)?;
-                            let y = solve_sparse_spd_multi(&sparse.factor, &hk_basis)?;
+                            let y = solve_sparse_spdmulti(&sparse.factor, &hk_basis)?;
                             apply_hk_block(l, &y)
                         },
                     )?;
@@ -997,11 +997,11 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        self.add_soft_prior_hessian_in_place(rho, &mut hess);
+        self.add_soft_priorhessian_in_place(rho, &mut hess);
         Ok(hess)
     }
 
-    pub(crate) fn last_ridge_used(&self) -> Option<f64> {
+    pub(crate) fn lastridge_used(&self) -> Option<f64> {
         self.cache_manager
             .current_eval_bundle
             .read()
@@ -1016,15 +1016,15 @@ impl<'a> RemlState<'a> {
         bundle.backend_kind()
     }
 
-    pub(super) fn select_hessian_strategy_policy(
+    pub(super) fn selecthessian_strategy_policy(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> HessianStrategyDecision {
-        if self.uses_objective_consistent_fd_gradient(rho) {
+        if self.usesobjective_consistentfdgradient(rho) {
             return HessianStrategyDecision {
                 strategy: HessianEvalStrategyKind::DiagnosticNumeric,
-                reason: "objective_consistent_numeric_gradient",
+                reason: "objective_consistent_numericgradient",
             };
         }
         if bundle.active_subspace_unstable {
@@ -1043,23 +1043,23 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn compute_laml_hessian_by_strategy(
+    pub(super) fn compute_lamlhessian_by_strategy(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         decision: HessianStrategyDecision,
     ) -> Result<Array2<f64>, EstimationError> {
         match decision.strategy {
-            HessianEvalStrategyKind::SpectralExact => self.compute_laml_hessian_exact(rho),
+            HessianEvalStrategyKind::SpectralExact => self.compute_lamlhessian_exact(rho),
             HessianEvalStrategyKind::AnalyticFallback => {
-                self.compute_laml_hessian_analytic_fallback(rho, Some(bundle))
+                self.compute_lamlhessian_analytic_fallback(rho, Some(bundle))
             }
             HessianEvalStrategyKind::DiagnosticNumeric => {
                 log::warn!(
                     "Using diagnostic numeric Hessian strategy routing (reason={}); dispatching to deterministic analytic fallback.",
                     decision.reason
                 );
-                self.compute_laml_hessian_analytic_fallback(rho, Some(bundle))
+                self.compute_lamlhessian_analytic_fallback(rho, Some(bundle))
             }
         }
     }

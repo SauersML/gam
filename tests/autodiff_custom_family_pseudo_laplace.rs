@@ -26,37 +26,37 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
         let resid = beta - self.target;
         Ok(FamilyEvaluation {
             log_likelihood: -resid * resid,
-            block_working_sets: vec![BlockWorkingSet::ExactNewton {
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
                 gradient: array![-2.0 * resid],
                 hessian: SymmetricMatrix::Dense(array![[2.0]]),
             }],
         })
     }
 
-    fn exact_newton_outer_objective(&self) -> ExactNewtonOuterObjective {
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
         ExactNewtonOuterObjective::PseudoLaplace
     }
 
     fn exact_newton_joint_hessian(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _d_beta: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _d_beta_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
@@ -76,37 +76,37 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         let resid = beta - self.psi;
         Ok(FamilyEvaluation {
             log_likelihood: -(resid * resid + 0.25 * self.psi * self.psi),
-            block_working_sets: vec![BlockWorkingSet::ExactNewton {
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
                 gradient: array![-2.0 * resid],
                 hessian: SymmetricMatrix::Dense(array![[2.0]]),
             }],
         })
     }
 
-    fn exact_newton_outer_objective(&self) -> ExactNewtonOuterObjective {
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
         ExactNewtonOuterObjective::PseudoLaplace
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _d_beta: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _d_beta_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
@@ -114,9 +114,9 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _psi_index: usize,
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let beta = block_states
             .first()
@@ -130,7 +130,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
     }
 }
 
-fn scalar_pseudo_laplace_rho_objective_numdual<D: DualNum<f64> + Copy>(rho: D, target: f64) -> D {
+fn scalar_pseudo_laplace_rhoobjective_numdual<D: DualNum<f64> + Copy>(rho: D, target: f64) -> D {
     let lambda = rho.exp();
     let beta_hat = D::from(2.0 * target) / (D::from(2.0) + lambda);
     let resid = beta_hat - D::from(target);
@@ -139,23 +139,23 @@ fn scalar_pseudo_laplace_rho_objective_numdual<D: DualNum<f64> + Copy>(rho: D, t
         + D::from(0.5) * (D::from(2.0) + lambda).ln()
 }
 
-fn scalar_pseudo_laplace_psi_objective_numdual<D: DualNum<f64> + Copy>(psi: D) -> D {
+fn scalar_pseudo_laplace_psiobjective_numdual<D: DualNum<f64> + Copy>(psi: D) -> D {
     D::from(0.25) * psi * psi + D::from(0.5) * D::from(2.0).ln()
 }
 
-fn scalar_pseudo_laplace_rho_objective_f64(rho: f64, target: f64) -> f64 {
+fn scalar_pseudo_laplace_rhoobjective_f64(rho: f64, target: f64) -> f64 {
     let lambda = rho.exp();
     let beta_hat = 2.0 * target / (2.0 + lambda);
     let resid = beta_hat - target;
     resid * resid + 0.5 * lambda * beta_hat * beta_hat + 0.5 * (2.0 + lambda).ln()
 }
 
-fn scalar_pseudo_laplace_psi_objective_f64(psi: f64) -> f64 {
+fn scalar_pseudo_laplace_psiobjective_f64(psi: f64) -> f64 {
     0.25 * psi * psi + 0.5 * 2.0_f64.ln()
 }
 
 #[test]
-fn exact_newton_pseudo_laplace_rho_gradient_matches_num_dual_band() {
+fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
     let spec = ParameterBlockSpec {
         name: "rho_block".to_string(),
         design: gam::matrix::DesignMatrix::Dense(array![[1.0]]),
@@ -166,7 +166,7 @@ fn exact_newton_pseudo_laplace_rho_gradient_matches_num_dual_band() {
     };
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
     let options = BlockwiseFitOptions {
-        use_reml_objective: true,
+        use_remlobjective: true,
         compute_covariance: false,
         ridge_floor: 1e-12,
         ..BlockwiseFitOptions::default()
@@ -186,13 +186,13 @@ fn exact_newton_pseudo_laplace_rho_gradient_matches_num_dual_band() {
         )
         .expect("pseudo-laplace rho hyper eval");
         let (value_nd, grad_nd) = first_derivative(
-            |x| scalar_pseudo_laplace_rho_objective_numdual(x, family.target),
+            |x| scalar_pseudo_laplace_rhoobjective_numdual(x, family.target),
             rho,
         );
-        let value_f64 = scalar_pseudo_laplace_rho_objective_f64(rho, family.target);
+        let value_f64 = scalar_pseudo_laplace_rhoobjective_f64(rho, family.target);
         let h = 1e-6;
-        let grad_fd = (scalar_pseudo_laplace_rho_objective_f64(rho + h, family.target)
-            - scalar_pseudo_laplace_rho_objective_f64(rho - h, family.target))
+        let gradfd = (scalar_pseudo_laplace_rhoobjective_f64(rho + h, family.target)
+            - scalar_pseudo_laplace_rhoobjective_f64(rho - h, family.target))
             / (2.0 * h);
         assert!(
             (result.objective - value_nd).abs() < 5e-12,
@@ -207,13 +207,13 @@ fn exact_newton_pseudo_laplace_rho_gradient_matches_num_dual_band() {
             "gradient",
             result.gradient[0],
             "num_dual" => grad_nd,
-            "fd" => grad_fd
+            "fd" => gradfd
         );
     }
 }
 
 #[test]
-fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
+fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
     let spec = ParameterBlockSpec {
         name: "psi_block".to_string(),
         design: gam::matrix::DesignMatrix::Dense(array![[1.0]]),
@@ -233,7 +233,7 @@ fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
     };
     let derivative_blocks = vec![vec![deriv]];
     let options = BlockwiseFitOptions {
-        use_reml_objective: true,
+        use_remlobjective: true,
         compute_covariance: false,
         ridge_floor: 1e-12,
         ..BlockwiseFitOptions::default()
@@ -253,11 +253,11 @@ fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
         )
         .expect("pseudo-laplace psi hyper eval");
         let (value_nd, grad_nd) =
-            first_derivative(scalar_pseudo_laplace_psi_objective_numdual, psi);
-        let value_f64 = scalar_pseudo_laplace_psi_objective_f64(psi);
+            first_derivative(scalar_pseudo_laplace_psiobjective_numdual, psi);
+        let value_f64 = scalar_pseudo_laplace_psiobjective_f64(psi);
         let h = 1e-6;
-        let grad_fd = (scalar_pseudo_laplace_psi_objective_f64(psi + h)
-            - scalar_pseudo_laplace_psi_objective_f64(psi - h))
+        let gradfd = (scalar_pseudo_laplace_psiobjective_f64(psi + h)
+            - scalar_pseudo_laplace_psiobjective_f64(psi - h))
             / (2.0 * h);
         assert!(
             (result.objective - value_nd).abs() < 5e-12,
@@ -272,7 +272,7 @@ fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
             "gradient",
             result.gradient[0],
             "num_dual" => grad_nd,
-            "fd" => grad_fd
+            "fd" => gradfd
         );
     }
 }

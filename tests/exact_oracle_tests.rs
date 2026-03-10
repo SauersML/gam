@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, array};
 
-use gam::estimate::{ExternalOptimOptions, evaluate_external_gradients};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
 use gam::types::LikelihoodFamily;
 
 #[inline]
@@ -113,7 +113,7 @@ fn exact_logit_oracle_eval_rho_2d(
     }
 }
 
-fn exact_logit_oracle_grad_fd_rho_2d(
+fn exact_logit_oraclegradfd_rho_2d(
     y: &Array1<f64>,
     x: &Array2<f64>,
     rho: f64,
@@ -125,7 +125,7 @@ fn exact_logit_oracle_grad_fd_rho_2d(
     (lp - lm) / h
 }
 
-fn laml_gradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f64 {
+fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f64 {
     let w = Array1::ones(y.len());
     let offset = Array1::zeros(y.len());
     let s_list = vec![Array2::eye(2)];
@@ -142,7 +142,7 @@ fn laml_gradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f
         firth_bias_reduction: None,
     };
     let rho_arr = array![rho];
-    let (analytic_grad, _fd_grad) = evaluate_external_gradients(
+    let (analytic_grad, fdgrad) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.clone(),
@@ -161,42 +161,42 @@ fn rel_err(a: f64, b: f64) -> f64 {
 }
 
 #[test]
-fn tiny_logit_oracle_gradient_identity_matches_fd_of_log_evidence() {
+fn tiny_logit_oraclegradient_identity_matchesfd_of_log_evidence() {
     let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
     let y = array![0.0, 1.0, 1.0];
     let cfg = OracleConfig::default();
     for rho in [-0.5, 0.0, 0.25, 0.8] {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-        let g_fd = exact_logit_oracle_grad_fd_rho_2d(&y, &x, rho, cfg);
-        let rel = (g_exact - g_fd).abs() / g_fd.abs().max(1e-8);
+        let gfd = exact_logit_oraclegradfd_rho_2d(&y, &x, rho, cfg);
+        let rel = (g_exact - gfd).abs() / gfd.abs().max(1e-8);
         assert_eq!(
             g_exact.signum(),
-            g_fd.signum(),
-            "oracle sign mismatch at rho={:.3}: g_exact={:.6e}, g_fd={:.6e}",
+            gfd.signum(),
+            "oracle sign mismatch at rho={:.3}: g_exact={:.6e}, gfd={:.6e}",
             rho,
             g_exact,
-            g_fd
+            gfd
         );
         assert!(
             rel < 2.5e-2,
-            "oracle identity mismatch at rho={:.3}: g_exact={:.6e}, g_fd={:.6e}, rel={:.3e}",
+            "oracle identity mismatch at rho={:.3}: g_exact={:.6e}, gfd={:.6e}, rel={:.3e}",
             rho,
             g_exact,
-            g_fd,
+            gfd,
             rel
         );
     }
 }
 
 #[test]
-fn tiny_logit_laml_vs_exact_oracle_regular_regime() {
+fn tiny_logit_lamlvs_exact_oracle_regular_regime() {
     let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
     let y = array![0.0, 1.0, 1.0];
     let cfg = OracleConfig::default();
 
     for rho in [-0.4, 0.0, 0.4] {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-        let g_laml = laml_gradient_external_logit(&y, &x, rho);
+        let g_laml = lamlgradient_external_logit(&y, &x, rho);
         let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
         assert!(g_laml.is_finite() && g_exact.is_finite());
         assert_eq!(
@@ -219,7 +219,7 @@ fn tiny_logit_laml_vs_exact_oracle_regular_regime() {
 }
 
 #[test]
-fn tiny_logit_laml_vs_exact_oracle_regular_regime_sweep_is_stable() {
+fn tiny_logit_lamlvs_exact_oracle_regular_regime_sweep_is_stable() {
     let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
     let y = array![0.0, 1.0, 1.0];
     let cfg = OracleConfig::default();
@@ -229,7 +229,7 @@ fn tiny_logit_laml_vs_exact_oracle_regular_regime_sweep_is_stable() {
     let mut rels = Vec::new();
     for rho in [-0.6, -0.3, 0.0, 0.3, 0.6] {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-        let g_laml = laml_gradient_external_logit(&y, &x, rho);
+        let g_laml = lamlgradient_external_logit(&y, &x, rho);
         assert!(g_exact.is_finite() && g_laml.is_finite());
         g_exacts.push(g_exact);
         g_lamls.push(g_laml);
@@ -265,7 +265,7 @@ fn tiny_logit_laml_vs_exact_oracle_regular_regime_sweep_is_stable() {
 }
 
 #[test]
-fn tiny_logit_laml_vs_exact_oracle_near_separation_stress() {
+fn tiny_logit_lamlvs_exact_oracle_near_separation_stress() {
     // Deliberately near-separable toy design. The point is to track discrepancy
     // behavior under stress, not to enforce tight approximation.
     let x = array![[1.0, -6.0], [1.0, 0.2], [1.0, 5.8]];
@@ -278,7 +278,7 @@ fn tiny_logit_laml_vs_exact_oracle_near_separation_stress() {
     let mut worst_rel = 0.0_f64;
     for rho in [-0.6, 0.0, 0.8] {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-        let g_laml = laml_gradient_external_logit(&y, &x, rho);
+        let g_laml = lamlgradient_external_logit(&y, &x, rho);
         let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
         worst_rel = worst_rel.max(rel_err);
         assert!(g_laml.is_finite() && g_exact.is_finite());
@@ -301,7 +301,7 @@ fn tiny_logit_laml_vs_exact_oracle_near_separation_stress() {
 }
 
 #[test]
-fn tiny_logit_laml_vs_exact_oracle_stress_sweep_direction_consistent() {
+fn tiny_logit_lamlvs_exact_oracle_stress_sweep_direction_consistent() {
     let x = array![[1.0, -6.0], [1.0, 0.2], [1.0, 5.8]];
     let y = array![0.0, 0.0, 1.0];
     let cfg = OracleConfig {
@@ -313,7 +313,7 @@ fn tiny_logit_laml_vs_exact_oracle_stress_sweep_direction_consistent() {
     let mut worst_rel = 0.0_f64;
     for rho in [-0.8, -0.3, 0.2, 0.7, 1.2] {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-        let g_laml = laml_gradient_external_logit(&y, &x, rho);
+        let g_laml = lamlgradient_external_logit(&y, &x, rho);
         if g_exact.is_finite() && g_laml.is_finite() {
             if g_exact.abs() > 1e-8 && g_laml.abs() > 1e-8 && g_exact.signum() != g_laml.signum() {
                 mismatches += 1;
@@ -333,13 +333,13 @@ fn tiny_logit_laml_vs_exact_oracle_stress_sweep_direction_consistent() {
 }
 
 #[test]
-fn test_laml_gradient_exact_formula_ground_truth() {
+fn test_lamlgradient_exact_formula_ground_truth() {
     let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
     let y = array![0.0, 1.0, 1.0];
     let cfg = OracleConfig::default();
     let rho = 0.0;
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-    let g_laml = laml_gradient_external_logit(&y, &x, rho);
+    let g_laml = lamlgradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
     assert_eq!(g_laml.signum(), g_exact.signum());
     assert!(
@@ -349,7 +349,7 @@ fn test_laml_gradient_exact_formula_ground_truth() {
 }
 
 #[test]
-fn test_laml_gradient_firth_exact_formula_ground_truth() {
+fn test_lamlgradient_firth_exact_formula_ground_truth() {
     let x = array![[1.0, -6.0], [1.0, 0.2], [1.0, 5.8]];
     let y = array![0.0, 0.0, 1.0];
     let cfg = OracleConfig {
@@ -358,7 +358,7 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
     };
     let rho = 0.0;
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-    let g_laml = laml_gradient_external_logit(&y, &x, rho);
+    let g_laml = lamlgradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
     assert_eq!(g_laml.signum(), g_exact.signum());
     assert!(
@@ -368,7 +368,7 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
 }
 
 #[test]
-fn test_external_gradient_adapter_isolated_matches_fd_direction() {
+fn test_externalgradient_adapter_isolated_matchesfd_direction() {
     let n = 96usize;
     let p = 7usize;
     let mut x = Array2::<f64>::zeros((n, p));
@@ -416,7 +416,7 @@ fn test_external_gradient_adapter_isolated_matches_fd_direction() {
         firth_bias_reduction: None,
     };
     let rho = array![1.5, 0.8];
-    let (analytic, fd) = evaluate_external_gradients(
+    let (analytic, fd) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),

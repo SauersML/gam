@@ -135,8 +135,8 @@ impl<'a> RemlState<'a> {
             let s_kr = u1.t().dot(&s_k_full[k]).dot(&u1);
             // Solve S_r * Y_k = S_{k,r} and use tr(Y_k) = tr(S_r^{-1} S_{k,r}).
             let mut y_k = s_kr.clone();
-            let mut y_k_view = array2_to_mat_mut(&mut y_k);
-            s_r_factor.solve_in_place(y_k_view.as_mut());
+            let mut y_kview = array2_to_matmut(&mut y_k);
+            s_r_factor.solve_in_place(y_kview.as_mut());
             let tr = kahan_sum((0..rank).map(|i| y_k[[i, i]]));
             // A_k = λ_k S_k => tr(S_+^† A_k) = λ_k tr(S_+^† S_k).
             det1[k] = lambdas[k] * tr;
@@ -166,7 +166,7 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
-    pub(super) fn compute_laml_hessian_analytic_fallback(
+    pub(super) fn compute_lamlhessian_analytic_fallback(
         &self,
         rho: &Array1<f64>,
         bundle_hint: Option<&EvalShared>,
@@ -219,7 +219,7 @@ impl<'a> RemlState<'a> {
             &pirls_result.reparam_result.e_transformed,
             pirls_result.ridge_passport,
         )?;
-        let (_det1, det2) = self.structural_penalty_logdet_derivatives(
+        let (_, det2) = self.structural_penalty_logdet_derivatives(
             &pirls_result.reparam_result.rs_transformed,
             &lambdas,
             structural_rank,
@@ -227,7 +227,7 @@ impl<'a> RemlState<'a> {
         )?;
         h += &det2.mapv(|v| -0.5 * v);
 
-        self.add_soft_prior_hessian_in_place(rho, &mut h);
+        self.add_soft_priorhessian_in_place(rho, &mut h);
 
         // Always return a numerically strict PD matrix for downstream Newton/
         // covariance uses in fallback regimes.
@@ -257,7 +257,7 @@ impl<'a> RemlState<'a> {
         Ok(h)
     }
 
-    pub(crate) fn compute_laml_hessian_consistent(
+    pub(crate) fn compute_lamlhessian_consistent(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
@@ -265,7 +265,7 @@ impl<'a> RemlState<'a> {
         // - policy decides spectral exact vs analytic fallback vs diagnostic numeric,
         // - math kernels remain strategy-local.
         let bundle = self.obtain_eval_bundle(rho)?;
-        let decision = self.select_hessian_strategy_policy(rho, &bundle);
+        let decision = self.selecthessian_strategy_policy(rho, &bundle);
         if decision.strategy != HessianEvalStrategyKind::SpectralExact {
             if decision.reason == "active_subspace_unstable" {
                 let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
@@ -280,27 +280,27 @@ impl<'a> RemlState<'a> {
                     decision.reason
                 );
             }
-            return self.compute_laml_hessian_by_strategy(rho, &bundle, decision);
+            return self.compute_lamlhessian_by_strategy(rho, &bundle, decision);
         }
-        match self.compute_laml_hessian_by_strategy(rho, &bundle, decision) {
+        match self.compute_lamlhessian_by_strategy(rho, &bundle, decision) {
             Ok(h) => Ok(h),
             Err(err) => {
                 log::warn!(
                     "Exact LAML Hessian unavailable ({}); using analytic fallback Hessian.",
                     err
                 );
-                self.compute_laml_hessian_analytic_fallback(rho, Some(&bundle))
+                self.compute_lamlhessian_analytic_fallback(rho, Some(&bundle))
             }
         }
     }
 
-    pub(crate) fn compute_laml_hessian_exact(
+    pub(crate) fn compute_lamlhessian_exact(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
-            return self.compute_laml_hessian_sparse_exact(rho, &bundle);
+            return self.compute_lamlhessian_sparse_exact(rho, &bundle);
         }
         // Full derivation for the dense transformed exact outer Hessian.
         //
@@ -327,9 +327,9 @@ impl<'a> RemlState<'a> {
         //
         // Let
         //
-        //   H = dG/dbeta = -ell_{beta,beta} + S(rho) - H_phi
-        //     = X'WX + S(rho) - H_phi
-        //   H_phi = d²Phi/dbeta²
+        //   H = dG/dbeta = -ell_{beta,beta} + S(rho) - Hphi
+        //     = X'WX + S(rho) - Hphi
+        //   Hphi = d²Phi/dbeta²
         //
         // denote the inner Hessian on the current geometry. In the dense
         // transformed path this is the active transformed Hessian `h_total`.
@@ -369,11 +369,11 @@ impl<'a> RemlState<'a> {
         //       + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
         //
         // and Firth adds exactly:
-        //   H_k  <- H_k  - D(H_phi)[B_k]
-        //   H_kl <- H_kl - D(H_phi)[B_kl] - D²(H_phi)[B_k,B_l].
+        //   H_k  <- H_k  - D(Hphi)[B_k]
+        //   H_kl <- H_kl - D(Hphi)[B_kl] - D²(Hphi)[B_k,B_l].
         //
         // Here `c` and `d` are (`solve_c_array`, `solve_d_array`), and
-        // D(H_phi), D²(H_phi) are evaluated by reduced-space exact operators.
+        // D(Hphi), D²(Hphi) are evaluated by reduced-space exact operators.
         //
         // Outer objective:
         //
@@ -476,7 +476,7 @@ impl<'a> RemlState<'a> {
         let mut e_eval = reparam_result.e_transformed.clone();
 
         if let Some(z) = free_basis_opt.as_ref() {
-            h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             rs_eval = reparam_result
                 .rs_transformed
@@ -498,20 +498,20 @@ impl<'a> RemlState<'a> {
         // This keeps IFT solves (B_k, B_kl) on the same spectral surface as
         // pseudo-logdet derivatives tr(H_+^dagger *), improving exactness near
         // weakly identified directions and avoiding ridge-surface mismatch.
-        let h_pos_w_for_solve =
-            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
-                Some(bundle.h_pos_factor_w.as_ref().clone())
+        let h_posw_for_solve =
+            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == p_dim {
+                Some(bundle.h_pos_factorw.as_ref().clone())
             } else {
                 None
             };
-        let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
+        let h_posw_for_solve_t = h_posw_for_solve.as_ref().map(|w| w.t().to_owned());
         let use_cached_factor = free_basis_opt.is_none();
-        let h_factor_cached = if h_pos_w_for_solve.is_none() && use_cached_factor {
+        let h_factor_cached = if h_posw_for_solve.is_none() && use_cached_factor {
             Some(self.get_faer_factor(rho, h_total))
         } else {
             None
         };
-        let h_factor_local = if h_pos_w_for_solve.is_none() && !use_cached_factor {
+        let h_factor_local = if h_posw_for_solve.is_none() && !use_cached_factor {
             Some(self.factorize_faer(h_total))
         } else {
             None
@@ -520,17 +520,17 @@ impl<'a> RemlState<'a> {
             if rhs.ncols() == 0 {
                 return rhs.clone();
             }
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }
             let mut out = rhs.clone();
-            let mut out_view = array2_to_mat_mut(&mut out);
+            let mut outview = array2_to_matmut(&mut out);
             if let Some(f) = h_factor_cached.as_ref() {
-                f.solve_in_place(out_view.as_mut());
+                f.solve_in_place(outview.as_mut());
             } else if let Some(f) = h_factor_local.as_ref() {
-                f.solve_in_place(out_view.as_mut());
+                f.solve_in_place(outview.as_mut());
             }
             out
         };
@@ -564,7 +564,7 @@ impl<'a> RemlState<'a> {
                     hess[[k, l]] = -0.5 * d2logs[[k, l]];
                 }
             }
-            self.add_soft_prior_hessian_in_place(rho, &mut hess);
+            self.add_soft_priorhessian_in_place(rho, &mut hess);
             return Ok(hess);
         }
         let c = &pirls_result.solve_c_array;
@@ -585,9 +585,9 @@ impl<'a> RemlState<'a> {
             // on a single, internally consistent nonlinear state.
             // Math mapping:
             //   Phi(beta)=0.5 log|I_r(beta)|, I_r=X_r' W(beta) X_r,
-            //   H_phi = d^2 Phi / d beta^2,
-            // and H_k/H_kl include -D(H_phi)[B_k], -D(H_phi)[B_kl],
-            // -D^2(H_phi)[B_k,B_l] exactly.
+            //   Hphi = d^2 Phi / d beta^2,
+            // and H_k/H_kl include -D(Hphi)[B_k], -D(Hphi)[B_kl],
+            // -D^2(Hphi)[B_k,B_l] exactly.
             if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                 Some(cached.as_ref().clone())
             } else {
@@ -676,18 +676,14 @@ impl<'a> RemlState<'a> {
             })
             .collect();
 
-        let _recommended_trace_backend = Self::select_trace_backend(n, p_dim, k_count);
         // Exact-only trace backend for Hessian assembly.
         //
         // This keeps all L_{k,l} contractions deterministic and analytic
-        // (no Hutchinson/Hutch++) across both Firth and non-Firth paths.
-        let trace_backend = TraceBackend::Exact;
-        let (exact_trace_mode, n_probe, n_sketch) = match trace_backend {
-            TraceBackend::Exact => (true, 0usize, 0usize),
-            TraceBackend::Hutchinson { probes } => (false, probes.max(1), 0usize),
-            TraceBackend::HutchPP { probes, sketch } => (false, probes.max(1), sketch.max(1)),
-        };
-        let use_hutchpp = matches!(trace_backend, TraceBackend::HutchPP { .. });
+        // across both Firth and non-Firth paths.
+        let exact_trace_mode = true;
+        let n_probe = 0usize;
+        let n_sketch = 0usize;
+        let use_hutchpp = false;
         // Backend semantics:
         // - Exact: deterministic traces.
         //   Preferred form is on the retained positive subspace:
@@ -700,11 +696,11 @@ impl<'a> RemlState<'a> {
         let projected_exact_mode = exact_trace_mode
             && !firth_active
             && free_basis_opt.is_none()
-            && bundle.h_pos_factor_w.nrows() == p_dim
-            && Self::dense_projected_exact_eligible(n, bundle.h_pos_factor_w.ncols(), k_count);
+            && bundle.h_pos_factorw.nrows() == p_dim
+            && Self::dense_projected_exact_eligible(n, bundle.h_pos_factorw.ncols(), k_count);
         let spectral_exact_mode = exact_trace_mode
             && free_basis_opt.is_none()
-            && bundle.h_pos_factor_w.nrows() == p_dim
+            && bundle.h_pos_factorw.nrows() == p_dim
             && !projected_exact_mode;
         // Mode split:
         //   projected_exact_mode: non-Firth optimized exact contractions.
@@ -712,15 +708,15 @@ impl<'a> RemlState<'a> {
         //   else: dense fallback (potentially full H^{-1}).
 
         let w_pos_projected = if projected_exact_mode {
-            Some(bundle.h_pos_factor_w.as_ref().clone())
+            Some(bundle.h_pos_factorw.as_ref().clone())
         } else {
             None
         };
         let z_mat_projected = w_pos_projected
             .as_ref()
             .map(|w_pos| fast_ab(x_dense, w_pos));
-        let w_pos_spectral = if spectral_exact_mode {
-            Some(bundle.h_pos_factor_w.as_ref().clone())
+        let w_posspectral = if spectral_exact_mode {
+            Some(bundle.h_pos_factorw.as_ref().clone())
         } else {
             None
         };
@@ -734,15 +730,15 @@ impl<'a> RemlState<'a> {
             } else {
                 None
             };
-        let w_pos_spectral_t = w_pos_spectral.as_ref().map(|w_pos| w_pos.t().to_owned());
-        let g_k_spectral: Option<Vec<Array2<f64>>> = w_pos_spectral.as_ref().map(|w_pos| {
+        let w_posspectral_t = w_posspectral.as_ref().map(|w_pos| w_pos.t().to_owned());
+        let g_kspectral: Option<Vec<Array2<f64>>> = w_posspectral.as_ref().map(|w_pos| {
             // Spectral exact traces on active positive subspace:
             //   H_+^dagger = W W^T
             //   tr(H_+^dagger A) = tr(W^T A W)
             //   tr(H_+^dagger B H_+^dagger C) = tr((W^T B W)(W^T C W)).
             // Here G_k := W^T H_k W so
             //   t1_{l,k} = tr(H_+^dagger H_l H_+^dagger H_k) = tr(G_l G_k).
-            let w_pos_t = w_pos_spectral_t
+            let w_pos_t = w_posspectral_t
                 .as_ref()
                 .expect("spectral W^T present in spectral exact mode");
             h_k.iter()
@@ -776,7 +772,7 @@ impl<'a> RemlState<'a> {
             None
         };
 
-        let mut probe_z: Option<Array2<f64>> = None;
+        let mut probez: Option<Array2<f64>> = None;
         let mut probe_u: Option<Array2<f64>> = None;
         let mut probe_xz: Option<Array2<f64>> = None;
         let mut probe_xu: Option<Array2<f64>> = None;
@@ -794,8 +790,8 @@ impl<'a> RemlState<'a> {
                 if q.ncols() > 0 {
                     for r in 0..n_probe {
                         let mut zr = z.column(r).to_owned();
-                        let qt_z = q.t().dot(&zr);
-                        let proj = q.dot(&qt_z);
+                        let qtz = q.t().dot(&zr);
+                        let proj = q.dot(&qtz);
                         zr -= &proj;
                         z.column_mut(r).assign(&zr);
                     }
@@ -811,7 +807,7 @@ impl<'a> RemlState<'a> {
             let u = solve_h(&z);
             let xz = fast_ab(x_dense, &z);
             let xu = fast_ab(x_dense, &u);
-            probe_z = Some(z);
+            probez = Some(z);
             probe_u = Some(u);
             probe_xz = Some(xz);
             probe_xu = Some(xu);
@@ -829,7 +825,7 @@ impl<'a> RemlState<'a> {
                     }
                 }
             } else if spectral_exact_mode {
-                let gk = g_k_spectral
+                let gk = g_kspectral
                     .as_ref()
                     .expect("spectral exact G_k present in spectral exact mode");
                 for l in 0..k_count {
@@ -879,7 +875,7 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
-            let z = probe_z.as_ref().expect("probes present in stochastic mode");
+            let z = probez.as_ref().expect("probes present in stochastic mode");
             let u = probe_u
                 .as_ref()
                 .expect("solved probes present in stochastic mode");
@@ -1061,19 +1057,19 @@ impl<'a> RemlState<'a> {
                             //             - D² H_φ[B_k,B_l].
                             h_kl -= &Self::firth_hphi_direction(op, &dir_kl);
                             if spectral_exact_mode {
-                                let w_pos = w_pos_spectral
+                                let w_pos = w_posspectral
                                     .as_ref()
                                     .expect("spectral W present in spectral exact mode");
-                                let w_pos_t = w_pos_spectral_t
+                                let w_pos_t = w_posspectral_t
                                     .as_ref()
                                     .expect("spectral W^T present in spectral exact mode");
-                                let d2_aw = Self::firth_hphi_second_direction_apply(
+                                let d2_aw = Self::firth_hphisecond_direction_apply(
                                     op, &dirs[k], &dirs[l], w_pos,
                                 );
                                 d2_trace_correction = Self::trace_product(w_pos_t, &d2_aw);
                             } else {
-                                // Exact dense-solve fallback for tr(H^{-1} D²H_phi[B_k,B_l])
-                                // without materializing the full p×p D²H_phi matrix.
+                                // Exact dense-solve fallback for tr(H^{-1} D²Hphi[B_k,B_l])
+                                // without materializing the full p×p D²Hphi matrix.
                                 const BLOCK: usize = 32;
                                 let mut acc = 0.0_f64;
                                 let mut start = 0usize;
@@ -1083,7 +1079,7 @@ impl<'a> RemlState<'a> {
                                     for j in 0..width {
                                         basis[[start + j, j]] = 1.0;
                                     }
-                                    let d2_block = Self::firth_hphi_second_direction_apply(
+                                    let d2_block = Self::firth_hphisecond_direction_apply(
                                         op, &dirs[k], &dirs[l], &basis,
                                     );
                                     let solved_block = solve_h(&d2_block);
@@ -1096,10 +1092,10 @@ impl<'a> RemlState<'a> {
                             }
                         }
                         if spectral_exact_mode {
-                            let w_pos = w_pos_spectral
+                            let w_pos = w_posspectral
                                 .as_ref()
                                 .expect("spectral W present in spectral exact mode");
-                            let w_pos_t = w_pos_spectral_t
+                            let w_pos_t = w_posspectral_t
                                 .as_ref()
                                 .expect("spectral W^T present in spectral exact mode");
                             let wt_hkl = fast_ab(w_pos_t, &h_kl);
@@ -1140,7 +1136,7 @@ impl<'a> RemlState<'a> {
                             t2_acc += term;
                         }
                     }
-                    let z = probe_z.as_ref().expect("probes present in stochastic mode");
+                    let z = probez.as_ref().expect("probes present in stochastic mode");
                     let u = probe_u
                         .as_ref()
                         .expect("solved probes present in stochastic mode");
@@ -1194,24 +1190,24 @@ impl<'a> RemlState<'a> {
                 // stochastic traces or floating-point order differ slightly.
                 // Conclusion for the Firth path:
                 // - `q` uses the same implicit derivatives B_k/B_kl as non-Firth,
-                //   but those derivatives were solved on H_total = X'WX + S - H_phi.
+                //   but those derivatives were solved on H_total = X'WX + S - Hphi.
                 // - `t1`/`t2` see Firth through H_k/H_kl, which include
-                //   -D(H_phi)[B_k], -D(H_phi)[B_kl], and -D²(H_phi)[B_k,B_l].
+                //   -D(Hphi)[B_k], -D(Hphi)[B_kl], and -D²(Hphi)[B_k,B_l].
                 // Therefore `val` is objective-consistent with the Firth-adjusted
                 // inner stationarity equation on smooth active-subspace regions.
                 hess[[k, l]] = val;
                 hess[[l, k]] = val;
             }
         }
-        self.add_soft_prior_hessian_in_place(rho, &mut hess);
+        self.add_soft_priorhessian_in_place(rho, &mut hess);
         Ok(hess)
     }
 
-    pub(crate) fn compute_laml_hessian_analytic_fallback_standalone(
+    pub(crate) fn compute_lamlhessian_analytic_fallback_standalone(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        self.compute_laml_hessian_analytic_fallback(rho, None)
+        self.compute_lamlhessian_analytic_fallback(rho, None)
     }
 
     pub(crate) fn compute_smoothing_correction_auto(
@@ -1219,7 +1215,7 @@ impl<'a> RemlState<'a> {
         final_rho: &Array1<f64>,
         final_fit: &PirlsResult,
         base_covariance: Option<&Array2<f64>>,
-        final_grad_norm: f64,
+        finalgrad_norm: f64,
     ) -> Option<Array2<f64>> {
         // Always compute the fast first-order correction first.
         let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
@@ -1247,13 +1243,13 @@ impl<'a> RemlState<'a> {
         let near_boundary = final_rho
             .iter()
             .any(|&v| (RHO_BOUND - v.abs()) <= AUTO_CUBATURE_BOUNDARY_MARGIN);
-        let grad_norm = if final_grad_norm.is_finite() {
-            final_grad_norm
+        let grad_norm = if finalgrad_norm.is_finite() {
+            finalgrad_norm
         } else {
             0.0
         };
-        let high_grad = grad_norm > 1e-3;
-        if !near_boundary && !high_grad {
+        let highgrad = grad_norm > 1e-3;
+        if !near_boundary && !highgrad {
             // Keep the hot path cheap when the local linearization is likely sufficient.
             return first_order_correction;
         }
@@ -1262,7 +1258,7 @@ impl<'a> RemlState<'a> {
         let mut hessian_rho = if let Some(h) = first_order.hessian_rho {
             h
         } else {
-            match self.compute_laml_hessian_consistent(final_rho) {
+            match self.compute_lamlhessian_consistent(final_rho) {
                 Ok(h) => h,
                 Err(err) => {
                     log::debug!("Auto cubature skipped: rho Hessian unavailable ({}).", err);
@@ -1288,16 +1284,16 @@ impl<'a> RemlState<'a> {
             hessian_rho[[i, i]] += ridge;
         }
         let hessian_rho_inv =
-            match matrix_inverse_with_regularization(&hessian_rho, "auto cubature rho Hessian") {
+            match matrix_inversewith_regularization(&hessian_rho, "auto cubature rho Hessian") {
                 Some(v) => v,
                 None => return first_order_correction,
             };
 
-        let max_rho_var = hessian_rho_inv
+        let max_rhovar = hessian_rho_inv
             .diag()
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if !near_boundary && !high_grad && max_rho_var < 0.1 {
+        if !near_boundary && !highgrad && max_rhovar < 0.1 {
             return first_order_correction;
         }
 
@@ -1317,8 +1313,8 @@ impl<'a> RemlState<'a> {
             return first_order_correction;
         }
         eig_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let total_var: f64 = eig_pairs.iter().map(|(_, v)| *v).sum();
-        if !total_var.is_finite() || total_var <= 0.0 {
+        let totalvar: f64 = eig_pairs.iter().map(|(_, v)| *v).sum();
+        if !totalvar.is_finite() || totalvar <= 0.0 {
             return first_order_correction;
         }
 
@@ -1330,7 +1326,7 @@ impl<'a> RemlState<'a> {
         {
             captured += *eig;
             rank += 1;
-            if captured / total_var >= AUTO_CUBATURE_TARGET_VAR_FRAC {
+            if captured / totalvar >= AUTO_CUBATURE_TARGET_VAR_FRAC {
                 break;
             }
         }
@@ -1345,9 +1341,9 @@ impl<'a> RemlState<'a> {
         let p = base_cov.nrows();
         let radius = (rank as f64).sqrt();
         let mut sigma_points: Vec<Array1<f64>> = Vec::with_capacity(2 * rank);
-        for (eig_idx, eig_val) in eig_pairs.iter().take(rank) {
+        for (eig_idx, eigval) in eig_pairs.iter().take(rank) {
             let axis = evecs.column(*eig_idx).to_owned();
-            let scale = radius * eig_val.sqrt();
+            let scale = radius * eigval.sqrt();
             let delta = axis.mapv(|v| v * scale);
 
             for sign in [1.0_f64, -1.0_f64] {
@@ -1367,27 +1363,34 @@ impl<'a> RemlState<'a> {
         // points in parallel. Cache lookups/inserts use an exclusive lock in
         // execute_pirls_if_needed(), so leaving cache enabled serializes this
         // block under contention.
-        let _cache_guard = AtomicFlagGuard::swap(
-            &self.cache_manager.pirls_cache_enabled,
-            false,
-            Ordering::SeqCst,
-        );
-        let _warm_start_guard =
-            AtomicFlagGuard::swap(&self.warm_start_enabled, false, Ordering::SeqCst);
-        let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = (0..sigma_points.len())
-            .into_par_iter()
-            .map(|idx| {
-                let fit_point = self.execute_pirls_if_needed(&sigma_points[idx]).ok()?;
-                let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
-                let cov_point =
-                    matrix_inverse_with_regularization(&h_point, "auto cubature point")?;
-                let beta_point = fit_point
-                    .reparam_result
-                    .qs
-                    .dot(fit_point.beta_transformed.as_ref());
-                Some((cov_point, beta_point))
-            })
-            .collect();
+        let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = {
+            let guards = (
+                AtomicFlagGuard::swap(
+                    &self.cache_manager.pirls_cache_enabled,
+                    false,
+                    Ordering::SeqCst,
+                ),
+                AtomicFlagGuard::swap(&self.warm_start_enabled, false, Ordering::SeqCst),
+            );
+            (
+                guards,
+                (0..sigma_points.len())
+                    .into_par_iter()
+                    .map(|idx| {
+                        let fit_point = self.execute_pirls_if_needed(&sigma_points[idx]).ok()?;
+                        let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
+                        let cov_point =
+                            matrix_inversewith_regularization(&h_point, "auto cubature point")?;
+                        let beta_point = fit_point
+                            .reparam_result
+                            .qs
+                            .dot(fit_point.beta_transformed.as_ref());
+                        Some((cov_point, beta_point))
+                    })
+                    .collect(),
+            )
+                .1
+        };
 
         if point_results.iter().any(|r| r.is_none()) {
             return first_order_correction;
@@ -1435,22 +1438,22 @@ impl<'a> RemlState<'a> {
         }
 
         log::info!(
-            "Using adaptive cubature smoothing correction (rank={}, points={}, near_boundary={}, grad_norm={:.2e}, max_var={:.2e})",
+            "Using adaptive cubature smoothing correction (rank={}, points={}, near_boundary={}, grad_norm={:.2e}, maxvar={:.2e})",
             rank,
             2 * rank,
             near_boundary,
             grad_norm,
-            max_rho_var
+            max_rhovar
         );
         Some(corr)
     }
 }
 
 impl<'a> RemlState<'a> {
-    pub(super) fn uses_objective_consistent_fd_gradient(&self, rho: &Array1<f64>) -> bool {
+    pub(super) fn usesobjective_consistentfdgradient(&self, rho: &Array1<f64>) -> bool {
         let _ = rho;
         self.config.link_function() != LinkFunction::Identity
-            && self.config.objective_consistent_fd_gradient
+            && self.config.objective_consistentfdgradient
     }
 
     /// Helper function that computes gradient using a shared evaluation bundle
@@ -1535,10 +1538,10 @@ impl<'a> RemlState<'a> {
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         let mut rs_eval = reparam_result.rs_transformed.clone();
         let mut x_transformed_eval = pirls_result.x_transformed.clone();
-        let mut h_pos_factor_w_eval = bundle.h_pos_factor_w.as_ref().clone();
+        let mut h_pos_factorw_eval = bundle.h_pos_factorw.as_ref().clone();
 
         if let Some(z) = free_basis_opt.as_ref() {
-            h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
+            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
             e_eval = reparam_result.e_transformed.dot(z);
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             rs_eval = reparam_result
@@ -1570,7 +1573,7 @@ impl<'a> RemlState<'a> {
                     .and(&u_col)
                     .for_each(|w_elem, &u_elem| *w_elem = u_elem * scale);
             }
-            h_pos_factor_w_eval = w;
+            h_pos_factorw_eval = w;
         }
         let h_eff = &h_eff_eval;
 
@@ -1603,9 +1606,9 @@ impl<'a> RemlState<'a> {
             let workspace = &mut *workspace_ref;
             let len = p.len();
             workspace.reset_for_eval(len);
-            workspace.set_lambda_values(p);
-            workspace.zero_cost_gradient(len);
-            let lambdas = workspace.lambda_view(len).to_owned();
+            workspace.set_lambdavalues(p);
+            workspace.zerocostgradient(len);
+            let lambdas = workspace.lambdaview(len).to_owned();
             let mut applied_truncation_corrections: Option<Vec<f64>> = None;
 
             // Branch-local structural truncated-logdet derivatives:
@@ -1624,10 +1627,10 @@ impl<'a> RemlState<'a> {
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // Use the same effective Hessian as the cost function for consistency.
-            if ridge_passport.laplace_hessian_ridge() > 0.0 {
+            if ridge_passport.laplacehessianridge() > 0.0 {
                 log::debug!(
                     "Gradient path using PIRLS-stabilized Hessian (ridge {:.3e})",
-                    ridge_passport.laplace_hessian_ridge()
+                    ridge_passport.laplacehessianridge()
                 );
             }
 
@@ -1643,8 +1646,8 @@ impl<'a> RemlState<'a> {
                         min_eig
                     );
                     // Generate an informed retreat direction based on current parameters
-                    let retreat_grad = p.mapv(|v| -(v.abs() + 1.0));
-                    return Ok(retreat_grad);
+                    let retreatgrad = p.mapv(|v| -(v.abs() + 1.0));
+                    return Ok(retreatgrad);
                 }
             }
 
@@ -1674,7 +1677,7 @@ impl<'a> RemlState<'a> {
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
-                    let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
+                    let (dp_c, dp_cgrad) = smooth_floor_dp(dp);
 
                     let penalty_rank = e_eval.nrows();
                     let mp = h_eff.ncols().saturating_sub(penalty_rank) as f64;
@@ -1683,7 +1686,7 @@ impl<'a> RemlState<'a> {
                     //   φ̂(ρ) = D_p(ρ)/(n-M_p), with D_p = rss + β̂ᵀSβ̂.
                     // The gradient therefore includes the profiled contribution
                     //   (n-M_p)/2 * D_k / D_p
-                    // which is exactly represented by `deviance_grad_term` below.
+                    // which is exactly represented by `deviancegrad_term` below.
                     // (Equivalent to Schur-complement profiling in (ρ, log φ).)
 
                     if dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH {
@@ -1715,7 +1718,7 @@ impl<'a> RemlState<'a> {
                     //   H_+^† = W W^T.
                     // Then tr(H_+^† A_k) = λ_k ||R_k W||_F^2 directly, with no separate
                     // truncated-subspace subtraction term.
-                    let w_pos = &h_pos_factor_w_eval;
+                    let w_pos = &h_pos_factorw_eval;
                     // Exact Gaussian identity REML gradient (profiled scale) in log-smoothing coordinates:
                     //
                     //   V_REML(ρ) =
@@ -1739,9 +1742,9 @@ impl<'a> RemlState<'a> {
                     //
                     // Mapping to variables below:
                     //   d1 / (2*scale)                     -> (1/(2 φ̂)) * β̂ᵀ S_k^ρ β̂
-                    //   log_det_h_grad_term (or numeric)   -> 0.5 * tr(H^{-1} S_k^ρ)
+                    //   log_det_hgrad_term (or numeric)   -> 0.5 * tr(H^{-1} S_k^ρ)
                     //   0.5 * det1_values[k]               -> 0.5 * tr(S^+ S_k^ρ)
-                    let compute_gaussian_grad = |k: usize| -> f64 {
+                    let compute_gaussiangrad = |k: usize| -> f64 {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
                         let r_beta = r_k.dot(beta_ref);
@@ -1757,9 +1760,9 @@ impl<'a> RemlState<'a> {
                         //   D_k = β̂ᵀ A_k β̂ = λ_k β̂ᵀ S_k β̂.
                         //
                         // `d1` stores D_k, and the expression below is D_k/(2φ̂)
-                        // with the smooth-floor derivative factor `dp_c_grad`.
+                        // with the smooth-floor derivative factor `dp_cgrad`.
                         let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
-                        let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
+                        let deviancegrad_term = dp_cgrad * (d1 / (2.0 * scale));
 
                         // A.3/A.5 Component 2 derivation:
                         //   ∂/∂ρ_k [0.5 log|H|_+] = 0.5 tr(H_+^† H_k),
@@ -1770,22 +1773,22 @@ impl<'a> RemlState<'a> {
                         //                = λ_k ||R_k W||_F², H_+^†=W W^T.
                         let rkw = r_k.dot(w_pos);
                         let trace_h_pos_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
-                        let log_det_h_grad_term = 0.5 * lambdas[k] * trace_h_pos_inv_s_k;
+                        let log_det_hgrad_term = 0.5 * lambdas[k] * trace_h_pos_inv_s_k;
 
-                        let corrected_log_det_h = log_det_h_grad_term;
+                        let corrected_log_det_h = log_det_hgrad_term;
 
                         // Component 3 derivation:
                         //   -0.5 * ∂/∂ρ_k log|S|_+,
                         // with `det1_values[k]` already equal to ∂ log|S|_+ / ∂ρ_k.
-                        let log_det_s_grad_term = 0.5 * det1_values[k];
+                        let log_det_sgrad_term = 0.5 * det1_values[k];
 
-                        deviance_grad_term + corrected_log_det_h - log_det_s_grad_term
+                        deviancegrad_term + corrected_log_det_h - log_det_sgrad_term
                     };
 
                     {
-                        let mut grad_view = workspace.cost_gradient_view(len);
+                        let mut gradview = workspace.costgradientview(len);
                         for k in 0..lambdas.len() {
-                            grad_view[k] = compute_gaussian_grad(k);
+                            gradview[k] = compute_gaussiangrad(k);
                         }
                     }
                     // No explicit truncation correction vector is needed in this branch:
@@ -1862,7 +1865,7 @@ impl<'a> RemlState<'a> {
                     // This curvature enters H_total and therefore d beta_hat / d rho_k.
                     // Our analytic LAML gradient uses H_pen = X' W X + S_lambda only,
                     // so it is inconsistent with the Firth-adjusted objective unless
-                    // we add H_phi. Below we compute H_phi and use H_total for the
+                    // we add Hphi. Below we compute Hphi and use H_total for the
                     // implicit solve (d beta_hat / d rho). If that fails, we fall
                     // back to H_pen for stability.
                     let mut w_prime = pirls_result.solve_c_array.clone();
@@ -1882,7 +1885,7 @@ impl<'a> RemlState<'a> {
                     }
                     let clamp_nonsmooth = self.config.firth_bias_reduction
                         && pirls_result
-                            .solve_mu
+                            .solvemu
                             .iter()
                             .any(|&mu| mu * (1.0 - mu) < Self::MIN_DMU_DETA);
                     if clamp_nonsmooth {
@@ -1919,7 +1922,7 @@ impl<'a> RemlState<'a> {
                     }
 
                     // Keep outer gradient on the same Hessian surface as PIRLS.
-                    // The outer loop uses H_eff consistently (no H_phi subtraction).
+                    // The outer loop uses H_eff consistently (no Hphi subtraction).
 
                     // P-IRLS already folded any stabilization ridge into h_eff.
 
@@ -1937,23 +1940,23 @@ impl<'a> RemlState<'a> {
                     // with B_k = -H^{-1}(A_kβ̂).
                     //
                     //   D(-∇²ℓ)[B_k] = Xᵀ diag(d ⊙ (X B_k)) X,
-                    // where d_i = -∂³ℓ_i/∂η_i³. Here `c_vec` stores this per-observation
+                    // where d_i = -∂³ℓ_i/∂η_i³. Here `cvec` stores this per-observation
                     // third derivative quantity in the stabilized logit path.
-                    let w_pos = &h_pos_factor_w_eval;
-                    let n_obs = pirls_result.solve_mu.len();
+                    let w_pos = &h_pos_factorw_eval;
+                    let nobs = pirls_result.solvemu.len();
 
                     // c_i = dW_ii/dη_i for H = Xᵀ W X + S.
                     // In smooth regimes this matches the required third-derivative object
                     // in dH/dρ. In clamped/floored regimes c_i may behave like a subgradient
                     // proxy rather than a classical derivative; see pirls.rs comments.
-                    let c_vec = &w_prime;
+                    let cvec = &w_prime;
 
                     // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
-                    let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
+                    let mut leverage_h_pos = Array1::<f64>::zeros(nobs);
                     if w_pos.ncols() > 0 {
                         for col in 0..w_pos.ncols() {
                             let w_col = w_pos.column(col).to_owned();
-                            let xw_col = x_transformed_eval.matrix_vector_multiply(&w_col);
+                            let xw_col = x_transformed_eval.matrixvectormultiply(&w_col);
                             Zip::from(&mut leverage_h_pos)
                                 .and(&xw_col)
                                 .for_each(|h, &v| *h += v * v);
@@ -1961,11 +1964,11 @@ impl<'a> RemlState<'a> {
                     }
 
                     // Precompute r = X^T (c ⊙ h) once:
-                    //   trace_third_k = (c ⊙ h)^T (X v_k) = r^T v_k.
+                    //   tracethird_k = (c ⊙ h)^T (X v_k) = r^T v_k.
                     // This removes the per-k O(np) multiply X*v_k from the hot loop.
                     // r := X^T (w' ⊙ h).
-                    let c_times_h = c_vec * &leverage_h_pos;
-                    let r_third = x_transformed_eval.transpose_vector_multiply(&c_times_h);
+                    let c_times_h = cvec * &leverage_h_pos;
+                    let rthird = x_transformed_eval.transpose_vector_multiply(&c_times_h);
 
                     // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
                     //   V = W (W^T [S_1 beta, ..., S_K beta]).
@@ -1981,10 +1984,10 @@ impl<'a> RemlState<'a> {
                         .map(|k_idx| {
                             let r_k = &rs_transformed[k_idx];
                             if r_k.ncols() == 0 || w_pos.ncols() == 0 {
-                                let log_det_h_grad_term = 0.0;
-                                let log_det_s_grad_term = 0.5 * det1_values[k_idx];
-                                return 0.5 * beta_terms[k_idx] + log_det_h_grad_term
-                                    - log_det_s_grad_term;
+                                let log_det_hgrad_term = 0.0;
+                                let log_det_sgrad_term = 0.5 * det1_values[k_idx];
+                                return 0.5 * beta_terms[k_idx] + log_det_hgrad_term
+                                    - log_det_sgrad_term;
                             }
 
                             // First piece:
@@ -1995,48 +1998,48 @@ impl<'a> RemlState<'a> {
                             // Exact third-derivative contraction:
                             //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
                             let v_k = v_all.column(k_idx);
-                            let mut trace_third = r_third.dot(&v_k);
-                            if !trace_third.is_finite() {
-                                trace_third = 0.0;
+                            let mut tracethird = rthird.dot(&v_k);
+                            if !tracethird.is_finite() {
+                                tracethird = 0.0;
                             }
                             // Auto-correct third-derivative contribution in numerically
                             // brittle regimes: cap its magnitude relative to the primary
                             // trace term so one noisy contraction cannot dominate the
                             // hyper-gradient.
                             let cap = (trace_h_inv_s_k.abs() + 1.0) * 10.0;
-                            trace_third = trace_third.clamp(-cap, cap);
-                            let trace_term = trace_h_inv_s_k - trace_third;
-                            let log_det_h_grad_term = 0.5 * lambdas[k_idx] * trace_term;
-                            let corrected_log_det_h = log_det_h_grad_term;
-                            let log_det_s_grad_term = 0.5 * det1_values[k_idx];
+                            tracethird = tracethird.clamp(-cap, cap);
+                            let trace_term = trace_h_inv_s_k - tracethird;
+                            let log_det_hgrad_term = 0.5 * lambdas[k_idx] * trace_term;
+                            let corrected_log_det_h = log_det_hgrad_term;
+                            let log_det_sgrad_term = 0.5 * det1_values[k_idx];
 
                             // Exact LAML gradient assembly for the implemented objective:
                             //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
                             // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
-                            0.5 * beta_terms[k_idx] + corrected_log_det_h - log_det_s_grad_term
+                            0.5 * beta_terms[k_idx] + corrected_log_det_h - log_det_sgrad_term
                         })
                         .collect();
                     {
-                        let mut grad_view = workspace.cost_gradient_view(len);
+                        let mut gradview = workspace.costgradientview(len);
                         for (k_idx, &gk) in grad_terms.iter().enumerate() {
-                            grad_view[k_idx] = gk;
+                            gradview[k_idx] = gk;
                         }
                     }
                 }
             }
 
             if !includes_prior {
-                let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
-                let prior_grad = prior_grad_view.to_owned();
+                let (_, priorgradview) = workspace.soft_priorcost_andgrad(p);
+                let priorgrad = priorgradview.to_owned();
                 {
-                    let mut cost_gradient_view = workspace.cost_gradient_view(len);
-                    cost_gradient_view += &prior_grad;
+                    let mut costgradientview = workspace.costgradientview(len);
+                    costgradientview += &priorgrad;
                 }
             }
 
             // Capture the gradient snapshot before releasing the workspace borrow so
             // that diagnostics can continue without holding the RefCell borrow.
-            let gradient_result = workspace.cost_gradient_view_const(len).to_owned();
+            let gradient_result = workspace.costgradientview_const(len).to_owned();
             let gradient_snapshot = if p.is_empty() {
                 None
             } else {
@@ -2059,7 +2062,7 @@ impl<'a> RemlState<'a> {
             && !p.is_empty()
         {
             // Run all diagnostics and emit a single summary if issues found
-            self.run_gradient_diagnostics(
+            self.rungradient_diagnostics(
                 p,
                 bundle,
                 &gradient_snapshot,
@@ -2067,16 +2070,16 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        if self.should_use_stochastic_exact_gradient(bundle, &gradient_result) {
-            match self.compute_logit_stochastic_exact_gradient(p, bundle) {
-                Ok(stochastic_grad) => {
+        if self.should_use_stochastic_exactgradient(bundle, &gradient_result) {
+            match self.compute_logit_stochastic_exactgradient(p, bundle) {
+                Ok(stochasticgrad) => {
                     self.arena
-                        .last_gradient_used_stochastic_fallback
+                        .lastgradient_used_stochastic_fallback
                         .store(true, Ordering::Relaxed);
                     log::warn!(
                         "[REML] using stochastic exact log-marginal gradient fallback (posterior-sampled expectation)"
                     );
-                    return Ok(stochastic_grad);
+                    return Ok(stochasticgrad);
                 }
                 Err(err) => {
                     log::warn!(
@@ -2090,7 +2093,7 @@ impl<'a> RemlState<'a> {
         Ok(gradient_result)
     }
 
-    pub(super) fn should_use_stochastic_exact_gradient(
+    pub(super) fn should_use_stochastic_exactgradient(
         &self,
         bundle: &EvalShared,
         gradient: &Array1<f64>,
@@ -2114,7 +2117,7 @@ impl<'a> RemlState<'a> {
         if matches!(pirls.status, pirls::PirlsStatus::Unstable) {
             return true;
         }
-        let kkt_like = pirls.last_gradient_norm;
+        let kkt_like = pirls.lastgradient_norm;
         if !kkt_like.is_finite() || kkt_like > 1e2 {
             return true;
         }
@@ -2122,7 +2125,7 @@ impl<'a> RemlState<'a> {
         !grad_inf.is_finite() || grad_inf > 1e9
     }
 
-    pub(super) fn compute_logit_stochastic_exact_gradient(
+    pub(super) fn compute_logit_stochastic_exactgradient(
         &self,
         p: &Array1<f64>,
         bundle: &EvalShared,
@@ -2169,7 +2172,7 @@ impl<'a> RemlState<'a> {
         // tr(S_k Q^{-1}) + μᵀ S_k μ instead of a raw quadratic draw.
         let pg_cfg = crate::hmc::NutsConfig {
             n_samples: 24,
-            n_warmup: 48,
+            nwarmup: 48,
             n_chains: 2,
             target_accept: 0.85,
             seed: 17_391,
@@ -2217,7 +2220,7 @@ impl<'a> RemlState<'a> {
 
                 let nuts_cfg = crate::hmc::NutsConfig {
                     n_samples: 120,
-                    n_warmup: 160,
+                    nwarmup: 160,
                     n_chains: 2,
                     target_accept: 0.85,
                     seed: 17_391,
@@ -2258,7 +2261,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         }
-        grad += &self.compute_soft_prior_grad(p);
+        grad += &self.compute_soft_priorgrad(p);
         Ok(grad)
     }
 }

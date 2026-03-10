@@ -1,4 +1,4 @@
-use gam::estimate::{ExternalOptimOptions, evaluate_external_gradients};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 
@@ -50,7 +50,7 @@ fn make_problem(
 }
 
 #[test]
-fn trace_third_auto_correction_against_fd() {
+fn tracethird_auto_correction_againstfd() {
     let opts = ExternalOptimOptions {
         mixture_link: None,
         optimize_mixture: false,
@@ -66,12 +66,12 @@ fn trace_third_auto_correction_against_fd() {
     let rho = Array1::from_vec(vec![1.0, 1.5]);
 
     unsafe {
-        std::env::set_var("GAM_DISABLE_GRAD_GATE", "1");
+        std::env::setvar("GAM_DISABLE_GRAD_GATE", "1");
     }
 
     for scale in [4.0_f64, 1.0_f64, 0.25_f64] {
         let (x, y, w, offset, s_list) = make_problem(scale);
-        let (analytic, fd) = evaluate_external_gradients(
+        let (analytic, fd) = evaluate_externalgradients(
             y.view(),
             w.view(),
             x.view(),

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// - Rejects NaN entries (returns `None` so callers skip caching).
 /// - Canonicalizes ±0.0 to +0.0 to avoid key drift.
-pub(super) fn sanitized_rho_key(rho: &Array1<f64>) -> Option<Vec<u64>> {
+pub(super) fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
     let mut key = Vec::with_capacity(rho.len());
     for &v in rho {
         if v.is_nan() {

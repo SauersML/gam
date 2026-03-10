@@ -1,11 +1,11 @@
 use gam::estimate::FittedLinkParameters;
-use gam::mixture_link::state_from_spec;
+use gam::mixture_link::state_fromspec;
 use gam::probability::try_inverse_link_array;
 use gam::types::LinkComponent;
 use gam::{
     FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
     PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_posterior_mean,
-    predict_gam_with_uncertainty,
+    predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 
@@ -82,7 +82,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
 }
 
 #[test]
-fn prediction_uncertainty_is_finite_and_well_shaped() {
+fn prediction_uncertainty_is_finite_andwell_shaped() {
     let n = 80usize;
     let mut x = Array2::<f64>::zeros((n, 2));
     let mut y = Array1::<f64>::zeros(n);
@@ -119,7 +119,7 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
     )
     .expect("fit should succeed");
 
-    let pred = predict_gam_with_uncertainty(
+    let pred = predict_gamwith_uncertainty(
         x.view(),
         fit.beta.view(),
         offset.view(),
@@ -129,7 +129,7 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
-            include_observation_interval: true,
+            includeobservation_interval: true,
         },
     )
     .expect("prediction uncertainty should succeed");
@@ -158,7 +158,7 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
 }
 
 #[test]
-fn gaussian_prediction_intervals_include_observation_noise() {
+fn gaussian_prediction_intervals_includeobservation_noise() {
     let n = 100usize;
     let mut x = Array2::<f64>::zeros((n, 2));
     let mut y = Array1::<f64>::zeros(n);
@@ -194,7 +194,7 @@ fn gaussian_prediction_intervals_include_observation_noise() {
     )
     .expect("fit should succeed");
 
-    let pred = predict_gam_with_uncertainty(
+    let pred = predict_gamwith_uncertainty(
         x.view(),
         fit.beta.view(),
         offset.view(),
@@ -334,7 +334,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
     .expect("base fit should succeed");
 
     let mut fit = fit_base.clone();
-    let state = state_from_spec(&gam::types::MixtureLinkSpec {
+    let state = state_fromspec(&gam::types::MixtureLinkSpec {
         components: vec![
             LinkComponent::Probit,
             LinkComponent::Logit,
@@ -348,7 +348,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         covariance: None,
     };
 
-    let pred = predict_gam_with_uncertainty(
+    let pred = predict_gamwith_uncertainty(
         x.view(),
         fit.beta.view(),
         offset.view(),
@@ -358,7 +358,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::Delta,
-            include_observation_interval: false,
+            includeobservation_interval: false,
         },
     )
     .expect("mixture uncertainty prediction should succeed");

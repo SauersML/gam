@@ -93,7 +93,7 @@ pub fn try_inverse_link_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mixture_link::{state_from_sas_spec, state_from_spec};
+    use crate::mixture_link::{state_from_sasspec, state_fromspec};
     use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
     use ndarray::array;
 
@@ -116,7 +116,7 @@ mod tests {
             LikelihoodFamily::BinomialSas,
             eta.view(),
             Some(&InverseLink::Sas(
-                state_from_sas_spec(SasLinkSpec {
+                state_from_sasspec(SasLinkSpec {
                     initial_epsilon: 0.2,
                     initial_log_delta: -0.1,
                 })
@@ -131,7 +131,7 @@ mod tests {
             components: vec![LinkComponent::Probit, LinkComponent::CLogLog],
             initial_rho: array![0.3],
         };
-        let state = state_from_spec(&spec).expect("mixture state");
+        let state = state_fromspec(&spec).expect("mixture state");
         let mix = try_inverse_link_array(
             LikelihoodFamily::BinomialMixture,
             eta.view(),

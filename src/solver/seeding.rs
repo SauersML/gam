@@ -70,12 +70,12 @@ fn spde_rho_triplet_from_log_tau_log_kappa_nu(
     if !(nu.is_finite() && nu > 1.0) {
         return None;
     }
-    let log_c0 = 0.0;
-    let log_c1 = safe_ln_pos(nu)?;
-    let log_c2 = safe_ln_pos(0.5 * nu * (nu - 1.0))?;
-    let rho0 = clamp_to_bounds(log_tau + log_c0 + 2.0 * nu * log_kappa, bounds);
-    let rho1 = clamp_to_bounds(log_tau + log_c1 + 2.0 * (nu - 1.0) * log_kappa, bounds);
-    let rho2 = clamp_to_bounds(log_tau + log_c2 + 2.0 * (nu - 2.0) * log_kappa, bounds);
+    let logc0 = 0.0;
+    let logc1 = safe_ln_pos(nu)?;
+    let logc2 = safe_ln_pos(0.5 * nu * (nu - 1.0))?;
+    let rho0 = clamp_to_bounds(log_tau + logc0 + 2.0 * nu * log_kappa, bounds);
+    let rho1 = clamp_to_bounds(log_tau + logc1 + 2.0 * (nu - 1.0) * log_kappa, bounds);
+    let rho2 = clamp_to_bounds(log_tau + logc2 + 2.0 * (nu - 2.0) * log_kappa, bounds);
     Some(Array1::from_vec(vec![rho0, rho1, rho2]))
 }
 
@@ -256,7 +256,7 @@ pub fn generate_rho_candidates(
     }
 
     // Prefer a full heuristic vector (length == k) as the primary anchor.
-    let heuristic_rho_vec: Option<Array1<f64>> = heuristic_lambdas.and_then(|vals| {
+    let heuristic_rhovec: Option<Array1<f64>> = heuristic_lambdas.and_then(|vals| {
         if vals.len() == num_penalties {
             Some(Array1::from_iter(
                 vals.iter().copied().map(|v| rho_from_lambda(v, bounds)),
@@ -266,7 +266,7 @@ pub fn generate_rho_candidates(
         }
     });
 
-    let primary = heuristic_rho_vec
+    let primary = heuristic_rhovec
         .clone()
         .unwrap_or_else(|| Array1::<f64>::zeros(num_penalties))
         .mapv(|v| clamp_to_bounds(v + risk_shift, bounds));
@@ -444,7 +444,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_full_heuristic_vector_as_primary_anchor() {
+    fn uses_full_heuristicvector_as_primary_anchor() {
         let cfg = SeedConfig {
             risk_profile: SeedRiskProfile::Gaussian,
             ..SeedConfig::default()
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn high_dim_uses_cluster_conflict_probes_without_exploding() {
+    fn high_dim_uses_cluster_conflict_probeswithout_exploding() {
         let cfg = SeedConfig {
             max_seeds: 18,
             risk_profile: SeedRiskProfile::GeneralizedLinear,
@@ -488,13 +488,13 @@ mod tests {
     }
 
     #[test]
-    fn includes_neutral_zero_seed() {
+    fn includes_neutralzero_seed() {
         let cfg = SeedConfig::default();
         let seeds = generate_rho_candidates(5, None, &cfg);
-        let has_zero = seeds
+        let haszero = seeds
             .iter()
             .any(|s| s.iter().all(|v| (*v - 0.0).abs() < 1e-12));
-        assert!(has_zero);
+        assert!(haszero);
     }
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn three_penalty_seeds_include_first_order_fallback_with_rho2_floor() {
+    fn three_penalty_seeds_include_first_order_fallbackwith_rho2_floor() {
         let cfg = SeedConfig {
             bounds: (-12.0, 12.0),
             ..SeedConfig::default()

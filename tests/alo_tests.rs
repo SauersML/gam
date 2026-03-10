@@ -1,6 +1,6 @@
 use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_pirls;
-use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetric_with_fallback, fast_ata};
+use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{InverseLink, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, Axis};
@@ -56,7 +56,7 @@ fn fit_unpenalized(
             x: x.view(),
             offset: offset.view(),
             y: y.view(),
-            prior_weights: w_prior.view(),
+            priorweights: w_prior.view(),
             covariate_se: None,
         },
         PenaltyConfig {
@@ -121,14 +121,14 @@ fn alo_se_calculation_correct() {
     let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
 
     let x_dense = fit.x_transformed.to_dense();
-    let sqrt_w = fit.final_weights.mapv(f64::sqrt);
+    let sqrtw = fit.finalweights.mapv(f64::sqrt);
     let mut u = x_dense.clone();
-    let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
-    u *= &sqrt_w_col;
+    let sqrtw_col = sqrtw.view().insert_axis(Axis(1));
+    u *= &sqrtw_col;
     let k = fit.penalized_hessian_transformed.clone();
     let p_dim = k.nrows();
-    let k_view = FaerArrayView::new(&k);
-    let factor = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).unwrap();
+    let kview = FaerArrayView::new(&k);
+    let factor = factorize_symmetricwith_fallback(kview.as_ref(), Side::Lower).unwrap();
     let xtwx = fast_ata(&u);
 
     for irow in 0..10 {
@@ -138,7 +138,7 @@ fn alo_se_calculation_correct() {
         let si_arr = Array1::from_shape_fn(p_dim, |j| si[(j, 0)]);
         let t_i = xtwx.dot(&si_arr);
         let quad: f64 = si_arr.iter().zip(t_i.iter()).map(|(a, b)| a * b).sum();
-        let wi = fit.final_weights[irow].max(1e-300);
+        let wi = fit.finalweights[irow].max(1e-300);
         let expected_se = (quad / wi).max(0.0).sqrt();
         assert!(
             (alo.se_sandwich[irow] - expected_se).abs() < 1e-10,
@@ -186,12 +186,12 @@ fn alo_hat_diag_sane_and_bounded() {
     assert!(corr > 0.3);
 
     // Zero prior weight should force zero leverage in ALO geometry.
-    let mut w_zero = w.clone();
-    w_zero[10] = 0.0;
-    let fit_zero = fit_unpenalized(&x, &y, &w_zero, LinkFunction::Logit);
-    let alo_zero =
-        compute_alo_diagnostics_from_pirls(&fit_zero, y.view(), LinkFunction::Logit).unwrap();
-    assert!(alo_zero.leverage[10].abs() < 1e-12);
+    let mut wzero = w.clone();
+    wzero[10] = 0.0;
+    let fitzero = fit_unpenalized(&x, &y, &wzero, LinkFunction::Logit);
+    let alozero =
+        compute_alo_diagnostics_from_pirls(&fitzero, y.view(), LinkFunction::Logit).unwrap();
+    assert!(alozero.leverage[10].abs() < 1e-12);
     let _ = x_dense; // keep parity with original helper context
 }
 
@@ -205,28 +205,28 @@ fn alo_matches_exact_linearized_loo_small_n_binomial() {
     let x_dense = fit.x_transformed.to_dense();
     let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
 
-    let w_full = fit.final_weights.clone();
-    let sqrt_w = w_full.mapv(f64::sqrt);
+    let w_full = fit.finalweights.clone();
+    let sqrtw = w_full.mapv(f64::sqrt);
     let mut u = x_dense.clone();
-    let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
-    u *= &sqrt_w_col;
+    let sqrtw_col = sqrtw.view().insert_axis(Axis(1));
+    u *= &sqrtw_col;
 
     let mut h = fit.penalized_hessian_transformed.clone();
     for d in 0..h.nrows() {
         h[[d, d]] += 1e-12;
     }
     let p_dim = h.nrows();
-    let h_view = FaerArrayView::new(&h);
-    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).unwrap();
+    let hview = FaerArrayView::new(&h);
+    let factor = factorize_symmetricwith_fallback(hview.as_ref(), Side::Lower).unwrap();
     let ut = u.t();
     let xtwx = ut.dot(&u);
     let rhs = ut.to_owned();
-    let rhs_view = FaerArrayView::new(&rhs);
-    let s_all = factor.solve(rhs_view.as_ref());
+    let rhsview = FaerArrayView::new(&rhs);
+    let s_all = factor.solve(rhsview.as_ref());
     let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
     let eta_hat = x_dense.dot(fit.beta_transformed.as_ref());
-    let z = &fit.solve_working_response;
+    let z = &fit.solveworking_response;
     let mut loo_pred = Array1::<f64>::zeros(n);
     let mut naive_se = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -266,13 +266,13 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
     let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
 
     let x_dense = fit.x_transformed.to_dense();
-    let sqrt_w = fit.final_weights.mapv(f64::sqrt);
+    let sqrtw = fit.finalweights.mapv(f64::sqrt);
     let mut u = x_dense.clone();
-    let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
-    u *= &sqrt_w_col;
+    let sqrtw_col = sqrtw.view().insert_axis(Axis(1));
+    u *= &sqrtw_col;
     let k = fit.penalized_hessian_transformed.clone();
-    let k_view = FaerArrayView::new(&k);
-    let factor = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).unwrap();
+    let kview = FaerArrayView::new(&k);
+    let factor = factorize_symmetricwith_fallback(kview.as_ref(), Side::Lower).unwrap();
     let mut naive_se = Array1::<f64>::zeros(n);
     for i in 0..n {
         let ui = u.row(i).to_owned();
@@ -280,7 +280,7 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
         let s = factor.solve(rhs.as_ref());
         let s_arr = Array1::from_shape_fn(p, |j| s[(j, 0)]);
         let quad: f64 = ui.iter().zip(s_arr.iter()).map(|(a, b)| a * b).sum();
-        let wi = fit.final_weights[i].max(1e-12);
+        let wi = fit.finalweights[i].max(1e-12);
         naive_se[i] = (quad / wi).max(0.0).sqrt();
     }
 
@@ -360,7 +360,7 @@ fn alo_error_is_driven_by_saturated_points() {
 
         let mut xtwx = Array2::<f64>::zeros((p, p));
         for r in 0..(n - 1) {
-            let wi = fit_loo.final_weights[r];
+            let wi = fit_loo.finalweights[r];
             if wi == 0.0 {
                 continue;
             }
@@ -374,8 +374,8 @@ fn alo_error_is_driven_by_saturated_points() {
         for d in 0..p {
             xtwx[[d, d]] += 1e-10;
         }
-        let k_view = FaerArrayView::new(&xtwx);
-        let llt = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).unwrap();
+        let kview = FaerArrayView::new(&xtwx);
+        let llt = factorize_symmetricwith_fallback(kview.as_ref(), Side::Lower).unwrap();
         let ui = x_i.to_owned();
         let rhs = FaerColView::new(&ui);
         let sol = llt.solve(rhs.as_ref());
@@ -390,8 +390,8 @@ fn alo_error_is_driven_by_saturated_points() {
         loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &loo_se);
     let beta_full = beta_in_original_basis(&fit);
     let eta_full = x.dot(&beta_full);
-    let z_full = &fit.solve_working_response;
-    let max_working_jump = z_full
+    let z_full = &fit.solveworking_response;
+    let maxworking_jump = z_full
         .iter()
         .zip(eta_full.iter())
         .map(|(&zv, &ev)| (zv - ev).abs())
@@ -399,5 +399,5 @@ fn alo_error_is_driven_by_saturated_points() {
 
     assert!(rmse_pred > 1e-2);
     assert!(max_abs_pred > 1e-1);
-    assert!(max_working_jump > 25.0);
+    assert!(maxworking_jump > 25.0);
 }

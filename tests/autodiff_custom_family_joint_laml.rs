@@ -22,7 +22,7 @@ mod common;
 struct CoupledQuarticExactFamily {
     center: f64,
     quartic: f64,
-    beta2_ridge: f64,
+    beta2ridge: f64,
 }
 
 impl CoupledQuarticExactFamily {
@@ -54,18 +54,18 @@ impl CustomFamily for CoupledQuarticExactFamily {
         let curvature = self.curvature(eta);
         let nll = 0.5 * (eta - self.center).powi(2)
             + 0.25 * self.quartic * eta.powi(4)
-            + 0.5 * self.beta2_ridge * beta2.powi(2);
+            + 0.5 * self.beta2ridge * beta2.powi(2);
 
         Ok(FamilyEvaluation {
             log_likelihood: -nll,
-            block_working_sets: vec![
+            blockworking_sets: vec![
                 BlockWorkingSet::ExactNewton {
                     gradient: array![-common],
                     hessian: SymmetricMatrix::Dense(array![[curvature]]),
                 },
                 BlockWorkingSet::ExactNewton {
-                    gradient: array![-(common + self.beta2_ridge * beta2)],
-                    hessian: SymmetricMatrix::Dense(array![[curvature + self.beta2_ridge]]),
+                    gradient: array![-(common + self.beta2ridge * beta2)],
+                    hessian: SymmetricMatrix::Dense(array![[curvature + self.beta2ridge]]),
                 },
             ],
         })
@@ -79,7 +79,7 @@ impl CustomFamily for CoupledQuarticExactFamily {
         let curvature = self.curvature(eta);
         Ok(Some(array![
             [curvature, curvature],
-            [curvature, curvature + self.beta2_ridge]
+            [curvature, curvature + self.beta2ridge]
         ]))
     }
 
@@ -113,10 +113,10 @@ fn solve_eta_numdual<D: DualNum<f64> + Copy>(
     rho: D,
     center: f64,
     quartic: f64,
-    beta2_ridge: f64,
+    beta2ridge: f64,
 ) -> D {
     let lambda = rho.exp();
-    let d = D::from(beta2_ridge);
+    let d = D::from(beta2ridge);
     let c = D::from(center);
     let a = D::from(quartic);
     let coupling = lambda * d / (d + lambda);
@@ -129,15 +129,15 @@ fn solve_eta_numdual<D: DualNum<f64> + Copy>(
     eta
 }
 
-fn coupled_quartic_objective_numdual<D: DualNum<f64> + Copy>(
+fn coupled_quarticobjective_numdual<D: DualNum<f64> + Copy>(
     rho: D,
     center: f64,
     quartic: f64,
-    beta2_ridge: f64,
+    beta2ridge: f64,
 ) -> D {
     let lambda = rho.exp();
-    let d = D::from(beta2_ridge);
-    let eta = solve_eta_numdual(rho, center, quartic, beta2_ridge);
+    let d = D::from(beta2ridge);
+    let eta = solve_eta_numdual(rho, center, quartic, beta2ridge);
     let beta1 = eta * d / (d + lambda);
     let beta2 = eta * lambda / (d + lambda);
     let nll = D::from(0.5) * (eta - D::from(center)) * (eta - D::from(center))
@@ -148,10 +148,10 @@ fn coupled_quartic_objective_numdual<D: DualNum<f64> + Copy>(
     nll + D::from(0.5) * lambda * beta1 * beta1 + D::from(0.5) * det.ln() - D::from(0.5) * rho
 }
 
-fn coupled_quartic_objective_f64(rho: f64, center: f64, quartic: f64, beta2_ridge: f64) -> f64 {
+fn coupled_quarticobjective_f64(rho: f64, center: f64, quartic: f64, beta2ridge: f64) -> f64 {
     let lambda = rho.exp();
-    let d = beta2_ridge;
-    let eta = solve_eta_numdual(rho, center, quartic, beta2_ridge);
+    let d = beta2ridge;
+    let eta = solve_eta_numdual(rho, center, quartic, beta2ridge);
     let beta1 = eta * d / (d + lambda);
     let beta2 = eta * lambda / (d + lambda);
     let nll = 0.5 * (eta - center).powi(2) + 0.25 * quartic * eta.powi(4) + 0.5 * d * beta2.powi(2);
@@ -160,9 +160,9 @@ fn coupled_quartic_objective_f64(rho: f64, center: f64, quartic: f64, beta2_ridg
     nll + 0.5 * lambda * beta1 * beta1 + 0.5 * det.ln() - 0.5 * rho
 }
 
-fn coupled_quartic_objective_f1(rho: F1, center: f64, quartic: f64, beta2_ridge: f64) -> F1 {
+fn coupled_quarticobjective_f1(rho: F1, center: f64, quartic: f64, beta2ridge: f64) -> F1 {
     let lambda = rho.exp();
-    let d = F1::cst(beta2_ridge);
+    let d = F1::cst(beta2ridge);
     let c = F1::cst(center);
     let a = F1::cst(quartic);
     let coupling = lambda * d / (d + lambda);
@@ -186,32 +186,32 @@ fn coupled_quartic_objective_f1(rho: F1, center: f64, quartic: f64, beta2_ridge:
 struct CoupledQuarticObjectiveFn<T: AD> {
     center: f64,
     quartic: f64,
-    beta2_ridge: f64,
-    _marker: PhantomData<T>,
+    beta2ridge: f64,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> CoupledQuarticObjectiveFn<T> {
-    fn new(center: f64, quartic: f64, beta2_ridge: f64) -> Self {
+    fn new(center: f64, quartic: f64, beta2ridge: f64) -> Self {
         Self {
             center,
             quartic,
-            beta2_ridge,
-            _marker: PhantomData,
+            beta2ridge,
+            marker: PhantomData,
         }
     }
 
     fn to_other_ad_type<T2: AD>(&self) -> CoupledQuarticObjectiveFn<T2> {
-        CoupledQuarticObjectiveFn::new(self.center, self.quartic, self.beta2_ridge)
+        CoupledQuarticObjectiveFn::new(self.center, self.quartic, self.beta2ridge)
     }
 }
 
 impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
     const NAME: &'static str = "CoupledQuarticObjectiveFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         let rho = inputs[0];
         let lambda = rho.exp();
-        let d = T::constant(self.beta2_ridge);
+        let d = T::constant(self.beta2ridge);
         let c = T::constant(self.center);
         let a = T::constant(self.quartic);
         let coupling = lambda * d / (d + lambda);
@@ -258,7 +258,7 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
         let resid = beta - self.target;
         Ok(FamilyEvaluation {
             log_likelihood: -0.5 * resid * resid,
-            block_working_sets: vec![BlockWorkingSet::ExactNewton {
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
                 gradient: array![-resid],
                 hessian: SymmetricMatrix::Dense(array![[1.0]]),
             }],
@@ -267,33 +267,33 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[1.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _d_beta: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _d_beta_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn block_linear_constraints(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _spec: &ParameterBlockSpec,
+        spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         if block_idx != 0 {
             return Ok(None);
@@ -305,7 +305,7 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
     }
 }
 
-fn constrained_exact_objective_numdual<D: DualNum<f64> + Copy>(
+fn constrained_exactobjective_numdual<D: DualNum<f64> + Copy>(
     rho: D,
     target: f64,
     lower: f64,
@@ -319,14 +319,14 @@ fn constrained_exact_objective_numdual<D: DualNum<f64> + Copy>(
         - D::from(0.5) * rho
 }
 
-fn constrained_exact_objective_f64(rho: f64, target: f64, lower: f64) -> f64 {
+fn constrained_exactobjective_f64(rho: f64, target: f64, lower: f64) -> f64 {
     let lambda = rho.exp();
     let beta_hat = lower;
     let resid = beta_hat - target;
     0.5 * resid * resid + 0.5 * lambda * beta_hat * beta_hat + 0.5 * (1.0 + lambda).ln() - 0.5 * rho
 }
 
-fn constrained_exact_objective_f1(rho: F1, target: f64, lower: f64) -> F1 {
+fn constrained_exactobjective_f1(rho: F1, target: f64, lower: f64) -> F1 {
     let lambda = rho.exp();
     let beta_hat = F1::cst(lower);
     let resid = beta_hat - F1::cst(target);
@@ -340,7 +340,7 @@ fn constrained_exact_objective_f1(rho: F1, target: f64, lower: f64) -> F1 {
 struct ConstrainedExactObjectiveFn<T: AD> {
     target: f64,
     lower: f64,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> ConstrainedExactObjectiveFn<T> {
@@ -348,7 +348,7 @@ impl<T: AD> ConstrainedExactObjectiveFn<T> {
         Self {
             target,
             lower,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -360,7 +360,7 @@ impl<T: AD> ConstrainedExactObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
     const NAME: &'static str = "ConstrainedExactObjectiveFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         let rho = inputs[0];
         let lambda = rho.exp();
         let beta_hat = T::constant(self.lower);
@@ -383,14 +383,14 @@ impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
 }
 
 #[test]
-fn exact_joint_quadratic_laml_gradient_matches_three_autodiff_engines() {
+fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
     let center = 0.7;
     let quartic = 0.18;
-    let beta2_ridge = 1.4;
+    let beta2ridge = 1.4;
     let family = CoupledQuarticExactFamily {
         center,
         quartic,
-        beta2_ridge,
+        beta2ridge,
     };
     let specs = vec![
         ParameterBlockSpec {
@@ -415,12 +415,12 @@ fn exact_joint_quadratic_laml_gradient_matches_three_autodiff_engines() {
         Vec::<CustomFamilyBlockPsiDerivative>::new(),
     ];
     let options = BlockwiseFitOptions {
-        use_reml_objective: true,
+        use_remlobjective: true,
         compute_covariance: false,
         ridge_floor: 1e-12,
         ..BlockwiseFitOptions::default()
     };
-    let f_std = CoupledQuarticObjectiveFn::<f64>::new(center, quartic, beta2_ridge);
+    let f_std = CoupledQuarticObjectiveFn::<f64>::new(center, quartic, beta2ridge);
     let f_ad = f_std.to_other_ad_type::<adfn<1>>();
     let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
     let rho_points = [-1.2, -0.4, 0.0, 0.6, 1.1];
@@ -437,16 +437,16 @@ fn exact_joint_quadratic_laml_gradient_matches_three_autodiff_engines() {
         )
         .expect("exact joint hyper eval");
         let (value_nd, grad_nd) = first_derivative(
-            |x| coupled_quartic_objective_numdual(x, center, quartic, beta2_ridge),
+            |x| coupled_quarticobjective_numdual(x, center, quartic, beta2ridge),
             rho,
         );
         let grad_autodiff = diff(
-            |x: F1| coupled_quartic_objective_f1(x, center, quartic, beta2_ridge),
+            |x: F1| coupled_quarticobjective_f1(x, center, quartic, beta2ridge),
             rho,
         );
-        let (_value_ad, jac) = engine.derivative(&[rho]);
-        let grad_fd = (coupled_quartic_objective_f64(rho + 1e-6, center, quartic, beta2_ridge)
-            - coupled_quartic_objective_f64(rho - 1e-6, center, quartic, beta2_ridge))
+        let (value_ad, jac) = engine.derivative(&[rho]);
+        let gradfd = (coupled_quarticobjective_f64(rho + 1e-6, center, quartic, beta2ridge)
+            - coupled_quarticobjective_f64(rho - 1e-6, center, quartic, beta2ridge))
             / (2.0 * 1e-6);
 
         assert!(
@@ -454,7 +454,7 @@ fn exact_joint_quadratic_laml_gradient_matches_three_autodiff_engines() {
             "exact_joint_laml objective mismatch at rho={rho}: analytic={} num_dual={} closed_form={}",
             result.objective,
             value_nd,
-            coupled_quartic_objective_f64(rho, center, quartic, beta2_ridge)
+            coupled_quarticobjective_f64(rho, center, quartic, beta2ridge)
         );
         assert_manual_ad_band!(
             "exact_joint_laml",
@@ -463,14 +463,14 @@ fn exact_joint_quadratic_laml_gradient_matches_three_autodiff_engines() {
             result.gradient[0],
             "num_dual" => grad_nd,
             "ad_trait" => jac[(0, 0)],
-            "fd" => grad_fd,
+            "fd" => gradfd,
             "autodiff" => grad_autodiff
         );
     }
 }
 
 #[test]
-fn exact_joint_quadratic_laml_gradient_respects_active_constraint_tangent_space() {
+fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space() {
     let target = -0.4;
     let lower = 0.6;
     let family = LowerBoundConstrainedExactFamily { target, lower };
@@ -484,7 +484,7 @@ fn exact_joint_quadratic_laml_gradient_respects_active_constraint_tangent_space(
     }];
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
     let options = BlockwiseFitOptions {
-        use_reml_objective: true,
+        use_remlobjective: true,
         compute_covariance: false,
         ridge_floor: 1e-12,
         ..BlockwiseFitOptions::default()
@@ -506,16 +506,16 @@ fn exact_joint_quadratic_laml_gradient_respects_active_constraint_tangent_space(
         )
         .expect("constrained exact joint hyper eval");
         let (value_nd, grad_nd) = first_derivative(
-            |x| constrained_exact_objective_numdual(x, target, lower),
+            |x| constrained_exactobjective_numdual(x, target, lower),
             rho,
         );
         let grad_autodiff = diff(
-            |x: F1| constrained_exact_objective_f1(x, target, lower),
+            |x: F1| constrained_exactobjective_f1(x, target, lower),
             rho,
         );
-        let (_value_ad, jac) = engine.derivative(&[rho]);
-        let grad_fd = (constrained_exact_objective_f64(rho + 1e-6, target, lower)
-            - constrained_exact_objective_f64(rho - 1e-6, target, lower))
+        let (value_ad, jac) = engine.derivative(&[rho]);
+        let gradfd = (constrained_exactobjective_f64(rho + 1e-6, target, lower)
+            - constrained_exactobjective_f64(rho - 1e-6, target, lower))
             / (2.0 * 1e-6);
 
         assert!(
@@ -523,7 +523,7 @@ fn exact_joint_quadratic_laml_gradient_respects_active_constraint_tangent_space(
             "constrained_exact_joint objective mismatch at rho={rho}: analytic={} num_dual={} closed_form={}",
             result.objective,
             value_nd,
-            constrained_exact_objective_f64(rho, target, lower)
+            constrained_exactobjective_f64(rho, target, lower)
         );
         assert_manual_ad_band!(
             "constrained_exact_joint_laml",
@@ -532,21 +532,21 @@ fn exact_joint_quadratic_laml_gradient_respects_active_constraint_tangent_space(
             result.gradient[0],
             "num_dual" => grad_nd,
             "ad_trait" => jac[(0, 0)],
-            "fd" => grad_fd,
+            "fd" => gradfd,
             "autodiff" => grad_autodiff
         );
     }
 }
 
 #[test]
-fn exact_joint_quadratic_laml_gradient_requires_joint_stationarity() {
+fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
     let center = 0.7;
     let quartic = 0.18;
-    let beta2_ridge = 1.4;
+    let beta2ridge = 1.4;
     let family = CoupledQuarticExactFamily {
         center,
         quartic,
-        beta2_ridge,
+        beta2ridge,
     };
     let specs = vec![
         ParameterBlockSpec {
@@ -571,13 +571,13 @@ fn exact_joint_quadratic_laml_gradient_requires_joint_stationarity() {
         Vec::<CustomFamilyBlockPsiDerivative>::new(),
     ];
     let options = BlockwiseFitOptions {
-        use_reml_objective: true,
+        use_remlobjective: true,
         compute_covariance: false,
         ridge_floor: 1e-12,
         inner_tol: 1e-3,
         ..BlockwiseFitOptions::default()
     };
-    let f_std = CoupledQuarticObjectiveFn::<f64>::new(center, quartic, beta2_ridge);
+    let f_std = CoupledQuarticObjectiveFn::<f64>::new(center, quartic, beta2ridge);
     let f_ad = f_std.to_other_ad_type::<adfn<1>>();
     let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
     let rho_points = [-1.2, -0.4, 0.0, 0.6, 1.1];
@@ -594,16 +594,16 @@ fn exact_joint_quadratic_laml_gradient_requires_joint_stationarity() {
         )
         .expect("exact joint hyper eval");
         let (value_nd, grad_nd) = first_derivative(
-            |x| coupled_quartic_objective_numdual(x, center, quartic, beta2_ridge),
+            |x| coupled_quarticobjective_numdual(x, center, quartic, beta2ridge),
             rho,
         );
         let grad_autodiff = diff(
-            |x: F1| coupled_quartic_objective_f1(x, center, quartic, beta2_ridge),
+            |x: F1| coupled_quarticobjective_f1(x, center, quartic, beta2ridge),
             rho,
         );
-        let (_value_ad, jac) = engine.derivative(&[rho]);
-        let grad_fd = (coupled_quartic_objective_f64(rho + 1e-6, center, quartic, beta2_ridge)
-            - coupled_quartic_objective_f64(rho - 1e-6, center, quartic, beta2_ridge))
+        let (value_ad, jac) = engine.derivative(&[rho]);
+        let gradfd = (coupled_quarticobjective_f64(rho + 1e-6, center, quartic, beta2ridge)
+            - coupled_quarticobjective_f64(rho - 1e-6, center, quartic, beta2ridge))
             / (2.0 * 1e-6);
 
         assert!(
@@ -611,7 +611,7 @@ fn exact_joint_quadratic_laml_gradient_requires_joint_stationarity() {
             "exact_joint_stationarity objective mismatch at rho={rho}: analytic={} num_dual={} closed_form={}",
             result.objective,
             value_nd,
-            coupled_quartic_objective_f64(rho, center, quartic, beta2_ridge)
+            coupled_quarticobjective_f64(rho, center, quartic, beta2ridge)
         );
         assert_manual_ad_band!(
             "exact_joint_stationarity",
@@ -620,7 +620,7 @@ fn exact_joint_quadratic_laml_gradient_requires_joint_stationarity() {
             result.gradient[0],
             "num_dual" => grad_nd,
             "ad_trait" => jac[(0, 0)],
-            "fd" => grad_fd,
+            "fd" => gradfd,
             "autodiff" => grad_autodiff
         );
     }

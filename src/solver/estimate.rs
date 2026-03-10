@@ -33,14 +33,14 @@ use crate::construction::{
 };
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
-    KahanSum, RidgePlanner, StableSolver, add_ridge, matrix_inverse_with_regularization,
+    KahanSum, RidgePlanner, StableSolver, addridge, matrix_inversewith_regularization,
     max_abs_diag,
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    beta_logistic_inverse_link_jet_with_param_partials,
-    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet_with_param_partials,
-    state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
+    beta_logistic_inverse_link_jetwith_param_partials,
+    mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
+    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
@@ -54,17 +54,17 @@ use crate::types::{MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut, fast_ab, fast_ata,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_ata,
     fast_atb,
 };
 
 use crate::diagnostics::{
-    approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
+    approx_f64, format_compact_series, format_cond, format_range, quantizevalue, quantizevec,
     should_emit_h_min_eig_diag,
 };
 use serde::{Deserialize, Serialize};
 
-// Note: deflate_weights_by_se was removed. We now use integrated (GHQ)
+// Note: deflateweights_by_se was removed. We now use integrated (GHQ)
 // family-dispatched likelihood updates in PIRLS instead of weight deflation.
 // The SE is passed through to PIRLS which integrates over uncertainty
 // in the likelihood, rather than using ad-hoc weight adjustment.
@@ -106,14 +106,14 @@ where
     acc.sum()
 }
 
-fn signed_xt_v_x(
+fn signed_xtv_x(
     design: &DesignMatrix,
-    row_weights: &Array1<f64>,
+    rowweights: &Array1<f64>,
 ) -> Result<Array2<f64>, EstimationError> {
-    if row_weights.len() != design.nrows() {
+    if rowweights.len() != design.nrows() {
         return Err(EstimationError::InvalidInput(format!(
-            "signed_xt_v_x row mismatch: weights={}, design rows={}",
-            row_weights.len(),
+            "signed_xtv_x row mismatch: weights={}, design rows={}",
+            rowweights.len(),
             design.nrows()
         )));
     }
@@ -122,7 +122,7 @@ fn signed_xt_v_x(
     match design {
         DesignMatrix::Dense(x) => {
             for i in 0..x.nrows() {
-                let vi = row_weights[i];
+                let vi = rowweights[i];
                 if vi == 0.0 {
                     continue;
                 }
@@ -141,7 +141,7 @@ fn signed_xt_v_x(
         DesignMatrix::Sparse(xs) => {
             let csr = xs.to_csr_arc().ok_or_else(|| {
                 EstimationError::InvalidInput(
-                    "signed_xt_v_x: failed to obtain CSR view".to_string(),
+                    "signed_xtv_x: failed to obtain CSR view".to_string(),
                 )
             })?;
             let sym = csr.symbolic();
@@ -149,7 +149,7 @@ fn signed_xt_v_x(
             let col_idx = sym.col_idx();
             let vals = csr.val();
             for i in 0..design.nrows() {
-                let vi = row_weights[i];
+                let vi = rowweights[i];
                 if vi == 0.0 {
                     continue;
                 }
@@ -180,7 +180,7 @@ fn assemble_parametric_score_beta_jacobian(
     penalty: &Array2<f64>,
     ridge: f64,
 ) -> Result<Array2<f64>, EstimationError> {
-    let mut jacobian = signed_xt_v_x(x_t, neg_du_deta)?;
+    let mut jacobian = signed_xtv_x(x_t, neg_du_deta)?;
     if penalty.nrows() != jacobian.nrows() || penalty.ncols() != jacobian.ncols() {
         return Err(EstimationError::InvalidInput(format!(
             "parametric score beta jacobian penalty mismatch: penalty={}x{}, jacobian={}x{}",
@@ -320,10 +320,10 @@ impl ParametricColumnConditioning {
         &self,
         hyper_dir: &DirectionalHyperParam,
     ) -> Result<DirectionalHyperParam, EstimationError> {
-        let x_tau_original = self.transform_matrix_columns_with_a(&hyper_dir.x_tau_original);
+        let x_tau_original = self.transform_matrix_columnswith_a(&hyper_dir.x_tau_original);
         let x_tau_tau_original = hyper_dir.x_tau_tau_original.as_ref().map(|rows| {
             rows.iter()
-                .map(|mat| self.transform_matrix_columns_with_a(mat))
+                .map(|mat| self.transform_matrix_columnswith_a(mat))
                 .collect::<Vec<_>>()
         });
         let penalty_first_components = hyper_dir
@@ -331,7 +331,7 @@ impl ParametricColumnConditioning {
             .iter()
             .map(|component| (component.penalty_index, component.matrix.clone()))
             .collect::<Vec<_>>();
-        let penalty_second_components = hyper_dir.penalty_second_component_rows().map(|rows| {
+        let penaltysecond_components = hyper_dir.penaltysecond_componentrows().map(|rows| {
             rows.iter()
                 .map(|components| {
                     components
@@ -345,7 +345,7 @@ impl ParametricColumnConditioning {
             x_tau_original,
             penalty_first_components,
             x_tau_tau_original,
-            penalty_second_components,
+            penaltysecond_components,
         )
     }
 
@@ -360,7 +360,7 @@ impl ParametricColumnConditioning {
         beta
     }
 
-    fn transform_matrix_columns_with_a(&self, mat: &Array2<f64>) -> Array2<f64> {
+    fn transform_matrix_columnswith_a(&self, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = mat.clone();
         for &(j, mean, scale) in &self.columns {
             let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
@@ -377,15 +377,15 @@ impl ParametricColumnConditioning {
         out
     }
 
-    fn transform_matrix_rows_with_a_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
+    fn transform_matrixrowswith_a_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = mat.clone();
         for &(j, mean, scale) in &self.columns {
-            let intercept_row = self.intercept_idx.map(|idx| out.row(idx).to_owned());
+            let interceptrow = self.intercept_idx.map(|idx| out.row(idx).to_owned());
             let mut target = out.row_mut(j);
             if mean != 0.0
-                && let Some(intercept_row) = intercept_row
+                && let Some(interceptrow) = interceptrow
             {
-                target -= &(intercept_row * mean);
+                target -= &(interceptrow * mean);
             }
             if scale != 1.0 {
                 target.mapv_inplace(|v| v / scale);
@@ -394,7 +394,7 @@ impl ParametricColumnConditioning {
         out
     }
 
-    fn transform_matrix_columns_with_b(&self, mat: &Array2<f64>) -> Array2<f64> {
+    fn transform_matrix_columnswith_b(&self, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = mat.clone();
         for &(j, mean, scale) in &self.columns {
             let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
@@ -411,15 +411,15 @@ impl ParametricColumnConditioning {
         out
     }
 
-    fn transform_matrix_rows_with_b_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
+    fn transform_matrixrowswith_b_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = mat.clone();
         for &(j, mean, scale) in &self.columns {
-            let intercept_row = self.intercept_idx.map(|idx| out.row(idx).to_owned());
+            let interceptrow = self.intercept_idx.map(|idx| out.row(idx).to_owned());
             let mut target = out.row_mut(j);
             if mean != 0.0
-                && let Some(intercept_row) = intercept_row
+                && let Some(interceptrow) = interceptrow
             {
-                target += &(intercept_row * mean);
+                target += &(interceptrow * mean);
             }
             if scale != 1.0 {
                 target.mapv_inplace(|v| v * scale);
@@ -429,13 +429,13 @@ impl ParametricColumnConditioning {
     }
 
     fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
-        let right = self.transform_matrix_columns_with_a(cov_internal);
-        self.transform_matrix_rows_with_a_transpose(&right)
+        let right = self.transform_matrix_columnswith_a(cov_internal);
+        self.transform_matrixrowswith_a_transpose(&right)
     }
 
     fn backtransform_penalized_hessian(&self, h_internal: &Array2<f64>) -> Array2<f64> {
-        let right = self.transform_matrix_columns_with_b(h_internal);
-        self.transform_matrix_rows_with_b_transpose(&right)
+        let right = self.transform_matrix_columnswith_b(h_internal);
+        self.transform_matrixrowswith_b_transpose(&right)
     }
 
     fn backtransform_external_result(
@@ -487,7 +487,7 @@ pub(crate) struct RemlConfig {
     max_iterations: usize,
     reml_convergence_tolerance: f64,
     firth_bias_reduction: bool,
-    objective_consistent_fd_gradient: bool,
+    objective_consistentfdgradient: bool,
 }
 
 impl RemlConfig {
@@ -498,7 +498,7 @@ impl RemlConfig {
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
-            objective_consistent_fd_gradient: false,
+            objective_consistentfdgradient: false,
         }
     }
 
@@ -587,8 +587,7 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 ///
 /// Returns the correction matrix in the ORIGINAL coefficient basis.
 ///
-/// FULL CORRECTION REFERENCE
-/// -------------------------
+/// Full correction reference.
 /// Let `rho ~ N(mu, Sigma)` with `mu = rho_hat`, `Sigma = V_rho`,
 /// and define:
 /// - `A(rho) = H_rho^{-1}`
@@ -599,9 +598,9 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 ///
 /// Around `mu`, this routine keeps the first-order terms:
 ///
-///   `E[A(rho)]      ~= A(mu) = H_mu^{-1}`
+///   `E[A(rho)]      ~= A(mu) = Hmu^{-1}`
 ///   `Var(b(rho))    ~= J Sigma J^T`
-///   `Var(beta)      ~= H_mu^{-1} + J V_rho J^T`.
+///   `Var(beta)      ~= Hmu^{-1} + J V_rho J^T`.
 ///
 /// Equivalent first-order propagation around the outer optimum `rho*`:
 ///
@@ -670,8 +669,8 @@ fn compute_smoothing_correction(
     //   X'WX+S here would be inconsistent with the fitted objective and would
     //   misstate smoothing-parameter uncertainty propagation.
     let h_trans = reml_state
-        .objective_inner_hessian(final_rho)
-        .unwrap_or_else(|_| final_fit.stabilized_hessian_transformed.clone());
+        .objective_innerhessian(final_rho)
+        .unwrap_or_else(|_| final_fit.stabilizedhessian_transformed.clone());
 
     // Factor the Hessian for solving
     let h_chol = match h_trans.cholesky(faer::Side::Lower) {
@@ -704,7 +703,7 @@ fn compute_smoothing_correction(
 
         // dβ/dρ_k = -H^{-1}(λ_k S_k β)
         let rhs = s_k_beta.mapv(|v| -lambdas[k] * v);
-        let delta = h_chol.solve_vec(&rhs);
+        let delta = h_chol.solvevec(&rhs);
 
         jacobian_trans.column_mut(k).assign(&delta);
     }
@@ -712,14 +711,14 @@ fn compute_smoothing_correction(
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
     // Prefer exact Hessian; if unavailable, use deterministic analytic fallback
     // from the same objective surface (no runtime FD Hessian path).
-    let mut hessian_rho = match reml_state.compute_laml_hessian_consistent(final_rho) {
+    let mut hessian_rho = match reml_state.compute_lamlhessian_consistent(final_rho) {
         Ok(h) => h,
         Err(err) => {
             log::warn!(
                 "LAML Hessian unavailable ({}); using analytic fallback Hessian for smoothing correction.",
                 err
             );
-            match reml_state.compute_laml_hessian_analytic_fallback_standalone(final_rho) {
+            match reml_state.compute_lamlhessian_analytic_fallback_standalone(final_rho) {
                 Ok(h) => h,
                 Err(fallback_err) => {
                     log::warn!(
@@ -761,8 +760,8 @@ fn compute_smoothing_correction(
         Ok(chol) => {
             let mut eye = Array2::<f64>::eye(n_rho);
             for col in 0..n_rho {
-                let col_vec = eye.column(col).to_owned();
-                let solved = chol.solve_vec(&col_vec);
+                let colvec = eye.column(col).to_owned();
+                let solved = chol.solvevec(&colvec);
                 eye.column_mut(col).assign(&solved);
             }
             eye
@@ -784,14 +783,14 @@ fn compute_smoothing_correction(
     // Here:
     //   J = dβ̂/dρ,  J[:,k] = -H^{-1}(A_k β̂),
     //   V_ρ = (∇²_{ρρ}V)^{-1} evaluated at the final ρ.
-    let j_v_rho = jacobian_trans.dot(&v_rho); // (n_coeffs_trans x n_rho)
-    let v_corr_trans = j_v_rho.dot(&jacobian_trans.t()); // (n_coeffs_trans x n_coeffs_trans)
+    let jv_rho = jacobian_trans.dot(&v_rho); // (n_coeffs_trans x n_rho)
+    let v_corr_trans = jv_rho.dot(&jacobian_trans.t()); // (n_coeffs_trans x n_coeffs_trans)
 
     // Step 5: Transform back to original coefficient basis:
     // V_corr_orig = Qs * V_corr_trans * Qs^T
     let qs = &final_fit.reparam_result.qs;
-    let qs_v = qs.dot(&v_corr_trans);
-    let v_corr_orig = qs_v.dot(&qs.t());
+    let qsv = qs.dot(&v_corr_trans);
+    let v_corr_orig = qsv.dot(&qs.t());
 
     // Validate the result
     if !v_corr_orig.iter().all(|v| v.is_finite()) {
@@ -947,7 +946,7 @@ pub struct ExternalOptimResult {
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
     pub iterations: usize,
-    pub final_grad_norm: f64,
+    pub finalgrad_norm: f64,
     pub pirls_status: crate::pirls::PirlsStatus,
     pub deviance: f64,
     pub stable_penalty_term: f64,
@@ -1043,19 +1042,19 @@ fn resolved_external_inverse_link(
     sas_link: Option<SasLinkSpec>,
 ) -> Result<InverseLink, EstimationError> {
     if let Some(spec) = mixture_link {
-        return Ok(InverseLink::Mixture(state_from_spec(spec).map_err(
+        return Ok(InverseLink::Mixture(state_fromspec(spec).map_err(
             |e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")),
         )?));
     }
     if let Some(spec) = sas_link {
         return Ok(match link {
             LinkFunction::BetaLogistic => {
-                InverseLink::BetaLogistic(state_from_beta_logistic_spec(spec).map_err(|e| {
+                InverseLink::BetaLogistic(state_from_beta_logisticspec(spec).map_err(|e| {
                     EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
                 })?)
             }
             _ => InverseLink::Sas(
-                state_from_sas_spec(spec)
+                state_from_sasspec(spec)
                     .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
             ),
         });
@@ -1141,7 +1140,7 @@ fn canonicalize_active_penalties(
             log::debug!(
                 "Dropped inactive external penalty block idx={} reason={}",
                 idx,
-                if analysis.is_zero {
+                if analysis.iszero {
                     "ZeroMatrix"
                 } else {
                     "NumericalRankZero"
@@ -1169,12 +1168,12 @@ pub fn optimize_external_design<X>(
 where
     X: Into<DesignMatrix>,
 {
-    optimize_external_design_with_heuristic_lambdas(y, w, x, offset, s_list, None, opts)
+    optimize_external_designwith_heuristic_lambdas(y, w, x, offset, s_list, None, opts)
 }
 
 /// Same as `optimize_external_design`, but allows heuristic λ warm-start seeds
 /// for the outer smoothing search.
-pub fn optimize_external_design_with_heuristic_lambdas<X>(
+pub fn optimize_external_designwith_heuristic_lambdas<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -1186,7 +1185,7 @@ pub fn optimize_external_design_with_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
-    optimize_external_design_with_heuristic_lambdas_and_warm_start(
+    optimize_external_designwith_heuristic_lambdas_andwarm_start(
         y,
         w,
         x,
@@ -1198,7 +1197,7 @@ where
     )
 }
 
-fn optimize_external_design_with_heuristic_lambdas_and_warm_start<X>(
+fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -1257,7 +1256,7 @@ where
     let x_fit_o = x_fit.clone();
     let offset_o = offset.to_owned();
     let s_list_shared = Arc::new(s_list);
-    let reml_state = RemlState::new_with_offset_shared(
+    let reml_state = RemlState::newwith_offset_shared(
         y_o.view(),
         x_fit_o.clone(),
         w_o.view(),
@@ -1269,14 +1268,14 @@ where
         None,
         fit_linear_constraints.clone(),
     )?;
-    reml_state.set_warm_start_original_beta(warm_start_beta);
+    reml_state.setwarm_start_original_beta(warm_start_beta);
 
     let smoothing_options = crate::solver::smoothing::SmoothingBfgsOptions {
         max_iter: opts.max_iter,
         tol: cfg.reml_convergence_tolerance,
         finite_diff_step: 1e-3,
         // External REML path below provides exact Hessians directly.
-        fd_hessian_max_dim: 0,
+        fdhessian_max_dim: 0,
         optimizer_kind: crate::solver::smoothing::SmoothingOptimizerKind::Arc,
         seed_config: SeedConfig {
             bounds: (-12.0, 12.0),
@@ -1301,23 +1300,23 @@ where
         },
     };
     let outer_eval_idx = AtomicUsize::new(0usize);
-    let mixture_opt_spec = if opts.optimize_mixture {
+    let mixture_optspec = if opts.optimize_mixture {
         opts.mixture_link.clone()
     } else {
         None
     };
-    let sas_opt_spec = if opts.optimize_sas {
+    let sas_optspec = if opts.optimize_sas {
         effective_sas_link
     } else {
         None
     };
-    let mixture_dim = mixture_opt_spec
+    let mixture_dim = mixture_optspec
         .as_ref()
         .map(|s| s.initial_rho.len())
         .unwrap_or(0);
-    let sas_dim = if sas_opt_spec.is_some() { 2 } else { 0 };
-    let sas_ridge_weight = if sas_dim > 0 {
-        sas_log_delta_ridge_weight()
+    let sas_dim = if sas_optspec.is_some() { 2 } else { 0 };
+    let sasridgeweight = if sas_dim > 0 {
+        sas_log_deltaridgeweight()
     } else {
         0.0
     };
@@ -1333,16 +1332,14 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        let mut pure_smoothing_options = smoothing_options.clone();
-        pure_smoothing_options.optimizer_kind =
-            crate::solver::smoothing::SmoothingOptimizerKind::Bfgs;
+        let pure_smoothing_options = smoothing_options.clone();
         let outer_result =
-            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
+            crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient(
                 k,
                 heuristic_lambdas,
                 |rho: &Array1<f64>| {
                     outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                    reml_state.set_warm_start_original_beta(None);
+                    reml_state.setwarm_start_original_beta(None);
                     let cost = reml_state.compute_cost(rho)?;
                     let grad = reml_state.compute_gradient(rho)?;
                     Ok((cost, grad))
@@ -1363,8 +1360,8 @@ where
         let use_beta_logistic =
             use_sas && matches!(cfg.link_function(), LinkFunction::BetaLogistic);
         let theta_dim = k + mixture_dim + sas_dim;
-        let sas_spec = sas_opt_spec;
-        let mix_spec = mixture_opt_spec
+        let sasspec = sas_optspec;
+        let mixspec = mixture_optspec
             .clone()
             .or_else(|| {
                 if use_mixture {
@@ -1383,9 +1380,9 @@ where
                 heuristic_theta.extend_from_slice(hvals);
                 if use_mixture {
                     heuristic_theta
-                        .extend_from_slice(mix_spec.initial_rho.as_slice().unwrap_or(&[]));
+                        .extend_from_slice(mixspec.initial_rho.as_slice().unwrap_or(&[]));
                 }
-                if let Some(spec) = sas_spec {
+                if let Some(spec) = sasspec {
                     heuristic_theta.push(spec.initial_epsilon);
                     heuristic_theta.push(spec.initial_log_delta);
                 }
@@ -1397,9 +1394,9 @@ where
             None
         };
         let mut smoothing_options_mix = smoothing_options.clone();
-        smoothing_options_mix.fd_hessian_max_dim = 0;
+        smoothing_options_mix.fdhessian_max_dim = 0;
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
-        let mut reml_eval = RemlState::new_with_offset_shared(
+        let mut reml_eval = RemlState::newwith_offset_shared(
             y_o.view(),
             x_fit_o.clone(),
             w_o.view(),
@@ -1439,7 +1436,7 @@ where
         } else {
             Vec::new()
         };
-        let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+        let outer_result = crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient_andhessian(
             theta_dim,
             heuristic_theta_ref,
             |theta: &Array1<f64>| {
@@ -1454,11 +1451,11 @@ where
                     })?;
                     mix_rho_arr.assign(&theta.slice(s![k..(k + mixture_dim)]));
                     let spec_eval = MixtureLinkSpec {
-                        components: mix_spec.components.clone(),
+                        components: mixspec.components.clone(),
                         initial_rho: mix_rho_arr.clone(),
                     };
                     cfg_eval.link_kind = InverseLink::Mixture(
-                        state_from_spec(&spec_eval).map_err(|e| {
+                        state_fromspec(&spec_eval).map_err(|e| {
                             EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                         })?,
                     );
@@ -1473,7 +1470,7 @@ where
                     let delta_like = theta[k + 1];
                     cfg_eval.link_kind = if use_beta_logistic {
                         InverseLink::BetaLogistic(
-                            state_from_beta_logistic_spec(SasLinkSpec {
+                            state_from_beta_logisticspec(SasLinkSpec {
                                 initial_epsilon: epsilon,
                                 initial_log_delta: delta_like,
                             })
@@ -1485,7 +1482,7 @@ where
                         )
                     } else {
                         InverseLink::Sas(
-                            state_from_sas_spec(SasLinkSpec {
+                            state_from_sasspec(SasLinkSpec {
                                 initial_epsilon: epsilon,
                                 initial_log_delta: delta_like,
                             })
@@ -1500,28 +1497,28 @@ where
                         cfg_eval.link_kind.mixture_state().cloned(),
                         cfg_eval.link_kind.sas_state().copied(),
                     );
-                let t_cost = Instant::now();
+                let tcost = Instant::now();
                 let mut cost = reml_eval.compute_cost(&rho_buf)?;
-                let sas_ridge = if use_sas && !use_beta_logistic {
-                    sas_ridge_weight
+                let sasridge = if use_sas && !use_beta_logistic {
+                    sasridgeweight
                 } else {
                     0.0
                 };
-                if use_sas && sas_ridge > 0.0 {
+                if use_sas && sasridge > 0.0 {
                     let log_delta = theta[k + 1];
-                    cost += 0.5 * sas_ridge * log_delta * log_delta;
+                    cost += 0.5 * sasridge * log_delta * log_delta;
                     if !use_beta_logistic {
-                        let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
-                        cost += barrier_cost;
+                        let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+                        cost += barriercost;
                     }
                 }
-                let cost_sec = t_cost.elapsed().as_secs_f64();
+                let cost_sec = tcost.elapsed().as_secs_f64();
 
-                let t_grad = Instant::now();
+                let tgrad = Instant::now();
                 let mut grad = Array1::<f64>::zeros(theta_dim);
                 let grad_rho = reml_eval.compute_gradient(&rho_buf)?;
                 grad.slice_mut(s![..k]).assign(&grad_rho);
-                let (pirls_mix, h_pos_w) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
+                let (pirls_mix, h_posw) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
                 if cfg_eval.firth_bias_reduction {
                     return Err(EstimationError::InvalidInput(
                         "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
@@ -1530,23 +1527,23 @@ where
                 }
                 let eta = &pirls_mix.final_eta;
                 let x_t = &pirls_mix.x_transformed;
-                let n_obs = eta.len();
+                let nobs = eta.len();
                 let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                debug_assert_eq!(n_obs, leverage_buf.len());
+                debug_assert_eq!(nobs, leverage_buf.len());
                 score_beta_jacobian_diag_buf.fill(0.0);
                 leverage_buf.fill(0.0);
-                if h_pos_w.ncols() > 0 {
+                if h_posw.ncols() > 0 {
                     match x_t {
                         DesignMatrix::Dense(x_dense) => {
-                            let xw = x_dense.dot(h_pos_w.as_ref());
+                            let xw = x_dense.dot(h_posw.as_ref());
                             for i in 0..xw.nrows() {
                                 leverage_buf[i] = xw.row(i).iter().map(|v| v * v).sum();
                             }
                         }
                         DesignMatrix::Sparse(_) => {
-                            for col in 0..h_pos_w.ncols() {
-                                let w_col = h_pos_w.column(col).to_owned();
-                                let xw_col = x_t.matrix_vector_multiply(&w_col);
+                            for col in 0..h_posw.ncols() {
+                                let w_col = h_posw.column(col).to_owned();
+                                let xw_col = x_t.matrixvectormultiply(&w_col);
                                 Zip::from(&mut leverage_buf)
                                     .and(&xw_col)
                                     .for_each(|h, &v| *h += v * v);
@@ -1563,8 +1560,8 @@ where
                     let mix_state = cfg_eval.link_kind.mixture_state().ok_or_else(|| {
                         EstimationError::InvalidInput("missing mixture state".to_string())
                     })?;
-                    for i in 0..n_obs {
-                        let jet = mixture_inverse_link_jet_with_rho_partials_into(
+                    for i in 0..nobs {
+                        let jet = mixture_inverse_link_jetwith_rho_partials_into(
                             mix_state,
                             eta[i],
                             &mut mix_partials_buf_reuse,
@@ -1582,7 +1579,7 @@ where
                             let dd1 = dj.d1;
                             direct_ll_buf[j] += aux.a1 * dmu;
                             du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                            let variance_param = aux.variance_mu_scale * dmu;
+                            let variance_param = aux.variancemu_scale * dmu;
                             let numerator = d1 * d1;
                             let numerator_param = 2.0 * d1 * dd1;
                             dw_explicit_by_j_buf[j][i] = wi
@@ -1594,16 +1591,16 @@ where
                     let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
                         EstimationError::InvalidInput("missing parameterized link state".to_string())
                     })?;
-                    for i in 0..n_obs {
+                    for i in 0..nobs {
                         let eta_i = eta[i].clamp(-30.0, 30.0);
                         let jets = if use_beta_logistic {
-                            beta_logistic_inverse_link_jet_with_param_partials(
+                            beta_logistic_inverse_link_jetwith_param_partials(
                                 eta_i,
                                 sas.log_delta,
                                 sas.epsilon,
                             )
                         } else {
-                            sas_inverse_link_jet_with_param_partials(
+                            sas_inverse_link_jetwith_param_partials(
                                 eta_i,
                                 sas.epsilon,
                                 sas.log_delta,
@@ -1626,7 +1623,7 @@ where
                             let dd1 = dj.d1;
                             direct_ll_buf[j] += aux.a1 * dmu;
                             du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                            let variance_param = aux.variance_mu_scale * dmu;
+                            let variance_param = aux.variancemu_scale * dmu;
                             let numerator = d1 * d1;
                             let numerator_param = 2.0 * d1 * dd1;
                             dw_explicit_by_j_buf[j][i] = wi
@@ -1642,14 +1639,14 @@ where
                     pirls_mix.ridge_used,
                 )?;
                 let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
-                let jacobian_ridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
+                let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
                 for j in 0..aux_dim {
                     let rhs_j = x_t.transpose_vector_multiply(&du_by_j_buf[j]);
                     let dbeta_j = solver
-                        .solve_vector_with_ridge_retries(
+                        .solvevectorwithridge_retries(
                             &score_beta_jacobian,
                             &rhs_j,
-                            jacobian_ridge_floor,
+                            jacobianridge_floor,
                         )
                         .ok_or_else(|| {
                             EstimationError::InvalidInput(
@@ -1657,9 +1654,9 @@ where
                                     .to_string(),
                             )
                         })?;
-                    let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
+                    let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
                     let mut trace_term = 0.0_f64;
-                    for i in 0..n_obs {
+                    for i in 0..nobs {
                         let dw_total =
                             dw_explicit_by_j_buf[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
                         trace_term += leverage_buf[i] * dw_total;
@@ -1670,15 +1667,15 @@ where
                     let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
                     grad[k] *= d_eps_d_raw;
                 }
-                if use_sas && sas_ridge > 0.0 {
+                if use_sas && sasridge > 0.0 {
                     let log_delta = theta[k + 1];
-                    grad[k + 1] += sas_ridge * log_delta;
+                    grad[k + 1] += sasridge * log_delta;
                     if !use_beta_logistic {
-                        let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(log_delta);
-                        grad[k + 1] += barrier_grad;
+                        let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
+                        grad[k + 1] += barriergrad;
                     }
                 }
-                let grad_sec = t_grad.elapsed().as_secs_f64();
+                let grad_sec = tgrad.elapsed().as_secs_f64();
                 log::info!(
                     "[outer-eval {eval_idx}] theta_dim={} aux_dim={} hessian=false time_sec(cost={:.3}, grad={:.3})",
                     theta_dim,
@@ -1694,8 +1691,8 @@ where
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
             Some(
-                state_from_spec(&MixtureLinkSpec {
-                    components: mix_spec.components.clone(),
+                state_fromspec(&MixtureLinkSpec {
+                    components: mixspec.components.clone(),
                     initial_rho: final_mix_rho,
                 })
                 .map_err(|e| {
@@ -1713,7 +1710,7 @@ where
                 v
             };
             Some(if use_beta_logistic {
-                state_from_beta_logistic_spec(SasLinkSpec {
+                state_from_beta_logisticspec(SasLinkSpec {
                     initial_epsilon: epsilon_eff,
                     initial_log_delta: outer_result.rho[k + 1],
                 })
@@ -1721,7 +1718,7 @@ where
                     EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
                 })?
             } else {
-                state_from_sas_spec(SasLinkSpec {
+                state_from_sasspec(SasLinkSpec {
                     initial_epsilon: epsilon_eff,
                     initial_log_delta: outer_result.rho[k + 1],
                 })
@@ -1738,13 +1735,13 @@ where
                 theta_aux[0] = outer_result.rho[k];
                 theta_aux[1] = outer_result.rho[k + 1];
             }
-            let mut evaluate_aux_cost = |aux: &Array1<f64>| -> Result<f64, EstimationError> {
+            let mut evaluate_auxcost = |aux: &Array1<f64>| -> Result<f64, EstimationError> {
                 if use_mixture {
                     let spec_eval = MixtureLinkSpec {
-                        components: mix_spec.components.clone(),
+                        components: mixspec.components.clone(),
                         initial_rho: aux.clone(),
                     };
-                    let mix_state = state_from_spec(&spec_eval).map_err(|e| {
+                    let mix_state = state_fromspec(&spec_eval).map_err(|e| {
                         EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                     })?;
                     reml_eval.set_link_states(Some(mix_state), None);
@@ -1756,7 +1753,7 @@ where
                         v
                     };
                     let sas_state = if use_beta_logistic {
-                        state_from_beta_logistic_spec(SasLinkSpec {
+                        state_from_beta_logisticspec(SasLinkSpec {
                             initial_epsilon: epsilon_eff,
                             initial_log_delta: aux[1],
                         })
@@ -1766,7 +1763,7 @@ where
                             ))
                         })?
                     } else {
-                        state_from_sas_spec(SasLinkSpec {
+                        state_from_sasspec(SasLinkSpec {
                             initial_epsilon: epsilon_eff,
                             initial_log_delta: aux[1],
                         })
@@ -1777,15 +1774,15 @@ where
                     reml_eval.set_link_states(None, Some(sas_state));
                 }
                 let mut cost = reml_eval.compute_cost(&final_rho)?;
-                if use_sas && !use_beta_logistic && sas_ridge_weight > 0.0 {
+                if use_sas && !use_beta_logistic && sasridgeweight > 0.0 {
                     let log_delta = aux[1];
-                    cost += 0.5 * sas_ridge_weight * log_delta * log_delta;
-                    let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
-                    cost += barrier_cost;
+                    cost += 0.5 * sasridgeweight * log_delta * log_delta;
+                    let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+                    cost += barriercost;
                 }
                 Ok(cost)
             };
-            let f0 = evaluate_aux_cost(&theta_aux)?;
+            let f0 = evaluate_auxcost(&theta_aux)?;
             let d = aux_dim_outer;
             let mut h_aux = Array2::<f64>::zeros((d, d));
             for i in 0..d {
@@ -1794,8 +1791,8 @@ where
                 let mut tm = theta_aux.clone();
                 tp[i] += hi;
                 tm[i] -= hi;
-                let fp = evaluate_aux_cost(&tp)?;
-                let fm = evaluate_aux_cost(&tm)?;
+                let fp = evaluate_auxcost(&tp)?;
+                let fm = evaluate_auxcost(&tm)?;
                 h_aux[[i, i]] = (fp - 2.0 * f0 + fm) / (hi * hi);
                 for j in (i + 1)..d {
                     let hj = 1e-3 * (1.0 + theta_aux[j].abs());
@@ -1811,10 +1808,10 @@ where
                     tmp[j] += hj;
                     tmm[i] -= hi;
                     tmm[j] -= hj;
-                    let fpp = evaluate_aux_cost(&tpp)?;
-                    let fpm = evaluate_aux_cost(&tpm)?;
-                    let fmp = evaluate_aux_cost(&tmp)?;
-                    let fmm = evaluate_aux_cost(&tmm)?;
+                    let fpp = evaluate_auxcost(&tpp)?;
+                    let fpm = evaluate_auxcost(&tpm)?;
+                    let fmp = evaluate_auxcost(&tmp)?;
+                    let fmm = evaluate_auxcost(&tmm)?;
                     let hij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
                     h_aux[[i, j]] = hij;
                     h_aux[[j, i]] = hij;
@@ -1831,7 +1828,7 @@ where
                     h_aux[[i, i]] = max_diag;
                 }
             }
-            matrix_inverse_with_regularization(&h_aux, "link parameter covariance")
+            matrix_inversewith_regularization(&h_aux, "link parameter covariance")
         } else {
             None
         };
@@ -1859,7 +1856,7 @@ where
             x: &x_fit_o,
             offset: offset_o.view(),
             y: y_o.view(),
-            prior_weights: w_o.view(),
+            priorweights: w_o.view(),
             covariate_se: None,
         },
         pirls::PenaltyConfig {
@@ -1899,7 +1896,7 @@ where
     let weighted_rss = if matches!(cfg.link_function(), LinkFunction::Identity) {
         let fitted = {
             let mut eta = offset_o.clone();
-            eta += &x_o.matrix_vector_multiply(&beta_orig);
+            eta += &x_o.matrixvectormultiply(&beta_orig);
             eta
         };
         let resid = y_o.to_owned() - &fitted;
@@ -1913,7 +1910,7 @@ where
 
     // EDF by block using stabilized H and penalty roots in transformed basis
     let lambdas = final_rho.mapv(f64::exp);
-    let h = &pirls_res.stabilized_hessian_transformed;
+    let h = &pirls_res.stabilizedhessian_transformed;
     let stable_solver = StableSolver::new("edf stabilized hessian");
     let mut planner = RidgePlanner::new(h);
     let cond_display = planner
@@ -1922,7 +1919,7 @@ where
         .unwrap_or_else(|| "unavailable".to_string());
     let factor = loop {
         let ridge = planner.ridge();
-        let candidate = add_ridge(h, ridge);
+        let candidate = addridge(h, ridge);
         if let Ok(f) = stable_solver.factorize(&candidate) {
             if ridge > 0.0 {
                 log::warn!(
@@ -1943,14 +1940,14 @@ where
                 condition_number: f64::INFINITY,
             });
         }
-        planner.bump_with_matrix(h);
+        planner.bumpwith_matrix(h);
     };
     let mut traces = vec![0.0f64; k];
     for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
         let ekt_arr = rs.t().to_owned();
-        let ekt_view = FaerArrayView::new(&ekt_arr);
-        let x_sol = factor.solve(ekt_view.as_ref());
-        let frob = faer_frob_inner(x_sol.as_ref(), ekt_view.as_ref());
+        let ektview = FaerArrayView::new(&ekt_arr);
+        let x_sol = factor.solve(ektview.as_ref());
+        let frob = faer_frob_inner(x_sol.as_ref(), ektview.as_ref());
         traces[kk] = lambdas[kk] * frob;
     }
     let p_dim = pirls_res.beta_transformed.len();
@@ -1981,24 +1978,24 @@ where
     };
 
     // Compute gradient norm at final rho for reporting
-    let final_grad = reml_state
+    let finalgrad = reml_state
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
-    let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
-    let final_grad_norm = if final_grad_norm_rho.is_finite() {
-        final_grad_norm_rho
+    let finalgrad_norm_rho = finalgrad.dot(&finalgrad).sqrt();
+    let finalgrad_norm = if finalgrad_norm_rho.is_finite() {
+        finalgrad_norm_rho
     } else {
-        outer_result.final_grad_norm
+        outer_result.finalgrad_norm
     };
 
     let penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
     let beta_covariance =
-        matrix_inverse_with_regularization(&penalized_hessian, "posterior covariance");
+        matrix_inversewith_regularization(&penalized_hessian, "posterior covariance");
     let smoothing_correction = reml_state.compute_smoothing_correction_auto(
         &final_rho,
         &pirls_res,
         beta_covariance.as_ref(),
-        final_grad_norm,
+        finalgrad_norm,
     );
     let beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
     let beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
@@ -2029,8 +2026,8 @@ where
         _ => None,
     };
     let beta_standard_errors_corrected = beta_covariance_corrected.as_ref().map(se_from_covariance);
-    let working_weights = pirls_res.solve_weights.clone();
-    let working_response = pirls_res.solve_working_response.clone();
+    let working_weights = pirls_res.solveweights.clone();
+    let working_response = pirls_res.solveworking_response.clone();
     let reparam_qs = Some(pirls_res.reparam_result.qs.clone());
 
     let pirls_status = pirls_res.status;
@@ -2042,7 +2039,7 @@ where
         edf_by_block,
         edf_total,
         iterations: iters,
-        final_grad_norm,
+        finalgrad_norm,
         pirls_status,
         deviance: pirls_res.deviance,
         stable_penalty_term: pirls_res.stable_penalty_term,
@@ -2185,7 +2182,7 @@ where
                 }
             }
         }
-        if let Some(s2) = hyper_dir.penalty_second_component_rows() {
+        if let Some(s2) = hyper_dir.penaltysecond_componentrows() {
             if s2.len() != psi_dim {
                 return Err(EstimationError::InvalidInput(format!(
                     "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
@@ -2224,7 +2221,7 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let mut reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::newwith_offset(
         y_o.view(),
         x_fit,
         w_o.view(),
@@ -2240,11 +2237,11 @@ where
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
     );
-    reml_state.set_warm_start_original_beta(warm_start_beta);
+    reml_state.setwarm_start_original_beta(warm_start_beta);
     eval(&reml_state, &conditioned_hyper_dirs)
 }
 
-pub(crate) fn compute_external_joint_hyper_cost_gradient_hessian<X>(
+pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -2270,9 +2267,9 @@ where
         hyper_dirs,
         warm_start_beta,
         opts,
-        "compute_external_joint_hyper_cost_gradient_hessian",
+        "compute_external_joint_hypercostgradienthessian",
         |reml_state, conditioned_hyper_dirs| {
-            reml_state.compute_joint_hyper_cost_gradient_hessian(
+            reml_state.compute_joint_hypercostgradienthessian(
                 theta,
                 rho_dim,
                 conditioned_hyper_dirs,
@@ -2342,7 +2339,7 @@ pub struct FitResult {
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
     pub iterations: usize,
-    pub final_grad_norm: f64,
+    pub finalgrad_norm: f64,
     pub pirls_status: crate::pirls::PirlsStatus,
     pub deviance: f64,
     pub stable_penalty_term: f64,
@@ -2468,8 +2465,8 @@ pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,
     pub std_error: Option<f64>,
-    pub z_value: Option<f64>,
-    pub p_value: Option<f64>,
+    pub zvalue: Option<f64>,
+    pub pvalue: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2478,7 +2475,7 @@ pub struct SmoothTermSummary {
     pub edf: f64,
     pub ref_df: f64,
     pub chi_sq: Option<f64>,
-    pub p_value: Option<f64>,
+    pub pvalue: Option<f64>,
     pub continuous_order: Option<ContinuousSmoothnessOrder>,
 }
 
@@ -2546,12 +2543,10 @@ fn unscale_to_physical_lambdas(
 // Continuous smoothness/order diagnostic from three operator penalties.
 //
 // Full derivation and implementation contract
-// -------------------------------------------
 // We assume one smooth term has exactly three operator penalties in term-local order:
 //   S0 = mass, S1 = tension (|grad f|^2), S2 = stiffness ((Delta f)^2).
 //
 // 1) Unscaling (physical lambda from optimizer lambda)
-// ----------------------------------------------------
 // If penalties were normalized before optimization:
 //   S_tilde_k = S_k / c_k
 // and the optimizer fits lambda_tilde_k, then
@@ -2563,7 +2558,6 @@ fn unscale_to_physical_lambdas(
 //   lambda_k = lambda_tilde_k / c_k,  k in {0,1,2}.
 //
 // 2) SPDE/binomial coefficient mapping
-// ------------------------------------
 // If the fitted (lambda0,lambda1,lambda2) are interpreted as proportional to
 //   a_m(kappa,nu) = C(nu,m) * kappa^(2*(nu-m)),  m=0,1,2,
 // then
@@ -2587,7 +2581,6 @@ fn unscale_to_physical_lambdas(
 //           = lambda1 / ((R-2)*lambda2).
 //
 // 3) Boundary/discriminant interpretation
-// ---------------------------------------
 // Spectral polynomial in x=|omega|^2:
 //   Q(x) = lambda0 + lambda1*x + lambda2*x^2.
 //
@@ -2604,7 +2597,6 @@ fn unscale_to_physical_lambdas(
 //   R = 4  => exact boundary (perfect square) => treated as Matérn-compatible.
 //
 // 4) Degenerate limits and guards
-// -------------------------------
 // - If lambda0 or lambda2 is non-finite or <= eps, the 3-term inversion is unstable;
 //   report UndefinedZeroLambda and do not divide by those terms.
 // - Intrinsic limit (lambda0 -> 0+, with finite lambda1/lambda2):
@@ -2757,12 +2749,6 @@ pub fn compute_continuous_smoothness_order(
     //
     // We use this exact closed form as the reported kappa^2.
     let kappa2 = lambda1 / ((r_ratio - 2.0) * lambda2);
-    // Optional algebraic consistency check (not used to alter output):
-    // from lambda0/lambda2 = 2*kappa^4/(nu*(nu-1)),
-    // kappa^2_alt = sqrt((lambda0/lambda2)*nu*(nu-1)/2).
-    let _kappa2_alt = ((lambda0 / lambda2) * nu * (nu - 1.0) / 2.0)
-        .max(0.0)
-        .sqrt();
     if !nu.is_finite() || !kappa2.is_finite() {
         return ContinuousSmoothnessOrder {
             lambda0,
@@ -2815,7 +2801,7 @@ fn significance_stars(p: Option<f64>) -> &'static str {
     }
 }
 
-fn format_p_value(p: Option<f64>) -> String {
+fn format_pvalue(p: Option<f64>) -> String {
     let Some(v) = p else {
         return "NA".to_string();
     };
@@ -2833,14 +2819,14 @@ fn format_p_value(p: Option<f64>) -> String {
 
 impl fmt::Display for ModelSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let param_name_w = self
+        let paramnamew = self
             .parametric_terms
             .iter()
             .map(|t| t.name.len())
             .max()
             .unwrap_or(10)
             .max("Term".len());
-        let smooth_name_w = self
+        let smoothnamew = self
             .smooth_terms
             .iter()
             .map(|t| t.name.len())
@@ -2861,18 +2847,18 @@ impl fmt::Display for ModelSummary {
         writeln!(f)?;
 
         writeln!(f, "Parametric Terms:")?;
-        writeln!(f, "{:-<1$}", "", param_name_w + 59)?;
+        writeln!(f, "{:-<1$}", "", paramnamew + 59)?;
         writeln!(
             f,
-            "{:<name_w$} {:>10} {:>12} {:>10} {:>19}",
+            "{:<namew$} {:>10} {:>12} {:>10} {:>19}",
             "Term",
             "Estimate",
             "Standard Error",
             "Z Statistic",
             "Two-Sided P-Value",
-            name_w = param_name_w
+            namew = paramnamew
         )?;
-        writeln!(f, "{:-<1$}", "", param_name_w + 59)?;
+        writeln!(f, "{:-<1$}", "", paramnamew + 59)?;
         for term in &self.parametric_terms {
             let estimate = format!("{:.4}", term.estimate);
             let se = term
@@ -2881,57 +2867,57 @@ impl fmt::Display for ModelSummary {
                 .map(|v| format!("{v:.4}"))
                 .unwrap_or_else(|| "NA".to_string());
             let z = term
-                .z_value
+                .zvalue
                 .filter(|v| v.is_finite())
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_else(|| "NA".to_string());
-            let p = format_p_value(term.p_value);
-            let stars = significance_stars(term.p_value);
+            let p = format_pvalue(term.pvalue);
+            let stars = significance_stars(term.pvalue);
             writeln!(
                 f,
-                "{:<name_w$} {:>10} {:>12} {:>10} {:>19} {}",
+                "{:<namew$} {:>10} {:>12} {:>10} {:>19} {}",
                 term.name,
                 estimate,
                 se,
                 z,
                 p,
                 stars,
-                name_w = param_name_w
+                namew = paramnamew
             )?;
         }
         writeln!(f)?;
 
         writeln!(f, "Smooth Terms:")?;
-        writeln!(f, "{:-<1$}", "", smooth_name_w + 86)?;
+        writeln!(f, "{:-<1$}", "", smoothnamew + 86)?;
         writeln!(
             f,
-            "{:<name_w$} {:>26} {:>30} {:>12} {:>10}",
+            "{:<namew$} {:>26} {:>30} {:>12} {:>10}",
             "Term",
             "Effective Degrees of Freedom",
             "Reference Degrees of Freedom",
             "Chi-Square",
             "P-Value",
-            name_w = smooth_name_w
+            namew = smoothnamew
         )?;
-        writeln!(f, "{:-<1$}", "", smooth_name_w + 86)?;
+        writeln!(f, "{:-<1$}", "", smoothnamew + 86)?;
         for term in &self.smooth_terms {
             let chisq = term
                 .chi_sq
                 .filter(|v| v.is_finite())
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_else(|| "NA".to_string());
-            let p = format_p_value(term.p_value);
-            let stars = significance_stars(term.p_value);
+            let p = format_pvalue(term.pvalue);
+            let stars = significance_stars(term.pvalue);
             writeln!(
                 f,
-                "{:<name_w$} {:>26.2} {:>30.2} {:>12} {:>10} {}",
+                "{:<namew$} {:>26.2} {:>30.2} {:>12} {:>10} {}",
                 term.name,
                 term.edf,
                 term.ref_df,
                 chisq,
                 p,
                 stars,
-                name_w = smooth_name_w
+                namew = smoothnamew
             )?;
         }
         writeln!(f)?;
@@ -2944,7 +2930,7 @@ impl fmt::Display for ModelSummary {
             writeln!(f, "Continuous Smoothness Order:")?;
             writeln!(
                 f,
-                "{:<name_w$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>20}",
+                "{:<namew$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>20}",
                 "Term",
                 "lambda0",
                 "lambda1",
@@ -2953,7 +2939,7 @@ impl fmt::Display for ModelSummary {
                 "nu",
                 "kappa^2",
                 "status",
-                name_w = smooth_name_w
+                namew = smoothnamew
             )?;
             for (name, o) in order_terms {
                 let r_txt = o
@@ -2979,7 +2965,7 @@ impl fmt::Display for ModelSummary {
                 };
                 writeln!(
                     f,
-                    "{:<name_w$} {:>10.3e} {:>10.3e} {:>10.3e} {:>10} {:>10} {:>10} {:>20}",
+                    "{:<namew$} {:>10.3e} {:>10.3e} {:>10.3e} {:>10} {:>10} {:>10} {:>20}",
                     name,
                     o.lambda0,
                     o.lambda1,
@@ -2988,7 +2974,7 @@ impl fmt::Display for ModelSummary {
                     nu_txt,
                     kappa_txt,
                     status_txt,
-                    name_w = smooth_name_w
+                    namew = smoothnamew
                 )?;
             }
             writeln!(f)?;
@@ -3004,20 +2990,20 @@ impl fmt::Display for ModelSummary {
 pub use crate::inference::predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
-    coefficient_uncertainty, coefficient_uncertainty_with_mode, predict_gam,
-    predict_gam_posterior_mean, predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
+    coefficient_uncertainty, coefficient_uncertaintywith_mode, predict_gam,
+    predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, SmoothingOptimizerKind,
-    optimize_log_smoothing_with_multistart, optimize_log_smoothing_with_multistart_parallel_fd,
-    optimize_log_smoothing_with_multistart_with_gradient,
+    optimize_log_smoothingwithmultistart, optimize_log_smoothingwithmultistart_parallelfd,
+    optimize_log_smoothingwithmultistartwithgradient,
 };
 
 /// Canonical engine entrypoint for external designs on supported GLM-style
 /// families.
 /// Likelihood dispatch is determined by `family` together with external-link
 /// options in `opts`; survival families use survival-specific training APIs.
-pub fn fit_gam_with_heuristic_lambdas<X>(
+pub fn fit_gamwith_heuristic_lambdas<X>(
     x: X,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -3030,7 +3016,7 @@ pub fn fit_gam_with_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
-    fit_gam_with_heuristic_lambdas_and_warm_start(
+    fit_gamwith_heuristic_lambdas_andwarm_start(
         x,
         y,
         weights,
@@ -3043,7 +3029,7 @@ where
     )
 }
 
-pub(crate) fn fit_gam_with_heuristic_lambdas_and_warm_start<X>(
+pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
     x: X,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -3139,13 +3125,13 @@ where
             .map(|(&yy, &ww)| yy.clamp(0.0, 1.0) * ww.max(0.0))
             .sum::<f64>();
         let weighted_total = weights.iter().map(|w| w.max(0.0)).sum::<f64>();
-        let weighted_nonevents = (weighted_total - weighted_events).max(0.0);
-        let minority_support = weighted_events.min(weighted_nonevents);
-        let start_with_firth = should_enable_firth_from_class_support(minority_support, x.ncols());
+        let weightednonevents = (weighted_total - weighted_events).max(0.0);
+        let minority_support = weighted_events.min(weightednonevents);
+        let startwith_firth = should_enable_firth_from_class_support(minority_support, x.ncols());
 
         // Start with Firth when class support is low relative to model complexity.
-        ext_opts.firth_bias_reduction = Some(start_with_firth);
-        let first_try = optimize_external_design_with_heuristic_lambdas_and_warm_start(
+        ext_opts.firth_bias_reduction = Some(startwith_firth);
+        let first_try = optimize_external_designwith_heuristic_lambdas_andwarm_start(
             y,
             weights,
             &x,
@@ -3164,9 +3150,9 @@ where
                         | crate::pirls::PirlsStatus::Unstable
                 );
                 let extreme_eta = res.max_abs_eta > 15.0;
-                if !start_with_firth && (unstable_status || extreme_eta) {
+                if !startwith_firth && (unstable_status || extreme_eta) {
                     ext_opts.firth_bias_reduction = Some(true);
-                    optimize_external_design_with_heuristic_lambdas_and_warm_start(
+                    optimize_external_designwith_heuristic_lambdas_andwarm_start(
                         y,
                         weights,
                         &x,
@@ -3181,11 +3167,11 @@ where
                 }
             }
             Err(err) => {
-                if start_with_firth {
+                if startwith_firth {
                     return Err(err);
                 }
                 ext_opts.firth_bias_reduction = Some(true);
-                optimize_external_design_with_heuristic_lambdas_and_warm_start(
+                optimize_external_designwith_heuristic_lambdas_andwarm_start(
                     y,
                     weights,
                     &x,
@@ -3198,7 +3184,7 @@ where
             }
         }
     } else {
-        optimize_external_design_with_heuristic_lambdas_and_warm_start(
+        optimize_external_designwith_heuristic_lambdas_andwarm_start(
             y,
             weights,
             &x,
@@ -3216,7 +3202,7 @@ where
         edf_by_block: result.edf_by_block,
         edf_total: result.edf_total,
         iterations: result.iterations,
-        final_grad_norm: result.final_grad_norm,
+        finalgrad_norm: result.finalgrad_norm,
         pirls_status: result.pirls_status,
         deviance: result.deviance,
         stable_penalty_term: result.stable_penalty_term,
@@ -3252,7 +3238,7 @@ pub fn fit_gam<X>(
 where
     X: Into<DesignMatrix>,
 {
-    fit_gam_with_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
+    fit_gamwith_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
 }
 
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
@@ -3272,14 +3258,14 @@ const FIRTH_BASE_MINORITY_SUPPORT: f64 = 20.0;
 const FIRTH_MINORITY_PER_PARAMETER: f64 = 2.0;
 
 #[inline]
-fn sas_log_delta_ridge_weight() -> f64 {
+fn sas_log_deltaridgeweight() -> f64 {
     // Weak fixed stabilization for the SAS tail parameter to avoid
     // boundary/flat-region pathologies in outer optimization.
     1e-4
 }
 
 #[inline]
-fn sas_log_delta_edge_barrier_weight() -> f64 {
+fn sas_log_delta_edge_barrierweight() -> f64 {
     // Keep SAS raw log-delta away from tanh-saturation edges where
     // link sensitivities collapse and outer gradients become uninformative.
     1e-2
@@ -3292,8 +3278,8 @@ fn sas_log_delta_bound() -> f64 {
 }
 
 #[inline]
-fn sas_log_delta_edge_barrier_cost_grad(raw_log_delta: f64) -> (f64, f64) {
-    let w = sas_log_delta_edge_barrier_weight();
+fn sas_log_delta_edge_barriercostgrad(raw_log_delta: f64) -> (f64, f64) {
+    let w = sas_log_delta_edge_barrierweight();
     if w <= 0.0 || !raw_log_delta.is_finite() {
         return (0.0, 0.0);
     }
@@ -3328,7 +3314,7 @@ struct BinomialAuxTerms {
     a1: f64,
     a2: f64,
     variance: f64,
-    variance_mu_scale: f64,
+    variancemu_scale: f64,
 }
 
 #[inline]
@@ -3338,19 +3324,19 @@ fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms 
     } else {
         0.5
     };
-    let one_minus_mu = 1.0 - mu;
-    let a1 = wi * (yi / mu - (1.0 - yi) / one_minus_mu);
-    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minus_mu * one_minus_mu));
+    let one_minusmu = 1.0 - mu;
+    let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
+    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
     BinomialAuxTerms {
         a1,
         a2,
-        variance: mu * one_minus_mu,
-        variance_mu_scale: 1.0 - 2.0 * mu,
+        variance: mu * one_minusmu,
+        variancemu_scale: 1.0 - 2.0 * mu,
     }
 }
 
 #[inline]
-fn should_sample_gradient_diag_fd(eval_idx: u64) -> bool {
+fn should_samplegradient_diagfd(eval_idx: u64) -> bool {
     eval_idx <= GRAD_DIAG_FD_WARMUP_EVALS
         || (GRAD_DIAG_FD_INTERVAL > 0 && eval_idx % GRAD_DIAG_FD_INTERVAL == 0)
 }
@@ -3360,13 +3346,6 @@ fn should_enable_firth_from_class_support(minority_support: f64, n_features: usi
     let complexity_threshold =
         (FIRTH_MINORITY_PER_PARAMETER * n_features as f64).max(FIRTH_BASE_MINORITY_SUPPORT);
     minority_support < complexity_threshold
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TraceBackend {
-    Exact,
-    Hutchinson { probes: usize },
-    HutchPP { probes: usize, sketch: usize },
 }
 
 struct FdEval {
@@ -3382,7 +3361,7 @@ struct FdEval {
     ridge_jitter: bool,
 }
 
-fn evaluate_fd_pair(
+fn evaluatefd_pair(
     reml_state: &RemlState,
     rho: &Array1<f64>,
     coord: usize,
@@ -3393,10 +3372,10 @@ fn evaluate_fd_pair(
     let mut rho_m = rho.clone();
     rho_m[coord] -= 0.5 * base_h;
     let f_p = reml_state.compute_cost(&rho_p)?;
-    let ridge_p = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    let ridge_p = reml_state.lastridge_used().unwrap_or(f64::NAN);
 
     let f_m = reml_state.compute_cost(&rho_m)?;
-    let ridge_m = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    let ridge_m = reml_state.lastridge_used().unwrap_or(f64::NAN);
     let d_small = (f_p - f_m) / base_h;
 
     let h2 = 2.0 * base_h;
@@ -3405,29 +3384,29 @@ fn evaluate_fd_pair(
     let mut rho_m2 = rho.clone();
     rho_m2[coord] -= 0.5 * h2;
     let f_p2 = reml_state.compute_cost(&rho_p2)?;
-    let ridge_p2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    let ridge_p2 = reml_state.lastridge_used().unwrap_or(f64::NAN);
 
     let f_m2 = reml_state.compute_cost(&rho_m2)?;
-    let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    let ridge_m2 = reml_state.lastridge_used().unwrap_or(f64::NAN);
     let d_big = (f_p2 - f_m2) / h2;
 
-    let finite_ridges: Vec<f64> = [ridge_p, ridge_m, ridge_p2, ridge_m2]
+    let finiteridges: Vec<f64> = [ridge_p, ridge_m, ridge_p2, ridge_m2]
         .iter()
         .copied()
         .filter(|v| v.is_finite() && *v >= 0.0)
         .collect();
-    let (ridge_min, ridge_max, ridge_span, ridge_rel_span) = if finite_ridges.is_empty() {
+    let (ridge_min, ridge_max, ridge_span, ridge_rel_span) = if finiteridges.is_empty() {
         (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
     } else {
-        let mut min_v = f64::INFINITY;
-        let mut max_v = f64::NEG_INFINITY;
-        for v in finite_ridges {
-            min_v = min_v.min(v);
-            max_v = max_v.max(v);
+        let mut minv = f64::INFINITY;
+        let mut maxv = f64::NEG_INFINITY;
+        for v in finiteridges {
+            minv = minv.min(v);
+            maxv = maxv.max(v);
         }
-        let span = max_v - min_v;
-        let rel = span / max_v.abs().max(1e-12);
-        (min_v, max_v, span, rel)
+        let span = maxv - minv;
+        let rel = span / maxv.abs().max(1e-12);
+        (minv, maxv, span, rel)
     };
     let ridge_jitter = ridge_span.is_finite()
         && ridge_rel_span.is_finite()
@@ -3456,7 +3435,7 @@ fn fd_same_sign(d_small: f64, d_big: f64) -> bool {
     }
 }
 
-fn select_fd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
+fn selectfd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
     match (d_small.is_finite(), d_big.is_finite()) {
         (true, true) => {
             if same_sign {
@@ -3471,13 +3450,13 @@ fn select_fd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
     }
 }
 
-fn compute_fd_gradient_internal(
+fn computefdgradient_internal(
     reml_state: &RemlState,
     rho: &Array1<f64>,
     emit_logs: bool,
     allow_analytic_fallback: bool,
 ) -> Result<Array1<f64>, EstimationError> {
-    let mut fd_grad = Array1::zeros(rho.len());
+    let mut fdgrad = Array1::zeros(rho.len());
     let mut analytic_fallback: Option<Array1<f64>> = None;
 
     let mut log_lines: Vec<String> = Vec::new();
@@ -3487,7 +3466,7 @@ fn compute_fd_gradient_internal(
             (min.min(v), max.max(v))
         });
     let rho_summary = format!("len={} range=[{:.3e},{:.3e}]", rho.len(), rho_min, rho_max);
-    match reml_state.last_ridge_used() {
+    match reml_state.lastridge_used() {
         Some(ridge) => log_lines.push(format!(
             "[FD RIDGE] Baseline cached ridge: {ridge:.3e} for rho {rho_summary}",
         )),
@@ -3517,7 +3496,7 @@ fn compute_fd_gradient_internal(
         let h_start = base_h;
 
         for attempt in 0..=FD_MAX_REFINEMENTS {
-            let eval = evaluate_fd_pair(reml_state, rho, i, base_h)?;
+            let eval = evaluatefd_pair(reml_state, rho, i, base_h)?;
             d_small = eval.d_small;
             d_big = eval.d_big;
             ridge_jitter_seen |= eval.ridge_jitter;
@@ -3532,7 +3511,7 @@ fn compute_fd_gradient_internal(
             if same_sign && !eval.ridge_jitter {
                 if rel_gap <= best_rel_gap {
                     best_rel_gap = rel_gap;
-                    best_derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+                    best_derivative = Some(selectfd_derivative(d_small, d_big, same_sign));
                 }
                 if rel_gap > last_rel_gap {
                     // Smaller steps are worsening the agreement; keep the best seen.
@@ -3544,8 +3523,8 @@ fn compute_fd_gradient_internal(
 
             let refine_for_rel_gap =
                 same_sign && rel_gap > FD_REL_GAP_THRESHOLD && base_h * 0.5 >= FD_MIN_BASE_STEP;
-            let refine_for_ridge = eval.ridge_jitter && base_h * 0.5 >= FD_MIN_BASE_STEP;
-            let refining = refine_for_rel_gap || refine_for_ridge;
+            let refine_forridge = eval.ridge_jitter && base_h * 0.5 >= FD_MIN_BASE_STEP;
+            let refining = refine_for_rel_gap || refine_forridge;
             if attempt == 0 {
                 rel_gap_first = Some(rel_gap);
             }
@@ -3594,7 +3573,7 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             if eval.ridge_jitter {
                 derivative = None;
             } else {
-                derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+                derivative = Some(selectfd_derivative(d_small, d_big, same_sign));
             }
             break;
         }
@@ -3603,9 +3582,9 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             let same_sign = fd_same_sign(d_small, d_big);
             if same_sign && !ridge_jitter_seen {
                 derivative = best_derivative
-                    .or_else(|| Some(select_fd_derivative(d_small, d_big, same_sign)));
+                    .or_else(|| Some(selectfd_derivative(d_small, d_big, same_sign)));
             } else if !ridge_jitter_seen {
-                derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+                derivative = Some(selectfd_derivative(d_small, d_big, same_sign));
             }
         }
 
@@ -3620,7 +3599,7 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             ));
         }
 
-        fd_grad[i] = derivative.unwrap_or(f64::NAN);
+        fdgrad[i] = derivative.unwrap_or(f64::NAN);
         let rel_gap_first = rel_gap_first.unwrap_or(f64::NAN);
         log_lines.push(format!(
             "[FD RIDGE]   refine steps={} h_start={:.3e} h_final={:.3e} rel_gap_first={:.3e} rel_gap_max={:.3e} ridge_jitter_seen={} ridge_rel_span_max={:.3e}",
@@ -3634,7 +3613,7 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
         ));
         log_lines.push(format!(
             "[FD RIDGE]   chosen derivative = {:+.9e}",
-            fd_grad[i]
+            fdgrad[i]
         ));
     }
 
@@ -3642,18 +3621,18 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
         println!("{}", log_lines.join("\n"));
     }
 
-    Ok(fd_grad)
+    Ok(fdgrad)
 }
 
-fn compute_fd_gradient(
+fn computefdgradient(
     reml_state: &RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    compute_fd_gradient_internal(reml_state, rho, true, true)
+    computefdgradient_internal(reml_state, rho, true, true)
 }
 
 /// Evaluate both analytic and finite-difference gradients for the external REML objective.
-pub fn evaluate_external_gradients<X>(
+pub fn evaluate_externalgradients<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -3677,11 +3656,11 @@ where
     }
 
     let p = x.ncols();
-    validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
-    let (s_vec, active_nullspace_dims) = canonicalize_active_penalties(
+    validate_full_size_penalties(s_list, p, "evaluate_externalgradients")?;
+    let (svec, active_nullspace_dims) = canonicalize_active_penalties(
         s_list.to_vec(),
         &opts.nullspace_dims,
-        "evaluate_external_gradients",
+        "evaluate_externalgradients",
     )?;
     if rho.len() != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
@@ -3696,17 +3675,17 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_vec);
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &svec);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
 
-    let mut reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::newwith_offset(
         y_o.view(),
         x_fit,
         w_o.view(),
         offset_o.view(),
-        s_vec,
+        svec,
         p,
         &cfg,
         Some(active_nullspace_dims),
@@ -3719,14 +3698,14 @@ where
     );
 
     let analytic_grad = reml_state.compute_gradient(rho)?;
-    let fd_grad = compute_fd_gradient(&reml_state, rho)?;
+    let fdgrad = computefdgradient(&reml_state, rho)?;
 
-    Ok((analytic_grad, fd_grad))
+    Ok((analytic_grad, fdgrad))
 }
 
 /// Evaluate the external cost and report the stabilization ridge used.
 /// This is a diagnostic helper for tests that need to detect ridge jitter.
-pub fn evaluate_external_cost_and_ridge<X>(
+pub fn evaluate_externalcost_andridge<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -3750,11 +3729,11 @@ where
     }
 
     let p = x.ncols();
-    validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
-    let (s_vec, active_nullspace_dims) = canonicalize_active_penalties(
+    validate_full_size_penalties(s_list, p, "evaluate_externalcost_andridge")?;
+    let (svec, active_nullspace_dims) = canonicalize_active_penalties(
         s_list.to_vec(),
         &opts.nullspace_dims,
-        "evaluate_external_cost_and_ridge",
+        "evaluate_externalcost_andridge",
     )?;
     if rho.len() != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
@@ -3769,17 +3748,17 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_vec);
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &svec);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
 
-    let mut reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::newwith_offset(
         y_o.view(),
         x_fit,
         w_o.view(),
         offset_o.view(),
-        s_vec,
+        svec,
         p,
         &cfg,
         Some(active_nullspace_dims),
@@ -3792,7 +3771,7 @@ where
     );
 
     let cost = reml_state.compute_cost(rho)?;
-    let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
+    let ridge = reml_state.lastridge_used().unwrap_or(0.0);
     Ok((cost, ridge))
 }
 
@@ -3801,7 +3780,7 @@ where
 ///
 /// This mirrors the exact first-order objective surface used by the outer
 /// optimizer when blended inverse-link or SAS parameters are optimized.
-pub fn evaluate_external_theta_cost_gradient<X>(
+pub fn evaluate_external_thetacostgradient<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -3824,11 +3803,11 @@ where
         )));
     }
     let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "evaluate_external_theta_cost_gradient")?;
+    validate_full_size_penalties(&s_list, p, "evaluate_external_thetacostgradient")?;
     let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
         s_list,
         &opts.nullspace_dims,
-        "evaluate_external_theta_cost_gradient",
+        "evaluate_external_thetacostgradient",
     )?;
     let k = active_nullspace_dims.len();
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
@@ -3863,7 +3842,7 @@ where
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
-    let mut reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::newwith_offset(
         y_o.view(),
         x_fit,
         w_o.view(),
@@ -3883,12 +3862,12 @@ where
     let mut mix_state_eval: Option<crate::types::MixtureLinkState> = None;
     let mut sas_state_eval: Option<crate::types::SasLinkState> = None;
     if use_mixture {
-        let mix_spec = opts.mixture_link.as_ref().ok_or_else(|| {
+        let mixspec = opts.mixture_link.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing blended inverse-link specification".to_string())
         })?;
         let mix_rho = theta.slice(s![k..(k + aux_dim)]).to_owned();
-        let mix_state = state_from_spec(&MixtureLinkSpec {
-            components: mix_spec.components.clone(),
+        let mix_state = state_fromspec(&MixtureLinkSpec {
+            components: mixspec.components.clone(),
             initial_rho: mix_rho,
         })
         .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?;
@@ -3902,7 +3881,7 @@ where
             v
         };
         let sas_state = if use_beta_logistic {
-            state_from_beta_logistic_spec(SasLinkSpec {
+            state_from_beta_logisticspec(SasLinkSpec {
                 initial_epsilon: epsilon_eff,
                 initial_log_delta: theta[k + 1],
             })
@@ -3910,7 +3889,7 @@ where
                 EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
             })?
         } else {
-            state_from_sas_spec(SasLinkSpec {
+            state_from_sasspec(SasLinkSpec {
                 initial_epsilon: epsilon_eff,
                 initial_log_delta: theta[k + 1],
             })
@@ -3935,37 +3914,37 @@ where
         ));
     }
 
-    let sas_ridge = if use_sas && !use_beta_logistic {
-        sas_log_delta_ridge_weight()
+    let sasridge = if use_sas && !use_beta_logistic {
+        sas_log_deltaridgeweight()
     } else {
         0.0
     };
-    if use_sas && sas_ridge > 0.0 {
+    if use_sas && sasridge > 0.0 {
         let log_delta = theta[k + 1];
-        cost += 0.5 * sas_ridge * log_delta * log_delta;
+        cost += 0.5 * sasridge * log_delta * log_delta;
         if !use_beta_logistic {
-            let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
-            cost += barrier_cost;
+            let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+            cost += barriercost;
         }
     }
 
-    let (pirls_mix, h_pos_w) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
+    let (pirls_mix, h_posw) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
     let eta = &pirls_mix.final_eta;
     let x_t = &pirls_mix.x_transformed;
-    let n_obs = eta.len();
-    let mut leverage = Array1::<f64>::zeros(n_obs);
-    if h_pos_w.ncols() > 0 {
+    let nobs = eta.len();
+    let mut leverage = Array1::<f64>::zeros(nobs);
+    if h_posw.ncols() > 0 {
         match x_t {
             DesignMatrix::Dense(x_dense) => {
-                let xw = x_dense.dot(h_pos_w.as_ref());
+                let xw = x_dense.dot(h_posw.as_ref());
                 for i in 0..xw.nrows() {
                     leverage[i] = xw.row(i).iter().map(|v| v * v).sum();
                 }
             }
             DesignMatrix::Sparse(_) => {
-                for col in 0..h_pos_w.ncols() {
-                    let w_col = h_pos_w.column(col).to_owned();
-                    let xw_col = x_t.matrix_vector_multiply(&w_col);
+                for col in 0..h_posw.ncols() {
+                    let w_col = h_posw.column(col).to_owned();
+                    let xw_col = x_t.matrixvectormultiply(&w_col);
                     Zip::from(&mut leverage)
                         .and(&xw_col)
                         .for_each(|h, &v| *h += v * v);
@@ -3974,11 +3953,11 @@ where
         }
     }
 
-    let mut score_beta_jacobian_diag = Array1::<f64>::zeros(n_obs);
+    let mut score_beta_jacobian_diag = Array1::<f64>::zeros(nobs);
     let mut direct_ll = vec![0.0_f64; aux_dim];
-    let mut du_by_j: Vec<Array1<f64>> = (0..aux_dim).map(|_| Array1::<f64>::zeros(n_obs)).collect();
+    let mut du_by_j: Vec<Array1<f64>> = (0..aux_dim).map(|_| Array1::<f64>::zeros(nobs)).collect();
     let mut dw_explicit_by_j: Vec<Array1<f64>> =
-        (0..aux_dim).map(|_| Array1::<f64>::zeros(n_obs)).collect();
+        (0..aux_dim).map(|_| Array1::<f64>::zeros(nobs)).collect();
     let mut mix_partials = if use_mixture {
         vec![
             crate::mixture_link::InverseLinkJet {
@@ -4002,8 +3981,8 @@ where
         let mix_state = mix_state_eval.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing blended inverse-link state".to_string())
         })?;
-        for i in 0..n_obs {
-            let jet = mixture_inverse_link_jet_with_rho_partials_into(
+        for i in 0..nobs {
+            let jet = mixture_inverse_link_jetwith_rho_partials_into(
                 mix_state,
                 eta[i],
                 &mut mix_partials,
@@ -4021,7 +4000,7 @@ where
                 let dd1 = dj.d1;
                 direct_ll[j] += aux.a1 * dmu;
                 du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                let variance_param = aux.variance_mu_scale * dmu;
+                let variance_param = aux.variancemu_scale * dmu;
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
                 dw_explicit_by_j[j][i] = wi
@@ -4033,16 +4012,16 @@ where
         let sas = sas_state_eval.ok_or_else(|| {
             EstimationError::InvalidInput("missing parameterized link state".to_string())
         })?;
-        for i in 0..n_obs {
+        for i in 0..nobs {
             let eta_i = eta[i].clamp(-30.0, 30.0);
             let jets = if use_beta_logistic {
-                beta_logistic_inverse_link_jet_with_param_partials(
+                beta_logistic_inverse_link_jetwith_param_partials(
                     eta_i,
                     sas.log_delta,
                     sas.epsilon,
                 )
             } else {
-                sas_inverse_link_jet_with_param_partials(eta_i, sas.epsilon, sas.log_delta)
+                sas_inverse_link_jetwith_param_partials(eta_i, sas.epsilon, sas.log_delta)
             };
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
@@ -4061,7 +4040,7 @@ where
                 let dd1 = dj.d1;
                 direct_ll[j] += aux.a1 * dmu;
                 du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                let variance_param = aux.variance_mu_scale * dmu;
+                let variance_param = aux.variancemu_scale * dmu;
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
                 dw_explicit_by_j[j][i] = wi
@@ -4077,10 +4056,9 @@ where
         pirls_mix.ridge_used,
     )?;
     let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
-    let jacobian_ridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
+    let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
     for j in 0..aux_dim {
         let rhs_j = x_t.transpose_vector_multiply(&du_by_j[j]);
-        // IMPORTANT:
         // The mathematically correct implicit solve for d beta / d psi_j is
         // based on the Jacobian of the penalized score equations
         //
@@ -4105,21 +4083,21 @@ where
         //
         //   dg/dbeta = X^T diag(-(a2*d1^2 + a1*d2)) X + S (+ ridge I).
         //
-        // The matrix currently used below, via h_pos_w, is the PIRLS/Fisher
+        // The matrix currently used below, via h_posw, is the PIRLS/Fisher
         // working Hessian X^T W X + S, with W_i = prior_i * d1_i^2/(mu_i(1-mu_i)).
         // That is not the same object unless the residual term a1_i vanishes
-        // rowwise. Using h_pos_w here is therefore mathematically incorrect for
+        // rowwise. Using h_posw here is therefore mathematically incorrect for
         // the exact link-parameter hypergradient.
         let dbeta_j = solver
-            .solve_vector_with_ridge_retries(&score_beta_jacobian, &rhs_j, jacobian_ridge_floor)
+            .solvevectorwithridge_retries(&score_beta_jacobian, &rhs_j, jacobianridge_floor)
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "failed to solve exact parametric beta sensitivity system".to_string(),
                 )
             })?;
-        let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
+        let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
         let mut trace_term = 0.0_f64;
-        for i in 0..n_obs {
+        for i in 0..nobs {
             let dw_total = dw_explicit_by_j[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
             trace_term += leverage[i] * dw_total;
         }
@@ -4129,12 +4107,12 @@ where
         let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
         grad[k] *= d_eps_d_raw;
     }
-    if use_sas && sas_ridge > 0.0 {
+    if use_sas && sasridge > 0.0 {
         let log_delta = theta[k + 1];
-        grad[k + 1] += sas_ridge * log_delta;
+        grad[k + 1] += sasridge * log_delta;
         if !use_beta_logistic {
-            let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(log_delta);
-            grad[k + 1] += barrier_grad;
+            let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
+            grad[k + 1] += barriergrad;
         }
     }
     Ok((cost, grad))
@@ -4150,16 +4128,16 @@ mod fd_policy_tests {
     use rand::{RngExt, SeedableRng};
 
     #[test]
-    fn test_gradient_diag_fd_sampling_schedule() {
+    fn testgradient_diagfd_sampling_schedule() {
         for eval in 1..=GRAD_DIAG_FD_WARMUP_EVALS {
-            assert!(should_sample_gradient_diag_fd(eval));
+            assert!(should_samplegradient_diagfd(eval));
         }
-        assert!(!should_sample_gradient_diag_fd(
+        assert!(!should_samplegradient_diagfd(
             GRAD_DIAG_FD_WARMUP_EVALS + 1
         ));
-        assert!(!should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL - 1));
-        assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL));
-        assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL * 2));
+        assert!(!should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL - 1));
+        assert!(should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL));
+        assert!(should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL * 2));
     }
 
     #[test]
@@ -4169,7 +4147,7 @@ mod fd_policy_tests {
     }
 
     #[test]
-    fn test_firth_support_rule_scales_with_model_dimension() {
+    fn test_firth_support_rule_scaleswith_model_dimension() {
         // High-dimensional setting: minority support that would pass the old
         // <20 rule still triggers Firth because support per parameter is weak.
         assert!(should_enable_firth_from_class_support(425.0, 225));
@@ -4197,7 +4175,7 @@ mod fd_policy_tests {
     }
 
     #[test]
-    fn sas_beta_raw_epsilon_sensitivity_matches_fd_at_seed19() {
+    fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
         let seed = 19_u64;
         let n = 20usize;
         let x = build_tiny_design(n);
@@ -4237,7 +4215,7 @@ mod fd_policy_tests {
             &s_list,
         );
         let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
-        let mut reml_state = RemlState::new_with_offset(
+        let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
             w.view(),
@@ -4252,7 +4230,7 @@ mod fd_policy_tests {
         .expect("reml_state");
         let rho = theta.slice(s![..1]).to_owned();
         let (epsilon_eff, d_eps_d_raw) = sas_effective_epsilon(theta[1]);
-        let sas_state = state_from_sas_spec(SasLinkSpec {
+        let sas_state = state_from_sasspec(SasLinkSpec {
             initial_epsilon: epsilon_eff,
             initial_log_delta: theta[2],
         })
@@ -4263,15 +4241,15 @@ mod fd_policy_tests {
             .pirls_result_and_hpos_for_rho(&rho)
             .expect("pirls_result");
         println!(
-            "sas_beta_raw_epsilon_sensitivity_matches_fd_at_seed19 last_gradient_norm={:.6e} status={:?} iteration={}",
-            pirls_result.last_gradient_norm, pirls_result.status, pirls_result.iteration
+            "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19 lastgradient_norm={:.6e} status={:?} iteration={}",
+            pirls_result.lastgradient_norm, pirls_result.status, pirls_result.iteration
         );
         let eta = &pirls_result.final_eta;
         let x_t = &pirls_result.x_transformed;
         let mut du_by_eps = Array1::<f64>::zeros(eta.len());
-        let mut clamped_obs = 0usize;
+        let mut clampedobs = 0usize;
         for i in 0..eta.len() {
-            let jets = sas_inverse_link_jet_with_param_partials(
+            let jets = sas_inverse_link_jetwith_param_partials(
                 eta[i],
                 sas_state.epsilon,
                 sas_state.log_delta,
@@ -4281,7 +4259,7 @@ mod fd_policy_tests {
             if (mu.is_finite() && (mu <= BINOMIAL_AUX_MU_EPS || mu >= 1.0 - BINOMIAL_AUX_MU_EPS))
                 || !mu.is_finite()
             {
-                clamped_obs += 1;
+                clampedobs += 1;
             }
             let d1 = jets.jet.d1;
             let dmu = jets.djet_depsilon.mu;
@@ -4290,14 +4268,14 @@ mod fd_policy_tests {
         }
         let score_at = |raw_eps: f64| -> Array1<f64> {
             let (eps_eff, _) = sas_effective_epsilon(raw_eps);
-            let sas_state = state_from_sas_spec(SasLinkSpec {
+            let sas_state = state_from_sasspec(SasLinkSpec {
                 initial_epsilon: eps_eff,
                 initial_log_delta: theta[2],
             })
             .expect("score sas state");
             let mut out = Array1::<f64>::zeros(eta.len());
             for i in 0..eta.len() {
-                let jets = sas_inverse_link_jet_with_param_partials(
+                let jets = sas_inverse_link_jetwith_param_partials(
                     eta[i],
                     sas_state.epsilon,
                     sas_state.log_delta,
@@ -4313,17 +4291,17 @@ mod fd_policy_tests {
         let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));
         let fd_du_raw = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
         let du_raw = du_by_eps.mapv(|v| v * d_eps_d_raw);
-        crate::testing::assert_matrix_derivative_fd(
+        crate::testing::assert_matrix_derivativefd(
             &fd_du_raw.insert_axis(Axis(1)),
             &du_raw.insert_axis(Axis(1)),
             2e-3,
             "sas du / d raw epsilon at fixed eta",
         );
         let rhs = x_t.transpose_vector_multiply(&du_by_eps);
-        println!("sas_beta_raw_epsilon_sensitivity_matches_fd_at_seed19 clamped_obs={clamped_obs}");
+        println!("sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19 clampedobs={clampedobs}");
         let mut neg_du_deta = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {
-            let jets = sas_inverse_link_jet_with_param_partials(
+            let jets = sas_inverse_link_jetwith_param_partials(
                 eta[i].clamp(-30.0, 30.0),
                 sas_state.epsilon,
                 sas_state.log_delta,
@@ -4343,7 +4321,7 @@ mod fd_policy_tests {
         .expect("score beta jacobian");
         let stable_solver = StableSolver::new("sas dbeta exact test");
         let mut dbeta_exact = stable_solver
-            .solve_vector_with_ridge_retries(
+            .solvevectorwithridge_retries(
                 &score_beta_jacobian,
                 &rhs,
                 max_abs_diag(&score_beta_jacobian) * 1e-12,
@@ -4353,7 +4331,7 @@ mod fd_policy_tests {
 
         let fd_h = 1e-4 * (1.0 + theta[1].abs());
         let beta_at = |raw_eps: f64| -> Array1<f64> {
-            let mut state = RemlState::new_with_offset(
+            let mut state = RemlState::newwith_offset(
                 y.view(),
                 conditioning.apply_to_design(&DesignMatrix::Dense(x.clone())),
                 w.view(),
@@ -4367,7 +4345,7 @@ mod fd_policy_tests {
             )
             .expect("fd state");
             let (eps_eff, _) = sas_effective_epsilon(raw_eps);
-            let sas_state = state_from_sas_spec(SasLinkSpec {
+            let sas_state = state_from_sasspec(SasLinkSpec {
                 initial_epsilon: eps_eff,
                 initial_log_delta: theta[2],
             })
@@ -4380,7 +4358,7 @@ mod fd_policy_tests {
         let beta_m = beta_at(theta[1] - fd_h);
         let fd_beta = (&beta_p - &beta_m).mapv(|v| v / (2.0 * fd_h));
 
-        crate::testing::assert_matrix_derivative_fd(
+        crate::testing::assert_matrix_derivativefd(
             &fd_beta.insert_axis(Axis(1)),
             &dbeta_exact.insert_axis(Axis(1)),
             2e-3,
@@ -4389,7 +4367,7 @@ mod fd_policy_tests {
     }
 
     #[test]
-    fn sas_true_score_beta_jacobian_matches_fd_at_seed19() {
+    fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
         let seed = 19_u64;
         let n = 20usize;
         let x = build_tiny_design(n);
@@ -4429,7 +4407,7 @@ mod fd_policy_tests {
             &s_list,
         );
         let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
-        let mut reml_state = RemlState::new_with_offset(
+        let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
             w.view(),
@@ -4444,7 +4422,7 @@ mod fd_policy_tests {
         .expect("reml_state");
         let rho = theta.slice(s![..1]).to_owned();
         let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
-        let sas_state = state_from_sas_spec(SasLinkSpec {
+        let sas_state = state_from_sasspec(SasLinkSpec {
             initial_epsilon: epsilon_eff,
             initial_log_delta: theta[2],
         })
@@ -4469,7 +4447,7 @@ mod fd_policy_tests {
             eta += &x_dense.dot(beta);
             let mut u = Array1::<f64>::zeros(eta.len());
             for i in 0..eta.len() {
-                let jets = sas_inverse_link_jet_with_param_partials(
+                let jets = sas_inverse_link_jetwith_param_partials(
                     eta[i].clamp(-30.0, 30.0),
                     sas_state.epsilon,
                     sas_state.log_delta,
@@ -4492,7 +4470,7 @@ mod fd_policy_tests {
         eta0 += &x_dense.dot(&beta0);
         let mut neg_du_deta = Array1::<f64>::zeros(eta0.len());
         for i in 0..eta0.len() {
-            let jets = sas_inverse_link_jet_with_param_partials(
+            let jets = sas_inverse_link_jetwith_param_partials(
                 eta0[i].clamp(-30.0, 30.0),
                 sas_state.epsilon,
                 sas_state.log_delta,
@@ -4525,7 +4503,7 @@ mod fd_policy_tests {
             fd_j.column_mut(j).assign(&fd_col);
         }
 
-        crate::testing::assert_matrix_derivative_fd(
+        crate::testing::assert_matrix_derivativefd(
             &fd_j,
             &analytic_j,
             2e-3,
@@ -4534,7 +4512,7 @@ mod fd_policy_tests {
     }
 
     #[test]
-    fn sas_pirls_hessian_matches_true_score_jacobian_at_seed19() {
+    fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
         let seed = 19_u64;
         let n = 20usize;
         let x = build_tiny_design(n);
@@ -4574,7 +4552,7 @@ mod fd_policy_tests {
             &s_list,
         );
         let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
-        let mut reml_state = RemlState::new_with_offset(
+        let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
             w.view(),
@@ -4589,7 +4567,7 @@ mod fd_policy_tests {
         .expect("reml_state");
         let rho = theta.slice(s![..1]).to_owned();
         let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
-        let sas_state = state_from_sas_spec(SasLinkSpec {
+        let sas_state = state_from_sasspec(SasLinkSpec {
             initial_epsilon: epsilon_eff,
             initial_log_delta: theta[2],
         })
@@ -4613,7 +4591,7 @@ mod fd_policy_tests {
         eta0 += &x_dense.dot(&beta0);
         let mut neg_du_deta = Array1::<f64>::zeros(eta0.len());
         for i in 0..eta0.len() {
-            let jets = sas_inverse_link_jet_with_param_partials(
+            let jets = sas_inverse_link_jetwith_param_partials(
                 eta0[i].clamp(-30.0, 30.0),
                 sas_state.epsilon,
                 sas_state.log_delta,
@@ -4649,13 +4627,13 @@ mod fd_policy_tests {
         let saturated_cases = [
             (
                 0.0,
-                sas_inverse_link_jet_with_param_partials(-30.0, 0.0, 12.0)
+                sas_inverse_link_jetwith_param_partials(-30.0, 0.0, 12.0)
                     .jet
                     .mu,
             ),
             (
                 1.0,
-                sas_inverse_link_jet_with_param_partials(30.0, 0.0, 12.0)
+                sas_inverse_link_jetwith_param_partials(30.0, 0.0, 12.0)
                     .jet
                     .mu,
             ),
@@ -4723,7 +4701,7 @@ mod continuous_order_tests {
     }
 
     #[test]
-    fn continuous_order_flags_non_matern_regime_when_r_le_4() {
+    fn continuous_order_flags_non_matern_regimewhen_r_le_4() {
         let out = compute_continuous_smoothness_order([1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 1e-12);
         assert_eq!(out.status, ContinuousSmoothnessOrderStatus::NonMaternRegime);
         assert!(out.nu.is_none());
@@ -4731,7 +4709,7 @@ mod continuous_order_tests {
     }
 
     #[test]
-    fn continuous_order_reports_effective_nu_kappa_in_non_matern_band_when_r_gt_2() {
+    fn continuous_order_reports_effective_nu_kappa_in_non_matern_bandwhen_r_gt_2() {
         let out = compute_continuous_smoothness_order([1.0, 3.0, 3.0], [1.0, 1.0, 1.0], 1e-12);
         assert_eq!(out.status, ContinuousSmoothnessOrderStatus::NonMaternRegime);
         let r = out.r_ratio.expect("R");
@@ -4749,14 +4727,14 @@ mod continuous_order_tests {
     }
 
     #[test]
-    fn continuous_order_guards_zero_or_near_zero_lambda() {
+    fn continuous_order_guardszero_or_nearzero_lambda() {
         let out = compute_continuous_smoothness_order([0.0, 1.0, 1.0], [1.0, 1.0, 1.0], 1e-12);
         assert_eq!(out.status, ContinuousSmoothnessOrderStatus::IntrinsicLimit);
         assert!(out.r_ratio.is_none());
     }
 
     #[test]
-    fn continuous_order_first_order_limit_when_lambda2_collapses() {
+    fn continuous_order_first_order_limitwhen_lambda2_collapses() {
         let out = compute_continuous_smoothness_order([2.0, 4.0, 1e-20], [1.0, 1.0, 1.0], 1e-12);
         assert_eq!(out.status, ContinuousSmoothnessOrderStatus::FirstOrderLimit);
         assert_eq!(out.nu, Some(1.0));
@@ -4765,7 +4743,7 @@ mod continuous_order_tests {
     }
 
     #[test]
-    fn continuous_order_intrinsic_limit_when_lambda0_collapses() {
+    fn continuous_order_intrinsic_limitwhen_lambda0_collapses() {
         let out = compute_continuous_smoothness_order([1e-20, 4.0, 2.0], [1.0, 1.0, 1.0], 1e-12);
         assert_eq!(out.status, ContinuousSmoothnessOrderStatus::IntrinsicLimit);
         assert_eq!(out.nu, Some(1.0));

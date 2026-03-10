@@ -34,7 +34,7 @@ pub struct OptimizationVisualizer {
     diagnostics_lines: Vec<String>,
     diagnostics_condition: Option<f64>,
     diagnostics_step_size: Option<f64>,
-    diagnostics_ridge: Option<f64>,
+    diagnosticsridge: Option<f64>,
 }
 
 impl OptimizationVisualizer {
@@ -51,9 +51,9 @@ impl OptimizationVisualizer {
 
         Ok(Self {
             terminal,
-            history_cost_accepted: Vec::new(),
-            history_cost_trial: Vec::new(),
-            history_grad_log: Vec::new(),
+            history_cost_accepted: Default::default(),
+            history_cost_trial: Default::default(),
+            history_grad_log: Default::default(),
             start_time: Instant::now(),
             current_iter: 0.0,
             best_cost: f64::INFINITY,
@@ -71,7 +71,7 @@ impl OptimizationVisualizer {
             diagnostics_lines: Vec::new(),
             diagnostics_condition: None,
             diagnostics_step_size: None,
-            diagnostics_ridge: None,
+            diagnosticsridge: None,
         })
     }
 
@@ -95,7 +95,7 @@ impl OptimizationVisualizer {
         let diagnostics_lines = self.diagnostics_lines.clone();
         let diagnostics_condition = self.diagnostics_condition;
         let diagnostics_step_size = self.diagnostics_step_size;
-        let diagnostics_ridge = self.diagnostics_ridge;
+        let diagnosticsridge = self.diagnosticsridge;
 
         self.terminal.draw(|f| {
             let area = f.area();
@@ -120,17 +120,17 @@ impl OptimizationVisualizer {
             let (min_y, max_y) = if cost_accepted.is_empty() && cost_trial.is_empty() {
                 (0.0, 1.0)
             } else {
-                let min_val = cost_accepted
+                let minval = cost_accepted
                     .iter()
                     .chain(cost_trial.iter())
                     .map(|(_, y)| *y)
                     .fold(f64::INFINITY, f64::min);
-                let max_val = cost_accepted
+                let maxval = cost_accepted
                     .iter()
                     .chain(cost_trial.iter())
                     .map(|(_, y)| *y)
                     .fold(f64::NEG_INFINITY, f64::max);
-                (min_val, max_val)
+                (minval, maxval)
             };
             let window = (max_y - min_y).max(1.0);
 
@@ -189,18 +189,18 @@ impl OptimizationVisualizer {
                 model_lines
                     .push("  Waiting for effective degrees of freedom updates...".to_string());
             } else {
-                let max_rows = top_chunks[1]
+                let maxrows = top_chunks[1]
                     .height
                     .saturating_sub(if compact { 3 } else { 4 })
                     as usize;
                 let mut shown_terms = edf_terms.iter().cloned().collect::<Vec<_>>();
                 shown_terms
                     .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                if shown_terms.len() > max_rows.saturating_sub(1) && max_rows > 1 {
-                    shown_terms.truncate(max_rows - 1);
+                if shown_terms.len() > maxrows.saturating_sub(1) && maxrows > 1 {
+                    shown_terms.truncate(maxrows - 1);
                     model_lines.push(format!("showing top {} terms by EDF", shown_terms.len()));
                 }
-                let name_w = shown_terms
+                let namew = shown_terms
                     .iter()
                     .map(|(name, _, _)| name.len())
                     .max()
@@ -213,26 +213,26 @@ impl OptimizationVisualizer {
                     } else {
                         0.0
                     };
-                    let bar_width: usize = if compact { 12 } else { 20 };
-                    let filled = (ratio * bar_width as f64).round() as usize;
+                    let barwidth: usize = if compact { 12 } else { 20 };
+                    let filled = (ratio * barwidth as f64).round() as usize;
                     let bar = format!(
                         "{}{}",
                         "█".repeat(filled),
-                        "·".repeat(bar_width.saturating_sub(filled))
+                        "·".repeat(barwidth.saturating_sub(filled))
                     );
-                    let display_name = if name.len() > name_w {
-                        let keep = name_w.saturating_sub(1);
+                    let displayname = if name.len() > namew {
+                        let keep = namew.saturating_sub(1);
                         format!("{}…", &name[..keep])
                     } else {
                         name
                     };
                     model_lines.push(format!(
-                        "{:<name_w$} effective {:>6.2} of {:>6.2} reference  {}",
-                        display_name,
+                        "{:<namew$} effective {:>6.2} of {:>6.2} reference  {}",
+                        displayname,
                         edf,
                         ref_df,
                         bar,
-                        name_w = name_w
+                        namew = namew
                     ));
                 }
             }
@@ -282,7 +282,7 @@ impl OptimizationVisualizer {
             ));
             diagnostics.push(format!(
                 "Stabilization Ridge: {}",
-                diagnostics_ridge
+                diagnosticsridge
                     .map(|v| format!("{v:.3e}"))
                     .unwrap_or_else(|| "n/a".to_string())
             ));
@@ -292,8 +292,8 @@ impl OptimizationVisualizer {
             ));
             diagnostics.push("Recent Diagnostics and Warnings:".to_string());
             let base_reserved = diagnostics.len() + 1; // + footer
-            let avail_rows = chunks[1].height.saturating_sub(2) as usize;
-            let max_diag_lines = avail_rows.saturating_sub(base_reserved).max(1);
+            let availrows = chunks[1].height.saturating_sub(2) as usize;
+            let max_diag_lines = availrows.saturating_sub(base_reserved).max(1);
             if diagnostics_lines.is_empty() {
                 diagnostics.push("  (no diagnostics yet)".to_string());
             } else {
@@ -410,7 +410,7 @@ impl VisualizerSession {
         if let Some(vis) = self.visualizer.as_mut() {
             vis.diagnostics_condition = condition_number;
             vis.diagnostics_step_size = step_size;
-            vis.diagnostics_ridge = ridge;
+            vis.diagnosticsridge = ridge;
             if vis.last_draw.elapsed() >= Duration::from_millis(40) {
                 let _ = vis.draw();
                 vis.last_draw = Instant::now();

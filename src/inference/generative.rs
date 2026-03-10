@@ -28,12 +28,12 @@ pub struct GenerativeSpec {
 }
 
 impl GenerativeSpec {
-    pub fn n_obs(&self) -> usize {
+    pub fn nobs(&self) -> usize {
         self.mean.len()
     }
 
     /// Pointwise conditional variance implied by the observation model.
-    pub fn conditional_variance(&self) -> Array1<f64> {
+    pub fn conditionalvariance(&self) -> Array1<f64> {
         match &self.noise {
             NoiseModel::Gaussian { sigma } => sigma.mapv(|s| s * s),
             NoiseModel::Poisson => self.mean.mapv(|m| m.max(0.0)),
@@ -46,7 +46,7 @@ impl GenerativeSpec {
 }
 
 /// Build a generative specification for built-in GAM families from eta/mean.
-pub fn generative_spec_from_predict(
+pub fn generativespec_from_predict(
     prediction: PredictResult,
     family: LikelihoodFamily,
     gaussian_scale: Option<f64>,
@@ -60,7 +60,7 @@ pub fn generative_spec_from_predict(
 }
 
 /// Convenience builder: from design + coefficients directly.
-pub fn generative_spec_from_gam<X>(
+pub fn generativespec_from_gam<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
@@ -71,11 +71,11 @@ where
     X: Into<DesignMatrix>,
 {
     let pred = predict_gam(x, beta, offset, family)?;
-    generative_spec_from_predict(pred, family, gaussian_scale)
+    generativespec_from_predict(pred, family, gaussian_scale)
 }
 
 /// Draw one synthetic observation vector from a generative spec.
-pub fn sample_observations<R: rand::Rng + ?Sized>(
+pub fn sampleobservations<R: rand::Rng + ?Sized>(
     spec: &GenerativeSpec,
     rng: &mut R,
 ) -> Result<Array1<f64>, EstimationError> {
@@ -156,16 +156,16 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
     }
 }
 
-/// Draw multiple synthetic replicates (n_draws x n_obs).
-pub fn sample_observation_replicates<R: rand::Rng + ?Sized>(
+/// Draw multiple synthetic replicates (n_draws x nobs).
+pub fn sampleobservation_replicates<R: rand::Rng + ?Sized>(
     spec: &GenerativeSpec,
     n_draws: usize,
     rng: &mut R,
 ) -> Result<Array2<f64>, EstimationError> {
-    let n = spec.n_obs();
+    let n = spec.nobs();
     let mut out = Array2::<f64>::zeros((n_draws, n));
     for d in 0..n_draws {
-        let draw = sample_observations(spec, rng)?;
+        let draw = sampleobservations(spec, rng)?;
         out.row_mut(d).assign(&draw);
     }
     Ok(out)
@@ -174,16 +174,16 @@ pub fn sample_observation_replicates<R: rand::Rng + ?Sized>(
 /// Extension trait for custom multi-block families that provide explicit
 /// generative semantics (mean + observation noise) at a fitted state.
 pub trait CustomFamilyGenerative: CustomFamily {
-    fn generative_spec(
+    fn generativespec(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String>;
 }
 
 /// Build custom-family generative spec from a fitted multi-block model.
-pub fn custom_generative_spec<F: CustomFamilyGenerative>(
+pub fn custom_generativespec<F: CustomFamilyGenerative>(
     family: &F,
     fit: &BlockwiseFitResult,
 ) -> Result<GenerativeSpec, String> {
-    family.generative_spec(&fit.block_states)
+    family.generativespec(&fit.block_states)
 }

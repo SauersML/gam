@@ -55,7 +55,7 @@ pub struct SurvivalEngineInputs<'a> {
     pub age_exit: ArrayView1<'a, f64>,
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
-    pub sample_weight: ArrayView1<'a, f64>,
+    pub sampleweight: ArrayView1<'a, f64>,
     pub x_entry: ArrayView2<'a, f64>,
     pub x_exit: ArrayView2<'a, f64>,
     pub x_derivative: ArrayView2<'a, f64>,
@@ -110,7 +110,7 @@ impl PenaltyBlocks {
 
     pub fn hessian(&self, dim: usize) -> Array2<f64> {
         let mut h = Array2::zeros((dim, dim));
-        self.add_hessian_inplace(&mut h);
+        self.addhessian_inplace(&mut h);
         h
     }
 
@@ -126,7 +126,7 @@ impl PenaltyBlocks {
         value
     }
 
-    pub fn add_hessian_inplace(&self, h: &mut Array2<f64>) {
+    pub fn addhessian_inplace(&self, h: &mut Array2<f64>) {
         for block in &self.blocks {
             if block.lambda == 0.0 {
                 continue;
@@ -161,19 +161,19 @@ fn compress_positive_collinear_constraints(
     const KEY_TOL: f64 = 1e-8;
 
     let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64)> = BTreeMap::new();
-    let mut fallback_rows: Vec<(Vec<f64>, f64)> = Vec::new();
+    let mut fallbackrows: Vec<(Vec<f64>, f64)> = Vec::new();
 
     for i in 0..a.nrows() {
         let row = a.row(i);
         let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if !scale.is_finite() || scale <= SCALE_TOL {
             if b[i] > 0.0 {
-                fallback_rows.push((row.to_vec(), b[i]));
+                fallbackrows.push((row.to_vec(), b[i]));
             }
             continue;
         }
 
-        let normalized_row: Vec<f64> = row
+        let normalizedrow: Vec<f64> = row
             .iter()
             .map(|&v| {
                 let scaled = v / scale;
@@ -181,42 +181,42 @@ fn compress_positive_collinear_constraints(
             })
             .collect();
         let normalized_rhs = b[i] / scale;
-        let key: Vec<i64> = normalized_row
+        let key: Vec<i64> = normalizedrow
             .iter()
             .map(|&v| (v / KEY_TOL).round() as i64)
             .collect();
 
         match grouped.get_mut(&key) {
-            Some((_row, rhs_max)) => {
+            Some((_, rhs_max)) => {
                 if normalized_rhs > *rhs_max {
                     *rhs_max = normalized_rhs;
                 }
             }
             None => {
-                grouped.insert(key, (normalized_row, normalized_rhs));
+                grouped.insert(key, (normalizedrow, normalized_rhs));
             }
         }
     }
 
-    let n_rows = grouped.len() + fallback_rows.len();
+    let nrows = grouped.len() + fallbackrows.len();
     let n_cols = a.ncols();
-    let mut a_out = Array2::<f64>::zeros((n_rows, n_cols));
-    let mut b_out = Array1::<f64>::zeros(n_rows);
+    let mut a_out = Array2::<f64>::zeros((nrows, n_cols));
+    let mut b_out = Array1::<f64>::zeros(nrows);
 
-    let mut out_row = 0usize;
-    for (_key, (row, rhs)) in grouped {
+    let mut outrow = 0usize;
+    for (_, (row, rhs)) in grouped {
         for (j, value) in row.into_iter().enumerate() {
-            a_out[[out_row, j]] = value;
+            a_out[[outrow, j]] = value;
         }
-        b_out[out_row] = rhs;
-        out_row += 1;
+        b_out[outrow] = rhs;
+        outrow += 1;
     }
-    for (row, rhs) in fallback_rows {
+    for (row, rhs) in fallbackrows {
         for (j, value) in row.into_iter().enumerate() {
-            a_out[[out_row, j]] = value;
+            a_out[[outrow, j]] = value;
         }
-        b_out[out_row] = rhs;
-        out_row += 1;
+        b_out[outrow] = rhs;
+        outrow += 1;
     }
 
     LinearInequalityConstraints { a: a_out, b: b_out }
@@ -239,7 +239,7 @@ pub struct WorkingModelSurvival {
     age_exit: Array1<f64>,
     entry_at_origin: Array1<bool>,
     event_target: Array1<u8>,
-    sample_weight: Array1<f64>,
+    sampleweight: Array1<f64>,
     x_entry: Array2<f64>,
     x_exit: Array2<f64>,
     x_derivative: Array2<f64>,
@@ -253,8 +253,7 @@ pub struct WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
-    fn row_derivative_constraint_lower_bound(&self, row: usize) -> f64 {
-        let _ = row;
+    fn row_derivative_constraint_lower_bound(&self, _: usize) -> f64 {
         self.derivative_guard()
     }
 
@@ -338,9 +337,9 @@ impl WorkingModelSurvival {
         if p == 0 {
             return None;
         }
-        let active_rows: Vec<usize> = (0..self.x_derivative.nrows())
+        let activerows: Vec<usize> = (0..self.x_derivative.nrows())
             .filter(|&i| {
-                self.sample_weight[i] > 0.0
+                self.sampleweight[i] > 0.0
                     && self
                         .x_derivative
                         .row(i)
@@ -349,12 +348,12 @@ impl WorkingModelSurvival {
                         > DERIVATIVE_ROW_NORM_TOL
             })
             .collect();
-        if active_rows.is_empty() {
+        if activerows.is_empty() {
             return None;
         }
-        let mut a = Array2::<f64>::zeros((active_rows.len(), p));
-        let mut b = Array1::<f64>::zeros(active_rows.len());
-        for (r, &i) in active_rows.iter().enumerate() {
+        let mut a = Array2::<f64>::zeros((activerows.len(), p));
+        let mut b = Array1::<f64>::zeros(activerows.len());
+        for (r, &i) in activerows.iter().enumerate() {
             a.row_mut(r).assign(&self.x_derivative.row(i));
             b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
         }
@@ -367,10 +366,10 @@ impl WorkingModelSurvival {
         monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
-        Self::from_engine_inputs_with_offsets(inputs, None, penalties, monotonicity, spec)
+        Self::from_engine_inputswith_offsets(inputs, None, penalties, monotonicity, spec)
     }
 
-    pub fn from_engine_inputs_with_offsets(
+    pub fn from_engine_inputswith_offsets(
         inputs: SurvivalEngineInputs<'_>,
         offsets: Option<SurvivalBaselineOffsets<'_>>,
         penalties: PenaltyBlocks,
@@ -393,7 +392,7 @@ impl WorkingModelSurvival {
         if inputs.age_exit.len() != n
             || inputs.event_target.len() != n
             || inputs.event_competing.len() != n
-            || inputs.sample_weight.len() != n
+            || inputs.sampleweight.len() != n
             || inputs.x_entry.nrows() != n
             || inputs.x_exit.nrows() != n
             || inputs.x_derivative.nrows() != n
@@ -407,7 +406,7 @@ impl WorkingModelSurvival {
         if inputs.age_entry.iter().any(|v| !v.is_finite())
             || inputs.age_exit.iter().any(|v| !v.is_finite())
             || inputs
-                .sample_weight
+                .sampleweight
                 .iter()
                 .any(|v| !v.is_finite() || *v < 0.0)
             || inputs.x_entry.iter().any(|v| !v.is_finite())
@@ -450,7 +449,7 @@ impl WorkingModelSurvival {
             age_exit: inputs.age_exit.to_owned(),
             entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
             event_target: inputs.event_target.to_owned(),
-            sample_weight: inputs.sample_weight.to_owned(),
+            sampleweight: inputs.sampleweight.to_owned(),
             x_entry: inputs.x_entry.to_owned(),
             x_exit: inputs.x_exit.to_owned(),
             x_derivative: inputs.x_derivative.to_owned(),
@@ -595,7 +594,7 @@ impl WorkingModelSurvival {
         let derivative_guard = self.derivative_guard();
         let derivative_guard_numerical = self.derivative_guard_numerical();
         for i in 0..n {
-            let w = self.sample_weight[i];
+            let w = self.sampleweight[i];
             if w <= 0.0 {
                 continue;
             }
@@ -668,19 +667,19 @@ impl WorkingModelSurvival {
             h[[j, j]] += diag_correction[j];
         }
 
-        let penalty_grad = self.penalties.gradient(beta);
+        let penaltygrad = self.penalties.gradient(beta);
         let penalty_dev = self.penalties.deviance(beta);
 
-        let mut total_grad = grad;
-        total_grad += &penalty_grad;
+        let mut totalgrad = grad;
+        totalgrad += &penaltygrad;
 
-        self.penalties.add_hessian_inplace(&mut h);
+        self.penalties.addhessian_inplace(&mut h);
         const SURVIVAL_STABILIZATION_RIDGE: f64 = 1e-8;
         let ridge_used = SURVIVAL_STABILIZATION_RIDGE;
         for d in 0..p {
             h[[d, d]] += ridge_used;
         }
-        total_grad += &beta.mapv(|v| ridge_used * v);
+        totalgrad += &beta.mapv(|v| ridge_used * v);
         // Keep scalar objective term consistent with:
         //   grad += ridge * beta,  Hess += ridge * I
         // which correspond to 0.5 * ridge * ||beta||^2.
@@ -690,9 +689,9 @@ impl WorkingModelSurvival {
 
         Ok(WorkingState {
             eta: LinearPredictor::new(eta_exit),
-            gradient: total_grad,
+            gradient: totalgrad,
             hessian: crate::linalg::matrix::SymmetricMatrix::Dense(h),
-            sparse_hessian: None,
+            sparsehessian: None,
             deviance,
             penalty_term: penalty_dev + ridge_penalty,
             firth: crate::pirls::FirthDiagnostics::Inactive,
@@ -700,7 +699,7 @@ impl WorkingModelSurvival {
         })
     }
 
-    fn laml_objective_from_state(
+    fn lamlobjective_from_state(
         &self,
         beta: &Array1<f64>,
         state: &WorkingState,
@@ -734,7 +733,7 @@ impl WorkingModelSurvival {
                 }
             }
         }
-        let (s_eval, _s_evec) = s_total
+        let (s_eval, _) = s_total
             .eigh(Side::Lower)
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
         let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
@@ -778,7 +777,7 @@ impl WorkingModelSurvival {
     ///
     /// Exact trace-contraction implementation details:
     /// - factorize `H` once,
-    /// - compute `H^{-1}` actions by solves (`solve_vec` / `solve_mat`),
+    /// - compute `H^{-1}` actions by solves (`solvevec` / `solve_mat`),
     /// - build directional Hessian derivative `dH_nll/d beta [u_k]` analytically,
     /// - evaluate trace as `tr(H^{-1} B)` using `solve_mat(B)`.
     ///
@@ -792,14 +791,14 @@ impl WorkingModelSurvival {
     ///   the solved mode and with the reported gradient/Hessian.
     /// - this ridge is constant in `rho`, so it does not enter `A_k` nor
     ///   `tr(S^+ A_k)`.
-    pub fn laml_objective_and_rho_gradient(
+    pub fn lamlobjective_and_rhogradient(
         &self,
         beta: &Array1<f64>,
         state: &WorkingState,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
         let p = beta.len();
         let k_count = self.penalties.blocks.len();
-        let objective = self.laml_objective_from_state(beta, state)?;
+        let objective = self.lamlobjective_from_state(beta, state)?;
 
         if k_count == 0 {
             return Ok((objective, Array1::zeros(0)));
@@ -815,10 +814,10 @@ impl WorkingModelSurvival {
 
         let solve_mat = |rhs: &Array2<f64>| -> Array2<f64> {
             factor
-                .solve_multi(rhs)
+                .solvemulti(rhs)
                 .expect("survival Hessian solve should succeed")
         };
-        let solve_vec = |rhs: &Array1<f64>| -> Array1<f64> {
+        let solvevec = |rhs: &Array1<f64>| -> Array1<f64> {
             let rhs_mat = rhs.clone().insert_axis(Axis(1));
             let solved = solve_mat(&rhs_mat);
             solved.column(0).to_owned()
@@ -903,7 +902,7 @@ impl WorkingModelSurvival {
 
             // Implicit inner derivative:
             // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
-            let u_k = -solve_vec(&a_k_beta);
+            let u_k = -solvevec(&a_k_beta);
 
             // trace(H^{-1} A_k) on block support from precomputed H^{-1}.
             let mut trace_hinv_ak = 0.0_f64;
@@ -917,7 +916,7 @@ impl WorkingModelSurvival {
             // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).
             b_dir.fill(0.0);
             for i in 0..n {
-                let w_i = self.sample_weight[i];
+                let w_i = self.sampleweight[i];
                 if w_i <= 0.0 {
                     continue;
                 }
@@ -927,17 +926,17 @@ impl WorkingModelSurvival {
                 let mut ds = 0.0_f64;
                 let x_e = self.x_exit.row(i);
                 let x_s = self.x_entry.row(i);
-                let d_row = self.x_derivative.row(i);
+                let drow = self.x_derivative.row(i);
                 for j in 0..p {
                     ge[j] = x_e[j] * jac[j];
                     gs[j] = x_s[j] * jac[j];
-                    gsd[j] = d_row[j] * jac[j];
+                    gsd[j] = drow[j] * jac[j];
                     he[j] = x_e[j] * curvature[j];
                     hs[j] = x_s[j] * curvature[j];
-                    hsd[j] = d_row[j] * curvature[j];
+                    hsd[j] = drow[j] * curvature[j];
                     te[j] = x_e[j] * third[j];
                     ts[j] = x_s[j] * third[j];
-                    tsd[j] = d_row[j] * third[j];
+                    tsd[j] = drow[j] * third[j];
                     deta_e += ge[j] * u_k[j];
                     if has_entry {
                         deta_s += gs[j] * u_k[j];
@@ -1010,13 +1009,13 @@ impl WorkingModelSurvival {
                 }
             }
 
-            let mut trace_third = 0.0_f64;
+            let mut tracethird = 0.0_f64;
             for r_idx in 0..p {
                 for c_idx in 0..p {
-                    trace_third += h_inv[[r_idx, c_idx]] * b_dir[[c_idx, r_idx]];
+                    tracethird += h_inv[[r_idx, c_idx]] * b_dir[[c_idx, r_idx]];
                 }
             }
-            let t_k = trace_hinv_ak + trace_third;
+            let t_k = trace_hinv_ak + tracethird;
 
             let mut p_k = 0.0_f64;
             for (i_local, i) in r.clone().enumerate() {
@@ -1028,7 +1027,7 @@ impl WorkingModelSurvival {
 
             // Final exact component:
             // 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} dH/drho_k) - 0.5 * tr(S^+ A_k),
-            // with tr(H^{-1} dH/drho_k) = trace_hinv_ak + trace_third.
+            // with tr(H^{-1} dH/drho_k) = trace_hinv_ak + tracethird.
             grad[k] = 0.5 * beta.dot(&a_k_beta) + 0.5 * t_k - 0.5 * p_k;
         }
 
@@ -1039,12 +1038,12 @@ impl WorkingModelSurvival {
 #[derive(Debug, Clone)]
 pub struct CrudeRiskResult {
     pub risk: f64,
-    pub disease_gradient: Array1<f64>,
-    pub mortality_gradient: Array1<f64>,
+    pub diseasegradient: Array1<f64>,
+    pub mortalitygradient: Array1<f64>,
 }
 
 fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
-    let mut nodes_weights = Vec::with_capacity(n);
+    let mut nodesweights = Vec::with_capacity(n);
     let m = n.div_ceil(2);
 
     for i in 0..m {
@@ -1070,15 +1069,15 @@ fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
         let x = z;
         let w = 2.0 / ((1.0 - z * z) * pp * pp);
         if !n.is_multiple_of(2) && i == m - 1 {
-            nodes_weights.push((0.0, w));
+            nodesweights.push((0.0, w));
         } else {
-            nodes_weights.push((-x, w));
-            nodes_weights.push((x, w));
+            nodesweights.push((-x, w));
+            nodesweights.push((x, w));
         }
     }
 
-    nodes_weights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    nodes_weights
+    nodesweights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    nodesweights
 }
 
 fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
@@ -1138,8 +1137,8 @@ where
     if t1 <= t0 {
         return Ok(CrudeRiskResult {
             risk: 0.0,
-            disease_gradient: Array1::zeros(coeff_len_d),
-            mortality_gradient: Array1::zeros(coeff_len_m),
+            diseasegradient: Array1::zeros(coeff_len_d),
+            mortalitygradient: Array1::zeros(coeff_len_m),
         });
     }
 
@@ -1157,9 +1156,9 @@ where
     }
 
     let mut total_risk = 0.0;
-    let mut disease_gradient = Array1::zeros(coeff_len_d);
-    let mut mortality_gradient = Array1::zeros(coeff_len_m);
-    let nodes_weights = gauss_legendre_quadrature();
+    let mut diseasegradient = Array1::zeros(coeff_len_d);
+    let mut mortalitygradient = Array1::zeros(coeff_len_m);
+    let nodesweights = gauss_legendre_quadrature();
 
     let mut design_d = Array1::<f64>::zeros(coeff_len_d);
     let mut deriv_d = Array1::<f64>::zeros(coeff_len_d);
@@ -1169,13 +1168,13 @@ where
         let a = segment[0];
         let b = segment[1];
         let center = 0.5 * (b + a);
-        let half_width = 0.5 * (b - a);
-        if half_width <= 0.0 {
+        let halfwidth = 0.5 * (b - a);
+        if halfwidth <= 0.0 {
             continue;
         }
 
-        for &(x, w) in nodes_weights {
-            let u = center + half_width * x;
+        for &(x, w) in nodesweights {
+            let u = center + halfwidth * x;
             let (inst_hazard_d, hazard_d, hazard_m) =
                 eval_at(u, &mut design_d, &mut deriv_d, &mut design_m)?;
             if !inst_hazard_d.is_finite() || !hazard_d.is_finite() || !hazard_m.is_finite() {
@@ -1193,33 +1192,33 @@ where
             let h_mor_cond = hazard_m - h_mor_t0;
             let s_total = (-(h_dis_cond + h_mor_cond)).exp();
 
-            total_risk += w * inst_hazard_d * s_total * half_width;
+            total_risk += w * inst_hazard_d * s_total * halfwidth;
 
             // d Risk / d beta_d:
             //   integral [ d h_d * S_total - h_d * S_total * d H_d ] du
-            let weight = w * s_total * half_width;
+            let weight = w * s_total * halfwidth;
             for j in 0..coeff_len_d {
                 let d_inst_hazard =
                     inst_hazard_d * (1.0 - hazard_d) * design_d[j] + hazard_d * deriv_d[j];
                 let d_hazard_cond = hazard_d * design_d[j] - h_dis_t0 * design_d_t0[j];
                 let g = d_inst_hazard - inst_hazard_d * d_hazard_cond;
-                disease_gradient[j] += weight * g;
+                diseasegradient[j] += weight * g;
             }
 
             // d Risk / d beta_m:
             //   -integral h_d * S_total * d H_m(u|t0) du
-            let weight = w * inst_hazard_d * s_total * half_width;
+            let weight = w * inst_hazard_d * s_total * halfwidth;
             for j in 0..coeff_len_m {
                 let g = -hazard_m * design_m[j] + h_mor_t0 * design_m_t0[j];
-                mortality_gradient[j] += weight * g;
+                mortalitygradient[j] += weight * g;
             }
         }
     }
 
     Ok(CrudeRiskResult {
         risk: total_risk,
-        disease_gradient,
-        mortality_gradient,
+        diseasegradient,
+        mortalitygradient,
     })
 }
 
@@ -1244,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn penalty_hessian_matches_gradient_jacobian() {
+    fn penaltyhessian_matchesgradient_jacobian() {
         let penalties = toy_penalties();
         let beta = array![10.0, -0.3, 1.2, 7.0];
 
@@ -1262,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn penalty_gradient_matches_deviance_finite_difference() {
+    fn penaltygradient_matches_deviance_finite_difference() {
         let penalties = toy_penalties();
         let beta = array![10.0, -0.3, 1.2, 7.0];
         let grad = penalties.gradient(&beta);
@@ -1294,7 +1293,7 @@ mod tests {
         let age_exit = array![2.0_f64, 3.5_f64];
         let event_target = array![1u8, 0u8];
         let event_competing = array![0u8, 0u8];
-        let sample_weight = array![1.0, 1.0];
+        let sampleweight = array![1.0, 1.0];
         let x_entry = array![[1.0, age_entry[0].ln()], [1.0, age_entry[1].ln()]];
         let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
         let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
@@ -1308,7 +1307,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1319,13 +1318,13 @@ mod tests {
         )
         .expect("construct base survival model");
 
-        let zero_offsets = WorkingModelSurvival::from_engine_inputs_with_offsets(
+        let zero_offsets = WorkingModelSurvival::from_engine_inputswith_offsets(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1342,24 +1341,24 @@ mod tests {
         .expect("construct offset survival model");
 
         let state_base = base.update_state(&beta).expect("base state");
-        let state_zero = zero_offsets.update_state(&beta).expect("zero-offset state");
-        assert!((state_base.deviance - state_zero.deviance).abs() < 1e-12);
+        let statezero = zero_offsets.update_state(&beta).expect("zero-offset state");
+        assert!((state_base.deviance - statezero.deviance).abs() < 1e-12);
         assert!(
             state_base
                 .gradient
                 .iter()
-                .zip(state_zero.gradient.iter())
+                .zip(statezero.gradient.iter())
                 .all(|(a, b)| (a - b).abs() < 1e-12)
         );
     }
 
     #[test]
-    fn crude_spec_is_rejected_by_one_hazard_engine() {
+    fn crudespec_is_rejected_by_one_hazard_engine() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![0u8];
         let event_competing = array![1u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.1]];
         let x_exit = array![[0.4]];
         let x_derivative = array![[1.0]];
@@ -1372,7 +1371,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1386,12 +1385,12 @@ mod tests {
     }
 
     #[test]
-    fn monotonicity_constraints_cover_all_weighted_rows() {
+    fn monotonicity_constraints_cover_allweightedrows() {
         let age_entry = array![1.0_f64, 1.5_f64];
         let age_exit = array![2.0_f64, 2.5_f64];
         let event_target = array![0u8, 0u8];
         let event_competing = array![0u8, 1u8];
-        let sample_weight = array![1.0, 1.0];
+        let sampleweight = array![1.0, 1.0];
         let x_entry = array![[0.2], [0.1]];
         let x_exit = array![[0.3], [0.2]];
         let x_derivative = array![[1.0], [1.0]];
@@ -1402,7 +1401,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1429,12 +1428,12 @@ mod tests {
     }
 
     #[test]
-    fn decreasing_interval_is_rejected_without_target_events() {
+    fn decreasing_interval_is_rejectedwithout_target_events() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![0u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.5]];
         let x_exit = array![[0.0]];
         let x_derivative = array![[1.0]];
@@ -1445,7 +1444,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1488,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn crude_risk_gradient_matches_monotone_objective() {
+    fn crude_riskgradient_matches_monotoneobjective() {
         let beta_d = -0.2_f64;
         let beta_m = -0.5_f64;
         let result = smooth_crude_risk(beta_d, beta_m);
@@ -1502,24 +1501,24 @@ mod tests {
             / (2.0 * eps);
 
         assert!(
-            (result.disease_gradient[0] - fd_d).abs() < 1e-5,
+            (result.diseasegradient[0] - fd_d).abs() < 1e-5,
             "disease gradient mismatch for monotone crude risk: analytic={} fd={fd_d}",
-            result.disease_gradient[0]
+            result.diseasegradient[0]
         );
         assert!(
-            (result.mortality_gradient[0] - fd_m).abs() < 1e-5,
+            (result.mortalitygradient[0] - fd_m).abs() < 1e-5,
             "mortality gradient mismatch for monotone crude risk: analytic={} fd={fd_m}",
-            result.mortality_gradient[0]
+            result.mortalitygradient[0]
         );
     }
 
     #[test]
-    fn survival_ridge_penalty_scalar_matches_gradient_hessian_scaling() {
+    fn survivalridge_penalty_scalar_matchesgradienthessian_scaling() {
         let age_entry = array![1.0_f64, 2.0_f64];
         let age_exit = array![2.0_f64, 3.5_f64];
         let event_target = array![1u8, 0u8];
         let event_competing = array![0u8, 0u8];
-        let sample_weight = array![1.0, 1.0];
+        let sampleweight = array![1.0, 1.0];
         let x_entry = array![[1.0, age_entry[0].ln()], [1.0, age_entry[1].ln()]];
         let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
         let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
@@ -1537,7 +1536,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1564,7 +1563,7 @@ mod tests {
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[1.0, 0.0]];
         let x_exit = array![[1.0, 0.5]];
         let x_derivative = array![[0.0, 1.0]];
@@ -1580,7 +1579,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1595,12 +1594,12 @@ mod tests {
     }
 
     #[test]
-    fn penalty_block_range_and_shape_must_match_coefficients() {
+    fn penalty_block_range_and_shapemust_match_coefficients() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[1.0, 0.0]];
         let x_exit = array![[1.0, 0.5]];
         let x_derivative = array![[0.0, 1.0]];
@@ -1616,7 +1615,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1631,12 +1630,12 @@ mod tests {
     }
 
     #[test]
-    fn survival_gradient_matches_objective_fd_with_ridge_scaling() {
+    fn survivalgradient_matchesobjectivefdwithridge_scaling() {
         let age_entry = array![1.0_f64, 2.0_f64, 3.0_f64];
         let age_exit = array![2.0_f64, 3.5_f64, 4.0_f64];
         let event_target = array![1u8, 0u8, 1u8];
         let event_competing = array![0u8, 0u8, 0u8];
-        let sample_weight = array![1.0, 1.0, 1.0];
+        let sampleweight = array![1.0, 1.0, 1.0];
         let x_entry = array![
             [1.0, age_entry[0].ln()],
             [1.0, age_entry[1].ln()],
@@ -1662,7 +1661,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1700,12 +1699,12 @@ mod tests {
     }
 
     #[test]
-    fn structural_monotonic_gradient_matches_objective_fd() {
+    fn structural_monotonicgradient_matchesobjectivefd() {
         let age_entry = array![1.0_f64, 1.3_f64, 1.8_f64];
         let age_exit = array![1.6_f64, 2.1_f64, 2.7_f64];
         let event_target = array![1u8, 0u8, 1u8];
         let event_competing = array![0u8, 0u8, 0u8];
-        let sample_weight = array![1.0, 1.0, 1.0];
+        let sampleweight = array![1.0, 1.0, 1.0];
 
         // Time block has 3 structural-monotone columns.
         // Final column is a covariate, left unconstrained.
@@ -1732,7 +1731,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1775,12 +1774,12 @@ mod tests {
     }
 
     #[test]
-    fn structural_monotonic_laml_gradient_returns_finite_values() {
+    fn structural_monotonic_lamlgradient_returns_finitevalues() {
         let age_entry = array![1.0_f64, 1.2_f64];
         let age_exit = array![1.5_f64, 2.0_f64];
         let event_target = array![1u8, 0u8];
         let event_competing = array![0u8, 0u8];
-        let sample_weight = array![1.0, 1.0];
+        let sampleweight = array![1.0, 1.0];
         let x_entry = array![[1.0, 0.2, -0.5], [1.0, 0.4, 0.2]];
         let x_exit = array![[1.0, 0.5, -0.5], [1.0, 0.8, 0.2]];
         let x_derivative = array![[0.0, 0.9, 0.0], [0.0, 0.7, 0.0]];
@@ -1792,7 +1791,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1814,7 +1813,7 @@ mod tests {
         let beta = array![0.2, 0.2, 0.1];
         let state = model.update_state(&beta).expect("state at structural beta");
         let (obj, grad) = model
-            .laml_objective_and_rho_gradient(&beta, &state)
+            .lamlobjective_and_rhogradient(&beta, &state)
             .expect("laml gradient should work in structural mode");
         assert!(obj.is_finite());
         assert_eq!(grad.len(), 1);
@@ -1827,7 +1826,7 @@ mod tests {
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.0]];
         let x_exit = array![[0.2]];
         let x_derivative = array![[1.0]];
@@ -1840,7 +1839,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1870,7 +1869,7 @@ mod tests {
         assert!(state.deviance.is_finite());
     }
 
-    fn model_with_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
+    fn modelwith_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
         let mut model = base.clone();
         assert_eq!(model.penalties.blocks.len(), rho.len());
         for (k, block) in model.penalties.blocks.iter_mut().enumerate() {
@@ -1890,39 +1889,39 @@ mod tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
         };
-        let out = crate::pirls::run_working_model_pirls(
+        let out = crate::pirls::runworking_model_pirls(
             &mut model_local,
             crate::types::Coefficients::new(beta_init.clone()),
             &opts,
-            |_info| {},
+            |info| {},
         )
         .expect("survival constrained PIRLS inner mode");
         out.beta.0
     }
 
-    fn laml_objective_at_rho(
+    fn lamlobjective_at_rho(
         base: &WorkingModelSurvival,
         rho: &Array1<f64>,
         beta_init: &Array1<f64>,
     ) -> (f64, Array1<f64>, Array1<f64>) {
-        let model = model_with_rho(base, rho);
+        let model = modelwith_rho(base, rho);
         let beta_hat = solve_inner_mode(&model, beta_init);
         let state = model
             .update_state(&beta_hat)
             .expect("state at inner mode for outer objective");
         let (obj, grad) = model
-            .laml_objective_and_rho_gradient(&beta_hat, &state)
+            .lamlobjective_and_rhogradient(&beta_hat, &state)
             .expect("analytic laml objective/gradient");
         (obj, grad, beta_hat)
     }
 
     #[test]
-    fn update_state_rejects_negative_exit_derivative_for_censored_rows() {
+    fn update_state_rejects_negative_exit_derivative_for_censoredrows() {
         let age_entry = array![1.0_f64];
         let age_exit = array![1.1_f64];
         let event_target = array![0u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.0]];
         let x_exit = array![[0.0]];
         let x_derivative = array![[-1.0]];
@@ -1934,7 +1933,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -1964,7 +1963,7 @@ mod tests {
             0.2,
             array![1.0].view(),
             array![1.0].view(),
-            |_u, design_d, deriv_d, design_m| {
+            |u, design_d, deriv_d, design_m| {
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;
@@ -1985,7 +1984,7 @@ mod tests {
             0.2,
             array![1.0].view(),
             array![1.0].view(),
-            |_u, design_d, deriv_d, design_m| {
+            |u, design_d, deriv_d, design_m| {
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;
@@ -1997,12 +1996,12 @@ mod tests {
     }
 
     #[test]
-    fn laml_no_penalties_matches_documented_objective() {
+    fn laml_no_penalties_matches_documentedobjective() {
         let age_entry = array![40.0, 45.0, 50.0, 55.0];
         let age_exit = array![44.0, 49.0, 54.0, 59.0];
         let event_target = array![1u8, 0u8, 1u8, 0u8];
         let event_competing = Array1::<u8>::zeros(4);
-        let sample_weight = Array1::ones(4);
+        let sampleweight = Array1::ones(4);
         let x_entry = array![
             [1.0, -0.2, 0.04],
             [1.0, -0.1, 0.01],
@@ -2031,7 +2030,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2044,7 +2043,7 @@ mod tests {
 
         let state = model.update_state(&beta).expect("state at beta");
         let (obj, grad) = model
-            .laml_objective_and_rho_gradient(&beta, &state)
+            .lamlobjective_and_rhogradient(&beta, &state)
             .expect("laml objective for no-penalty model");
 
         let h_dense = state.hessian.to_dense();
@@ -2066,7 +2065,7 @@ mod tests {
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.0]];
         let x_exit = array![[0.2]];
         let x_derivative = array![[0.5]];
@@ -2076,7 +2075,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2091,13 +2090,13 @@ mod tests {
         state.hessian = crate::linalg::matrix::SymmetricMatrix::Dense(array![[-1.0]]);
 
         let objective = model
-            .laml_objective_from_state(&beta, &state)
+            .lamlobjective_from_state(&beta, &state)
             .expect("indefinite hessian should use positive-spectrum logdet fallback");
         assert!(objective.is_finite());
     }
 
     #[test]
-    fn laml_rho_gradient_matches_fd_with_nonzero_offsets() {
+    fn laml_rhogradient_matchesfdwith_nonzero_offsets() {
         let n = 8usize;
         let p = 3usize;
 
@@ -2105,7 +2104,7 @@ mod tests {
         let age_exit = array![44.0, 49.0, 55.0, 61.0, 66.0, 48.0, 56.0, 63.0];
         let event_target = array![1u8, 0u8, 1u8, 1u8, 0u8, 1u8, 0u8, 1u8];
         let event_competing = Array1::<u8>::zeros(n);
-        let sample_weight = Array1::ones(n);
+        let sampleweight = Array1::ones(n);
 
         let mut x_entry = Array2::<f64>::zeros((n, p));
         let mut x_exit = Array2::<f64>::zeros((n, p));
@@ -2146,13 +2145,13 @@ mod tests {
         ]);
         let mono = MonotonicityPenalty { tolerance: 1e-6 };
 
-        let base_model = WorkingModelSurvival::from_engine_inputs_with_offsets(
+        let base_model = WorkingModelSurvival::from_engine_inputswith_offsets(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2170,7 +2169,7 @@ mod tests {
 
         let rho = array![(-0.3f64), (0.45f64)];
         let beta0 = Array1::<f64>::zeros(p);
-        let (obj, analytic, beta_hat) = laml_objective_at_rho(&base_model, &rho, &beta0);
+        let (obj, analytic, beta_hat) = lamlobjective_at_rho(&base_model, &rho, &beta0);
         assert!(obj.is_finite());
         assert!(analytic.iter().all(|v| v.is_finite()));
 
@@ -2184,8 +2183,8 @@ mod tests {
             rho_plus[k] += eps;
             let mut rho_minus = rho.clone();
             rho_minus[k] -= eps;
-            let (obj_plus, _, _) = laml_objective_at_rho(&base_model, &rho_plus, &beta_hat);
-            let (obj_minus, _, _) = laml_objective_at_rho(&base_model, &rho_minus, &beta_hat);
+            let (obj_plus, _, _) = lamlobjective_at_rho(&base_model, &rho_plus, &beta_hat);
+            let (obj_minus, _, _) = lamlobjective_at_rho(&base_model, &rho_minus, &beta_hat);
             fd[k] = (obj_plus - obj_minus) / (2.0 * eps);
         }
 
@@ -2211,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn laml_rho_gradient_matches_fd_in_event_heavy_third_derivative_regime() {
+    fn laml_rhogradient_matchesfd_in_event_heavythird_derivative_regime() {
         let n = 7usize;
         let p = 3usize;
 
@@ -2219,7 +2218,7 @@ mod tests {
         let age_exit = array![33.0, 37.0, 41.0, 45.0, 49.0, 53.0, 57.0];
         let event_target = Array1::from_elem(n, 1u8);
         let event_competing = Array1::<u8>::zeros(n);
-        let sample_weight = Array1::ones(n);
+        let sampleweight = Array1::ones(n);
 
         let mut x_entry = Array2::<f64>::zeros((n, p));
         let mut x_exit = Array2::<f64>::zeros((n, p));
@@ -2259,7 +2258,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2272,7 +2271,7 @@ mod tests {
 
         let rho = array![0.15f64, -0.25f64];
         let beta0 = array![-2.2, 0.4, 0.1];
-        let (obj, analytic, beta_hat) = laml_objective_at_rho(&base_model, &rho, &beta0);
+        let (obj, analytic, beta_hat) = lamlobjective_at_rho(&base_model, &rho, &beta0);
         assert!(obj.is_finite());
         assert!(analytic.iter().all(|v| v.is_finite()));
 
@@ -2283,8 +2282,8 @@ mod tests {
             rho_plus[k] += eps;
             let mut rho_minus = rho.clone();
             rho_minus[k] -= eps;
-            let (obj_plus, _, _) = laml_objective_at_rho(&base_model, &rho_plus, &beta_hat);
-            let (obj_minus, _, _) = laml_objective_at_rho(&base_model, &rho_minus, &beta_hat);
+            let (obj_plus, _, _) = lamlobjective_at_rho(&base_model, &rho_plus, &beta_hat);
+            let (obj_minus, _, _) = lamlobjective_at_rho(&base_model, &rho_minus, &beta_hat);
             fd[k] = (obj_plus - obj_minus) / (2.0 * eps);
         }
 
@@ -2310,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn monotonicity_constraints_collapse_positive_collinear_rows() {
+    fn monotonicity_constraints_collapse_positive_collinearrows() {
         let a = array![[0.0, 0.5, 0.0], [0.0, 0.25, 0.0], [0.0, 0.125, 0.0]];
         let b = array![1e-8, 1e-8, 1e-8];
 
@@ -2349,7 +2348,7 @@ mod tests {
     }
 
     #[test]
-    fn monotonicity_constraints_cluster_near_collinear_rows() {
+    fn monotonicity_constraints_cluster_near_collinearrows() {
         let a = array![
             [0.0, 0.5, 0.0],
             [0.0, 0.50000000003, 0.0],
@@ -2405,7 +2404,7 @@ mod tests {
         let age_exit = array![2.0_f64, 4.0, 8.0];
         let event_target = array![0u8, 1u8, 0u8];
         let event_competing = array![0u8, 0u8, 0u8];
-        let sample_weight = array![1.0, 1.0, 1.0];
+        let sampleweight = array![1.0, 1.0, 1.0];
         let x_entry = array![
             [1.0, age_entry[0].ln()],
             [1.0, age_entry[1].ln()],
@@ -2426,7 +2425,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2446,12 +2445,12 @@ mod tests {
     }
 
     #[test]
-    fn monotonicity_constraints_skip_numerically_zero_rows() {
+    fn monotonicity_constraints_skip_numericallyzerorows() {
         let age_entry = array![1.0_f64, 1.0, 1.0];
         let age_exit = array![2.0_f64, 3.0, 4.0];
         let event_target = array![0u8, 0u8, 0u8];
         let event_competing = array![0u8, 0u8, 0u8];
-        let sample_weight = array![1.0, 1.0, 1.0];
+        let sampleweight = array![1.0, 1.0, 1.0];
         let x_entry = array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]];
         let x_exit = x_entry.clone();
         let x_derivative = array![[0.0, 0.0], [0.0, 1e-16], [0.0, 0.25]];
@@ -2462,7 +2461,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2482,12 +2481,12 @@ mod tests {
     }
 
     #[test]
-    fn censored_rows_allow_zero_boundary_derivative() {
+    fn censoredrows_allowzero_boundary_derivative() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![0u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.0]];
         let x_exit = array![[0.0]];
         let x_derivative = array![[1.0]];
@@ -2498,7 +2497,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2516,12 +2515,12 @@ mod tests {
     }
 
     #[test]
-    fn event_rows_keep_positive_derivative_constraint() {
+    fn eventrows_keep_positive_derivative_constraint() {
         let age_entry = array![1.0_f64, 1.0];
         let age_exit = array![2.0_f64, 4.0];
         let event_target = array![0u8, 1u8];
         let event_competing = array![0u8, 0u8];
-        let sample_weight = array![1.0, 1.0];
+        let sampleweight = array![1.0, 1.0];
         let x_entry = array![[0.0], [0.0]];
         let x_exit = array![[0.0], [0.0]];
         let x_derivative = array![[0.5], [0.25]];
@@ -2532,7 +2531,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
@@ -2557,7 +2556,7 @@ mod tests {
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.0]];
         let x_exit = array![[0.0]];
         let x_derivative = array![[1.0]];
@@ -2567,7 +2566,7 @@ mod tests {
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
+                sampleweight: sampleweight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),

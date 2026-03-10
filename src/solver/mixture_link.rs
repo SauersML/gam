@@ -21,15 +21,15 @@ pub struct InverseLinkJet {
 }
 
 #[inline]
-fn canonical_zero(v: f64) -> f64 {
+fn canonicalzero(v: f64) -> f64 {
     if v.abs() < 1e-12 { 0.0 } else { v }
 }
 
 #[inline]
 fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
-    jet.d1 = canonical_zero(jet.d1);
-    jet.d2 = canonical_zero(jet.d2);
-    jet.d3 = canonical_zero(jet.d3);
+    jet.d1 = canonicalzero(jet.d1);
+    jet.d2 = canonicalzero(jet.d2);
+    jet.d3 = canonicalzero(jet.d3);
     jet
 }
 
@@ -97,7 +97,7 @@ fn probit_jet(eta: f64) -> InverseLinkJet {
 }
 
 #[inline]
-fn probit_pdf_third_derivative(eta: f64) -> f64 {
+fn probit_pdfthird_derivative(eta: f64) -> f64 {
     // Since d1 = mu' = phi(eta), this returns
     //
     //   d³/deta³ d1 = mu'''' = -(eta³ - 3 eta) phi(eta).
@@ -109,7 +109,7 @@ fn probit_pdf_third_derivative(eta: f64) -> f64 {
     }
     let x = eta;
     let phi = normal_pdf(x);
-    canonical_zero(-(x * x * x - 3.0 * x) * phi)
+    canonicalzero(-(x * x * x - 3.0 * x) * phi)
 }
 
 #[inline]
@@ -123,9 +123,9 @@ fn chain_inverse_link_jet(base: InverseLinkJet, z1: f64, z2: f64, z3: f64) -> In
 }
 
 #[inline]
-fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f64) -> f64 {
+fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64) -> f64 {
     match component {
-        LinkComponent::Probit => probit_pdf_third_derivative(eta),
+        LinkComponent::Probit => probit_pdfthird_derivative(eta),
         LinkComponent::Logit => {
             // Logistic link:
             //   mu'   = d1 = mu(1-mu)
@@ -226,7 +226,7 @@ pub enum LinkParamPartials {
 pub trait InverseLinkKernel {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError>;
 
-    fn param_partials(&self, _eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+    fn param_partials(&self, _: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
         Ok(None)
     }
 }
@@ -261,11 +261,11 @@ impl SasLinkState {
     }
 }
 
-pub fn state_from_sas_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
+pub fn state_from_sasspec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
     SasLinkState::new(spec.initial_epsilon, spec.initial_log_delta)
 }
 
-pub fn state_from_beta_logistic_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
+pub fn state_from_beta_logisticspec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
     if !spec.initial_epsilon.is_finite() || !spec.initial_log_delta.is_finite() {
         return Err("Beta-Logistic link parameters must be finite".to_string());
     }
@@ -327,7 +327,7 @@ fn sas_delta_from_raw_log_delta(raw_log_delta: f64) -> f64 {
     ld_eff.exp()
 }
 
-pub fn validate_mixture_spec(spec: &MixtureLinkSpec) -> Result<(), String> {
+pub fn validate_mixturespec(spec: &MixtureLinkSpec) -> Result<(), String> {
     if spec.components.is_empty() {
         return Err("mixture link requires at least 1 component".to_string());
     }
@@ -348,21 +348,21 @@ pub fn validate_mixture_spec(spec: &MixtureLinkSpec) -> Result<(), String> {
     Ok(())
 }
 
-pub fn softmax_last_fixed_zero(rho: &Array1<f64>) -> Array1<f64> {
+pub fn softmax_last_fixedzero(rho: &Array1<f64>) -> Array1<f64> {
     let k = rho.len() + 1;
     let mut logits = Vec::with_capacity(k);
-    let mut max_v = 0.0_f64;
+    let mut maxv = 0.0_f64;
     for &v in rho {
-        max_v = max_v.max(v);
+        maxv = maxv.max(v);
         logits.push(v);
     }
-    max_v = max_v.max(0.0);
+    maxv = maxv.max(0.0);
     logits.push(0.0);
 
     let mut sum = 0.0_f64;
     let mut exps = vec![0.0_f64; k];
     for i in 0..k {
-        let e = (logits[i] - max_v).exp();
+        let e = (logits[i] - maxv).exp();
         exps[i] = e;
         sum += e;
     }
@@ -375,10 +375,10 @@ pub fn softmax_last_fixed_zero(rho: &Array1<f64>) -> Array1<f64> {
 
 /// Returns softmax weights and Jacobian wrt free logits (last logit fixed at zero).
 /// Jacobian shape is (K, K-1): d pi_k / d rho_j.
-pub fn softmax_with_jacobian_last_fixed_zero(
+pub fn softmaxwith_jacobian_last_fixedzero(
     rho: &Array1<f64>,
 ) -> (Array1<f64>, ndarray::Array2<f64>) {
-    let pi = softmax_last_fixed_zero(rho);
+    let pi = softmax_last_fixedzero(rho);
     let k = pi.len();
     let m = k.saturating_sub(1);
     let mut jac = ndarray::Array2::<f64>::zeros((k, m));
@@ -392,9 +392,9 @@ pub fn softmax_with_jacobian_last_fixed_zero(
     (pi, jac)
 }
 
-pub fn state_from_spec(spec: &MixtureLinkSpec) -> Result<MixtureLinkState, String> {
-    validate_mixture_spec(spec)?;
-    let pi = softmax_last_fixed_zero(&spec.initial_rho);
+pub fn state_fromspec(spec: &MixtureLinkSpec) -> Result<MixtureLinkState, String> {
+    validate_mixturespec(spec)?;
+    let pi = softmax_last_fixedzero(&spec.initial_rho);
     Ok(MixtureLinkState {
         components: spec.components.clone(),
         rho: spec.initial_rho.clone(),
@@ -609,7 +609,7 @@ impl InverseLinkKernel for SasLinkState {
 
     fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
         Ok(Some(LinkParamPartials::Sas(
-            sas_inverse_link_jet_with_param_partials(eta, self.epsilon, self.log_delta),
+            sas_inverse_link_jetwith_param_partials(eta, self.epsilon, self.log_delta),
         )))
     }
 }
@@ -631,7 +631,7 @@ impl InverseLinkKernel for BetaLogisticKernel {
 
     fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
         Ok(Some(LinkParamPartials::Sas(
-            beta_logistic_inverse_link_jet_with_param_partials(eta, self.delta, self.epsilon),
+            beta_logistic_inverse_link_jetwith_param_partials(eta, self.delta, self.epsilon),
         )))
     }
 }
@@ -643,7 +643,7 @@ impl InverseLinkKernel for MixtureLinkState {
 
     fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
         Ok(Some(LinkParamPartials::Mixture(
-            mixture_inverse_link_jet_with_rho_partials(self, eta),
+            mixture_inverse_link_jetwith_rho_partials(self, eta),
         )))
     }
 }
@@ -686,7 +686,7 @@ pub fn inverse_link_jet_for_inverse_link(
     link.jet(eta)
 }
 
-pub fn inverse_link_pdf_third_derivative_for_inverse_link(
+pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     link: &InverseLink,
     eta: f64,
 ) -> Result<f64, EstimationError> {
@@ -707,25 +707,25 @@ pub fn inverse_link_pdf_third_derivative_for_inverse_link(
     // because the mixture weights `pi_j` are constant with respect to `eta`.
     match link {
         InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
-        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdf_third_derivative(eta)),
+        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdfthird_derivative(eta)),
         InverseLink::Standard(LinkFunction::Logit) => Ok(
-            component_inverse_link_pdf_third_derivative(LinkComponent::Logit, eta),
+            component_inverse_link_pdfthird_derivative(LinkComponent::Logit, eta),
         ),
         InverseLink::Standard(LinkFunction::CLogLog) => Ok(
-            component_inverse_link_pdf_third_derivative(LinkComponent::CLogLog, eta),
+            component_inverse_link_pdfthird_derivative(LinkComponent::CLogLog, eta),
         ),
         InverseLink::Standard(LinkFunction::Sas) => {
-            Ok(sas_inverse_link_pdf_third_derivative(eta, 0.0, 0.0))
+            Ok(sas_inverse_link_pdfthird_derivative(eta, 0.0, 0.0))
         }
-        InverseLink::Sas(state) => Ok(sas_inverse_link_pdf_third_derivative(
+        InverseLink::Sas(state) => Ok(sas_inverse_link_pdfthird_derivative(
             eta,
             state.epsilon,
             state.log_delta,
         )),
         InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(
-            beta_logistic_inverse_link_pdf_third_derivative(eta, 0.0, 0.0),
+            beta_logistic_inverse_link_pdfthird_derivative(eta, 0.0, 0.0),
         ),
-        InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_pdf_third_derivative(
+        InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_pdfthird_derivative(
             eta,
             state.log_delta,
             state.epsilon,
@@ -735,7 +735,7 @@ pub fn inverse_link_pdf_third_derivative_for_inverse_link(
             .iter()
             .zip(state.pi.iter())
             .map(|(&component, &weight)| {
-                weight * component_inverse_link_pdf_third_derivative(component, eta)
+                weight * component_inverse_link_pdfthird_derivative(component, eta)
             })
             .sum()),
     }
@@ -868,7 +868,7 @@ pub fn mixture_inverse_link_jet(state: &MixtureLinkState, eta: f64) -> InverseLi
 ///   d mu'    / d rho_j = pi_j (mu_j'    - mu')
 ///   d mu''   / d rho_j = pi_j (mu_j''   - mu'')
 ///   d mu'''  / d rho_j = pi_j (mu_j'''  - mu''')
-pub fn mixture_inverse_link_jet_with_rho_partials(
+pub fn mixture_inverse_link_jetwith_rho_partials(
     state: &MixtureLinkState,
     eta: f64,
 ) -> MixtureJetWithRhoPartials {
@@ -883,13 +883,13 @@ pub fn mixture_inverse_link_jet_with_rho_partials(
         };
         m
     ];
-    let jet = mixture_inverse_link_jet_with_rho_partials_into(state, eta, &mut djet_drho);
+    let jet = mixture_inverse_link_jetwith_rho_partials_into(state, eta, &mut djet_drho);
     MixtureJetWithRhoPartials { jet, djet_drho }
 }
 
 /// Computes mixture jet and writes exact rho partial jets into `out` (length >= K-1).
 /// This avoids heap allocation in hot loops.
-pub fn mixture_inverse_link_jet_with_rho_partials_into(
+pub fn mixture_inverse_link_jetwith_rho_partials_into(
     state: &MixtureLinkState,
     eta: f64,
     out: &mut [InverseLinkJet],
@@ -935,7 +935,7 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
 }
 
 #[inline]
-fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
+fn logistic_uwith_derivatives(eta: f64) -> (f64, f64) {
     let u = logistic_stable(eta);
     let u_clamped = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
     let clamp_active = !eta.is_finite() || u_clamped != u;
@@ -953,7 +953,7 @@ fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
 ///   a = exp(delta - epsilon), b = exp(delta + epsilon)
 ///   mu = I_u(a, b)
 pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> InverseLinkJet {
-    let (u, du) = logistic_u_with_derivatives(eta);
+    let (u, du) = logistic_uwith_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
     let mu = beta_reg(a, b, u);
@@ -973,7 +973,7 @@ pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> Inv
     InverseLinkJet { mu, d1, d2, d3 }
 }
 
-pub fn beta_logistic_inverse_link_pdf_third_derivative(eta: f64, delta: f64, epsilon: f64) -> f64 {
+pub fn beta_logistic_inverse_link_pdfthird_derivative(eta: f64, delta: f64, epsilon: f64) -> f64 {
     // Beta-logistic link:
     //
     //   u = logistic(eta),
@@ -996,13 +996,12 @@ pub fn beta_logistic_inverse_link_pdf_third_derivative(eta: f64, delta: f64, eps
     //      = d1 [ t³ - 3 c t u' - c u'' ],
     //
     // since `t' = -c u'`.
-    let (u, du) = logistic_u_with_derivatives(eta);
+    let (u, du) = logistic_uwith_derivatives(eta);
     if du == 0.0 {
         return 0.0;
     }
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let _mu = beta_reg(a, b, u);
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let c = a + b;
@@ -1011,12 +1010,12 @@ pub fn beta_logistic_inverse_link_pdf_third_derivative(eta: f64, delta: f64, eps
     d1 * (t * t * t - 3.0 * c * t * du - c * u2)
 }
 
-pub fn beta_logistic_inverse_link_jet_with_param_partials(
+pub fn beta_logistic_inverse_link_jetwith_param_partials(
     eta: f64,
     delta: f64,
     epsilon: f64,
 ) -> SasJetWithParamPartials {
-    let (u, du) = logistic_u_with_derivatives(eta);
+    let (u, du) = logistic_uwith_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
     let mu = beta_reg(a, b, u);
@@ -1129,7 +1128,7 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     chain_inverse_link_jet(base, z1, z2, z3)
 }
 
-pub fn sas_inverse_link_pdf_third_derivative(eta: f64, epsilon: f64, log_delta: f64) -> f64 {
+pub fn sas_inverse_link_pdfthird_derivative(eta: f64, epsilon: f64, log_delta: f64) -> f64 {
     // SAS link with bounded latent transform:
     //
     //   a  = asinh(eta),
@@ -1201,16 +1200,16 @@ pub fn sas_inverse_link_pdf_third_derivative(eta: f64, epsilon: f64, log_delta: 
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
     let z4 =
         s * u1.powi(4) + 6.0 * c * u1 * u1 * u2 + 3.0 * s * u2 * u2 + 4.0 * s * u1 * u3 + c * u4;
-    let base4 = probit_pdf_third_derivative(z);
+    let base4 = probit_pdfthird_derivative(z);
     let out = base4 * z1.powi(4)
         + 6.0 * base.d3 * z1 * z1 * z2
         + 3.0 * base.d2 * z2 * z2
         + 4.0 * base.d2 * z1 * z3
         + base.d1 * z4;
-    canonical_zero(out)
+    canonicalzero(out)
 }
 
-pub fn sas_inverse_link_jet_with_param_partials(
+pub fn sas_inverse_link_jetwith_param_partials(
     eta: f64,
     epsilon: f64,
     log_delta: f64,
@@ -1270,7 +1269,7 @@ pub fn sas_inverse_link_jet_with_param_partials(
                 + 2.0 * base.d2 * z1 * z1_t
                 + base.d2 * z_t * z2
                 + base.d1 * z2_t,
-            d3: probit_pdf_third_derivative(z) * z_t * z1.powi(3)
+            d3: probit_pdfthird_derivative(z) * z_t * z1.powi(3)
                 + 3.0 * base.d3 * z1 * z1 * z1_t
                 + 3.0 * base.d3 * z_t * z1 * z2
                 + 3.0 * base.d2 * (z1_t * z2 + z1 * z2_t)
@@ -1324,17 +1323,17 @@ mod tests {
     use crate::types::{InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkState};
 
     #[test]
-    fn softmax_jacobian_matches_fd() {
+    fn softmax_jacobian_matchesfd() {
         let rho = Array1::from_vec(vec![0.7, -1.2, 0.4]);
-        let (pi, jac) = softmax_with_jacobian_last_fixed_zero(&rho);
+        let (pi, jac) = softmaxwith_jacobian_last_fixedzero(&rho);
         let h = 1e-6;
         for j in 0..rho.len() {
             let mut rp = rho.clone();
             rp[j] += h;
             let mut rm = rho.clone();
             rm[j] -= h;
-            let pp = softmax_last_fixed_zero(&rp);
-            let pm = softmax_last_fixed_zero(&rm);
+            let pp = softmax_last_fixedzero(&rp);
+            let pm = softmax_last_fixedzero(&rm);
             let fd = (&pp - &pm).mapv(|v| v / (2.0 * h));
             for k in 0..pi.len() {
                 let err = (jac[[k, j]] - fd[k]).abs();
@@ -1351,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn mixture_jet_rho_partials_match_fd() {
+    fn mixture_jet_rho_partials_matchfd() {
         let spec = MixtureLinkSpec {
             components: vec![
                 LinkComponent::Probit,
@@ -1361,9 +1360,9 @@ mod tests {
             ],
             initial_rho: Array1::from_vec(vec![0.3, -0.6, 0.2]),
         };
-        let state = state_from_spec(&spec).expect("state");
+        let state = state_fromspec(&spec).expect("state");
         let eta = 0.35;
-        let out = mixture_inverse_link_jet_with_rho_partials(&state, eta);
+        let out = mixture_inverse_link_jetwith_rho_partials(&state, eta);
         let h = 1e-6;
         for j in 0..state.rho.len() {
             let mut rp = state.rho.clone();
@@ -1372,14 +1371,14 @@ mod tests {
                 components: state.components.clone(),
                 initial_rho: rp,
             };
-            let jp = mixture_inverse_link_jet(&state_from_spec(&sp).expect("sp"), eta);
+            let jp = mixture_inverse_link_jet(&state_fromspec(&sp).expect("sp"), eta);
             let mut rm = state.rho.clone();
             rm[j] -= h;
             let sm = MixtureLinkSpec {
                 components: state.components.clone(),
                 initial_rho: rm,
             };
-            let jm = mixture_inverse_link_jet(&state_from_spec(&sm).expect("sm"), eta);
+            let jm = mixture_inverse_link_jet(&state_fromspec(&sm).expect("sm"), eta);
             let fd = InverseLinkJet {
                 mu: (jp.mu - jm.mu) / (2.0 * h),
                 d1: (jp.d1 - jm.d1) / (2.0 * h),
@@ -1399,11 +1398,11 @@ mod tests {
     }
 
     #[test]
-    fn sas_param_partials_match_fd() {
+    fn sas_param_partials_matchfd() {
         let eta = 0.37;
         let epsilon = -0.12;
         let log_delta = 0.21;
-        let out = sas_inverse_link_jet_with_param_partials(eta, epsilon, log_delta);
+        let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta);
         let h = 1e-6;
 
         let ep_p = sas_inverse_link_jet(eta, epsilon + h, log_delta);
@@ -1457,7 +1456,7 @@ mod tests {
             assert!(j.d1.is_finite());
             assert!(j.d2.is_finite());
             assert!(j.d3.is_finite());
-            let p = sas_inverse_link_jet_with_param_partials(eta, eps, log_delta);
+            let p = sas_inverse_link_jetwith_param_partials(eta, eps, log_delta);
             assert!(p.djet_depsilon.mu.is_finite());
             assert!(p.djet_depsilon.d1.is_finite());
             assert!(p.djet_depsilon.d2.is_finite());
@@ -1474,7 +1473,7 @@ mod tests {
         let eta = 10.0;
         let epsilon = -60.0;
         let log_delta = 40.0;
-        let j = sas_inverse_link_jet_with_param_partials(eta, epsilon, log_delta);
+        let j = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta);
         assert!(j.djet_depsilon.mu.is_finite());
         assert!(j.djet_depsilon.d1.is_finite());
         assert!(j.djet_depsilon.d2.is_finite());
@@ -1486,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn sas_eta_jets_match_fd() {
+    fn sas_eta_jets_matchfd() {
         let eta = -0.43;
         let epsilon = 0.27;
         let log_delta = -0.31;
@@ -1494,15 +1493,15 @@ mod tests {
         let j0 = sas_inverse_link_jet(eta, epsilon, log_delta);
         let jp = sas_inverse_link_jet(eta + h, epsilon, log_delta);
         let jm = sas_inverse_link_jet(eta - h, epsilon, log_delta);
-        let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
-        let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
-        let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
-        assert_eq!(j0.d1.signum(), d1_fd.signum());
-        assert_eq!(j0.d2.signum(), d2_fd.signum());
-        assert_eq!(j0.d3.signum(), d3_fd.signum());
-        assert!((j0.d1 - d1_fd).abs() < 5e-5);
-        assert!((j0.d2 - d2_fd).abs() < 2e-4);
-        assert!((j0.d3 - d3_fd).abs() < 1e-3);
+        let d1fd = (jp.mu - jm.mu) / (2.0 * h);
+        let d2fd = (jp.d1 - jm.d1) / (2.0 * h);
+        let d3fd = (jp.d2 - jm.d2) / (2.0 * h);
+        assert_eq!(j0.d1.signum(), d1fd.signum());
+        assert_eq!(j0.d2.signum(), d2fd.signum());
+        assert_eq!(j0.d3.signum(), d3fd.signum());
+        assert!((j0.d1 - d1fd).abs() < 5e-5);
+        assert!((j0.d2 - d2fd).abs() < 2e-4);
+        assert!((j0.d3 - d3fd).abs() < 1e-3);
     }
 
     #[test]
@@ -1538,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn beta_logistic_eta_jets_match_fd() {
+    fn beta_logistic_eta_jets_matchfd() {
         let eta = -0.31;
         let delta = 0.27;
         let epsilon = -0.19;
@@ -1546,15 +1545,15 @@ mod tests {
         let j0 = beta_logistic_inverse_link_jet(eta, delta, epsilon);
         let jp = beta_logistic_inverse_link_jet(eta + h, delta, epsilon);
         let jm = beta_logistic_inverse_link_jet(eta - h, delta, epsilon);
-        let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
-        let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
-        let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
-        assert_eq!(j0.d1.signum(), d1_fd.signum());
-        assert_eq!(j0.d2.signum(), d2_fd.signum());
-        assert_eq!(j0.d3.signum(), d3_fd.signum());
-        assert!((j0.d1 - d1_fd).abs() < 5e-5);
-        assert!((j0.d2 - d2_fd).abs() < 5e-5);
-        assert!((j0.d3 - d3_fd).abs() < 2e-4);
+        let d1fd = (jp.mu - jm.mu) / (2.0 * h);
+        let d2fd = (jp.d1 - jm.d1) / (2.0 * h);
+        let d3fd = (jp.d2 - jm.d2) / (2.0 * h);
+        assert_eq!(j0.d1.signum(), d1fd.signum());
+        assert_eq!(j0.d2.signum(), d2fd.signum());
+        assert_eq!(j0.d3.signum(), d3fd.signum());
+        assert!((j0.d1 - d1fd).abs() < 5e-5);
+        assert!((j0.d2 - d2fd).abs() < 5e-5);
+        assert!((j0.d3 - d3fd).abs() < 2e-4);
     }
 
     #[test]
@@ -1583,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn all_component_eta_jets_match_fd() {
+    fn all_component_eta_jets_matchfd() {
         let components = [
             LinkComponent::Logit,
             LinkComponent::Probit,
@@ -1598,9 +1597,9 @@ mod tests {
                 let j0 = component_inverse_link_jet(c, eta);
                 let jp = component_inverse_link_jet(c, eta + h);
                 let jm = component_inverse_link_jet(c, eta - h);
-                let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
-                let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
-                let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
+                let d1fd = (jp.mu - jm.mu) / (2.0 * h);
+                let d2fd = (jp.d1 - jm.d1) / (2.0 * h);
+                let d3fd = (jp.d2 - jm.d2) / (2.0 * h);
                 let d1_tol = if matches!(c, LinkComponent::CLogLog | LinkComponent::LogLog) {
                     1.2e-4
                 } else {
@@ -1616,46 +1615,46 @@ mod tests {
                 } else {
                     4e-4
                 };
-                if j0.d1.abs().max(d1_fd.abs()) > 1e-10 {
+                if j0.d1.abs().max(d1fd.abs()) > 1e-10 {
                     assert_eq!(
                         j0.d1.signum(),
-                        d1_fd.signum(),
+                        d1fd.signum(),
                         "d1 sign mismatch for {c:?} eta={eta}"
                     );
                 }
-                if j0.d2.abs().max(d2_fd.abs()) > 1e-10 {
+                if j0.d2.abs().max(d2fd.abs()) > 1e-10 {
                     assert_eq!(
                         j0.d2.signum(),
-                        d2_fd.signum(),
+                        d2fd.signum(),
                         "d2 sign mismatch for {c:?} eta={eta}: analytic={} fd={}",
                         j0.d2,
-                        d2_fd
+                        d2fd
                     );
                 }
-                if j0.d3.abs().max(d3_fd.abs()) > 1e-10 {
+                if j0.d3.abs().max(d3fd.abs()) > 1e-10 {
                     assert_eq!(
                         j0.d3.signum(),
-                        d3_fd.signum(),
+                        d3fd.signum(),
                         "d3 sign mismatch for {c:?} eta={eta}"
                     );
                 }
                 assert!(
-                    (j0.d1 - d1_fd).abs() < d1_tol,
+                    (j0.d1 - d1fd).abs() < d1_tol,
                     "d1 mismatch for {c:?} eta={eta}: analytic={} fd={}",
                     j0.d1,
-                    d1_fd
+                    d1fd
                 );
                 assert!(
-                    (j0.d2 - d2_fd).abs() < d2_tol,
+                    (j0.d2 - d2fd).abs() < d2_tol,
                     "d2 mismatch for {c:?} eta={eta}: analytic={} fd={}",
                     j0.d2,
-                    d2_fd
+                    d2fd
                 );
                 assert!(
-                    (j0.d3 - d3_fd).abs() < d3_tol,
+                    (j0.d3 - d3fd).abs() < d3_tol,
                     "d3 mismatch for {c:?} eta={eta}: analytic={} fd={}",
                     j0.d3,
-                    d3_fd
+                    d3fd
                 );
             }
         }
@@ -1689,11 +1688,11 @@ mod tests {
     }
 
     #[test]
-    fn beta_logistic_param_partials_match_fd() {
+    fn beta_logistic_param_partials_matchfd() {
         let eta = -0.41;
         let delta = 0.23;
         let epsilon = -0.17;
-        let out = beta_logistic_inverse_link_jet_with_param_partials(eta, delta, epsilon);
+        let out = beta_logistic_inverse_link_jetwith_param_partials(eta, delta, epsilon);
         let h = 1e-6;
 
         let dp = beta_logistic_inverse_link_jet(eta, delta + h, epsilon);
@@ -1732,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn inverse_link_pdf_third_derivative_matches_d3_finite_difference() {
+    fn inverse_link_pdfthird_derivative_matches_d3_finite_difference() {
         let sas = InverseLink::Sas(SasLinkState::new(-0.25, 0.35).expect("sas state"));
         let beta_logistic = InverseLink::BetaLogistic(SasLinkState {
             epsilon: 0.18,
@@ -1740,7 +1739,7 @@ mod tests {
             delta: (-0.22_f64).exp(),
         });
         let mixture = InverseLink::Mixture(
-            state_from_spec(&MixtureLinkSpec {
+            state_fromspec(&MixtureLinkSpec {
                 components: vec![
                     LinkComponent::Probit,
                     LinkComponent::Logit,
@@ -1766,23 +1765,23 @@ mod tests {
             for &eta in &etas {
                 let jp = inverse_link_jet_for_inverse_link(link, eta + h).expect("jet+");
                 let jm = inverse_link_jet_for_inverse_link(link, eta - h).expect("jet-");
-                let d4_fd = (jp.d3 - jm.d3) / (2.0 * h);
-                let d4 = inverse_link_pdf_third_derivative_for_inverse_link(link, eta)
+                let d4fd = (jp.d3 - jm.d3) / (2.0 * h);
+                let d4 = inverse_link_pdfthird_derivative_for_inverse_link(link, eta)
                     .expect("analytic d4");
                 assert_eq!(
                     d4.signum(),
-                    d4_fd.signum(),
+                    d4fd.signum(),
                     "d4 sign mismatch for {:?} at eta={eta}: analytic={} fd={}",
                     link,
                     d4,
-                    d4_fd
+                    d4fd
                 );
                 assert!(
-                    (d4 - d4_fd).abs() < 5e-3,
+                    (d4 - d4fd).abs() < 5e-3,
                     "d4 mismatch for {:?} at eta={eta}: analytic={} fd={}",
                     link,
                     d4,
-                    d4_fd
+                    d4fd
                 );
             }
         }

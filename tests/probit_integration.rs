@@ -1,4 +1,4 @@
-use gam::pirls::update_glm_vectors_by_family;
+use gam::pirls::update_glmvectors_by_family;
 use gam::probability::normal_cdf;
 use gam::types::GlmLikelihoodFamily;
 use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
@@ -78,7 +78,7 @@ fn probit_fit_and_predict_fast_integration() {
 }
 
 #[test]
-fn probit_working_vectors_are_finite_for_extreme_eta() {
+fn probitworkingvectors_are_finite_for_extreme_eta() {
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0]);
     let eta = Array1::from_vec(vec![-100.0, -20.0, 0.0, 20.0, 100.0]);
     let w = Array1::ones(y.len());
@@ -86,7 +86,7 @@ fn probit_working_vectors_are_finite_for_extreme_eta() {
     let mut weights = Array1::zeros(y.len());
     let mut z = Array1::zeros(y.len());
 
-    update_glm_vectors_by_family(
+    update_glmvectors_by_family(
         y.view(),
         &eta,
         GlmLikelihoodFamily::BinomialProbit,
@@ -162,7 +162,7 @@ fn cloglog_fit_and_predict_fast_integration() {
 }
 
 #[test]
-fn cloglog_working_vectors_are_finite_for_extreme_eta() {
+fn cloglogworkingvectors_are_finite_for_extreme_eta() {
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0]);
     let eta = Array1::from_vec(vec![-100.0, -20.0, 0.0, 20.0, 100.0]);
     let w = Array1::ones(y.len());
@@ -170,7 +170,7 @@ fn cloglog_working_vectors_are_finite_for_extreme_eta() {
     let mut weights = Array1::zeros(y.len());
     let mut z = Array1::zeros(y.len());
 
-    update_glm_vectors_by_family(
+    update_glmvectors_by_family(
         y.view(),
         &eta,
         GlmLikelihoodFamily::BinomialCLogLog,

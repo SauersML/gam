@@ -2,14 +2,14 @@ use super::*;
 
 impl<'a> RemlState<'a> {
     pub(super) fn dense_projected_exact_eligible(
-        n_obs: usize,
+        nobs: usize,
         eff_rank: usize,
         k_count: usize,
     ) -> bool {
         if eff_rank == 0 || eff_rank > 1024 {
             return false;
         }
-        let work_n_r2_k = (n_obs as u128)
+        let work_n_r2_k = (nobs as u128)
             .saturating_mul(eff_rank as u128)
             .saturating_mul(eff_rank as u128)
             .saturating_mul(k_count as u128);
@@ -25,21 +25,21 @@ impl<'a> RemlState<'a> {
         w_pos: &Array2<f64>,
         r_k: &Array2<f64>,
         lambda_k: f64,
-        c_weighted_u_k: &Array1<f64>,
+        cweighted_u_k: &Array1<f64>,
     ) -> Array2<f64> {
         // T_k = W' H_k W
         //     = lambda_k (R_k W)' (R_k W)
         //       + Z' diag(c ⊙ u_k) Z,
         // where Z = XW.
-        let rk_w = fast_ab(r_k, w_pos);
-        let mut t_k = fast_ata(&rk_w);
+        let rkw = fast_ab(r_k, w_pos);
+        let mut t_k = fast_ata(&rkw);
         t_k.mapv_inplace(|v| v * lambda_k);
 
-        let mut z_weighted = z_mat.clone();
-        ndarray::Zip::from(z_weighted.rows_mut())
-            .and(c_weighted_u_k.view())
+        let mut zweighted = z_mat.clone();
+        ndarray::Zip::from(zweighted.rows_mut())
+            .and(cweighted_u_k.view())
             .for_each(|mut row, weight| row *= *weight);
-        t_k += &fast_atb(z_mat, &z_weighted);
+        t_k += &fast_atb(z_mat, &zweighted);
         t_k
     }
 
@@ -57,8 +57,8 @@ impl<'a> RemlState<'a> {
         //             + Z' diag(diag_kl) Z.
         let mut trace = 0.0_f64;
         if let Some(r_k) = r_k {
-            let rk_w = fast_ab(r_k, w_pos);
-            let penalty_part = fast_ata(&rk_w);
+            let rkw = fast_ab(r_k, w_pos);
+            let penalty_part = fast_ata(&rkw);
             trace += lambda_k * penalty_part.diag().sum();
         }
 
@@ -76,66 +76,6 @@ impl<'a> RemlState<'a> {
     pub(super) fn dense_projected_trace_quadratic(t_k: &Array2<f64>, t_l: &Array2<f64>) -> f64 {
         // tr(H_+^dagger H_k H_+^dagger H_l) = tr(T_k T_l)
         Self::trace_product(t_k, t_l)
-    }
-
-    pub(super) fn select_trace_backend(n_obs: usize, p_dim: usize, k_count: usize) -> TraceBackend {
-        // Workload-aware policy driven by (n, p, K):
-        // - Exact for moderate total complexity.
-        // - Hutchinson/Hutch++ as n·p·K and p²·K² costs grow.
-        //
-        // Note: this backend switch currently lives inside the dense
-        // transformed REML Hessian path below. Replacing the stochastic
-        // branch with selected inversion is only meaningful after the trace
-        // computation is moved onto a sparse/banded factorization of the
-        // original penalized system; it is not effective while "exact"
-        // still means forming dense Array2 contractions/inverses.
-        //
-        // The bottleneck term is the second-order logdet contribution
-        //   L_{k,l} = 0.5 [ -tr(H^{-1} H_l H^{-1} H_k) + tr(H^{-1} H_{kl}) ].
-        // In the current transformed-coordinate implementation, the "exact"
-        // backend forms dense solves/contractions to evaluate these traces,
-        // while Hutchinson/Hutch++ estimates them from probe identities
-        //   tr(A) = E[z' A z],   z_i in {+1,-1}.
-        // Selected inversion would change the cost model only if H and the
-        // derivative matrices are represented on a sparse pattern where the
-        // needed inverse entries remain local.
-        //
-        // Proxies:
-        //   w_npk   ~ n*p*K   (X/Xᵀ + diagonal contractions)
-        //   w_pk2   ~ p*K²    (pairwise rho-Hessian assembly)
-        let k = k_count.max(1);
-        let w_npk = (n_obs as u128)
-            .saturating_mul(p_dim as u128)
-            .saturating_mul(k as u128);
-        let w_pk2 = (p_dim as u128).saturating_mul((k as u128).saturating_mul(k as u128));
-
-        if p_dim <= 700 && k <= 20 && w_npk <= 220_000_000 && w_pk2 <= 20_000_000 {
-            return TraceBackend::Exact;
-        }
-
-        let very_large = p_dim >= 1_800 || k >= 28 || w_npk >= 1_100_000_000 || w_pk2 >= 85_000_000;
-        if very_large {
-            let sketch = if p_dim >= 3_500 || w_npk >= 2_500_000_000 {
-                12
-            } else {
-                8
-            };
-            let probes = if k >= 36 || w_pk2 >= 150_000_000 {
-                28
-            } else {
-                22
-            };
-            return TraceBackend::HutchPP { probes, sketch };
-        }
-
-        let probes = if w_npk >= 700_000_000 || k >= 24 {
-            34
-        } else if w_npk >= 350_000_000 {
-            28
-        } else {
-            22
-        };
-        TraceBackend::Hutchinson { probes }
     }
 
     #[inline]

@@ -5,7 +5,7 @@ use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt};
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
     assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
-    leverages_from_factor, solve_sparse_spd, solve_sparse_spd_multi, sparse_matvec_public,
+    leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti, sparse_matvec_public,
     trace_hinv_sk,
 };
 use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
@@ -38,27 +38,27 @@ mod tests {
     use crate::linalg::sparse_exact::{
         SparsePenaltyBlock, dense_to_sparse_symmetric_upper, factorize_sparse_spd,
     };
-    use crate::pirls::{PirlsCoordinateFrame, directional_working_curvature_from_eta};
+    use crate::pirls::{PirlsCoordinateFrame, directionalworking_curvature_from_eta};
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     #[test]
-    fn dense_projected_tk_matches_direct_wt_hk_w() {
+    fn dense_projected_tk_matches_directwt_hkw() {
         let w_pos = array![[1.0, 0.0], [0.5, 1.0], [0.0, 1.0],];
         let x = array![[1.0, 2.0, 0.0], [0.0, 1.0, 1.0], [2.0, 0.0, 1.0],];
         let r_k = array![[1.0, -1.0, 0.0], [0.0, 1.0, -1.0],];
         let lambda_k = 1.7;
-        let c_weighted_u_k = array![0.2, -0.1, 0.4];
+        let cweighted_u_k = array![0.2, -0.1, 0.4];
 
         let z_mat = fast_ab(&x, &w_pos);
-        let actual = RemlState::dense_projected_tk(&z_mat, &w_pos, &r_k, lambda_k, &c_weighted_u_k);
+        let actual = RemlState::dense_projected_tk(&z_mat, &w_pos, &r_k, lambda_k, &cweighted_u_k);
 
         let s_k = r_k.t().dot(&r_k);
         let mut h_k = s_k.mapv(|v| lambda_k * v);
-        let x_weighted = RemlState::row_scale(&x, &c_weighted_u_k);
-        h_k += &fast_atb(&x, &x_weighted);
+        let xweighted = RemlState::row_scale(&x, &cweighted_u_k);
+        h_k += &fast_atb(&x, &xweighted);
         let expected = w_pos.t().dot(&h_k).dot(&w_pos);
 
         let diff = &actual - &expected;
@@ -85,8 +85,8 @@ mod tests {
 
         let s_k = r_k.t().dot(&r_k);
         let mut h_kl = s_k.mapv(|v| lambda_k * v);
-        let x_weighted = RemlState::row_scale(&x, &diag_kl);
-        h_kl += &fast_atb(&x, &x_weighted);
+        let xweighted = RemlState::row_scale(&x, &diag_kl);
+        h_kl += &fast_atb(&x, &xweighted);
         let expected = RemlState::trace_product(&w_pos.dot(&w_pos.t()), &h_kl);
 
         assert!((actual - expected).abs() < 1e-10);
@@ -102,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_projected_exact_cost_gate_behaves_as_expected() {
+    fn dense_projected_exactcost_gate_behaves_as_expected() {
         assert!(RemlState::dense_projected_exact_eligible(5_000, 100, 10));
         assert!(!RemlState::dense_projected_exact_eligible(50_000, 1025, 10));
         assert!(!RemlState::dense_projected_exact_eligible(200_000, 200, 20));
@@ -116,7 +116,7 @@ mod tests {
         cfg: &'a RemlConfig,
     ) -> RemlState<'a> {
         let offset = Array1::<f64>::zeros(y.len());
-        RemlState::new_with_offset(
+        RemlState::newwith_offset(
             y.view(),
             x.clone(),
             w.view(),
@@ -182,45 +182,45 @@ mod tests {
 
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
         let pr = bundle.pirls_result.as_ref();
 
         let beta = beta_original_from_bundle(&bundle);
         let h_orig = h_original_from_bundle(&bundle);
-        let u = &pr.solve_weights * &(&pr.solve_working_response - &pr.final_eta);
+        let u = &pr.solveweights * &(&pr.solveworking_response - &pr.final_eta);
 
         // B from implicit solve:
         //   H B = X_τ^T g - X^T W(X_τ β̂) - S_τ β̂.
         let x_tau_beta = x_tau.dot(&beta);
-        let weighted_x_tau_beta = &pr.solve_weights * &x_tau_beta;
+        let weighted_x_tau_beta = &pr.solveweights * &x_tau_beta;
         let rhs = x_tau.t().dot(&u) - x.t().dot(&weighted_x_tau_beta) - s_tau.dot(&beta);
         let chol = h_orig.cholesky(Side::Lower).expect("chol(H)");
-        let b_analytic = chol.solve_vec(&rhs);
+        let b_analytic = chol.solvevec(&rhs);
 
         // H_τ from exact total derivative:
         //   H_τ = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ,
         // with W_τ provided by the family directional curvature callback.
         let eta_dot = &x_tau_beta + &x.dot(&b_analytic);
-        let w_direction = directional_working_curvature_from_eta(
+        let w_direction = directionalworking_curvature_from_eta(
             LinkFunction::Logit,
             &pr.final_eta,
             state.weights,
-            &pr.solve_weights,
+            &pr.solveweights,
             &eta_dot,
         )
         .expect("directional working curvature should evaluate for logit");
-        let wx = RemlState::row_scale(&x, &pr.solve_weights);
-        let wx_tau = RemlState::row_scale(&x_tau, &pr.solve_weights);
-        let mut x_wtau_x = x.clone();
+        let wx = RemlState::row_scale(&x, &pr.solveweights);
+        let wx_tau = RemlState::row_scale(&x_tau, &pr.solveweights);
+        let mut xwtau_x = x.clone();
         match w_direction {
             super::DirectionalWorkingCurvature::Diagonal(diag) => {
-                x_wtau_x = RemlState::row_scale(&x_wtau_x, &diag);
+                xwtau_x = RemlState::row_scale(&xwtau_x, &diag);
             }
         }
         let mut h_tau_analytic = x_tau.t().dot(&wx);
         h_tau_analytic += &x.t().dot(&wx_tau);
-        h_tau_analytic += &x.t().dot(&x_wtau_x);
+        h_tau_analytic += &x.t().dot(&xwtau_x);
         h_tau_analytic += &s_tau;
 
         // Fit-block stationarity cancellation:
@@ -240,37 +240,37 @@ mod tests {
 
         let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
         let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-        state_plus.clear_warm_start();
-        state_minus.clear_warm_start();
+        state_plus.clearwarm_start();
+        state_minus.clearwarm_start();
 
         let bundle_plus = state_plus.obtain_eval_bundle(&rho).expect("bundle+");
         let bundle_minus = state_minus.obtain_eval_bundle(&rho).expect("bundle-");
         let beta_plus = beta_original_from_bundle(&bundle_plus);
         let beta_minus = beta_original_from_bundle(&bundle_minus);
-        let b_fd = (&beta_plus - &beta_minus).mapv(|v| v / (2.0 * h));
+        let bfd = (&beta_plus - &beta_minus).mapv(|v| v / (2.0 * h));
 
         let h_plus = h_original_from_bundle(&bundle_plus);
         let h_minus = h_original_from_bundle(&bundle_minus);
-        let h_tau_fd = (&h_plus - &h_minus).mapv(|v| v / (2.0 * h));
+        let h_taufd = (&h_plus - &h_minus).mapv(|v| v / (2.0 * h));
 
         let v_plus = state_plus.compute_cost(&rho).expect("cost+");
         let v_minus = state_minus.compute_cost(&rho).expect("cost-");
-        let v_tau_fd = (v_plus - v_minus) / (2.0 * h);
+        let v_taufd = (v_plus - v_minus) / (2.0 * h);
 
         let v_tau_analytic = state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &bundle, &hyper)
             .expect("analytic directional gradient");
 
-        let b_num = (&b_analytic - &b_fd).mapv(|v| v * v).sum().sqrt();
-        let b_den = b_fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
+        let b_num = (&b_analytic - &bfd).mapv(|v| v * v).sum().sqrt();
+        let b_den = bfd.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let b_rel = b_num / b_den;
         for i in 0..b_analytic.len() {
             assert_eq!(
                 b_analytic[i].signum(),
-                b_fd[i].signum(),
+                bfd[i].signum(),
                 "B sign mismatch at i={i}: analytic={} fd={}",
                 b_analytic[i],
-                b_fd[i]
+                bfd[i]
             );
         }
         assert!(
@@ -278,17 +278,17 @@ mod tests {
             "B implicit solve mismatch vs FD: rel={b_rel:.3e}, num={b_num:.3e}, den={b_den:.3e}"
         );
 
-        let dh_num = (&h_tau_analytic - &h_tau_fd).mapv(|v| v * v).sum().sqrt();
-        let dh_den = h_tau_fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
+        let dh_num = (&h_tau_analytic - &h_taufd).mapv(|v| v * v).sum().sqrt();
+        let dh_den = h_taufd.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let dh_rel = dh_num / dh_den;
         for i in 0..h_tau_analytic.nrows() {
             for j in 0..h_tau_analytic.ncols() {
                 assert_eq!(
                     h_tau_analytic[[i, j]].signum(),
-                    h_tau_fd[[i, j]].signum(),
+                    h_taufd[[i, j]].signum(),
                     "H_tau sign mismatch at ({i},{j}): analytic={} fd={}",
                     h_tau_analytic[[i, j]],
-                    h_tau_fd[[i, j]]
+                    h_taufd[[i, j]]
                 );
             }
         }
@@ -297,16 +297,16 @@ mod tests {
             "H_tau mismatch vs FD: rel={dh_rel:.3e}, num={dh_num:.3e}, den={dh_den:.3e}"
         );
 
-        let v_abs = (v_tau_analytic - v_tau_fd).abs();
-        let v_rel = v_abs / v_tau_fd.abs().max(1e-10);
+        let v_abs = (v_tau_analytic - v_taufd).abs();
+        let v_rel = v_abs / v_taufd.abs().max(1e-10);
         assert_eq!(
             v_tau_analytic.signum(),
-            v_tau_fd.signum(),
-            "V_tau sign mismatch: analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+            v_taufd.signum(),
+            "V_tau sign mismatch: analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
         );
         assert!(
             v_rel < 5e-2,
-            "V_tau mismatch vs FD: rel={v_rel:.3e}, abs={v_abs:.3e}, analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+            "V_tau mismatch vs FD: rel={v_rel:.3e}, abs={v_abs:.3e}, analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
         );
 
         assert!(
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_exact_hessian_matches_fd_on_rank_deficient_design() {
+    fn firth_exacthessian_matchesfd_on_rank_deficient_design() {
         // Rank-deficient X: the 4th column is 2x the 2nd column.
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
@@ -347,7 +347,7 @@ mod tests {
         ];
         let offset = Array1::<f64>::zeros(y.len());
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-9, true);
-        let state = RemlState::new_with_offset(
+        let state = RemlState::newwith_offset(
             y.view(),
             x.clone(),
             w.view(),
@@ -360,14 +360,14 @@ mod tests {
             None,
         )
         .expect("state");
-        state.clear_warm_start();
+        state.clearwarm_start();
 
         let rho = array![0.1, -0.2];
         let h_exact = state
-            .compute_laml_hessian_exact(&rho)
+            .compute_lamlhessian_exact(&rho)
             .expect("exact firth hessian");
         let h_fallback = state
-            .compute_laml_hessian_analytic_fallback(&rho, None)
+            .compute_lamlhessian_analytic_fallback(&rho, None)
             .expect("analytic fallback hessian");
 
         assert!(h_exact.iter().all(|v| v.is_finite()));
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_gradient_lives_in_design_column_space_under_rank_deficiency() {
+    fn firthgradient_lives_in_design_column_space_under_rank_deficiency() {
         // Rank-deficient design: col4 = 2*col2.
         let x = array![
             [1.0, -1.2, 0.4, -2.4],
@@ -415,14 +415,14 @@ mod tests {
 
         // Exact reduced-space Firth gradient:
         //   gradPhi = 0.5 Xᵀ (w' ⊙ h), with h = diag(X_r K_r X_rᵀ).
-        let grad_phi = 0.5 * x.t().dot(&(&op.w1 * &op.h_diag));
+        let gradphi = 0.5 * x.t().dot(&(&op.w1 * &op.h_diag));
 
         // Check (I - QQᵀ) gradPhi ≈ 0.
         let q = &op.q_basis;
-        let proj = q.dot(&q.t().dot(&grad_phi));
-        let resid = &grad_phi - &proj;
+        let proj = q.dot(&q.t().dot(&gradphi));
+        let resid = &gradphi - &proj;
         let rel =
-            resid.mapv(|v| v * v).sum().sqrt() / grad_phi.mapv(|v| v * v).sum().sqrt().max(1e-12);
+            resid.mapv(|v| v * v).sum().sqrt() / gradphi.mapv(|v| v * v).sum().sqrt().max(1e-12);
         assert!(
             rel < 1e-10,
             "Firth gradient should lie in Col(Xᵀ): rel residual={rel:.3e}"
@@ -448,7 +448,7 @@ mod tests {
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
         let pr = bundle.pirls_result.as_ref();
         let e = &pr.reparam_result.e_transformed;
@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hyper_gradient_supports_penalty_only_direction() {
+    fn firth_logit_directional_hypergradient_supports_penalty_only_direction() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -526,10 +526,10 @@ mod tests {
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("firth eval bundle");
         let g = state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &bundle, &hyper)
             .expect("firth penalty-only directional gradient should evaluate");
         assert!(
             g.is_finite(),
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hyper_gradient_supports_design_moving_direction() {
+    fn firth_logit_directional_hypergradient_supports_design_moving_direction() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -561,10 +561,10 @@ mod tests {
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("firth eval bundle");
         let g = state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &bundle, &hyper)
             .expect("firth design-moving directional gradient should evaluate");
         assert!(
             g.is_finite(),
@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn directional_hyper_gradient_ignores_h_pos_factor_when_active_subspace_is_unstable() {
+    fn directional_hypergradient_ignores_h_pos_factorwhen_active_subspace_is_unstable() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -596,20 +596,20 @@ mod tests {
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let dense_bundle = state.obtain_eval_bundle(&rho).expect("dense bundle");
 
         let mut unstable_bundle = dense_bundle.clone();
         unstable_bundle.active_subspace_unstable = true;
         let g_unstable = state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &unstable_bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &unstable_bundle, &hyper)
             .expect("unstable bundle directional gradient");
 
         let mut poisoned_bundle = unstable_bundle.clone();
-        poisoned_bundle.h_pos_factor_w =
-            Arc::new(Array2::<f64>::zeros(dense_bundle.h_pos_factor_w.raw_dim()));
+        poisoned_bundle.h_pos_factorw =
+            Arc::new(Array2::<f64>::zeros(dense_bundle.h_pos_factorw.raw_dim()));
         let g_poisoned = state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &poisoned_bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &poisoned_bundle, &hyper)
             .expect("poisoned unstable bundle directional gradient");
 
         let abs = (g_unstable - g_poisoned).abs();
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_exact_directional_firth_branch_is_wired_and_matches_dense() {
+    fn sparse_exact_directional_firth_branch_iswired_and_matches_dense() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x_dense = array![
@@ -645,10 +645,10 @@ mod tests {
 
         // Dense reference path.
         let dense_state = build_logit_state(&y, &w, &x_dense, &s0, &cfg);
-        dense_state.clear_warm_start();
+        dense_state.clearwarm_start();
         let dense_bundle = dense_state.obtain_eval_bundle(&rho).expect("dense bundle");
         let g_dense = dense_state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &dense_bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &dense_bundle, &hyper)
             .expect("dense firth directional gradient");
 
         // Build a synthetic sparse bundle and call sparse branch directly.
@@ -662,7 +662,7 @@ mod tests {
             logdet_h: 0.0,
             logdet_s_pos: 0.0,
             det1_values: Arc::new(Array1::<f64>::zeros(rho.len())),
-            trace_workspace: Arc::new(Mutex::new(super::SparseTraceWorkspace::default())),
+            traceworkspace: Arc::new(Mutex::new(super::SparseTraceWorkspace::default())),
         });
         let sparse_bundle = EvalShared {
             key: None,
@@ -671,7 +671,7 @@ mod tests {
             geometry: super::RemlGeometry::SparseExactSpd,
             h_eff: dense_bundle.h_eff.clone(),
             h_total: dense_bundle.h_total.clone(),
-            h_pos_factor_w: dense_bundle.h_pos_factor_w.clone(),
+            h_pos_factorw: dense_bundle.h_pos_factorw.clone(),
             h_total_log_det: dense_bundle.h_total_log_det,
             active_subspace_rel_gap: dense_bundle.active_subspace_rel_gap,
             active_subspace_unstable: dense_bundle.active_subspace_unstable,
@@ -679,7 +679,7 @@ mod tests {
             firth_dense_operator: dense_bundle.firth_dense_operator.clone(),
         };
         let g_sparse_branch = dense_state
-            .compute_directional_hyper_gradient_sparse_exact(&rho, &sparse_bundle, &hyper)
+            .compute_directional_hypergradient_sparse_exact(&rho, &sparse_bundle, &hyper)
             .expect("sparse exact directional firth");
         assert!(
             g_sparse_branch.is_finite(),
@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_hyper_hessian_wires_mixed_blocks() {
+    fn joint_hyperhessianwires_mixed_blocks() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -713,7 +713,7 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let rho = array![0.0];
         let theta = array![0.0, 0.0, 0.0];
         let hyper_dirs = vec![
@@ -736,7 +736,7 @@ mod tests {
         ];
 
         let h = state
-            .compute_joint_hyper_hessian(&theta, rho.len(), &hyper_dirs)
+            .compute_joint_hyperhessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper hessian");
         assert_eq!(h.nrows(), theta.len());
         assert_eq!(h.ncols(), theta.len());
@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_tau_tau_linear_dirs_match_fd_reference_away_from_zero_psi() {
+    fn joint_tau_tau_linear_dirs_matchfd_reference_away_fromzero_psi() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -776,7 +776,7 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let rho = array![0.0];
         let psi = array![0.7, -0.4];
         let theta = array![rho[0], psi[0], psi[1]];
@@ -800,11 +800,11 @@ mod tests {
         ];
 
         let h = state
-            .compute_joint_hyper_hessian(&theta, rho.len(), &hyper_dirs)
+            .compute_joint_hyperhessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper hessian");
         let h_tt_analytic = h.slice(s![rho.len().., rho.len()..]).to_owned();
 
-        let mut h_tt_fd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
+        let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
         for j in 0..hyper_dirs.len() {
             let h = 1e-5;
             let mut theta_plus = theta.clone();
@@ -812,38 +812,38 @@ mod tests {
             theta_plus[rho.len() + j] += h;
             theta_minus[rho.len() + j] -= h;
             let (_, g_plus) = state
-                .compute_joint_hyper_cost_gradient(&theta_plus, rho.len(), &hyper_dirs)
+                .compute_joint_hypercostgradient(&theta_plus, rho.len(), &hyper_dirs)
                 .expect("g+");
             let (_, g_minus) = state
-                .compute_joint_hyper_cost_gradient(&theta_minus, rho.len(), &hyper_dirs)
+                .compute_joint_hypercostgradient(&theta_minus, rho.len(), &hyper_dirs)
                 .expect("g-");
             let tau_col =
                 (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
-            h_tt_fd.column_mut(j).assign(&tau_col);
+            h_ttfd.column_mut(j).assign(&tau_col);
         }
-        for i in 0..h_tt_fd.nrows() {
+        for i in 0..h_ttfd.nrows() {
             for j in 0..i {
-                let avg = 0.5 * (h_tt_fd[[i, j]] + h_tt_fd[[j, i]]);
-                h_tt_fd[[i, j]] = avg;
-                h_tt_fd[[j, i]] = avg;
+                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
+                h_ttfd[[i, j]] = avg;
+                h_ttfd[[j, i]] = avg;
             }
         }
 
-        let num = (&h_tt_analytic - &h_tt_fd)
+        let num = (&h_tt_analytic - &h_ttfd)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let den = h_tt_fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
+        let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
             rel < 3e-1,
-            "linear-dir joint tau-tau block deviates from FD reference away from zero psi: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
+            "linear-dir joint tau-tau block deviates from FD reference away from zero psi: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
     }
 
     #[test]
-    fn joint_hyper_validation_rejects_out_of_bounds_second_order_penalty_index() {
+    fn joint_hypervalidation_rejects_out_of_boundssecond_order_penalty_index() {
         let y = array![0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -867,7 +867,7 @@ mod tests {
         ];
 
         let err = state
-            .compute_joint_hyper_hessian(&theta, 1, &hyper_dirs)
+            .compute_joint_hyperhessian(&theta, 1, &hyper_dirs)
             .expect_err("invalid second-order penalty index should be rejected");
         let msg = err.to_string();
         assert!(
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_mixed_rho_tau_analytic_matches_fd_reference() {
+    fn joint_mixed_rho_tau_analytic_matchesfd_reference() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -893,35 +893,35 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
-        let mut x_second_0 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
-        let mut s_second_0 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
-        let mut x_second_1 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
-        let mut s_second_1 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
-        x_second_0[0] = Array2::from_elem((x.nrows(), x.ncols()), 5e-5);
-        s_second_0[0] = array![[0.0, 0.0, 0.0], [0.0, 0.06, 0.01], [0.0, 0.01, 0.04],];
+        let mut xsecond_0 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
+        let mut ssecond_0 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
+        let mut xsecond_1 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
+        let mut ssecond_1 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
+        xsecond_0[0] = Array2::from_elem((x.nrows(), x.ncols()), 5e-5);
+        ssecond_0[0] = array![[0.0, 0.0, 0.0], [0.0, 0.06, 0.01], [0.0, 0.01, 0.04],];
         // Provide cross second derivative from only one side to exercise fallback.
-        x_second_0[1] = Array2::from_elem((x.nrows(), x.ncols()), -2e-5);
-        s_second_0[1] = array![[0.0, 0.0, 0.0], [0.0, 0.03, -0.005], [0.0, -0.005, 0.02],];
-        x_second_1[1] = Array2::from_elem((x.nrows(), x.ncols()), 4e-5);
-        s_second_1[1] = array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],];
+        xsecond_0[1] = Array2::from_elem((x.nrows(), x.ncols()), -2e-5);
+        ssecond_0[1] = array![[0.0, 0.0, 0.0], [0.0, 0.03, -0.005], [0.0, -0.005, 0.02],];
+        xsecond_1[1] = Array2::from_elem((x.nrows(), x.ncols()), 4e-5);
+        ssecond_1[1] = array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],];
         let hyper_dirs = vec![
             DirectionalHyperParam::single_penalty(
                 0,
                 Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
-                Some(x_second_0),
-                Some(s_second_0),
+                Some(xsecond_0),
+                Some(ssecond_0),
             )
             .expect("single-penalty hyper direction"),
             DirectionalHyperParam::single_penalty(
                 0,
                 Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 Array2::<f64>::zeros((x.ncols(), x.ncols())),
-                Some(x_second_1),
-                Some(s_second_1),
+                Some(xsecond_1),
+                Some(ssecond_1),
             )
             .expect("single-penalty hyper direction"),
         ];
@@ -939,7 +939,7 @@ mod tests {
         // Reference only for test validation:
         // central difference of analytic rho-gradient under +/- tau_j state
         // perturbations.
-        let mut mixed_fd = Array2::<f64>::zeros((rho.len(), hyper_dirs.len()));
+        let mut mixedfd = Array2::<f64>::zeros((rho.len(), hyper_dirs.len()));
         for j in 0..hyper_dirs.len() {
             let h = 1e-5;
             let mut psi_plus = psi.clone();
@@ -961,15 +961,15 @@ mod tests {
                 .compute_gradient_with_bundle(&rho, &bundle_minus)
                 .expect("g-");
             let col = (&g_plus - &g_minus) / (2.0 * h);
-            mixed_fd.column_mut(j).assign(&col);
+            mixedfd.column_mut(j).assign(&col);
         }
 
-        let num = (&mixed_analytic - &mixed_fd)
+        let num = (&mixed_analytic - &mixedfd)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let den = mixed_fd
+        let den = mixedfd
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
@@ -978,12 +978,12 @@ mod tests {
         let rel = num / den;
         assert!(
             rel < 2e-1,
-            "analytic mixed block deviates from FD reference: rel={rel:.3e}, analytic={mixed_analytic:?}, fd={mixed_fd:?}"
+            "analytic mixed block deviates from FD reference: rel={rel:.3e}, analytic={mixed_analytic:?}, fd={mixedfd:?}"
         );
     }
 
     #[test]
-    fn joint_tau_tau_analytic_matches_fd_reference() {
+    fn joint_tau_tau_analytic_matchesfd_reference() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -999,7 +999,7 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
         let hyper_dirs = vec![
@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(h_tt_analytic.nrows(), hyper_dirs.len());
         assert_eq!(h_tt_analytic.ncols(), hyper_dirs.len());
 
-        let mut h_tt_fd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
+        let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
         for j in 0..hyper_dirs.len() {
             let h = 1e-5;
             let mut psi_plus = psi.clone();
@@ -1047,32 +1047,32 @@ mod tests {
             let bundle_plus = state_plus.obtain_eval_bundle(&rho).expect("bundle+");
             let bundle_minus = state_minus.obtain_eval_bundle(&rho).expect("bundle-");
             let g_plus = state_plus
-                .compute_multi_psi_gradient_with_bundle(&rho, &bundle_plus, &hyper_dirs)
+                .computemulti_psigradientwith_bundle(&rho, &bundle_plus, &hyper_dirs)
                 .expect("g+");
             let g_minus = state_minus
-                .compute_multi_psi_gradient_with_bundle(&rho, &bundle_minus, &hyper_dirs)
+                .computemulti_psigradientwith_bundle(&rho, &bundle_minus, &hyper_dirs)
                 .expect("g-");
             let col = (&g_plus - &g_minus) / (2.0 * h);
-            h_tt_fd.column_mut(j).assign(&col);
+            h_ttfd.column_mut(j).assign(&col);
         }
-        for i in 0..h_tt_fd.nrows() {
+        for i in 0..h_ttfd.nrows() {
             for j in 0..i {
-                let avg = 0.5 * (h_tt_fd[[i, j]] + h_tt_fd[[j, i]]);
-                h_tt_fd[[i, j]] = avg;
-                h_tt_fd[[j, i]] = avg;
+                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
+                h_ttfd[[i, j]] = avg;
+                h_ttfd[[j, i]] = avg;
             }
         }
 
-        let num = (&h_tt_analytic - &h_tt_fd)
+        let num = (&h_tt_analytic - &h_ttfd)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let den = h_tt_fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
+        let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
             rel < 3e-1,
-            "analytic tau-tau block deviates from FD reference: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
+            "analytic tau-tau block deviates from FD reference: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
     }
 
@@ -1112,12 +1112,12 @@ mod tests {
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clear_warm_start();
+        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("dense bundle");
 
         let t0 = Instant::now();
         let g_dense = state
-            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
+            .compute_directional_hypergradientwith_bundle(&rho, &bundle, &hyper)
             .expect("dense directional");
         let dt_dense = t0.elapsed();
 
@@ -1131,7 +1131,7 @@ mod tests {
             logdet_h: 0.0,
             logdet_s_pos: 0.0,
             det1_values: Arc::new(Array1::<f64>::zeros(rho.len())),
-            trace_workspace: Arc::new(Mutex::new(super::SparseTraceWorkspace::default())),
+            traceworkspace: Arc::new(Mutex::new(super::SparseTraceWorkspace::default())),
         });
         let sparse_bundle = EvalShared {
             key: None,
@@ -1140,7 +1140,7 @@ mod tests {
             geometry: super::RemlGeometry::SparseExactSpd,
             h_eff: bundle_dense.h_eff.clone(),
             h_total: bundle_dense.h_total.clone(),
-            h_pos_factor_w: bundle_dense.h_pos_factor_w.clone(),
+            h_pos_factorw: bundle_dense.h_pos_factorw.clone(),
             h_total_log_det: bundle_dense.h_total_log_det,
             active_subspace_rel_gap: bundle_dense.active_subspace_rel_gap,
             active_subspace_unstable: bundle_dense.active_subspace_unstable,
@@ -1149,7 +1149,7 @@ mod tests {
         };
         let t1 = Instant::now();
         let g_sparse = state
-            .compute_directional_hyper_gradient_sparse_exact(&rho, &sparse_bundle, &hyper)
+            .compute_directional_hypergradient_sparse_exact(&rho, &sparse_bundle, &hyper)
             .expect("sparse directional");
         let dt_sparse = t1.elapsed();
 
@@ -1207,7 +1207,7 @@ pub(crate) struct DirectionalHyperParam {
     pub x_tau_tau_original: Option<Vec<Array2<f64>>>,
     // Pairwise second derivatives are stored in the same canonical base-penalty
     // decomposition as the first derivatives.
-    penalty_second_components: Option<Vec<Vec<PenaltyDerivativeComponent>>>,
+    penaltysecond_components: Option<Vec<Vec<PenaltyDerivativeComponent>>>,
 }
 
 impl DirectionalHyperParam {
@@ -1234,11 +1234,11 @@ impl DirectionalHyperParam {
         x_tau_original: Array2<f64>,
         penalty_first_components: Vec<(usize, Array2<f64>)>,
         x_tau_tau_original: Option<Vec<Array2<f64>>>,
-        penalty_second_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+        penaltysecond_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
     ) -> Result<Self, EstimationError> {
         let penalty_first_components =
             Self::canonicalize_penalty_components(penalty_first_components)?;
-        let penalty_second_components = match penalty_second_components {
+        let penaltysecond_components = match penaltysecond_components {
             Some(rows) => {
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
@@ -1252,7 +1252,7 @@ impl DirectionalHyperParam {
             x_tau_original,
             penalty_first_components,
             x_tau_tau_original,
-            penalty_second_components,
+            penaltysecond_components,
         })
     }
 
@@ -1264,7 +1264,7 @@ impl DirectionalHyperParam {
         x_tau_tau_original: Option<Vec<Array2<f64>>>,
         s_tau_tau_original: Option<Vec<Array2<f64>>>,
     ) -> Result<Self, EstimationError> {
-        let penalty_second_components = s_tau_tau_original.map(|rows| {
+        let penaltysecond_components = s_tau_tau_original.map(|rows| {
             rows.into_iter()
                 .map(|mat| vec![(penalty_index, mat)])
                 .collect::<Vec<_>>()
@@ -1273,7 +1273,7 @@ impl DirectionalHyperParam {
             x_tau_original,
             vec![(penalty_index, s_tau_original)],
             x_tau_tau_original,
-            penalty_second_components,
+            penaltysecond_components,
         )
     }
 
@@ -1281,20 +1281,20 @@ impl DirectionalHyperParam {
         &self.penalty_first_components
     }
 
-    pub(crate) fn penalty_second_components_for(
+    pub(crate) fn penaltysecond_components_for(
         &self,
         j: usize,
     ) -> Option<&[PenaltyDerivativeComponent]> {
-        self.penalty_second_components
+        self.penaltysecond_components
             .as_ref()
             .and_then(|rows| rows.get(j))
             .map(|row| row.as_slice())
     }
 
-    pub(crate) fn penalty_second_component_rows(
+    pub(crate) fn penaltysecond_componentrows(
         &self,
     ) -> Option<&[Vec<PenaltyDerivativeComponent>]> {
-        self.penalty_second_components.as_deref()
+        self.penaltysecond_components.as_deref()
     }
 
     pub(crate) fn penalty_total_at(
@@ -1316,13 +1316,13 @@ impl DirectionalHyperParam {
         Ok(total)
     }
 
-    pub(crate) fn penalty_second_component_matrix(
+    pub(crate) fn penaltysecond_component_matrix(
         &self,
         j: usize,
         penalty_index: usize,
         p: usize,
     ) -> Array2<f64> {
-        if let Some(components) = self.penalty_second_components_for(j) {
+        if let Some(components) = self.penaltysecond_components_for(j) {
             if let Some(component) = components
                 .iter()
                 .find(|component| component.penalty_index == penalty_index)
@@ -1351,7 +1351,7 @@ struct SparseExactEvalData {
     logdet_h: f64,
     logdet_s_pos: f64,
     det1_values: Arc<Array1<f64>>,
-    trace_workspace: Arc<Mutex<SparseTraceWorkspace>>,
+    traceworkspace: Arc<Mutex<SparseTraceWorkspace>>,
 }
 
 #[derive(Clone)]
@@ -1393,7 +1393,7 @@ struct FirthDenseOperator {
     w2: Array1<f64>,
     w3: Array1<f64>,
     w4: Array1<f64>,
-    // B = diag(w') X used in D H_phi and D^2 H_phi contractions.
+    // B = diag(w') X used in D Hphi and D^2 Hphi contractions.
     b_base: Array2<f64>,
     b_base_t: Array2<f64>,
     // Cached invariant contraction P*B where P = (X_r K_r X_r') ⊙ (X_r K_r X_r').
@@ -1408,7 +1408,7 @@ struct FirthDirection {
     a_u_reduced: Array2<f64>,
     dh: Array1<f64>,
     // B_u = diag(w'' ⊙ δη_u) X and invariant contractions derived from it.
-    b_u_vec: Array1<f64>,
+    b_uvec: Array1<f64>,
     b_u_base: Array2<f64>,
     b_u_base_t: Array2<f64>,
     p_bu_base: Array2<f64>,
@@ -1418,8 +1418,8 @@ struct FirthDirection {
 
 #[derive(Clone)]
 struct FirthTauPartialKernel {
-    dot_w1: Array1<f64>,
-    dot_w2: Array1<f64>,
+    dotw1: Array1<f64>,
+    dotw2: Array1<f64>,
     dot_h_partial: Array1<f64>,
     // Reduced design drift X_{tau,r} = X_tau Q used in exact design-moving
     // Hadamard-Gram contractions.
@@ -1432,7 +1432,7 @@ struct FirthTauPartialKernel {
 
 #[derive(Clone)]
 struct FirthTauExactKernel {
-    g_phi_tau: Array1<f64>,
+    gphi_tau: Array1<f64>,
     phi_tau_partial: f64,
     tau_kernel: Option<FirthTauPartialKernel>,
 }
@@ -1441,7 +1441,7 @@ struct FirthTauExactKernel {
 /// gradient evaluations to the `opt` optimizer.
 ///
 /// The `cache` field uses `RefCell` to enable interior mutability. This is a crucial
-/// performance optimization. The `cost_and_grad` closure required by the BFGS
+/// performance optimization. The `cost_andgrad` closure required by the BFGS
 /// optimizer takes an immutable reference `&self`. However, we want to cache the
 /// results of the expensive P-IRLS computation to avoid re-calculating the fit
 /// for the same `rho` vector, which can happen during the line search.
@@ -1456,7 +1456,7 @@ struct EvalShared {
     geometry: RemlGeometry,
     h_eff: Arc<Array2<f64>>,
     /// The exact H_total matrix used for LAML cost computation.
-    /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
+    /// For Firth: h_eff - hphi. For non-Firth: h_eff.
     h_total: Arc<Array2<f64>>,
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1515,7 +1515,7 @@ struct EvalShared {
     /// This is why the current code can evaluate the trace term from the
     /// spectral factor alone, but it also means the computation is tied to a
     /// dense eigenbasis rather than a sparse factorization.
-    h_pos_factor_w: Arc<Array2<f64>>,
+    h_pos_factorw: Arc<Array2<f64>>,
 
     /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
     h_total_log_det: f64,
@@ -1554,17 +1554,17 @@ impl PenalizedGeometry for EvalShared {
 }
 
 struct RemlWorkspace {
-    lambda_values: Array1<f64>,
-    cost_gradient: Array1<f64>,
-    prior_gradient: Array1<f64>,
+    lambdavalues: Array1<f64>,
+    costgradient: Array1<f64>,
+    priorgradient: Array1<f64>,
 }
 
 impl RemlWorkspace {
     fn new(max_penalties: usize) -> Self {
         RemlWorkspace {
-            lambda_values: Array1::zeros(max_penalties),
-            cost_gradient: Array1::zeros(max_penalties),
-            prior_gradient: Array1::zeros(max_penalties),
+            lambdavalues: Array1::zeros(max_penalties),
+            costgradient: Array1::zeros(max_penalties),
+            priorgradient: Array1::zeros(max_penalties),
         }
     }
 
@@ -1572,63 +1572,63 @@ impl RemlWorkspace {
         if penalties == 0 {
             return;
         }
-        self.cost_gradient.slice_mut(s![..penalties]).fill(0.0);
-        self.prior_gradient.slice_mut(s![..penalties]).fill(0.0);
+        self.costgradient.slice_mut(s![..penalties]).fill(0.0);
+        self.priorgradient.slice_mut(s![..penalties]).fill(0.0);
     }
 
-    fn set_lambda_values(&mut self, rho: &Array1<f64>) {
+    fn set_lambdavalues(&mut self, rho: &Array1<f64>) {
         let len = rho.len();
         if len == 0 {
             return;
         }
-        let mut view = self.lambda_values.slice_mut(s![..len]);
+        let mut view = self.lambdavalues.slice_mut(s![..len]);
         for (dst, &src) in view.iter_mut().zip(rho.iter()) {
             *dst = src.exp();
         }
     }
 
-    fn lambda_view(&self, len: usize) -> ArrayView1<'_, f64> {
-        self.lambda_values.slice(s![..len])
+    fn lambdaview(&self, len: usize) -> ArrayView1<'_, f64> {
+        self.lambdavalues.slice(s![..len])
     }
 
-    fn cost_gradient_view(&mut self, len: usize) -> ArrayViewMut1<'_, f64> {
-        self.cost_gradient.slice_mut(s![..len])
+    fn costgradientview(&mut self, len: usize) -> ArrayViewMut1<'_, f64> {
+        self.costgradient.slice_mut(s![..len])
     }
 
-    fn zero_cost_gradient(&mut self, len: usize) {
-        self.cost_gradient.slice_mut(s![..len]).fill(0.0);
+    fn zerocostgradient(&mut self, len: usize) {
+        self.costgradient.slice_mut(s![..len]).fill(0.0);
     }
 
-    fn cost_gradient_view_const(&self, len: usize) -> ArrayView1<'_, f64> {
-        self.cost_gradient.slice(s![..len])
+    fn costgradientview_const(&self, len: usize) -> ArrayView1<'_, f64> {
+        self.costgradient.slice(s![..len])
     }
 
-    fn soft_prior_cost_and_grad<'a>(&'a mut self, rho: &Array1<f64>) -> (f64, ArrayView1<'a, f64>) {
+    fn soft_priorcost_andgrad<'a>(&'a mut self, rho: &Array1<f64>) -> (f64, ArrayView1<'a, f64>) {
         let len = rho.len();
-        let mut grad_view = self.prior_gradient.slice_mut(s![..len]);
-        grad_view.fill(0.0);
+        let mut gradview = self.priorgradient.slice_mut(s![..len]);
+        gradview.fill(0.0);
 
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-            return (0.0, self.prior_gradient.slice(s![..len]));
+            return (0.0, self.priorgradient.slice(s![..len]));
         }
 
         let inv_bound = 1.0 / RHO_BOUND;
         let sharp = RHO_SOFT_PRIOR_SHARPNESS;
         let mut cost = 0.0;
-        for (grad, &ri) in grad_view.iter_mut().zip(rho.iter()) {
+        for (grad, &ri) in gradview.iter_mut().zip(rho.iter()) {
             let scaled = sharp * ri * inv_bound;
             cost += scaled.cosh().ln();
             *grad = sharp * inv_bound * scaled.tanh();
         }
 
         if RHO_SOFT_PRIOR_WEIGHT != 1.0 {
-            for grad in grad_view.iter_mut() {
+            for grad in gradview.iter_mut() {
                 *grad *= RHO_SOFT_PRIOR_WEIGHT;
             }
             cost *= RHO_SOFT_PRIOR_WEIGHT;
         }
 
-        (cost, self.prior_gradient.slice(s![..len]))
+        (cost, self.priorgradient.slice(s![..len]))
     }
 }
 
@@ -1670,8 +1670,8 @@ impl PirlsLruCache {
         }
 
         while self.map.len() >= self.capacity {
-            if let Some(evict_key) = self.order.pop_front() {
-                self.map.remove(&evict_key);
+            if let Some(evictkey) = self.order.pop_front() {
+                self.map.remove(&evictkey);
             } else {
                 break;
             }
@@ -1711,8 +1711,8 @@ impl EvalCacheManager {
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure key stability.
-    fn sanitized_rho_key(rho: &Array1<f64>) -> Option<Vec<u64>> {
-        self::cache::sanitized_rho_key(rho)
+    fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
+        self::cache::sanitized_rhokey(rho)
     }
 
     fn cached_eval_bundle(&self, key: &Option<Vec<u64>>) -> Option<EvalShared> {
@@ -1748,7 +1748,7 @@ struct RemlArena {
     cost_eval_count: RwLock<u64>,
     raw_cond_snapshot: RwLock<f64>,
     gaussian_cond_snapshot: RwLock<f64>,
-    last_gradient_used_stochastic_fallback: AtomicBool,
+    lastgradient_used_stochastic_fallback: AtomicBool,
 }
 
 impl RemlArena {
@@ -1761,7 +1761,7 @@ impl RemlArena {
             cost_eval_count: RwLock::new(0),
             raw_cond_snapshot: RwLock::new(f64::NAN),
             gaussian_cond_snapshot: RwLock::new(f64::NAN),
-            last_gradient_used_stochastic_fallback: AtomicBool::new(false),
+            lastgradient_used_stochastic_fallback: AtomicBool::new(false),
         }
     }
 }
@@ -1953,9 +1953,7 @@ impl CostAgg {
 
 // Formatting utilities moved to crate::diagnostics
 impl<'a> RemlState<'a> {
-    // -------------------------------------------------------------------------
     // Firth / Jeffreys outer-derivative derivation map (implementation guide)
-    // -------------------------------------------------------------------------
     //
     // Research-to-production assumptions used in this file:
     // - Inner objective (minimization):
@@ -1984,11 +1982,11 @@ impl<'a> RemlState<'a> {
     // Explicit low-order closed forms (same fixed-active-subspace regime):
     //   D^3 log|M|_+[u,v,w]
     //   = tr(M_+^† M_uvw)
-    //     - tr(M_+^† M_uv M_+^† M_w)
-    //     - tr(M_+^† M_uw M_+^† M_v)
-    //     - tr(M_+^† M_vw M_+^† M_u)
-    //     + 2 tr(M_+^† M_u M_+^† M_v M_+^† M_w)
-    //     + 2 tr(M_+^† M_u M_+^† M_w M_+^† M_v).
+    //     - tr(M_+^† M_uv M_+^† Mw)
+    //     - tr(M_+^† M_uw M_+^† Mv)
+    //     - tr(M_+^† Mvw M_+^† M_u)
+    //     + 2 tr(M_+^† M_u M_+^† Mv M_+^† Mw)
+    //     + 2 tr(M_+^† M_u M_+^† Mw M_+^† Mv).
     //
     //   D^4 log|M|_+[u,v,w,z]
     //   = tr(M_+^† M_uvwz)
@@ -2030,8 +2028,8 @@ impl<'a> RemlState<'a> {
     // Inner stationarity:
     //   G*(beta,rho) = dL*/dbeta = 0
     // with Jacobian
-    //   H_total = dG*/dbeta = X'WX + S - H_phi,
-    //   H_phi   = d²Phi/dbeta².
+    //   H_total = dG*/dbeta = X'WX + S - Hphi,
+    //   Hphi   = d²Phi/dbeta².
     //
     // Implicit derivatives (solve-surface inverse):
     //   B_k    = dbeta_hat/drho_k
@@ -2041,10 +2039,10 @@ impl<'a> RemlState<'a> {
     //          = -H_total^{-1}(H_l B_k + A_k B_l + delta_kl A_k beta_hat).
     //
     // Define operator-valued derivatives used throughout:
-    //   J(u) = D(X'WX)[u] - D(H_phi)[u]
-    //        = X' diag(w' ⊙ (Xu)) X - D(H_phi)[u]
-    //   K(u,v) = D²(X'WX)[u,v] - D²(H_phi)[u,v]
-    //          = X' diag(w'' ⊙ (Xu) ⊙ (Xv)) X - D²(H_phi)[u,v].
+    //   J(u) = D(X'WX)[u] - D(Hphi)[u]
+    //        = X' diag(w' ⊙ (Xu)) X - D(Hphi)[u]
+    //   K(u,v) = D²(X'WX)[u,v] - D²(Hphi)[u,v]
+    //          = X' diag(w'' ⊙ (Xu) ⊙ (Xv)) X - D²(Hphi)[u,v].
     //
     // Then:
     //   H_k  = A_k + J(B_k)
@@ -2125,17 +2123,16 @@ impl<'a> RemlState<'a> {
     //       = 0.5[ tr(I_+^† I_alpha,gamma)
     //              - tr(I_+^† I_alpha I_+^† I_gamma) ].
     //   Hence:
-    //     (g_phi)_tau = Phi_beta,tau,
-    //     (H_phi)_tau|beta = Phi_beta,beta,tau,
-    //   and D(H_phi)[beta_tau] = Phi_beta,beta,beta[beta_tau].
+    //     (gphi)_tau = Phi_beta,tau,
+    //     (Hphi)_tau|beta = Phi_beta,beta,tau,
+    //   and D(Hphi)[beta_tau] = Phi_beta,beta,beta[beta_tau].
     //
     // Conclusion:
     //   Every Firth-specific contribution at any order enters via derivatives
     //   of Phi(beta)=0.5log|I(beta)|_+, i.e. through G and H derivative tensors
     //   and their implicit β̂-coupled recursions above.
-    // -------------------------------------------------------------------------
 
-    fn run_gradient_diagnostics(
+    fn rungradient_diagnostics(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2143,8 +2140,8 @@ impl<'a> RemlState<'a> {
         applied_truncation_corrections: Option<&[f64]>,
     ) {
         use crate::diagnostics::{
-            DiagnosticConfig, GradientDiagnosticReport, compute_dual_ridge_check,
-            compute_envelope_audit, compute_spectral_bleed,
+            DiagnosticConfig, GradientDiagnosticReport, compute_dualridge_check,
+            compute_envelopeaudit, computespectral_bleed,
         };
 
         let config = DiagnosticConfig::default();
@@ -2157,29 +2154,29 @@ impl<'a> RemlState<'a> {
 
         // === Strategy 4: Dual-Ridge Consistency Check ===
         // Compare the PIRLS ridge with the ridge used by cost/gradient paths.
-        let dual_ridge = compute_dual_ridge_check(
+        let dualridge = compute_dualridge_check(
             pirls_result.ridge_passport.delta, // Ridge from PIRLS passport
             ridge_used,                        // Ridge passed to cost
             ridge_used,                        // Ridge passed to gradient (same bundle)
             beta,
         );
-        report.dual_ridge = Some(dual_ridge);
+        report.dualridge = Some(dualridge);
 
         // === Strategy 1: KKT/Envelope Theorem Audit ===
         // Check if the inner solver actually reached stationarity
         let reparam = &pirls_result.reparam_result;
-        let penalty_grad = reparam.s_transformed.dot(beta);
+        let penaltygrad = reparam.s_transformed.dot(beta);
 
-        let envelope_audit = compute_envelope_audit(
-            pirls_result.last_gradient_norm,
-            &penalty_grad,
+        let envelopeaudit = compute_envelopeaudit(
+            pirls_result.lastgradient_norm,
+            &penaltygrad,
             pirls_result.ridge_passport.delta,
             ridge_used, // What gradient assumes
             beta,
             config.kkt_tolerance,
             config.rel_error_threshold,
         );
-        report.envelope_audit = Some(envelope_audit);
+        report.envelopeaudit = Some(envelopeaudit);
 
         // === Strategy 3: Spectral Bleed Trace ===
         // Check if truncated eigenspace corrections are adequate
@@ -2192,20 +2189,20 @@ impl<'a> RemlState<'a> {
         // - `h_eff` and `reparam.rs_transformed` are transformed as well.
 
         if truncated_count > 0
-            && let Some(applied_values) = applied_truncation_corrections
+            && let Some(appliedvalues) = applied_truncation_corrections
         {
             let h_eff = bundle.h_eff.as_ref();
 
             // Solve H⁻¹ U_⊥ for spectral bleed calculation
-            let h_view = FaerArrayView::new(h_eff);
-            if let Ok(chol) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+            let hview = FaerArrayView::new(h_eff);
+            if let Ok(chol) = FaerLlt::new(hview.as_ref(), Side::Lower) {
                 let mut h_inv_u = u_truncated.clone();
-                let mut rhs_view = array2_to_mat_mut(&mut h_inv_u);
-                chol.solve_in_place(rhs_view.as_mut());
+                let mut rhsview = array2_to_matmut(&mut h_inv_u);
+                chol.solve_in_place(rhsview.as_mut());
 
                 for (k, r_k) in reparam.rs_transformed.iter().enumerate() {
-                    let applied_correction = applied_values.get(k).copied().unwrap_or(0.0);
-                    let bleed = compute_spectral_bleed(
+                    let applied_correction = appliedvalues.get(k).copied().unwrap_or(0.0);
+                    let bleed = computespectral_bleed(
                         k,
                         r_k.view(),
                         u_truncated.view(),
@@ -2224,55 +2221,60 @@ impl<'a> RemlState<'a> {
         // === Strategy 2: Component-wise FD (only if we detected other issues) ===
         // This is expensive, so rate-limit it unless diagnostics are severe.
         let eval_idx = (*self.arena.cost_eval_count.read().unwrap()).max(1);
-        let severe_envelope = report.envelope_audit.as_ref().is_some_and(|a| {
+        let severe_envelope = report.envelopeaudit.as_ref().is_some_and(|a| {
             a.kkt_residual_norm > GRAD_DIAG_SEVERE_KKT_NORM
-                || (a.inner_ridge - a.outer_ridge).abs() > GRAD_DIAG_SEVERE_RIDGE_MISMATCH
+                || (a.innerridge - a.outerridge).abs() > GRAD_DIAG_SEVERE_RIDGE_MISMATCH
         });
         let severe_bleed = report
             .spectral_bleed
             .iter()
             .any(|b| b.has_bleed && b.truncated_energy.abs() > GRAD_DIAG_SEVERE_BLEED_ENERGY);
-        let severe_ridge = report.dual_ridge.as_ref().is_some_and(|r| {
+        let severeridge = report.dualridge.as_ref().is_some_and(|r| {
             r.has_mismatch
                 && (r.ridge_impact.abs() > GRAD_DIAG_SEVERE_RIDGE_IMPACT
                     || r.phantom_penalty.abs() > GRAD_DIAG_SEVERE_PHANTOM_PENALTY)
         });
-        let periodic_sample = should_sample_gradient_diag_fd(eval_idx);
-        let run_component_fd = report.has_issues()
-            && (severe_envelope || severe_bleed || severe_ridge || periodic_sample);
-        if run_component_fd {
-            let _cache_guard = AtomicFlagGuard::swap(
-                &self.cache_manager.pirls_cache_enabled,
-                false,
-                Ordering::Relaxed,
-            );
-
+        let periodic_sample = should_samplegradient_diagfd(eval_idx);
+        let run_componentfd = report.has_issues()
+            && (severe_envelope || severe_bleed || severeridge || periodic_sample);
+        if run_componentfd {
             let h = config.fd_step_size;
-            let numeric_vals: Vec<f64> = (0..rho.len())
-                .into_par_iter()
-                .map(|k| {
-                    let mut rho_plus = rho.clone();
-                    rho_plus[k] += h;
-                    let mut rho_minus = rho.clone();
-                    rho_minus[k] -= h;
+            let numericvals: Vec<f64> = {
+                let cache_guard = AtomicFlagGuard::swap(
+                    &self.cache_manager.pirls_cache_enabled,
+                    false,
+                    Ordering::Relaxed,
+                );
+                (
+                    cache_guard,
+                    (0..rho.len())
+                        .into_par_iter()
+                        .map(|k| {
+                            let mut rho_plus = rho.clone();
+                            rho_plus[k] += h;
+                            let mut rho_minus = rho.clone();
+                            rho_minus[k] -= h;
 
-                    let (fp, fm) = rayon::join(
-                        || self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY),
-                        || self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY),
-                    );
-                    (fp - fm) / (2.0 * h)
-                })
-                .collect();
-            let numeric_grad = Array1::from_vec(numeric_vals);
+                            let (fp, fm) = rayon::join(
+                                || self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY),
+                                || self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY),
+                            );
+                            (fp - fm) / (2.0 * h)
+                        })
+                        .collect(),
+                )
+                    .1
+            };
+            let numericgrad = Array1::from_vec(numericvals);
 
             report.analytic_gradient = Some(analytic_grad.clone());
-            report.numeric_gradient = Some(numeric_grad.clone());
+            report.numericgradient = Some(numericgrad.clone());
 
             // Compute per-component relative errors
             let mut rel_errors = Array1::<f64>::zeros(rho.len());
             for k in 0..rho.len() {
-                let denom = analytic_grad[k].abs().max(numeric_grad[k].abs()).max(1e-8);
-                rel_errors[k] = (analytic_grad[k] - numeric_grad[k]).abs() / denom;
+                let denom = analytic_grad[k].abs().max(numericgrad[k].abs()).max(1e-8);
+                rel_errors[k] = (analytic_grad[k] - numericgrad[k]).abs() / denom;
             }
             report.component_rel_errors = Some(rel_errors);
         } else if report.has_issues() {
@@ -2291,7 +2293,7 @@ impl<'a> RemlState<'a> {
             );
 
             if let (Some(analytic), Some(numeric)) =
-                (&report.analytic_gradient, &report.numeric_gradient)
+                (&report.analytic_gradient, &report.numericgradient)
             {
                 let diff = analytic - numeric;
                 let rel_l2 = diff.dot(&diff).sqrt() / numeric.dot(numeric).sqrt().max(1e-8);

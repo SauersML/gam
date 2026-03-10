@@ -28,8 +28,8 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
         }
     }
 
-    let (tps, _knots) =
-        create_thin_plate_spline_basis_with_knot_count(data.view(), 24).expect("TPS basis");
+    let basis = create_thin_plate_spline_basis_with_knot_count(data.view(), 24).expect("TPS basis");
+    let tps = basis.0;
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);

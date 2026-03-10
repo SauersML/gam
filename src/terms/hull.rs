@@ -132,13 +132,13 @@ impl PeeledHull {
         proj.axis_iter_mut(Axis(0))
             .into_par_iter()
             .enumerate()
-            .for_each(|(i, mut out_row)| {
-                let point_row = points.row(i);
-                if self.is_inside(point_row) {
-                    out_row.assign(&point_row);
+            .for_each(|(i, mut outrow)| {
+                let pointrow = points.row(i);
+                if self.is_inside(pointrow) {
+                    outrow.assign(&pointrow);
                 } else {
-                    let zi = self.project_point(point_row);
-                    out_row.assign(&zi);
+                    let zi = self.project_point(pointrow);
+                    outrow.assign(&zi);
                 }
             });
 
@@ -149,18 +149,18 @@ impl PeeledHull {
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, slot)| {
-                let point_row = points.row(i);
-                if self.is_inside(point_row) {
+                let pointrow = points.row(i);
+                if self.is_inside(pointrow) {
                     let mut min_slack = f64::INFINITY;
                     for (a, b) in &self.facets {
-                        let slack = *b - a.dot(&point_row);
+                        let slack = *b - a.dot(&pointrow);
                         if slack < min_slack {
                             min_slack = slack;
                         }
                     }
                     *slot = -min_slack.max(0.0);
                 } else {
-                    let diff = point_row.to_owned() - proj.row(i).to_owned();
+                    let diff = pointrow.to_owned() - proj.row(i).to_owned();
                     *slot = diff.mapv(|v| v * v).sum().sqrt();
                 }
             });
@@ -272,14 +272,14 @@ pub fn build_peeled_hull(data: &Array2<f64>, peels: usize) -> Result<PeeledHull,
         // Ensure unit-length for numerical stability
         let norm = a.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let a_unit = a.mapv(|v| v / norm);
-        let mut max_val = f64::NEG_INFINITY;
+        let mut maxval = f64::NEG_INFINITY;
         for i in 0..current.nrows() {
             let s = a_unit.dot(&current.row(i));
-            if s > max_val {
-                max_val = s;
+            if s > maxval {
+                maxval = s;
             }
         }
-        facets.push((a_unit, max_val));
+        facets.push((a_unit, maxval));
     }
 
     Ok(PeeledHull { facets, dim: d })
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_project_if_needed_with_outliers() {
+    fn test_project_if_neededwith_outliers() {
         // Build a small 2D clustered training set in [-1, 1]^2
         let mut pts = Vec::new();
         for x in [-1.0, 0.0, 1.0] {

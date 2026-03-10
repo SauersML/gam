@@ -39,7 +39,7 @@ fn weighted_centered_ss(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Resu
         .sum())
 }
 
-fn solve_weighted_projection_dense(
+fn solveweighted_projection_dense(
     design: &Array2<f64>,
     target: &Array1<f64>,
     weights: &Array1<f64>,
@@ -140,7 +140,7 @@ pub fn build_scale_deviation_transform(
     let mut rescale = Array1::<f64>::ones(p_noise);
     for j in non_intercept_start.min(p_noise)..p_noise {
         let col = noise_design.column(j).to_owned();
-        let proj = solve_weighted_projection_dense(primary_design, &col, weights)?;
+        let proj = solveweighted_projection_dense(primary_design, &col, weights)?;
         let fitted = primary_design.dot(&proj);
         let mut residual = &col - &fitted;
         let center = weighted_mean(residual.view(), weights)?;
@@ -170,18 +170,18 @@ pub fn build_scale_deviation_transform(
 
 pub fn apply_scale_deviation_transform(
     primary_design: &Array2<f64>,
-    raw_noise_design: &Array2<f64>,
+    rawnoise_design: &Array2<f64>,
     transform: &ScaleDeviationTransform,
 ) -> Result<Array2<f64>, String> {
-    if primary_design.nrows() != raw_noise_design.nrows() {
+    if primary_design.nrows() != rawnoise_design.nrows() {
         return Err("scale deviation apply row mismatch".to_string());
     }
     if primary_design.ncols() != transform.projection_coef.nrows()
-        || raw_noise_design.ncols() != transform.projection_coef.ncols()
+        || rawnoise_design.ncols() != transform.projection_coef.ncols()
     {
         return Err("scale deviation apply column mismatch".to_string());
     }
-    let mut out = raw_noise_design.clone();
+    let mut out = rawnoise_design.clone();
     let projected = primary_design.dot(&transform.projection_coef);
     for j in transform.non_intercept_start.min(out.ncols())..out.ncols() {
         for i in 0..out.nrows() {

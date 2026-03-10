@@ -1,5 +1,5 @@
 use gam::construction::compute_penalty_square_roots;
-use gam::estimate::{ExternalOptimOptions, evaluate_external_cost_and_ridge};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalcost_andridge};
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, array};
@@ -52,7 +52,7 @@ fn fit_beta_norm(
             x: x.view(),
             offset: offset.view(),
             y: y.view(),
-            prior_weights: w.view(),
+            priorweights: w.view(),
             covariate_se: None,
         },
         PenaltyConfig {
@@ -72,7 +72,7 @@ fn fit_beta_norm(
         .sqrt()
 }
 
-fn proxy_cost_with_pirls(
+fn proxycostwith_pirls(
     x: &Array2<f64>,
     y: &Array1<f64>,
     w: &Array1<f64>,
@@ -94,7 +94,7 @@ fn proxy_cost_with_pirls(
             x: x.view(),
             offset: offset.view(),
             y: y.view(),
-            prior_weights: w.view(),
+            priorweights: w.view(),
             covariate_se: None,
         },
         PenaltyConfig {
@@ -116,7 +116,7 @@ fn proxy_cost_with_pirls(
 }
 
 #[test]
-fn firth_fd_step_size_sensitivity() {
+fn firthfd_step_size_sensitivity() {
     let (x, y, w, s_list) = make_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
@@ -133,7 +133,7 @@ fn firth_fd_step_size_sensitivity() {
     };
     let base_rho = 12.0;
     let cost_at = |rho: f64| -> f64 {
-        evaluate_external_cost_and_ridge(
+        evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
@@ -187,18 +187,18 @@ fn firth_beta_monotonicity_comparison() {
 }
 
 #[test]
-fn firth_cost_oscillation_vs_no_firth() {
+fn firthcost_oscillationvs_no_firth() {
     let (x, y, w, s_list) = make_problem(31);
     let rs = compute_penalty_square_roots(&s_list).expect("roots");
     let s = &s_list[0];
     let steps: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.001).collect();
     let cost_firth: Vec<f64> = steps
         .iter()
-        .map(|&d| proxy_cost_with_pirls(&x, &y, &w, &rs, s, 12.0 + d, true))
+        .map(|&d| proxycostwith_pirls(&x, &y, &w, &rs, s, 12.0 + d, true))
         .collect();
     let cost_no_firth: Vec<f64> = steps
         .iter()
-        .map(|&d| proxy_cost_with_pirls(&x, &y, &w, &rs, s, 12.0 + d, false))
+        .map(|&d| proxycostwith_pirls(&x, &y, &w, &rs, s, 12.0 + d, false))
         .collect();
     let count_direction_changes = |costs: &[f64]| -> usize {
         let mut changes = 0;

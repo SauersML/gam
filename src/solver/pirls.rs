@@ -1,8 +1,8 @@
 use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ab, fast_atv,
+    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_matmut,
+    array2_to_matmut, fast_ab, fast_atv,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
@@ -11,7 +11,7 @@ use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
-    state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
+    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
@@ -54,7 +54,7 @@ impl<'a> LltView<'a> {
         if out.nrows() != rhs.nrows() || out.ncols() != rhs.ncols() {
             *out = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
         }
-        let mut out_mat = array2_to_mat_mut(out);
+        let mut out_mat = array2_to_matmut(out);
         out_mat.as_mut().copy_from(rhs);
         faer::linalg::cholesky::llt::solve::solve_in_place(
             self.matrix,
@@ -108,9 +108,9 @@ fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms 
     } else {
         0.5
     };
-    let one_minus_mu = 1.0 - mu;
-    let a1 = wi * (yi / mu - (1.0 - yi) / one_minus_mu);
-    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minus_mu * one_minus_mu));
+    let one_minusmu = 1.0 - mu;
+    let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
+    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
     BinomialAuxTerms { a1, a2 }
 }
 
@@ -228,9 +228,9 @@ struct SparsePenalizedSystemCache {
     xtwx_cache: SparseXtWxCache,
     penalty_pattern: SparsePenaltyPattern,
     h_upper_symbolic: SymbolicSparseColMat<usize>,
-    h_upper_values: Vec<f64>,
+    h_uppervalues: Vec<f64>,
     h_upper_col_ptr: Vec<usize>,
-    h_upper_row_idx: Vec<usize>,
+    h_upperrow_idx: Vec<usize>,
     p: usize,
 }
 
@@ -247,14 +247,14 @@ impl SparsePenalizedSystemCache {
             xtwx_cache.xtwx_symbolic.row_idx(),
             &penalty_pattern.upper_triplets,
         )?;
-        let h_upper_values = vec![0.0; h_upper_symbolic.row_idx().len()];
+        let h_uppervalues = vec![0.0; h_upper_symbolic.row_idx().len()];
         Ok(Self {
             xtwx_cache,
             penalty_pattern,
             h_upper_col_ptr: h_upper_symbolic.col_ptr().to_vec(),
-            h_upper_row_idx: h_upper_symbolic.row_idx().to_vec(),
+            h_upperrow_idx: h_upper_symbolic.row_idx().to_vec(),
             h_upper_symbolic,
-            h_upper_values,
+            h_uppervalues,
             p,
         })
     }
@@ -297,32 +297,32 @@ impl SparsePenalizedSystemCache {
             )));
         }
         self.xtwx_cache.compute_numeric(x, weights)?;
-        self.h_upper_values.fill(0.0);
+        self.h_uppervalues.fill(0.0);
 
         let mut cursor = self.h_upper_col_ptr[..self.p].to_vec();
 
         let xtwx_col_ptr = self.xtwx_cache.xtwx_symbolic.col_ptr();
-        let xtwx_row_idx = self.xtwx_cache.xtwx_symbolic.row_idx();
+        let xtwxrow_idx = self.xtwx_cache.xtwx_symbolic.row_idx();
         for col in 0..self.p {
             let start = xtwx_col_ptr[col];
             let end = xtwx_col_ptr[col + 1];
             for idx in start..end {
-                let row = xtwx_row_idx[idx];
+                let row = xtwxrow_idx[idx];
                 if row <= col {
                     let cursor_idx = &mut cursor[col];
                     while *cursor_idx < self.h_upper_col_ptr[col + 1]
-                        && self.h_upper_row_idx[*cursor_idx] < row
+                        && self.h_upperrow_idx[*cursor_idx] < row
                     {
                         *cursor_idx += 1;
                     }
                     if *cursor_idx >= self.h_upper_col_ptr[col + 1]
-                        || self.h_upper_row_idx[*cursor_idx] != row
+                        || self.h_upperrow_idx[*cursor_idx] != row
                     {
                         return Err(EstimationError::InvalidInput(
                             "penalized symbolic pattern missing XtWX entry".to_string(),
                         ));
                     }
-                    self.h_upper_values[*cursor_idx] += self.xtwx_cache.xtwx_values[idx];
+                    self.h_uppervalues[*cursor_idx] += self.xtwx_cache.xtwxvalues[idx];
                 }
             }
         }
@@ -331,18 +331,18 @@ impl SparsePenalizedSystemCache {
         for &(row, col, value) in &self.penalty_pattern.upper_triplets {
             let cursor_idx = &mut cursor[col];
             while *cursor_idx < self.h_upper_col_ptr[col + 1]
-                && self.h_upper_row_idx[*cursor_idx] < row
+                && self.h_upperrow_idx[*cursor_idx] < row
             {
                 *cursor_idx += 1;
             }
             if *cursor_idx >= self.h_upper_col_ptr[col + 1]
-                || self.h_upper_row_idx[*cursor_idx] != row
+                || self.h_upperrow_idx[*cursor_idx] != row
             {
                 return Err(EstimationError::InvalidInput(
                     "penalized symbolic pattern missing penalty entry".to_string(),
                 ));
             }
-            self.h_upper_values[*cursor_idx] += value;
+            self.h_uppervalues[*cursor_idx] += value;
         }
 
         if ridge > 0.0 {
@@ -350,24 +350,24 @@ impl SparsePenalizedSystemCache {
             for col in 0..self.p {
                 let cursor_idx = &mut cursor[col];
                 while *cursor_idx < self.h_upper_col_ptr[col + 1]
-                    && self.h_upper_row_idx[*cursor_idx] < col
+                    && self.h_upperrow_idx[*cursor_idx] < col
                 {
                     *cursor_idx += 1;
                 }
                 if *cursor_idx >= self.h_upper_col_ptr[col + 1]
-                    || self.h_upper_row_idx[*cursor_idx] != col
+                    || self.h_upperrow_idx[*cursor_idx] != col
                 {
                     return Err(EstimationError::InvalidInput(
                         "penalized symbolic pattern missing diagonal entry".to_string(),
                     ));
                 }
-                self.h_upper_values[*cursor_idx] += ridge;
+                self.h_uppervalues[*cursor_idx] += ridge;
             }
         }
 
         Ok(SparseColMat::new(
             self.h_upper_symbolic.clone(),
-            self.h_upper_values.clone(),
+            self.h_uppervalues.clone(),
         ))
     }
 }
@@ -375,7 +375,7 @@ impl SparsePenalizedSystemCache {
 fn build_penalized_symbolic(
     p: usize,
     xtwx_col_ptr: &[usize],
-    xtwx_row_idx: &[usize],
+    xtwxrow_idx: &[usize],
     penalty_triplets: &[(usize, usize, f64)],
 ) -> Result<SymbolicSparseColMat<usize>, EstimationError> {
     let mut cols: Vec<BTreeSet<usize>> = (0..p).map(|_| BTreeSet::new()).collect();
@@ -383,7 +383,7 @@ fn build_penalized_symbolic(
         cols[col].insert(col);
         let start = xtwx_col_ptr[col];
         let end = xtwx_col_ptr[col + 1];
-        for &row in &xtwx_row_idx[start..end] {
+        for &row in &xtwxrow_idx[start..end] {
             if row <= col {
                 cols[col].insert(row);
             }
@@ -415,7 +415,7 @@ pub trait WorkingModel {
 /// Uncertainty inputs for integrated (GHQ) IRLS updates.
 #[derive(Clone, Copy)]
 pub struct IntegratedWorkingInput<'a> {
-    pub quad_ctx: &'a crate::quadrature::QuadratureContext,
+    pub quadctx: &'a crate::quadrature::QuadratureContext,
     pub se: ArrayView1<'a, f64>,
 }
 
@@ -446,7 +446,7 @@ pub trait WorkingLikelihood {
         &self,
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
-        prior_weights: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
         mu: &mut Array1<f64>,
         weights: &mut Array1<f64>,
         z: &mut Array1<f64>,
@@ -458,7 +458,7 @@ pub trait WorkingLikelihood {
         &self,
         y: ArrayView1<f64>,
         mu: &Array1<f64>,
-        prior_weights: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
 
     /// Weighted log-likelihood used by blockwise/custom-family wrappers.
@@ -472,7 +472,7 @@ pub trait WorkingLikelihood {
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
         mu: &Array1<f64>,
-        prior_weights: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
 }
 
@@ -481,7 +481,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         &self,
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
-        prior_weights: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
         mu: &mut Array1<f64>,
         weights: &mut Array1<f64>,
         z: &mut Array1<f64>,
@@ -497,13 +497,13 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 | GlmLikelihoodFamily::BinomialBetaLogistic,
                 Some(integ),
             ) => {
-                update_glm_vectors_integrated_by_family(
-                    integ.quad_ctx,
+                update_glmvectors_integrated_by_family(
+                    integ.quadctx,
                     y,
                     eta,
                     integ.se,
                     *self,
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -514,11 +514,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 Ok(())
             }
             (GlmLikelihoodFamily::BinomialLogit, None) => {
-                update_glm_vectors(
+                update_glmvectors(
                     y,
                     eta,
                     &InverseLink::Standard(LinkFunction::Logit),
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -527,11 +527,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 Ok(())
             }
             (GlmLikelihoodFamily::BinomialProbit, None) => {
-                update_glm_vectors(
+                update_glmvectors(
                     y,
                     eta,
                     &InverseLink::Standard(LinkFunction::Probit),
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -540,11 +540,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 Ok(())
             }
             (GlmLikelihoodFamily::BinomialCLogLog, None) => {
-                update_glm_vectors(
+                update_glmvectors(
                     y,
                     eta,
                     &InverseLink::Standard(LinkFunction::CLogLog),
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -553,11 +553,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 Ok(())
             }
             (GlmLikelihoodFamily::BinomialSas, None) => {
-                update_glm_vectors(
+                update_glmvectors(
                     y,
                     eta,
                     &InverseLink::Standard(LinkFunction::Sas),
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -566,11 +566,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 Ok(())
             }
             (GlmLikelihoodFamily::BinomialBetaLogistic, None) => {
-                update_glm_vectors(
+                update_glmvectors(
                     y,
                     eta,
                     &InverseLink::Standard(LinkFunction::BetaLogistic),
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -582,11 +582,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 "BinomialMixture updates are handled by the PIRLS working model path".to_string(),
             )),
             (GlmLikelihoodFamily::GaussianIdentity, _) => {
-                update_glm_vectors(
+                update_glmvectors(
                     y,
                     eta,
                     &InverseLink::Standard(LinkFunction::Identity),
-                    prior_weights,
+                    priorweights,
                     mu,
                     weights,
                     z,
@@ -601,47 +601,47 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         &self,
         y: ArrayView1<f64>,
         mu: &Array1<f64>,
-        prior_weights: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
         match self {
             GlmLikelihoodFamily::GaussianIdentity => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Identity,
-                prior_weights,
+                priorweights,
             )),
             GlmLikelihoodFamily::BinomialLogit => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Logit,
-                prior_weights,
+                priorweights,
             )),
             GlmLikelihoodFamily::BinomialProbit => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Probit,
-                prior_weights,
+                priorweights,
             )),
             GlmLikelihoodFamily::BinomialCLogLog => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::CLogLog,
-                prior_weights,
+                priorweights,
             )),
             GlmLikelihoodFamily::BinomialSas => {
-                Ok(calculate_deviance(y, mu, LinkFunction::Sas, prior_weights))
+                Ok(calculate_deviance(y, mu, LinkFunction::Sas, priorweights))
             }
             GlmLikelihoodFamily::BinomialBetaLogistic => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::BetaLogistic,
-                prior_weights,
+                priorweights,
             )),
             GlmLikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Logit,
-                prior_weights,
+                priorweights,
             )),
         }
     }
@@ -649,13 +649,13 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
     fn log_likelihood(
         &self,
         y: ArrayView1<f64>,
-        _eta: &Array1<f64>,
+        _: &Array1<f64>,
         mu: &Array1<f64>,
-        prior_weights: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
         match self {
             GlmLikelihoodFamily::GaussianIdentity => {
-                let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
+                let ll = ndarray::Zip::from(y).and(mu).and(priorweights).fold(
                     0.0,
                     |acc, &yi, &mui, &wi| {
                         let r = yi - mui;
@@ -670,7 +670,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
             | GlmLikelihoodFamily::BinomialSas
             | GlmLikelihoodFamily::BinomialBetaLogistic
             | GlmLikelihoodFamily::BinomialMixture => {
-                let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
+                let ll = ndarray::Zip::from(y).and(mu).and(priorweights).fold(
                     0.0,
                     |acc, &yi, &mui, &wi| {
                         let p = mui;
@@ -710,7 +710,7 @@ pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
     pub hessian: crate::linalg::matrix::SymmetricMatrix,
-    pub sparse_hessian: Option<faer::sparse::SparseColMat<usize, f64>>,
+    pub sparsehessian: Option<faer::sparse::SparseColMat<usize, f64>>,
     pub deviance: f64,
     pub penalty_term: f64,
     pub firth: FirthDiagnostics,
@@ -732,15 +732,15 @@ impl WorkingState {
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers (n, p sizes)
-    pub sqrt_w: Array1<f64>,
+    pub sqrtw: Array1<f64>,
     pub wx: Array2<f64>,
     pub wz: Array1<f64>,
     pub eta_buf: Array1<f64>,
     // Stage 2/4 assembly (use max needed sizes)
-    pub scaled_matrix: Array2<f64>,    // (<= p + eb_rows) x p
-    pub final_aug_matrix: Array2<f64>, // (<= p + e_rows) x p
+    pub scaled_matrix: Array2<f64>,    // (<= p + ebrows) x p
+    pub final_aug_matrix: Array2<f64>, // (<= p + erows) x p
     // Stage 5 RHS buffers
-    pub rhs_full: Array1<f64>, // length <= p + e_rows
+    pub rhs_full: Array1<f64>, // length <= p + erows
     // Gradient check helpers
     pub working_residual: Array1<f64>,
     pub weighted_residual: Array1<f64>,
@@ -760,21 +760,21 @@ pub struct PirlsWorkspace {
     // Buffer for in-place factorization (preserves original Hessian in WorkingState)
     pub factorization_matrix: Array2<f64>,
     // Buffer for sparse matrix scaling (avoid per-iteration allocation)
-    pub weighted_x_values: Vec<f64>,
+    pub weighted_xvalues: Vec<f64>,
     // Dense chunk buffer for streaming X'WX assembly on very large n.
     pub weighted_x_chunk: Array2<f64>,
 }
 
 impl PirlsWorkspace {
-    pub fn new(n: usize, p: usize, eb_rows: usize, e_rows: usize) -> Self {
+    pub fn new(n: usize, p: usize, ebrows: usize, erows: usize) -> Self {
         // Stage buffers are allocated lazily: historically these were pre-sized to
-        // worst-case dimensions (p + eb_rows / p + e_rows), which inflates memory
+        // worst-case dimensions (p + ebrows / p + erows), which inflates memory
         // when many PIRLS workspaces exist concurrently (e.g. parallel REML evals).
         // The active code paths resize-on-demand where needed.
-        let _ = (eb_rows, e_rows);
+        let _ = (ebrows, erows);
 
         PirlsWorkspace {
-            sqrt_w: Array1::zeros(n),
+            sqrtw: Array1::zeros(n),
             wx: Array2::zeros((n, p).f()),
             wz: Array1::zeros(n),
             eta_buf: Array1::zeros(n),
@@ -801,18 +801,18 @@ impl PirlsWorkspace {
             perm: vec![0; p],
             perm_inv: vec![0; p],
             factorization_matrix: Array2::zeros((0, 0)),
-            weighted_x_values: Vec::new(),
+            weighted_xvalues: Vec::new(),
             weighted_x_chunk: Array2::zeros((0, 0).f()),
         }
     }
 
     #[inline]
-    fn dense_xtwx_chunk_rows(p: usize) -> usize {
+    fn dense_xtwx_chunkrows(p: usize) -> usize {
         const MIN_ROWS: usize = 512;
         const MAX_ROWS: usize = 2048;
         const TARGET_BYTES: usize = 2 * 1024 * 1024;
-        let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
-        (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
+        let bytes_perrow = p.max(1) * std::mem::size_of::<f64>();
+        (TARGET_BYTES / bytes_perrow).clamp(MIN_ROWS, MAX_ROWS)
     }
 
     fn add_dense_xtwx_streaming_from_sqrt<S>(
@@ -829,35 +829,35 @@ impl PirlsWorkspace {
             return;
         }
         debug_assert_eq!(
-            self.sqrt_w.len(),
+            self.sqrtw.len(),
             n,
-            "sqrt_w length must match row count for streamed XtWX"
+            "sqrtw length must match row count for streamed XtWX"
         );
-        let chunk_rows = Self::dense_xtwx_chunk_rows(p).min(n);
-        if self.weighted_x_chunk.ncols() != p || self.weighted_x_chunk.nrows() != chunk_rows {
-            self.weighted_x_chunk = Array2::zeros((chunk_rows, p).f());
+        let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
+        if self.weighted_x_chunk.ncols() != p || self.weighted_x_chunk.nrows() != chunkrows {
+            self.weighted_x_chunk = Array2::zeros((chunkrows, p).f());
         }
 
-        let mut out_view = array2_to_mat_mut(out);
-        for start in (0..n).step_by(chunk_rows) {
-            let rows = (n - start).min(chunk_rows);
+        let mut outview = array2_to_matmut(out);
+        for start in (0..n).step_by(chunkrows) {
+            let rows = (n - start).min(chunkrows);
             {
                 let mut chunk = self.weighted_x_chunk.slice_mut(s![0..rows, ..]);
-                for local_row in 0..rows {
-                    let src_row = start + local_row;
-                    let sqrt_w = self.sqrt_w[src_row];
+                for localrow in 0..rows {
+                    let srcrow = start + localrow;
+                    let sqrtw = self.sqrtw[srcrow];
                     for col in 0..p {
-                        chunk[[local_row, col]] = x[[src_row, col]] * sqrt_w;
+                        chunk[[localrow, col]] = x[[srcrow, col]] * sqrtw;
                     }
                 }
             }
-            let chunk_rows_view = self.weighted_x_chunk.slice(s![0..rows, ..]);
-            let chunk_view = FaerArrayView::new(&chunk_rows_view);
+            let chunkrowsview = self.weighted_x_chunk.slice(s![0..rows, ..]);
+            let chunkview = FaerArrayView::new(&chunkrowsview);
             matmul(
-                out_view.as_mut(),
+                outview.as_mut(),
                 Accum::Add,
-                chunk_view.as_ref().transpose(),
-                chunk_view.as_ref(),
+                chunkview.as_ref().transpose(),
+                chunkview.as_ref(),
                 1.0,
                 par,
             );
@@ -865,52 +865,52 @@ impl PirlsWorkspace {
     }
 
     #[inline]
-    fn fill_sqrt_weights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
+    fn fill_sqrtweights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
     where
         S: Data<Elem = f64>,
     {
-        if self.sqrt_w.len() != weights.len() {
-            self.sqrt_w = Array1::zeros(weights.len());
+        if self.sqrtw.len() != weights.len() {
+            self.sqrtw = Array1::zeros(weights.len());
         }
-        Zip::from(&mut self.sqrt_w)
+        Zip::from(&mut self.sqrtw)
             .and(weights)
-            .for_each(|sqrt_w, &w| *sqrt_w = w.max(0.0).sqrt());
+            .for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
     }
 
-    pub fn compute_hessian_sparse_faer(
+    pub fn computehessian_sparse_faer(
         &mut self,
         x: &SparseRowMat<usize, f64>,
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        let csr_rows = x.nrows();
-        if weights.len() != csr_rows {
+        let csrrows = x.nrows();
+        if weights.len() != csrrows {
             return Err(EstimationError::InvalidInput(format!(
                 "weights length {} does not match design rows {}",
                 weights.len(),
-                csr_rows
+                csrrows
             )));
         }
 
         // Treat the CSR matrix as a transposed CSC view for sparse matmul.
         let x_t = x.as_ref().transpose();
-        let csc_view = x_t
+        let cscview = x_t
             .transpose()
             .to_col_major()
             .map_err(|_| EstimationError::InvalidInput("failed to view CSR as CSC".to_string()))?;
 
         let rebuild = match self.sparse_xtwx_cache.as_ref() {
-            Some(cache) => !cache.matches(&csc_view),
+            Some(cache) => !cache.matches(&cscview),
             None => true,
         };
         if rebuild {
-            self.sparse_xtwx_cache = Some(SparseXtWxCache::new(&csc_view)?);
+            self.sparse_xtwx_cache = Some(SparseXtWxCache::new(&cscview)?);
         }
 
         let cache = self
             .sparse_xtwx_cache
             .as_mut()
             .ok_or_else(|| EstimationError::InvalidInput("missing sparse cache".to_string()))?;
-        cache.compute_dense(&csc_view, weights)
+        cache.compute_dense(&cscview, weights)
     }
 
     pub(crate) fn sparse_penalized_system_stats(
@@ -1015,7 +1015,7 @@ pub struct WorkingModelPirlsResult {
     pub state: WorkingState,
     pub status: PirlsStatus,
     pub iterations: usize,
-    pub last_gradient_norm: f64,
+    pub lastgradient_norm: f64,
     pub last_deviance_change: f64,
     pub last_step_size: f64,
     pub last_step_halving: usize,
@@ -1051,16 +1051,16 @@ struct GamWorkingModel<'a> {
     coordinate_design: WorkingCoordinateDesign,
     offset: Array1<f64>,
     y: ArrayView1<'a, f64>,
-    prior_weights: ArrayView1<'a, f64>,
+    priorweights: ArrayView1<'a, f64>,
     s_transformed: Array2<f64>,
     e_transformed: Array2<f64>,
     workspace: PirlsWorkspace,
     likelihood: GlmLikelihoodFamily,
     link_kind: InverseLink,
     firth_bias_reduction: bool,
-    last_mu: Array1<f64>,
-    last_weights: Array1<f64>,
-    last_z: Array1<f64>,
+    lastmu: Array1<f64>,
+    lastweights: Array1<f64>,
+    lastz: Array1<f64>,
     last_c: Array1<f64>,
     last_d: Array1<f64>,
     last_dmu_deta: Array1<f64>,
@@ -1071,16 +1071,16 @@ struct GamWorkingModel<'a> {
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses integrated family-dispatched working updates.
     covariate_se: Option<Array1<f64>>,
-    quad_ctx: crate::quadrature::QuadratureContext,
+    quadctx: crate::quadrature::QuadratureContext,
 }
 
 struct GamModelFinalState {
     x_active: DesignMatrix,
     coordinate_frame: PirlsCoordinateFrame,
     e_transformed: Array2<f64>,
-    final_mu: Array1<f64>,
-    final_weights: Array1<f64>,
-    final_z: Array1<f64>,
+    finalmu: Array1<f64>,
+    finalweights: Array1<f64>,
+    finalz: Array1<f64>,
     final_c: Array1<f64>,
     final_d: Array1<f64>,
     final_dmu_deta: Array1<f64>,
@@ -1096,14 +1096,14 @@ impl<'a> GamWorkingModel<'a> {
         coordinate_frame: PirlsCoordinateFrame,
         offset: ArrayView1<f64>,
         y: ArrayView1<'a, f64>,
-        prior_weights: ArrayView1<'a, f64>,
+        priorweights: ArrayView1<'a, f64>,
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
         workspace: PirlsWorkspace,
         link_kind: InverseLink,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
-        quad_ctx: crate::quadrature::QuadratureContext,
+        quadctx: crate::quadrature::QuadratureContext,
     ) -> Self {
         let coordinate_design = match coordinate_frame {
             PirlsCoordinateFrame::OriginalSparseNative => {
@@ -1143,16 +1143,16 @@ impl<'a> GamWorkingModel<'a> {
             coordinate_design,
             offset: offset.to_owned(),
             y,
-            prior_weights,
+            priorweights,
             s_transformed,
             e_transformed,
             workspace,
             likelihood,
             link_kind,
             firth_bias_reduction,
-            last_mu: Array1::zeros(n),
-            last_weights: Array1::zeros(n),
-            last_z: Array1::zeros(n),
+            lastmu: Array1::zeros(n),
+            lastweights: Array1::zeros(n),
+            lastz: Array1::zeros(n),
             last_c: Array1::zeros(n),
             last_d: Array1::zeros(n),
             last_dmu_deta: Array1::zeros(n),
@@ -1161,7 +1161,7 @@ impl<'a> GamWorkingModel<'a> {
             last_penalty_term: 0.0,
             x_original_csr,
             covariate_se: None,
-            quad_ctx,
+            quadctx,
         }
     }
 
@@ -1177,9 +1177,9 @@ impl<'a> GamWorkingModel<'a> {
             x_original,
             coordinate_design,
             e_transformed,
-            last_mu,
-            last_weights,
-            last_z,
+            lastmu,
+            lastweights,
+            lastz,
             last_c,
             last_d,
             last_dmu_deta,
@@ -1207,9 +1207,9 @@ impl<'a> GamWorkingModel<'a> {
             x_active,
             coordinate_frame,
             e_transformed,
-            final_mu: last_mu,
-            final_weights: last_weights,
-            final_z: last_z,
+            finalmu: lastmu,
+            finalweights: lastweights,
+            finalz: lastz,
             final_c: last_c,
             final_d: last_d,
             final_dmu_deta: last_dmu_deta,
@@ -1222,14 +1222,14 @@ impl<'a> GamWorkingModel<'a> {
     fn transformed_matvec(&self, beta: &Coefficients) -> Array1<f64> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::OriginalSparseNative => {
-                self.x_original.matrix_vector_multiply(beta)
+                self.x_original.matrixvectormultiply(beta)
             }
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                x_transformed.matrix_vector_multiply(beta)
+                x_transformed.matrixvectormultiply(beta)
             }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
                 let beta_orig = qs.dot(beta.as_ref());
-                self.x_original.matrix_vector_multiply(&beta_orig)
+                self.x_original.matrixvectormultiply(&beta_orig)
             }
         }
     }
@@ -1255,7 +1255,7 @@ impl<'a> GamWorkingModel<'a> {
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         design
-            .diag_xt_w_x(weights)
+            .diag_xtw_x(weights)
             .map_err(EstimationError::InvalidInput)
     }
 
@@ -1280,14 +1280,14 @@ impl<'a> GamWorkingModel<'a> {
     fn observed_binomial_score_jacobian_diagonal(
         &self,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        let needs_observed_jacobian = matches!(
+        let needsobserved_jacobian = matches!(
             self.link_kind,
             InverseLink::Sas(_) | InverseLink::BetaLogistic(_)
         ) && matches!(
             self.likelihood,
             GlmLikelihoodFamily::BinomialSas | GlmLikelihoodFamily::BinomialBetaLogistic
         );
-        if !needs_observed_jacobian {
+        if !needsobserved_jacobian {
             return Ok(None);
         }
 
@@ -1296,8 +1296,8 @@ impl<'a> GamWorkingModel<'a> {
         for i in 0..n {
             let aux = stabilized_binomial_aux_terms(
                 self.y[i],
-                self.prior_weights[i].max(0.0),
-                self.last_mu[i],
+                self.priorweights[i].max(0.0),
+                self.lastmu[i],
             );
             let d1 = self.last_dmu_deta[i];
             let d2 = self.last_d2mu_deta2[i];
@@ -1336,7 +1336,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.
         let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
-            quad_ctx: &self.quad_ctx,
+            quadctx: &self.quadctx,
             se: se.view(),
         });
         match &self.link_kind {
@@ -1347,14 +1347,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             .to_string(),
                     ));
                 }
-                update_glm_vectors(
+                update_glmvectors(
                     self.y,
                     &self.workspace.eta_buf,
                     &self.link_kind,
-                    self.prior_weights,
-                    &mut self.last_mu,
-                    &mut self.last_weights,
-                    &mut self.last_z,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
                     Some(WorkingDerivativeBuffersMut {
                         c: &mut self.last_c,
                         d: &mut self.last_d,
@@ -1366,16 +1366,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             }
             InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
                 if let Some(integ) = integrated {
-                    update_glm_vectors_integrated_by_family(
-                        integ.quad_ctx,
+                    update_glmvectors_integrated_by_family(
+                        integ.quadctx,
                         self.y,
                         &self.workspace.eta_buf,
                         integ.se,
                         self.likelihood,
-                        self.prior_weights,
-                        &mut self.last_mu,
-                        &mut self.last_weights,
-                        &mut self.last_z,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
                         Some(WorkingDerivativeBuffersMut {
                             c: &mut self.last_c,
                             d: &mut self.last_d,
@@ -1387,14 +1387,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         self.link_kind.sas_state(),
                     )?;
                 } else {
-                    update_glm_vectors(
+                    update_glmvectors(
                         self.y,
                         &self.workspace.eta_buf,
                         &self.link_kind,
-                        self.prior_weights,
-                        &mut self.last_mu,
-                        &mut self.last_weights,
-                        &mut self.last_z,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
                         Some(WorkingDerivativeBuffersMut {
                             c: &mut self.last_c,
                             d: &mut self.last_d,
@@ -1409,10 +1409,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 self.likelihood.irls_update(
                     self.y,
                     &self.workspace.eta_buf,
-                    self.prior_weights,
-                    &mut self.last_mu,
-                    &mut self.last_weights,
-                    &mut self.last_z,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
                     integrated,
                     Some(WorkingDerivativeBuffersMut {
                         c: &mut self.last_c,
@@ -1424,8 +1424,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 )?;
             }
         }
-        let weights = self.last_weights.clone();
-        let mu = self.last_mu.clone();
+        let weights = self.lastweights.clone();
+        let mu = self.lastmu.clone();
         let mut firth = FirthDiagnostics::Inactive;
         if self.firth_bias_reduction {
             // IMPORTANT: Firth bias reduction must be computed in the *same basis*
@@ -1504,15 +1504,15 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 log_det: half_log_det,
                 hat_diag: hat_diag.clone(),
             };
-            for i in 0..self.last_z.len() {
+            for i in 0..self.lastz.len() {
                 let wi = weights[i];
                 if wi > 0.0 {
-                    self.last_z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
+                    self.lastz[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
                 }
             }
         }
 
-        let z = &self.last_z;
+        let z = &self.lastz;
         self.workspace
             .working_residual
             .assign(&self.workspace.eta_buf);
@@ -1528,11 +1528,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             .observed_binomial_score_jacobian_diagonal()?
             .unwrap_or_else(|| weights.clone());
 
-        let (penalized_hessian, sparse_hessian, ridge_used) = if matches!(
+        let (penalized_hessian, sparsehessian, ridge_used) = if matches!(
             self.coordinate_design,
             WorkingCoordinateDesign::OriginalSparseNative
         ) {
-            let (h_sparse, ridge_used) = ensure_sparse_positive_definite_with_ridge(|ridge| {
+            let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
                 self.sparse_penalized_hessian(&hessian_diag, ridge)
             })?;
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
@@ -1540,7 +1540,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             let mut penalized_hessian = self.penalized_hessian(&hessian_diag)?;
             #[cfg(debug_assertions)]
             debug_assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
-            let ridge_used = ensure_positive_definite_with_ridge(
+            let ridge_used = ensure_positive_definitewithridge(
                 &mut penalized_hessian,
                 "PIRLS penalized Hessian",
             )?;
@@ -1556,7 +1556,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // that drives log|H| and the implicit-gradient correction.
         let deviance = self
             .likelihood
-            .loglik_deviance(self.y, &mu, self.prior_weights)?;
+            .loglik_deviance(self.y, &mu, self.priorweights)?;
 
         let mut penalty_term = beta.as_ref().dot(&s_beta);
         if ridge_used > 0.0 {
@@ -1570,12 +1570,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         Ok(WorkingState {
             eta: LinearPredictor::new(self.workspace.eta_buf.clone()),
             gradient,
-            hessian: if let Some(h_sparse) = sparse_hessian.clone() {
+            hessian: if let Some(h_sparse) = sparsehessian.clone() {
                 crate::linalg::matrix::SymmetricMatrix::Sparse(h_sparse)
             } else {
                 crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian)
             },
-            sparse_hessian,
+            sparsehessian,
             deviance,
             penalty_term,
             firth,
@@ -1586,9 +1586,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
 pub(crate) struct SparseXtWxCache {
     xtwx_symbolic: SymbolicSparseColMat<usize>,
-    xtwx_values: Vec<f64>,
-    wx_values: Vec<f64>,
-    wx_t_values: Vec<f64>,
+    xtwxvalues: Vec<f64>,
+    wxvalues: Vec<f64>,
+    wx_tvalues: Vec<f64>,
     info: SparseMatMulInfo,
     scratch: MemBuffer,
     par: Par,
@@ -1596,7 +1596,7 @@ pub(crate) struct SparseXtWxCache {
     ncols: usize,
     nnz: usize,
     x_col_ptr: Vec<usize>,
-    x_row_idx: Vec<usize>,
+    xrow_idx: Vec<usize>,
     x_t_csc: SparseColMat<usize, f64>, // CSC format of X transpose for matmul
 }
 
@@ -1612,9 +1612,9 @@ impl SparseXtWxCache {
             .map_err(|_| {
                 EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
             })?;
-        let xtwx_values = vec![0.0; xtwx_symbolic.row_idx().len()];
-        let wx_values = vec![0.0; x.val().len()];
-        let wx_t_values = vec![0.0; x_t_csc.val().len()];
+        let xtwxvalues = vec![0.0; xtwx_symbolic.row_idx().len()];
+        let wxvalues = vec![0.0; x.val().len()];
+        let wx_tvalues = vec![0.0; x_t_csc.val().len()];
         let par = sparse_xtwx_par(x.ncols());
         let scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
             xtwx_symbolic.as_ref(),
@@ -1622,9 +1622,9 @@ impl SparseXtWxCache {
         ));
         Ok(Self {
             xtwx_symbolic,
-            xtwx_values,
-            wx_values,
-            wx_t_values,
+            xtwxvalues,
+            wxvalues,
+            wx_tvalues,
             info,
             scratch,
             par,
@@ -1632,7 +1632,7 @@ impl SparseXtWxCache {
             ncols: x.ncols(),
             nnz: x.val().len(),
             x_col_ptr: x.symbolic().col_ptr().to_vec(),
-            x_row_idx: x.symbolic().row_idx().to_vec(),
+            xrow_idx: x.symbolic().row_idx().to_vec(),
             x_t_csc,
         })
     }
@@ -1642,7 +1642,7 @@ impl SparseXtWxCache {
             return false;
         }
         let sym = x.symbolic();
-        self.x_col_ptr.as_slice() == sym.col_ptr() && self.x_row_idx.as_slice() == sym.row_idx()
+        self.x_col_ptr.as_slice() == sym.col_ptr() && self.xrow_idx.as_slice() == sym.row_idx()
     }
 
     fn compute_numeric(
@@ -1662,35 +1662,35 @@ impl SparseXtWxCache {
         // Build right factor: sqrt(W) * X (same CSC sparsity pattern as X).
         for col in 0..self.ncols {
             let rows = x_ref.row_idx_of_col_raw(col);
-            let x_vals = x_ref.val_of_col(col);
+            let xvals = x_ref.val_of_col(col);
             let range = x_ref.col_range(col);
-            let wx_vals = &mut self.wx_values[range];
-            for ((dst, &src), row) in wx_vals.iter_mut().zip(x_vals.iter()).zip(rows.iter()) {
+            let wxvals = &mut self.wxvalues[range];
+            for ((dst, &src), row) in wxvals.iter_mut().zip(xvals.iter()).zip(rows.iter()) {
                 let w = weights[row.unbound()].max(0.0);
                 *dst = src * w.sqrt();
             }
         }
 
         // Build left factor: (sqrt(W) * X)^T in CSC form, using X^T sparsity.
-        // X^T has columns corresponding to rows of X, so scale each column by sqrt(w_row).
+        // X^T has columns corresponding to rows of X, so scale each column by sqrt(wrow).
         let x_t_ref = self.x_t_csc.as_ref();
         for col in 0..x_t_ref.ncols() {
             let w = weights[col].max(0.0).sqrt();
-            let x_t_vals = x_t_ref.val_of_col(col);
+            let x_tvals = x_t_ref.val_of_col(col);
             let range = x_t_ref.col_range(col);
-            let wx_t_vals = &mut self.wx_t_values[range];
-            for (dst, &src) in wx_t_vals.iter_mut().zip(x_t_vals.iter()) {
+            let wx_tvals = &mut self.wx_tvalues[range];
+            for (dst, &src) in wx_tvals.iter_mut().zip(x_tvals.iter()) {
                 *dst = src * w;
             }
         }
 
-        let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wx_values);
-        let wx_t_ref = SparseColMatRef::new(self.x_t_csc.symbolic(), &self.wx_t_values);
+        let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wxvalues);
+        let wx_t_ref = SparseColMatRef::new(self.x_t_csc.symbolic(), &self.wx_tvalues);
         let mut stack = MemStack::new(&mut self.scratch);
         let xtwx_symbolic = self.xtwx_symbolic.as_ref();
-        let xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
+        let xtwxmut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwxvalues);
         sparse_sparse_matmul_numeric(
-            xtwx_mut,
+            xtwxmut,
             Accum::Replace,
             wx_t_ref,
             wx_ref,
@@ -1720,7 +1720,7 @@ impl SparseXtWxCache {
             let start = col_ptr[col];
             let end = col_ptr[col + 1];
             for idx in start..end {
-                out[[row_idx[idx], col]] += self.xtwx_values[idx];
+                out[[row_idx[idx], col]] += self.xtwxvalues[idx];
             }
         }
         Ok(out)
@@ -1749,7 +1749,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
 
     // Use efficient faer sparse multiplication
     let xtwx_transformed =
-        workspace.compute_hessian_sparse_faer(x_design_csr, &weights.to_owned())?;
+        workspace.computehessian_sparse_faer(x_design_csr, &weights.to_owned())?;
 
     let mut stabilized = xtwx_transformed.clone();
     if let Some(s) = s_transformed {
@@ -1758,7 +1758,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
     #[cfg(debug_assertions)]
     debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (sparse)", 1e-8);
     // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
-    ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
+    ensure_positive_definitewith_label(&mut stabilized, "Firth Fisher information")?;
 
     let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
@@ -1774,14 +1774,14 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let h_inv_arr = chol.solve_mat(&identity);
 
     let mut hat_diag = Array1::<f64>::zeros(n);
-    let x_view = x_design_csr.as_ref();
+    let xview = x_design_csr.as_ref();
     for i in 0..n {
         let w = weights[i];
         if w <= 0.0 {
             continue;
         }
-        let vals = x_view.val_of_row(i);
-        let cols = x_view.col_idx_of_row_raw(i);
+        let vals = xview.val_of_row(i);
+        let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
             return Err(EstimationError::InvalidInput(
                 "sparse row structure mismatch: column/value lengths differ".to_string(),
@@ -1812,7 +1812,7 @@ fn compute_firth_hat_and_half_logdet(
     let n = x_design.nrows();
     let p = x_design.ncols();
 
-    workspace.fill_sqrt_weights(&weights);
+    workspace.fill_sqrtweights(&weights);
     let mut stabilized = Array2::<f64>::zeros((p, p).f());
     workspace.add_dense_xtwx_streaming_from_sqrt(
         &x_design,
@@ -1824,7 +1824,7 @@ fn compute_firth_hat_and_half_logdet(
     }
     #[cfg(debug_assertions)]
     debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (dense)", 1e-8);
-    ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
+    ensure_positive_definitewith_label(&mut stabilized, "Firth Fisher information")?;
 
     let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
@@ -1854,9 +1854,9 @@ fn compute_firth_hat_and_half_logdet(
 
             for local_col in 0..cols_this {
                 let obs = col_start + local_col;
-                let sqrt_w = workspace.sqrt_w[obs];
+                let sqrtw = workspace.sqrtw[obs];
                 for k in 0..p {
-                    workspace.scaled_matrix[[k, local_col]] = x_design[[obs, k]] * sqrt_w;
+                    workspace.scaled_matrix[[k, local_col]] = x_design[[obs, k]] * sqrtw;
                 }
             }
 
@@ -1876,14 +1876,14 @@ fn compute_firth_hat_and_half_logdet(
     Ok((hat_diag, half_log_det))
 }
 
-pub(crate) fn ensure_positive_definite_with_label(
+pub(crate) fn ensure_positive_definitewith_label(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<(), EstimationError> {
-    ensure_positive_definite_with_ridge(hess, label).map(|_| ())
+    ensure_positive_definitewithridge(hess, label).map(|_| ())
 }
 
-fn ensure_positive_definite_with_ridge(
+fn ensure_positive_definitewithridge(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<f64, EstimationError> {
@@ -1932,8 +1932,8 @@ fn solve_newton_direction_dense(
         .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     direction_out.assign(gradient);
-    let mut rhs_view = array1_to_col_mat_mut(direction_out);
-    factor.solve_in_place(rhs_view.as_mut());
+    let mut rhsview = array1_to_col_matmut(direction_out);
+    factor.solve_in_place(rhsview.as_mut());
     direction_out.mapv_inplace(|v| -v);
     if array1_is_finite(direction_out) {
         return Ok(());
@@ -2075,7 +2075,7 @@ pub(crate) fn sparse_reml_penalized_hessian(
     workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
 }
 
-fn ensure_sparse_positive_definite_with_ridge<F>(
+fn ensure_sparse_positive_definitewithridge<F>(
     mut assemble: F,
 ) -> Result<(SparseColMat<usize, f64>, f64), EstimationError>
 where
@@ -2146,7 +2146,7 @@ fn solve_subsystem_direction(
             )
         })?;
     out.assign(g_sub);
-    let mut rhs = array1_to_col_mat_mut(out);
+    let mut rhs = array1_to_col_matmut(out);
     factor.solve_in_place(rhs.as_mut());
     out.mapv_inplace(|v| -v);
     if array1_is_finite(out) {
@@ -2172,8 +2172,8 @@ fn solve_symmetric_system(
             EstimationError::InvalidInput("symmetric system factorization failed".to_string())
         })?;
     out.assign(rhs);
-    let mut rhs_view = array1_to_col_mat_mut(out);
-    factor.solve_in_place(rhs_view.as_mut());
+    let mut rhsview = array1_to_col_matmut(out);
+    factor.solve_in_place(rhsview.as_mut());
     if array1_is_finite(out) {
         return Ok(());
     }
@@ -2185,16 +2185,16 @@ fn solve_symmetric_system(
 fn linear_constraints_from_lower_bounds(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
-    let active_rows: Vec<usize> = (0..lower_bounds.len())
+    let activerows: Vec<usize> = (0..lower_bounds.len())
         .filter(|&i| lower_bounds[i].is_finite())
         .collect();
-    if active_rows.is_empty() {
+    if activerows.is_empty() {
         return None;
     }
     let p = lower_bounds.len();
-    let mut a = Array2::<f64>::zeros((active_rows.len(), p));
-    let mut b = Array1::<f64>::zeros(active_rows.len());
-    for (r, &idx) in active_rows.iter().enumerate() {
+    let mut a = Array2::<f64>::zeros((activerows.len(), p));
+    let mut b = Array1::<f64>::zeros(activerows.len());
+    for (r, &idx) in activerows.iter().enumerate() {
         a[[r, idx]] = 1.0;
         b[r] = lower_bounds[idx];
     }
@@ -2266,24 +2266,24 @@ fn compute_constraint_kkt_diagnostics(
     }
 }
 
-fn max_linear_constraint_violation(
+fn max_linear_constraintviolation(
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
 ) -> (f64, usize) {
     let mut worst = 0.0_f64;
-    let mut worst_row = 0usize;
+    let mut worstrow = 0usize;
     for i in 0..constraints.a.nrows() {
         let slack = constraints.a.row(i).dot(beta) - constraints.b[i];
         let viol = (-slack).max(0.0);
         if viol > worst {
             worst = viol;
-            worst_row = i;
+            worstrow = i;
         }
     }
-    (worst, worst_row)
+    (worst, worstrow)
 }
 
-fn max_lower_bound_violation(beta: &Array1<f64>, lower_bounds: &Array1<f64>) -> (f64, usize) {
+fn max_lower_boundviolation(beta: &Array1<f64>, lower_bounds: &Array1<f64>) -> (f64, usize) {
     let mut worst = 0.0_f64;
     let mut worst_idx = 0usize;
     for i in 0..beta.len().min(lower_bounds.len()) {
@@ -2299,7 +2299,7 @@ fn max_lower_bound_violation(beta: &Array1<f64>, lower_bounds: &Array1<f64>) -> 
     (worst, worst_idx)
 }
 
-fn solve_newton_direction_with_lower_bounds(
+fn solve_newton_directionwith_lower_bounds(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -2384,12 +2384,12 @@ fn solve_newton_direction_with_lower_bounds(
         }
         if free_idx.is_empty() {
             let hd = hessian.dot(direction_out);
-            let mut worst_violation = 0.0_f64;
+            let mut worstviolation = 0.0_f64;
             let mut release_idx: Option<usize> = None;
             for &i in &active_idx {
                 let lambda_i = gradient[i] + hd[i];
-                if lambda_i < worst_violation {
-                    worst_violation = lambda_i;
+                if lambda_i < worstviolation {
+                    worstviolation = lambda_i;
                     release_idx = Some(i);
                 }
             }
@@ -2447,15 +2447,15 @@ fn solve_newton_direction_with_lower_bounds(
         // Dual feasibility on active constraints:
         // λ_i = g_i + (H d)_i must be >= 0 for all active lower bounds.
         let hd = hessian.dot(direction_out);
-        let mut worst_violation = 0.0_f64;
+        let mut worstviolation = 0.0_f64;
         let mut release_idx: Option<usize> = None;
         for i in 0..p {
             if !active[i] {
                 continue;
             }
             let lambda_i = gradient[i] + hd[i];
-            if lambda_i < worst_violation {
-                worst_violation = lambda_i;
+            if lambda_i < worstviolation {
+                worstviolation = lambda_i;
                 release_idx = Some(i);
             }
         }
@@ -2471,7 +2471,7 @@ fn solve_newton_direction_with_lower_bounds(
         return Ok(());
     }
 
-    let (worst, idx) = max_lower_bound_violation(beta, lower_bounds);
+    let (worst, idx) = max_lower_boundviolation(beta, lower_bounds);
     Err(EstimationError::ParameterConstraintViolation(format!(
         "bounded-constraint Newton active-set failed to converge; max lower-bound violation={worst:.3e} at coefficient index {idx}"
     )))
@@ -2519,9 +2519,9 @@ fn solve_kkt_direction(
         }
     }
 
-    let kkt_view = FaerArrayView::new(&kkt);
-    let lb = FaerLblt::new(kkt_view.as_ref(), Side::Lower);
-    let mut rhs_col = array1_to_col_mat_mut(&mut rhs);
+    let kktview = FaerArrayView::new(&kkt);
+    let lb = FaerLblt::new(kktview.as_ref(), Side::Lower);
+    let mut rhs_col = array1_to_col_matmut(&mut rhs);
     lb.solve_in_place(rhs_col.as_mut());
     if !rhs.iter().all(|v| v.is_finite()) {
         return Err(EstimationError::InvalidInput(
@@ -2538,7 +2538,7 @@ struct CompressedActiveWorkingSet {
     groups: Vec<Vec<usize>>,
 }
 
-fn compress_active_working_set(
+fn compress_activeworking_set(
     x: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
     active: &[usize],
@@ -2554,7 +2554,7 @@ fn compress_active_working_set(
     }
 
     let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64, Vec<usize>)> = BTreeMap::new();
-    let mut fallback_rows: Vec<(Vec<f64>, f64, Vec<usize>)> = Vec::new();
+    let mut fallbackrows: Vec<(Vec<f64>, f64, Vec<usize>)> = Vec::new();
 
     for (pos, &idx) in active.iter().enumerate() {
         if idx >= constraints.a.nrows() {
@@ -2568,11 +2568,11 @@ fn compress_active_working_set(
         let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if !scale.is_finite() || scale <= SCALE_TOL {
             let rhs = constraints.b[idx];
-            fallback_rows.push((row.to_vec(), rhs, vec![pos]));
+            fallbackrows.push((row.to_vec(), rhs, vec![pos]));
             continue;
         }
 
-        let normalized_row: Vec<f64> = row
+        let normalizedrow: Vec<f64> = row
             .iter()
             .map(|&v| {
                 let scaled = v / scale;
@@ -2580,7 +2580,7 @@ fn compress_active_working_set(
             })
             .collect();
         let normalized_rhs = constraints.b[idx] / scale;
-        let key: Vec<i64> = normalized_row
+        let key: Vec<i64> = normalizedrow
             .iter()
             .map(|&v| (v / KEY_TOL).round() as i64)
             .collect();
@@ -2588,38 +2588,38 @@ fn compress_active_working_set(
         match grouped.get_mut(&key) {
             Some((row_rep, rhs_max, group_positions)) => {
                 if normalized_rhs > *rhs_max {
-                    *row_rep = normalized_row;
+                    *row_rep = normalizedrow;
                     *rhs_max = normalized_rhs;
                 }
                 group_positions.push(pos);
             }
             None => {
-                grouped.insert(key, (normalized_row, normalized_rhs, vec![pos]));
+                grouped.insert(key, (normalizedrow, normalized_rhs, vec![pos]));
             }
         }
     }
 
-    let n_rows = grouped.len() + fallback_rows.len();
-    let mut a_out = Array2::<f64>::zeros((n_rows, p));
-    let mut b_out = Array1::<f64>::zeros(n_rows);
-    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(n_rows);
+    let nrows = grouped.len() + fallbackrows.len();
+    let mut a_out = Array2::<f64>::zeros((nrows, p));
+    let mut b_out = Array1::<f64>::zeros(nrows);
+    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(nrows);
 
-    let mut out_row = 0usize;
-    for (_key, (row, rhs, positions)) in grouped {
+    let mut outrow = 0usize;
+    for (_, (row, rhs, positions)) in grouped {
         for (j, value) in row.into_iter().enumerate() {
-            a_out[[out_row, j]] = value;
+            a_out[[outrow, j]] = value;
         }
-        b_out[out_row] = rhs;
+        b_out[outrow] = rhs;
         groups_out.push(positions);
-        out_row += 1;
+        outrow += 1;
     }
-    for (row, rhs, positions) in fallback_rows {
+    for (row, rhs, positions) in fallbackrows {
         for (j, value) in row.into_iter().enumerate() {
-            a_out[[out_row, j]] = value;
+            a_out[[outrow, j]] = value;
         }
-        b_out[out_row] = rhs;
+        b_out[outrow] = rhs;
         groups_out.push(positions);
-        out_row += 1;
+        outrow += 1;
     }
 
     Ok(CompressedActiveWorkingSet {
@@ -2628,7 +2628,7 @@ fn compress_active_working_set(
     })
 }
 
-fn working_set_kkt_diagnostics_from_multipliers(
+fn working_set_kkt_diagnostics_frommultipliers(
     x: &Array1<f64>,
     gradient: &Array1<f64>,
     working_constraints: &LinearInequalityConstraints,
@@ -2682,7 +2682,7 @@ fn working_set_kkt_diagnostics_from_multipliers(
     })
 }
 
-fn solve_newton_direction_with_linear_constraints(
+fn solve_newton_directionwith_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -2749,53 +2749,53 @@ fn solve_newton_direction_with_linear_constraints(
             is_active[i] = true;
         }
     }
-    let mut last_working_x = x.clone();
-    let mut last_working_direction = d_total.clone();
-    let mut last_working_gradient = g_cur.clone();
-    let mut last_working_active = active.clone();
-    let mut last_working_constraints = LinearInequalityConstraints {
+    let mut lastworking_x = x.clone();
+    let mut lastworking_direction = d_total.clone();
+    let mut lastworkinggradient = g_cur.clone();
+    let mut lastworking_active = active.clone();
+    let mut lastworking_constraints = LinearInequalityConstraints {
         a: Array2::<f64>::zeros((0, p)),
         b: Array1::<f64>::zeros(0),
     };
-    let mut last_working_lambda_true = Array1::<f64>::zeros(0);
+    let mut lastworking_lambda_true = Array1::<f64>::zeros(0);
 
     for _ in 0..((p + m + 8) * 4) {
-        let compressed_working = compress_active_working_set(&x, constraints, &active)?;
-        let mut residual_w = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
-        for r in 0..compressed_working.constraints.a.nrows() {
-            residual_w[r] = compressed_working.constraints.b[r]
-                - compressed_working.constraints.a.row(r).dot(&x);
+        let compressedworking = compress_activeworking_set(&x, constraints, &active)?;
+        let mut residualw = Array1::<f64>::zeros(compressedworking.constraints.a.nrows());
+        for r in 0..compressedworking.constraints.a.nrows() {
+            residualw[r] = compressedworking.constraints.b[r]
+                - compressedworking.constraints.a.row(r).dot(&x);
         }
-        let (d, lambda_w) = solve_kkt_direction(
+        let (d, lambdaw) = solve_kkt_direction(
             hessian,
             &g_cur,
-            &compressed_working.constraints.a,
-            Some(&residual_w),
+            &compressedworking.constraints.a,
+            Some(&residualw),
         )?;
-        last_working_x.assign(&x);
-        last_working_direction.assign(&d_total);
-        last_working_gradient.assign(&g_cur);
-        last_working_active.clear();
-        last_working_active.extend(active.iter().copied());
-        last_working_constraints = LinearInequalityConstraints {
-            a: compressed_working.constraints.a.clone(),
-            b: compressed_working.constraints.b.clone(),
+        lastworking_x.assign(&x);
+        lastworking_direction.assign(&d_total);
+        lastworkinggradient.assign(&g_cur);
+        lastworking_active.clear();
+        lastworking_active.extend(active.iter().copied());
+        lastworking_constraints = LinearInequalityConstraints {
+            a: compressedworking.constraints.a.clone(),
+            b: compressedworking.constraints.b.clone(),
         };
-        last_working_lambda_true = lambda_w.mapv(|lam_sys| -lam_sys);
+        lastworking_lambda_true = lambdaw.mapv(|lam_sys| -lam_sys);
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
-            if compressed_working.groups.is_empty() {
+            if compressedworking.groups.is_empty() {
                 direction_out.assign(&d_total);
                 return Ok(());
             }
             let mut remove_pos: Option<usize> = None;
             // KKT solve returns multipliers for:
-            //   H d + A_w^T lambda_sys = -g_cur.
+            //   H d + Aw^T lambda_sys = -g_cur.
             // Under our inequality convention A*beta >= b, the true multipliers are
             // lambda_true = -lambda_sys, and dual feasibility requires lambda_true >= 0.
             // Therefore release active rows with the most negative lambda_true.
             let mut most_negative_true = -tol_dual;
-            for (group_pos, &lam_sys) in lambda_w.iter().enumerate() {
+            for (group_pos, &lam_sys) in lambdaw.iter().enumerate() {
                 let lam_true = -lam_sys;
                 if lam_true < most_negative_true {
                     most_negative_true = lam_true;
@@ -2803,7 +2803,7 @@ fn solve_newton_direction_with_linear_constraints(
                 }
             }
             if let Some(group_pos) = remove_pos {
-                for &active_pos in compressed_working.groups[group_pos].iter().rev() {
+                for &active_pos in compressedworking.groups[group_pos].iter().rev() {
                     let idx = active.remove(active_pos);
                     is_active[idx] = false;
                 }
@@ -2856,27 +2856,27 @@ fn solve_newton_direction_with_linear_constraints(
         }
     }
 
-    let (worst, row) = max_linear_constraint_violation(&last_working_x, constraints);
-    let working_kkt = working_set_kkt_diagnostics_from_multipliers(
-        &last_working_x,
-        &last_working_gradient,
-        &last_working_constraints,
-        &last_working_lambda_true,
+    let (worst, row) = max_linear_constraintviolation(&lastworking_x, constraints);
+    let working_kkt = working_set_kkt_diagnostics_frommultipliers(
+        &lastworking_x,
+        &lastworkinggradient,
+        &lastworking_constraints,
+        &lastworking_lambda_true,
         m,
     )?;
     let kkt =
-        compute_constraint_kkt_diagnostics(&last_working_x, &last_working_gradient, constraints);
-    let grad_inf = last_working_gradient
+        compute_constraint_kkt_diagnostics(&lastworking_x, &lastworkinggradient, constraints);
+    let grad_inf = lastworkinggradient
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
-    let step_inf = last_working_direction
+    let step_inf = lastworking_direction
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let hd_total = hessian.dot(&last_working_direction);
-    let predicted_delta = gradient.dot(&last_working_direction)
+    let hd_total = hessian.dot(&lastworking_direction);
+    let predicted_delta = gradient.dot(&lastworking_direction)
         + 0.5
-            * last_working_direction
+            * lastworking_direction
                 .iter()
                 .zip(hd_total.iter())
                 .map(|(a, b)| a * b)
@@ -2895,9 +2895,9 @@ fn solve_newton_direction_with_linear_constraints(
     {
         if let Some(hint) = active_hint {
             hint.clear();
-            hint.extend(last_working_active.iter().copied());
+            hint.extend(lastworking_active.iter().copied());
         }
-        direction_out.assign(&last_working_direction);
+        direction_out.assign(&lastworking_direction);
         return Ok(());
     }
     Err(EstimationError::ParameterConstraintViolation(format!(
@@ -2917,7 +2917,7 @@ fn default_beta_guess_external(
     p: usize,
     link_function: LinkFunction,
     y: ArrayView1<f64>,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
 ) -> Array1<f64> {
@@ -2930,14 +2930,14 @@ fn default_beta_guess_external(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             let mut weighted_sum = 0.0;
-            let mut total_weight = 0.0;
-            for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
                 weighted_sum += wi * yi;
-                total_weight += wi;
+                totalweight += wi;
             }
-            if total_weight > 0.0 {
+            if totalweight > 0.0 {
                 let prevalence =
-                    ((weighted_sum + 0.5) / (total_weight + 1.0)).clamp(1e-6, 1.0 - 1e-6);
+                    ((weighted_sum + 0.5) / (totalweight + 1.0)).clamp(1e-6, 1.0 - 1e-6);
                 beta[intercept_col] = match link_function {
                     LinkFunction::Logit => (prevalence / (1.0 - prevalence)).ln(),
                     LinkFunction::Probit => {
@@ -2983,13 +2983,13 @@ fn default_beta_guess_external(
         }
         LinkFunction::Identity => {
             let mut weighted_sum = 0.0;
-            let mut total_weight = 0.0;
-            for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
                 weighted_sum += wi * yi;
-                total_weight += wi;
+                totalweight += wi;
             }
-            if total_weight > 0.0 {
-                beta[intercept_col] = weighted_sum / total_weight;
+            if totalweight > 0.0 {
+                beta[intercept_col] = weighted_sum / totalweight;
             }
         }
     }
@@ -3095,7 +3095,7 @@ fn solve_intercept_for_prevalence(
     Some(0.5 * (lo + hi))
 }
 
-pub fn run_working_model_pirls<M, F>(
+pub fn runworking_model_pirls<M, F>(
     model: &mut M,
     mut beta: Coefficients,
     options: &WorkingModelPirlsOptions,
@@ -3108,7 +3108,7 @@ where
     if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
         project_coefficients_to_lower_bounds(&mut beta.0, lb);
     }
-    let mut last_gradient_norm = f64::INFINITY;
+    let mut lastgradient_norm = f64::INFINITY;
     let mut last_deviance_change = f64::INFINITY;
     let mut last_step_size = 0.0;
     let mut last_step_halving = 0usize;
@@ -3124,7 +3124,7 @@ where
         .as_ref()
         .map(|_| Vec::new());
 
-    let penalized_objective = |state: &WorkingState| {
+    let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
         if options.firth_bias_reduction {
             if let Some(firth_log_det) = state.firth_log_det() {
@@ -3141,7 +3141,7 @@ where
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
         let state = model.update(&beta)?;
-        let current_penalized = penalized_objective(&state);
+        let current_penalized = penalizedobjective(&state);
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
 
@@ -3167,7 +3167,7 @@ where
 
             let has_constraints =
                 options.linear_constraints.is_some() || options.coefficient_lower_bounds.is_some();
-            let direction = match if let Some(h_sparse) = state.sparse_hessian.as_ref() {
+            let direction = match if let Some(h_sparse) = state.sparsehessian.as_ref() {
                 if has_constraints {
                     Err(EstimationError::InvalidInput(
                         "sparse-native PIRLS does not support constrained solves".to_string(),
@@ -3180,7 +3180,7 @@ where
                     Ok(())
                 }
             } else if let Some(lin) = options.linear_constraints.as_ref() {
-                solve_newton_direction_with_linear_constraints(
+                solve_newton_directionwith_linear_constraints(
                     regularized.as_dense().expect("dense regularized Hessian"),
                     &state.gradient,
                     beta.as_ref(),
@@ -3189,7 +3189,7 @@ where
                     linear_active_hint.as_mut(),
                 )
             } else if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
-                solve_newton_direction_with_lower_bounds(
+                solve_newton_directionwith_lower_bounds(
                     regularized.as_dense().expect("dense regularized Hessian"),
                     &state.gradient,
                     beta.as_ref(),
@@ -3229,7 +3229,7 @@ where
             // Actually, we should check against the model: m(0) - m(δ)
             // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
             // Reduction = -(g'δ + 0.5 δ'Hδ)
-            let q_term = if let Some(h_sparse) = state.sparse_hessian.as_ref() {
+            let q_term = if let Some(h_sparse) = state.sparsehessian.as_ref() {
                 sparse_symmetric_upper_matvec_public(h_sparse, direction)
             } else {
                 state.hessian.dot(direction)
@@ -3239,16 +3239,16 @@ where
             let predicted_reduction = -(lin + quad);
 
             // 3. Compute Actual Reduction
-            let mut candidate_vec = &*beta + direction;
+            let mut candidatevec = &*beta + direction;
             if options.linear_constraints.is_none()
                 && let Some(lb) = options.coefficient_lower_bounds.as_ref()
             {
-                project_coefficients_to_lower_bounds(&mut candidate_vec, lb);
+                project_coefficients_to_lower_bounds(&mut candidatevec, lb);
             }
-            let candidate_beta = Coefficients::new(candidate_vec);
+            let candidate_beta = Coefficients::new(candidatevec);
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
-                    let candidate_penalized = penalized_objective(&candidate_state);
+                    let candidate_penalized = penalizedobjective(&candidate_state);
                     let actual_reduction = current_penalized - candidate_penalized;
 
                     // 4. Gain Ratio
@@ -3276,7 +3276,7 @@ where
                         beta = candidate_beta;
 
                         // Update Iteration Info
-                        let candidate_grad_norm = candidate_state
+                        let candidategrad_norm = candidate_state
                             .gradient
                             .dot(&candidate_state.gradient)
                             .sqrt();
@@ -3285,12 +3285,12 @@ where
                         iteration_callback(&WorkingModelIterationInfo {
                             iteration: iter,
                             deviance: candidate_state.deviance,
-                            gradient_norm: candidate_grad_norm,
+                            gradient_norm: candidategrad_norm,
                             step_size: 1.0,
                             step_halving: attempts, // repurpose as attempt count
                         });
 
-                        last_gradient_norm = candidate_grad_norm;
+                        lastgradient_norm = candidategrad_norm;
                         last_deviance_change = deviance_change;
                         last_step_size = 1.0;
                         last_step_halving = attempts;
@@ -3314,13 +3314,13 @@ where
                         let grad_tol = options.convergence_tolerance; // Absolute norm check
                         let dev_tol = options.convergence_tolerance * deviance_scale;
 
-                        if candidate_grad_norm < grad_tol {
+                        if candidategrad_norm < grad_tol {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
                         if deviance_change.abs() < dev_tol
                             && deviance_change >= 0.0
-                            && candidate_grad_norm < grad_tol
+                            && candidategrad_norm < grad_tol
                         {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
@@ -3329,7 +3329,7 @@ where
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
                         // Reject Step
-                        let state_grad_norm = state.gradient.dot(&state.gradient).sqrt();
+                        let stategrad_norm = state.gradient.dot(&state.gradient).sqrt();
                         let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 50.0;
                         let reduction_noise_floor = (current_penalized
                             .abs()
@@ -3341,11 +3341,11 @@ where
                         // noise and LM gain-ratio logic may reject every candidate indefinitely.
                         // Treat this as a valid stalled optimum rather than escalating damping.
                         if candidate_penalized.is_finite()
-                            && state_grad_norm <= near_stationary_tol
+                            && stategrad_norm <= near_stationary_tol
                             && predicted_reduction.abs() <= reduction_noise_floor
                             && actual_reduction >= -reduction_noise_floor
                         {
-                            last_gradient_norm = state_grad_norm;
+                            lastgradient_norm = stategrad_norm;
                             last_deviance_change = 0.0;
                             last_step_size = 0.0;
                             last_step_halving = attempts;
@@ -3359,10 +3359,10 @@ where
                         if loop_lambda > 1e12 {
                             // Exhausted attempts
                             if attempts > 30 {
-                                last_gradient_norm = state_grad_norm;
+                                lastgradient_norm = stategrad_norm;
                                 // Only accept "stalled but valid" when we are near stationarity.
                                 // Otherwise report MaxIterationsReached so callers can fail fast.
-                                if state_grad_norm <= near_stationary_tol {
+                                if stategrad_norm <= near_stationary_tol {
                                     status = PirlsStatus::StalledAtValidMinimum;
                                 } else {
                                     status = PirlsStatus::MaxIterationsReached;
@@ -3385,11 +3385,11 @@ where
 
     let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,
-        last_change: last_gradient_norm,
+        last_change: lastgradient_norm,
     })?;
 
     if matches!(status, PirlsStatus::MaxIterationsReached)
-        && last_gradient_norm < options.convergence_tolerance
+        && lastgradient_norm < options.convergence_tolerance
     {
         status = PirlsStatus::StalledAtValidMinimum;
     }
@@ -3410,7 +3410,7 @@ where
         state,
         status,
         iterations,
-        last_gradient_norm,
+        lastgradient_norm,
         last_deviance_change,
         last_step_size,
         last_step_halving,
@@ -3478,7 +3478,7 @@ pub enum PirlsStatus {
 /// * `deviance`: The final deviance value. Note that this means different things depending on the link function:
 ///    - For `LinkFunction::Identity` (Gaussian): This is the Residual Sum of Squares (RSS).
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
-/// * `final_weights`: The final IRLS weights at convergence.
+/// * `finalweights`: The final IRLS weights at convergence.
 /// * `reparam_result`: Contains the transformation matrix (`qs`) and other reparameterization data.
 ///
 /// # Point Estimate: Posterior Mode (MAP)
@@ -3494,7 +3494,7 @@ pub struct PirlsResult {
     pub beta_transformed: Coefficients,
     pub penalized_hessian_transformed: Array2<f64>,
     // Single stabilized Hessian for consistent cost/gradient computation
-    pub stabilized_hessian_transformed: Array2<f64>,
+    pub stabilizedhessian_transformed: Array2<f64>,
     /// Canonical ridge metadata passport consumed by outer objective/gradient code.
     pub ridge_passport: RidgePassport,
     // Ridge added to make the stabilized Hessian positive definite. When > 0,
@@ -3519,15 +3519,15 @@ pub struct PirlsResult {
     pub firth: FirthDiagnostics,
 
     // The final IRLS weights at convergence
-    pub final_weights: Array1<f64>,
+    pub finalweights: Array1<f64>,
     // Additional PIRLS state captured at the accepted step to support
     // cost/gradient consistency in the outer optimization
     pub final_offset: Array1<f64>,
     pub final_eta: Array1<f64>,
-    pub final_mu: Array1<f64>,
-    pub solve_weights: Array1<f64>,
-    pub solve_working_response: Array1<f64>,
-    pub solve_mu: Array1<f64>,
+    pub finalmu: Array1<f64>,
+    pub solveweights: Array1<f64>,
+    pub solveworking_response: Array1<f64>,
+    pub solvemu: Array1<f64>,
     pub solve_dmu_deta: Array1<f64>,
     pub solve_d2mu_deta2: Array1<f64>,
     pub solve_d3mu_deta3: Array1<f64>,
@@ -3548,7 +3548,7 @@ pub struct PirlsResult {
     pub status: PirlsStatus,
     pub iteration: usize,
     pub max_abs_eta: f64,
-    pub last_gradient_norm: f64,
+    pub lastgradient_norm: f64,
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
     /// Optional KKT diagnostics when inequality constraints were active.
@@ -3576,12 +3576,12 @@ fn assemble_pirls_result(
     working_summary: &WorkingModelPirlsResult,
     offset: ArrayView1<'_, f64>,
     penalized_hessian_transformed: Array2<f64>,
-    stabilized_hessian_transformed: Array2<f64>,
+    stabilizedhessian_transformed: Array2<f64>,
     edf: f64,
     penalty_term: f64,
-    final_mu: &Array1<f64>,
-    final_weights: &Array1<f64>,
-    final_z: &Array1<f64>,
+    finalmu: &Array1<f64>,
+    finalweights: &Array1<f64>,
+    finalz: &Array1<f64>,
     final_c: &Array1<f64>,
     final_d: &Array1<f64>,
     final_dmu_deta: &Array1<f64>,
@@ -3598,7 +3598,7 @@ fn assemble_pirls_result(
     PirlsResult {
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
-        stabilized_hessian_transformed,
+        stabilizedhessian_transformed,
         ridge_passport: RidgePassport::scaled_identity(
             working_summary.state.ridge_used,
             RidgePolicy::explicit_stabilization_full(),
@@ -3608,13 +3608,13 @@ fn assemble_pirls_result(
         edf,
         stable_penalty_term: penalty_term,
         firth: working_summary.state.firth.clone(),
-        final_weights: final_weights.clone(),
+        finalweights: finalweights.clone(),
         final_offset: offset.to_owned(),
         final_eta: final_eta_arr,
-        final_mu: final_mu.clone(),
-        solve_weights: final_weights.clone(),
-        solve_working_response: final_z.clone(),
-        solve_mu: final_mu.clone(),
+        finalmu: finalmu.clone(),
+        solveweights: finalweights.clone(),
+        solveworking_response: finalz.clone(),
+        solvemu: finalmu.clone(),
         solve_dmu_deta: final_dmu_deta.clone(),
         solve_d2mu_deta2: final_d2mu_deta2.clone(),
         solve_d3mu_deta3: final_d3mu_deta3.clone(),
@@ -3623,7 +3623,7 @@ fn assemble_pirls_result(
         status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
-        last_gradient_norm: working_summary.last_gradient_norm,
+        lastgradient_norm: working_summary.lastgradient_norm,
         last_deviance_change: working_summary.last_deviance_change,
         last_step_halving: working_summary.last_step_halving,
         constraint_kkt: working_summary.constraint_kkt.clone(),
@@ -3640,8 +3640,8 @@ fn detect_logit_instability(
     has_penalty: bool,
     firth_active: bool,
     summary: &WorkingModelPirlsResult,
-    final_mu: &Array1<f64>,
-    final_weights: &Array1<f64>,
+    finalmu: &Array1<f64>,
+    finalweights: &Array1<f64>,
     y: ArrayView1<'_, f64>,
 ) -> bool {
     if link != LinkFunction::Logit || firth_active {
@@ -3656,7 +3656,7 @@ fn detect_logit_instability(
     let max_abs_eta = summary.max_abs_eta;
     let sat_fraction = {
         const SAT_EPS: f64 = 1e-3;
-        final_mu
+        finalmu
             .iter()
             .filter(|&&m| m <= SAT_EPS || m >= 1.0 - SAT_EPS)
             .count() as f64
@@ -3665,7 +3665,7 @@ fn detect_logit_instability(
 
     let weight_collapse_fraction = {
         const WEIGHT_EPS: f64 = 1e-8;
-        final_weights
+        finalweights
             .iter()
             .filter(|&&w| w <= WEIGHT_EPS || !w.is_finite())
             .count() as f64
@@ -3708,16 +3708,16 @@ fn detect_logit_instability(
     order_separated || severe_saturation || weights_collapsed || dev_extremely_small
 }
 
-fn stack_lambda_weighted_penalty_root(
+fn stack_lambdaweighted_penalty_root(
     rs_original: &[Array2<f64>],
     lambdas: &[f64],
     p: usize,
 ) -> Array2<f64> {
-    let total_rows = rs_original.iter().map(Array2::nrows).sum();
-    if total_rows == 0 {
+    let totalrows = rs_original.iter().map(Array2::nrows).sum();
+    if totalrows == 0 {
         return Array2::zeros((0, p));
     }
-    let mut e = Array2::<f64>::zeros((total_rows, p));
+    let mut e = Array2::<f64>::zeros((totalrows, p));
     let mut row_start = 0usize;
     for (k, rs_k) in rs_original.iter().enumerate() {
         let rows = rs_k.nrows();
@@ -3759,7 +3759,7 @@ fn build_sparse_native_reparam_result(
         qs: Array2::<f64>::eye(p),
         rs_transformed: rs_original.to_vec(),
         rs_transposed: rs_original.iter().map(|rs| rs.t().to_owned()).collect(),
-        e_transformed: stack_lambda_weighted_penalty_root(rs_original, lambdas, p),
+        e_transformed: stack_lambdaweighted_penalty_root(rs_original, lambdas, p),
         u_truncated: u_original,
     }
 }
@@ -3768,7 +3768,7 @@ pub struct PirlsProblem<'a, X> {
     pub x: X,
     pub offset: ArrayView1<'a, f64>,
     pub y: ArrayView1<'a, f64>,
-    pub prior_weights: ArrayView1<'a, f64>,
+    pub priorweights: ArrayView1<'a, f64>,
     pub covariate_se: Option<ArrayView1<'a, f64>>,
 }
 
@@ -3806,10 +3806,10 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         x,
         offset,
         y,
-        prior_weights,
+        priorweights,
         covariate_se,
     } = problem;
-    let quad_ctx = crate::quadrature::QuadratureContext::new();
+    let quadctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();
     let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
@@ -3819,7 +3819,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     use crate::construction::{
         EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
-        stable_reparameterization_with_invariant_engine,
+        stable_reparameterizationwith_invariant_engine,
     };
 
     let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = penalty.balanced_penalty_root {
@@ -3834,7 +3834,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let eb: &Array2<f64> = eb_cow.as_ref();
 
     let reparam_result = if let Some(invariant) = penalty.reparam_invariant {
-        stable_reparameterization_with_invariant_engine(
+        stable_reparameterizationwith_invariant_engine(
             penalty.rs_original,
             lambdas_slice,
             EngineDims::new(penalty.p, penalty.rs_original.len()),
@@ -3858,10 +3858,10 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
 
     let x_original: DesignMatrix = x.into();
-    let eb_rows = eb.nrows();
-    let e_rows = reparam_result.e_transformed.nrows();
+    let ebrows = eb.nrows();
+    let erows = reparam_result.e_transformed.nrows();
     let mut workspace =
-        PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), eb_rows, e_rows);
+        PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
     let solver_decision = should_use_sparse_native_pirls(
         &mut workspace,
         &x_original,
@@ -3907,7 +3907,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let (pls_result, _) = solve_penalized_least_squares(
             x_transformed_dense.view(),
             y,
-            prior_weights,
+            priorweights,
             offset,
             &reparam_result.e_transformed,
             &reparam_result.s_transformed,
@@ -3919,29 +3919,29 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let beta_transformed = pls_result.beta;
         let penalized_hessian = pls_result.penalized_hessian;
         let edf = pls_result.edf;
-        let base_ridge = pls_result.ridge_used;
+        let baseridge = pls_result.ridge_used;
 
-        let prior_weights_owned = prior_weights.to_owned();
+        let priorweights_owned = priorweights.to_owned();
         let mut eta = offset.to_owned();
         eta += &x_transformed_dense.dot(beta_transformed.as_ref());
         let final_eta = eta.clone();
-        let final_mu = eta.clone();
-        let final_z = y.to_owned();
+        let finalmu = eta.clone();
+        let finalz = y.to_owned();
 
-        let mut weighted_residual = final_mu.clone();
-        weighted_residual -= &final_z;
-        weighted_residual *= &prior_weights_owned;
+        let mut weighted_residual = finalmu.clone();
+        weighted_residual -= &finalz;
+        weighted_residual *= &priorweights_owned;
         let gradient_data = fast_atv(&x_transformed_dense, &weighted_residual);
         let s_beta = reparam_result.s_transformed.dot(beta_transformed.as_ref());
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
-        let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
-        let mut stabilized_hessian = penalized_hessian.clone();
-        let ridge_used = base_ridge;
+        let deviance = calculate_deviance(y, &finalmu, link_function, priorweights);
+        let mut stabilizedhessian = penalized_hessian.clone();
+        let ridge_used = baseridge;
         if ridge_used > 0.0 {
-            for i in 0..stabilized_hessian.nrows() {
-                stabilized_hessian[[i, i]] += ridge_used;
+            for i in 0..stabilizedhessian.nrows() {
+                stabilizedhessian[[i, i]] += ridge_used;
             }
         }
         if ridge_used > 0.0 {
@@ -3952,13 +3952,13 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         }
 
         let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let max_abs_eta = final_mu.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let max_abs_eta = finalmu.iter().copied().map(f64::abs).fold(0.0, f64::max);
 
         let working_state = WorkingState {
-            eta: LinearPredictor::new(final_mu.clone()),
+            eta: LinearPredictor::new(finalmu.clone()),
             gradient: gradient.clone(),
             hessian: crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian.clone()),
-            sparse_hessian: None,
+            sparsehessian: None,
             deviance,
             penalty_term,
             firth: FirthDiagnostics::Inactive,
@@ -3970,7 +3970,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             state: working_state,
             status: PirlsStatus::Converged,
             iterations: 1,
-            last_gradient_norm: gradient_norm,
+            lastgradient_norm: gradient_norm,
             last_deviance_change: 0.0,
             last_step_size: 1.0,
             last_step_halving: 0,
@@ -3981,15 +3981,15 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         };
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
-            compute_working_weight_derivatives_from_eta(
+            computeworkingweight_derivatives_from_eta(
                 &config.link_kind,
                 &final_eta,
-                prior_weights_owned.view(),
+                priorweights_owned.view(),
             )?;
         let pirls_result = PirlsResult {
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
-            stabilized_hessian_transformed: stabilized_hessian,
+            stabilizedhessian_transformed: stabilizedhessian,
             ridge_passport: RidgePassport::scaled_identity(
                 ridge_used,
                 RidgePolicy::explicit_stabilization_full(),
@@ -3999,13 +3999,13 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             edf,
             stable_penalty_term: penalty_term,
             firth: FirthDiagnostics::Inactive,
-            final_weights: prior_weights_owned.clone(),
+            finalweights: priorweights_owned.clone(),
             final_offset: offset.to_owned(),
             final_eta: final_eta.clone(),
-            final_mu: final_mu.clone(),
-            solve_weights: prior_weights_owned,
-            solve_working_response: final_z.clone(),
-            solve_mu: final_mu.clone(),
+            finalmu: finalmu.clone(),
+            solveweights: priorweights_owned,
+            solveworking_response: finalz.clone(),
+            solvemu: finalmu.clone(),
             solve_dmu_deta,
             solve_d2mu_deta2,
             solve_d3mu_deta3,
@@ -4014,7 +4014,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             status: PirlsStatus::Converged,
             iteration: 1,
             max_abs_eta,
-            last_gradient_norm: gradient_norm,
+            lastgradient_norm: gradient_norm,
             last_deviance_change: 0.0,
             last_step_halving: 0,
             constraint_kkt: working_summary.constraint_kkt.clone(),
@@ -4039,7 +4039,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         coordinate_frame.clone(),
         offset,
         y,
-        prior_weights,
+        priorweights,
         reparam_result_active.s_transformed.clone(),
         reparam_result_active.e_transformed.clone(),
         workspace,
@@ -4050,7 +4050,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 InverseLink::Standard(LinkFunction::Logit)
             ),
         None, // We either use explicit dense transform or sparse native without qs
-        quad_ctx,
+        quadctx,
     );
 
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
@@ -4067,7 +4067,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 penalty.p,
                 link_function,
                 y,
-                prior_weights,
+                priorweights,
                 config.link_kind.mixture_state(),
                 config.link_kind.sas_state(),
             ))
@@ -4103,7 +4103,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         );
     };
 
-    let mut working_summary = run_working_model_pirls(
+    let mut working_summary = runworking_model_pirls(
         &mut working_model,
         Coefficients::new(initial_beta),
         &options,
@@ -4115,9 +4115,9 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         x_active,
         coordinate_frame,
         e_transformed,
-        final_mu,
-        final_weights,
-        final_z,
+        finalmu,
+        finalweights,
+        finalz,
         final_c,
         final_d,
         final_dmu_deta,
@@ -4131,7 +4131,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     // P-IRLS already folded any stabilization ridge directly into the Hessian.
     // Keep that exact matrix so outer LAML derivatives stay consistent:
     // H_eff = X'WX + S_λ + ridge I (if ridge_used > 0).
-    let stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+    let stabilizedhessian_transformed = penalized_hessian_transformed.clone();
 
     let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
     if !edf.is_finite() || edf.is_nan() {
@@ -4146,7 +4146,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
         let grad_ok =
-            working_summary.last_gradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
+            working_summary.lastgradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
         if (working_summary.last_deviance_change.abs() <= dev_tol
             || working_summary.last_step_size <= step_floor)
             && grad_ok
@@ -4162,7 +4162,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
         let grad_ok =
-            working_summary.last_gradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
+            working_summary.lastgradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
         if (working_summary.last_deviance_change.abs() <= dev_tol
             || working_summary.last_step_size <= step_floor)
             && grad_ok
@@ -4181,8 +4181,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         has_penalty,
         firth_active,
         &working_summary,
-        &final_mu,
-        &final_weights,
+        &finalmu,
+        &finalweights,
         y,
     ) {
         status = PirlsStatus::Unstable;
@@ -4201,12 +4201,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         &working_summary,
         offset,
         penalized_hessian_transformed,
-        stabilized_hessian_transformed,
+        stabilizedhessian_transformed,
         edf,
         penalty_term,
-        &final_mu,
-        &final_weights,
-        &final_z,
+        &finalmu,
+        &finalweights,
+        &finalz,
         &final_c,
         &final_d,
         &final_dmu_deta,
@@ -4226,8 +4226,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 #[derive(Clone)]
 pub struct RunPirlsOptions {
     pub family: LikelihoodFamily,
-    pub mixture_link_spec: Option<MixtureLinkSpec>,
-    pub sas_link_spec: Option<SasLinkSpec>,
+    pub mixture_linkspec: Option<MixtureLinkSpec>,
+    pub sas_linkspec: Option<SasLinkSpec>,
     pub max_iter: usize,
     pub tol: f64,
     pub firth_bias_reduction: bool,
@@ -4273,7 +4273,7 @@ pub fn run_pirls<'a>(
     x: ArrayView2<'a, f64>,
     offset: ArrayView1<f64>,
     y: ArrayView1<'a, f64>,
-    prior_weights: ArrayView1<'a, f64>,
+    priorweights: ArrayView1<'a, f64>,
     rs_original: &[Array2<f64>],
     balanced_penalty_root: Option<&Array2<f64>>,
     reparam_invariant: Option<&crate::construction::ReparamInvariant>,
@@ -4286,19 +4286,19 @@ pub fn run_pirls<'a>(
     covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let (link, firth_active) = resolve_pirls_family(opts.family, opts.firth_bias_reduction)?;
-    let mixture_link_state = match &opts.mixture_link_spec {
-        Some(spec) => Some(state_from_spec(spec).map_err(|e| {
+    let mixture_link_state = match &opts.mixture_linkspec {
+        Some(spec) => Some(state_fromspec(spec).map_err(|e| {
             EstimationError::InvalidInput(format!("invalid mixture link spec: {e}"))
         })?),
         None => None,
     };
-    let sas_link_state = match opts.sas_link_spec {
+    let sas_link_state = match opts.sas_linkspec {
         Some(spec) => Some(if matches!(link, LinkFunction::BetaLogistic) {
-            state_from_beta_logistic_spec(spec).map_err(|e| {
+            state_from_beta_logisticspec(spec).map_err(|e| {
                 EstimationError::InvalidInput(format!("invalid Beta-Logistic link spec: {e}"))
             })?
         } else {
-            state_from_sas_spec(spec)
+            state_from_sasspec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link spec: {e}")))?
         }),
         None => None,
@@ -4333,7 +4333,7 @@ pub fn run_pirls<'a>(
             x,
             offset,
             y,
-            prior_weights,
+            priorweights,
             covariate_se: covariate_se.map(|se| se.view()),
         },
         PenaltyConfig {
@@ -4350,7 +4350,7 @@ pub fn run_pirls<'a>(
 }
 
 fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
-    if let Some(sparse) = sparse_from_dense_view(x.view()) {
+    if let Some(sparse) = sparse_from_denseview(x.view()) {
         sparse
     } else {
         DesignMatrix::from(x.clone())
@@ -4398,13 +4398,13 @@ fn build_transformed_lower_bound_constraints(
     if lb.len() != qs.nrows() {
         return None;
     }
-    let active_rows: Vec<usize> = (0..lb.len()).filter(|&i| lb[i].is_finite()).collect();
-    if active_rows.is_empty() {
+    let activerows: Vec<usize> = (0..lb.len()).filter(|&i| lb[i].is_finite()).collect();
+    if activerows.is_empty() {
         return None;
     }
-    let mut a = Array2::<f64>::zeros((active_rows.len(), qs.ncols()));
-    let mut b = Array1::<f64>::zeros(active_rows.len());
-    for (r, &idx) in active_rows.iter().enumerate() {
+    let mut a = Array2::<f64>::zeros((activerows.len(), qs.ncols()));
+    let mut b = Array1::<f64>::zeros(activerows.len());
+    for (r, &idx) in activerows.iter().enumerate() {
         a.row_mut(r).assign(&qs.row(idx));
         b[r] = lb[idx];
     }
@@ -4449,7 +4449,7 @@ fn merge_linear_constraints(
     }
 }
 
-fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
+fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     let nrows = x.nrows();
     let ncols = x.ncols();
     if nrows == 0 || ncols == 0 {
@@ -4490,10 +4490,10 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
 }
 
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
-/// This is a direct translation of `undrop_rows` from mgcv's C code:
+/// This is a direct translation of `undroprows` from mgcv's C code:
 ///
 /// ```c
-/// void undrop_rows(double *X, int r, int c, int *drop, int n_drop) {
+/// void undroprows(double *X, int r, int c, int *drop, int n_drop) {
 ///   double *Xs;
 ///   int i,j,k;
 ///   if (n_drop <= 0) return;
@@ -4513,10 +4513,10 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
 ///
 /// Parameters:
 /// * `src`: Source vector without the dropped rows (length = total - n_drop)
-/// * `dropped_rows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
+/// * `droppedrows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
 /// * `dst`: Destination vector where zeros will be inserted (length = total)
-pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
-    let n_drop = dropped_rows.len();
+pub fn undroprows(src: &Array1<f64>, droppedrows: &[usize], dst: &mut Array1<f64>) {
+    let n_drop = droppedrows.len();
 
     if n_drop == 0 {
         // If no rows to drop, just copy src to dst
@@ -4533,11 +4533,11 @@ pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f
         "Source length + dropped rows must equal destination length"
     );
 
-    // Ensure dropped_rows is in ascending order
+    // Ensure droppedrows is in ascending order
     for i in 1..n_drop {
         assert!(
-            dropped_rows[i] > dropped_rows[i - 1],
-            "dropped_rows must be in ascending order"
+            droppedrows[i] > droppedrows[i - 1],
+            "droppedrows must be in ascending order"
         );
     }
 
@@ -4546,7 +4546,7 @@ pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f
     let mut src_idx = 0usize;
     let mut drop_ptr = 0usize;
     for dst_idx in 0..dst.len() {
-        if drop_ptr < n_drop && dropped_rows[drop_ptr] == dst_idx {
+        if drop_ptr < n_drop && droppedrows[drop_ptr] == dst_idx {
             drop_ptr += 1;
             continue;
         }
@@ -4555,9 +4555,9 @@ pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f
     }
 }
 
-/// Performs the complement operation to undrop_rows - it removes specified rows from a vector
+/// Performs the complement operation to undroprows - it removes specified rows from a vector
 /// This simulates the behavior of drop_cols in the C code but for a 1D vector
-pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
+pub fn droprows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
     let n_drop = drop_indices.len();
 
     if n_drop == 0 {
@@ -4597,7 +4597,7 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
 }
 
 #[inline]
-fn logit_clamp_zero_enabled() -> bool {
+fn logit_clampzero_enabled() -> bool {
     // Auto-correct behavior: when logit geometry enters hard-clamped/nonsmooth
     // regions, force c/d to zero to keep IRLS updates stable and consistent with
     // piecewise-smooth objective behavior.
@@ -4622,9 +4622,9 @@ fn bernoulli_geometry_from_jet(
     eta_raw: f64,
     eta_used: f64,
     y: f64,
-    prior_weight: f64,
+    priorweight: f64,
     jet: MixtureInverseLinkJet,
-    apply_weight_floor: bool,
+    applyweight_floor: bool,
     zero_on_nonsmooth: bool,
 ) -> WorkingBernoulliGeometry {
     const MIN_WEIGHT: f64 = 1e-12;
@@ -4635,7 +4635,7 @@ fn bernoulli_geometry_from_jet(
     let v = (mu * (1.0 - mu)).max(PROB_EPS);
     let n0 = jet.d1 * jet.d1;
     let fisher = n0 / v;
-    let fisher_effective = if apply_weight_floor {
+    let fisher_effective = if applyweight_floor {
         fisher.max(MIN_WEIGHT)
     } else {
         fisher
@@ -4649,13 +4649,13 @@ fn bernoulli_geometry_from_jet(
         let n1 = 2.0 * jet.d1 * jet.d2;
         let n2 = 2.0 * (jet.d2 * jet.d2 + jet.d1 * jet.d3);
         let numer1 = n1 * v - n0 * v1;
-        let c = prior_weight * numer1 / (v * v);
-        let d = prior_weight * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
+        let c = priorweight * numer1 / (v * v);
+        let d = priorweight * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
         (c, d)
     };
     WorkingBernoulliGeometry {
         mu,
-        weight: prior_weight * fisher_effective,
+        weight: priorweight * fisher_effective,
         z: eta_used + (y - mu) / jet.d1.max(MIN_D_FOR_Z),
         c,
         d,
@@ -4663,10 +4663,10 @@ fn bernoulli_geometry_from_jet(
 }
 
 #[inline]
-fn write_identity_working_state(
+fn write_identityworking_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
@@ -4675,7 +4675,7 @@ fn write_identity_working_state(
     let n = eta.len();
     for i in 0..n {
         mu[i] = eta[i];
-        weights[i] = prior_weights[i];
+        weights[i] = priorweights[i];
         z[i] = y[i];
     }
     if let Some(derivs) = derivatives {
@@ -4691,11 +4691,11 @@ fn write_identity_working_state(
 
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
 #[inline]
-pub fn update_glm_vectors(
+pub fn update_glmvectors(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     inverse_link: &InverseLink,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
@@ -4710,7 +4710,7 @@ pub fn update_glm_vectors(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
+                matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
             let mut derivatives = derivatives;
             for i in 0..n {
                 let eta_used = match link {
@@ -4726,7 +4726,7 @@ pub fn update_glm_vectors(
                     eta[i],
                     eta_used,
                     y[i],
-                    prior_weights[i],
+                    priorweights[i],
                     jet,
                     true,
                     zero_on_nonsmooth,
@@ -4745,7 +4745,7 @@ pub fn update_glm_vectors(
             Ok(())
         }
         LinkFunction::Identity => {
-            write_identity_working_state(y, eta, prior_weights, mu, weights, z, derivatives);
+            write_identityworking_state(y, eta, priorweights, mu, weights, z, derivatives);
             Ok(())
         }
     }
@@ -4753,16 +4753,16 @@ pub fn update_glm_vectors(
 
 /// Family-dispatched GLM vector update helper.
 #[inline]
-pub fn update_glm_vectors_by_family(
+pub fn update_glmvectors_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     family: GlmLikelihoodFamily,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
-    family.irls_update(y, eta, prior_weights, mu, weights, z, None, None)
+    family.irls_update(y, eta, priorweights, mu, weights, z, None, None)
 }
 
 /// Updates GLM working vectors using integrated (uncertainty-aware) likelihood.
@@ -4814,13 +4814,13 @@ pub fn update_glm_vectors_by_family(
 ///   exact non-GHQ representations (Gamma / erfc / asymptotic series), which
 ///   is also relevant to survival transforms of the form exp(-exp(eta)).
 ///
-pub(crate) fn update_glm_vectors_integrated_for_link(
-    quad_ctx: &crate::quadrature::QuadratureContext,
+pub(crate) fn update_glmvectors_integrated_for_link(
+    quadctx: &crate::quadrature::QuadratureContext,
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
     inverse_link: &InverseLink,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
@@ -4834,11 +4834,11 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         LinkFunction::Sas => GlmLikelihoodFamily::BinomialSas,
         LinkFunction::BetaLogistic => GlmLikelihoodFamily::BinomialBetaLogistic,
         LinkFunction::Identity => {
-            update_glm_vectors(
+            update_glmvectors(
                 y,
                 eta,
                 inverse_link,
-                prior_weights,
+                priorweights,
                 mu,
                 weights,
                 z,
@@ -4847,13 +4847,13 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
             return Ok(());
         }
     };
-    update_glm_vectors_integrated_by_family(
-        quad_ctx,
+    update_glmvectors_integrated_by_family(
+        quadctx,
         y,
         eta,
         se,
         family,
-        prior_weights,
+        priorweights,
         mu,
         weights,
         z,
@@ -4886,13 +4886,13 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
 /// with link-specific special-function code and lets each family choose the
 /// mathematically correct integration strategy.
 #[inline]
-pub fn update_glm_vectors_integrated_by_family(
-    quad_ctx: &crate::quadrature::QuadratureContext,
+pub fn update_glmvectors_integrated_by_family(
+    quadctx: &crate::quadrature::QuadratureContext,
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
     family: GlmLikelihoodFamily,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
@@ -4914,11 +4914,11 @@ pub fn update_glm_vectors_integrated_by_family(
     }
     let n = eta.len();
     let zero_on_nonsmooth =
-        matches!(family, GlmLikelihoodFamily::BinomialLogit) && logit_clamp_zero_enabled();
+        matches!(family, GlmLikelihoodFamily::BinomialLogit) && logit_clampzero_enabled();
     let mut derivatives = derivatives;
     for i in 0..n {
-        let moments = crate::quadrature::integrated_family_moments_jet_with_state(
-            quad_ctx,
+        let moments = crate::quadrature::integrated_family_moments_jetwith_state(
+            quadctx,
             family.into(),
             eta[i],
             se[i],
@@ -4936,7 +4936,7 @@ pub fn update_glm_vectors_integrated_by_family(
             eta[i],
             e,
             y[i],
-            prior_weights[i],
+            priorweights[i],
             local_jet,
             false,
             zero_on_nonsmooth,
@@ -4956,7 +4956,7 @@ pub fn update_glm_vectors_integrated_by_family(
 }
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
-/// consistent with the clamping/flooring used by `update_glm_vectors`.
+/// consistent with the clamping/flooring used by `update_glmvectors`.
 ///
 /// Math note:
 /// - In the smooth interior (no clamps/floors active), `c[i]` and `d[i]` are
@@ -4972,10 +4972,10 @@ pub fn update_glm_vectors_integrated_by_family(
 ///   practical subgradient-like choice to avoid unstable explosive derivatives.
 ///   In that regime analytic and central-FD gradients can diverge because FD may
 ///   straddle a kink.
-fn compute_working_weight_derivatives_from_eta(
+fn computeworkingweight_derivatives_from_eta(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
 ) -> Result<
     (
         Array1<f64>,
@@ -5003,7 +5003,7 @@ fn compute_working_weight_derivatives_from_eta(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
+                matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
@@ -5018,7 +5018,7 @@ fn compute_working_weight_derivatives_from_eta(
                     eta[i],
                     eta_used,
                     jet.mu,
-                    prior_weights[i],
+                    priorweights[i],
                     jet,
                     true,
                     zero_on_nonsmooth,
@@ -5042,74 +5042,74 @@ pub enum DirectionalWorkingCurvature {
     Diagonal(Array1<f64>),
 }
 
-fn directional_working_curvature_diagonal_builtin(
+fn directionalworking_curvature_diagonal_builtin(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     let (c, _, _, _, _) =
-        compute_working_weight_derivatives_from_eta(inverse_link, eta, prior_weights)?;
+        computeworkingweight_derivatives_from_eta(inverse_link, eta, priorweights)?;
     let mut w_direction = &c * eta_direction;
     for i in 0..w_direction.len() {
-        if solve_weights[i] <= 0.0 || !w_direction[i].is_finite() {
+        if solveweights[i] <= 0.0 || !w_direction[i].is_finite() {
             w_direction[i] = 0.0;
         }
     }
     Ok(DirectionalWorkingCurvature::Diagonal(w_direction))
 }
 
-fn directional_working_curvature_logit(
+fn directionalworking_curvature_logit(
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    directional_working_curvature_diagonal_builtin(
+    directionalworking_curvature_diagonal_builtin(
         &InverseLink::Standard(LinkFunction::Logit),
         eta,
-        prior_weights,
-        solve_weights,
+        priorweights,
+        solveweights,
         eta_direction,
     )
 }
 
-fn directional_working_curvature_probit(
+fn directionalworking_curvature_probit(
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    directional_working_curvature_diagonal_builtin(
+    directionalworking_curvature_diagonal_builtin(
         &InverseLink::Standard(LinkFunction::Probit),
         eta,
-        prior_weights,
-        solve_weights,
+        priorweights,
+        solveweights,
         eta_direction,
     )
 }
 
-fn directional_working_curvature_cloglog(
+fn directionalworking_curvature_cloglog(
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    directional_working_curvature_diagonal_builtin(
+    directionalworking_curvature_diagonal_builtin(
         &InverseLink::Standard(LinkFunction::CLogLog),
         eta,
-        prior_weights,
-        solve_weights,
+        priorweights,
+        solveweights,
         eta_direction,
     )
 }
 
-fn directional_working_curvature_identity(
+fn directionalworking_curvature_identity(
     eta: &Array1<f64>,
-    _prior_weights: ArrayView1<'_, f64>,
-    _solve_weights: &Array1<f64>,
-    _eta_direction: &Array1<f64>,
+    _: ArrayView1<'_, f64>,
+    _: &Array1<f64>,
+    _: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     // Gaussian identity has constant W in η, so W_τ = 0.
     Ok(DirectionalWorkingCurvature::Diagonal(Array1::<f64>::zeros(
@@ -5127,28 +5127,28 @@ fn directional_working_curvature_identity(
 /// in observation space, so the operator currently reduces to a diagonal
 /// vector. Keeping it behind this family dispatch avoids hard-coding the
 /// diagonal special case at higher layers like REML hyper-gradients.
-pub fn directional_working_curvature_from_eta(
+pub fn directionalworking_curvature_from_eta(
     link: LinkFunction,
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     match link {
         LinkFunction::Logit => {
-            directional_working_curvature_logit(eta, prior_weights, solve_weights, eta_direction)
+            directionalworking_curvature_logit(eta, priorweights, solveweights, eta_direction)
         }
         LinkFunction::Probit => {
-            directional_working_curvature_probit(eta, prior_weights, solve_weights, eta_direction)
+            directionalworking_curvature_probit(eta, priorweights, solveweights, eta_direction)
         }
         LinkFunction::CLogLog => {
-            directional_working_curvature_cloglog(eta, prior_weights, solve_weights, eta_direction)
+            directionalworking_curvature_cloglog(eta, priorweights, solveweights, eta_direction)
         }
         LinkFunction::Identity => {
-            directional_working_curvature_identity(eta, prior_weights, solve_weights, eta_direction)
+            directionalworking_curvature_identity(eta, priorweights, solveweights, eta_direction)
         }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
-            "state-less directional SAS curvature is unsupported; use directional_working_curvature_from_eta_with_state with SasLinkState"
+            "state-less directional SAS curvature is unsupported; use directionalworking_curvature_from_etawith_state with SasLinkState"
                 .to_string(),
         )),
         LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
@@ -5159,30 +5159,30 @@ pub fn directional_working_curvature_from_eta(
 
 /// State-aware directional derivative of PIRLS working curvature.
 ///
-/// Unlike `directional_working_curvature_from_eta`, this path evaluates
+/// Unlike `directionalworking_curvature_from_eta`, this path evaluates
 /// curvature using the active parameterized inverse-link state (mixture/SAS)
 /// when present. This keeps REML directional derivatives consistent with the
 /// inner working model surface.
-pub fn directional_working_curvature_from_eta_with_state(
+pub fn directionalworking_curvature_from_etawith_state(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     match inverse_link.link_function() {
         LinkFunction::Identity => {
-            directional_working_curvature_identity(eta, prior_weights, solve_weights, eta_direction)
+            directionalworking_curvature_identity(eta, priorweights, solveweights, eta_direction)
         }
         LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
         | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => directional_working_curvature_diagonal_builtin(
+        | LinkFunction::BetaLogistic => directionalworking_curvature_diagonal_builtin(
             inverse_link,
             eta,
-            prior_weights,
-            solve_weights,
+            priorweights,
+            solveweights,
             eta_direction,
         ),
     }
@@ -5205,7 +5205,7 @@ pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
     link: LinkFunction,
-    prior_weights: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
     match link {
@@ -5214,7 +5214,7 @@ pub fn calculate_deviance(
         | LinkFunction::CLogLog
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
-            let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
+            let total_residual = ndarray::Zip::from(y).and(mu).and(priorweights).fold(
                 0.0,
                 |acc, &yi, &mui, &wi| {
                     let mui_c = mui;
@@ -5239,7 +5239,7 @@ pub fn calculate_deviance(
             // Weighted RSS: sum_i w_i (y_i - mu_i)^2
             ndarray::Zip::from(y)
                 .and(mu)
-                .and(prior_weights)
+                .and(priorweights)
                 .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
                 .sum()
         }
@@ -5279,7 +5279,7 @@ pub fn solve_penalized_least_squares(
     let p_dim = x_transformed.ncols();
 
     // 1. Prepare weighted buffers
-    workspace.fill_sqrt_weights(&weights);
+    workspace.fill_sqrtweights(&weights);
 
     // wz := w .* (z - offset)  (used for X'Wz)
     workspace.wz.assign(&z);
@@ -5298,14 +5298,14 @@ pub fn solve_penalized_least_squares(
     if workspace.vec_buf_p.len() != p_dim {
         workspace.vec_buf_p = Array1::zeros(p_dim);
     }
-    let x_view = FaerArrayView::new(&x_transformed);
-    let wz_view = FaerColView::new(&workspace.wz);
-    let mut xtwz_view = array1_to_col_mat_mut(&mut workspace.vec_buf_p);
+    let xview = FaerArrayView::new(&x_transformed);
+    let wzview = FaerColView::new(&workspace.wz);
+    let mut xtwzview = array1_to_col_matmut(&mut workspace.vec_buf_p);
     matmul(
-        xtwz_view.as_mut(),
+        xtwzview.as_mut(),
         Accum::Replace,
-        x_view.as_ref().transpose(),
-        wz_view.as_ref(),
+        xview.as_ref().transpose(),
+        wzview.as_ref(),
         1.0,
         get_global_parallelism(),
     );
@@ -5363,15 +5363,15 @@ pub fn solve_penalized_least_squares(
     // solution and the standard dV/dρ formula (ignoring dβ/dρ) becomes invalid.
     let nugget = FIXED_STABILIZATION_RIDGE;
 
-    let mut regularized_hessian = penalized_hessian.clone();
+    let mut regularizedhessian = penalized_hessian.clone();
     if nugget > 0.0 {
         for i in 0..p_dim {
-            regularized_hessian[[i, i]] += nugget;
+            regularizedhessian[[i, i]] += nugget;
         }
     }
 
     // Build the RHS for the system H * beta = X'Wz
-    let rhs_vec = &workspace.vec_buf_p; // X'Wz
+    let rhsvec = &workspace.vec_buf_p; // X'Wz
 
     // Track detected numerical rank and the actual stabilization used.
     let ridge_used = nugget;
@@ -5380,25 +5380,25 @@ pub fn solve_penalized_least_squares(
     if workspace.rhs_full.len() != p_dim {
         workspace.rhs_full = Array1::zeros(p_dim);
     }
-    workspace.rhs_full.assign(rhs_vec);
+    workspace.rhs_full.assign(rhsvec);
     let factor = StableSolver::new("pirls stable pls")
-        .factorize(&regularized_hessian)
+        .factorize(&regularizedhessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
-    let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
-    factor.solve_in_place(rhs_view.as_mut());
+    let mut rhsview = array1_to_col_matmut(&mut workspace.rhs_full);
+    factor.solve_in_place(rhsview.as_mut());
     if !array1_is_finite(&workspace.rhs_full) {
         return Err(EstimationError::LinearSystemSolveFailed(
             FaerLinalgError::FactorizationFailed,
         ));
     }
-    let (beta_vec, detected_rank) = (workspace.rhs_full.clone(), p_dim);
+    let (betavec, detected_rank) = (workspace.rhs_full.clone(), p_dim);
 
     // 7. Calculate EDF and Scale
-    // Re-use `regularized_hessian` for EDF to consistency.
-    let edf = calculate_edf_with_workspace(&regularized_hessian, e_transformed, workspace)?;
+    // Re-use `regularizedhessian` for EDF to consistency.
+    let edf = calculate_edfwithworkspace(&regularizedhessian, e_transformed, workspace)?;
 
     let standard_deviation = calculate_scale(
-        &beta_vec,
+        &betavec,
         x_transformed,
         y,
         weights,
@@ -5409,7 +5409,7 @@ pub fn solve_penalized_least_squares(
 
     Ok((
         StablePLSResult {
-            beta: Coefficients::new(beta_vec),
+            beta: Coefficients::new(betavec),
             penalized_hessian, // Return original H for derivatives
             edf,
             standard_deviation,
@@ -5429,13 +5429,13 @@ fn calculate_edf(
         return Ok(p as f64);
     }
     let rhs_arr = e_transformed.t().to_owned();
-    let rhs_view = FaerArrayView::new(&rhs_arr);
+    let rhsview = FaerArrayView::new(&rhs_arr);
     let factor = StableSolver::new("pirls edf")
         .factorize(penalized_hessian)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })?;
-    let sol = factor.solve(rhs_view.as_ref());
+    let sol = factor.solve(rhsview.as_ref());
     if sol.nrows() == p && sol.ncols() == r && matref_is_finite(sol.as_ref()) {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[(i, j)]
@@ -5447,7 +5447,7 @@ fn calculate_edf(
     })
 }
 
-fn calculate_edf_with_workspace(
+fn calculate_edfwithworkspace(
     penalized_hessian: &Array2<f64>,
     e_transformed: &Array2<f64>,
     workspace: &mut PirlsWorkspace,
@@ -5473,8 +5473,8 @@ fn calculate_edf_with_workspace(
             condition_number: f64::INFINITY,
         })?;
     {
-        let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
-        factor.solve_in_place(rhs_view.as_mut());
+        let mut rhsview = array2_to_matmut(&mut workspace.final_aug_matrix);
+        factor.solve_in_place(rhsview.as_mut());
     }
     if workspace.final_aug_matrix.nrows() == p
         && workspace.final_aug_matrix.ncols() == r
@@ -5569,11 +5569,11 @@ pub fn compute_final_penalized_hessian(
     let p = x.ncols();
 
     // Stage: Perform the QR decomposition of sqrt(W)X to get R_bar
-    let sqrt_w = weights.mapv(|w| w.max(0.0).sqrt());
-    let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
+    let sqrtw = weights.mapv(|w| w.max(0.0).sqrt());
+    let wx = &x * &sqrtw.view().insert_axis(ndarray::Axis(1));
     let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    let r_rows = r_bar.nrows().min(p);
-    let r1_full = r_bar.slice(s![..r_rows, ..]);
+    let rrows = r_bar.nrows().min(p);
+    let r1_full = r_bar.slice(s![..rrows, ..]);
 
     // Stage: Get the square root of the penalty matrix, E
     // We need to use eigendecomposition as S_lambda is not necessarily from a single root
@@ -5607,12 +5607,12 @@ pub fn compute_final_penalized_hessian(
     // Note: Here we use the full, un-truncated matrices because we are just computing
     // the Hessian for a given model, not performing rank detection.
     let e_t = e.t();
-    let nr = r_rows + e_t.nrows();
+    let nr = rrows + e_t.nrows();
     let mut augmented_matrix = Array2::zeros((nr, p));
     augmented_matrix
-        .slice_mut(s![..r_rows, ..])
+        .slice_mut(s![..rrows, ..])
         .assign(&r1_full);
-    augmented_matrix.slice_mut(s![r_rows.., ..]).assign(&e_t);
+    augmented_matrix.slice_mut(s![rrows.., ..]).assign(&e_t);
 
     // Stage: Perform the QR decomposition on the augmented matrix
     let (_, r_aug) = augmented_matrix
@@ -5630,11 +5630,11 @@ mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut,
-        bernoulli_geometry_from_jet, calculate_scale, compress_active_working_set,
+        bernoulli_geometry_from_jet, calculate_scale, compress_activeworking_set,
         compute_constraint_kkt_diagnostics, default_beta_guess_external, fit_model_for_fixed_rho,
-        logit_clamp_zero_enabled, should_use_sparse_native_pirls,
-        solve_newton_direction_with_linear_constraints, solve_newton_direction_with_lower_bounds,
-        update_glm_vectors_integrated_for_link, working_set_kkt_diagnostics_from_multipliers,
+        logit_clampzero_enabled, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        update_glmvectors_integrated_for_link, working_set_kkt_diagnostics_frommultipliers,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -5671,7 +5671,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_scale_matches_weighted_sd_with_offset() {
+    fn gaussian_scale_matchesweighted_sdwith_offset() {
         let x = array![[1.0], [2.0], [4.0]];
         let beta = array![1.5];
         let offset = array![0.5, -1.0, 2.0];
@@ -5707,7 +5707,7 @@ mod tests {
     }
 
     #[test]
-    fn kkt_diagnostics_zero_for_strictly_feasible_stationary_point() {
+    fn kkt_diagnosticszero_for_strictly_feasible_stationary_point() {
         let constraints = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [0.0, 1.0]],
             b: array![0.0, 0.0],
@@ -5739,7 +5739,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_releases_positive_kkt_system_multiplier() {
+    fn linear_constraint_active_set_releases_positive_kkt_systemmultiplier() {
         // min_d g^T d + 0.5 d^T H d, subject to A(beta + d) >= b
         // with beta fixed at the lower bound x >= 0 and an upper bound x <= 0.1.
         // The first active-set KKT solve at x=0 yields d=0 and lambda_sys=+1
@@ -5753,7 +5753,7 @@ mod tests {
         };
         let mut direction = Array1::zeros(1);
 
-        solve_newton_direction_with_linear_constraints(
+        solve_newton_directionwith_linear_constraints(
             &hessian,
             &gradient,
             &beta,
@@ -5771,7 +5771,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_ignores_near_tangential_inactive_rows() {
+    fn linear_constraint_active_set_ignores_near_tangential_inactiverows() {
         let hessian = array![[1.0, 0.0], [0.0, 1.0]];
         let gradient = array![-1.0, 0.0];
         let beta = array![0.0, 0.0];
@@ -5781,7 +5781,7 @@ mod tests {
         };
         let mut direction = Array1::zeros(2);
 
-        solve_newton_direction_with_linear_constraints(
+        solve_newton_directionwith_linear_constraints(
             &hessian,
             &gradient,
             &beta,
@@ -5920,7 +5920,7 @@ mod tests {
         let mut d2 = Array1::<f64>::zeros(1);
         let mut d3 = Array1::<f64>::zeros(1);
 
-        update_glm_vectors_integrated_for_link(
+        update_glmvectors_integrated_for_link(
             &ctx,
             y.view(),
             &eta,
@@ -5959,7 +5959,7 @@ mod tests {
                 d3: jet.d3,
             },
             false,
-            logit_clamp_zero_enabled(),
+            logit_clampzero_enabled(),
         );
 
         assert_relative_eq!(mu[0], expected.mu, epsilon = 1e-12);
@@ -5999,7 +5999,7 @@ mod tests {
                 x: x.view(),
                 offset: offset.view(),
                 y: y.view(),
-                prior_weights: w.view(),
+                priorweights: w.view(),
                 covariate_se: Some(covariate_se.view()),
             },
             PenaltyConfig {
@@ -6036,7 +6036,7 @@ mod tests {
                     d3: jet.d3,
                 },
                 false,
-                logit_clamp_zero_enabled(),
+                logit_clampzero_enabled(),
             );
             assert_relative_eq!(
                 fit.solve_dmu_deta[i],
@@ -6072,7 +6072,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_releases_stale_warm_boundary_hint() {
+    fn linear_constraint_active_set_releases_stalewarm_boundary_hint() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
         let beta = array![1e-9];
@@ -6083,7 +6083,7 @@ mod tests {
         let mut direction = Array1::zeros(1);
         let mut active_hint = vec![0];
 
-        solve_newton_direction_with_linear_constraints(
+        solve_newton_directionwith_linear_constraints(
             &hessian,
             &gradient,
             &beta,
@@ -6100,7 +6100,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_releases_stale_warm_hint() {
+    fn linear_constraint_active_set_releases_stalewarm_hint() {
         let hessian = array![[1.0]];
         let gradient = array![-1.0];
         let beta = array![0.0];
@@ -6111,7 +6111,7 @@ mod tests {
         let mut direction = Array1::zeros(1);
         let mut active_hint = vec![0];
 
-        solve_newton_direction_with_linear_constraints(
+        solve_newton_directionwith_linear_constraints(
             &hessian,
             &gradient,
             &beta,
@@ -6130,7 +6130,7 @@ mod tests {
     }
 
     #[test]
-    fn working_set_kkt_diagnostics_use_active_set_multipliers() {
+    fn working_set_kkt_diagnostics_use_active_setmultipliers() {
         let working_constraints = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [2.0, 0.0], [0.0, 1.0]],
             b: array![0.0, 0.0, 0.0],
@@ -6139,7 +6139,7 @@ mod tests {
         let lambda_true = array![1.0, 0.5, 2.0];
         let gradient = working_constraints.a.t().dot(&lambda_true);
 
-        let kkt = working_set_kkt_diagnostics_from_multipliers(
+        let kkt = working_set_kkt_diagnostics_frommultipliers(
             &x,
             &gradient,
             &working_constraints,
@@ -6156,7 +6156,7 @@ mod tests {
     }
 
     #[test]
-    fn compress_active_working_set_groups_near_collinear_rows() {
+    fn compress_activeworking_set_groups_near_collinearrows() {
         let constraints = LinearInequalityConstraints {
             a: array![
                 [0.0, 0.5, 0.0],
@@ -6169,7 +6169,7 @@ mod tests {
         let active = vec![0, 1, 2];
 
         let compressed =
-            compress_active_working_set(&x, &constraints, &active).expect("compress working set");
+            compress_activeworking_set(&x, &constraints, &active).expect("compress working set");
 
         assert_eq!(compressed.constraints.a.nrows(), 2);
         assert_eq!(compressed.groups.len(), 2);
@@ -6181,7 +6181,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_bound_active_set_releases_stale_warm_boundary_hint() {
+    fn lower_bound_active_set_releases_stalewarm_boundary_hint() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
         let beta = array![1e-9];
@@ -6189,7 +6189,7 @@ mod tests {
         let mut direction = Array1::zeros(1);
         let mut active_hint = vec![0];
 
-        solve_newton_direction_with_lower_bounds(
+        solve_newton_directionwith_lower_bounds(
             &hessian,
             &gradient,
             &beta,
@@ -6206,7 +6206,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_bound_active_set_releases_stale_warm_hint() {
+    fn lower_bound_active_set_releases_stalewarm_hint() {
         let hessian = array![[1.0]];
         let gradient = array![-1.0];
         let beta = array![0.0];
@@ -6214,7 +6214,7 @@ mod tests {
         let mut direction = Array1::zeros(1);
         let mut active_hint = vec![0];
 
-        solve_newton_direction_with_lower_bounds(
+        solve_newton_directionwith_lower_bounds(
             &hessian,
             &gradient,
             &beta,

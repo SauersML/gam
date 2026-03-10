@@ -23,7 +23,7 @@ fn sigma_numdual<D: DualNum<f64> + Copy>(eta: D) -> D {
     eta.exp()
 }
 
-fn e2e_objective_numdual<D: DualNum<f64> + Copy>(theta: D, data: &E2EData) -> D {
+fn e2eobjective_numdual<D: DualNum<f64> + Copy>(theta: D, data: &E2EData) -> D {
     let mut acc = D::zero();
     for i in 0..data.a.len() {
         let eta = theta * D::from(data.a[i]) + D::from(data.b[i]);
@@ -36,7 +36,7 @@ fn e2e_objective_numdual<D: DualNum<f64> + Copy>(theta: D, data: &E2EData) -> D 
     acc
 }
 
-fn e2e_objective_f64(theta: f64, data: &E2EData) -> f64 {
+fn e2eobjective_f64(theta: f64, data: &E2EData) -> f64 {
     let mut acc = 0.0;
     for i in 0..data.a.len() {
         let eta = theta * data.a[i] + data.b[i];
@@ -87,19 +87,19 @@ fn e2e_manual_derivatives(theta: f64, data: &E2EData) -> (f64, f64, f64, f64) {
 
 #[derive(Clone)]
 struct SigmaFn<T: AD> {
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> SigmaFn<T> {
     fn new() -> Self {
         Self {
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
     fn to_other_ad_type<T2: AD>(&self) -> SigmaFn<T2> {
         SigmaFn {
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }
@@ -107,7 +107,7 @@ impl<T: AD> SigmaFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SigmaFn<T> {
     const NAME: &'static str = "SigmaFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         vec![inputs[0].exp()]
     }
 
@@ -123,21 +123,21 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SigmaFn<T> {
 #[derive(Clone)]
 struct E2EFn<T: AD> {
     data: E2EData,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> E2EFn<T> {
     fn new(data: E2EData) -> Self {
         Self {
             data,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
     fn to_other_ad_type<T2: AD>(&self) -> E2EFn<T2> {
         E2EFn {
             data: self.data.clone(),
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }
@@ -145,7 +145,7 @@ impl<T: AD> E2EFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
     const NAME: &'static str = "E2EFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         let theta = inputs[0];
         let mut acc = T::zero();
 
@@ -171,7 +171,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
 }
 
 #[test]
-fn sigma_manual_matches_num_dual_first_through_third() {
+fn sigma_manual_matches_num_dual_first_throughthird() {
     let points = [-7.0, -3.0, -1.25, -0.2, 0.0, 0.4, 1.7, 3.2, 6.5];
 
     for eta in points {
@@ -213,7 +213,7 @@ fn sigma_manual_matches_ad_trait_forward_mode_first_derivative() {
 
     for eta in points {
         let (_, d1, _, _) = exp_sigma_derivs_up_to_third_scalar(eta);
-        let (_value, jac) = engine.derivative(&[eta]);
+        let (value, jac) = engine.derivative(&[eta]);
         assert_manual_ad_band!("sigma_ad_trait", eta, "d1", d1, "ad_trait" => jac[(0, 0)]);
     }
 }
@@ -236,11 +236,11 @@ fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
     for theta in points {
         let (v_manual, d1_manual, d2_manual, d3_manual) = e2e_manual_derivatives(theta, &data);
 
-        let (v_nd, d1_nd) = first_derivative(|t| e2e_objective_numdual(t, &data), theta);
-        let (_v_nd2, _d1_nd2, d2_nd) =
-            second_derivative(|t| e2e_objective_numdual(t, &data), theta);
-        let (_v_nd3, _d1_nd3, _d2_nd3, d3_nd) =
-            third_derivative(|t| e2e_objective_numdual(t, &data), theta);
+        let (v_nd, d1_nd) = first_derivative(|t| e2eobjective_numdual(t, &data), theta);
+        let (v_nd2, d1_nd2, d2_nd) =
+            second_derivative(|t| e2eobjective_numdual(t, &data), theta);
+        let (v_nd3, d1_nd3, d2_nd3, d3_nd) =
+            third_derivative(|t| e2eobjective_numdual(t, &data), theta);
 
         let d1_autodiff = diff(
             |x: F1| {
@@ -261,7 +261,7 @@ fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
         let d1_ad_trait = jac_ad_trait[(0, 0)];
 
         assert_manual_ad_band!("e2e", theta, "value", v_manual,
-            "plain_f64" => e2e_objective_f64(theta, &data),
+            "plain_f64" => e2eobjective_f64(theta, &data),
             "num_dual" => v_nd,
             "ad_trait" => values_ad_trait[0]);
         assert_manual_ad_band!("e2e", theta, "d1", d1_manual,

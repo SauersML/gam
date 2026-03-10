@@ -1,5 +1,5 @@
 use gam::estimate::{
-    ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
 };
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, array};
@@ -26,7 +26,7 @@ fn one_penalty(p: usize) -> Vec<Array2<f64>> {
     vec![s]
 }
 
-fn fd_gradient(
+fn fdgradient(
     y: &Array1<f64>,
     w: &Array1<f64>,
     x: &Array2<f64>,
@@ -40,7 +40,7 @@ fn fd_gradient(
     for k in 0..rho.len() {
         let mut rp = rho.clone();
         rp[k] += h;
-        let fp = evaluate_external_cost_and_ridge(
+        let fp = evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
@@ -54,7 +54,7 @@ fn fd_gradient(
 
         let mut rm = rho.clone();
         rm[k] -= h;
-        let fm = evaluate_external_cost_and_ridge(
+        let fm = evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
@@ -72,7 +72,7 @@ fn fd_gradient(
 }
 
 #[test]
-fn test_log_det_gradient_formula() {
+fn test_log_detgradient_formula() {
     use faer::Side;
     use gam::faer_ndarray::FaerCholesky;
 
@@ -85,7 +85,7 @@ fn test_log_det_gradient_formula() {
 
     let a = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.2], [0.5, 0.2, 2.0]];
     let h = 1e-7;
-    let mut grad_fd = Array2::<f64>::zeros((3, 3));
+    let mut gradfd = Array2::<f64>::zeros((3, 3));
     for i in 0..3 {
         for j in 0..3 {
             let mut a_plus = a.clone();
@@ -94,7 +94,7 @@ fn test_log_det_gradient_formula() {
             a_minus[[i, j]] -= h;
             a_plus[[j, i]] = a_plus[[i, j]];
             a_minus[[j, i]] = a_minus[[i, j]];
-            grad_fd[[i, j]] =
+            gradfd[[i, j]] =
                 (log_det_chol(&a_plus).unwrap() - log_det_chol(&a_minus).unwrap()) / (2.0 * h);
         }
     }
@@ -127,17 +127,17 @@ fn test_log_det_gradient_formula() {
     }
 
     for i in 0..3 {
-        assert!((grad_fd[[i, i]] - a_inv[[i, i]]).abs() < 1e-4);
+        assert!((gradfd[[i, i]] - a_inv[[i, i]]).abs() < 1e-4);
     }
     for i in 0..3 {
         for j in (i + 1)..3 {
-            assert!((grad_fd[[i, j]] - 2.0 * a_inv[[i, j]]).abs() < 1e-4);
+            assert!((gradfd[[i, j]] - 2.0 * a_inv[[i, j]]).abs() < 1e-4);
         }
     }
 }
 
 #[test]
-fn test_laml_gradient_nonfirth_well_conditioned() {
+fn test_lamlgradient_nonfirthwell_conditioned() {
     let n = 220;
     let p = 8;
     let x = build_design(42, n, p);
@@ -160,7 +160,7 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
         firth_bias_reduction: None,
     };
     let rho = array![0.0];
-    let (analytic, _) = evaluate_external_gradients(
+    let (analytic, _) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),
@@ -170,7 +170,7 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
         &rho,
     )
     .expect("analytic");
-    let fd = fd_gradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
+    let fd = fdgradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
     for i in 0..analytic.len() {
         assert_eq!(
             analytic[i].signum(),
@@ -198,7 +198,7 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
 }
 
 #[test]
-fn test_laml_gradient_logit_with_firth_well_conditioned() {
+fn test_lamlgradient_logitwith_firthwell_conditioned() {
     let n = 260;
     let p = 8;
     let x = build_design(123, n, p);
@@ -231,7 +231,7 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
         firth_bias_reduction: None,
     };
     let rho = array![0.0];
-    let (analytic, _) = evaluate_external_gradients(
+    let (analytic, _) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),
@@ -241,7 +241,7 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
         &rho,
     )
     .expect("analytic");
-    let fd = fd_gradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
+    let fd = fdgradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
     for i in 0..analytic.len() {
         assert_eq!(
             analytic[i].signum(),
@@ -266,7 +266,7 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
 }
 
 #[test]
-fn stress_test_firth_gradient_vs_conditioning() {
+fn stress_test_firthgradientvs_conditioning() {
     let configs = [(200usize, 4usize), (150usize, 6usize), (100usize, 8usize)];
     let mut saw_ok = false;
     for (n, p) in configs {
@@ -300,7 +300,7 @@ fn stress_test_firth_gradient_vs_conditioning() {
             firth_bias_reduction: None,
         };
         let rho = array![0.0];
-        let Ok((analytic, _)) = evaluate_external_gradients(
+        let Ok((analytic, _)) = evaluate_externalgradients(
             y.view(),
             w.view(),
             x.view(),
@@ -311,7 +311,7 @@ fn stress_test_firth_gradient_vs_conditioning() {
         ) else {
             continue;
         };
-        let fd = fd_gradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
+        let fd = fdgradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
         for i in 0..analytic.len() {
             assert_eq!(
                 analytic[i].signum(),

@@ -43,13 +43,13 @@ pub fn working_model_from_flattened(
         }
     };
 
-    WorkingModelSurvival::from_engine_inputs_with_offsets(
+    WorkingModelSurvival::from_engine_inputswith_offsets(
         SurvivalEngineInputs {
             age_entry: inputs.age_entry,
             age_exit: inputs.age_exit,
             event_target: inputs.event_target,
             event_competing: inputs.event_competing,
-            sample_weight: inputs.weights,
+            sampleweight: inputs.weights,
             x_entry: inputs.x_entry,
             x_exit: inputs.x_exit,
             x_derivative: inputs.x_derivative,
@@ -62,7 +62,7 @@ pub fn working_model_from_flattened(
 }
 
 /// Compute expected Hessian directly from flattened inputs.
-pub fn expected_hessian_from_flattened(
+pub fn expectedhessian_from_flattened(
     penalties: PenaltyBlocks,
     monotonicity: MonotonicityPenalty,
     spec: SurvivalSpec,
@@ -107,7 +107,7 @@ pub struct SurvivalLambdaOptimizerResult {
     pub lambdas: Array1<f64>,
     pub final_value: f64,
     pub iterations: usize,
-    pub final_grad_norm: f64,
+    pub finalgrad_norm: f64,
     pub stationary: bool,
 }
 
@@ -139,7 +139,7 @@ fn warn_survival_lambda_optimization_health(
             "[survival lambda opt/{context}] non-stationary exit (iters={}, max_iter={}, ||grad||={:.3e}, tol={:.3e})",
             result.iterations,
             options.max_iter,
-            result.final_grad_norm,
+            result.finalgrad_norm,
             options.tol
         );
     }
@@ -150,11 +150,11 @@ fn warn_survival_lambda_optimization_health(
             options.max_iter
         );
     }
-    if !result.final_value.is_finite() || !result.final_grad_norm.is_finite() {
+    if !result.final_value.is_finite() || !result.finalgrad_norm.is_finite() {
         log::warn!(
             "[survival lambda opt/{context}] non-finite terminal diagnostics (value={}, ||grad||={})",
             result.final_value,
-            result.final_grad_norm
+            result.finalgrad_norm
         );
     }
     if !finite_range_ok {
@@ -181,10 +181,10 @@ fn warn_survival_lambda_optimization_health(
 /// The engine optimizer then runs multi-start BFGS directly in `rho = log(lambda)`
 /// coordinates and uses that gradient as-is; it does not apply any additional
 /// `lambda -> rho` chain-rule transform.
-pub fn optimize_survival_lambdas_with_multistart<F>(
+pub fn optimize_survival_lambdaswithmultistart<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    objective_with_gradient: F,
+    objectivewithgradient: F,
     options: &SurvivalLambdaOptimizerOptions,
 ) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
 where
@@ -192,10 +192,10 @@ where
 {
     let mut eval_count = 0usize;
     let mut warned_rho_extreme = false;
-    let mut warned_nonfinite_value = false;
-    let mut warned_nonfinite_grad = false;
-    let mut objective_with_gradient = objective_with_gradient;
-    let wrapped_objective = |rho: &Array1<f64>| {
+    let mut warned_nonfinitevalue = false;
+    let mut warned_nonfinitegrad = false;
+    let mut objectivewithgradient = objectivewithgradient;
+    let wrappedobjective = |rho: &Array1<f64>| {
         eval_count += 1;
         if !warned_rho_extreme && rho.iter().any(|r| r.abs() > 12.0) {
             warned_rho_extreme = true;
@@ -205,16 +205,16 @@ where
                 rho.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
             );
         }
-        let (value, grad) = objective_with_gradient(rho)?;
-        if !warned_nonfinite_value && !value.is_finite() {
-            warned_nonfinite_value = true;
+        let (value, grad) = objectivewithgradient(rho)?;
+        if !warned_nonfinitevalue && !value.is_finite() {
+            warned_nonfinitevalue = true;
             log::warn!(
                 "[survival lambda opt/exact] non-finite objective value at eval {}",
                 eval_count
             );
         }
-        if !warned_nonfinite_grad && grad.iter().any(|g| !g.is_finite()) {
-            warned_nonfinite_grad = true;
+        if !warned_nonfinitegrad && grad.iter().any(|g| !g.is_finite()) {
+            warned_nonfinitegrad = true;
             log::warn!(
                 "[survival lambda opt/exact] non-finite rho-gradient at eval {}",
                 eval_count
@@ -229,14 +229,14 @@ where
         max_iter: options.max_iter,
         tol: options.tol,
         finite_diff_step: options.finite_diff_step,
-        fd_hessian_max_dim: usize::MAX,
+        fdhessian_max_dim: usize::MAX,
         optimizer_kind: crate::estimate::SmoothingOptimizerKind::Bfgs,
         seed_config: options.seed_config,
     };
-    let result = crate::estimate::optimize_log_smoothing_with_multistart_with_gradient(
+    let result = crate::estimate::optimize_log_smoothingwithmultistartwithgradient(
         num_penalties,
         heuristic_lambdas,
-        wrapped_objective,
+        wrappedobjective,
         &core_opts,
     )?;
     warn_survival_lambda_optimization_health("exact", &result, options);
@@ -246,14 +246,14 @@ where
         lambdas,
         final_value: result.final_value,
         iterations: result.iterations,
-        final_grad_norm: result.final_grad_norm,
+        finalgrad_norm: result.finalgrad_norm,
         stationary: result.stationary,
     })
 }
 
 /// Explicit finite-difference fallback for callers that only expose an
 /// objective value `V(rho)` and not an exact rho-gradient.
-pub fn optimize_survival_lambdas_with_multistart_fd<F>(
+pub fn optimize_survival_lambdaswithmultistartfd<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     objective: F,
@@ -264,8 +264,8 @@ where
 {
     let eval_count = AtomicUsize::new(0usize);
     let warned_rho_extreme = AtomicBool::new(false);
-    let warned_nonfinite_value = AtomicBool::new(false);
-    let wrapped_objective = |rho: &Array1<f64>| {
+    let warned_nonfinitevalue = AtomicBool::new(false);
+    let wrappedobjective = |rho: &Array1<f64>| {
         let eval_idx = eval_count.fetch_add(1, Ordering::Relaxed) + 1;
         if !warned_rho_extreme.load(Ordering::Relaxed)
             && rho.iter().any(|r| r.abs() > 12.0)
@@ -278,9 +278,9 @@ where
             );
         }
         let value = objective(rho)?;
-        if !warned_nonfinite_value.load(Ordering::Relaxed)
+        if !warned_nonfinitevalue.load(Ordering::Relaxed)
             && !value.is_finite()
-            && !warned_nonfinite_value.swap(true, Ordering::Relaxed)
+            && !warned_nonfinitevalue.swap(true, Ordering::Relaxed)
         {
             log::warn!(
                 "[survival lambda opt/fd] non-finite objective value at eval {}",
@@ -296,14 +296,14 @@ where
         max_iter: options.max_iter,
         tol: options.tol,
         finite_diff_step: options.finite_diff_step,
-        fd_hessian_max_dim: usize::MAX,
+        fdhessian_max_dim: usize::MAX,
         optimizer_kind: crate::estimate::SmoothingOptimizerKind::Bfgs,
         seed_config: options.seed_config,
     };
-    let result = crate::estimate::optimize_log_smoothing_with_multistart_parallel_fd(
+    let result = crate::estimate::optimize_log_smoothingwithmultistart_parallelfd(
         num_penalties,
         heuristic_lambdas,
-        wrapped_objective,
+        wrappedobjective,
         &core_opts,
     )?;
     warn_survival_lambda_optimization_health("fd", &result, options);
@@ -313,25 +313,25 @@ where
         lambdas,
         final_value: result.final_value,
         iterations: result.iterations,
-        final_grad_norm: result.final_grad_norm,
+        finalgrad_norm: result.finalgrad_norm,
         stationary: result.stationary,
     })
 }
 
 /// Backward-compatible alias for explicit-gradient survival optimization.
-pub fn optimize_survival_lambdas_with_multistart_with_gradient<F>(
+pub fn optimize_survival_lambdaswithmultistartwithgradient<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    objective_with_gradient: F,
+    objectivewithgradient: F,
     options: &SurvivalLambdaOptimizerOptions,
 ) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
 where
     F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
 {
-    optimize_survival_lambdas_with_multistart(
+    optimize_survival_lambdaswithmultistart(
         num_penalties,
         heuristic_lambdas,
-        objective_with_gradient,
+        objectivewithgradient,
         options,
     )
 }

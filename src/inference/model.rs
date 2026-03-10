@@ -1,5 +1,5 @@
 use crate::estimate::{FitResult, FittedLinkParameters};
-use crate::mixture_link::{state_from_beta_logistic_spec, state_from_sas_spec};
+use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, BoundedCoefficientPriorSpec, LinearCoefficientGeometry,
     SmoothBasisSpec, TensorBSplineIdentifiability, TermCollectionSpec,
@@ -73,13 +73,13 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub joint_degree: Option<usize>,
     #[serde(default)]
-    pub joint_ridge_used: Option<f64>,
+    pub jointridge_used: Option<f64>,
     #[serde(default)]
-    pub probit_wiggle_knots: Option<Vec<f64>>,
+    pub probitwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
-    pub probit_wiggle_degree: Option<usize>,
+    pub probitwiggle_degree: Option<usize>,
     #[serde(default)]
-    pub beta_wiggle: Option<Vec<f64>>,
+    pub betawiggle: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -87,7 +87,7 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_event: Option<String>,
     #[serde(default)]
-    pub survival_spec: Option<String>,
+    pub survivalspec: Option<String>,
     #[serde(default)]
     pub survival_baseline_target: Option<String>,
     #[serde(default)]
@@ -107,7 +107,7 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_time_smooth_lambda: Option<f64>,
     #[serde(default)]
-    pub survival_ridge_lambda: Option<f64>,
+    pub survivalridge_lambda: Option<f64>,
     #[serde(default)]
     pub survival_likelihood: Option<String>,
     #[serde(default)]
@@ -129,9 +129,9 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
     #[serde(default)]
-    pub resolved_term_spec: Option<TermCollectionSpec>,
+    pub resolved_termspec: Option<TermCollectionSpec>,
     #[serde(default)]
-    pub resolved_term_spec_noise: Option<TermCollectionSpec>,
+    pub resolved_termspec_noise: Option<TermCollectionSpec>,
     #[serde(default)]
     pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
@@ -166,14 +166,14 @@ impl FittedModelPayload {
             joint_knot_vector: None,
             joint_link_transform: None,
             joint_degree: None,
-            joint_ridge_used: None,
-            probit_wiggle_knots: None,
-            probit_wiggle_degree: None,
-            beta_wiggle: None,
+            jointridge_used: None,
+            probitwiggle_knots: None,
+            probitwiggle_degree: None,
+            betawiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
-            survival_spec: None,
+            survivalspec: None,
             survival_baseline_target: None,
             survival_baseline_scale: None,
             survival_baseline_shape: None,
@@ -183,7 +183,7 @@ impl FittedModelPayload {
             survival_time_degree: None,
             survival_time_knots: None,
             survival_time_smooth_lambda: None,
-            survival_ridge_lambda: None,
+            survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
             survival_beta_threshold: None,
@@ -194,8 +194,8 @@ impl FittedModelPayload {
             survival_noise_non_intercept_start: None,
             survival_distribution: None,
             training_headers: None,
-            resolved_term_spec: None,
-            resolved_term_spec_noise: None,
+            resolved_termspec: None,
+            resolved_termspec_noise: None,
             adaptive_regularization_diagnostics: None,
         }
     }
@@ -336,7 +336,7 @@ impl FittedModel {
                 FittedLinkParameters::Sas { state, covariance },
             ) => {
                 *sas_state = Some(*state);
-                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
             }
             (
                 FittedFamily::Standard {
@@ -347,7 +347,7 @@ impl FittedModel {
                 FittedLinkParameters::BetaLogistic { state, covariance },
             ) => {
                 *sas_state = Some(*state);
-                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
             }
             (
                 FittedFamily::Standard {
@@ -359,7 +359,7 @@ impl FittedModel {
             ) => {
                 *mixture_state = Some(state.clone());
                 payload.mixture_link_param_covariance =
-                    covariance.as_ref().map(array2_to_nested_vec);
+                    covariance.as_ref().map(array2_to_nestedvec);
             }
             _ => {}
         }
@@ -428,7 +428,7 @@ impl FittedModel {
             },
             _ => return Ok(None),
         };
-        state_from_sas_spec(SasLinkSpec {
+        state_from_sasspec(SasLinkSpec {
             initial_epsilon: raw.epsilon,
             initial_log_delta: raw.log_delta,
         })
@@ -461,7 +461,7 @@ impl FittedModel {
             },
             _ => return Ok(None),
         };
-        state_from_beta_logistic_spec(SasLinkSpec {
+        state_from_beta_logisticspec(SasLinkSpec {
             initial_epsilon: raw.epsilon,
             initial_log_delta: raw.log_delta,
         })
@@ -560,20 +560,20 @@ impl FittedModel {
                     .to_string(),
             );
         }
-        let spec = self.resolved_term_spec.as_ref().ok_or_else(|| {
-            "model is missing resolved_term_spec; refit with the current CLI to guarantee train/predict design consistency"
+        let spec = self.resolved_termspec.as_ref().ok_or_else(|| {
+            "model is missing resolved_termspec; refit with the current CLI to guarantee train/predict design consistency"
                 .to_string()
         })?;
-        validate_frozen_term_collection_spec(spec, "resolved_term_spec")?;
+        validate_frozen_term_collectionspec(spec, "resolved_termspec")?;
 
-        if self.formula_noise.is_some() && self.resolved_term_spec_noise.is_none() {
+        if self.formula_noise.is_some() && self.resolved_termspec_noise.is_none() {
             return Err(
-                "model defines formula_noise but is missing resolved_term_spec_noise; refit with the current CLI"
+                "model defines formula_noise but is missing resolved_termspec_noise; refit with the current CLI"
                     .to_string(),
             );
         }
-        if let Some(spec_noise) = self.resolved_term_spec_noise.as_ref() {
-            validate_frozen_term_collection_spec(spec_noise, "resolved_term_spec_noise")?;
+        if let Some(spec_noise) = self.resolved_termspec_noise.as_ref() {
+            validate_frozen_term_collectionspec(spec_noise, "resolved_termspec_noise")?;
         }
 
         if matches!(
@@ -642,7 +642,7 @@ impl FittedModel {
     pub fn validate_numeric_finiteness(&self) -> Result<(), String> {
         if let Some(fit) = self.fit_result.as_ref() {
             ensure_finite_scalar("fit_result.standard_deviation", fit.standard_deviation)?;
-            ensure_finite_scalar("fit_result.final_grad_norm", fit.final_grad_norm)?;
+            ensure_finite_scalar("fit_result.finalgrad_norm", fit.finalgrad_norm)?;
             ensure_finite_scalar("fit_result.deviance", fit.deviance)?;
             ensure_finite_scalar("fit_result.stable_penalty_term", fit.stable_penalty_term)?;
             ensure_finite_scalar("fit_result.max_abs_eta", fit.max_abs_eta)?;
@@ -683,7 +683,7 @@ impl FittedModel {
                 FittedLinkParameters::Mixture { state, covariance } => {
                     validate_all_finite("fit_result.mixture_link_rho", state.rho.iter().copied())?;
                     validate_all_finite(
-                        "fit_result.mixture_link_weights",
+                        "fit_result.mixture_linkweights",
                         state.pi.iter().copied(),
                     )?;
                     if let Some(v) = covariance.as_ref() {
@@ -714,8 +714,8 @@ impl FittedModel {
                 "survival_time_smooth_lambda",
                 self.survival_time_smooth_lambda,
             ),
-            ("survival_ridge_lambda", self.survival_ridge_lambda),
-            ("joint_ridge_used", self.joint_ridge_used),
+            ("survivalridge_lambda", self.survivalridge_lambda),
+            ("jointridge_used", self.jointridge_used),
         ] {
             if let Some(v) = opt {
                 ensure_finite_scalar(name, v)?;
@@ -745,8 +745,8 @@ impl FittedModel {
         if let Some(v) = self.joint_knot_vector.as_ref() {
             validate_all_finite("joint_knot_vector", v.iter().copied())?;
         }
-        if let Some(v) = self.beta_wiggle.as_ref() {
-            validate_all_finite("beta_wiggle", v.iter().copied())?;
+        if let Some(v) = self.betawiggle.as_ref() {
+            validate_all_finite("betawiggle", v.iter().copied())?;
         }
         if let Some(v) = self.survival_beta_time.as_ref() {
             validate_all_finite("survival_beta_time", v.iter().copied())?;
@@ -776,7 +776,7 @@ impl FittedModel {
     }
 }
 
-fn array2_to_nested_vec(a: &ndarray::Array2<f64>) -> Vec<Vec<f64>> {
+fn array2_to_nestedvec(a: &ndarray::Array2<f64>) -> Vec<Vec<f64>> {
     a.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
@@ -800,7 +800,7 @@ where
     Ok(())
 }
 
-fn validate_frozen_term_collection_spec(
+fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,
     label: &str,
 ) -> Result<(), String> {
@@ -853,9 +853,9 @@ fn validate_frozen_term_collection_spec(
     for st in &spec.smooth_terms {
         match &st.basis {
             SmoothBasisSpec::BSpline1D { spec, .. } => {
-                if !matches!(spec.knot_spec, BSplineKnotSpec::Provided(_)) {
+                if !matches!(spec.knotspec, BSplineKnotSpec::Provided(_)) {
                     return Err(format!(
-                        "{label} term '{}' is not frozen: BSpline knot_spec must be Provided",
+                        "{label} term '{}' is not frozen: BSpline knotspec must be Provided",
                         st.name
                     ));
                 }
@@ -903,10 +903,10 @@ fn validate_frozen_term_collection_spec(
                 }
             }
             SmoothBasisSpec::TensorBSpline { spec, .. } => {
-                for (dim, marginal) in spec.marginal_specs.iter().enumerate() {
-                    if !matches!(marginal.knot_spec, BSplineKnotSpec::Provided(_)) {
+                for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
+                    if !matches!(marginal.knotspec, BSplineKnotSpec::Provided(_)) {
                         return Err(format!(
-                            "{label} term '{}' dim {} is not frozen: tensor marginal knot_spec must be Provided",
+                            "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided",
                             st.name, dim
                         ));
                     }

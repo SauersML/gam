@@ -1,6 +1,6 @@
 use crate::construction::calculate_condition_number;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerLinalgError, array2_to_mat_mut, factorize_symmetric_with_fallback,
+    FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
 use faer::Side;
 use ndarray::{Array1, Array2};
@@ -28,11 +28,11 @@ impl KahanSum {
     }
 }
 
-pub(crate) fn matrix_inverse_with_regularization(
+pub(crate) fn matrix_inversewith_regularization(
     matrix: &Array2<f64>,
     label: &str,
 ) -> Option<Array2<f64>> {
-    StableSolver::new(label).inverse_with_regularization(matrix)
+    StableSolver::new(label).inversewith_regularization(matrix)
 }
 
 pub(crate) struct StableSolver<'a> {
@@ -49,20 +49,20 @@ impl<'a> StableSolver<'a> {
         matrix: &Array2<f64>,
     ) -> Result<crate::faer_ndarray::FaerSymmetricFactor, FaerLinalgError> {
         let view = FaerArrayView::new(matrix);
-        factorize_symmetric_with_fallback(view.as_ref(), Side::Lower)
+        factorize_symmetricwith_fallback(view.as_ref(), Side::Lower)
     }
 
-    pub(crate) fn inverse_with_regularization(&self, matrix: &Array2<f64>) -> Option<Array2<f64>> {
+    pub(crate) fn inversewith_regularization(&self, matrix: &Array2<f64>) -> Option<Array2<f64>> {
         let p = matrix.nrows();
         if p == 0 || matrix.ncols() != p {
             return None;
         }
 
         let mut planner = RidgePlanner::new(matrix);
-        let (factor, _ridge, regularized) = self.factorize_with_ridge_plan(matrix, &mut planner)?;
+        let (factor, _, regularized) = self.factorize_with_ridge_plan(matrix, &mut planner)?;
         let mut inv = Array2::<f64>::eye(p);
-        let mut inv_view = array2_to_mat_mut(&mut inv);
-        factor.solve_in_place(inv_view.as_mut());
+        let mut invview = array2_to_matmut(&mut inv);
+        factor.solve_in_place(invview.as_mut());
 
         if !inv.iter().all(|v| v.is_finite()) {
             log::warn!("Non-finite inverse produced for {}", self.label);
@@ -81,11 +81,11 @@ impl<'a> StableSolver<'a> {
         Some(inv)
     }
 
-    pub(crate) fn solve_vector_with_ridge_retries(
+    pub(crate) fn solvevectorwithridge_retries(
         &self,
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
-        base_ridge: f64,
+        baseridge: f64,
     ) -> Option<Array1<f64>> {
         let p = matrix.nrows();
         if matrix.ncols() != p || rhs.len() != p {
@@ -93,18 +93,18 @@ impl<'a> StableSolver<'a> {
         }
 
         for retry in 0..MAX_SOLVE_RETRIES {
-            let ridge = if base_ridge > 0.0 {
-                base_ridge * 10f64.powi(retry as i32)
+            let ridge = if baseridge > 0.0 {
+                baseridge * 10f64.powi(retry as i32)
             } else {
                 0.0
             };
-            let h = add_ridge(matrix, ridge);
+            let h = addridge(matrix, ridge);
             let factor = match self.factorize(&h) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
             let mut out = rhs.clone();
-            let mut out_mat = crate::faer_ndarray::array1_to_col_mat_mut(&mut out);
+            let mut out_mat = crate::faer_ndarray::array1_to_col_matmut(&mut out);
             factor.solve_in_place(out_mat.as_mut());
             if out.iter().all(|v| v.is_finite()) {
                 return Some(out);
@@ -113,10 +113,10 @@ impl<'a> StableSolver<'a> {
         None
     }
 
-    pub(crate) fn inverse_with_ridge_retries(
+    pub(crate) fn inversewithridge_retries(
         &self,
         matrix: &Array2<f64>,
-        base_ridge: f64,
+        baseridge: f64,
         max_retry: usize,
     ) -> Option<Array2<f64>> {
         let p = matrix.nrows();
@@ -124,19 +124,19 @@ impl<'a> StableSolver<'a> {
             return None;
         }
         for retry in 0..max_retry {
-            let ridge = if base_ridge > 0.0 {
-                base_ridge * 10f64.powi(retry as i32)
+            let ridge = if baseridge > 0.0 {
+                baseridge * 10f64.powi(retry as i32)
             } else {
                 0.0
             };
-            let h = add_ridge(matrix, ridge);
+            let h = addridge(matrix, ridge);
             let factor = match self.factorize(&h) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
             let mut inv = Array2::<f64>::eye(p);
-            let mut inv_view = array2_to_mat_mut(&mut inv);
-            factor.solve_in_place(inv_view.as_mut());
+            let mut invview = array2_to_matmut(&mut inv);
+            factor.solve_in_place(invview.as_mut());
             if inv.iter().all(|v| v.is_finite()) {
                 for i in 0..p {
                     for j in (i + 1)..p {
@@ -158,7 +158,7 @@ impl<'a> StableSolver<'a> {
     ) -> Option<(crate::faer_ndarray::FaerSymmetricFactor, f64, Array2<f64>)> {
         loop {
             let ridge = planner.ridge();
-            let h_eff = add_ridge(matrix, ridge);
+            let h_eff = addridge(matrix, ridge);
             if let Ok(factor) = self.factorize(&h_eff) {
                 return Some((factor, ridge, h_eff));
             }
@@ -170,7 +170,7 @@ impl<'a> StableSolver<'a> {
                 );
                 return None;
             }
-            planner.bump_with_matrix(matrix);
+            planner.bumpwith_matrix(matrix);
         }
     }
 }
@@ -185,7 +185,7 @@ pub(crate) fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
         .max(1.0)
 }
 
-pub(crate) fn add_ridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
+pub(crate) fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     if ridge <= 0.0 {
         return matrix.clone();
     }
@@ -259,9 +259,9 @@ impl RidgePlanner {
     }
 
     #[inline]
-    fn estimate_condition_with_ridge(&self, matrix: &Array2<f64>, ridge: f64) -> Option<f64> {
+    fn estimate_conditionwithridge(&self, matrix: &Array2<f64>, ridge: f64) -> Option<f64> {
         let regularized = if ridge > 0.0 {
-            add_ridge(matrix, ridge)
+            addridge(matrix, ridge)
         } else {
             matrix.clone()
         };
@@ -270,13 +270,13 @@ impl RidgePlanner {
             .filter(|c| c.is_finite() && *c > 0.0)
     }
 
-    pub(crate) fn bump_with_matrix(&mut self, matrix: &Array2<f64>) {
+    pub(crate) fn bumpwith_matrix(&mut self, matrix: &Array2<f64>) {
         self.attempts += 1;
         let min_step = self.scale * 1e-10;
         let base = self.ridge.max(min_step);
 
         // Estimate conditioning at the current ridge level.
-        let cond_now = self.estimate_condition_with_ridge(matrix, base);
+        let cond_now = self.estimate_conditionwithridge(matrix, base);
         self.cond_estimate = cond_now;
 
         self.ridge = if let Some(cond) = cond_now {
@@ -295,7 +295,7 @@ impl RidgePlanner {
             let mut proposal = base * multiplier;
             // Verify whether the proposal actually improves condition enough.
             // If not, escalate once more before returning.
-            if let Some(cond_next) = self.estimate_condition_with_ridge(matrix, proposal)
+            if let Some(cond_next) = self.estimate_conditionwithridge(matrix, proposal)
                 && cond_next > cond * 0.9
                 && ratio > 1.0
             {

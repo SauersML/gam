@@ -24,7 +24,7 @@ macro_rules! assert_central_difference_array {
 
 /// Asserts that a finite difference dense matrix closely matches an analytically computed
 /// directional derivative matrix, both in tolerance and in component-wise sign.
-pub fn assert_matrix_derivative_fd(
+pub fn assert_matrix_derivativefd(
     fd: &Array2<f64>,
     analytic: &Array2<f64>,
     tol: f64,

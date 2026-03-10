@@ -11,7 +11,7 @@ impl<'a> RemlState<'a> {
             && (eval_idx == 1 || eval_idx % 200 == 0)
     }
 
-    pub(super) fn log_gam_cost(
+    pub(super) fn log_gamcost(
         &self,
         rho: &Array1<f64>,
         lambdas: &[f64],
@@ -26,10 +26,10 @@ impl<'a> RemlState<'a> {
         }
         const GAM_REPEAT_EMIT: u64 = 50;
         const GAM_MIN_EMIT_GAP: u64 = 200;
-        let rho_q = quantize_vec(rho.as_slice().unwrap_or_default(), 5e-3, 1e-6);
-        let smooth_q = quantize_vec(lambdas, 5e-3, 1e-6);
-        let stab_q = quantize_value(stab_cond, 5e-3, 1e-6);
-        let raw_q = quantize_value(raw_cond, 5e-3, 1e-6);
+        let rho_q = quantizevec(rho.as_slice().unwrap_or_default(), 5e-3, 1e-6);
+        let smooth_q = quantizevec(lambdas, 5e-3, 1e-6);
+        let stab_q = quantizevalue(stab_cond, 5e-3, 1e-6);
+        let raw_q = quantizevalue(raw_cond, 5e-3, 1e-6);
         let key = CostKey::new(&rho_q, &smooth_q, stab_q, raw_q);
 
         let mut last_opt = self.arena.cost_last.write().unwrap();
@@ -104,7 +104,7 @@ impl<'a> RemlState<'a> {
     }
 
     /// Compute soft prior cost without needing workspace
-    pub(super) fn compute_soft_prior_cost(&self, rho: &Array1<f64>) -> f64 {
+    pub(super) fn compute_soft_priorcost(&self, rho: &Array1<f64>) -> f64 {
         let len = rho.len();
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
             return 0.0;
@@ -122,7 +122,7 @@ impl<'a> RemlState<'a> {
     }
 
     /// Compute soft prior gradient without workspace mutation.
-    pub(super) fn compute_soft_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+    pub(super) fn compute_soft_priorgrad(&self, rho: &Array1<f64>) -> Array1<f64> {
         let len = rho.len();
         let mut grad = Array1::<f64>::zeros(len);
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
@@ -141,8 +141,8 @@ impl<'a> RemlState<'a> {
     ///
     /// Prior definition per coordinate:
     ///   C_i(rho_i) = w * log(cosh(a * rho_i)),
-    ///   a = RHO_SOFT_PRIOR_SHARPNESS / RHO_BOUND,
-    ///   w = RHO_SOFT_PRIOR_WEIGHT.
+    ///   a = rho_soft_prior_sharpness / rho_bound,
+    ///   w = rho_soft_prior_weight.
     ///
     /// Then:
     ///   dC_i/drho_i   = w * a * tanh(a * rho_i),
@@ -150,7 +150,7 @@ impl<'a> RemlState<'a> {
     ///                = w * a² * (1 - tanh²(a * rho_i)).
     ///
     /// The prior is separable across coordinates, so off-diagonals are zero.
-    pub(super) fn add_soft_prior_hessian_in_place(
+    pub(super) fn add_soft_priorhessian_in_place(
         &self,
         rho: &Array1<f64>,
         hess: &mut Array2<f64>,
@@ -175,11 +175,11 @@ impl<'a> RemlState<'a> {
     /// Therefore the curvature used in LAML is
     ///   H_eff = X'WX + S_λ + ridge I,
     /// and adding another ridge here places the Laplace expansion on a different surface.
-    pub(super) fn effective_hessian(
+    pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        let base = pr.stabilized_hessian_transformed.clone();
+        let base = pr.stabilizedhessian_transformed.clone();
 
         if base.cholesky(Side::Lower).is_ok() {
             return Ok((base, pr.ridge_passport));
@@ -190,7 +190,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    pub(crate) fn new_with_offset<X>(
+    pub(crate) fn newwith_offset<X>(
         y: ArrayView1<'a, f64>,
         x: X,
         weights: ArrayView1<'a, f64>,
@@ -205,7 +205,7 @@ impl<'a> RemlState<'a> {
     where
         X: Into<DesignMatrix>,
     {
-        Self::new_with_offset_shared(
+        Self::newwith_offset_shared(
             y,
             x,
             weights,
@@ -219,7 +219,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    pub(crate) fn new_with_offset_shared<X>(
+    pub(crate) fn newwith_offset_shared<X>(
         y: ArrayView1<'a, f64>,
         x: X,
         weights: ArrayView1<'a, f64>,
@@ -287,11 +287,11 @@ impl<'a> RemlState<'a> {
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
-    pub(super) fn rho_key_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
-        EvalCacheManager::sanitized_rho_key(rho)
+    pub(super) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
+        EvalCacheManager::sanitized_rhokey(rho)
     }
 
-    pub(super) fn prepare_eval_bundle_with_key(
+    pub(super) fn prepare_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
@@ -299,7 +299,7 @@ impl<'a> RemlState<'a> {
         let decision = self.select_reml_geometry(rho);
         match decision.geometry {
             RemlGeometry::SparseExactSpd => {
-                match self.prepare_sparse_eval_bundle_with_key(rho, key.clone()) {
+                match self.prepare_sparse_eval_bundlewithkey(rho, key.clone()) {
                     Ok(bundle) => {
                         log::info!(
                             "[reml-geometry] sparse_exact_spd reason={} p={} nnz_x={} nnz_h_est={} density_h_est={}",
@@ -322,11 +322,11 @@ impl<'a> RemlState<'a> {
                             "[reml-geometry] sparse_exact_spd failed ({}); falling back to dense spectral",
                             err
                         );
-                        self.prepare_dense_eval_bundle_with_key(rho, key)
+                        self.prepare_dense_eval_bundlewithkey(rho, key)
                     }
                 }
             }
-            RemlGeometry::DenseSpectral => self.prepare_dense_eval_bundle_with_key(rho, key),
+            RemlGeometry::DenseSpectral => self.prepare_dense_eval_bundlewithkey(rho, key),
         }
     }
 
@@ -334,16 +334,16 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
-        let key = self.rho_key_sanitized(rho);
+        let key = self.rhokey_sanitized(rho);
         if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
             return Ok(existing.clone());
         }
-        let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
+        let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
         Ok(bundle)
     }
 
-    pub(crate) fn objective_inner_hessian(
+    pub(crate) fn objective_innerhessian(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
@@ -356,7 +356,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<(Arc<crate::pirls::PirlsResult>, Arc<Array2<f64>>), EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        Ok((bundle.pirls_result.clone(), bundle.h_pos_factor_w.clone()))
+        Ok((bundle.pirls_result.clone(), bundle.h_pos_factorw.clone()))
     }
 
     pub(super) fn edf_from_h_and_e(
@@ -372,9 +372,9 @@ impl<'a> RemlState<'a> {
         // glance that can look risky—two different Hessians with the same ρ might appear to be
         // conflated.  The surrounding call graph prevents that situation:
         //   • Identity / Gaussian models call `edf_from_h_and_rk` with the stabilized Hessian
-        //     `pirls_result.stabilized_hessian_transformed`.
+        //     `pirls_result.stabilizedhessian_transformed`.
         //   • Non-Gaussian (logit / LAML) models call it with the effective / ridged Hessian
-        //     returned by `effective_hessian(pr)`.
+        //     returned by `effectivehessian(pr)`.
         // Within a given `RemlState` we never switch between those two flavours—the state is
         // constructed for a single link function, so the cost/gradient pathways stay aligned.
         // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
@@ -402,9 +402,9 @@ impl<'a> RemlState<'a> {
         // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
         // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly.
         let e_t = e_transformed.t().to_owned(); // (p_eff × rank_total)
-        let e_view = FaerArrayView::new(&e_t);
-        let x = factor.solve(e_view.as_ref());
-        let trace_h_inv_s_lambda = faer_frob_inner(x.as_ref(), e_view.as_ref());
+        let eview = FaerArrayView::new(&e_t);
+        let x = factor.solve(eview.as_ref());
+        let trace_h_inv_s_lambda = faer_frob_inner(x.as_ref(), eview.as_ref());
 
         // Calculate EDF as p - trace, clamped to the penalty nullspace dimension
         let p = h_eff.ncols() as f64;
@@ -419,27 +419,27 @@ impl<'a> RemlState<'a> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
         let active_tol = 1e-8;
         let beta_t = pr.beta_transformed.as_ref();
-        let mut active_rows: Vec<Array1<f64>> = Vec::new();
+        let mut activerows: Vec<Array1<f64>> = Vec::new();
         for i in 0..lin.a.nrows() {
             let slack = lin.a.row(i).dot(beta_t) - lin.b[i];
             if slack <= active_tol {
-                active_rows.push(lin.a.row(i).to_owned());
+                activerows.push(lin.a.row(i).to_owned());
             }
         }
-        if active_rows.is_empty() {
+        if activerows.is_empty() {
             return None;
         }
 
         let p_t = lin.a.ncols();
-        let mut a_t = Array2::<f64>::zeros((p_t, active_rows.len()));
-        for (j, row) in active_rows.iter().enumerate() {
+        let mut a_t = Array2::<f64>::zeros((p_t, activerows.len()));
+        for (j, row) in activerows.iter().enumerate() {
             for k in 0..p_t {
                 a_t[[k, j]] = row[k];
             }
         }
 
-        let q_row = Self::orthonormalize_columns(&a_t, 1e-10); // basis for active row-space^T
-        let rank = q_row.ncols();
+        let qrow = Self::orthonormalize_columns(&a_t, 1e-10); // basis for active row-space^T
+        let rank = qrow.ncols();
         if rank == 0 {
             return None;
         }
@@ -454,7 +454,7 @@ impl<'a> RemlState<'a> {
             let mut v = Array1::<f64>::zeros(p_t);
             v[j] = 1.0;
             for t in 0..rank {
-                let qt = q_row.column(t);
+                let qt = qrow.column(t);
                 let proj = qt.dot(&v);
                 v -= &qt.mapv(|x| x * proj);
             }
@@ -488,21 +488,21 @@ impl<'a> RemlState<'a> {
             || kkt.complementarity > tol_comp
             || kkt.stationarity > tol_stat
         {
-            let mut worst_row_msg = String::new();
+            let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
                 let mut worst = 0.0_f64;
-                let mut worst_row = 0usize;
+                let mut worstrow = 0usize;
                 for i in 0..lin.a.nrows() {
                     let slack = lin.a.row(i).dot(&pr.beta_transformed.0) - lin.b[i];
                     let viol = (-slack).max(0.0);
                     if viol > worst {
                         worst = viol;
-                        worst_row = i;
+                        worstrow = i;
                     }
                 }
                 if worst > 0.0 {
-                    worst_row_msg =
-                        format!("; worst_row={} worst_violation={:.3e}", worst_row, worst);
+                    worstrow_msg =
+                        format!("; worstrow={} worstviolation={:.3e}", worstrow, worst);
                 }
             }
             return Err(EstimationError::ParameterConstraintViolation(format!(
@@ -513,18 +513,18 @@ impl<'a> RemlState<'a> {
                 kkt.stationarity,
                 kkt.n_active,
                 kkt.n_constraints,
-                worst_row_msg
+                worstrow_msg
             )));
         }
         Ok(())
     }
 
-    pub(super) fn project_with_basis(matrix: &Array2<f64>, z: &Array2<f64>) -> Array2<f64> {
+    pub(super) fn projectwith_basis(matrix: &Array2<f64>, z: &Array2<f64>) -> Array2<f64> {
         let zt_m = z.t().dot(matrix);
         zt_m.dot(z)
     }
 
-    pub(super) fn positive_part_factor_w(
+    pub(super) fn positive_part_factorw(
         matrix: &Array2<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         // Build W such that M_+^dagger = W W^T on the retained positive subspace.
@@ -658,7 +658,7 @@ impl<'a> RemlState<'a> {
         Ok(trace)
     }
 
-    pub(super) fn update_warm_start_from(&self, pr: &PirlsResult) {
+    pub(super) fn updatewarm_start_from(&self, pr: &PirlsResult) {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -683,7 +683,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(crate) fn set_warm_start_original_beta(&self, beta_original: Option<ArrayView1<'_, f64>>) {
+    pub(crate) fn setwarm_start_original_beta(&self, beta_original: Option<ArrayView1<'_, f64>>) {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -703,7 +703,7 @@ impl<'a> RemlState<'a> {
     /// Clear warm-start state. Used in tests to ensure consistent starting points
     /// when comparing different gradient computation paths.
     #[cfg(test)]
-    pub fn clear_warm_start(&self) {
+    pub fn clearwarm_start(&self) {
         self.warm_start_beta.write().unwrap().take();
         self.cache_manager.invalidate_eval_bundle();
     }
@@ -721,7 +721,7 @@ impl<'a> RemlState<'a> {
         let stable_solver = StableSolver::new("reml hessian");
         loop {
             let ridge = planner.ridge();
-            let regularized = add_ridge(h, ridge);
+            let regularized = addridge(h, ridge);
             if let Ok(factor) = stable_solver.factorize(&regularized) {
                 return match factor {
                     crate::faer_ndarray::FaerSymmetricFactor::Llt(inner) => FaerFactor::Llt(inner),
@@ -738,7 +738,7 @@ impl<'a> RemlState<'a> {
                 let f = FaerLblt::new(view.as_ref(), Side::Lower);
                 return FaerFactor::Lblt(f);
             }
-            planner.bump_with_matrix(h);
+            planner.bumpwith_matrix(h);
         }
     }
 
@@ -756,7 +756,7 @@ impl<'a> RemlState<'a> {
         // path ever appears, extend the key (for example by tagging the Hessian variant) or
         // split the cache.  The current key maximizes cache
         // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
-        let key_opt = self.rho_key_sanitized(rho);
+        let key_opt = self.rhokey_sanitized(rho);
         if let Some(key) = &key_opt
             && let Some(f) = self
                 .cache_manager
@@ -814,13 +814,13 @@ impl<'a> RemlState<'a> {
         (logdet, det1)
     }
 
-    pub(super) fn prepare_dense_eval_bundle_with_key(
+    pub(super) fn prepare_dense_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
-        let (h_eff, ridge_passport) = self.effective_hessian(pirls_result.as_ref())?;
+        let (h_eff, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
 
         const EIG_REL_THRESHOLD: f64 = 1e-10;
         const EIG_ABS_FLOOR: f64 = 1e-14;
@@ -844,7 +844,7 @@ impl<'a> RemlState<'a> {
             // the Firth-augmented stationarity system.
             //
             // Conceptually Φ is the pseudodeterminant term 0.5 log|XᵀWX|_+.
-            // The h_phi block below is therefore the curvature of that
+            // The hphi block below is therefore the curvature of that
             // identifiable-subspace Jeffreys penalty, represented in the
             // current transformed basis.
             let mut weighted_xtdx = Array2::<f64>::zeros(firth_op.x_dense.raw_dim());
@@ -854,18 +854,18 @@ impl<'a> RemlState<'a> {
                 &mut weighted_xtdx,
             );
             let bpb = fast_ab(&firth_op.b_base.t().to_owned(), &firth_op.p_b_base);
-            let mut h_phi = 0.5 * (diag_term - bpb);
+            let mut hphi = 0.5 * (diag_term - bpb);
             // Numerical symmetry guard.
-            for i in 0..h_phi.nrows() {
+            for i in 0..hphi.nrows() {
                 for j in 0..i {
-                    let avg = 0.5 * (h_phi[[i, j]] + h_phi[[j, i]]);
-                    h_phi[[i, j]] = avg;
-                    h_phi[[j, i]] = avg;
+                    let avg = 0.5 * (hphi[[i, j]] + hphi[[j, i]]);
+                    hphi[[i, j]] = avg;
+                    hphi[[j, i]] = avg;
                 }
             }
             // Keep tiny numerical noise from making the solve surface less stable.
-            if h_phi.iter().all(|v| v.is_finite()) {
-                h_total -= &h_phi;
+            if hphi.iter().all(|v| v.is_finite()) {
+                h_total -= &hphi;
             }
             firth_dense_operator = Some(firth_op);
         }
@@ -950,7 +950,7 @@ impl<'a> RemlState<'a> {
             geometry: RemlGeometry::DenseSpectral,
             h_eff: Arc::new(h_eff),
             h_total: Arc::new(h_total),
-            h_pos_factor_w: Arc::new(w),
+            h_pos_factorw: Arc::new(w),
             h_total_log_det,
             active_subspace_rel_gap,
             active_subspace_unstable,
@@ -959,7 +959,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    pub(super) fn prepare_sparse_eval_bundle_with_key(
+    pub(super) fn prepare_sparse_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
@@ -1000,7 +1000,7 @@ impl<'a> RemlState<'a> {
         let sparse_system = assemble_and_factor_sparse_penalized_system(
             &mut workspace,
             x_sparse,
-            &pirls_result.solve_weights,
+            &pirls_result.solveweights,
             &s_lambda,
             ridge_passport.delta,
         )?;
@@ -1025,7 +1025,7 @@ impl<'a> RemlState<'a> {
             geometry: RemlGeometry::SparseExactSpd,
             h_eff: Arc::new(Array2::zeros((0, 0))),
             h_total: Arc::new(Array2::zeros((0, 0))),
-            h_pos_factor_w: Arc::new(Array2::zeros((0, 0))),
+            h_pos_factorw: Arc::new(Array2::zeros((0, 0))),
             h_total_log_det: 0.0,
             active_subspace_rel_gap: None,
             active_subspace_unstable: false,
@@ -1035,7 +1035,7 @@ impl<'a> RemlState<'a> {
                 logdet_h: sparse_system.logdet_h,
                 logdet_s_pos,
                 det1_values: Arc::new(det1_values),
-                trace_workspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
+                traceworkspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
             })),
             firth_dense_operator,
         })
@@ -1051,7 +1051,7 @@ impl<'a> RemlState<'a> {
             .pirls_cache_enabled
             .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
-        let key_opt = self.rho_key_sanitized(rho);
+        let key_opt = self.rhokey_sanitized(rho);
         if use_cache
             && let Some(key) = &key_opt
             && let Some(cached) = self.cache_manager.pirls_cache.write().unwrap().get(key)
@@ -1088,7 +1088,7 @@ impl<'a> RemlState<'a> {
                 x: &self.x,
                 offset: self.offset.view(),
                 y: self.y,
-                prior_weights: self.weights,
+                priorweights: self.weights,
                 covariate_se: None,
             };
             let penalty = pirls::PenaltyConfig {
@@ -1123,7 +1123,7 @@ impl<'a> RemlState<'a> {
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                self.update_warm_start_from(pirls_result.as_ref());
+                self.updatewarm_start_from(pirls_result.as_ref());
                 // This is a successful fit. Cache only if key is valid (not NaN).
                 if use_cache && let Some(key) = key_opt {
                     self.cache_manager
@@ -1154,27 +1154,27 @@ impl<'a> RemlState<'a> {
                 } else {
                     (self.config.convergence_tolerance * 10.0).max(1e-4)
                 };
-                if pirls_result.last_gradient_norm > acceptable_kkt {
+                if pirls_result.lastgradient_norm > acceptable_kkt {
                     // The fit timed out and gradient is still too large for reliable outer
                     // derivatives, so fail fast and let the caller backtrack.
                     log::error!(
                         "P-IRLS failed convergence check: gradient norm {:.3e} > {:.3e} (iter {})",
-                        pirls_result.last_gradient_norm,
+                        pirls_result.lastgradient_norm,
                         acceptable_kkt,
                         pirls_result.iteration
                     );
                     Err(EstimationError::PirlsDidNotConverge {
                         max_iterations: pirls_result.iteration,
-                        last_change: pirls_result.last_gradient_norm,
+                        last_change: pirls_result.lastgradient_norm,
                     })
                 } else {
                     // Near-stationary despite max iterations; treat as usable.
                     log::warn!(
                         "P-IRLS reached max iterations but gradient norm {:.3e} <= {:.3e}; accepting near-stationary fit.",
-                        pirls_result.last_gradient_norm,
+                        pirls_result.lastgradient_norm,
                         acceptable_kkt
                     );
-                    self.update_warm_start_from(pirls_result.as_ref());
+                    self.updatewarm_start_from(pirls_result.as_ref());
                     Ok(pirls_result)
                 }
             }
@@ -1184,8 +1184,7 @@ impl<'a> RemlState<'a> {
 impl<'a> RemlState<'a> {
     /// Compute the objective function for BFGS optimization.
     ///
-    /// FULL OBJECTIVE REFERENCE
-    /// ------------------------
+    /// Full objective reference.
     /// This function returns the scalar outer cost minimized over ρ.
     ///
     /// Non-Gaussian branch (negative LAML form used by optimizer):
@@ -1308,8 +1307,8 @@ impl<'a> RemlState<'a> {
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let mut e_eval = pirls_result.reparam_result.e_transformed.clone();
         if let Some(z) = free_basis_opt.as_ref() {
-            h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
+            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             e_eval = pirls_result.reparam_result.e_transformed.dot(z);
         }
         let h_eff = &h_eff_eval;
@@ -1502,9 +1501,9 @@ impl<'a> RemlState<'a> {
                     + 0.5 * (log_det_h - log_det_s_plus)
                     + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                let prior_cost = self.compute_soft_prior_cost(p);
+                let priorcost = self.compute_soft_priorcost(p);
 
-                Ok(reml + prior_cost)
+                Ok(reml + priorcost)
             }
             _ => {
                 // For non-Gaussian GLMs, use the LAML approximation
@@ -1524,13 +1523,13 @@ impl<'a> RemlState<'a> {
                 }
 
                 // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
-                let (_penalty_rank, log_det_s) =
+                let (_, log_det_s) =
                     self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
 
                 // Log-determinant of the effective Hessian.
                 // HESSIAN PASSPORT: Use the pre-computed h_total and its factorization
                 // from the bundle to ensure exact consistency with gradient computation.
-                // For Firth: h_total = h_eff - h_phi (computed in prepare_eval_bundle)
+                // For Firth: h_total = h_eff - hphi (computed in prepare_eval_bundle)
                 // For non-Firth: h_total = h_eff
                 //
                 // LAML objective:
@@ -1598,8 +1597,8 @@ impl<'a> RemlState<'a> {
                     let x_orig_arc = self.x().to_dense_arc();
                     let x_orig = x_orig_arc.as_ref();
                     let w_orig = self.weights();
-                    let sqrt_w = w_orig.mapv(|w| w.max(0.0).sqrt());
-                    let wx = x_orig * &sqrt_w.insert_axis(Axis(1));
+                    let sqrtw = w_orig.mapv(|w| w.max(0.0).sqrt());
+                    let wx = x_orig * &sqrtw.insert_axis(Axis(1));
                     let mut h_raw = fast_ata(&wx);
                     for (k, &lambda) in lambdas.iter().enumerate() {
                         let s_k = &self.s_full_list[k];
@@ -1622,7 +1621,7 @@ impl<'a> RemlState<'a> {
                     *self.arena.raw_cond_snapshot.read().unwrap()
                 };
                 if want_hot_diag {
-                    self.log_gam_cost(
+                    self.log_gamcost(
                         &p,
                         lambdas.as_slice().unwrap_or(&[]),
                         laml,
@@ -1633,17 +1632,15 @@ impl<'a> RemlState<'a> {
                     );
                 }
 
-                let prior_cost = self.compute_soft_prior_cost(p);
+                let priorcost = self.compute_soft_priorcost(p);
 
-                Ok(-laml + prior_cost)
+                Ok(-laml + priorcost)
             }
         }
     }
 
     ///
-    /// -------------------------------------------------------------------------
     /// Exact non-Laplace evidence identities (reference comments; not runtime path)
-    /// -------------------------------------------------------------------------
     /// We optimize a Laplace-style outer objective for scalability, but the exact
     /// marginal likelihood for non-Gaussian models can be written analytically as:
     ///
@@ -1698,8 +1695,7 @@ impl<'a> RemlState<'a> {
     ///   machinery for the main optimizer path, with exact tensor terms where
     ///   feasible (H_k, H_{kℓ}, c/d arrays), and scalable trace backends.
     ///
-    /// FULL OUTER-DERIVATIVE REFERENCE (exact system, sign convention used here)
-    /// -------------------------------------------------------------------------
+    /// Full outer-derivative reference (exact system, sign convention used here).
     /// This optimizer minimizes an outer cost V(ρ).
     ///
     /// Common definitions:
@@ -1846,7 +1842,7 @@ impl<'a> RemlState<'a> {
     //     direct quadratic pieces are exact negatives, which is what the algebra requires.
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.arena
-            .last_gradient_used_stochastic_fallback
+            .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
         // Get the converged P-IRLS result for the current rho (`p`)
         let bundle = match self.obtain_eval_bundle(p) {

@@ -146,7 +146,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10d_p1_s0() {
 }
 
 #[test]
-fn duchon_fit_term_collection_gaussian_simulated_10d_with_exact_adaptive_regularization() {
+fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regularization() {
     let n = 96usize;
     let d = 10usize;
     let (x, y, y_true) = simulate_duchon_regression(n, d);

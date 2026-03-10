@@ -2,11 +2,11 @@ use crate::estimate::{EstimationError, FitResult, FittedLinkState};
 use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet};
 use crate::quadrature::{
-    IntegratedMomentsJet, QuadratureContext, cloglog_posterior_mean_variance,
-    integrated_family_moments_jet_with_state, integrated_inverse_link_jet_with_state,
-    integrated_inverse_link_mean_and_derivative, logit_posterior_mean_variance,
+    IntegratedMomentsJet, QuadratureContext, cloglog_posterior_meanvariance,
+    integrated_family_moments_jetwith_state, integrated_inverse_link_jetwith_state,
+    integrated_inverse_link_mean_and_derivative, logit_posterior_meanvariance,
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
-    probit_posterior_mean_variance,
+    probit_posterior_meanvariance,
 };
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
 use ndarray::{Array1, ArrayView1};
@@ -28,14 +28,14 @@ pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
 
     fn posterior_mean(
         &self,
-        quad_ctx: &QuadratureContext,
+        quadctx: &QuadratureContext,
         eta: f64,
         se_eta: f64,
     ) -> Result<f64, EstimationError>;
 
-    fn posterior_mean_variance(
+    fn posterior_meanvariance(
         &self,
-        quad_ctx: &QuadratureContext,
+        quadctx: &QuadratureContext,
         eta: f64,
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError>;
@@ -48,7 +48,7 @@ pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
 
     fn integrated_moments(
         &self,
-        quad_ctx: &QuadratureContext,
+        quadctx: &QuadratureContext,
         eta: f64,
         se_eta: f64,
     ) -> Result<IntegratedMomentsJet, EstimationError>;
@@ -156,7 +156,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 
     fn posterior_mean(
         &self,
-        quad_ctx: &QuadratureContext,
+        quadctx: &QuadratureContext,
         eta: f64,
         se_eta: f64,
     ) -> Result<f64, EstimationError> {
@@ -165,15 +165,15 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog => integrated_inverse_link_mean_and_derivative(
-                quad_ctx,
+                quadctx,
                 self.link_function(),
                 eta,
                 se_eta,
             )
             .map(|v| v.mean),
             LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialBetaLogistic => {
-                integrated_inverse_link_jet_with_state(
-                    quad_ctx,
+                integrated_inverse_link_jetwith_state(
+                    quadctx,
                     self.link_function(),
                     eta,
                     se_eta,
@@ -189,7 +189,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                             .to_string(),
                     )
                 })?;
-                Ok(normal_expectation_1d_adaptive(quad_ctx, eta, se_eta, |x| {
+                Ok(normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
                     mixture_inverse_link_jet(state, x).mu
                 }))
             }
@@ -200,22 +200,22 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         }
     }
 
-    fn posterior_mean_variance(
+    fn posterior_meanvariance(
         &self,
-        quad_ctx: &QuadratureContext,
+        quadctx: &QuadratureContext,
         eta: f64,
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError> {
         match self.family {
             LikelihoodFamily::GaussianIdentity => Ok((eta, (se_eta * se_eta).max(0.0))),
             LikelihoodFamily::BinomialLogit => {
-                Ok(logit_posterior_mean_variance(quad_ctx, eta, se_eta))
+                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }
             LikelihoodFamily::BinomialProbit => {
-                Ok(probit_posterior_mean_variance(quad_ctx, eta, se_eta))
+                Ok(probit_posterior_meanvariance(quadctx, eta, se_eta))
             }
             LikelihoodFamily::BinomialCLogLog => {
-                Ok(cloglog_posterior_mean_variance(quad_ctx, eta, se_eta))
+                Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
             }
             LikelihoodFamily::BinomialSas => {
                 let state = self.sas_state().ok_or_else(|| {
@@ -223,7 +223,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                         "BinomialSas posterior mean requires fitted SAS link state".to_string(),
                     )
                 })?;
-                let (m1, m2) = normal_expectation_1d_adaptive_pair(quad_ctx, eta, se_eta, |x| {
+                let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
                     let p = crate::mixture_link::sas_inverse_link_jet(
                         x,
                         state.epsilon,
@@ -241,7 +241,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                             .to_string(),
                     )
                 })?;
-                let (m1, m2) = normal_expectation_1d_adaptive_pair(quad_ctx, eta, se_eta, |x| {
+                let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
                     let p = crate::mixture_link::beta_logistic_inverse_link_jet(
                         x,
                         state.log_delta,
@@ -259,7 +259,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                             .to_string(),
                     )
                 })?;
-                let (m1, m2) = normal_expectation_1d_adaptive_pair(quad_ctx, eta, se_eta, |x| {
+                let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
                     let p = mixture_inverse_link_jet(state, x).mu;
                     (p, p * p)
                 });
@@ -299,12 +299,12 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 
     fn integrated_moments(
         &self,
-        quad_ctx: &QuadratureContext,
+        quadctx: &QuadratureContext,
         eta: f64,
         se_eta: f64,
     ) -> Result<IntegratedMomentsJet, EstimationError> {
-        integrated_family_moments_jet_with_state(
-            quad_ctx,
+        integrated_family_moments_jetwith_state(
+            quadctx,
             self.family,
             eta,
             se_eta,

@@ -24,8 +24,8 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
         solve_sparse_spd(self, rhs).map_err(|e| e.to_string())
     }
 
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
-        solve_sparse_spd_multi(self, rhs).map_err(|e| e.to_string())
+    fn solvemulti(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+        solve_sparse_spdmulti(self, rhs).map_err(|e| e.to_string())
     }
 
     fn logdet(&self) -> f64 {
@@ -50,7 +50,7 @@ pub struct SparsePenaltyBlock {
     pub s_k_block_dense: Arc<Array2<f64>>,
     pub s_k_block_upper_entries: Arc<Vec<(usize, usize, f64)>>,
     pub r_k_sparse: SparseColMat<usize, f64>,
-    r_k_rows: Arc<SparseRowMat<usize, f64>>,
+    r_krows: Arc<SparseRowMat<usize, f64>>,
 }
 
 #[derive(Clone)]
@@ -80,7 +80,7 @@ impl SparseTraceWorkspace {
             for j in 0..block_dim {
                 rhs[[p_start + j, j]] = 1.0;
             }
-            let solved = solve_sparse_spd_multi(factor, &rhs)?;
+            let solved = solve_sparse_spdmulti(factor, &rhs)?;
             let block = solved.slice(ndarray::s![p_start..p_end, ..]).to_owned();
             self.selected_block_inv_cache.insert(key, block);
         }
@@ -117,7 +117,7 @@ impl SparseTraceWorkspace {
             for (j, &idx) in key.iter().enumerate() {
                 rhs[[idx, j]] = 1.0;
             }
-            let solved = solve_sparse_spd_multi(factor, &rhs)?;
+            let solved = solve_sparse_spdmulti(factor, &rhs)?;
             let mut sub = Array2::<f64>::zeros((m, m));
             for (i_local, &i_global) in key.iter().enumerate() {
                 for j_local in 0..m {
@@ -247,17 +247,17 @@ pub fn sparse_symmetric_upper_matvec_public(
     out
 }
 
-fn sparse_row_quadratic_form_from_selected_inverse(
+fn sparserow_quadratic_form_from_selected_inverse(
     row_idx: &[usize],
-    row_val: &[f64],
+    rowval: &[f64],
     support_pos: &BTreeMap<usize, usize>,
     h_support: &Array2<f64>,
 ) -> Result<f64, EstimationError> {
-    if row_idx.len() != row_val.len() {
+    if row_idx.len() != rowval.len() {
         return Err(EstimationError::InvalidInput(format!(
             "row quadratic form support/value length mismatch: idx={}, val={}",
             row_idx.len(),
-            row_val.len()
+            rowval.len()
         )));
     }
     let mut quad = 0.0_f64;
@@ -268,7 +268,7 @@ fn sparse_row_quadratic_form_from_selected_inverse(
                 ia
             ))
         })?;
-        let va = row_val[a];
+        let va = rowval[a];
         for (b, &ib) in row_idx.iter().enumerate() {
             let pb = support_pos.get(&ib).ok_or_else(|| {
                 EstimationError::InvalidInput(format!(
@@ -276,7 +276,7 @@ fn sparse_row_quadratic_form_from_selected_inverse(
                     ib
                 ))
             })?;
-            quad += va * h_support[[*pa, *pb]] * row_val[b];
+            quad += va * h_support[[*pa, *pb]] * rowval[b];
         }
     }
     Ok(quad)
@@ -408,8 +408,8 @@ pub fn solve_sparse_spd(
 ) -> Result<Array1<f64>, EstimationError> {
     let rhs_arr =
         Array2::from_shape_vec((rhs.len(), 1), rhs.to_vec()).expect("rhs vector should reshape");
-    let rhs_view = FaerArrayView::new(&rhs_arr);
-    let out = factor.factor.solve(rhs_view.as_ref());
+    let rhsview = FaerArrayView::new(&rhs_arr);
+    let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array1::<f64>::zeros(rhs.len());
     for i in 0..rhs.len() {
         result[i] = out[(i, 0)];
@@ -422,12 +422,12 @@ pub fn solve_sparse_spd(
     Ok(result)
 }
 
-pub fn solve_sparse_spd_multi(
+pub fn solve_sparse_spdmulti(
     factor: &SparseExactFactor,
     rhs: &Array2<f64>,
 ) -> Result<Array2<f64>, EstimationError> {
-    let rhs_view = FaerArrayView::new(rhs);
-    let out = factor.factor.solve(rhs_view.as_ref());
+    let rhsview = FaerArrayView::new(rhs);
+    let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array2::<f64>::zeros(rhs.raw_dim());
     for j in 0..rhs.ncols() {
         for i in 0..rhs.nrows() {
@@ -478,10 +478,10 @@ pub fn trace_hinv_sk(
         return Ok(total);
     }
 
-    let symbolic = penalty.r_k_rows.symbolic();
+    let symbolic = penalty.r_krows.symbolic();
     let row_ptr = symbolic.row_ptr();
     let col_idx = symbolic.col_idx();
-    let values = penalty.r_k_rows.val();
+    let values = penalty.r_krows.val();
 
     // Takahashi-style selected support route (exact): build H^{-1}_{J,J} once
     // for J = union(support(R_k)), then evaluate all row quadratics using only
@@ -496,10 +496,10 @@ pub fn trace_hinv_sk(
     }
 
     let mut total = 0.0_f64;
-    for row in 0..penalty.r_k_rows.nrows() {
+    for row in 0..penalty.r_krows.nrows() {
         let start = row_ptr[row];
         let end = row_ptr[row + 1];
-        total += sparse_row_quadratic_form_from_selected_inverse(
+        total += sparserow_quadratic_form_from_selected_inverse(
             &col_idx[start..end],
             &values[start..end],
             &support_pos,
@@ -528,7 +528,7 @@ pub fn leverages_from_factor(
                     let row = start + local_col;
                     rhs.column_mut(local_col).assign(&matrix.row(row).t());
                 }
-                let solved = solve_sparse_spd_multi(factor, &rhs)?;
+                let solved = solve_sparse_spdmulti(factor, &rhs)?;
                 for local_col in 0..cols {
                     let row = start + local_col;
                     out[row] = matrix.row(row).dot(&solved.column(local_col));
@@ -555,12 +555,12 @@ pub fn leverages_from_factor(
                 let r1 = row_ptr[row + 1];
                 let idx = &col_idx[r0..r1];
                 let val = &values[r0..r1];
-                let h_row = workspace.selected_support_inverse(factor, idx)?;
+                let hrow = workspace.selected_support_inverse(factor, idx)?;
                 let mut quad = 0.0_f64;
                 for i in 0..idx.len() {
                     let vi = val[i];
                     for j in 0..idx.len() {
-                        quad += vi * h_row[[i, j]] * val[j];
+                        quad += vi * hrow[[i, j]] * val[j];
                     }
                 }
                 out[row] = quad;
@@ -670,7 +670,7 @@ pub fn build_sparse_penalty_blocks(
         }
         let s_k_sparse = dense_to_sparse(s_k, ZERO_TOL)?;
         let r_k_sparse = dense_to_sparse(r_k, ZERO_TOL)?;
-        let r_k_rows = Arc::new(r_k_sparse.as_ref().to_row_major().map_err(|_| {
+        let r_krows = Arc::new(r_k_sparse.as_ref().to_row_major().map_err(|_| {
             EstimationError::InvalidInput("failed to convert penalty root to CSR".to_string())
         })?);
         let block_dense = if p_end > p_start {
@@ -697,7 +697,7 @@ pub fn build_sparse_penalty_blocks(
             s_k_block_dense: Arc::new(s_k_block_dense),
             s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
             r_k_sparse,
-            r_k_rows,
+            r_krows,
         });
     }
     Ok(Some(blocks))
