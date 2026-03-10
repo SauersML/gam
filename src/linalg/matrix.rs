@@ -10,6 +10,8 @@ const MATRIX_FREE_PCG_MIN_P: usize = 512;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 
+pub use crate::linalg::utils::PcgSolveInfo;
+
 struct PenalizedWeightedNormalOperator<'a, O: LinearOperator + ?Sized> {
     operator: &'a O,
     weights: &'a Array1<f64>,
@@ -451,6 +453,16 @@ pub trait LinearOperator {
         penalty: Option<&Array2<f64>>,
         baseridge: f64,
     ) -> Result<Array1<f64>, String> {
+        self.solve_system_matrix_free_pcg_with_info_try(weights, rhs, penalty, baseridge)
+            .map(|(solution, _)| solution)
+    }
+    fn solve_system_matrix_free_pcg_with_info_try(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        baseridge: f64,
+    ) -> Result<(Array1<f64>, PcgSolveInfo), String> {
         if rhs.len() != self.ncols() {
             return Err(format!(
                 "solve_system_matrix_free_pcg rhs dimension mismatch: rhs length {} != ncols {}",
@@ -485,17 +497,17 @@ pub trait LinearOperator {
                 ridge,
             };
             let preconditioner = normal_op.jacobi_preconditioner()?;
-            let solved = crate::linalg::utils::solve_spd_pcg(
+            let solved = crate::linalg::utils::solve_spd_pcg_with_info(
                 |v| normal_op.apply(v),
                 rhs,
                 &preconditioner,
                 MATRIX_FREE_PCG_REL_TOL,
                 MATRIX_FREE_PCG_MAX_ITER.max(4 * self.ncols()),
             );
-            if let Some(solution) = solved
+            if let Some((solution, info)) = solved
                 && solution.iter().all(|v| v.is_finite())
             {
-                return Ok(solution);
+                return Ok((solution, info));
             }
         }
         Err("matrix-free PCG failed after ridge retries".to_string())
@@ -1062,6 +1074,26 @@ impl DesignMatrix {
         )
     }
 
+    pub fn solve_system_matrix_free_pcg_with_info(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge_floor: f64,
+    ) -> Result<(Array1<f64>, PcgSolveInfo), String> {
+        <Self as LinearOperator>::solve_system_matrix_free_pcg_with_info_try(
+            self,
+            weights,
+            rhs,
+            penalty,
+            ridge_floor.max(1e-15),
+        )
+    }
+
+    pub fn should_use_matrix_free_pcg(&self) -> bool {
+        <Self as LinearOperator>::uses_matrix_free_pcg(self) && self.ncols() >= MATRIX_FREE_PCG_MIN_P
+    }
+
     pub fn factorize_system(
         &self,
         weights: &Array1<f64>,
@@ -1110,7 +1142,7 @@ impl From<&DesignMatrix> for DesignMatrix {
 #[cfg(test)]
 mod tests {
     use super::{DesignMatrix, dense_matvec, dense_transpose_matvec};
-    use crate::linalg::utils::StableSolver;
+    use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, Axis, array};
@@ -1312,6 +1344,45 @@ mod tests {
                 "policy mismatch at {i}: explicit={} policy={}",
                 explicit[i],
                 policy[i]
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_matrix_free_pcg_reports_convergence_diagnostics() {
+        let n = 36usize;
+        let p = 540usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] =
+                    (((3 * i + 5 * j + 7) % 29) as f64 / 29.0) + 0.015 * (i as f64) + 1e-4 * j as f64;
+            }
+        }
+        let design = DesignMatrix::Dense(x.clone());
+        assert!(design.should_use_matrix_free_pcg());
+        let weights = Array1::from_iter((0..n).map(|i| 0.75 + 0.01 * i as f64));
+        let rhs = Array1::from_iter((0..p).map(|j| ((j % 9) as f64 - 4.0) / 9.0));
+        let penalty = Array2::from_diag(&Array1::from_iter(
+            (0..p).map(|j| 0.05 + 0.002 * ((j % 11) as f64)),
+        ));
+        let ridge = 1e-8;
+
+        let (pcg, info): (Array1<f64>, PcgSolveInfo) = design
+            .solve_system_matrix_free_pcg_with_info(&weights, &rhs, Some(&penalty), ridge)
+            .expect("pcg with info");
+        assert!(info.converged);
+        assert!(info.iterations > 0);
+        assert!(info.relative_residual_norm.is_finite());
+        assert!(info.relative_residual_norm < 1e-6);
+
+        let exact = exact_weighted_penalized_solve(&x, &weights, &rhs, &penalty, ridge);
+        for i in 0..p {
+            assert!(
+                (pcg[i] - exact[i]).abs() < 1e-5,
+                "solution mismatch at {i}: pcg={} exact={}",
+                pcg[i],
+                exact[i]
             );
         }
     }

@@ -229,13 +229,20 @@ pub(crate) fn boundary_hit_step_fraction(
     None
 }
 
-pub(crate) fn solve_spd_pcg<F>(
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PcgSolveInfo {
+    pub iterations: usize,
+    pub converged: bool,
+    pub relative_residual_norm: f64,
+}
+
+pub fn solve_spd_pcg_with_info<F>(
     apply: F,
     rhs: &Array1<f64>,
     preconditioner_diag: &Array1<f64>,
     rel_tol: f64,
     max_iter: usize,
-) -> Option<Array1<f64>>
+) -> Option<(Array1<f64>, PcgSolveInfo)>
 where
     F: Fn(&Array1<f64>) -> Array1<f64>,
 {
@@ -248,7 +255,14 @@ where
         return None;
     }
     if rhs_norm == 0.0 {
-        return Some(Array1::<f64>::zeros(p));
+        return Some((
+            Array1::<f64>::zeros(p),
+            PcgSolveInfo {
+                iterations: 0,
+                converged: true,
+                relative_residual_norm: 0.0,
+            },
+        ));
     }
 
     let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
@@ -264,7 +278,7 @@ where
         return None;
     }
 
-    for _ in 0..max_iter.max(1) {
+    for iter in 0..max_iter.max(1) {
         let ap = apply(&p_dir);
         let denom = p_dir.dot(&ap);
         if !denom.is_finite() || denom <= 0.0 {
@@ -278,7 +292,14 @@ where
         r.scaled_add(-alpha, &ap);
         let r_norm = r.dot(&r).sqrt();
         if r_norm.is_finite() && r_norm <= tol {
-            return x.iter().all(|v| v.is_finite()).then_some(x);
+            return x.iter().all(|v| v.is_finite()).then_some((
+                x,
+                PcgSolveInfo {
+                    iterations: iter + 1,
+                    converged: true,
+                    relative_residual_norm: r_norm / rhs_norm.max(1.0),
+                },
+            ));
         }
         for i in 0..p {
             z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
@@ -297,6 +318,20 @@ where
         rz_old = rz_new;
     }
     None
+}
+
+pub fn solve_spd_pcg<F>(
+    apply: F,
+    rhs: &Array1<f64>,
+    preconditioner_diag: &Array1<f64>,
+    rel_tol: f64,
+    max_iter: usize,
+) -> Option<Array1<f64>>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    solve_spd_pcg_with_info(apply, rhs, preconditioner_diag, rel_tol, max_iter)
+        .map(|(solution, _)| solution)
 }
 
 pub fn stochastic_lanczos_logdet_spd(
