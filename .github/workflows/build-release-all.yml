@@ -1,0 +1,161 @@
+name: Build and Release All
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'Cargo.toml'
+      - '**/*.rs'
+      - '.github/workflows/build-release-all.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-release-all-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GAM_SKIP_LINT_CHECKS: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # MacOS ARM (Apple Silicon) - GH Actions uses M1
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact_name: gam
+            asset_name: gam-macos-arm64
+            cpu: apple-m1
+
+          # MacOS Intel - use macos-15-intel which runs on Intel hardware
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact_name: gam
+            asset_name: gam-macos-intel
+            cpu: x86-64-v3
+
+          # Linux x86_64 (ubuntu-22.04 for wider glibc compatibility)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: gam
+            asset_name: gam-linux-x64
+            cpu: x86-64-v3
+
+          # Linux ARM64 (ubuntu-22.04 for wider glibc compatibility)
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: gam
+            asset_name: gam-linux-arm64
+            cpu: neoverse-n1
+
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: gam.exe
+            asset_name: gam-windows-x64
+            cpu: x86-64-v3
+
+          # Windows ARM64 (native ARM runner)
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact_name: gam.exe
+            asset_name: gam-windows-arm64
+            cpu: cortex-a76
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          targets: ${{ matrix.target }}
+
+      - name: Install NVIDIA CUDA Toolkit
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.2.2'
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Remove local cargo config
+        # Prevent .cargo/config.toml's target-cpu=native from interfering with release builds
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - name: Build
+        shell: bash
+        env:
+          # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
+          RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
+          GAM_SKIP_LINT_CHECKS: "1"
+          # Embed commit-addressable release tag in binary for version command
+          GAM_RELEASE_TAG: "main-${{ github.sha }}"
+        run: cargo +nightly build --release --target ${{ matrix.target }}
+
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+          tar -czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.artifact_name }} -Destination ${{ matrix.asset_name }}.exe
+          Compress-Archive -Path ${{ matrix.asset_name }}.exe -DestinationPath ${{ matrix.asset_name }}.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}.tar.gz
+            ${{ matrix.asset_name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Generate release tag
+        id: tag
+        run: echo "release_tag=main-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: Release ${{ steps.tag.outputs.release_tag }}
+          files: artifacts/**/*
