@@ -268,22 +268,7 @@ where
 
     let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        x[i] = rhs[i] / preconditioner_diag[i].abs().max(1e-12);
-    }
-    let ax0 = apply(&x);
-    let mut r = rhs - &ax0;
-    let r0_norm = r.dot(&r).sqrt();
-    if r0_norm.is_finite() && r0_norm <= tol {
-        return x.iter().all(|v| v.is_finite()).then_some((
-            x,
-            PcgSolveInfo {
-                iterations: 0,
-                converged: true,
-                relative_residual_norm: r0_norm / rhs_norm.max(1.0),
-            },
-        ));
-    }
+    let mut r = rhs.clone();
     let mut z = Array1::<f64>::zeros(p);
     for i in 0..p {
         z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
