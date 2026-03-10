@@ -242,6 +242,27 @@ pub struct WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
+    const LOG_F64_MAX: f64 = 709.782712893384;
+
+    #[inline]
+    fn scaled_exp_component(log_scale: f64, base: f64) -> Result<f64, EstimationError> {
+        if base == 0.0 {
+            return Ok(0.0);
+        }
+        let log_abs = log_scale + base.abs().ln();
+        if !log_abs.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "survival interval term produced non-finite log-magnitude".to_string(),
+            ));
+        }
+        if log_abs > Self::LOG_F64_MAX {
+            return Err(EstimationError::InvalidInput(format!(
+                "survival interval term exceeds f64 range (log-magnitude={log_abs:.3e})"
+            )));
+        }
+        Ok(base.signum() * log_abs.exp())
+    }
+
     fn row_derivative_constraint_lower_bound(&self, _: usize) -> f64 {
         self.derivative_guard()
     }
@@ -320,6 +341,99 @@ impl WorkingModelSurvival {
     fn interval_increment_guard(&self, h_entry: f64, h_exit: f64) -> f64 {
         let scale = h_entry.abs().max(h_exit.abs()).max(1.0);
         1e-10 * scale
+    }
+
+    fn stable_sigmoid(x: f64) -> f64 {
+        if x >= 0.0 {
+            let exp_neg = (-x).exp();
+            1.0 / (1.0 + exp_neg)
+        } else {
+            let exp_pos = x.exp();
+            exp_pos / (1.0 + exp_pos)
+        }
+    }
+
+    fn stable_softplus(x: f64) -> f64 {
+        if x > 0.0 {
+            x + (-x).exp().ln_1p()
+        } else {
+            x.exp().ln_1p()
+        }
+    }
+
+    fn stable_softplus_inverse(y: f64) -> Result<f64, EstimationError> {
+        if !y.is_finite() || y <= 0.0 {
+            return Err(EstimationError::InvalidInput(format!(
+                "softplus inverse requires strictly positive input, got {y}"
+            )));
+        }
+        if y > 20.0 {
+            Ok(y + (-(-y).exp()).ln_1p())
+        } else {
+            Ok(y.exp_m1().ln())
+        }
+    }
+
+    pub fn structural_time_coefficient_lower_bounds(&self) -> Option<Array1<f64>> {
+        if !self.structurally_monotonic || self.structural_time_columns == 0 {
+            return None;
+        }
+        let p = self.x_derivative.ncols();
+        let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
+        let derivative_guard = self.derivative_guard();
+        let mut min_uniform_time_coef = 0.0_f64;
+
+        for i in 0..self.x_derivative.nrows() {
+            if self.sampleweight[i] <= 0.0 {
+                continue;
+            }
+            let row = self.x_derivative.row(i);
+            let row_sum = row
+                .slice(ndarray::s![0..self.structural_time_columns])
+                .iter()
+                .copied()
+                .fold(0.0_f64, |acc, v| acc + v);
+            if row_sum <= 1e-12 {
+                continue;
+            }
+            let rhs = (derivative_guard - self.offset_derivative_exit[i]).max(0.0);
+            min_uniform_time_coef = min_uniform_time_coef.max(rhs / row_sum);
+        }
+
+        for j in 0..self.structural_time_columns {
+            lower_bounds[j] = min_uniform_time_coef;
+        }
+        Some(lower_bounds)
+    }
+
+    pub fn structural_time_initial_coefficient_floor(
+        &self,
+        derivative_target_floor: f64,
+    ) -> Option<f64> {
+        if !self.structurally_monotonic || self.structural_time_columns == 0 {
+            return None;
+        }
+        let derivative_target_floor = derivative_target_floor.max(self.derivative_guard());
+        let mut min_uniform_time_coef = 0.0_f64;
+
+        for i in 0..self.x_derivative.nrows() {
+            if self.sampleweight[i] <= 0.0 {
+                continue;
+            }
+            let row = self.x_derivative.row(i);
+            let row_sum = row
+                .slice(ndarray::s![0..self.structural_time_columns])
+                .iter()
+                .copied()
+                .fold(0.0_f64, |acc, v| acc + v);
+            if row_sum <= 1e-12 {
+                continue;
+            }
+            let rhs = (derivative_target_floor - self.offset_derivative_exit[i]).max(0.0);
+            min_uniform_time_coef = min_uniform_time_coef.max(rhs / row_sum);
+        }
+
+        Some(min_uniform_time_coef)
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
@@ -541,17 +655,9 @@ impl WorkingModelSurvival {
         let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
         let derivative_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
 
-        let h_entry = eta_entry.mapv(f64::exp);
-        let h_exit = eta_exit.mapv(f64::exp);
-        if h_entry.iter().any(|v| !v.is_finite()) || h_exit.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "survival linear predictor produced non-finite cumulative hazard".to_string(),
-            ));
-        }
-
         let mut nll = 0.0;
-        let mut w_exit_interval = Array1::<f64>::zeros(n);
-        let mut w_entry_interval = Array1::<f64>::zeros(n);
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut h = Array2::<f64>::zeros((p, p));
         let mut w_event = Array1::<f64>::zeros(n);
         let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
         let mut w_event_outer = Array1::<f64>::zeros(n);
@@ -573,8 +679,19 @@ impl WorkingModelSurvival {
             let d = f64::from(self.event_target[i]);
 
             let has_entry_interval = !self.entry_at_origin[i];
-            let h_s = if has_entry_interval { h_entry[i] } else { 0.0 };
-            let h_e = h_exit[i];
+            let interval_scale = if has_entry_interval {
+                eta_exit[i].max(eta_entry[i])
+            } else {
+                eta_exit[i]
+            };
+            let h_e_scaled = (eta_exit[i] - interval_scale).exp();
+            let h_s_scaled = if has_entry_interval {
+                (eta_entry[i] - interval_scale).exp()
+            } else {
+                0.0
+            };
+            let interval_scaled = h_e_scaled - h_s_scaled;
+            let interval = Self::scaled_exp_component(interval_scale, interval_scaled)?;
             let deriv = self
                 .stabilized_structural_derivative(derivative_raw[i])
                 .unwrap_or(derivative_raw[i]);
@@ -591,19 +708,32 @@ impl WorkingModelSurvival {
                 )));
             }
             if has_entry_interval {
-                let increment_guard = self.interval_increment_guard(h_s, h_e);
-                if h_e + increment_guard < h_s {
+                let increment_guard = self.interval_increment_guard(h_s_scaled, h_e_scaled);
+                if interval_scaled + increment_guard < 0.0 {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
-                        "survival cumulative hazard decreased over row {}: H(exit)={:.6e} < H(entry)={:.6e}",
-                        i, h_e, h_s
+                        "survival cumulative hazard decreased over row {}: H(exit)-H(entry)={:.6e}",
+                        i, interval
                     )));
                 }
             }
-            w_exit_interval[i] = w * h_e;
-            if has_entry_interval {
-                w_entry_interval[i] = w * h_s;
+            nll += w * interval;
+
+            let x_e = self.x_exit.row(i);
+            let x_s = self.x_entry.row(i);
+            for r in 0..p {
+                let interval_grad_r = Self::scaled_exp_component(
+                    interval_scale,
+                    h_e_scaled * x_e[r] - h_s_scaled * x_s[r],
+                )?;
+                grad[r] += w * interval_grad_r;
+                for c in 0..p {
+                    let interval_h_rc = Self::scaled_exp_component(
+                        interval_scale,
+                        h_e_scaled * x_e[r] * x_e[c] - h_s_scaled * x_s[r] * x_s[c],
+                    )?;
+                    h[[r, c]] += w * interval_h_rc;
+                }
             }
-            nll += w * (h_e - h_s);
 
             if d > 0.0 {
                 let inv_deriv = 1.0 / deriv;
@@ -614,13 +744,9 @@ impl WorkingModelSurvival {
             }
         }
 
-        let mut grad = fast_atv(&self.x_exit, &w_exit_interval);
-        grad -= &fast_atv(&self.x_entry, &w_entry_interval);
         grad -= &fast_atv(&self.x_exit, &w_event);
         grad -= &fast_atv(&self.x_derivative, &w_event_inv_deriv);
 
-        let mut h = fast_xt_diag_x(&self.x_exit, &w_exit_interval);
-        h -= &fast_xt_diag_x(&self.x_entry, &w_entry_interval);
         h += &fast_xt_diag_x(&self.x_derivative, &w_event_outer);
 
         let penaltygrad = self.penalties.gradient(beta);
@@ -990,6 +1116,142 @@ impl WorkingModelSurvival {
         }
 
         Ok((objective, grad))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuralTimeLatentSurvivalModel {
+    inner: WorkingModelSurvival,
+    coefficient_lower_bounds: Array1<f64>,
+}
+
+impl StructuralTimeLatentSurvivalModel {
+    pub fn new(
+        inner: WorkingModelSurvival,
+        coefficient_lower_bounds: Array1<f64>,
+    ) -> Result<Self, EstimationError> {
+        if coefficient_lower_bounds.len() != inner.x_exit.ncols() {
+            return Err(EstimationError::InvalidInput(format!(
+                "structural survival latent model lower-bound length mismatch: got {}, expected {}",
+                coefficient_lower_bounds.len(),
+                inner.x_exit.ncols()
+            )));
+        }
+        if !inner.structurally_monotonic || inner.structural_time_columns == 0 {
+            return Err(EstimationError::InvalidInput(
+                "structural survival latent model requires structural monotonicity on a non-empty time block"
+                    .to_string(),
+            ));
+        }
+        for j in 0..inner.structural_time_columns {
+            if !coefficient_lower_bounds[j].is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "structural survival latent model requires finite lower bounds on time coefficient {j}"
+                )));
+            }
+        }
+        for j in inner.structural_time_columns..coefficient_lower_bounds.len() {
+            if coefficient_lower_bounds[j].is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "structural survival latent model only supports bounded time coefficients; found finite lower bound at coefficient {j}"
+                )));
+            }
+        }
+        Ok(Self {
+            inner,
+            coefficient_lower_bounds,
+        })
+    }
+
+    fn latent_derivative_data(
+        &self,
+        latent_beta: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        if latent_beta.len() != self.coefficient_lower_bounds.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "latent beta length mismatch: got {}, expected {}",
+                latent_beta.len(),
+                self.coefficient_lower_bounds.len()
+            )));
+        }
+        let mut beta_user = latent_beta.clone();
+        let mut jac_diag = Array1::<f64>::ones(latent_beta.len());
+        let mut second_diag = Array1::<f64>::zeros(latent_beta.len());
+        for j in 0..self.inner.structural_time_columns {
+            let lb = self.coefficient_lower_bounds[j];
+            let sigmoid = WorkingModelSurvival::stable_sigmoid(latent_beta[j]);
+            beta_user[j] = lb + WorkingModelSurvival::stable_softplus(latent_beta[j]);
+            jac_diag[j] = sigmoid;
+            second_diag[j] = sigmoid * (1.0 - sigmoid);
+        }
+        Ok((beta_user, jac_diag, second_diag))
+    }
+
+    pub fn latent_to_user_coefficients(
+        &self,
+        latent_beta: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let (beta_user, _, _) = self.latent_derivative_data(latent_beta)?;
+        Ok(beta_user)
+    }
+
+    pub fn user_to_latent_coefficients(
+        &self,
+        beta_user: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if beta_user.len() != self.coefficient_lower_bounds.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "user beta length mismatch: got {}, expected {}",
+                beta_user.len(),
+                self.coefficient_lower_bounds.len()
+            )));
+        }
+        let mut latent_beta = beta_user.clone();
+        for j in 0..self.inner.structural_time_columns {
+            let slack = beta_user[j] - self.coefficient_lower_bounds[j];
+            latent_beta[j] = WorkingModelSurvival::stable_softplus_inverse(slack)?;
+        }
+        Ok(latent_beta)
+    }
+
+    pub fn evaluate_user_state(
+        &self,
+        beta_user: &Array1<f64>,
+    ) -> Result<WorkingState, EstimationError> {
+        self.inner.update_state(beta_user)
+    }
+}
+
+impl PirlsWorkingModel for StructuralTimeLatentSurvivalModel {
+    fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+        let (beta_user, jac_diag, second_diag) = self.latent_derivative_data(beta.as_ref())?;
+        let user_state = self.inner.update_state(&beta_user)?;
+        let user_hessian = user_state.hessian.to_dense();
+        let p = beta_user.len();
+
+        let mut latent_gradient = user_state.gradient.clone();
+        for j in 0..p {
+            latent_gradient[j] *= jac_diag[j];
+        }
+
+        let mut latent_hessian = user_hessian;
+        for r in 0..p {
+            for c in 0..p {
+                latent_hessian[[r, c]] *= jac_diag[r] * jac_diag[c];
+            }
+            latent_hessian[[r, r]] += user_state.gradient[r] * second_diag[r];
+        }
+
+        Ok(WorkingState {
+            eta: user_state.eta,
+            gradient: latent_gradient,
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(latent_hessian),
+            sparsehessian: None,
+            deviance: user_state.deviance,
+            penalty_term: user_state.penalty_term,
+            firth: user_state.firth,
+            ridge_used: user_state.ridge_used,
+        })
     }
 }
 
@@ -1830,6 +2092,123 @@ mod tests {
             .update_state(&array![1e-6])
             .expect("small positive derivative coefficient should remain feasible");
         assert!(state.deviance.is_finite());
+    }
+
+    #[test]
+    fn structural_monotonicity_derives_uniform_time_lower_bounds() {
+        let age_entry = array![1.0_f64, 1.5_f64];
+        let age_exit = array![2.0_f64, 3.0_f64];
+        let event_target = array![1u8, 0u8];
+        let event_competing = array![0u8, 0u8];
+        let sampleweight = array![1.0, 1.0];
+        let x_entry = array![[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
+        let x_exit = array![[0.2, 0.4, 1.0], [0.3, 0.5, 1.0]];
+        let x_derivative = array![[0.3, 0.2, 0.0], [0.4, 0.1, 0.0]];
+
+        let mut model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct structural survival model");
+        model
+            .set_structural_monotonicity(true, 2)
+            .expect("enable structural monotonicity");
+
+        let lower_bounds = model
+            .structural_time_coefficient_lower_bounds()
+            .expect("structural lower bounds");
+
+        assert_eq!(lower_bounds.len(), 3);
+        assert!(lower_bounds[0].is_finite());
+        assert!(lower_bounds[1].is_finite());
+        assert!(!lower_bounds[2].is_finite());
+        assert!(lower_bounds[0] >= 0.0);
+        assert!((lower_bounds[0] - lower_bounds[1]).abs() <= 1e-18);
+    }
+
+    #[test]
+    fn structural_time_latent_model_matches_exact_chain_rule() {
+        let age_entry = array![1.0_f64, 1.5_f64];
+        let age_exit = array![2.0_f64, 3.0_f64];
+        let event_target = array![1u8, 0u8];
+        let event_competing = array![0u8, 0u8];
+        let sampleweight = array![1.0, 1.0];
+        let x_entry = array![[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
+        let x_exit = array![[0.2, 0.4, 1.0], [0.3, 0.5, 1.0]];
+        let x_derivative = array![[0.3, 0.2, 0.0], [0.4, 0.1, 0.0]];
+
+        let mut base_model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct structural survival model");
+        base_model
+            .set_structural_monotonicity(true, 2)
+            .expect("enable structural monotonicity");
+        let lower_bounds = base_model
+            .structural_time_coefficient_lower_bounds()
+            .expect("structural lower bounds");
+
+        let latent_beta = array![-0.1, 0.3, 0.7];
+        let wrapper = StructuralTimeLatentSurvivalModel::new(base_model.clone(), lower_bounds)
+            .expect("construct latent structural model");
+        let beta_user = wrapper
+            .latent_to_user_coefficients(&latent_beta)
+            .expect("map latent beta to user space");
+        let user_state = base_model
+            .update_state(&beta_user)
+            .expect("evaluate user-space survival state");
+        let latent_state = wrapper
+            .clone()
+            .update(&crate::types::Coefficients::new(latent_beta.clone()))
+            .expect("evaluate latent-space survival state");
+
+        let mut jac_diag = Array1::<f64>::ones(3);
+        let mut second_diag = Array1::<f64>::zeros(3);
+        for j in 0..2 {
+            let sigmoid = WorkingModelSurvival::stable_sigmoid(latent_beta[j]);
+            jac_diag[j] = sigmoid;
+            second_diag[j] = sigmoid * (1.0 - sigmoid);
+        }
+
+        for j in 0..3 {
+            let expected_grad = user_state.gradient[j] * jac_diag[j];
+            assert!((latent_state.gradient[j] - expected_grad).abs() <= 1e-12);
+        }
+
+        let user_hessian = user_state.hessian.to_dense();
+        let latent_hessian = latent_state.hessian.to_dense();
+        for r in 0..3 {
+            for c in 0..3 {
+                let mut expected = user_hessian[[r, c]] * jac_diag[r] * jac_diag[c];
+                if r == c {
+                    expected += user_state.gradient[r] * second_diag[r];
+                }
+                assert!((latent_hessian[[r, c]] - expected).abs() <= 1e-12);
+            }
+        }
     }
 
     fn modelwith_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {

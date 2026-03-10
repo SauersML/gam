@@ -516,9 +516,6 @@ fn compact_fit_result_for_batch(fit: &mut FitResult) {
 }
 
 fn run_fit(args: FitArgs) -> Result<(), String> {
-    let mut progress = gam::visualizer::VisualizerSession::new(true);
-    let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
-    progress.start_workflow("Fit", fit_total_steps);
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
     let formula_link = parsed.linkspec.clone();
@@ -567,6 +564,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         };
         return run_survival(surv_args);
     }
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
+    progress.start_workflow("Fit", fit_total_steps);
     progress.set_stage("fit", "parsing csv and inferring schema");
     progress.start_secondary_workflow("Data Loading", 3);
     let ds = load_dataset(&args.data)?;
@@ -726,9 +726,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), link_choice.as_ref());
     let learn_linkwiggle = effective_linkwiggle.is_some();
-    if learn_linkwiggle && args.predict_noise.is_none() {
+    let mean_only_flexible_linkwiggle = link_choice
+        .as_ref()
+        .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible));
+    if learn_linkwiggle && args.predict_noise.is_none() && !mean_only_flexible_linkwiggle {
         return Err(
-            "link wiggle currently requires --predict-noise with binomial location-scale fitting"
+            "link wiggle without --predict-noise is currently supported only through flexible(...) binomial mean fitting"
                 .to_string(),
         );
     }
@@ -3321,27 +3324,10 @@ fn evaluate_survival_baseline(
 }
 
 fn choose_survival_time_block_initial_coefficient(
-    constraints: &gam::pirls::LinearInequalityConstraints,
-    p_time: usize,
+    min_uniform_time_coef: f64,
 ) -> f64 {
     const INIT_MARGIN_FACTOR: f64 = 1.5;
-    const INIT_DERIVATIVE_TARGET_FLOOR: f64 = 1e-6;
-
-    let mut min_uniform_time_coef = 0.0_f64;
-    for i in 0..constraints.a.nrows() {
-        let row = constraints.a.row(i);
-        let row_sum = row
-            .slice(s![0..p_time])
-            .iter()
-            .copied()
-            .fold(0.0_f64, |acc, v| acc + v);
-        if row_sum > 1e-12 {
-            let required_coef = (constraints.b[i] / row_sum).max(0.0);
-            let target_coef = (INIT_DERIVATIVE_TARGET_FLOOR / row_sum).max(required_coef);
-            min_uniform_time_coef = min_uniform_time_coef.max(target_coef);
-        }
-    }
-    min_uniform_time_coef * INIT_MARGIN_FACTOR
+    min_uniform_time_coef.max(0.0) * INIT_MARGIN_FACTOR
 }
 
 fn build_survival_baseline_offsets(
@@ -4111,14 +4097,38 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
 
     let mut beta0 = Array1::<f64>::zeros(p);
-    let linear_constraints = model.monotonicity_linear_constraints();
-    if let Some(constraints) = linear_constraints.as_ref() {
-        let initial_time_coef = choose_survival_time_block_initial_coefficient(constraints, p_time);
-        if initial_time_coef > 0.0 {
-            beta0.slice_mut(s![0..p_time]).fill(initial_time_coef);
-        }
+    let structural_time_lower_bounds = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
+        model.structural_time_coefficient_lower_bounds()
+    } else {
+        None
+    };
+    let structural_time_initial_floor = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
+        model
+            .structural_time_initial_coefficient_floor(1e-6)
+            .ok_or_else(|| {
+                "structural survival fit requires structural monotone time-coefficient initialization"
+                    .to_string()
+            })?
+    } else {
+        0.0
+    };
+    let initial_time_coef =
+        choose_survival_time_block_initial_coefficient(structural_time_initial_floor);
+    if initial_time_coef > 0.0 {
+        beta0.slice_mut(s![0..p_time]).fill(initial_time_coef);
     }
     let beta0_norm = beta0.dot(&beta0).sqrt();
+    progress.set_stage("fit", "running survival pirls");
+    let lower_bounds = structural_time_lower_bounds.ok_or_else(|| {
+        "exact survival training requires structural monotone time coefficients; non-structural training paths are not supported"
+            .to_string()
+    })?;
+    let mut latent_model =
+        gam::survival::StructuralTimeLatentSurvivalModel::new(model, lower_bounds)
+            .map_err(|e| format!("failed to construct structural survival latent model: {e}"))?;
+    let latent_beta0 = latent_model
+        .user_to_latent_coefficients(&beta0)
+        .map_err(|e| format!("failed to map structural survival start point to latent coordinates: {e}"))?;
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -4126,18 +4136,21 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         min_step_size: 1e-12,
         firth_bias_reduction: false,
         coefficient_lower_bounds: None,
-        linear_constraints,
+        linear_constraints: None,
     };
-    progress.set_stage("fit", "running survival pirls");
     let summary = gam::pirls::runworking_model_pirls(
-        &mut model,
-        gam::types::Coefficients::new(beta0),
+        &mut latent_model,
+        gam::types::Coefficients::new(latent_beta0),
         &pirls_opts,
         |_| {},
     )
-    .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
-    let beta = summary.beta.0.clone();
-    let state = summary.state.clone();
+    .map_err(|e| format!("survival latent-coordinate PIRLS failed: {e}"))?;
+    let beta = latent_model
+        .latent_to_user_coefficients(summary.beta.as_ref())
+        .map_err(|e| format!("failed to map structural survival optimum back to spline coefficients: {e}"))?;
+    let state = latent_model
+        .evaluate_user_state(&beta)
+        .map_err(|e| format!("failed to evaluate structural survival optimum in spline coordinates: {e}"))?;
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {
@@ -4150,33 +4163,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let min_entry = age_entry.iter().copied().fold(f64::INFINITY, f64::min);
             let max_exit = age_exit.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let beta_norm = beta.dot(&beta).sqrt();
-            let linear_constraint_count = pirls_opts
-                .linear_constraints
-                .as_ref()
-                .map(|c| c.a.nrows())
-                .unwrap_or(0);
-            let constraint_mode = if linear_constraint_count > 0 {
-                format!("linear-inequality({linear_constraint_count})")
-            } else {
-                "none".to_string()
-            };
-            let kkt_summary = summary
-                .constraint_kkt
-                .as_ref()
-                .map(|kkt| {
-                    format!(
-                        " | kkt[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
-                        kkt.primal_feasibility,
-                        kkt.dual_feasibility,
-                        kkt.complementarity,
-                        kkt.stationarity,
-                        kkt.n_active,
-                        kkt.n_constraints
-                    )
-                })
-                .unwrap_or_default();
+            let constraint_mode = "latent-structural-time".to_string();
             return Err(format!(
-                "survival constrained PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}, last_deviance_change={:.3e}, last_step_size={:.3e}, last_step_halving={}, max_abs_eta={:.3e}, beta0_norm={:.3e}, beta_norm={:.3e}; run[likelihood={}, spec={}, baseline_target={}, time_basis={}, constraint_mode={}, n={}, events={}, event_rate={:.4}, time_range=[{:.3e}, {:.3e}], p_time={}, p_cov={}, formula=\"{}\"]{}",
+                "survival latent PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}, last_deviance_change={:.3e}, last_step_size={:.3e}, last_step_halving={}, max_abs_eta={:.3e}, beta0_norm={:.3e}, beta_norm={:.3e}; run[likelihood={}, spec={}, baseline_target={}, time_basis={}, constraint_mode={}, n={}, events={}, event_rate={:.4}, time_range=[{:.3e}, {:.3e}], p_time={}, p_cov={}, formula=\"{}\"]",
                 summary.lastgradient_norm,
                 summary.iterations,
                 state.deviance,
@@ -4198,29 +4187,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 max_exit,
                 p_time,
                 p_cov,
-                formula,
-                kkt_summary
-            ));
-        }
-    }
-    if let Some(kkt) = summary.constraint_kkt.as_ref() {
-        let tol_primal = 1e-7;
-        let tol_dual = 1e-7;
-        let tol_comp = 1e-7;
-        let tol_stat = (pirls_opts.convergence_tolerance * 50.0).max(5e-6);
-        if kkt.primal_feasibility > tol_primal
-            || kkt.dual_feasibility > tol_dual
-            || kkt.complementarity > tol_comp
-            || kkt.stationarity > tol_stat
-        {
-            return Err(format!(
-                "survival constrained PIRLS failed KKT checks: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}; active={}/{}",
-                kkt.primal_feasibility,
-                kkt.dual_feasibility,
-                kkt.complementarity,
-                kkt.stationarity,
-                kkt.n_active,
-                kkt.n_constraints
+                formula
             ));
         }
     }
@@ -8755,12 +8722,13 @@ mod tests {
         apply_saved_probitwiggle, build_survival_time_basis, chi_square_survival_approx,
         classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
-        effectivelinkwiggle_formulaspec, evaluate_survival_baseline, parse_duchon_order,
-        parse_duchon_power, parse_formula, parse_link_choice, parse_surv_response,
-        parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, pretty_familyname, run_generate_gaussian_location_scale,
-        run_predict_binomial_location_scale, run_predict_gaussian_location_scale,
-        saved_probitwiggle_derivative_q0, saved_probitwiggle_design, summarizewiggle_domain,
+        choose_survival_time_block_initial_coefficient, effectivelinkwiggle_formulaspec,
+        evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
+        parse_link_choice, parse_surv_response, parse_survival_baseline_config,
+        parse_survival_inverse_link, parse_survival_time_basis_config, pretty_familyname,
+        run_generate_gaussian_location_scale, run_predict_binomial_location_scale,
+        run_predict_gaussian_location_scale, saved_probitwiggle_derivative_q0,
+        saved_probitwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
@@ -10659,13 +10627,42 @@ mod tests {
 
     #[test]
     fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
-        let constraints = gam::pirls::LinearInequalityConstraints {
-            a: Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
-                .expect("constraint matrix"),
-            b: Array1::from_vec(vec![1e-12, 1e-12]),
-        };
+        let age_entry = Array1::from_vec(vec![1.0, 1.5]);
+        let age_exit = Array1::from_vec(vec![2.0, 3.0]);
+        let event_target = Array1::from_vec(vec![1u8, 0u8]);
+        let event_competing = Array1::from_vec(vec![0u8, 0u8]);
+        let sampleweight = Array1::from_vec(vec![1.0, 1.0]);
+        let x_entry = Array2::from_shape_vec((2, 3), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0])
+            .expect("entry design");
+        let x_exit = Array2::from_shape_vec((2, 3), vec![0.2, 0.4, 1.0, 0.3, 0.5, 1.0])
+            .expect("exit design");
+        let x_derivative =
+            Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
+                .expect("derivative design");
+        let mut model = gam::survival::WorkingModelSurvival::from_engine_inputs(
+            gam::survival::SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            gam::survival::PenaltyBlocks::new(Vec::new()),
+            gam::survival::MonotonicityPenalty { tolerance: 0.0 },
+            gam::survival::SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+        model
+            .set_structural_monotonicity(true, 2)
+            .expect("enable structural monotonicity");
+        let min_uniform_time_coef = model
+            .structural_time_initial_coefficient_floor(1e-6)
+            .expect("structural initial coefficient floor");
 
-        let coef = choose_survival_time_block_initial_coefficient(&constraints, 2);
+        let coef = choose_survival_time_block_initial_coefficient(min_uniform_time_coef);
 
         assert!(coef.is_finite());
         assert!(coef > 0.0);

@@ -896,17 +896,17 @@ mod tests {
         state.clearwarm_start();
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
-        let mut xsecond_0 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
-        let mut ssecond_0 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
-        let mut xsecond_1 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
-        let mut ssecond_1 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
-        xsecond_0[0] = Array2::from_elem((x.nrows(), x.ncols()), 5e-5);
-        ssecond_0[0] = array![[0.0, 0.0, 0.0], [0.0, 0.06, 0.01], [0.0, 0.01, 0.04],];
+        let mut xsecond_0 = vec![None; 2];
+        let mut ssecond_0 = vec![None; 2];
+        let mut xsecond_1 = vec![None; 2];
+        let mut ssecond_1 = vec![None; 2];
+        xsecond_0[0] = Some(Array2::from_elem((x.nrows(), x.ncols()), 5e-5));
+        ssecond_0[0] = Some(array![[0.0, 0.0, 0.0], [0.0, 0.06, 0.01], [0.0, 0.01, 0.04],]);
         // Provide cross second derivative from only one side to exercise fallback.
-        xsecond_0[1] = Array2::from_elem((x.nrows(), x.ncols()), -2e-5);
-        ssecond_0[1] = array![[0.0, 0.0, 0.0], [0.0, 0.03, -0.005], [0.0, -0.005, 0.02],];
-        xsecond_1[1] = Array2::from_elem((x.nrows(), x.ncols()), 4e-5);
-        ssecond_1[1] = array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],];
+        xsecond_0[1] = Some(Array2::from_elem((x.nrows(), x.ncols()), -2e-5));
+        ssecond_0[1] = Some(array![[0.0, 0.0, 0.0], [0.0, 0.03, -0.005], [0.0, -0.005, 0.02],]);
+        xsecond_1[1] = Some(Array2::from_elem((x.nrows(), x.ncols()), 4e-5));
+        ssecond_1[1] = Some(array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],]);
         let hyper_dirs = vec![
             DirectionalHyperParam::single_penalty(
                 0,
