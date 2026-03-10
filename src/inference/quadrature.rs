@@ -334,7 +334,7 @@ struct ClenshawCurtisRule {
 }
 
 fn compute_clenshaw_curtis_n(n: usize) -> ClenshawCurtisRule {
-    debug_assert!(n >= 2);
+    assert!(n >= 2);
     // Classic cosine-grid Clenshaw-Curtis rule on [-1, 1].
     //
     // The nodes are
@@ -2994,7 +2994,7 @@ mod tests {
     use approx::assert_relative_eq;
 
     fn even_moment_exp_neg_x2(power: usize) -> f64 {
-        debug_assert!(power.is_multiple_of(2));
+        assert!(power.is_multiple_of(2));
         let m = power / 2;
         let mut odd_double_factorial = 1.0_f64;
         for k in 0..m {

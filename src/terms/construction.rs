@@ -733,7 +733,7 @@ pub fn compute_penalty_square_roots(
         let analysis = analyze_penalty_block(s).map_err(|err| {
             EstimationError::InvalidInput(format!("penalty canonicalization failed: {err}"))
         })?;
-        debug_assert!(
+        assert!(
             analysis.rank > 0 || s.iter().all(|v| v.abs() <= analysis.tol),
             "inactive penalty block reached square-root construction"
         );
@@ -1258,7 +1258,7 @@ pub fn stable_reparameterization_with_invariant(
             let reference = *lambda * trace;
             max_det1_mismatch = max_det1_mismatch.max((reference - det1_vec[k]).abs());
         }
-        debug_assert!(
+        assert!(
             max_det1_mismatch <= 1e-9,
             "det1 mismatch between optimized and reference formulas: max_abs={max_det1_mismatch:.3e}"
         );
@@ -1297,7 +1297,7 @@ pub fn stable_reparameterization_with_invariant(
                 }
             }
         }
-        debug_assert!(
+        assert!(
             max_null_diag <= 1e-10 && max_null_offdiag <= 1e-10,
             "null-space leakage in transformed penalty: max_null_diag={max_null_diag:.3e}, max_null_offdiag={max_null_offdiag:.3e}"
         );
