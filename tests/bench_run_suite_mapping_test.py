@@ -112,6 +112,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "scenario_name": "thread3_admixture_cliff",
                     "contender": kwargs.get("contender_name", "rust_gam"),
                     "model_spec": "5-fold CV",
+                    "evaluation": "cv",
                 }
 
             with tempfile.TemporaryDirectory() as td:
@@ -202,6 +203,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "scenario_name": "heart_failure_survival",
                     "contender": "rust_gam",
                     "model_spec": "5-fold CV",
+                    "evaluation": "cv",
                 }
 
             def _fake_run_rust_gamlss_survival_cv(*args, **kwargs):
@@ -211,6 +213,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "scenario_name": "heart_failure_survival",
                     "contender": "rust_gamlss_survival",
                     "model_spec": "5-fold CV",
+                    "evaluation": "cv",
                 }
 
             with tempfile.TemporaryDirectory() as td:
