@@ -79,26 +79,6 @@ impl<'a> RemlState<'a> {
         Ok(out)
     }
 
-    fn relinearized_penaltysecond_components(
-        hyper_dirs: &[DirectionalHyperParam],
-        j: usize,
-        psi_dim: usize,
-        p: usize,
-    ) -> Result<Option<Vec<Vec<(usize, Array2<f64>)>>>, EstimationError> {
-        let mut out = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-        for target in 0..psi_dim {
-            let extra = hyper_dirs[j]
-                .penaltysecond_components_for(target)
-                .or_else(|| {
-                    hyper_dirs
-                        .get(target)
-                        .and_then(|dir| dir.penaltysecond_components_for(j))
-                });
-            out[target] = Self::sum_penalty_components(p, &[], extra, 1.0)?;
-        }
-        Ok(Some(out))
-    }
-
     fn relinearized_hyper_dirs(
         hyper_dirs: &[DirectionalHyperParam],
         psi: &Array1<f64>,
@@ -143,8 +123,8 @@ impl<'a> RemlState<'a> {
             out.push(DirectionalHyperParam::new(
                 x_j,
                 s_j,
-                hyper_dirs[j].x_tau_tau_original.clone(),
-                Self::relinearized_penaltysecond_components(hyper_dirs, j, psi_dim, p)?,
+                None,
+                None,
             )?);
         }
         Ok(out)
@@ -238,6 +218,7 @@ impl<'a> RemlState<'a> {
                 .get(i)
                 .and_then(|d| d.x_tau_tau_original.as_ref())
                 .and_then(|v| v.get(j))
+                .and_then(|mat| mat.as_ref())
         } else {
             None
         };
@@ -249,6 +230,7 @@ impl<'a> RemlState<'a> {
                 .get(j)
                 .and_then(|d| d.x_tau_tau_original.as_ref())
                 .and_then(|v| v.get(i))
+                .and_then(|mat| mat.as_ref())
         } else {
             None
         }
@@ -300,6 +282,9 @@ impl<'a> RemlState<'a> {
                     )));
                 }
                 for (i, x_ij) in x2.iter().enumerate() {
+                    let Some(x_ij) = x_ij.as_ref() else {
+                        continue;
+                    };
                     if x_ij.nrows() != self.y.len() || x_ij.ncols() != self.p {
                         return Err(EstimationError::InvalidInput(format!(
                             "X_tau_tau[{j}][{i}] shape mismatch: expected {}x{}, got {}x{}",
@@ -320,6 +305,9 @@ impl<'a> RemlState<'a> {
                     )));
                 }
                 for (i, components) in s2.iter().enumerate() {
+                    let Some(components) = components.as_ref() else {
+                        continue;
+                    };
                     for component in components {
                         if component.penalty_index >= self.s_full_list.len() {
                             return Err(EstimationError::InvalidInput(format!(
@@ -360,7 +348,10 @@ impl<'a> RemlState<'a> {
                 return true;
             }
             if let Some(x2) = dir.x_tau_tau_original.as_ref() {
-                return x2.iter().any(|m| m.iter().any(|v| *v != 0.0));
+                return x2
+                    .iter()
+                    .flatten()
+                    .any(|m| m.iter().any(|v| *v != 0.0));
             }
             false
         });

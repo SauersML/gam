@@ -175,7 +175,7 @@ impl AsRef<SparseColMat<usize, f64>> for SparseDesignMatrix {
 /// Unified design matrix representation for dense and sparse workflows.
 #[derive(Clone)]
 pub enum DesignMatrix {
-    Dense(Arc<Array2<f64>>),
+    Dense(Array2<f64>),
     Sparse(SparseDesignMatrix),
 }
 
@@ -1038,14 +1038,14 @@ impl DesignMatrix {
 
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
-            Self::Dense(matrix) => matrix.as_ref().clone(),
+            Self::Dense(matrix) => matrix.clone(),
             Self::Sparse(matrix) => matrix.to_dense_arc().as_ref().clone(),
         }
     }
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
-            Self::Dense(matrix) => matrix.clone(),
+            Self::Dense(matrix) => Arc::new(matrix.clone()),
             Self::Sparse(matrix) => matrix.to_dense_arc(),
         }
     }
@@ -1066,7 +1066,7 @@ impl DesignMatrix {
 
     pub fn as_dense(&self) -> Option<&Array2<f64>> {
         match self {
-            Self::Dense(matrix) => Some(matrix.as_ref()),
+            Self::Dense(matrix) => Some(matrix),
             Self::Sparse(_) => None,
         }
     }
@@ -1170,25 +1170,19 @@ impl DesignMatrix {
 
 impl<'a> From<ArrayView2<'a, f64>> for DesignMatrix {
     fn from(value: ArrayView2<'a, f64>) -> Self {
-        Self::Dense(Arc::new(value.to_owned()))
+        Self::Dense(value.to_owned())
     }
 }
 
 impl From<Array2<f64>> for DesignMatrix {
     fn from(value: Array2<f64>) -> Self {
-        Self::Dense(Arc::new(value))
-    }
-}
-
-impl From<Arc<Array2<f64>>> for DesignMatrix {
-    fn from(value: Arc<Array2<f64>>) -> Self {
         Self::Dense(value)
     }
 }
 
 impl From<&Array2<f64>> for DesignMatrix {
     fn from(value: &Array2<f64>) -> Self {
-        Self::Dense(Arc::new(value.clone()))
+        Self::Dense(value.clone())
     }
 }
 

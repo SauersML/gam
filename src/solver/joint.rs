@@ -3048,6 +3048,9 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
     let total_candidates = candidate_plans.len();
     let mut candidate_idx = 0usize;
     let snapshot = JointRemlSnapshot::new(&reml_state);
+    reml_state
+        .visualizer
+        .start_workflow("Candidates", total_candidates.max(1));
 
     for (label, rho) in candidate_plans.drain(..) {
         candidate_idx += 1;
@@ -3056,7 +3059,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             .set_stage("joint", &format!("candidate {label}"));
         reml_state
             .visualizer
-            .set_progress("Candidates", candidate_idx, Some(total_candidates));
+            .advance_workflow(candidate_idx);
 
         snapshot.restore(&mut reml_state);
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);

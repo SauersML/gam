@@ -6286,10 +6286,8 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     let mut hyper_dirs = Vec::with_capacity(info_list.len());
     let log_kappa_dim = info_list.len();
     for (i, info) in info_list.into_iter().enumerate() {
-        let mut xsecond = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); log_kappa_dim];
-        let mut ssecond = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); log_kappa_dim];
-        xsecond[i] = info.x_psi_psi.clone();
-        ssecond[i] = info.s_psi_psi.clone();
+        let mut xsecond = vec![None; log_kappa_dim];
+        xsecond[i] = Some(info.x_psi_psi);
         let s_components = info
             .penalty_indices
             .iter()
@@ -6302,8 +6300,8 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .copied()
             .zip(info.s_psi_psi_components.iter().cloned())
             .collect::<Vec<_>>();
-        let mut ssecond_components = vec![Vec::<(usize, Array2<f64>)>::new(); log_kappa_dim];
-        ssecond_components[i] = s2_components;
+        let mut ssecond_components = vec![None; log_kappa_dim];
+        ssecond_components[i] = Some(s2_components);
         hyper_dirs.push(DirectionalHyperParam::new(
             info.x_psi,
             s_components,
@@ -6351,7 +6349,7 @@ fn try_exact_joint_spatial_hypercostgradienthessian(
         design.penalties.clone(),
         theta,
         rho_dim,
-        &hyper_dirs,
+        hyper_dirs,
         Some(warm_start_fit.fit.beta.view()),
         &external_opts,
     )?;

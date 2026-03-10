@@ -1069,7 +1069,6 @@ struct GamWorkingModel<'a> {
 }
 
 struct GamModelFinalState {
-    x_active: DesignMatrix,
     coordinate_frame: PirlsCoordinateFrame,
     e_transformed: Array2<f64>,
     finalmu: Array1<f64>,
@@ -1182,23 +1181,15 @@ impl<'a> GamWorkingModel<'a> {
             last_penalty_term,
             ..
         } = self;
-        let (x_active, coordinate_frame) = match coordinate_design {
-            WorkingCoordinateDesign::OriginalSparseNative => {
-                (x_original, PirlsCoordinateFrame::OriginalSparseNative)
-            }
-            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                (x_transformed, PirlsCoordinateFrame::TransformedQs)
-            }
+        let coordinate_frame = match coordinate_design {
+            WorkingCoordinateDesign::OriginalSparseNative => PirlsCoordinateFrame::OriginalSparseNative,
+            WorkingCoordinateDesign::TransformedExplicit { .. } => PirlsCoordinateFrame::TransformedQs,
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
-                let x_transformed_dense = design_dot_dense_rhs(&x_original, &qs);
-                (
-                    maybe_sparse_design(&x_transformed_dense),
-                    PirlsCoordinateFrame::TransformedQs,
-                )
+                let _ = design_dot_dense_rhs(&x_original, &qs);
+                PirlsCoordinateFrame::TransformedQs
             }
         };
         GamModelFinalState {
-            x_active,
             coordinate_frame,
             e_transformed,
             finalmu: lastmu,
@@ -3223,9 +3214,10 @@ where
             // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
             // Reduction = -(g'δ + 0.5 δ'Hδ)
             let q_term = if let Some(h_sparse) = state.sparsehessian.as_ref() {
-                sparse_symmetric_upper_matvec_public(h_sparse, direction)
+                let regularized = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
+                sparse_symmetric_upper_matvec_public(&regularized, direction)
             } else {
-                state.hessian.dot(direction)
+                regularized.dot(direction)
             };
             let quad = 0.5 * direction.dot(&q_term);
             let lin = state.gradient.dot(direction);
@@ -3554,7 +3546,6 @@ pub struct PirlsResult {
     pub reparam_result: ReparamResult,
     // Cached X·Qs for this PIRLS result (transformed design matrix)
     pub x_transformed: DesignMatrix,
-    pub x_active: DesignMatrix,
     pub coordinate_frame: PirlsCoordinateFrame,
 }
 
@@ -3583,7 +3574,6 @@ fn assemble_pirls_result(
     status: PirlsStatus,
     reparam_result: ReparamResult,
     x_transformed: DesignMatrix,
-    x_active: DesignMatrix,
     coordinate_frame: PirlsCoordinateFrame,
     linear_constraints_transformed: Option<LinearInequalityConstraints>,
 ) -> PirlsResult {
@@ -3623,7 +3613,6 @@ fn assemble_pirls_result(
         linear_constraints_transformed,
         reparam_result,
         x_transformed,
-        x_active,
         coordinate_frame,
     }
 }
@@ -4012,7 +4001,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
-            x_active: x_transformed_design.clone(),
             x_transformed: x_transformed_design,
             coordinate_frame: PirlsCoordinateFrame::TransformedQs,
         };
@@ -4104,7 +4092,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     let final_state = working_model.into_final_state();
     let GamModelFinalState {
-        x_active,
         coordinate_frame,
         e_transformed,
         finalmu,
@@ -4181,12 +4168,23 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         working_summary.status = status.clone();
     }
 
-    let x_transformed_final = if let Some(xt) = x_transformed_dense {
-        maybe_sparse_design(&xt)
-    } else {
-        let x_transformed_dense_res =
-            design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs);
-        maybe_sparse_design(&x_transformed_dense_res)
+    let x_transformed_final = match coordinate_frame {
+        PirlsCoordinateFrame::TransformedQs => {
+            let x_transformed_dense_res = if let Some(xt) = x_transformed_dense {
+                xt
+            } else {
+                design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs)
+            };
+            maybe_sparse_design(&x_transformed_dense_res)
+        }
+        PirlsCoordinateFrame::OriginalSparseNative => {
+            let x_transformed_dense_res = if let Some(xt) = x_transformed_dense {
+                xt
+            } else {
+                design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs)
+            };
+            maybe_sparse_design(&x_transformed_dense_res)
+        }
     };
 
     let pirls_result = assemble_pirls_result(
@@ -4207,7 +4205,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         status,
         reparam_result_active,
         x_transformed_final,
-        x_active,
         coordinate_frame,
         linear_constraints,
     );
