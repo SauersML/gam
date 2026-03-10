@@ -47,6 +47,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![0, 0],
@@ -58,7 +59,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
 
     assert_eq!(fit.lambdas.len(), 2);
     assert_eq!(fit.beta.len(), tps.basis.ncols());
-    assert!(fit.edf_total.is_finite());
+    assert!(fit.edf_total().is_some_and(f64::is_finite));
 
     let pred = predict_gam(
         tps.basis.view(),
@@ -126,6 +127,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 60,
             tol: 1e-6,
             // First penalty has TPS polynomial null space (d+1 => 3 in 2D),
@@ -139,7 +141,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
 
     assert_eq!(fit.lambdas.len(), 2);
     assert_eq!(fit.beta.len(), tps_train.basis.ncols());
-    assert!(fit.edf_total.is_finite());
+    assert!(fit.edf_total().is_some_and(f64::is_finite));
 
     // Test set with the same data-generating process.
     let mut x_test = Array2::<f64>::zeros((n_test, 2));
@@ -236,6 +238,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: vec![4, 0],
@@ -246,8 +249,8 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
     .expect("fit_gam with 3D TPS should succeed");
 
     assert_eq!(fit.lambdas.len(), 2);
-    assert!(fit.edf_total.is_finite());
-    assert!(fit.edf_total > 1.0);
+    assert!(fit.edf_total().is_some_and(f64::is_finite));
+    assert!(fit.edf_total().unwrap_or(0.0) > 1.0);
 
     let mut x_test = Array2::<f64>::zeros((n_test, 3));
     let mut y_test_true = Array1::<f64>::zeros(n_test);

@@ -63,6 +63,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
     #[serde(default)]
+    pub gaussian_response_scale: Option<f64>,
+    #[serde(default)]
     pub joint_beta_link: Option<Vec<f64>>,
     #[serde(default)]
     pub joint_knot_range: Option<(f64, f64)>,
@@ -161,6 +163,7 @@ impl FittedModelPayload {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            gaussian_response_scale: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -647,36 +650,38 @@ impl FittedModel {
             ensure_finite_scalar("fit_result.stable_penalty_term", fit.stable_penalty_term)?;
             ensure_finite_scalar("fit_result.max_abs_eta", fit.max_abs_eta)?;
             ensure_finite_scalar("fit_result.reml_score", fit.reml_score)?;
-            ensure_finite_scalar("fit_result.edf_total", fit.edf_total)?;
             validate_all_finite("fit_result.beta", fit.beta.iter().copied())?;
             validate_all_finite("fit_result.lambdas", fit.lambdas.iter().copied())?;
-            validate_all_finite("fit_result.edf_by_block", fit.edf_by_block.iter().copied())?;
-            validate_all_finite(
-                "fit_result.working_weights",
-                fit.working_weights.iter().copied(),
-            )?;
-            validate_all_finite(
-                "fit_result.working_response",
-                fit.working_response.iter().copied(),
-            )?;
-            validate_all_finite(
-                "fit_result.penalized_hessian",
-                fit.penalized_hessian.iter().copied(),
-            )?;
-            if let Some(v) = fit.beta_covariance.as_ref() {
-                validate_all_finite("fit_result.beta_covariance", v.iter().copied())?;
-            }
-            if let Some(v) = fit.beta_covariance_corrected.as_ref() {
-                validate_all_finite("fit_result.beta_covariance_corrected", v.iter().copied())?;
-            }
-            if let Some(v) = fit.beta_standard_errors.as_ref() {
-                validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
-            }
-            if let Some(v) = fit.beta_standard_errors_corrected.as_ref() {
+            if let Some(inf) = fit.inference() {
+                ensure_finite_scalar("fit_result.edf_total", inf.edf_total)?;
+                validate_all_finite("fit_result.edf_by_block", inf.edf_by_block.iter().copied())?;
                 validate_all_finite(
-                    "fit_result.beta_standard_errors_corrected",
-                    v.iter().copied(),
+                    "fit_result.working_weights",
+                    inf.working_weights.iter().copied(),
                 )?;
+                validate_all_finite(
+                    "fit_result.working_response",
+                    inf.working_response.iter().copied(),
+                )?;
+                validate_all_finite(
+                    "fit_result.penalized_hessian",
+                    inf.penalized_hessian.iter().copied(),
+                )?;
+                if let Some(v) = inf.beta_covariance.as_ref() {
+                    validate_all_finite("fit_result.beta_covariance", v.iter().copied())?;
+                }
+                if let Some(v) = inf.beta_covariance_corrected.as_ref() {
+                    validate_all_finite("fit_result.beta_covariance_corrected", v.iter().copied())?;
+                }
+                if let Some(v) = inf.beta_standard_errors.as_ref() {
+                    validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
+                }
+                if let Some(v) = inf.beta_standard_errors_corrected.as_ref() {
+                    validate_all_finite(
+                        "fit_result.beta_standard_errors_corrected",
+                        v.iter().copied(),
+                    )?;
+                }
             }
             match &fit.fitted_link_parameters {
                 FittedLinkParameters::Standard => {}
@@ -738,6 +743,9 @@ impl FittedModel {
         }
         if let Some(v) = self.noise_scale.as_ref() {
             validate_all_finite("noise_scale", v.iter().copied())?;
+        }
+        if let Some(v) = self.gaussian_response_scale {
+            ensure_finite_scalar("gaussian_response_scale", v)?;
         }
         if let Some(v) = self.joint_beta_link.as_ref() {
             validate_all_finite("joint_beta_link", v.iter().copied())?;

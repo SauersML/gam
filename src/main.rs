@@ -482,9 +482,11 @@ fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOp
 }
 
 fn compact_fit_result_for_batch(fit: &mut FitResult) {
-    fit.working_weights = Array1::zeros(0);
-    fit.working_response = Array1::zeros(0);
-    fit.reparam_qs = None;
+    if let Some(inf) = fit.inference.as_mut() {
+        inf.working_weights = Array1::zeros(0);
+        inf.working_response = Array1::zeros(0);
+        inf.reparam_qs = None;
+    }
     fit.artifacts = gam::estimate::FitArtifacts { pirls: None };
 }
 
@@ -1117,6 +1119,7 @@ fn run_fitwith_predict_noise(
                 fit_result,
                 fit.block_states.get(1).map(|b| b.beta.to_vec()),
                 Some(&gaussian_noise_transform),
+                Some(response_scale),
             );
             write_model_json(out, &model)?;
         }
@@ -1255,6 +1258,7 @@ fn run_fitwith_predict_noise(
             fit_result,
             fit.block_states.get(1).map(|b| b.beta.to_vec()),
             Some(&binomial_noise_transform),
+            None,
         );
         match &location_scale_link_kind {
             InverseLink::Sas(state) => {
@@ -1749,7 +1753,8 @@ fn run_predict_gaussian_location_scale(
     };
     let etamu = designmu.design.dot(&betamu);
     let eta_noise = preparednoise_design.dot(&beta_noise);
-    let sigma = eta_noise.mapv(f64::exp);
+    let response_scale = gaussian_response_scale_from_saved_model(model)?;
+    let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
     let mut mean_lo = None;
     let mut mean_hi = None;
     if args.uncertainty {
@@ -4360,7 +4365,13 @@ fn run_sample_standard(
             weights: weights.view(),
             penalty_matrix: penalty.view(),
             mode: fit.beta.view(),
-            hessian: fit.penalized_hessian.view(),
+            hessian: fit
+                .penalized_hessian()
+                .ok_or_else(|| {
+                    "fit result is missing inference Hessian; refit with inference enabled"
+                        .to_string()
+                })?
+                .view(),
             firth_bias_reduction: false,
         }),
         cfg,
@@ -4477,7 +4488,8 @@ fn run_generate_gaussian_location_scale(
         design_noise.design.clone()
     };
     let eta_noise = preparednoise_design.dot(&beta_noise);
-    let sigma = eta_noise.mapv(f64::exp);
+    let response_scale = gaussian_response_scale_from_saved_model(model)?;
+    let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
     Ok(gam::generative::GenerativeSpec {
         mean,
         noise: gam::generative::NoiseModel::Gaussian { sigma },
@@ -4655,13 +4667,12 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     ));
     summaryrows.push(format!(
         "<tr><th>EDF total</th><td>{:.4}</td></tr>",
-        fit.edf_total
+        fit.edf_total().unwrap_or(0.0)
     ));
 
     let beta_se = fit
-        .beta_standard_errors_corrected
-        .as_ref()
-        .or(fit.beta_standard_errors.as_ref());
+        .beta_standard_errors_corrected()
+        .or(fit.beta_standard_errors());
     let mut coefrows = Vec::<String>::new();
     for (i, b) in fit.beta.iter().copied().enumerate() {
         let se = beta_se.and_then(|s| s.get(i).copied());
@@ -4675,7 +4686,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     }
 
     let mut edfrows = Vec::<String>::new();
-    for (i, edf) in fit.edf_by_block.iter().copied().enumerate() {
+    for (i, edf) in fit.edf_by_block().iter().copied().enumerate() {
         edfrows.push(format!("<tr><td>{}</td><td>{:.6}</td></tr>", i, edf));
     }
 
@@ -5307,6 +5318,7 @@ fn build_location_scale_saved_model(
     fit_result: FitResult,
     beta_noise: Option<Vec<f64>>,
     noise_transform: Option<&ScaleDeviationTransform>,
+    gaussian_response_scale: Option<f64>,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -5327,6 +5339,7 @@ fn build_location_scale_saved_model(
     payload.link = link;
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = beta_noise;
+    payload.gaussian_response_scale = gaussian_response_scale;
     if let Some(transform) = noise_transform {
         payload.noise_projection = Some(
             transform
@@ -5385,6 +5398,18 @@ fn scale_transform_from_payload(
     }))
 }
 
+fn gaussian_response_scale_from_saved_model(model: &SavedModel) -> Result<f64, String> {
+    let scale = model.gaussian_response_scale.ok_or_else(|| {
+        "gaussian-location-scale model is missing gaussian_response_scale; refit with the current CLI".to_string()
+    })?;
+    if scale <= 0.0 {
+        return Err(format!(
+            "gaussian-location-scale model has non-positive gaussian_response_scale={scale}"
+        ));
+    }
+    Ok(scale)
+}
+
 fn core_saved_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
@@ -5420,8 +5445,6 @@ fn core_saved_fit_result(
         beta,
         lambdas,
         standard_deviation,
-        edf_by_block: Vec::new(),
-        edf_total: 0.0,
         iterations: summary.iterations,
         finalgrad_norm: summary.finalgrad_norm,
         pirls_status: summary.pirls_status,
@@ -5429,16 +5452,20 @@ fn core_saved_fit_result(
         stable_penalty_term: summary.stable_penalty_term,
         max_abs_eta: summary.max_abs_eta,
         constraint_kkt: None,
-        smoothing_correction: None,
-        penalized_hessian: Array2::<f64>::zeros((p, p)),
-        working_weights: Array1::<f64>::zeros(0),
-        working_response: Array1::<f64>::zeros(0),
-        reparam_qs: None,
         artifacts: gam::estimate::FitArtifacts { pirls: None },
-        beta_covariance,
-        beta_standard_errors: None,
-        beta_covariance_corrected,
-        beta_standard_errors_corrected: None,
+        inference: Some(gam::estimate::FitInference {
+            edf_by_block: Vec::new(),
+            edf_total: 0.0,
+            smoothing_correction: None,
+            penalized_hessian: Array2::<f64>::zeros((p, p)),
+            working_weights: Array1::<f64>::zeros(0),
+            working_response: Array1::<f64>::zeros(0),
+            reparam_qs: None,
+            beta_covariance,
+            beta_standard_errors: None,
+            beta_covariance_corrected,
+            beta_standard_errors_corrected: None,
+        }),
         reml_score: summary.reml_score,
         fitted_link_parameters: FittedLinkParameters::Standard,
     }
@@ -7731,13 +7758,11 @@ fn build_model_summary(
 ) -> ModelSummary {
     const CONTINUOUS_ORDER_EPS: f64 = 1e-12;
     let se = fit
-        .beta_standard_errors_corrected
-        .as_ref()
-        .or(fit.beta_standard_errors.as_ref());
+        .beta_standard_errors_corrected()
+        .or(fit.beta_standard_errors());
     let cov_forwald = fit
-        .beta_covariance_corrected
-        .as_ref()
-        .or(fit.beta_covariance.as_ref());
+        .beta_covariance_corrected()
+        .or(fit.beta_covariance());
 
     let link = family_to_link(family);
     let nullmu = match family {
@@ -7852,7 +7877,7 @@ fn build_model_summary(
     let mut smooth_terms = Vec::<SmoothTermSummary>::new();
     let mut penalty_cursor = 0usize;
     for (name, range) in &design.random_effect_ranges {
-        let edf = fit.edf_by_block.get(penalty_cursor).copied().unwrap_or(0.0);
+        let edf = fit.edf_by_block().get(penalty_cursor).copied().unwrap_or(0.0);
         penalty_cursor += 1;
         let chi_sq_opt = cov_forwald.and_then(|cov| {
             let beta_block = fit.beta.slice(s![range.start..range.end]);
@@ -7873,9 +7898,11 @@ fn build_model_summary(
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
-        let edf = fit.edf_by_block[penalty_cursor..penalty_cursor + k]
-            .iter()
-            .sum::<f64>();
+        let edf = fit
+            .edf_by_block()
+            .get(penalty_cursor..penalty_cursor + k)
+            .map(|block| block.iter().sum::<f64>())
+            .unwrap_or(0.0);
         penalty_cursor += k;
         let chi_sq_opt = cov_forwald.and_then(|cov| {
             let beta_block = fit
@@ -7996,10 +8023,9 @@ fn covariance_from_model(
     })?;
     let cov = match mode {
         CovarianceModeArg::Corrected => fit
-            .beta_covariance_corrected
-            .as_ref()
-            .or(fit.beta_covariance.as_ref()),
-        CovarianceModeArg::Conditional => fit.beta_covariance.as_ref(),
+            .beta_covariance_corrected()
+            .or(fit.beta_covariance()),
+        CovarianceModeArg::Conditional => fit.beta_covariance(),
     }
     .ok_or_else(|| {
         "nonlinear posterior-mean prediction requires covariance; refit model with current CLI"
@@ -8179,8 +8205,6 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         beta: ext.beta,
         lambdas: ext.lambdas,
         standard_deviation: ext.standard_deviation,
-        edf_by_block: ext.edf_by_block,
-        edf_total: ext.edf_total,
         iterations: ext.iterations,
         finalgrad_norm: ext.finalgrad_norm,
         pirls_status: ext.pirls_status,
@@ -8188,16 +8212,8 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         stable_penalty_term: ext.stable_penalty_term,
         max_abs_eta: ext.max_abs_eta,
         constraint_kkt: ext.constraint_kkt,
-        smoothing_correction: ext.smoothing_correction,
-        penalized_hessian: ext.penalized_hessian,
-        working_weights: ext.working_weights,
-        working_response: ext.working_response,
-        reparam_qs: ext.reparam_qs,
         artifacts: ext.artifacts,
-        beta_covariance: ext.beta_covariance,
-        beta_standard_errors: ext.beta_standard_errors,
-        beta_covariance_corrected: ext.beta_covariance_corrected,
-        beta_standard_errors_corrected: ext.beta_standard_errors_corrected,
+        inference: ext.inference,
         reml_score: ext.reml_score,
         fitted_link_parameters: ext.fitted_link_parameters,
     }
@@ -8422,7 +8438,8 @@ mod tests {
         evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
         parse_link_choice, parse_surv_response, parse_survival_baseline_config,
         parse_survival_inverse_link, parse_survival_time_basis_config, pretty_familyname,
-        run_predict_binomial_location_scale,
+        run_generate_gaussian_location_scale, run_predict_binomial_location_scale,
+        run_predict_gaussian_location_scale, FAMILY_GAUSSIAN_LOCATION_SCALE,
         saved_probitwiggle_derivative_q0, saved_probitwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
@@ -8482,6 +8499,90 @@ mod tests {
         rows[row_idx]["mean"].parse::<f64>().expect("mean should parse")
     }
 
+    fn csv_sigma_at(path: &std::path::Path, row_idx: usize) -> f64 {
+        let mut rdr = csv::Reader::from_path(path).expect("open prediction csv");
+        let rows = rdr
+            .deserialize::<BTreeMap<String, String>>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse prediction csv");
+        rows[row_idx]["sigma"]
+            .parse::<f64>()
+            .expect("sigma should parse")
+    }
+
+    fn intercept_only_gaussian_location_scale_model(
+        beta_mu: f64,
+        beta_log_sigma: f64,
+        response_scale: f64,
+    ) -> SavedModel {
+        let fit_result = core_saved_fit_result(
+            array![beta_mu],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_stub(),
+        );
+        SavedModel::from_payload(FittedModelPayload {
+            version: MODEL_VERSION,
+            formula: "y ~ 1".to_string(),
+            model_kind: ModelKind::LocationScale,
+            family_state: FittedFamily::LocationScale {
+                likelihood: LikelihoodFamily::GaussianIdentity,
+                base_link: None,
+            },
+            family: FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
+            fit_result: Some(fit_result),
+            data_schema: None,
+            link: None,
+            mixture_link_param_covariance: None,
+            sas_param_covariance: None,
+            formula_noise: Some("y ~ 1".to_string()),
+            beta_noise: Some(vec![beta_log_sigma]),
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
+            gaussian_response_scale: Some(response_scale),
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            jointridge_used: None,
+            probitwiggle_knots: None,
+            probitwiggle_degree: None,
+            betawiggle: None,
+            survival_entry: None,
+            survival_exit: None,
+            survival_event: None,
+            survivalspec: None,
+            survival_baseline_target: None,
+            survival_baseline_scale: None,
+            survival_baseline_shape: None,
+            survival_baseline_rate: None,
+            survival_baseline_makeham: None,
+            survival_time_basis: None,
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_smooth_lambda: None,
+            survivalridge_lambda: None,
+            survival_likelihood: None,
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
+            survival_distribution: None,
+            training_headers: Some(vec![]),
+            resolved_termspec: Some(empty_termspec()),
+            resolved_termspec_noise: Some(empty_termspec()),
+            adaptive_regularization_diagnostics: None,
+        })
+    }
+
     fn intercept_only_binomial_location_scale_model(
         beta_t: f64,
         beta_ls: f64,
@@ -8518,6 +8619,7 @@ mod tests {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            gaussian_response_scale: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -9441,6 +9543,52 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_location_scale_predict_restores_sigma_to_response_units() {
+        let model = intercept_only_gaussian_location_scale_model(12.0, (0.5f64).ln(), 10.0);
+        let td = tempdir().expect("tempdir");
+        let out_path = td.path().join("pred.csv");
+        let args = PredictArgs {
+            model: td.path().join("unused_model.json"),
+            new_data: td.path().join("unused_data.csv"),
+            out: out_path.clone(),
+            uncertainty: true,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        };
+        let data = ndarray::Array2::<f64>::zeros((1, 0));
+        let headers = vec![];
+        let col_map = HashMap::new();
+        run_predict_gaussian_location_scale(
+            &args,
+            &model,
+            data.view(),
+            &col_map,
+            Some(&headers),
+        )
+        .expect("predict gaussian location-scale");
+        assert!((csv_mean_at(&out_path, 0) - 12.0).abs() < 1e-12);
+        assert!((csv_sigma_at(&out_path, 0) - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
+        let model = intercept_only_gaussian_location_scale_model(-3.0, (0.25f64).ln(), 8.0);
+        let data = ndarray::Array2::<f64>::zeros((2, 0));
+        let headers = vec![];
+        let col_map = HashMap::new();
+        let spec = run_generate_gaussian_location_scale(&model, data.view(), &col_map, Some(&headers))
+            .expect("generate gaussian location-scale");
+        assert_eq!(spec.mean.to_vec(), vec![-3.0, -3.0]);
+        match spec.noise {
+            gam::generative::NoiseModel::Gaussian { sigma } => {
+                assert_eq!(sigma.to_vec(), vec![2.0, 2.0]);
+            }
+            _ => panic!("expected Gaussian noise model"),
+        }
+    }
+
+    #[test]
     fn parse_survival_time_basis_accepts_ispline() {
         let args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
@@ -9565,6 +9713,7 @@ mod tests {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            gaussian_response_scale: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -10095,6 +10244,7 @@ mod tests {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            gaussian_response_scale: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -10290,6 +10440,7 @@ mod tests {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            gaussian_response_scale: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -10354,6 +10505,7 @@ mod tests {
             noise_center: None,
             noise_scale: None,
             noise_non_intercept_start: None,
+            gaussian_response_scale: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,

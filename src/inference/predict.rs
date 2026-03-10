@@ -441,7 +441,7 @@ where
     // - Corrected: adds first-order Var(b(rho)) term J V_rho J^T
     let (cov, covariance_corrected_used) = match requested_mode {
         InferenceCovarianceMode::Conditional => (
-            fit.beta_covariance.as_ref().ok_or_else(|| {
+            fit.beta_covariance().ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "fit result does not contain conditional covariance".to_string(),
                 )
@@ -449,9 +449,9 @@ where
             false,
         ),
         InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
-            if let Some(cov_corr) = fit.beta_covariance_corrected.as_ref() {
+            if let Some(cov_corr) = fit.beta_covariance_corrected() {
                 (cov_corr, true)
-            } else if let Some(cov_base) = fit.beta_covariance.as_ref() {
+            } else if let Some(cov_base) = fit.beta_covariance() {
                 (cov_base, false)
             } else {
                 return Err(EstimationError::InvalidInput(
@@ -460,7 +460,7 @@ where
             }
         }
         InferenceCovarianceMode::ConditionalPlusSmoothingRequired => (
-            fit.beta_covariance_corrected.as_ref().ok_or_else(|| {
+            fit.beta_covariance_corrected().ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "fit result does not contain smoothing-corrected covariance".to_string(),
                 )
@@ -683,7 +683,7 @@ pub fn coefficient_uncertaintywith_mode(
     // - first-order corrected covariance H^{-1} + J V_rho J^T.
     let (se, corrected) = match covariance_mode {
         InferenceCovarianceMode::Conditional => (
-            fit.beta_standard_errors.as_ref().cloned().ok_or_else(|| {
+            fit.beta_standard_errors().cloned().ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "fit result does not contain conditional coefficient standard errors"
                         .to_string(),
@@ -692,9 +692,9 @@ pub fn coefficient_uncertaintywith_mode(
             false,
         ),
         InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
-            if let Some(se_corr) = fit.beta_standard_errors_corrected.as_ref() {
+            if let Some(se_corr) = fit.beta_standard_errors_corrected() {
                 (se_corr.clone(), true)
-            } else if let Some(se_base) = fit.beta_standard_errors.as_ref() {
+            } else if let Some(se_base) = fit.beta_standard_errors() {
                 (se_base.clone(), false)
             } else {
                 return Err(EstimationError::InvalidInput(
@@ -703,8 +703,7 @@ pub fn coefficient_uncertaintywith_mode(
             }
         }
         InferenceCovarianceMode::ConditionalPlusSmoothingRequired => (
-            fit.beta_standard_errors_corrected
-                .as_ref()
+            fit.beta_standard_errors_corrected()
                 .cloned()
                 .ok_or_else(|| {
                     EstimationError::InvalidInput(

@@ -9921,6 +9921,7 @@ mod tests {
     ) -> Array1<D> {
         let (z, penalty) = compute_geometric_constraint_transform(knots, degree, 2)
             .expect("wiggle constraint transform");
+        let _ = penalty;
         let full = bspline_basis_scalar_numdual(x, knots, degree);
         let mut constrained = Array1::from_elem(z.ncols(), D::zero());
         for j in 0..z.nrows() {
@@ -11304,6 +11305,7 @@ mod tests {
             &core,
         )
         .expect("working sets");
+        let _ = w;
         let tw = match &tws {
             BlockWorkingSet::Diagonal {
                 working_response: _,
@@ -11683,6 +11685,8 @@ mod tests {
             |bt| wiggle_negloglik_threshold_numdual(bt, beta_ls0, &betaw, &y, &weights, &knots, 3),
             beta_t0,
         );
+        let _ = value_ad;
+        let _ = grad_ad;
         assert!(
             (blockhessian[[0, 0]] - hess_ad).abs() <= 5e-6,
             "wiggle threshold exact hessian mismatch: evaluate()={} autodiff={}",
@@ -12681,6 +12685,7 @@ mod tests {
         let (z, s_constrained) =
             compute_geometric_constraint_transform(&knots, degree, penalty_order)
                 .expect("constraint transform");
+        let _ = s_constrained;
         let g = compute_greville_abscissae(&knots, degree).expect("greville abscissae");
 
         assert_eq!(block.design.ncols(), z.ncols());
@@ -12745,6 +12750,7 @@ mod tests {
         let (z, s_constrained) =
             compute_geometric_constraint_transform(&knots, degree, penalty_order)
                 .expect("constraint transform");
+        let _ = s_constrained;
         let expected = full.dot(&z);
 
         let got = match &block.design {
@@ -12864,6 +12870,7 @@ mod tests {
         let (geom_x, geom_offset) = family
             .block_geometry(&states, &wigglespec)
             .expect("block geometry");
+        let _ = geom_offset;
         let geom = match geom_x {
             DesignMatrix::Dense(x) => x,
             DesignMatrix::Sparse(_) => panic!("expected dense wiggle geometry design"),

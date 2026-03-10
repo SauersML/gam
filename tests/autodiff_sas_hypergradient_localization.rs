@@ -479,6 +479,7 @@ fn sas_exact_outergradient_seed19_epsilon_component_matches_profiledfd() {
             initial_log_delta: 0.0,
         }),
         optimize_sas: true,
+        compute_inference: true,
         max_iter: 80,
         tol: 1e-7,
         nullspace_dims: vec![1],

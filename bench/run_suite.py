@@ -3248,6 +3248,23 @@ def _append_formula_link_term(formula: str, link_name: str | None) -> str:
     return f"{lhs.strip()} ~ {rhs} + {link_term}"
 
 
+def _flexible_link_name(link_name: str) -> str:
+    raw = str(link_name).strip()
+    if raw.startswith("flexible(") and raw.endswith(")"):
+        return raw
+    return f"flexible({raw})"
+
+
+def _default_rust_formula_link_for_family(family: str) -> str:
+    if family == "binomial":
+        return "logit"
+    if family == "gaussian":
+        return "identity"
+    if family == "survival":
+        return "probit"
+    raise RuntimeError(f"unsupported family for flexible-link benchmark companion: {family}")
+
+
 def _is_matern_rust_scenario(s_cfg) -> bool:
     cfg = _rust_fit_mapping(s_cfg["name"])
     if cfg is None:
@@ -3586,6 +3603,7 @@ def run_rust_scenario_cv(
     collect_continuous_order: bool = False,
     collect_adaptive_diagnostics: bool = False,
     rust_fit_extra_args: list[str] | None = None,
+    formula_link: str | None = None,
 ):
     scenario_name = scenario["name"]
     if ds is None:
@@ -3651,6 +3669,7 @@ def run_rust_scenario_cv(
                 if ds["family"] == "binomial" and binomial_link
                 else formula
             )
+            formula = _append_formula_link_term(formula, formula_link)
             fit_cmd = [
                 str(rust_bin),
                 "fit",
@@ -3993,6 +4012,8 @@ def run_rust_sas_scenario_cv(
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
+    contender_name: str = "rust_gam_sas",
+    binomial_link_name: str = "sas",
 ):
     if ds is None:
         ds = dataset_for_scenario(scenario)
@@ -4000,8 +4021,8 @@ def run_rust_sas_scenario_cv(
         return None
     return run_rust_scenario_cv(
         scenario,
-        contender_name="rust_gam_sas",
-        binomial_link="sas",
+        contender_name=contender_name,
+        binomial_link=binomial_link_name,
         ds=ds,
         folds=folds,
         shared_fold_artifacts=shared_fold_artifacts,
@@ -4013,6 +4034,7 @@ def _run_rust_gamlss_scenario_cv_variant(
     *,
     contender_name: str,
     binomial_cli_family: str,
+    gaussian_formula_link: str | None = None,
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
@@ -4043,6 +4065,8 @@ def _run_rust_gamlss_scenario_cv_variant(
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
     if family == "binomial":
         mean_formula = _append_formula_link_term(mean_formula, binomial_cli_family)
+    elif gaussian_formula_link:
+        mean_formula = _append_formula_link_term(mean_formula, gaussian_formula_link)
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
     plot_payload = _init_plot_payload(ds)
@@ -4234,14 +4258,18 @@ def _run_rust_gamlss_scenario_cv_variant(
 def run_rust_gamlss_scenario_cv(
     scenario,
     *,
+    contender_name: str = "rust_gamlss",
+    binomial_cli_family: str = "binomial-probit",
+    gaussian_formula_link: str | None = None,
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
 ):
     return _run_rust_gamlss_scenario_cv_variant(
         scenario,
-        contender_name="rust_gamlss",
-        binomial_cli_family="binomial-probit",
+        contender_name=contender_name,
+        binomial_cli_family=binomial_cli_family,
+        gaussian_formula_link=gaussian_formula_link,
         ds=ds,
         folds=folds,
         shared_fold_artifacts=shared_fold_artifacts,
@@ -4251,6 +4279,8 @@ def run_rust_gamlss_scenario_cv(
 def run_rust_gamlss_survival_cv(
     scenario,
     *,
+    contender_name: str = "rust_gamlss_survival",
+    survival_link: str | None = None,
     ds: dict | None = None,
     folds: list[Fold] | None = None,
 ):
@@ -4267,7 +4297,7 @@ def run_rust_gamlss_survival_cv(
         rust_bin = _ensure_rust_binary()
     except _EXPECTED_EXTERNAL_FAILURES as e:
         return {
-            "contender": "rust_gamlss_survival",
+            "contender": contender_name,
             "scenario_name": scenario_name,
             "status": "failed",
             "error": str(e),
@@ -4317,6 +4347,8 @@ def run_rust_gamlss_survival_cv(
                 "--out",
                 str(model_path),
             ]
+            if survival_link:
+                fit_cmd.extend(["--link", str(survival_link)])
             fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
             fit_cmd.extend([str(train_path), fit_formula])
 
@@ -4325,7 +4357,7 @@ def run_rust_gamlss_survival_cv(
             fit_sec = perf_counter() - t0
             if code != 0:
                 return {
-                    "contender": "rust_gamlss_survival",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "fold_id": int(fold_id),
@@ -4342,7 +4374,7 @@ def run_rust_gamlss_survival_cv(
             pred_sec = perf_counter() - t1
             if code != 0:
                 return {
-                    "contender": "rust_gamlss_survival",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "fold_id": int(fold_id),
@@ -4353,7 +4385,7 @@ def run_rust_gamlss_survival_cv(
                 risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
             except RuntimeError as e:
                 return {
-                    "contender": "rust_gamlss_survival",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "error": str(e),
@@ -4370,7 +4402,7 @@ def run_rust_gamlss_survival_cv(
                 )
             except RuntimeError as e:
                 return {
-                    "contender": "rust_gamlss_survival",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "error": str(e),
@@ -4409,7 +4441,7 @@ def run_rust_gamlss_survival_cv(
 
     if not cv_rows:
         return {
-            "contender": "rust_gamlss_survival",
+            "contender": contender_name,
             "family": ds["family"],
             "scenario_name": scenario_name,
             "status": "failed",
@@ -4417,7 +4449,7 @@ def run_rust_gamlss_survival_cv(
         }
 
     return _finalize_cv_result(
-        contender="rust_gamlss_survival",
+        contender=contender_name,
         scenario_name=scenario_name,
         family=ds["family"],
         cv_rows=cv_rows,
@@ -4512,6 +4544,11 @@ def _sigma_feature_terms(ds: dict, *, scenario_name: str | None, backend: str) -
 
 def _sigma_feature_formula(ds: dict, *, scenario_name: str | None, backend: str) -> str:
     terms = _sigma_feature_terms(ds, scenario_name=scenario_name, backend=backend)
+    if backend == "r_gamlss" and not terms:
+        raise RuntimeError(
+            f"r_gamlss requires a non-constant sigma model for scenario "
+            f"'{scenario_name or ds.get('name', 'unknown')}', but no sigma terms were generated"
+        )
     return "~ " + (" + ".join(terms) if terms else "1")
 
 
@@ -4523,7 +4560,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
     if ds is None:
         ds = dataset_for_scenario(scenario)
     family = ds["family"]
-    if family != "gaussian":
+    if family not in ("gaussian", "binomial"):
         return None
     if folds is None:
         folds = folds_for_dataset(ds)
@@ -4531,6 +4568,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
     mu_formula = _gamlss_mu_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None
+    sigma_formula = _sigma_feature_formula(ds, scenario_name=scenario_name, backend="r_gamlss")
 
     with _workspace_tempdir(prefix="gam_bench_r_gamlss_cv_") as td:
         td_path = Path(td)
@@ -4541,8 +4579,9 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
         payload = {
             "dataset": ds,
             "scenario_name": scenario_name,
+            "family": family,
             "mu_formula": mu_formula,
-            "sigma_formula": _sigma_feature_formula(ds, scenario_name=scenario_name, backend="r_gamlss"),
+            "sigma_formula": sigma_formula,
         }
         data_path.write_text(json.dumps(payload))
 
@@ -4562,6 +4601,7 @@ suppressPackageStartupMessages({
 payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
+family_name <- as.character(payload$family)
 mu_formula <- as.character(payload$mu_formula)
 sigma_formula <- as.formula(as.character(payload$sigma_formula))
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
@@ -4583,11 +4623,12 @@ for (cn in feature_cols) {
 
 t0 <- proc.time()[["elapsed"]]
 fit_formula <- mu_formula
+fit_family <- if (family_name == "binomial") BI() else NO()
 fit <- tryCatch(
   gamlss(
     as.formula(fit_formula),
     sigma.formula = sigma_formula,
-    family = NO(),
+    family = fit_family,
     data = train_df,
     control = gamlss.control(n.cyc=200, trace=FALSE)
   ),
@@ -4642,25 +4683,36 @@ if (any(!is.finite(sigma_hat) | sigma_hat <= 0)) {
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
-rmse <- sqrt(mean((y_test - p)^2))
-mae <- mean(abs(y_test - p))
-sst <- sum((y_test - mean(y_test))^2)
-r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
-logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
-out <- list(
-  status="ok",
-  fit_sec=fit_sec,
-  predict_sec=pred_sec,
-  pred=as.numeric(p),
-  auc=NULL,
-  brier=NULL,
-  logloss=logloss,
-  nagelkerke_r2=NULL,
-  rmse=rmse,
-  mae=mae,
-  r2=r2,
-  model_spec=paste0("gamlss(NO; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
-)
+if (family_name == "binomial") {
+  out <- list(
+    status="ok",
+    fit_sec=fit_sec,
+    predict_sec=pred_sec,
+    pred=as.numeric(p),
+    sigma=as.numeric(sigma_hat),
+    model_spec=paste0("gamlss(BI; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
+  )
+} else {
+  rmse <- sqrt(mean((y_test - p)^2))
+  mae <- mean(abs(y_test - p))
+  sst <- sum((y_test - mean(y_test))^2)
+  r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+  logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
+  out <- list(
+    status="ok",
+    fit_sec=fit_sec,
+    predict_sec=pred_sec,
+    pred=as.numeric(p),
+    auc=NULL,
+    brier=NULL,
+    logloss=logloss,
+    nagelkerke_r2=NULL,
+    rmse=rmse,
+    mae=mae,
+    r2=r2,
+    model_spec=paste0("gamlss(NO; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
+  )
+}
 write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 '''
         script_path.write_text(script)
@@ -4724,9 +4776,46 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                 }
             test_df = pd.DataFrame(ds["rows"]).iloc[fold.test_idx].copy()
             _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
-            fold_row.pop("pred", None)
-            fold_row["n_test"] = int(len(fold.test_idx))
-            cv_rows.append(fold_row)
+            fit_sec = float(fold_row.get("fit_sec", 0.0))
+            predict_sec = float(fold_row.get("predict_sec", 0.0))
+            model_spec = str(fold_row.get("model_spec", "r_gamlss"))
+            if family == "binomial":
+                sigma_hat = np.asarray(fold_row.get("sigma", []), dtype=float).reshape(-1)
+                if sigma_hat.shape[0] != len(fold.test_idx):
+                    return {
+                        "contender": "r_gamlss",
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "fold_id": int(fold_id),
+                        "n_train": int(len(fold.train_idx)),
+                        "n_test": int(len(fold.test_idx)),
+                        "n_folds": int(len(folds)),
+                        "error": (
+                            "r_gamlss fold output missing/invalid sigma vector "
+                            f"(got {sigma_hat.shape[0]}, expected {len(fold.test_idx)})"
+                        ),
+                    }
+                y_test = test_df[ds["target"]].to_numpy(dtype=float)
+                train_df = pd.DataFrame(ds["rows"]).iloc[fold.train_idx].copy()
+                y_train = train_df[ds["target"]].to_numpy(dtype=float)
+                cv_rows.append(
+                    {
+                        "fit_sec": fit_sec,
+                        "predict_sec": predict_sec,
+                        "auc": auc_score(y_test, pred),
+                        "brier": brier_score(y_test, pred),
+                        "logloss": log_loss_score(y_test, pred),
+                        "nagelkerke_r2": nagelkerke_r2_score(
+                            y_test, pred, null_mean=float(np.mean(y_train))
+                        ),
+                        "n_test": int(len(fold.test_idx)),
+                        "model_spec": model_spec,
+                    }
+                )
+            else:
+                fold_row.pop("pred", None)
+                fold_row["n_test"] = int(len(fold.test_idx))
+                cv_rows.append(fold_row)
 
     return _finalize_cv_result(
         contender="r_gamlss",
@@ -7183,6 +7272,19 @@ def main():
                         shared_fold_artifacts=shared_fold_artifacts,
                     )
                 )
+                if ds["family"] == "binomial":
+                    results.append(
+                        run_rust_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_gam_flexible",
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                            formula_link=_flexible_link_name(
+                                _default_rust_formula_link_for_family(ds["family"])
+                            ),
+                        )
+                    )
             if _is_matern_rust_scenario(s_cfg):
                 results.append(
                     run_rust_scenario_cv(
@@ -7195,6 +7297,21 @@ def main():
                         eval_ood=True,
                     )
                 )
+                if ds["family"] == "binomial":
+                    results.append(
+                        run_rust_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_matern_decomposed_flexible",
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                            rust_cfg_override={"double_penalty": True},
+                            eval_ood=True,
+                            formula_link=_flexible_link_name(
+                                _default_rust_formula_link_for_family(ds["family"])
+                            ),
+                        )
+                    )
                 results.append(
                     run_rust_scenario_cv(
                         s_cfg,
@@ -7206,6 +7323,21 @@ def main():
                         eval_ood=True,
                     )
                 )
+                if ds["family"] == "binomial":
+                    results.append(
+                        run_rust_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_matern_standard_flexible",
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                            rust_cfg_override={"double_penalty": False},
+                            eval_ood=True,
+                            formula_link=_flexible_link_name(
+                                _default_rust_formula_link_for_family(ds["family"])
+                            ),
+                        )
+                    )
             if str(s_cfg.get("name", "")).startswith("continuous_order_"):
                 results.append(
                     run_rust_scenario_cv(
@@ -7229,6 +7361,20 @@ def main():
                         rust_cfg_override={"double_penalty": True},
                     )
                 )
+                if ds["family"] == "binomial":
+                    results.append(
+                        run_rust_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_thread3_standard_reml_flexible",
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                            rust_cfg_override={"double_penalty": True},
+                            formula_link=_flexible_link_name(
+                                _default_rust_formula_link_for_family(ds["family"])
+                            ),
+                        )
+                    )
                 results.append(
                     run_rust_scenario_cv(
                         s_cfg,
@@ -7244,6 +7390,22 @@ def main():
                         ],
                     )
                 )
+                if ds["family"] == "binomial":
+                    results.append(
+                        run_rust_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_thread3_adaptive_reml_flexible",
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                            rust_cfg_override={"double_penalty": True},
+                            collect_adaptive_diagnostics=True,
+                            rust_fit_extra_args=[
+                                "--adaptive-regularization",
+                                "true",
+                            ],
+                        )
+                    )
             rust_sas_row = (
                 run_rust_sas_scenario_cv(
                     s_cfg,
@@ -7264,6 +7426,17 @@ def main():
             )
             if rust_gamlss_row is not None:
                 results.append(rust_gamlss_row)
+                if ds["family"] == "binomial":
+                    results.append(
+                        run_rust_gamlss_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_gamlss_flexible",
+                            binomial_cli_family=_flexible_link_name("probit"),
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                        )
+                    )
             rust_gamlss_surv_row = (
                 run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "rust_gamlss_survival")

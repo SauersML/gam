@@ -446,25 +446,25 @@ impl ParametricColumnConditioning {
             return result;
         }
         result.beta = self.backtransform_beta(&result.beta);
-        result.penalized_hessian = self.backtransform_penalized_hessian(&result.penalized_hessian);
-        result.beta_covariance = result
-            .beta_covariance
-            .take()
-            .map(|cov| self.backtransform_covariance(&cov));
-        result.beta_standard_errors = result.beta_covariance.as_ref().map(se_from_covariance);
-        result.beta_covariance_corrected = result
-            .beta_covariance_corrected
-            .take()
-            .map(|cov| self.backtransform_covariance(&cov));
-        result.beta_standard_errors_corrected = result
-            .beta_covariance_corrected
-            .as_ref()
-            .map(se_from_covariance);
-        result.smoothing_correction = result
-            .smoothing_correction
-            .take()
-            .map(|cov| self.backtransform_covariance(&cov));
-        result.reparam_qs = None;
+        if let Some(inf) = result.inference.as_mut() {
+            inf.penalized_hessian = self.backtransform_penalized_hessian(&inf.penalized_hessian);
+            inf.beta_covariance = inf
+                .beta_covariance
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            inf.beta_standard_errors = inf.beta_covariance.as_ref().map(se_from_covariance);
+            inf.beta_covariance_corrected = inf
+                .beta_covariance_corrected
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            inf.beta_standard_errors_corrected =
+                inf.beta_covariance_corrected.as_ref().map(se_from_covariance);
+            inf.smoothing_correction = inf
+                .smoothing_correction
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            inf.reparam_qs = None;
+        }
         result.constraint_kkt = None;
         result.artifacts = FitArtifacts { pirls: None };
         result
@@ -943,8 +943,6 @@ pub struct ExternalOptimResult {
     /// deviation sigma here. Non-Gaussian families keep the canonical fixed
     /// scale (currently 1.0).
     pub standard_deviation: f64,
-    pub edf_by_block: Vec<f64>,
-    pub edf_total: f64,
     pub iterations: usize,
     pub finalgrad_norm: f64,
     pub pirls_status: crate::pirls::PirlsStatus,
@@ -952,24 +950,8 @@ pub struct ExternalOptimResult {
     pub stable_penalty_term: f64,
     pub max_abs_eta: f64,
     pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
-    pub smoothing_correction: Option<Array2<f64>>,
-    pub penalized_hessian: Array2<f64>,
-    pub working_weights: Array1<f64>,
-    pub working_response: Array1<f64>,
-    pub reparam_qs: Option<Array2<f64>>,
     pub artifacts: FitArtifacts,
-    /// Conditional posterior covariance under fixed smoothing parameters:
-    /// Var(β | λ) ≈ (X'WX + S)^(-1)
-    pub beta_covariance: Option<Array2<f64>>,
-    /// Marginal SEs from `beta_covariance`.
-    pub beta_standard_errors: Option<Array1<f64>>,
-    /// Optional smoothing-parameter-corrected covariance.
-    /// Usually this is first-order:
-    /// Var*(β) ≈ Var(β|λ) + J Var(ρ) J^T.
-    /// In high-risk regimes the engine may use adaptive cubature for higher-order terms.
-    pub beta_covariance_corrected: Option<Array2<f64>>,
-    /// Marginal SEs from `beta_covariance_corrected`.
-    pub beta_standard_errors_corrected: Option<Array1<f64>>,
+    pub inference: Option<FitInference>,
     pub reml_score: f64,
     pub fitted_link_parameters: FittedLinkParameters,
 }
@@ -1911,8 +1893,8 @@ where
 
     let lambdas = final_rho.mapv(f64::exp);
     let p_dim = pirls_res.beta_transformed.len();
-    let mut edf_by_block = vec![f64::NAN; k];
-    let mut edf_total = f64::NAN;
+    let mut edf_by_block = vec![0.0; k];
+    let mut edf_total = 0.0;
     let mut smoothing_correction = None;
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
@@ -2038,9 +2020,19 @@ where
         beta_standard_errors_corrected =
             beta_covariance_corrected.as_ref().map(se_from_covariance);
     }
-    let working_weights = pirls_res.solveweights.clone();
-    let working_response = pirls_res.solveworking_response.clone();
-    let reparam_qs = Some(pirls_res.reparam_result.qs.clone());
+    let inference = opts.compute_inference.then(|| FitInference {
+        edf_by_block,
+        edf_total,
+        smoothing_correction,
+        penalized_hessian,
+        working_weights: pirls_res.solveweights.clone(),
+        working_response: pirls_res.solveworking_response.clone(),
+        reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
+        beta_covariance,
+        beta_standard_errors,
+        beta_covariance_corrected,
+        beta_standard_errors_corrected,
+    });
 
     let pirls_status = pirls_res.status;
 
@@ -2048,8 +2040,6 @@ where
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
         standard_deviation,
-        edf_by_block,
-        edf_total,
         iterations: iters,
         finalgrad_norm,
         pirls_status,
@@ -2057,18 +2047,10 @@ where
         stable_penalty_term: pirls_res.stable_penalty_term,
         max_abs_eta: pirls_res.max_abs_eta,
         constraint_kkt: pirls_res.constraint_kkt.clone(),
-        smoothing_correction,
-        penalized_hessian,
-        working_weights,
-        working_response,
-        reparam_qs,
         artifacts: FitArtifacts {
             pirls: Some(pirls_res),
         },
-        beta_covariance,
-        beta_standard_errors,
-        beta_covariance_corrected,
-        beta_standard_errors_corrected,
+        inference,
         reml_score: outer_result.final_value,
         fitted_link_parameters: if let Some(state) = final_mixture_state {
             FittedLinkParameters::Mixture {
@@ -2340,30 +2322,14 @@ pub struct FitArtifacts {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct FitResult {
-    pub beta: Array1<f64>,
-    pub lambdas: Array1<f64>,
-    /// Residual scale on the response scale.
-    ///
-    /// Contract: Gaussian identity models store residual standard deviation
-    /// sigma here. This is serialized into saved models and consumed by
-    /// prediction/benchmark code as a standard deviation, not a variance.
-    pub standard_deviation: f64,
+pub struct FitInference {
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
-    pub iterations: usize,
-    pub finalgrad_norm: f64,
-    pub pirls_status: crate::pirls::PirlsStatus,
-    pub deviance: f64,
-    pub stable_penalty_term: f64,
-    pub max_abs_eta: f64,
-    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
     pub smoothing_correction: Option<Array2<f64>>,
     pub penalized_hessian: Array2<f64>,
     pub working_weights: Array1<f64>,
     pub working_response: Array1<f64>,
     pub reparam_qs: Option<Array2<f64>>,
-    pub artifacts: FitArtifacts,
     /// Conditional posterior covariance under fixed smoothing parameters:
     /// Var(β | λ) ≈ (X'WX + S)^(-1)
     pub beta_covariance: Option<Array2<f64>>,
@@ -2376,6 +2342,27 @@ pub struct FitResult {
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FitResult {
+    pub beta: Array1<f64>,
+    pub lambdas: Array1<f64>,
+    /// Residual scale on the response scale.
+    ///
+    /// Contract: Gaussian identity models store residual standard deviation
+    /// sigma here. This is serialized into saved models and consumed by
+    /// prediction/benchmark code as a standard deviation, not a variance.
+    pub standard_deviation: f64,
+    pub iterations: usize,
+    pub finalgrad_norm: f64,
+    pub pirls_status: crate::pirls::PirlsStatus,
+    pub deviance: f64,
+    pub stable_penalty_term: f64,
+    pub max_abs_eta: f64,
+    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
+    pub artifacts: FitArtifacts,
+    pub inference: Option<FitInference>,
     pub reml_score: f64,
     pub fitted_link_parameters: FittedLinkParameters,
 }
@@ -2415,6 +2402,57 @@ pub enum FittedLinkState {
 }
 
 impl FitResult {
+    pub fn inference(&self) -> Option<&FitInference> {
+        self.inference.as_ref()
+    }
+
+    pub fn edf_total(&self) -> Option<f64> {
+        self.inference.as_ref().map(|inf| inf.edf_total)
+    }
+
+    pub fn edf_by_block(&self) -> &[f64] {
+        self.inference
+            .as_ref()
+            .map(|inf| inf.edf_by_block.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn penalized_hessian(&self) -> Option<&Array2<f64>> {
+        self.inference.as_ref().map(|inf| &inf.penalized_hessian)
+    }
+
+    pub fn working_weights(&self) -> Option<&Array1<f64>> {
+        self.inference.as_ref().map(|inf| &inf.working_weights)
+    }
+
+    pub fn working_response(&self) -> Option<&Array1<f64>> {
+        self.inference.as_ref().map(|inf| &inf.working_response)
+    }
+
+    pub fn beta_covariance(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_covariance.as_ref())
+    }
+
+    pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_covariance_corrected.as_ref())
+    }
+
+    pub fn beta_standard_errors(&self) -> Option<&Array1<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_standard_errors.as_ref())
+    }
+
+    pub fn beta_standard_errors_corrected(&self) -> Option<&Array1<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_standard_errors_corrected.as_ref())
+    }
+
     pub fn fitted_link_state(
         &self,
         family: crate::types::LikelihoodFamily,
@@ -3213,8 +3251,6 @@ where
         beta: result.beta,
         lambdas: result.lambdas,
         standard_deviation: result.standard_deviation,
-        edf_by_block: result.edf_by_block,
-        edf_total: result.edf_total,
         iterations: result.iterations,
         finalgrad_norm: result.finalgrad_norm,
         pirls_status: result.pirls_status,
@@ -3222,16 +3258,8 @@ where
         stable_penalty_term: result.stable_penalty_term,
         max_abs_eta: result.max_abs_eta,
         constraint_kkt: result.constraint_kkt,
-        smoothing_correction: result.smoothing_correction,
-        penalized_hessian: result.penalized_hessian,
-        working_weights: result.working_weights,
-        working_response: result.working_response,
-        reparam_qs: result.reparam_qs,
         artifacts: result.artifacts,
-        beta_covariance: result.beta_covariance,
-        beta_standard_errors: result.beta_standard_errors,
-        beta_covariance_corrected: result.beta_covariance_corrected,
-        beta_standard_errors_corrected: result.beta_standard_errors_corrected,
+        inference: result.inference,
         reml_score: result.reml_score,
         fitted_link_parameters: result.fitted_link_parameters,
     })

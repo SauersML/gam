@@ -87,6 +87,7 @@ fn fit_duchon_simulated_10d(
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -101,7 +102,7 @@ fn fit_duchon_simulated_10d(
     // For `nullspace_order=Zero` (p=0) this can be full-rank => one active lambda.
     // For `nullspace_order=Linear` (p=1) a nullspace block is present => two lambdas.
     assert_eq!(fitted.fit.lambdas.len(), expected_lambda_count);
-    assert!(fitted.fit.edf_total.is_finite());
+    assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
 
     let pred = predict_gam(
         fitted.design.design.view(),
@@ -184,6 +185,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 10,
             tol: 1e-4,
             nullspace_dims: vec![],

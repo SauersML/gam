@@ -18,7 +18,8 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
-    EstimationError, ExternalOptimOptions, FitOptions, FitResult, FittedLinkParameters,
+    EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
+    FittedLinkParameters,
     compute_external_joint_hypercostgradienthessian, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
@@ -2141,7 +2142,7 @@ pub fn fitted_penalty_block_report(
             nullspace_dim: info.penalty.nullspace_dim_hint,
             normalization_scale: info.penalty.normalization_scale,
             lambda: fit.lambdas.get(info.global_index).copied(),
-            edf: fit.edf_by_block.get(info.global_index).copied(),
+            edf: fit.edf_by_block().get(info.global_index).copied(),
         })
         .collect()
 }
@@ -4208,8 +4209,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             beta,
             lambdas: full_lambdas,
             standard_deviation,
-            edf_by_block,
-            edf_total,
             iterations: solution.iterations,
             finalgrad_norm: solution.final_gradient_norm,
             pirls_status: if final_fit.converged {
@@ -4227,23 +4226,27 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 .map(f64::abs)
                 .fold(0.0, f64::max),
             constraint_kkt: None,
-            smoothing_correction: None,
-            penalized_hessian,
-            working_weights: final_eval.obs.fisherweight.clone(),
-            working_response: {
-                let mut out = final_eval.obs.eta.clone();
-                for i in 0..out.len() {
-                    let wi = final_eval.obs.fisherweight[i].max(1e-12);
-                    out[i] += final_eval.obs.score[i] / wi;
-                }
-                out
-            },
-            reparam_qs: None,
             artifacts: crate::estimate::FitArtifacts { pirls: None },
-            beta_covariance,
-            beta_standard_errors,
-            beta_covariance_corrected: None,
-            beta_standard_errors_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block,
+                edf_total,
+                smoothing_correction: None,
+                penalized_hessian,
+                working_weights: final_eval.obs.fisherweight.clone(),
+                working_response: {
+                    let mut out = final_eval.obs.eta.clone();
+                    for i in 0..out.len() {
+                        let wi = final_eval.obs.fisherweight[i].max(1e-12);
+                        out[i] += final_eval.obs.score[i] / wi;
+                    }
+                    out
+                },
+                reparam_qs: None,
+                beta_covariance,
+                beta_standard_errors,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+            }),
             reml_score: final_fit.penalizedobjective,
             fitted_link_parameters,
         },
@@ -5754,8 +5757,6 @@ fn fit_bounded_term_collection_forspec(
             beta: beta_user,
             lambdas: fit.lambdas,
             standard_deviation: 1.0,
-            edf_by_block,
-            edf_total,
             iterations: fit.outer_iterations,
             finalgrad_norm: 0.0,
             pirls_status: if fit.converged {
@@ -5772,23 +5773,27 @@ fn fit_bounded_term_collection_forspec(
                 .map(f64::abs)
                 .fold(0.0, f64::max),
             constraint_kkt: None,
-            smoothing_correction: None,
-            penalized_hessian,
-            working_weights: eta_state.fisherweight.clone(),
-            working_response: {
-                let mut working_response = eta_state.eta.clone();
-                for i in 0..working_response.len() {
-                    let wi = eta_state.fisherweight[i].max(1e-12);
-                    working_response[i] += eta_state.score[i] / wi;
-                }
-                working_response
-            },
-            reparam_qs: None,
             artifacts: crate::estimate::FitArtifacts { pirls: None },
-            beta_covariance,
-            beta_standard_errors,
-            beta_covariance_corrected: None,
-            beta_standard_errors_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block,
+                edf_total,
+                smoothing_correction: None,
+                penalized_hessian,
+                working_weights: eta_state.fisherweight.clone(),
+                working_response: {
+                    let mut working_response = eta_state.eta.clone();
+                    for i in 0..working_response.len() {
+                        let wi = eta_state.fisherweight[i].max(1e-12);
+                        working_response[i] += eta_state.score[i] / wi;
+                    }
+                    working_response
+                },
+                reparam_qs: None,
+                beta_covariance,
+                beta_standard_errors,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+            }),
             reml_score: fit.penalizedobjective,
             fitted_link_parameters: crate::estimate::FittedLinkParameters::Standard,
         },
@@ -8266,6 +8271,7 @@ mod tests {
         assert_eq!(design.penalties.len(), 1);
         assert_eq!(design.nullspace_dims, vec![0]);
         let (name, range) = &design.random_effect_ranges[0];
+        let _ = name;
         for i in 0..design.design.nrows() {
             let row_sum: f64 = design.design.slice(s![i, range.clone()]).sum();
             assert!((row_sum - 1.0).abs() < 1e-12);
@@ -10518,7 +10524,7 @@ mod tests {
 
         assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.deviance.is_finite());
-        assert!(fit.fit.edf_total.is_finite());
+        assert!(fit.fit.edf_total().is_some_and(f64::is_finite));
         let diag = fit
             .adaptive_diagnostics
             .as_ref()

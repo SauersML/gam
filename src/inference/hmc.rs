@@ -522,6 +522,7 @@ mod tests {
 
         let z = array![0.15, -0.35];
         let (logp, grad) = posterior.compute_logp_and_grad_nd(&z);
+        let _ = logp;
 
         let eps = 1e-6;
         for j in 0..z.len() {
@@ -589,6 +590,7 @@ mod tests {
         let u = array![-0.25, 0.5, 1.2];
         let theta = mode_theta.clone();
         let (b_eval, eta) = posterior.evaluate_link(&u, &theta);
+        let _ = eta;
 
         let rw = 1.0;
         let z_raw = u.mapv(|ui| ui / rw);
@@ -671,6 +673,7 @@ mod tests {
         let u = array![-0.25, 0.5, 1.2];
         let g = posterior.compute_g_prime(&u, &mode_theta);
         let (z_raw, z_c, rw) = posterior.standardized_z(&u);
+        let _ = z_raw;
         let (bp_arc, _) = create_basis::<Dense>(
             z_c.view(),
             KnotSource::Provided(knots.view()),
