@@ -444,6 +444,62 @@ pub trait LinearOperator {
     fn uses_matrix_free_pcg(&self) -> bool {
         false
     }
+    fn solve_system_matrix_free_pcg_try(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        baseridge: f64,
+    ) -> Result<Array1<f64>, String> {
+        if rhs.len() != self.ncols() {
+            return Err(format!(
+                "solve_system_matrix_free_pcg rhs dimension mismatch: rhs length {} != ncols {}",
+                rhs.len(),
+                self.ncols()
+            ));
+        }
+        if !self.uses_matrix_free_pcg() {
+            return Err("matrix-free PCG is only enabled for eligible operator types".to_string());
+        }
+        if let Some(pen) = penalty
+            && (pen.nrows() != self.ncols() || pen.ncols() != self.ncols())
+        {
+            return Err(format!(
+                "solve_system_matrix_free_pcg penalty shape mismatch: got {}x{}, expected {}x{}",
+                pen.nrows(),
+                pen.ncols(),
+                self.ncols(),
+                self.ncols()
+            ));
+        }
+        for retry in 0..8 {
+            let ridge = if baseridge > 0.0 {
+                baseridge * 10f64.powi(retry as i32)
+            } else {
+                0.0
+            };
+            let normal_op = PenalizedWeightedNormalOperator {
+                operator: self,
+                weights,
+                penalty,
+                ridge,
+            };
+            let preconditioner = normal_op.jacobi_preconditioner()?;
+            let solved = crate::linalg::utils::solve_spd_pcg(
+                |v| normal_op.apply(v),
+                rhs,
+                &preconditioner,
+                MATRIX_FREE_PCG_REL_TOL,
+                MATRIX_FREE_PCG_MAX_ITER.max(4 * self.ncols()),
+            );
+            if let Some(solution) = solved
+                && solution.iter().all(|v| v.is_finite())
+            {
+                return Ok(solution);
+            }
+        }
+        Err("matrix-free PCG failed after ridge retries".to_string())
+    }
     fn factorize_system(
         &self,
         weights: &Array1<f64>,
@@ -515,31 +571,10 @@ pub trait LinearOperator {
             0.0
         };
         if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
-            for retry in 0..8 {
-                let ridge = if baseridge > 0.0 {
-                    baseridge * 10f64.powi(retry as i32)
-                } else {
-                    0.0
-                };
-                let normal_op = PenalizedWeightedNormalOperator {
-                    operator: self,
-                    weights,
-                    penalty,
-                    ridge,
-                };
-                let precond_retry = normal_op.jacobi_preconditioner()?;
-                let solved = crate::linalg::utils::solve_spd_pcg(
-                    |v| normal_op.apply(v),
-                    rhs,
-                    &precond_retry,
-                    MATRIX_FREE_PCG_REL_TOL,
-                    MATRIX_FREE_PCG_MAX_ITER.max(4 * self.ncols()),
-                );
-                if let Some(solution) = solved
-                    && solution.iter().all(|v| v.is_finite())
-                {
-                    return Ok(solution);
-                }
+            if let Ok(solution) =
+                self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, baseridge)
+            {
+                return Ok(solution);
             }
         }
         crate::linalg::utils::StableSolver::new("linear operator system")
@@ -1011,6 +1046,22 @@ impl DesignMatrix {
         )
     }
 
+    pub fn solve_system_matrix_free_pcg(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge_floor: f64,
+    ) -> Result<Array1<f64>, String> {
+        <Self as LinearOperator>::solve_system_matrix_free_pcg_try(
+            self,
+            weights,
+            rhs,
+            penalty,
+            ridge_floor.max(1e-15),
+        )
+    }
+
     pub fn factorize_system(
         &self,
         weights: &Array1<f64>,
@@ -1059,8 +1110,29 @@ impl From<&DesignMatrix> for DesignMatrix {
 #[cfg(test)]
 mod tests {
     use super::{DesignMatrix, dense_matvec, dense_transpose_matvec};
+    use crate::linalg::utils::StableSolver;
+    use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use ndarray::{Array2, array};
+    use ndarray::{Array1, Array2, Axis, array};
+
+    fn exact_weighted_penalized_solve(
+        design: &Array2<f64>,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: &Array2<f64>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        let mut h = design.t().dot(&(design * &weights.view().insert_axis(Axis(1))));
+        h += penalty;
+        if ridge > 0.0 {
+            for i in 0..h.nrows() {
+                h[[i, i]] += ridge;
+            }
+        }
+        StableSolver::new("matrix-free pcg exact reference")
+            .solvevectorwithridge_retries(&h, rhs, 0.0)
+            .expect("exact reference solve")
+    }
 
     #[test]
     fn dense_matvec_matches_ndarray_dot() {
@@ -1160,5 +1232,87 @@ mod tests {
         assert!(beta.iter().all(|v| v.is_finite()));
         assert!((beta[0] - 2.0).abs() < 1e-10);
         assert!(beta[1].abs() < 1e-8);
+    }
+
+    #[test]
+    fn explicit_matrix_free_pcg_matches_exact_large_dense_weighted_penalized_solve() {
+        let n = 48usize;
+        let p = 520usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] = (((i + 3) * (j + 5)) % 17) as f64 / 17.0
+                    + 0.02 * (i as f64)
+                    + 0.001 * (j as f64);
+            }
+        }
+        let design = DesignMatrix::Dense(x.clone());
+        let weights = Array1::from_iter((0..n).map(|i| 0.5 + (i as f64) / (2.0 * n as f64)));
+        let rhs = Array1::from_iter((0..p).map(|j| ((j % 13) as f64 - 6.0) / 13.0));
+        let penalty = Array2::from_diag(&Array1::from_iter(
+            (0..p).map(|j| 0.1 + 0.005 * ((j % 7) as f64)),
+        ));
+        let ridge = 1e-8;
+
+        let pcg = design
+            .solve_system_matrix_free_pcg(&weights, &rhs, Some(&penalty), ridge)
+            .expect("matrix-free pcg solve");
+        let exact = exact_weighted_penalized_solve(&x, &weights, &rhs, &penalty, ridge);
+        for i in 0..p {
+            assert!(
+                (pcg[i] - exact[i]).abs() < 1e-5,
+                "solution mismatch at {i}: pcg={} exact={}",
+                pcg[i],
+                exact[i]
+            );
+        }
+        let mut h = x.t().dot(&(x.clone() * &weights.view().insert_axis(Axis(1))));
+        h += &penalty;
+        for i in 0..p {
+            h[[i, i]] += ridge;
+        }
+        let residual = h.dot(&pcg) - &rhs;
+        let residual_norm = residual.dot(&residual).sqrt();
+        assert!(residual_norm < 1e-4, "residual_norm={residual_norm}");
+    }
+
+    #[test]
+    fn policy_solve_matches_explicit_matrix_free_pcg_on_large_dense_system() {
+        let n = 40usize;
+        let p = 520usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] = (((2 * i + j + 11) % 23) as f64 / 23.0) + 0.0005 * (j as f64);
+            }
+        }
+        let design = DesignMatrix::Dense(x);
+        let weights = Array1::from_iter((0..n).map(|i| 1.0 + 0.01 * i as f64));
+        let rhs = Array1::from_iter((0..p).map(|j| ((j % 5) as f64) - 2.0));
+        let penalty = Array2::from_diag(&Array1::from_iter(
+            (0..p).map(|j| 0.2 + 0.01 * ((j % 3) as f64)),
+        ));
+        let ridge_floor = 1e-8;
+
+        let explicit = design
+            .solve_system_matrix_free_pcg(&weights, &rhs, Some(&penalty), ridge_floor)
+            .expect("explicit pcg");
+        let policy = design
+            .solve_systemwith_policy(
+                &weights,
+                &rhs,
+                Some(&penalty),
+                ridge_floor,
+                RidgePolicy::explicit_stabilization_pospart(),
+            )
+            .expect("policy solve");
+        for i in 0..p {
+            assert!(
+                (explicit[i] - policy[i]).abs() < 1e-6,
+                "policy mismatch at {i}: explicit={} policy={}",
+                explicit[i],
+                policy[i]
+            );
+        }
     }
 }
