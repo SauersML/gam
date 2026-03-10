@@ -1,5 +1,5 @@
-use gam::estimate::{ExternalOptimOptions, evaluate_external_theta_cost_gradient};
-use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
+use gam::estimate::{ExternalOptimOptions, evaluate_external_thetacostgradient};
+use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_fromspec};
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -25,7 +25,7 @@ fn one_penalty_non_intercept(p: usize) -> Vec<Array2<f64>> {
     vec![s]
 }
 
-fn central_fd_gradient<F>(theta: &Array1<f64>, mut f: F) -> Array1<f64>
+fn centralfdgradient<F>(theta: &Array1<f64>, mut f: F) -> Array1<f64>
 where
     F: FnMut(&Array1<f64>) -> f64,
 {
@@ -44,7 +44,7 @@ where
 }
 
 #[test]
-fn full_outer_theta_gradient_matches_fd_for_blended_link() {
+fn full_outer_thetagradient_matchesfd_for_blended_link() {
     for seed in [31_u64, 77_u64, 901_u64] {
         let n = 20usize;
         let x = build_tiny_design(n);
@@ -54,7 +54,7 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
 
         let true_beta = array![-0.3, 0.8, -0.5];
         let eta = x.dot(&true_beta);
-        let true_spec = MixtureLinkSpec {
+        let truespec = MixtureLinkSpec {
             components: vec![
                 LinkComponent::Probit,
                 LinkComponent::CLogLog,
@@ -62,7 +62,7 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
             ],
             initial_rho: array![0.5, -0.3],
         };
-        let true_state = state_from_spec(&true_spec).expect("true blended state");
+        let true_state = state_fromspec(&truespec).expect("true blended state");
         let p = eta.mapv(|e| mixture_inverse_link_jet(&true_state, e).mu);
         let mut rng = StdRng::seed_from_u64(seed);
         let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
@@ -70,7 +70,7 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
         let opts = ExternalOptimOptions {
             family: LikelihoodFamily::BinomialMixture,
             mixture_link: Some(MixtureLinkSpec {
-                components: true_spec.components.clone(),
+                components: truespec.components.clone(),
                 initial_rho: array![0.0, 0.0],
             }),
             optimize_mixture: true,
@@ -84,7 +84,7 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
         };
 
         let theta = array![0.15, -0.2, 0.1];
-        let (cost, analytic) = evaluate_external_theta_cost_gradient(
+        let (cost, analytic) = evaluate_external_thetacostgradient(
             y.view(),
             w.view(),
             x.view(),
@@ -97,8 +97,8 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
         assert!(cost.is_finite());
         assert!(analytic.iter().all(|v| v.is_finite()));
 
-        let fd = central_fd_gradient(&theta, |t| {
-            evaluate_external_theta_cost_gradient(
+        let fd = centralfdgradient(&theta, |t| {
+            evaluate_external_thetacostgradient(
                 y.view(),
                 w.view(),
                 x.view(),
@@ -135,7 +135,7 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
 }
 
 #[test]
-fn full_outer_theta_gradient_matches_fd_for_sas_link() {
+fn full_outer_thetagradient_matchesfd_for_sas_link() {
     for seed in [19_u64, 63_u64, 707_u64] {
         let n = 20usize;
         let x = build_tiny_design(n);
@@ -168,7 +168,7 @@ fn full_outer_theta_gradient_matches_fd_for_sas_link() {
         };
 
         let theta = array![0.10, 0.12, -0.18];
-        let (cost, analytic) = evaluate_external_theta_cost_gradient(
+        let (cost, analytic) = evaluate_external_thetacostgradient(
             y.view(),
             w.view(),
             x.view(),
@@ -181,8 +181,8 @@ fn full_outer_theta_gradient_matches_fd_for_sas_link() {
         assert!(cost.is_finite());
         assert!(analytic.iter().all(|v| v.is_finite()));
 
-        let fd = central_fd_gradient(&theta, |t| {
-            evaluate_external_theta_cost_gradient(
+        let fd = centralfdgradient(&theta, |t| {
+            evaluate_external_thetacostgradient(
                 y.view(),
                 w.view(),
                 x.view(),

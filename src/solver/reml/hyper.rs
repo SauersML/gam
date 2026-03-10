@@ -18,25 +18,25 @@ impl<'a> JointHyperThetaBlocks<'a> {
         self.theta.slice(s![self.rho_dim..]).to_owned()
     }
 
-    fn assemble_gradient(
+    fn assemblegradient(
         &self,
-        rho_grad: &Array1<f64>,
-        psi_grad: &Array1<f64>,
+        rhograd: &Array1<f64>,
+        psigrad: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        if rho_grad.len() != self.rho_dim
-            || psi_grad.len() != self.theta.len().saturating_sub(self.rho_dim)
+        if rhograd.len() != self.rho_dim
+            || psigrad.len() != self.theta.len().saturating_sub(self.rho_dim)
         {
             return Err(EstimationError::InvalidInput(format!(
-                "joint hyper gradient split mismatch: rho_grad={}, psi_grad={}, rho_dim={}, theta_dim={}",
-                rho_grad.len(),
-                psi_grad.len(),
+                "joint hyper gradient split mismatch: rhograd={}, psigrad={}, rho_dim={}, theta_dim={}",
+                rhograd.len(),
+                psigrad.len(),
                 self.rho_dim,
                 self.theta.len()
             )));
         }
         let mut out = Array1::<f64>::zeros(self.theta.len());
-        out.slice_mut(s![..self.rho_dim]).assign(rho_grad);
-        out.slice_mut(s![self.rho_dim..]).assign(psi_grad);
+        out.slice_mut(s![..self.rho_dim]).assign(rhograd);
+        out.slice_mut(s![self.rho_dim..]).assign(psigrad);
         Ok(out)
     }
 }
@@ -79,7 +79,7 @@ impl<'a> RemlState<'a> {
         Ok(out)
     }
 
-    fn relinearized_penalty_second_components(
+    fn relinearized_penaltysecond_components(
         hyper_dirs: &[DirectionalHyperParam],
         j: usize,
         psi_dim: usize,
@@ -88,11 +88,11 @@ impl<'a> RemlState<'a> {
         let mut out = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
         for target in 0..psi_dim {
             let extra = hyper_dirs[j]
-                .penalty_second_components_for(target)
+                .penaltysecond_components_for(target)
                 .or_else(|| {
                     hyper_dirs
                         .get(target)
-                        .and_then(|dir| dir.penalty_second_components_for(j))
+                        .and_then(|dir| dir.penaltysecond_components_for(j))
                 });
             out[target] = Self::sum_penalty_components(p, &[], extra, 1.0)?;
         }
@@ -118,13 +118,13 @@ impl<'a> RemlState<'a> {
                 if amp == 0.0 {
                     continue;
                 }
-                if let Some(x_ji) = Self::get_pairwise_second_derivative(hyper_dirs, j, i, true) {
+                if let Some(x_ji) = Self::get_pairwisesecond_derivative(hyper_dirs, j, i, true) {
                     x_j.scaled_add(amp, x_ji);
                 }
-                let extra = hyper_dirs[j].penalty_second_components_for(i).or_else(|| {
+                let extra = hyper_dirs[j].penaltysecond_components_for(i).or_else(|| {
                     hyper_dirs
                         .get(i)
-                        .and_then(|dir| dir.penalty_second_components_for(j))
+                        .and_then(|dir| dir.penaltysecond_components_for(j))
                 });
                 s_j = Self::sum_penalty_components(p, &[], Some(extra.unwrap_or(&[])), amp)?
                     .into_iter()
@@ -144,13 +144,13 @@ impl<'a> RemlState<'a> {
                 x_j,
                 s_j,
                 hyper_dirs[j].x_tau_tau_original.clone(),
-                Self::relinearized_penalty_second_components(hyper_dirs, j, psi_dim, p)?,
+                Self::relinearized_penaltysecond_components(hyper_dirs, j, psi_dim, p)?,
             )?);
         }
         Ok(out)
     }
 
-    fn get_pairwise_second_penalty_component(
+    fn get_pairwisesecond_penalty_component(
         hyper_dirs: &[DirectionalHyperParam],
         i: usize,
         j: usize,
@@ -159,8 +159,8 @@ impl<'a> RemlState<'a> {
     ) -> Array2<f64> {
         if let Some(component) = hyper_dirs
             .get(i)
-            .and_then(|dir| dir.penalty_second_components_for(j))
-            .map(|_| hyper_dirs[i].penalty_second_component_matrix(j, penalty_index, p))
+            .and_then(|dir| dir.penaltysecond_components_for(j))
+            .map(|_| hyper_dirs[i].penaltysecond_component_matrix(j, penalty_index, p))
         {
             if component.iter().any(|v| *v != 0.0) {
                 return component;
@@ -168,7 +168,7 @@ impl<'a> RemlState<'a> {
         }
         hyper_dirs
             .get(j)
-            .map(|dir| dir.penalty_second_component_matrix(i, penalty_index, p))
+            .map(|dir| dir.penaltysecond_component_matrix(i, penalty_index, p))
             .unwrap_or_else(|| Array2::<f64>::zeros((p, p)))
     }
 
@@ -231,7 +231,7 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn get_pairwise_second_derivative<'b>(
+    fn get_pairwisesecond_derivative<'b>(
         hyper_dirs: &'b [DirectionalHyperParam],
         i: usize,
         j: usize,
@@ -315,7 +315,7 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
-            if let Some(s2) = dir.penalty_second_components.as_ref() {
+            if let Some(s2) = dir.penaltysecond_components.as_ref() {
                 if s2.len() != psi_dim {
                     return Err(EstimationError::InvalidInput(format!(
                         "S_tau_tau[{j}] length mismatch: expected {}, got {}",
@@ -416,14 +416,14 @@ impl<'a> RemlState<'a> {
                 if amp == 0.0 {
                     continue;
                 }
-                if let Some(x_ij) = Self::get_pairwise_second_derivative(hyper_dirs, i, j, true)
+                if let Some(x_ij) = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true)
                     && let Some(x_mod) = x_mod_dense.as_mut()
                 {
                     x_mod.scaled_add(amp, x_ij);
                 }
                 let mut second_components = Vec::<PenaltyDerivativeComponent>::new();
                 for penalty_index in 0..s_mod.len() {
-                    let matrix = Self::get_pairwise_second_penalty_component(
+                    let matrix = Self::get_pairwisesecond_penalty_component(
                         hyper_dirs,
                         i,
                         j,
@@ -449,7 +449,7 @@ impl<'a> RemlState<'a> {
             .unwrap()
             .as_ref()
             .map(|beta| beta.as_ref().clone());
-        let mut pert_state = RemlState::new_with_offset(
+        let mut pert_state = RemlState::newwith_offset(
             self.y,
             x_mod,
             self.weights,
@@ -466,26 +466,26 @@ impl<'a> RemlState<'a> {
             self.runtime_sas_link_state,
         );
         if let Some(beta) = warm_start_beta.as_ref() {
-            pert_state.set_warm_start_original_beta(Some(beta.view()));
+            pert_state.setwarm_start_original_beta(Some(beta.view()));
         }
         Ok(pert_state)
     }
 
-    pub(super) fn compute_multi_psi_gradient_with_bundle(
+    pub(super) fn computemulti_psigradientwith_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Array1<f64>, EstimationError> {
-        let mut psi_grad = Array1::<f64>::zeros(hyper_dirs.len());
+        let mut psigrad = Array1::<f64>::zeros(hyper_dirs.len());
         for (i, hyper_dir) in hyper_dirs.iter().enumerate() {
-            psi_grad[i] =
-                self.compute_directional_hyper_gradient_with_bundle(rho, bundle, hyper_dir)?;
+            psigrad[i] =
+                self.compute_directional_hypergradientwith_bundle(rho, bundle, hyper_dir)?;
         }
-        Ok(psi_grad)
+        Ok(psigrad)
     }
 
-    pub(crate) fn compute_joint_hyper_cost_gradient(
+    pub(crate) fn compute_joint_hypercostgradient(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,
@@ -496,13 +496,13 @@ impl<'a> RemlState<'a> {
         let rho = blocks.rho_owned();
         let psi = blocks.psi_owned();
         let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi, self.p)?;
-        let (cost, rho_grad, psi_grad) = if psi_dim > 0 {
+        let (cost, rhograd, psigrad) = if psi_dim > 0 {
             let pert_state = self.build_joint_perturbed_state(&psi, hyper_dirs)?;
             let bundle = pert_state.obtain_eval_bundle(&rho)?;
             (
                 pert_state.compute_cost(&rho)?,
                 pert_state.compute_gradient_with_bundle(&rho, &bundle)?,
-                pert_state.compute_multi_psi_gradient_with_bundle(&rho, &bundle, &eff_dirs)?,
+                pert_state.computemulti_psigradientwith_bundle(&rho, &bundle, &eff_dirs)?,
             )
         } else {
             let bundle = self.obtain_eval_bundle(&rho)?;
@@ -512,7 +512,7 @@ impl<'a> RemlState<'a> {
                 Array1::<f64>::zeros(0),
             )
         };
-        let out = blocks.assemble_gradient(&rho_grad, &psi_grad)?;
+        let out = blocks.assemblegradient(&rhograd, &psigrad)?;
         Ok((cost, out))
     }
 
@@ -539,17 +539,17 @@ impl<'a> RemlState<'a> {
         //
         // Mixed directional identity (u=ρ_k, v=τ_j):
         //   V_uv
-        //   = (L*_{uv} - g_u^T H_+^† g_v)
-        //     + 0.5[ tr(H_+^† H_uv^tot) - tr(H_+^† H_u^tot H_+^† H_v^tot) ]
-        //     - 0.5[ tr(S_+^† S_uv) - tr(S_+^† S_u S_+^† S_v) ].
+        //   = (L*_{uv} - g_u^T H_+^† gv)
+        //     + 0.5[ tr(H_+^† H_uv^tot) - tr(H_+^† H_u^tot H_+^† Hv^tot) ]
+        //     - 0.5[ tr(S_+^† S_uv) - tr(S_+^† S_u S_+^† Sv) ].
         //
         // In this block:
         //   - u=ρ_k has X_u=0, S_u=A_k=λ_k S_k.
-        //   - v=τ_j may move both X and S: X_v=X_{τ_j}, S_v=S_{τ_j}.
-        //   - Firth/logit enters through g_v and H_v^tot via
-        //       (g_φ)_v = Φ_{βv},
-        //       (H_φ)_v|β = Φ_{ββv},
-        //       D(H_φ)[β_v] = Φ_{βββ}[β_v].
+        //   - v=τ_j may move both X and S: Xv=X_{τ_j}, Sv=S_{τ_j}.
+        //   - Firth/logit enters through gv and Hv^tot via
+        //       (g_φ)v = Φ_{βv},
+        //       (H_φ)v|β = Φ_{ββv},
+        //       D(H_φ)[βv] = Φ_{βββ}[βv].
         //
         // Implemented equivalent decomposition:
         //   V_{k,tau}
@@ -564,7 +564,7 @@ impl<'a> RemlState<'a> {
         //
         // This removes the previous FD-in-(tau amplitude) mixed block path.
         for j in 0..psi_dim {
-            let col = pert_state.compute_mixed_rho_tau_column_analytic_with_bundle(
+            let col = pert_state.compute_mixed_rho_tau_column_analyticwith_bundle(
                 rho,
                 bundle,
                 &hyper_dirs[j],
@@ -574,7 +574,7 @@ impl<'a> RemlState<'a> {
         Ok(mixed)
     }
 
-    pub(super) fn compute_mixed_rho_tau_column_analytic_with_bundle(
+    pub(super) fn compute_mixed_rho_tau_column_analyticwith_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -585,9 +585,7 @@ impl<'a> RemlState<'a> {
         if k_count == 0 {
             return Ok(out);
         }
-        // -----------------------------------------------------------------
         // Literal derivation map for one mixed column V_{ρ_k,τ}
-        // -----------------------------------------------------------------
         // Let τ denote the current directional hyperparameter (hyper_dir).
         //
         // Profiled objective:
@@ -633,7 +631,6 @@ impl<'a> RemlState<'a> {
         //   for each multi-index I=(α_1,...,α_m), where R_I is assembled from
         //   partition sums of mixed derivatives of G with lower-order β̂ terms.
         //   Then apply the same partition calculus to f, log|H|_+, and log|S|_+.
-        // -----------------------------------------------------------------
 
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
@@ -658,8 +655,8 @@ impl<'a> RemlState<'a> {
                 .map(|r| r.dot(z))
                 .collect();
             x_eval = x_eval.dot(z);
-            h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
+            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             x_tau_t = x_tau_t.dot(z);
         }
         let p_dim = beta_eval.len();
@@ -712,11 +709,11 @@ impl<'a> RemlState<'a> {
         // the branch-local truncated-logdet surface, but the branch itself is
         // no longer stable enough to treat as exact.
         let prefer_h_pos = !bundle.active_subspace_unstable;
-        let h_pos_w_for_solve = if prefer_h_pos {
-            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
-                Some(bundle.h_pos_factor_w.as_ref().clone())
+        let h_posw_for_solve = if prefer_h_pos {
+            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == p_dim {
+                Some(bundle.h_pos_factorw.as_ref().clone())
             } else {
-                match Self::positive_part_factor_w(h_solve_eval) {
+                match Self::positive_part_factorw(h_solve_eval) {
                     Ok(w) => Some(w),
                     Err(err) => {
                         log::warn!(
@@ -733,41 +730,41 @@ impl<'a> RemlState<'a> {
             );
             None
         };
-        let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
-        let h_factor = if h_pos_w_for_solve.is_none() {
+        let h_posw_for_solve_t = h_posw_for_solve.as_ref().map(|w| w.t().to_owned());
+        let h_factor = if h_posw_for_solve.is_none() {
             Some(self.factorize_faer(h_solve_eval))
         } else {
             None
         };
-        let solve_h_vec = |rhs: &Array1<f64>| -> Array1<f64> {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+        let solve_hvec = |rhs: &Array1<f64>| -> Array1<f64> {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let tmp = w_t.dot(rhs);
                 return w.dot(&tmp);
             }
             let mut rhs_mat = Array2::<f64>::zeros((rhs.len(), 1));
             rhs_mat.column_mut(0).assign(rhs);
-            let mut rhs_view = array2_to_mat_mut(&mut rhs_mat);
+            let mut rhsview = array2_to_matmut(&mut rhs_mat);
             if let Some(f) = h_factor.as_ref() {
-                f.solve_in_place(rhs_view.as_mut());
+                f.solve_in_place(rhsview.as_mut());
             }
             rhs_mat.column(0).to_owned()
         };
         let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }
             let mut out = rhs.clone();
-            let mut out_view = array2_to_mat_mut(&mut out);
+            let mut outview = array2_to_matmut(&mut out);
             if let Some(f) = h_factor.as_ref() {
-                f.solve_in_place(out_view.as_mut());
+                f.solve_in_place(outview.as_mut());
             }
             out
         };
         let trace_hdag = |a: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let wt_a = fast_ab(w_t, a);
                 let g = fast_ab(&wt_a, w);
@@ -777,31 +774,31 @@ impl<'a> RemlState<'a> {
                 solved.diag().sum()
             }
         };
-        // Matrix-free trace contraction for D²(H_phi)[u,v]:
-        //   tr(H_+^dagger D²H_phi[u,v]) = tr(W^T (D²H_phi[u,v] W))
+        // Matrix-free trace contraction for D²(Hphi)[u,v]:
+        //   tr(H_+^dagger D²Hphi[u,v]) = tr(W^T (D²Hphi[u,v] W))
         // when the positive-subspace solve projector W is available.
         // Falls back to dense assembly only when W is unavailable.
-        let trace_hdag_firth_second =
+        let trace_hdag_firthsecond =
             |op: &FirthDenseOperator, u_dir: &FirthDirection, v_dir: &FirthDirection| -> f64 {
                 Self::trace_hdag_operator_apply(
                     p_dim,
-                    h_pos_w_for_solve.as_ref(),
-                    h_pos_w_for_solve_t.as_ref(),
+                    h_posw_for_solve.as_ref(),
+                    h_posw_for_solve_t.as_ref(),
                     |a| solve_h_mat(a),
-                    |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
+                    |basis| Self::firth_hphisecond_direction_apply(op, u_dir, v_dir, basis),
                 )
             };
         let trace_hdag_firth_first = |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
             Self::trace_hdag_operator_apply(
                 p_dim,
-                h_pos_w_for_solve.as_ref(),
-                h_pos_w_for_solve_t.as_ref(),
+                h_posw_for_solve.as_ref(),
+                h_posw_for_solve_t.as_ref(),
                 |a| solve_h_mat(a),
                 |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
             )
         };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let gb = fast_ab(&fast_ab(w_t, b), w);
                 let gc = fast_ab(&fast_ab(w_t, c_mat), w);
@@ -829,10 +826,10 @@ impl<'a> RemlState<'a> {
         let b_k_mat = solve_h_mat(&rhs_bk);
         let u_k_mat = x_eval.dot(&b_k_mat);
 
-        let u = &pirls_result.solve_weights
-            * &(&pirls_result.solve_working_response - &pirls_result.final_eta);
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         let x_tau_beta = x_tau_t.dot(&beta_eval);
-        let weighted_x_tau_beta = &pirls_result.solve_weights * &x_tau_beta;
+        let weighted_x_tau_beta = &pirls_result.solveweights * &x_tau_beta;
         let mut g_tau = x_tau_t.t().dot(&u)
             - x_eval.t().dot(&weighted_x_tau_beta)
             - s_tau_total_t.dot(&beta_eval);
@@ -854,22 +851,22 @@ impl<'a> RemlState<'a> {
             let need_tau_kernel = x_tau_t.iter().any(|v| *v != 0.0);
             let tau_bundle =
                 Self::firth_exact_tau_kernel(op, &x_tau_t, &beta_eval, need_tau_kernel);
-            g_tau -= &tau_bundle.g_phi_tau;
+            g_tau -= &tau_bundle.gphi_tau;
             if need_tau_kernel {
                 tau_kernel_opt = Some(tau_bundle.tau_kernel.expect(
                     "exact directional assembly requires tau kernel when design drift is active",
                 ));
             }
         }
-        let beta_tau = solve_h_vec(&g_tau);
+        let beta_tau = solve_hvec(&g_tau);
         let eta_tau = &x_tau_beta + &x_eval.dot(&beta_tau);
 
         let runtime_link = self.runtime_inverse_link();
-        let w_tau = match crate::pirls::directional_working_curvature_from_eta_with_state(
+        let w_tau = match crate::pirls::directionalworking_curvature_from_etawith_state(
             &runtime_link,
             &pirls_result.final_eta,
             self.weights,
-            &pirls_result.solve_weights,
+            &pirls_result.solveweights,
             &eta_tau,
         )? {
             DirectionalWorkingCurvature::Diagonal(diag) => diag,
@@ -879,8 +876,8 @@ impl<'a> RemlState<'a> {
         let d = &pirls_result.solve_d_array;
         let c_tau = d * &eta_tau;
         let mut weighted = Array2::<f64>::zeros(x_eval.raw_dim());
-        let wx = Self::row_scale(&x_eval, &pirls_result.solve_weights);
-        let wx_tau = Self::row_scale(&x_tau_t, &pirls_result.solve_weights);
+        let wx = Self::row_scale(&x_eval, &pirls_result.solveweights);
+        let wx_tau = Self::row_scale(&x_tau_t, &pirls_result.solveweights);
         let mut h_tau = x_tau_t.t().dot(&wx)
             + x_eval.t().dot(&wx_tau)
             + Self::xt_diag_x_dense_into(&x_eval, &w_tau, &mut weighted)
@@ -889,7 +886,7 @@ impl<'a> RemlState<'a> {
             if x_tau_t.iter().any(|v| *v != 0.0) {
                 let kernel = tau_kernel_opt
                     .as_ref()
-                    .expect("exact directional assembly requires cached tau kernel for H_phi,tau");
+                    .expect("exact directional assembly requires cached tau kernel for Hphi,tau");
                 let eye = Array2::<f64>::eye(p_dim);
                 let hphi_tau_partial =
                     Self::firth_hphi_tau_partial_apply(op, &x_tau_t, kernel, &eye);
@@ -922,7 +919,7 @@ impl<'a> RemlState<'a> {
             .fold(Array2::<f64>::zeros((p_dim, p_dim)), |acc, (k, r)| {
                 acc + r.t().dot(r).mapv(|v| lambdas[k] * v)
             });
-        let (s_eigs, s_vecs) = s_eval
+        let (s_eigs, svecs) = s_eval
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
         let s_max = s_eigs
@@ -935,7 +932,7 @@ impl<'a> RemlState<'a> {
         for i in 0..p_dim {
             let ev = s_eigs[i];
             if ev > s_tol {
-                let ucol = s_vecs.column(i).to_owned();
+                let ucol = svecs.column(i).to_owned();
                 let scale = 1.0 / ev;
                 let outer = ucol
                     .view()
@@ -956,7 +953,7 @@ impl<'a> RemlState<'a> {
             // B_{k,τ} solve:
             //   H B_{k,τ} = -(H_τ B_k + A_k β_τ + A_{k,τ} β).
             let rhs_bktau = -(&h_tau.dot(&b_k) + &a_k.dot(&beta_tau) + &a_k_tau.dot(&beta_eval));
-            let b_k_tau = solve_h_vec(&rhs_bktau);
+            let b_k_tau = solve_hvec(&rhs_bktau);
 
             let u_k = u_k_mat.column(k).to_owned();
             let u_k_tau = x_eval.dot(&b_k_tau);
@@ -974,7 +971,7 @@ impl<'a> RemlState<'a> {
                 let dir_ktau = Self::firth_direction(op, &b_k_tau);
                 let dir_tau = Self::firth_direction(op, &beta_tau);
                 d1_trace_correction = trace_hdag_firth_first(op, &dir_ktau);
-                d2_trace_correction = trace_hdag_firth_second(op, &dirs[k], &dir_tau);
+                d2_trace_correction = trace_hdag_firthsecond(op, &dirs[k], &dir_tau);
             }
 
             // Q_{k,τ} from profiled fit block.
@@ -1010,13 +1007,13 @@ impl<'a> RemlState<'a> {
         //
         // For u=τ_i, v=τ_j with stationarity g(β̂,θ)=0:
         //   V_uv
-        //   = (L*_{uv} - g_u^T H_+^† g_v)
-        //     + 0.5[ tr(H_+^† H_uv^tot) - tr(H_+^† H_u^tot H_+^† H_v^tot) ]
-        //     - 0.5[ tr(S_+^† S_uv) - tr(S_+^† S_u S_+^† S_v) ].
+        //   = (L*_{uv} - g_u^T H_+^† gv)
+        //     + 0.5[ tr(H_+^† H_uv^tot) - tr(H_+^† H_u^tot H_+^† Hv^tot) ]
+        //     - 0.5[ tr(S_+^† S_uv) - tr(S_+^† S_u S_+^† Sv) ].
         //
         // Key IFT solves used below:
-        //   H β_u = -g_u,   H β_v = -g_v,
-        //   H β_uv = -(g_uv + H_u β_v + H_v β_u + D_βH[β_u,β_v]).
+        //   H β_u = -g_u,   H βv = -gv,
+        //   H β_uv = -(g_uv + H_u βv + Hv β_u + D_βH[β_u,βv]).
         //
         // Here H = X'WX + S - H_φ (Firth path), so H_u/H_uv include:
         //   - moving X terms (X_u, X_uv),
@@ -1052,7 +1049,7 @@ impl<'a> RemlState<'a> {
         let mut x_tau_tau_t = vec![vec![Array2::<f64>::zeros(x_eval.raw_dim()); psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
-                if let Some(x_ij) = Self::get_pairwise_second_derivative(hyper_dirs, i, j, true) {
+                if let Some(x_ij) = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true) {
                     x_tau_tau_t[i][j] = x_ij.dot(&reparam_result.qs);
                 }
             }
@@ -1060,8 +1057,8 @@ impl<'a> RemlState<'a> {
         if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             x_eval = x_eval.dot(z);
-            h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
+            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             for j in 0..psi_dim {
                 x_tau_t[j] = x_tau_t[j].dot(z);
             }
@@ -1089,11 +1086,11 @@ impl<'a> RemlState<'a> {
         // Same policy as above: use H_+^dagger only while the retained
         // eigenspace is stably separated from the dropped spectrum.
         let prefer_h_pos = !bundle.active_subspace_unstable;
-        let h_pos_w_for_solve = if prefer_h_pos {
-            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
-                Some(bundle.h_pos_factor_w.as_ref().clone())
+        let h_posw_for_solve = if prefer_h_pos {
+            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == p_dim {
+                Some(bundle.h_pos_factorw.as_ref().clone())
             } else {
-                match Self::positive_part_factor_w(h_solve_eval) {
+                match Self::positive_part_factorw(h_solve_eval) {
                     Ok(w) => Some(w),
                     Err(err) => {
                         log::warn!(
@@ -1110,71 +1107,71 @@ impl<'a> RemlState<'a> {
             );
             None
         };
-        let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
-        let h_factor = if h_pos_w_for_solve.is_none() {
+        let h_posw_for_solve_t = h_posw_for_solve.as_ref().map(|w| w.t().to_owned());
+        let h_factor = if h_posw_for_solve.is_none() {
             Some(pert_state.factorize_faer(h_solve_eval))
         } else {
             None
         };
-        let solve_h_vec = |rhs: &Array1<f64>| -> Array1<f64> {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+        let solve_hvec = |rhs: &Array1<f64>| -> Array1<f64> {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let tmp = w_t.dot(rhs);
                 return w.dot(&tmp);
             }
             let mut rhs_mat = Array2::<f64>::zeros((rhs.len(), 1));
             rhs_mat.column_mut(0).assign(rhs);
-            let mut rhs_view = array2_to_mat_mut(&mut rhs_mat);
+            let mut rhsview = array2_to_matmut(&mut rhs_mat);
             if let Some(f) = h_factor.as_ref() {
-                f.solve_in_place(rhs_view.as_mut());
+                f.solve_in_place(rhsview.as_mut());
             }
             rhs_mat.column(0).to_owned()
         };
         let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }
             let mut out = rhs.clone();
-            let mut out_view = array2_to_mat_mut(&mut out);
+            let mut outview = array2_to_matmut(&mut out);
             if let Some(f) = h_factor.as_ref() {
-                f.solve_in_place(out_view.as_mut());
+                f.solve_in_place(outview.as_mut());
             }
             out
         };
         let trace_hdag = |a: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let wt_a = fast_ab(w_t, a);
                 let g = fast_ab(&wt_a, w);
                 g.diag().sum()
             } else {
                 let mut solved = a.clone();
-                let mut solved_view = array2_to_mat_mut(&mut solved);
+                let mut solvedview = array2_to_matmut(&mut solved);
                 if let Some(f) = h_factor.as_ref() {
-                    f.solve_in_place(solved_view.as_mut());
+                    f.solve_in_place(solvedview.as_mut());
                 }
                 solved.diag().sum()
             }
         };
-        // Matrix-free D²(H_phi) trace contraction, identical to mixed block:
-        // use tr(W^T (D²H_phi[u,v] W)) on the active positive solve subspace.
-        let trace_hdag_firth_second =
+        // Matrix-free D²(Hphi) trace contraction, identical to mixed block:
+        // use tr(W^T (D²Hphi[u,v] W)) on the active positive solve subspace.
+        let trace_hdag_firthsecond =
             |op: &FirthDenseOperator, u_dir: &FirthDirection, v_dir: &FirthDirection| -> f64 {
                 Self::trace_hdag_operator_apply(
                     p_dim,
-                    h_pos_w_for_solve.as_ref(),
-                    h_pos_w_for_solve_t.as_ref(),
+                    h_posw_for_solve.as_ref(),
+                    h_posw_for_solve_t.as_ref(),
                     |a| solve_h_mat(a),
-                    |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
+                    |basis| Self::firth_hphisecond_direction_apply(op, u_dir, v_dir, basis),
                 )
             };
         let trace_hdag_firth_first = |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
             Self::trace_hdag_operator_apply(
                 p_dim,
-                h_pos_w_for_solve.as_ref(),
-                h_pos_w_for_solve_t.as_ref(),
+                h_posw_for_solve.as_ref(),
+                h_posw_for_solve_t.as_ref(),
                 |a| solve_h_mat(a),
                 |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
             )
@@ -1183,14 +1180,14 @@ impl<'a> RemlState<'a> {
             |op: &FirthDenseOperator, x_tau: &Array2<f64>, kernel: &FirthTauPartialKernel| -> f64 {
                 Self::trace_hdag_operator_apply(
                     p_dim,
-                    h_pos_w_for_solve.as_ref(),
-                    h_pos_w_for_solve_t.as_ref(),
+                    h_posw_for_solve.as_ref(),
+                    h_posw_for_solve_t.as_ref(),
                     |a| solve_h_mat(a),
                     |basis| Self::firth_hphi_tau_partial_apply(op, x_tau, kernel, basis),
                 )
             };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let gb = fast_ab(&fast_ab(w_t, b), w);
                 let gc = fast_ab(&fast_ab(w_t, c_mat), w);
@@ -1198,22 +1195,22 @@ impl<'a> RemlState<'a> {
             } else {
                 let mut left = b.clone();
                 let mut right = c_mat.clone();
-                let mut left_view = array2_to_mat_mut(&mut left);
-                let mut right_view = array2_to_mat_mut(&mut right);
+                let mut leftview = array2_to_matmut(&mut left);
+                let mut rightview = array2_to_matmut(&mut right);
                 if let Some(f) = h_factor.as_ref() {
-                    f.solve_in_place(left_view.as_mut());
-                    f.solve_in_place(right_view.as_mut());
+                    f.solve_in_place(leftview.as_mut());
+                    f.solve_in_place(rightview.as_mut());
                 }
                 Self::trace_product(&left, &right)
             }
         };
 
         // Build first directional solves for all tau directions.
-        let u = &pirls_result.solve_weights
-            * &(&pirls_result.solve_working_response - &pirls_result.final_eta);
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         let c = &pirls_result.solve_c_array;
         let d = &pirls_result.solve_d_array;
-        let w_diag = &pirls_result.solve_weights;
+        let w_diag = &pirls_result.solveweights;
         let lambdas = rho.mapv(f64::exp);
         let transformed_first_components: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
             .iter()
@@ -1245,7 +1242,7 @@ impl<'a> RemlState<'a> {
                     let mat = Self::transform_penalty_components(
                         &[PenaltyDerivativeComponent {
                             penalty_index,
-                            matrix: Self::get_pairwise_second_penalty_component(
+                            matrix: Self::get_pairwisesecond_penalty_component(
                                 hyper_dirs,
                                 i,
                                 j,
@@ -1297,7 +1294,7 @@ impl<'a> RemlState<'a> {
                 - a_tau[j].dot(&beta_eval);
             if let Some(op) = firth_op.as_ref() {
                 let tau_bundle = Self::firth_exact_tau_kernel(op, &x_tau_t[j], &beta_eval, true);
-                g_tau -= &tau_bundle.g_phi_tau;
+                g_tau -= &tau_bundle.gphi_tau;
                 if let Some(v) = firth_tau_kernels.as_mut() {
                     let kernel = tau_bundle.tau_kernel.expect(
                         "firth_exact_tau_kernel(include_hphi_tau_kernel=true) should return kernel",
@@ -1305,15 +1302,15 @@ impl<'a> RemlState<'a> {
                     v.push(kernel);
                 }
             }
-            beta_tau[j] = solve_h_vec(&g_tau);
+            beta_tau[j] = solve_hvec(&g_tau);
             eta_tau[j] = &x_tau_beta[j] + &x_eval.dot(&beta_tau[j]);
 
             let runtime_link = pert_state.runtime_inverse_link();
-            let w_tau_j = match crate::pirls::directional_working_curvature_from_eta_with_state(
+            let w_tau_j = match crate::pirls::directionalworking_curvature_from_etawith_state(
                 &runtime_link,
                 &pirls_result.final_eta,
                 pert_state.weights,
-                &pirls_result.solve_weights,
+                &pirls_result.solveweights,
                 &eta_tau[j],
             )? {
                 DirectionalWorkingCurvature::Diagonal(diag) => diag,
@@ -1355,7 +1352,7 @@ impl<'a> RemlState<'a> {
             };
             s_eval += &r_proj.t().dot(&r_proj).mapv(|v| lambdas[k] * v);
         }
-        let (s_eigs, s_vecs) = s_eval
+        let (s_eigs, svecs) = s_eval
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
         let s_max = s_eigs
@@ -1368,7 +1365,7 @@ impl<'a> RemlState<'a> {
         for i in 0..p_dim {
             let ev = s_eigs[i];
             if ev > s_tol {
-                let ucol = s_vecs.column(i).to_owned();
+                let ucol = svecs.column(i).to_owned();
                 let outer = ucol
                     .view()
                     .insert_axis(Axis(1))
@@ -1386,7 +1383,7 @@ impl<'a> RemlState<'a> {
                 //   g_{tau_i,tau_j} = d/dtau_j [ g_{tau_i} ].
                 //
                 // Expanded score-side terms in this implementation:
-                //   g_tau = X_tau^T u - X^T W(X_tau beta) - S_tau beta - (g_phi)_tau|beta,
+                //   g_tau = X_tau^T u - X^T W(X_tau beta) - S_tau beta - (gphi)_tau|beta,
                 //   g_taui,tauj = d/dtau_j[g_taui] at fixed-beta partial stage,
                 // then totalized through beta_tau_j via the linear solve above.
                 //
@@ -1420,11 +1417,11 @@ impl<'a> RemlState<'a> {
                     if x_tau_tau_t[i][j].iter().any(|v| *v != 0.0) {
                         let xij_bundle =
                             Self::firth_exact_tau_kernel(op, &x_tau_tau_t[i][j], &beta_eval, true);
-                        g_ij -= &xij_bundle.g_phi_tau;
+                        g_ij -= &xij_bundle.gphi_tau;
                     }
                 }
                 let rhs_ij = -(&h_tau[j].dot(&beta_tau[i]) + &g_ij);
-                let beta_ij = solve_h_vec(&rhs_ij);
+                let beta_ij = solve_hvec(&rhs_ij);
                 let eta_ij = x_tau_tau_t[i][j].dot(&beta_eval)
                     + x_tau_t[i].dot(&beta_tau[j])
                     + x_tau_t[j].dot(&beta_tau[i])
@@ -1442,10 +1439,10 @@ impl<'a> RemlState<'a> {
                 h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[i], &diag_j));
                 h_ij += &x_tau_t[i]
                     .t()
-                    .dot(&Self::row_scale(&x_tau_t[j], &pirls_result.solve_weights));
+                    .dot(&Self::row_scale(&x_tau_t[j], &pirls_result.solveweights));
                 h_ij += &x_tau_t[j]
                     .t()
-                    .dot(&Self::row_scale(&x_tau_t[i], &pirls_result.solve_weights));
+                    .dot(&Self::row_scale(&x_tau_t[i], &pirls_result.solveweights));
                 h_ij += &x_tau_t[j].t().dot(&Self::row_scale(&x_eval, &diag_i));
                 h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[j], &diag_i));
                 h_ij += &Self::xt_diag_x_dense_into(&x_eval, &diag_ij, &mut weighted);
@@ -1457,7 +1454,7 @@ impl<'a> RemlState<'a> {
                 if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_tau_dirs.as_ref()) {
                     let dir_ij = Self::firth_direction(op, &beta_ij);
                     d1_trace_correction = trace_hdag_firth_first(op, &dir_ij);
-                    d2_trace_correction = trace_hdag_firth_second(op, &dirs[i], &dirs[j]);
+                    d2_trace_correction = trace_hdag_firthsecond(op, &dirs[i], &dirs[j]);
                     if x_tau_tau_t[i][j].iter().any(|v| *v != 0.0) {
                         let xij_bundle =
                             Self::firth_exact_tau_kernel(op, &x_tau_tau_t[i][j], &beta_eval, true);
@@ -1484,7 +1481,7 @@ impl<'a> RemlState<'a> {
                     + 0.5 * beta_eval.dot(&a_tau_tau[i][j].dot(&beta_eval));
                 // l = 0.5[ tr(H_+^† H_{ij}) - tr(H_+^† H_j H_+^† H_i) ]
                 // with explicit subtractive Firth trace corrections for:
-                //   D(H_phi)[beta_ij], D²(H_phi)[beta_i,beta_j],
+                //   D(Hphi)[beta_ij], D²(Hphi)[beta_i,beta_j],
                 //   and mixed tau-partial terms.
                 let l = 0.5
                     * (trace_hdag(&h_ij)
@@ -1510,7 +1507,7 @@ impl<'a> RemlState<'a> {
         Ok(h_tt)
     }
 
-    pub(crate) fn compute_joint_hyper_hessian(
+    pub(crate) fn compute_joint_hyperhessian(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,
@@ -1527,13 +1524,13 @@ impl<'a> RemlState<'a> {
             (
                 // Joint block assembly is kept fully analytic/objective-consistent.
                 // Do not route through FD fallback policy here.
-                pert_state.compute_laml_hessian_exact(&rho)?,
+                pert_state.compute_lamlhessian_exact(&rho)?,
                 self.compute_mixed_rho_tau_block(&pert_state, &rho, &bundle, &eff_dirs)?,
                 self.compute_tau_tau_block(&pert_state, &rho, &bundle, &eff_dirs)?,
             )
         } else {
             (
-                self.compute_laml_hessian_exact(&rho)?,
+                self.compute_lamlhessian_exact(&rho)?,
                 Array2::<f64>::zeros((rho_dim, 0)),
                 Array2::<f64>::zeros((0, 0)),
             )
@@ -1558,18 +1555,18 @@ impl<'a> RemlState<'a> {
         Ok(h)
     }
 
-    pub(crate) fn compute_joint_hyper_cost_gradient_hessian(
+    pub(crate) fn compute_joint_hypercostgradienthessian(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-        let (cost, grad) = self.compute_joint_hyper_cost_gradient(theta, rho_dim, hyper_dirs)?;
-        let hess = self.compute_joint_hyper_hessian(theta, rho_dim, hyper_dirs)?;
+        let (cost, grad) = self.compute_joint_hypercostgradient(theta, rho_dim, hyper_dirs)?;
+        let hess = self.compute_joint_hyperhessian(theta, rho_dim, hyper_dirs)?;
         Ok((cost, grad, hess))
     }
 
-    pub(super) fn compute_directional_hyper_gradient_with_bundle(
+    pub(super) fn compute_directional_hypergradientwith_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1605,7 +1602,7 @@ impl<'a> RemlState<'a> {
             )));
         }
         if Self::geometry_backend_kind(bundle) == GeometryBackendKind::SparseExactSpd {
-            return self.compute_directional_hyper_gradient_sparse_exact(rho, bundle, hyper_dir);
+            return self.compute_directional_hypergradient_sparse_exact(rho, bundle, hyper_dir);
         }
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
@@ -1622,8 +1619,8 @@ impl<'a> RemlState<'a> {
         let mut x_psi_t = hyper_dir.x_tau_original.dot(&reparam_result.qs);
 
         if let Some(z) = free_basis_opt.as_ref() {
-            h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
+            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
             x_transformed_eval = DesignMatrix::Dense(x_dense_arc.as_ref().dot(z));
@@ -1697,9 +1694,9 @@ impl<'a> RemlState<'a> {
         // This matches the same pseudo-logdet active subspace used in
         // 0.5*tr(H_+^dagger H_tau), avoiding inverse-mismatch between trace and IFT.
         let prefer_h_pos = !bundle.active_subspace_unstable;
-        let h_pos_w_for_solve = if prefer_h_pos {
-            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == h_solve_eval.nrows() {
-                Some(bundle.h_pos_factor_w.as_ref().clone())
+        let h_posw_for_solve = if prefer_h_pos {
+            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == h_solve_eval.nrows() {
+                Some(bundle.h_pos_factorw.as_ref().clone())
             } else {
                 None
             }
@@ -1709,7 +1706,7 @@ impl<'a> RemlState<'a> {
             );
             None
         };
-        let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
+        let h_posw_for_solve_t = h_posw_for_solve.as_ref().map(|w| w.t().to_owned());
         enum DirectionalSolveFactor {
             Cached(Arc<FaerFactor>),
             Local(FaerFactor),
@@ -1722,7 +1719,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         }
-        let h_solve_factor = if h_pos_w_for_solve.is_some() {
+        let h_solve_factor = if h_posw_for_solve.is_some() {
             None
         } else if free_basis_opt.is_none() && !firth_logit_active {
             Some(DirectionalSolveFactor::Cached(
@@ -1733,11 +1730,11 @@ impl<'a> RemlState<'a> {
                 self.factorize_faer(h_solve_eval),
             ))
         };
-        let solve_h_vec = |rhs: &Array1<f64>| -> Array1<f64> {
+        let solve_hvec = |rhs: &Array1<f64>| -> Array1<f64> {
             if rhs.is_empty() {
                 return rhs.clone();
             }
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 // Minimum-norm active-subspace solve:
                 //   beta_tau = H_+^dagger rhs = W (W' rhs),  H_+^dagger = W W'.
@@ -1746,9 +1743,9 @@ impl<'a> RemlState<'a> {
             }
             let mut rhs_mat = Array2::<f64>::zeros((rhs.len(), 1));
             rhs_mat.column_mut(0).assign(rhs);
-            let mut rhs_view = array2_to_mat_mut(&mut rhs_mat);
+            let mut rhsview = array2_to_matmut(&mut rhs_mat);
             if let Some(f) = h_solve_factor.as_ref() {
-                f.solve_in_place(rhs_view.as_mut());
+                f.solve_in_place(rhsview.as_mut());
             }
             rhs_mat.column(0).to_owned()
         };
@@ -1756,15 +1753,15 @@ impl<'a> RemlState<'a> {
             if rhs.ncols() == 0 {
                 return rhs.clone();
             }
-            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
             {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }
             let mut out = rhs.clone();
-            let mut out_view = array2_to_mat_mut(&mut out);
+            let mut outview = array2_to_matmut(&mut out);
             if let Some(f) = h_solve_factor.as_ref() {
-                f.solve_in_place(out_view.as_mut());
+                f.solve_in_place(outview.as_mut());
             }
             out
         };
@@ -1772,18 +1769,18 @@ impl<'a> RemlState<'a> {
         //   0.5 * tr(H_+^dagger A) = 0.5 * tr(W^T A W), H_+^dagger = W W^T.
         // Fall back to solve-surface contraction only when projected/active
         // coordinates are not aligned with the cached spectral basis.
-        let h_pos_w = if prefer_h_pos {
-            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == h_solve_eval.nrows() {
-                Some(bundle.h_pos_factor_w.as_ref().clone())
+        let h_posw = if prefer_h_pos {
+            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == h_solve_eval.nrows() {
+                Some(bundle.h_pos_factorw.as_ref().clone())
             } else {
                 None
             }
         } else {
             None
         };
-        let h_pos_w_t = h_pos_w.as_ref().map(|w| w.t().to_owned());
+        let h_posw_t = h_posw.as_ref().map(|w| w.t().to_owned());
         let half_trace_h_pos = |a: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_pos_w.as_ref(), h_pos_w_t.as_ref()) {
+            if let (Some(w), Some(w_t)) = (h_posw.as_ref(), h_posw_t.as_ref()) {
                 // Derivation:
                 //   d/dτ [0.5 log|H|_+] = 0.5 tr(H_+^dagger H_τ),
                 //   H_+^dagger = W W^T on the retained positive eigenspace.
@@ -1798,12 +1795,12 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        let u = &pirls_result.solve_weights
-            * &(&pirls_result.solve_working_response - &pirls_result.final_eta);
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // `u` is the current predictor-space score contribution g pulled through
         // the PIRLS linearization, so X_τ^T g is represented by x_psi_t^T u.
         let xpsi_beta = x_psi_t.dot(&beta_eval);
-        let weighted_xpsi_beta = &pirls_result.solve_weights * &xpsi_beta;
+        let weighted_xpsi_beta = &pirls_result.solveweights * &xpsi_beta;
         // Differentiate the stationarity equation
         //   0 = X^T g - S β̂
         // along the solution path β̂(τ):
@@ -1813,17 +1810,17 @@ impl<'a> RemlState<'a> {
         //   η̇ = X_τ β̂ + X B.
         //
         // Rearranging gives the implicit solve
-        //   H_solve B = X_τ^T g - X^T W(X_τ β̂) - S_τ β̂ - (g_phi)_tau|beta,
+        //   H_solve B = X_τ^T g - X^T W(X_τ β̂) - S_τ β̂ - (gphi)_tau|beta,
         // where:
         //   - non-Firth: H_solve = X^T W X + S,
-        //   - Firth logit: H_solve = H_total = X^T W X + S - H_phi.
+        //   - Firth logit: H_solve = H_total = X^T W X + S - Hphi.
         // This matches the stationarity surface used by the fitted objective.
         //
         // With Firth enabled this is:
-        //   g_τ = (g_std)_τ - (g_phi)_τ|_{beta fixed},
-        // where (g_phi)_τ comes from reduced Fisher pseudodeterminant calculus:
+        //   g_τ = (g_std)_τ - (gphi)_τ|_{beta fixed},
+        // where (gphi)_τ comes from reduced Fisher pseudodeterminant calculus:
         //   Phi = 0.5 log|I_r|_+, I_r = X_r^T W X_r.
-        // This RHS is exactly `g_psi`, and `solve_h_vec(g_psi)` computes B
+        // This RHS is exactly `g_psi`, and `solve_hvec(g_psi)` computes B
         // without ever forming H^{-1} explicitly.
         let mut g_psi = x_psi_t.t().dot(&u)
             - x_dense.t().dot(&weighted_xpsi_beta)
@@ -1832,12 +1829,12 @@ impl<'a> RemlState<'a> {
         let mut tau_kernel_opt: Option<FirthTauPartialKernel> = None;
         if let Some(op) = firth_op.as_ref() {
             // Exact Firth design-moving partial score correction (beta held fixed):
-            //   g_tau = (g_std)_tau - (g_phi)_tau,
-            // where (g_phi)_tau and Phi_tau|beta are computed from reduced Fisher
+            //   g_tau = (g_std)_tau - (gphi)_tau,
+            // where (gphi)_tau and Phi_tau|beta are computed from reduced Fisher
             // pseudodeterminant calculus under fixed active subspace.
             //
             // Implemented formulas:
-            //   (g_phi)_tau
+            //   (gphi)_tau
             //   = 0.5 X_tau' (w' ⊙ h)
             //     + 0.5 X'((w'' ⊙ (X_tau β)) ⊙ h + w' ⊙ h_tau|beta),
             //   Phi_tau|beta = 0.5 tr(I_r^{-1} I_{r,tau}),
@@ -1845,7 +1842,7 @@ impl<'a> RemlState<'a> {
             let need_tau_kernel = x_psi_t.iter().any(|v| *v != 0.0);
             let tau_bundle =
                 Self::firth_exact_tau_kernel(op, &x_psi_t, &beta_eval, need_tau_kernel);
-            g_psi -= &tau_bundle.g_phi_tau;
+            g_psi -= &tau_bundle.gphi_tau;
             fit_firth_partial = tau_bundle.phi_tau_partial;
             if need_tau_kernel {
                 tau_kernel_opt = Some(tau_bundle.tau_kernel.expect(
@@ -1853,7 +1850,7 @@ impl<'a> RemlState<'a> {
                 ));
             }
         }
-        let beta_psi = solve_h_vec(&g_psi);
+        let beta_psi = solve_hvec(&g_psi);
         // Total predictor drift:
         //   η̇ = d/dτ(X β̂) = X_τ β̂ + X B.
         let eta_psi = &xpsi_beta + &x_dense.dot(&beta_psi);
@@ -1886,7 +1883,7 @@ impl<'a> RemlState<'a> {
         // Firth drifts. Gaussian identity branch uses profiled dispersion algebra:
         //   D_{p,τ} = 2*fit_block and profiled_fit_term = D_{p,τ}/(2φ̂).
 
-        let w = &pirls_result.solve_weights;
+        let w = &pirls_result.solveweights;
         let wx = Self::row_scale(&x_dense, w);
         let wx_psi = Self::row_scale(&x_psi_t, w);
 
@@ -1939,14 +1936,14 @@ impl<'a> RemlState<'a> {
             }
             _ => {
                 let runtime_link = self.runtime_inverse_link();
-                let w_direction = crate::pirls::directional_working_curvature_from_eta_with_state(
+                let w_direction = crate::pirls::directionalworking_curvature_from_etawith_state(
                     &runtime_link,
                     &pirls_result.final_eta,
                     self.weights,
-                    &pirls_result.solve_weights,
+                    &pirls_result.solveweights,
                     &eta_psi,
                 )?;
-                let mut x_wpsi = x_dense.clone();
+                let mut xwpsi = x_dense.clone();
                 match &w_direction {
                     // Directional curvature derivative:
                     //   W_τ = T[η̇].
@@ -1955,29 +1952,29 @@ impl<'a> RemlState<'a> {
                     // this derivative. Built-in links are diagonal in observation space,
                     // so the operator is represented by the per-row vector `w_direction`.
                     DirectionalWorkingCurvature::Diagonal(w_direction) => {
-                        x_wpsi = Self::row_scale(&x_wpsi, w_direction);
+                        xwpsi = Self::row_scale(&xwpsi, w_direction);
                     }
                 }
                 // Exact total curvature derivative:
                 //   H_τ = d/dτ(X^T W X + S)
                 //       = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ.
-                h_psi += &x_dense.t().dot(&x_wpsi);
+                h_psi += &x_dense.t().dot(&xwpsi);
                 h_psi += &s_psi_total_t;
                 if let Some(op) = firth_op.as_ref() {
                     // Firth-adjusted curvature surface:
-                    //   H_total = H_std - H_phi.
+                    //   H_total = H_std - Hphi.
                     // Exact total Firth contribution in this branch:
-                    //   H_{phi,tau} = (H_phi)_tau|beta + D(H_phi)[beta_tau].
+                    //   H_{phi,tau} = (Hphi)_tau|beta + D(Hphi)[beta_tau].
                     // Therefore:
                     //   H_total,tau = H_std,tau - H_{phi,tau}
                     //               = H_std,tau
-                    //                 - (H_phi)_tau|beta
-                    //                 - D(H_phi)[beta_tau].
+                    //                 - (Hphi)_tau|beta
+                    //                 - D(Hphi)[beta_tau].
                     //
                     // We apply both terms explicitly.
                     if x_psi_t.iter().any(|v| *v != 0.0) {
                         let kernel = tau_kernel_opt.as_ref().expect(
-                            "exact directional assembly requires cached tau kernel for H_phi,tau",
+                            "exact directional assembly requires cached tau kernel for Hphi,tau",
                         );
                         let eye = Array2::<f64>::eye(beta_eval.len());
                         let hphi_tau_partial =

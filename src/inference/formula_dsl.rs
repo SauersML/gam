@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_function_call_with_named_and_positional_args() {
+    fn parses_function_callwithnamed_and_positional_args() {
         let call = parse_function_call("s(log(x + 1), type=\"duchon\", centers=12)").expect("call");
         assert_eq!(call.name, "s");
         assert_eq!(call.args.len(), 3);

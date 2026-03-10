@@ -1,5 +1,5 @@
 use gam::estimate::{
-    ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
 };
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, array};
@@ -41,7 +41,7 @@ fn make_binary_external_problem(
 }
 
 #[test]
-fn analytic_gradient_matches_cost_trend() {
+fn analytic_gradient_matchescost_trend() {
     let (x, y, w, s_list) = make_binary_external_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
@@ -57,7 +57,7 @@ fn analytic_gradient_matches_cost_trend() {
         firth_bias_reduction: None,
     };
 
-    let (analytic, _fd) = evaluate_external_gradients(
+    let (analytic, fd) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),
@@ -71,7 +71,7 @@ fn analytic_gradient_matches_cost_trend() {
     let local_steps = [1e-2, 5e-2, 1e-1];
     let mut local_derivs = Vec::new();
     for &h in &local_steps {
-        let cost_minus = evaluate_external_cost_and_ridge(
+        let cost_minus = evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
@@ -82,7 +82,7 @@ fn analytic_gradient_matches_cost_trend() {
         )
         .map(|(c, _)| c)
         .expect("cost_minus");
-        let cost_plus = evaluate_external_cost_and_ridge(
+        let cost_plus = evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
@@ -123,7 +123,7 @@ fn analytic_gradient_matches_cost_trend() {
 }
 
 #[test]
-fn hypothesis_analytic_gradient_matches_cost_trend() {
+fn hypothesis_analytic_gradient_matchescost_trend() {
     let (x, y, w, s_list) = make_binary_external_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
@@ -143,37 +143,37 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
     let mut opposite_sign = 0usize;
     let mut considered = 0usize;
 
-    for rho_val in [0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
-        let (analytic, _fd) = evaluate_external_gradients(
+    for rhoval in [0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
+        let (analytic, fd) = evaluate_externalgradients(
             y.view(),
             w.view(),
             x.view(),
             offset.view(),
             &s_list,
             &opts,
-            &array![rho_val],
+            &array![rhoval],
         )
         .expect("gradients");
         let delta = 0.25;
-        let cost_minus = evaluate_external_cost_and_ridge(
+        let cost_minus = evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
             offset.view(),
             &s_list,
             &opts,
-            &array![rho_val - delta],
+            &array![rhoval - delta],
         )
         .map(|(c, _)| c)
         .expect("cost_minus");
-        let cost_plus = evaluate_external_cost_and_ridge(
+        let cost_plus = evaluate_externalcost_andridge(
             y.view(),
             w.view(),
             x.view(),
             offset.view(),
             &s_list,
             &opts,
-            &array![rho_val + delta],
+            &array![rhoval + delta],
         )
         .map(|(c, _)| c)
         .expect("cost_plus");

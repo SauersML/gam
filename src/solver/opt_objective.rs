@@ -108,7 +108,7 @@ impl<F> CachedSecondOrderObjective<F> {
         Ok((cost, grad, hessian))
     }
 
-    fn finite_difference_hessian(
+    fn finite_differencehessian(
         &mut self,
         x: &Array1<f64>,
     ) -> Result<Array2<f64>, ObjectiveEvalError>
@@ -170,7 +170,7 @@ where
         grad_out.assign(&grad);
         let hessian = match hessian_opt {
             Some(hessian) => hessian,
-            None => self.finite_difference_hessian(x)?,
+            None => self.finite_differencehessian(x)?,
         };
         hess_out
             .assign_dense(&hessian)

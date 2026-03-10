@@ -28,7 +28,7 @@ pub struct SigmaJet4 {
 }
 
 #[inline]
-fn canonical_zero(v: f64) -> f64 {
+fn canonicalzero(v: f64) -> f64 {
     if v.abs() < 1e-15 { 0.0 } else { v }
 }
 
@@ -60,9 +60,9 @@ pub fn exp_sigma_jet3_scalar(eta: f64) -> SigmaJet3 {
     let sigma = eta.exp();
     SigmaJet3 {
         sigma,
-        d1: canonical_zero(sigma),
-        d2: canonical_zero(sigma),
-        d3: canonical_zero(sigma),
+        d1: canonicalzero(sigma),
+        d2: canonicalzero(sigma),
+        d3: canonicalzero(sigma),
     }
 }
 
@@ -84,10 +84,10 @@ pub fn exp_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
     let sigma = eta.exp();
     SigmaJet4 {
         sigma,
-        d1: canonical_zero(sigma),
-        d2: canonical_zero(sigma),
-        d3: canonical_zero(sigma),
-        d4: canonical_zero(sigma),
+        d1: canonicalzero(sigma),
+        d2: canonicalzero(sigma),
+        d3: canonicalzero(sigma),
+        d4: canonicalzero(sigma),
     }
 }
 
@@ -137,7 +137,7 @@ mod tests {
         }
     }
 
-    fn strip_whitespace(s: &str) -> String {
+    fn stripwhitespace(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
@@ -167,7 +167,7 @@ mod tests {
             let Ok(content) = fs::read_to_string(&file) else {
                 continue;
             };
-            let compact = strip_whitespace(&content);
+            let compact = stripwhitespace(&content);
             for pat in bad_patterns {
                 assert!(
                     !compact.contains(pat),
@@ -189,23 +189,23 @@ mod tests {
             let s_plus = exp_sigma_from_eta_scalar(eta + h);
             let s_minus = exp_sigma_from_eta_scalar(eta - h);
 
-            let d1_fd = (s_plus - s_minus) / (2.0 * h);
-            let d2_fd = (s_plus - 2.0 * s + s_minus) / (h * h);
+            let d1fd = (s_plus - s_minus) / (2.0 * h);
+            let d2fd = (s_plus - 2.0 * s + s_minus) / (h * h);
             let d2_at = |x: f64| {
                 let xp = exp_sigma_from_eta_scalar(x + h3);
                 let xc = exp_sigma_from_eta_scalar(x);
                 let xm = exp_sigma_from_eta_scalar(x - h3);
                 (xp - 2.0 * xc + xm) / (h3 * h3)
             };
-            let d3_fd = (d2_at(eta + h3) - d2_at(eta - h3)) / (2.0 * h3);
+            let d3fd = (d2_at(eta + h3) - d2_at(eta - h3)) / (2.0 * h3);
 
-            let d1_scale = d1.abs().max(d1_fd.abs()).max(1.0);
-            let d2_scale = d2.abs().max(d2_fd.abs()).max(1.0);
-            let d3_scale = d3.abs().max(d3_fd.abs()).max(1.0);
+            let d1_scale = d1.abs().max(d1fd.abs()).max(1.0);
+            let d2_scale = d2.abs().max(d2fd.abs()).max(1.0);
+            let d3_scale = d3.abs().max(d3fd.abs()).max(1.0);
 
-            assert!((d1 - d1_fd).abs() < 1e-8 * d1_scale);
-            assert!((d2 - d2_fd).abs() < 1e-5 * d2_scale);
-            assert!((d3 - d3_fd).abs() < 5e-4 * d3_scale);
+            assert!((d1 - d1fd).abs() < 1e-8 * d1_scale);
+            assert!((d2 - d2fd).abs() < 1e-5 * d2_scale);
+            assert!((d3 - d3fd).abs() < 5e-4 * d3_scale);
         }
     }
 
@@ -222,14 +222,14 @@ mod tests {
             assert!((d2_4 - d2_3).abs() < 1e-12);
             assert!((d3_4 - d3_3).abs() < 1e-12);
 
-            let d4_fd = (d3_at(eta + h) - d3_at(eta - h)) / (2.0 * h);
-            let d4_scale = d4_4.abs().max(d4_fd.abs()).max(1.0);
-            assert!((d4_4 - d4_fd).abs() < 5e-4 * d4_scale);
+            let d4fd = (d3_at(eta + h) - d3_at(eta - h)) / (2.0 * h);
+            let d4_scale = d4_4.abs().max(d4fd.abs()).max(1.0);
+            assert!((d4_4 - d4fd).abs() < 5e-4 * d4_scale);
         }
     }
 
     #[test]
-    fn exp_sigma_vectorized_up_to_fourth_matches_scalar() {
+    fn exp_sigmavectorized_up_to_fourth_matches_scalar() {
         let eta = Array1::from_vec(vec![-4.2, -1.4, -0.2, 0.4, 1.9, 3.1]);
         let (s, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth(eta.view());
         for i in 0..eta.len() {

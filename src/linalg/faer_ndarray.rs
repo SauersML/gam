@@ -62,7 +62,7 @@ impl FaerSymmetricFactor {
 impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
     fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
         let mut out = rhs.clone();
-        let mut out_mat = array1_to_col_mat_mut(&mut out);
+        let mut out_mat = array1_to_col_matmut(&mut out);
         self.solve_in_place(out_mat.as_mut());
         if !out.iter().all(|v| v.is_finite()) {
             return Err("symmetric factor solve produced non-finite values".to_string());
@@ -70,14 +70,14 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
         Ok(out)
     }
 
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+    fn solvemulti(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
         let mut out = Array2::<f64>::zeros(rhs.raw_dim());
         for j in 0..rhs.ncols() {
             for i in 0..rhs.nrows() {
                 out[[i, j]] = rhs[[i, j]];
             }
         }
-        let mut out_mat = array2_to_mat_mut(&mut out);
+        let mut out_mat = array2_to_matmut(&mut out);
         self.solve_in_place(out_mat.as_mut());
         if !out.iter().all(|v| v.is_finite()) {
             return Err("symmetric factor multi-solve produced non-finite values".to_string());
@@ -99,7 +99,7 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
             FaerSymmetricFactor::Ldlt(f) => {
                 f.D().column_vector().iter().map(|&x| x.ln()).sum::<f64>()
             }
-            FaerSymmetricFactor::Lblt(_f) => {
+            FaerSymmetricFactor::Lblt(..) => {
                 // lblt doesn't easily expose diagonal determinant. Fallback to sparse or other representations if needed, but typically Lblt is indefinite!
                 // Actually faer doesn't easily expose lblt logdet since it has 2x2 blocks.
                 // For our ML systems, if we dropped to LBLT, the matrix was indefinite and logdet is ill-defined (or complex).
@@ -111,7 +111,7 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
 
 /// Factorize a symmetric system with LLT -> LDLT -> LBLT fallback.
 #[inline]
-pub fn factorize_symmetric_with_fallback(
+pub fn factorize_symmetricwith_fallback(
     matrix: MatRef<'_, f64>,
     side: Side,
 ) -> Result<FaerSymmetricFactor, FaerLinalgError> {
@@ -155,7 +155,7 @@ fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
 }
 
 #[inline]
-pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
+pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let (rows, cols) = array.dim();
     let strides = array.strides();
 
@@ -174,7 +174,7 @@ pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
 }
 
 #[inline]
-pub fn array1_to_col_mat_mut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
+pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
     let len = array.len();
     let stride = array.strides()[0];
     unsafe {
@@ -209,8 +209,8 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     // Create output matrix
     let mut result = Mat::<f64>::zeros(p, p);
 
-    let a_view = FaerArrayView::new(a);
-    let a_ref = a_view.as_ref();
+    let aview = FaerArrayView::new(a);
+    let a_ref = aview.as_ref();
     let a_t = a_ref.transpose();
 
     // dst = A^T * A
@@ -237,13 +237,13 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         return;
     }
 
-    let mut out_view = array2_to_mat_mut(out);
+    let mut outview = array2_to_matmut(out);
 
-    let a_view = FaerArrayView::new(a);
-    let a_ref = a_view.as_ref();
+    let aview = FaerArrayView::new(a);
+    let a_ref = aview.as_ref();
     let a_t = a_ref.transpose();
     let par = matmul_parallelism(p, p, n);
-    matmul(out_view.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
+    matmul(outview.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
 }
 
 /// Compute A^T * B using faer's SIMD-optimized GEMM.
@@ -268,10 +268,10 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let mut result = Mat::<f64>::zeros(p, q);
 
-    let a_view = FaerArrayView::new(a);
-    let b_view = FaerArrayView::new(b);
-    let a_ref = a_view.as_ref();
-    let b_ref = b_view.as_ref();
+    let aview = FaerArrayView::new(a);
+    let bview = FaerArrayView::new(b);
+    let a_ref = aview.as_ref();
+    let b_ref = bview.as_ref();
 
     // dst = A^T * B
     let par = matmul_parallelism(p, q, n_a);
@@ -308,10 +308,10 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let mut result = Mat::<f64>::zeros(n, q);
 
-    let a_view = FaerArrayView::new(a);
-    let b_view = FaerArrayView::new(b);
-    let a_ref = a_view.as_ref();
-    let b_ref = b_view.as_ref();
+    let aview = FaerArrayView::new(a);
+    let bview = FaerArrayView::new(b);
+    let a_ref = aview.as_ref();
+    let b_ref = bview.as_ref();
 
     let par = matmul_parallelism(n, q, p);
     matmul(result.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
@@ -339,15 +339,15 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
         return;
     }
 
-    let mut out_view = array1_to_col_mat_mut(out);
+    let mut outview = array1_to_col_matmut(out);
 
-    let a_view = FaerArrayView::new(a);
-    let v_view = FaerColView::new(v);
-    let a_ref = a_view.as_ref();
-    let v_ref = v_view.as_ref();
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
     let par = matmul_parallelism(p, 1, n);
     matmul(
-        out_view.as_mut(),
+        outview.as_mut(),
         Accum::Replace,
         a_ref.transpose(),
         v_ref,
@@ -376,10 +376,10 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let mut result = Mat::<f64>::zeros(p, 1);
 
-    let a_view = FaerArrayView::new(a);
-    let v_view = FaerColView::new(v);
-    let a_ref = a_view.as_ref();
-    let v_ref = v_view.as_ref();
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
 
     // dst = A^T * v (treating v as n×1 matrix)
     let par = matmul_parallelism(p, 1, n);
@@ -485,7 +485,7 @@ fn compute_bunch_kaufman_inertia(
     (positive, negative, zero)
 }
 
-fn is_symmetric_with_tolerance(matrix: &Array2<f64>, rel_tol: f64, abs_tol: f64) -> bool {
+fn is_symmetricwith_tolerance(matrix: &Array2<f64>, rel_tol: f64, abs_tol: f64) -> bool {
     let (nrows, ncols) = matrix.dim();
     if nrows != ncols {
         return false;
@@ -539,7 +539,7 @@ fn reconstruct_from_bunch_kaufman(
     out
 }
 
-fn is_valid_inverse_permutation(perm_fwd: &[usize], perm_inv: &[usize], n: usize) -> bool {
+fn isvalid_inverse_permutation(perm_fwd: &[usize], perm_inv: &[usize], n: usize) -> bool {
     if perm_fwd.len() != n || perm_inv.len() != n {
         return false;
     }
@@ -578,7 +578,7 @@ fn validate_ldlt_rook_outputs(
     perm_inv: &[usize],
 ) -> bool {
     let n = matrix.nrows();
-    if !is_valid_inverse_permutation(perm_fwd, perm_inv, n) {
+    if !isvalid_inverse_permutation(perm_fwd, perm_inv, n) {
         return false;
     }
 
@@ -608,7 +608,7 @@ fn validate_ldlt_rook_outputs(
 /// - `d_diag`: diagonal entries of block-diagonal `B`.
 /// - `d_subdiag`: off-diagonal entries for `2x2` blocks in `B` (zeros for `1x1` pivots).
 /// - `perm_fwd`, `perm_inv`: permutation arrays from faer.
-/// - `inertia`: `(n_pos, n_neg, n_zero)` computed from `B` blocks.
+/// - `inertia`: `(n_pos, n_neg, nzero)` computed from `B` blocks.
 ///
 /// This mirrors faer's bunch-kaufman storage contract for `cholesky_in_place`.
 pub fn ldlt_rook(
@@ -631,7 +631,7 @@ pub fn ldlt_rook(
     if !matrix.iter().all(|v| v.is_finite()) {
         return Err(FaerLinalgError::FactorizationFailed);
     }
-    if !is_symmetric_with_tolerance(matrix, SYMMETRY_REL_TOL, SYMMETRY_ABS_TOL) {
+    if !is_symmetricwith_tolerance(matrix, SYMMETRY_REL_TOL, SYMMETRY_ABS_TOL) {
         return Err(FaerLinalgError::FactorizationFailed);
     }
     let n = nrows;
@@ -650,30 +650,30 @@ pub fn ldlt_rook(
     let mut perm_fwd = vec![0usize; n];
     let mut perm_inv = vec![0usize; n];
 
-    let mut faer_mat = array2_to_mat_mut(&mut l_unit_lower);
+    let mut faer_mat = array2_to_matmut(&mut l_unit_lower);
     let subdiag_slice = d_subdiag
         .as_slice_memory_order_mut()
         .expect("1-D array should expose contiguous slice");
-    let mut b_subdiag_mut = DiagMut::from_slice_mut(subdiag_slice);
+    let mut b_subdiagmut = DiagMut::from_slice_mut(subdiag_slice);
     let par = get_global_parallelism();
     let mut params = <LbltParams as Auto<f64>>::auto();
     params.pivoting = PivotingStrategy::Rook;
-    let params_spec = Spec::new(params);
+    let paramsspec = Spec::new(params);
     let mut mem = MemBuffer::new(factor::cholesky_in_place_scratch::<usize, f64>(
         n,
         par,
-        params_spec,
+        paramsspec,
     ));
     let stack = MemStack::new(&mut mem);
 
     factor::cholesky_in_place(
         faer_mat.as_mut(),
-        b_subdiag_mut.as_mut(),
+        b_subdiagmut.as_mut(),
         &mut perm_fwd,
         &mut perm_inv,
         par,
         stack,
-        params_spec,
+        paramsspec,
     );
 
     // Extract B diagonal from faer in-place diagonal, then normalize L diagonal to 1.
@@ -709,7 +709,7 @@ pub struct FaerArrayView<'a> {
     row_stride: isize,
     col_stride: isize,
     owned: Option<Array2<f64>>,
-    _marker: PhantomData<&'a f64>,
+    marker: PhantomData<&'a f64>,
 }
 
 impl<'a> FaerArrayView<'a> {
@@ -729,7 +729,7 @@ impl<'a> FaerArrayView<'a> {
                 row_stride: owned_strides[0],
                 col_stride: owned_strides[1],
                 owned: Some(owned),
-                _marker: PhantomData,
+                marker: PhantomData,
             };
         }
 
@@ -740,7 +740,7 @@ impl<'a> FaerArrayView<'a> {
             row_stride: strides[0],
             col_stride: strides[1],
             owned: None,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -776,7 +776,7 @@ pub struct FaerColView<'a> {
     len: usize,
     stride: isize,
     owned: Option<Array1<f64>>,
-    _marker: PhantomData<&'a f64>,
+    marker: PhantomData<&'a f64>,
 }
 
 impl<'a> FaerColView<'a> {
@@ -790,7 +790,7 @@ impl<'a> FaerColView<'a> {
                 len,
                 stride: 1,
                 owned: Some(owned),
-                _marker: PhantomData,
+                marker: PhantomData,
             };
         }
         Self {
@@ -798,7 +798,7 @@ impl<'a> FaerColView<'a> {
             len,
             stride,
             owned: None,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -818,7 +818,7 @@ pub trait FaerSvd {
     fn svd(
         &self,
         compute_u: bool,
-        compute_vt: bool,
+        computevt: bool,
     ) -> Result<(Option<Array2<f64>>, Array1<f64>, Option<Array2<f64>>), FaerLinalgError>;
 }
 
@@ -826,11 +826,11 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
     fn svd(
         &self,
         compute_u: bool,
-        compute_vt: bool,
+        computevt: bool,
     ) -> Result<(Option<Array2<f64>>, Array1<f64>, Option<Array2<f64>>), FaerLinalgError> {
-        let faer_view = FaerArrayView::new(self);
-        let faer_mat = faer_view.as_ref();
-        if !compute_u && !compute_vt {
+        let faerview = FaerArrayView::new(self);
+        let faer_mat = faerview.as_ref();
+        if !compute_u && !computevt {
             let (rows, cols) = faer_mat.shape();
             let mut singular = Diag::<f64>::zeros(rows.min(cols));
             let par = get_global_parallelism();
@@ -853,8 +853,8 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
                 Default::default(),
             )
             .map_err(|_| FaerLinalgError::SvdNoConvergence)?;
-            let singular_values = diag_to_array(singular.as_ref());
-            return Ok((None, singular_values, None));
+            let singularvalues = diag_to_array(singular.as_ref());
+            return Ok((None, singularvalues, None));
         }
 
         let (rows, cols) = faer_mat.shape();
@@ -863,7 +863,7 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
         } else {
             ComputeSvdVectors::No
         };
-        let compute_v_flag = if compute_vt {
+        let computev_flag = if computevt {
             ComputeSvdVectors::Full
         } else {
             ComputeSvdVectors::No
@@ -871,14 +871,14 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
 
         let mut singular = Diag::<f64>::zeros(rows.min(cols));
         let mut u_storage = compute_u.then(|| Mat::<f64>::zeros(rows, rows));
-        let mut v_storage = compute_vt.then(|| Mat::<f64>::zeros(cols, cols));
+        let mut v_storage = computevt.then(|| Mat::<f64>::zeros(cols, cols));
 
         let par = get_global_parallelism();
         let mut mem = MemBuffer::new(svd::svd_scratch::<f64>(
             rows,
             cols,
             compute_u_flag,
-            compute_v_flag,
+            computev_flag,
             par,
             Default::default(),
         ));
@@ -895,7 +895,7 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
         )
         .map_err(|_| FaerLinalgError::SvdNoConvergence)?;
 
-        let singular_values = diag_to_array(singular.as_ref());
+        let singularvalues = diag_to_array(singular.as_ref());
         let u_opt = u_storage.map(|mat| mat_to_array(mat.as_ref()));
         let vt_opt = v_storage.map(|mat| {
             let mat_ref = mat.as_ref();
@@ -908,7 +908,7 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
             out
         });
 
-        Ok((u_opt, singular_values, vt_opt))
+        Ok((u_opt, singularvalues, vt_opt))
     }
 }
 
@@ -918,8 +918,8 @@ pub trait FaerEigh {
 
 impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
     fn eigh(&self, side: Side) -> Result<(Array1<f64>, Array2<f64>), FaerLinalgError> {
-        let faer_view = FaerArrayView::new(self);
-        let eigen = faer_view
+        let faerview = FaerArrayView::new(self);
+        let eigen = faerview
             .as_ref()
             .self_adjoint_eigen(side)
             .map_err(FaerLinalgError::SelfAdjointEigen)?;
@@ -934,10 +934,10 @@ pub struct FaerCholeskyFactor {
 }
 
 impl FaerCholeskyFactor {
-    pub fn solve_vec(&self, rhs: &Array1<f64>) -> Array1<f64> {
+    pub fn solvevec(&self, rhs: &Array1<f64>) -> Array1<f64> {
         let mut rhs = rhs.to_owned();
-        let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
-        self.factor.solve_in_place(rhs_view.as_mut());
+        let mut rhsview = array1_to_col_matmut(&mut rhs);
+        self.factor.solve_in_place(rhsview.as_mut());
         rhs
     }
 
@@ -950,8 +950,8 @@ impl FaerCholeskyFactor {
             *out = Array2::<f64>::zeros(rhs.dim());
         }
         out.assign(rhs);
-        let mut rhs_view = array2_to_mat_mut(out);
-        self.factor.solve_in_place(rhs_view.as_mut());
+        let mut rhsview = array2_to_matmut(out);
+        self.factor.solve_in_place(rhsview.as_mut());
     }
 
     pub fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
@@ -975,8 +975,8 @@ pub trait FaerCholesky {
 
 impl<S: Data<Elem = f64>> FaerCholesky for ArrayBase<S, Ix2> {
     fn cholesky(&self, side: Side) -> Result<FaerCholeskyFactor, FaerLinalgError> {
-        let faer_view = FaerArrayView::new(self);
-        let factor = faer_view
+        let faerview = FaerArrayView::new(self);
+        let factor = faerview
             .as_ref()
             .llt(side)
             .map_err(FaerLinalgError::Cholesky)?;
@@ -990,8 +990,8 @@ pub trait FaerQr {
 
 impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
     fn qr(&self) -> Result<(Array2<f64>, Array2<f64>), FaerLinalgError> {
-        let faer_view = FaerArrayView::new(self);
-        let qr = faer_view.as_ref().qr();
+        let faerview = FaerArrayView::new(self);
+        let qr = faerview.as_ref().qr();
         let q = qr.compute_Q();
         let r = qr.R();
         Ok((mat_to_array(q.as_ref()), mat_to_array(r)))
@@ -1007,8 +1007,8 @@ pub fn rrqr_nullspace_basis<S: Data<Elem = f64>>(
     a: &ArrayBase<S, Ix2>,
     rank_alpha: f64,
 ) -> Result<(Array2<f64>, usize), FaerLinalgError> {
-    let faer_view = FaerArrayView::new(a);
-    let qr = faer_view.as_ref().col_piv_qr();
+    let faerview = FaerArrayView::new(a);
+    let qr = faerview.as_ref().col_piv_qr();
     let r = qr.thin_R();
     let diag_len = r.nrows().min(r.ncols());
     let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
@@ -1084,7 +1084,7 @@ mod tests {
             [0.0, 0.3, 0.4, -0.2]
         ];
 
-        let (l, d_diag, d_subdiag, _perm_fwd, perm_inv, inertia) =
+        let (l, d_diag, d_subdiag, perm_fwd, perm_inv, inertia) =
             ldlt_rook(&a).expect("ldlt_rook should succeed");
 
         // L should be unit-lower and upper triangle should be zeroed by construction.
@@ -1155,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn rrqr_nullspace_basis_detects_zero_rank_matrix() {
+    fn rrqr_nullspace_basis_detectszero_rank_matrix() {
         let a = Array2::<f64>::zeros((5, 2));
         let (z, rank) =
             rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");

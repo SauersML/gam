@@ -42,7 +42,7 @@ pub fn is_binomial_family(f: LikelihoodFamily) -> bool {
 }
 
 #[inline]
-pub fn pretty_family_name(f: LikelihoodFamily) -> &'static str {
+pub fn pretty_familyname(f: LikelihoodFamily) -> &'static str {
     match f {
         LikelihoodFamily::GaussianIdentity => "Gaussian Identity",
         LikelihoodFamily::BinomialLogit => "Binomial Logit",

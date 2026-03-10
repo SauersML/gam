@@ -23,7 +23,7 @@ pub enum PenaltySpec {
 pub struct EngineTermSpec {
     pub kind: EngineTermKind,
     pub width: usize,
-    pub penalty_spec: PenaltySpec,
+    pub penaltyspec: PenaltySpec,
 }
 
 impl EngineTermSpec {
@@ -31,7 +31,7 @@ impl EngineTermSpec {
         Self {
             kind,
             width,
-            penalty_spec: PenaltySpec::None,
+            penaltyspec: PenaltySpec::None,
         }
     }
 
@@ -39,7 +39,7 @@ impl EngineTermSpec {
         Self {
             kind,
             width,
-            penalty_spec: PenaltySpec::New {
+            penaltyspec: PenaltySpec::New {
                 count: penalty_count,
             },
         }
@@ -107,7 +107,7 @@ impl EngineLayoutBuilder {
             ));
         }
 
-        let penalties = match spec.penalty_spec {
+        let penalties = match spec.penaltyspec {
             PenaltySpec::None => Vec::new(),
             PenaltySpec::New { count } => {
                 if count == 0 {
@@ -190,7 +190,7 @@ mod tests {
         b.push_term(EngineTermSpec {
             kind: EngineTermKind::Custom,
             width: 3,
-            penalty_spec: PenaltySpec::Existing(vec![1, 7]),
+            penaltyspec: PenaltySpec::Existing(vec![1, 7]),
         })
         .expect("custom");
         let layout = b.build();
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_invalid_specs() {
+    fn builder_rejects_invalidspecs() {
         let mut b = EngineLayoutBuilder::new();
         let err = b
             .push_term(EngineTermSpec::unpenalized(EngineTermKind::Linear, 0))
@@ -211,7 +211,7 @@ mod tests {
             .push_term(EngineTermSpec {
                 kind: EngineTermKind::Smooth,
                 width: 4,
-                penalty_spec: PenaltySpec::New { count: 0 },
+                penaltyspec: PenaltySpec::New { count: 0 },
             })
             .expect_err("zero penalty count");
         assert!(err.message.contains("at least one"));

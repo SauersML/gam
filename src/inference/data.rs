@@ -17,18 +17,18 @@ pub struct EncodedDataset {
     pub column_kinds: Vec<ColumnKindTag>,
 }
 
-pub fn load_csv_with_inferred_schema(path: &Path) -> Result<EncodedDataset, String> {
+pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, String> {
     let (headers, records) = read_csv_raw(path)?;
-    encode_records_with_inferred_schema(headers, records)
+    encode_recordswith_inferred_schema(headers, records)
 }
 
-pub fn load_csv_with_schema(
+pub fn load_csvwith_schema(
     path: &Path,
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<EncodedDataset, String> {
     let (headers, records) = read_csv_raw(path)?;
-    encode_records_with_schema(headers, records, schema, unseen_policy)
+    encode_recordswith_schema(headers, records, schema, unseen_policy)
 }
 
 pub fn read_csv_raw(path: &Path) -> Result<(Vec<String>, Vec<StringRecord>), String> {
@@ -77,7 +77,7 @@ pub fn read_csv_raw(path: &Path) -> Result<(Vec<String>, Vec<StringRecord>), Str
     Ok((headers, records))
 }
 
-pub fn encode_records_with_inferred_schema(
+pub fn encode_recordswith_inferred_schema(
     headers: Vec<String>,
     records: Vec<StringRecord>,
 ) -> Result<EncodedDataset, String> {
@@ -88,10 +88,10 @@ pub fn encode_records_with_inferred_schema(
     let schema = DataSchema {
         columns: schema_cols,
     };
-    encode_records_with_schema(headers, records, &schema, UnseenCategoryPolicy::Error)
+    encode_recordswith_schema(headers, records, &schema, UnseenCategoryPolicy::Error)
 }
 
-pub fn encode_records_with_schema(
+pub fn encode_recordswith_schema(
     headers: Vec<String>,
     records: Vec<StringRecord>,
     schema: &DataSchema,
@@ -100,7 +100,7 @@ pub fn encode_records_with_schema(
     let n = records.len();
     let p = headers.len();
     let mut values = Array2::<f64>::zeros((n, p));
-    let schema_by_name: HashMap<&str, &SchemaColumn> = schema
+    let schema_byname: HashMap<&str, &SchemaColumn> = schema
         .columns
         .iter()
         .map(|c| (c.name.as_str(), c))
@@ -109,7 +109,7 @@ pub fn encode_records_with_schema(
 
     for (j, name) in headers.iter().enumerate() {
         let inferred_for_extra;
-        let col_schema = if let Some(s) = schema_by_name.get(name.as_str()) {
+        let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
             *s
         } else {
             inferred_for_extra = infer_schema_column(name, &records, j)?;

@@ -47,13 +47,13 @@ fn crude_risk_matches_constant_hazard_analytic_solution() {
 }
 
 #[test]
-fn crude_risk_zero_mortality_and_high_mortality_limits() {
+fn crude_riskzero_mortality_and_high_mortality_limits() {
     let t0 = 0.0_f64;
     let t1 = 10.0_f64;
 
     let zero_mort = run_constant_hazard_crude(t0, t1, 0.1_f64.ln(), (1e-12_f64).ln());
-    let expected_zero = 1.0 - (-(0.1_f64) * (t1 - t0)).exp();
-    assert!((zero_mort.risk - expected_zero).abs() < 2e-3);
+    let expectedzero = 1.0 - (-(0.1_f64) * (t1 - t0)).exp();
+    assert!((zero_mort.risk - expectedzero).abs() < 2e-3);
 
     let high_mort = run_constant_hazard_crude(t0, t1, 0.1_f64.ln(), 100.0_f64.ln());
     assert!(high_mort.risk < 2e-3);

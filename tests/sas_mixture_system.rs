@@ -1,13 +1,13 @@
 use gam::estimate::FittedLinkParameters;
 use gam::estimate::{
-    ExternalOptimOptions, FitOptions, evaluate_external_theta_cost_gradient, fit_gam,
-    fit_gam_with_heuristic_lambdas,
+    ExternalOptimOptions, FitOptions, evaluate_external_thetacostgradient, fit_gam,
+    fit_gamwith_heuristic_lambdas,
 };
 use gam::inference::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gam_with_uncertainty,
+    predict_gamwith_uncertainty,
 };
-use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
+use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_fromspec};
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -109,7 +109,7 @@ fn sas_fit_recovery_and_calibration_system() {
         "delta recovery off: hat={delta_hat:.4}, true={delta_true:.4}"
     );
 
-    let pred = predict_gam_with_uncertainty(
+    let pred = predict_gamwith_uncertainty(
         x.view(),
         fit.beta.view(),
         offset.view(),
@@ -132,7 +132,7 @@ fn mixture_recovery_and_prediction_alignment_system() {
     let n = 2000usize;
     let x = build_design(n);
     let beta_true = Array1::from_vec(vec![-0.20, 1.0, -0.5, 0.3]);
-    let mix_spec_true = MixtureLinkSpec {
+    let mixspec_true = MixtureLinkSpec {
         components: vec![
             LinkComponent::Probit,
             LinkComponent::CLogLog,
@@ -140,7 +140,7 @@ fn mixture_recovery_and_prediction_alignment_system() {
         ],
         initial_rho: Array1::from_vec(vec![1.0, -0.6]),
     };
-    let mix_state_true = state_from_spec(&mix_spec_true).expect("true mixture state");
+    let mix_state_true = state_fromspec(&mixspec_true).expect("true mixture state");
     let eta = x.dot(&beta_true);
     let p_true = eta.mapv(|e| mixture_inverse_link_jet(&mix_state_true, e).mu);
     let mut rng = StdRng::seed_from_u64(12345);
@@ -151,7 +151,7 @@ fn mixture_recovery_and_prediction_alignment_system() {
 
     let mut opts = base_fit_options();
     opts.mixture_link = Some(MixtureLinkSpec {
-        components: mix_spec_true.components.clone(),
+        components: mixspec_true.components.clone(),
         initial_rho: Array1::zeros(2),
     });
     opts.optimize_mixture = true;
@@ -176,7 +176,7 @@ fn mixture_recovery_and_prediction_alignment_system() {
         "fitted mixture weights must be a valid simplex, got pi={pi_hat:?}"
     );
 
-    let pred = predict_gam_with_uncertainty(
+    let pred = predict_gamwith_uncertainty(
         x.view(),
         fit.beta.view(),
         offset.view(),
@@ -185,14 +185,14 @@ fn mixture_recovery_and_prediction_alignment_system() {
         &PredictUncertaintyOptions::default(),
     )
     .expect("mixture predict");
-    let pred_rmse_vs_truth = (&pred.mean - &p_true)
+    let pred_rmsevs_truth = (&pred.mean - &p_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY)
         .sqrt();
     assert!(
-        pred_rmse_vs_truth < 0.11,
-        "mixture truth-prob RMSE too high: {pred_rmse_vs_truth:.4}"
+        pred_rmsevs_truth < 0.11,
+        "mixture truth-prob RMSE too high: {pred_rmsevs_truth:.4}"
     );
 }
 
@@ -224,7 +224,7 @@ fn theta_evaluator_accepts_intrinsic_sas_defaults() {
     };
 
     let theta = array![0.2, -0.1, 0.05];
-    let (cost, grad) = evaluate_external_theta_cost_gradient(
+    let (cost, grad) = evaluate_external_thetacostgradient(
         y.view(),
         w.view(),
         x.view(),
@@ -331,10 +331,10 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         confidence_level: 0.90,
         covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         mean_interval_method: MeanIntervalMethod::TransformEta,
-        include_observation_interval: false,
+        includeobservation_interval: false,
     };
 
-    let pred_logit = predict_gam_with_uncertainty(
+    let pred_logit = predict_gamwith_uncertainty(
         x_test.view(),
         fit_logit.beta.view(),
         offset_test.view(),
@@ -343,7 +343,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         &options,
     )
     .expect("logit pred");
-    let pred_probit = predict_gam_with_uncertainty(
+    let pred_probit = predict_gamwith_uncertainty(
         x_test.view(),
         fit_probit.beta.view(),
         offset_test.view(),
@@ -352,7 +352,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         &options,
     )
     .expect("probit pred");
-    let pred_sas = predict_gam_with_uncertainty(
+    let pred_sas = predict_gamwith_uncertainty(
         x_test.view(),
         fit_sas.beta.view(),
         offset_test.view(),
@@ -361,7 +361,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         &options,
     )
     .expect("sas pred");
-    let pred_mix = predict_gam_with_uncertainty(
+    let pred_mix = predict_gamwith_uncertainty(
         x_test.view(),
         fit_mix.beta.view(),
         offset_test.view(),
@@ -376,22 +376,22 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
     let c_sas = coverage(&p_test, &pred_sas.mean_lower, &pred_sas.mean_upper);
     let c_mix = coverage(&p_test, &pred_mix.mean_lower, &pred_mix.mean_upper);
 
-    let mean_width_logit = (&pred_logit.mean_upper - &pred_logit.mean_lower)
+    let meanwidth_logit = (&pred_logit.mean_upper - &pred_logit.mean_lower)
         .mean()
         .unwrap_or(f64::INFINITY);
-    let mean_width_probit = (&pred_probit.mean_upper - &pred_probit.mean_lower)
+    let meanwidth_probit = (&pred_probit.mean_upper - &pred_probit.mean_lower)
         .mean()
         .unwrap_or(f64::INFINITY);
-    let mean_width_sas = (&pred_sas.mean_upper - &pred_sas.mean_lower)
+    let meanwidth_sas = (&pred_sas.mean_upper - &pred_sas.mean_lower)
         .mean()
         .unwrap_or(f64::INFINITY);
-    let mean_width_mix = (&pred_mix.mean_upper - &pred_mix.mean_lower)
+    let meanwidth_mix = (&pred_mix.mean_upper - &pred_mix.mean_lower)
         .mean()
         .unwrap_or(f64::INFINITY);
 
     for (name, c, w) in [
-        ("logit", c_logit, mean_width_logit),
-        ("probit", c_probit, mean_width_probit),
+        ("logit", c_logit, meanwidth_logit),
+        ("probit", c_probit, meanwidth_probit),
     ] {
         assert!(c >= 0.75, "{name} 90% coverage too low: {c:.3}");
         assert!(
@@ -400,8 +400,8 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         );
     }
     for (name, c, w) in [
-        ("sas", c_sas, mean_width_sas),
-        ("mixture", c_mix, mean_width_mix),
+        ("sas", c_sas, meanwidth_sas),
+        ("mixture", c_mix, meanwidth_mix),
     ] {
         assert!(
             c.is_finite() && (0.0..=1.0).contains(&c),
@@ -415,7 +415,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
 }
 
 #[test]
-fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
+fn outer_profileobjective_stationary_near_fitted_sas_and_mixture_params() {
     let n = 260usize;
     let x = build_design(n);
     let w = Array1::<f64>::ones(n);
@@ -470,14 +470,14 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
         linear_constraints: None,
         firth_bias_reduction: None,
     };
-    let sas_cost = |raw_eps: f64, ld: f64| -> Result<f64, String> {
+    let sascost = |raw_eps: f64, ld: f64| -> Result<f64, String> {
         let mut theta_sas = Array1::<f64>::zeros(rho_hat.len() + 2);
         for i in 0..rho_hat.len() {
             theta_sas[i] = rho_hat[i];
         }
         theta_sas[rho_hat.len()] = raw_eps;
         theta_sas[rho_hat.len() + 1] = ld;
-        evaluate_external_theta_cost_gradient(
+        evaluate_external_thetacostgradient(
             y_sas.view(),
             w.view(),
             x.view(),
@@ -509,7 +509,7 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
                 } else {
                     (base_eps, base_ld - step)
                 };
-                if let (Ok(cp), Ok(cm)) = (sas_cost(ep_p, ld_p), sas_cost(ep_m, ld_m)) {
+                if let (Ok(cp), Ok(cm)) = (sascost(ep_p, ld_p), sascost(ep_m, ld_m)) {
                     Some((cp - cm) / (2.0 * step))
                 } else {
                     None
@@ -535,7 +535,7 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
     );
 
     // Mixture profile stationarity
-    let true_mix_spec = MixtureLinkSpec {
+    let true_mixspec = MixtureLinkSpec {
         components: vec![
             LinkComponent::Probit,
             LinkComponent::CLogLog,
@@ -543,12 +543,12 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
         ],
         initial_rho: Array1::from_vec(vec![0.7, -0.4]),
     };
-    let true_mix_state = state_from_spec(&true_mix_spec).expect("true mix");
+    let true_mix_state = state_fromspec(&true_mixspec).expect("true mix");
     let p_mix = eta.mapv(|e| mixture_inverse_link_jet(&true_mix_state, e).mu);
     let y_mix = p_mix.mapv(|p| if rng.random::<f64>() < p { 1.0 } else { 0.0 });
     let mut opts_mix = base_fit_options();
     opts_mix.mixture_link = Some(MixtureLinkSpec {
-        components: true_mix_spec.components.clone(),
+        components: true_mixspec.components.clone(),
         initial_rho: Array1::zeros(2),
     });
     opts_mix.optimize_mixture = true;
@@ -570,11 +570,11 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
     let profile_mix = |rho: &Array1<f64>| -> f64 {
         let mut o = base_fit_options();
         o.mixture_link = Some(MixtureLinkSpec {
-            components: true_mix_spec.components.clone(),
+            components: true_mixspec.components.clone(),
             initial_rho: rho.clone(),
         });
         o.optimize_mixture = false;
-        fit_gam_with_heuristic_lambdas(
+        fit_gamwith_heuristic_lambdas(
             x.view(),
             y_mix.view(),
             w.view(),

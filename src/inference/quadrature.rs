@@ -518,11 +518,11 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
     indices.sort_by(|&a, &b| nodes[a].total_cmp(&nodes[b]));
 
     let sorted_nodes: [f64; N_POINTS] = std::array::from_fn(|i| nodes[indices[i]]);
-    let sorted_weights: [f64; N_POINTS] = std::array::from_fn(|i| weights[indices[i]]);
+    let sortedweights: [f64; N_POINTS] = std::array::from_fn(|i| weights[indices[i]]);
 
     GaussHermiteRule {
         nodes: sorted_nodes,
-        weights: sorted_weights,
+        weights: sortedweights,
     }
 }
 
@@ -755,7 +755,7 @@ pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f
 ///
 /// Returns: (μ, dμ/dm)
 #[inline]
-pub fn logit_posterior_mean_with_deriv(
+pub fn logit_posterior_meanwith_deriv(
     ctx: &QuadratureContext,
     eta: f64,
     se_eta: f64,
@@ -789,7 +789,7 @@ pub fn logit_posterior_mean_with_deriv(
 }
 
 #[inline]
-pub fn probit_posterior_mean_with_deriv_exact(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+pub fn probit_posterior_meanwith_deriv_exact(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // Exact Gaussian-probit convolution.
     //
     // If eta ~ N(mu, sigma^2), then
@@ -883,7 +883,7 @@ fn erfcx_nonnegative(x: f64) -> f64 {
 }
 
 #[inline]
-fn scaled_erfcx_term_with_derivative(m: f64, s: f64, x: f64, dxdm: f64) -> (f64, f64) {
+fn scaled_erfcx_termwith_derivative(m: f64, s: f64, x: f64, dxdm: f64) -> (f64, f64) {
     let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
     if x >= 0.0 {
         let ex = erfcx_nonnegative(x);
@@ -894,12 +894,12 @@ fn scaled_erfcx_term_with_derivative(m: f64, s: f64, x: f64, dxdm: f64) -> (f64,
     } else {
         let lead = (x * x - (m * m) / (2.0 * s * s)).exp();
         let dlead = lead * (2.0 * x * dxdm - m / (s * s));
-        let (rest, drest) = scaled_erfcx_term_with_derivative(m, s, -x, -dxdm);
+        let (rest, drest) = scaled_erfcx_termwith_derivative(m, s, -x, -dxdm);
         (lead - rest, dlead - drest)
     }
 }
 
-pub(crate) fn logit_posterior_mean_with_deriv_exact(
+pub(crate) fn logit_posterior_meanwith_deriv_exact(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
@@ -935,10 +935,10 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
             "logit exact expectation outside guarded domain".to_string(),
         ));
     }
-    logit_posterior_mean_with_deriv_exact_erfcx(mu, sigma)
+    logit_posterior_meanwith_deriv_exact_erfcx(mu, sigma)
 }
 
-fn logit_posterior_mean_with_deriv_exact_erfcx(
+fn logit_posterior_meanwith_deriv_exact_erfcx(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
@@ -980,8 +980,8 @@ fn logit_posterior_mean_with_deriv_exact_erfcx(
             let a = (kf * s * s + m) / z;
             let b = (kf * s * s - m) / z;
             let sign = if kk % 2 == 1 { 1.0 } else { -1.0 };
-            let (va, dva) = scaled_erfcx_term_with_derivative(m, s, a, 1.0 / z);
-            let (vb, dvb) = scaled_erfcx_term_with_derivative(m, s, b, -1.0 / z);
+            let (va, dva) = scaled_erfcx_termwith_derivative(m, s, a, 1.0 / z);
+            let (vb, dvb) = scaled_erfcx_termwith_derivative(m, s, b, -1.0 / z);
             pair_contrib += sign * (va - vb);
             pair_dcontrib += sign * (dva - dvb);
         }
@@ -1068,7 +1068,7 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
 
 #[cfg(test)]
 #[inline]
-fn cloglog_posterior_mean_with_deriv_ghq(
+fn cloglog_posterior_meanwith_deriv_ghq(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
@@ -1213,7 +1213,7 @@ fn lognormal_laplace_term_controlled(
 }
 
 #[inline]
-fn cloglog_survival_second_moment_controlled(
+fn cloglog_survivalsecond_moment_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
@@ -1244,7 +1244,7 @@ fn cloglog_survival_pair_controlled(
     (f64, IntegratedExpectationMode),
     (f64, IntegratedExpectationMode),
 ) {
-    let shifted_mu = mu + sigma * sigma;
+    let shiftedmu = mu + sigma * sigma;
 
     // For the exact/control branches it is numerically cleaner if the mean
     // path S(mu, sigma) and the derivative path S(mu + sigma^2, sigma) are
@@ -1259,7 +1259,7 @@ fn cloglog_survival_pair_controlled(
     if (mu.abs() / sigma) >= 3.0
         && let (Ok(base), Ok(shifted)) = (
             cloglog_survival_miles(mu, sigma),
-            cloglog_survival_miles(shifted_mu, sigma),
+            cloglog_survival_miles(shiftedmu, sigma),
         )
     {
         return (
@@ -1275,10 +1275,10 @@ fn cloglog_survival_pair_controlled(
     }
 
     if cloglog_should_prefer_cc(mu, sigma, CLOGLOG_CC_TOL)
-        && cloglog_should_prefer_cc(shifted_mu, sigma, CLOGLOG_CC_TOL)
+        && cloglog_should_prefer_cc(shiftedmu, sigma, CLOGLOG_CC_TOL)
         && let (Ok(base), Ok(shifted)) = (
             cloglog_survival_cc(ctx, mu, sigma, CLOGLOG_CC_TOL),
-            cloglog_survival_cc(ctx, shifted_mu, sigma, CLOGLOG_CC_TOL),
+            cloglog_survival_cc(ctx, shiftedmu, sigma, CLOGLOG_CC_TOL),
         )
     {
         return (
@@ -1295,7 +1295,7 @@ fn cloglog_survival_pair_controlled(
 
     if let (Ok(base), Ok(shifted)) = (
         cloglog_survival_gamma_reference(mu, sigma),
-        cloglog_survival_gamma_reference(shifted_mu, sigma),
+        cloglog_survival_gamma_reference(shiftedmu, sigma),
     ) {
         return (
             (
@@ -1311,7 +1311,7 @@ fn cloglog_survival_pair_controlled(
 
     (
         cloglog_survival_term_controlled(ctx, mu, sigma),
-        cloglog_survival_term_controlled(ctx, shifted_mu, sigma),
+        cloglog_survival_term_controlled(ctx, shiftedmu, sigma),
     )
 }
 
@@ -1548,7 +1548,7 @@ fn complex_sub(a: Complex, b: Complex) -> Complex {
 }
 
 #[inline]
-fn complex_mul(a: Complex, b: Complex) -> Complex {
+fn complexmul(a: Complex, b: Complex) -> Complex {
     Complex {
         re: a.re * b.re - a.im * b.im,
         im: a.re * b.im + a.im * b.re,
@@ -1612,11 +1612,11 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
     ];
 
     if z.re < 0.5 {
-        let pi_z = Complex {
+        let piz = Complex {
             re: std::f64::consts::PI * z.re,
             im: std::f64::consts::PI * z.im,
         };
-        let one_minus_z = Complex {
+        let one_minusz = Complex {
             re: 1.0 - z.re,
             im: -z.im,
         };
@@ -1626,9 +1626,9 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
                     re: std::f64::consts::PI.ln(),
                     im: 0.0,
                 },
-                complex_ln(complex_sin(pi_z)),
+                complex_ln(complex_sin(piz)),
             ),
-            complex_log_gamma_lanczos(one_minus_z),
+            complex_log_gamma_lanczos(one_minusz),
         );
     }
 
@@ -1662,7 +1662,7 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
                 re: 0.5 * (2.0 * std::f64::consts::PI).ln(),
                 im: 0.0,
             },
-            complex_mul(
+            complexmul(
                 Complex {
                     re: z1.re + 0.5,
                     im: z1.im,
@@ -1675,7 +1675,7 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
 }
 
 #[cfg(test)]
-pub(crate) fn cloglog_posterior_mean_with_deriv_gamma_reference(
+pub(crate) fn cloglog_posterior_meanwith_deriv_gamma_reference(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
@@ -1759,7 +1759,7 @@ fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, Estimati
             im: t,
         };
         let log_gamma = complex_log_gamma_lanczos(z);
-        let z_sq = complex_mul(z, z);
+        let z_sq = complexmul(z, z);
         let exponent = complex_sub(
             complex_add(
                 log_gamma,
@@ -1785,16 +1785,16 @@ fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, Estimati
         let w = if i % 2 == 0 { 2.0 } else { 4.0 };
         sum_s += w * fi;
     }
-    let s_val = ((h / 3.0) * sum_s / std::f64::consts::PI).clamp(0.0, 1.0);
-    if !s_val.is_finite() {
+    let sval = ((h / 3.0) * sum_s / std::f64::consts::PI).clamp(0.0, 1.0);
+    if !sval.is_finite() {
         return Err(EstimationError::InvalidInput(
             "Gamma cloglog reference backend produced non-finite values".to_string(),
         ));
     }
-    Ok(s_val)
+    Ok(sval)
 }
 
-pub(crate) fn cloglog_posterior_mean_with_deriv_controlled(
+pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
@@ -1875,7 +1875,7 @@ pub(crate) fn cloglog_posterior_mean_with_deriv_controlled(
 }
 
 pub fn integrated_inverse_link_mean_and_derivative(
-    quad_ctx: &QuadratureContext,
+    quadctx: &QuadratureContext,
     link: LinkFunction,
     mu: f64,
     sigma: f64,
@@ -1909,24 +1909,24 @@ pub fn integrated_inverse_link_mean_and_derivative(
     // mathematics local to one module instead of leaking into PIRLS or
     // prediction code.
     match link {
-        LinkFunction::Probit => Ok(probit_posterior_mean_with_deriv_exact(mu, sigma)),
+        LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
         // The in-repo logit special-function backend is useful as a research
         // implementation and local oracle, but it is not yet uniformly accurate
         // enough across the production domain to replace GHQ in the hot path.
         // Use the exact plug-in limit when sigma is effectively zero and route
         // everything else through the validated GHQ backend.
         LinkFunction::Logit if sigma <= LOGIT_SIGMA_DEGENERATE => {
-            logit_posterior_mean_with_deriv_exact(mu, sigma)
+            logit_posterior_meanwith_deriv_exact(mu, sigma)
         }
         LinkFunction::Logit => {
-            let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma)?;
+            let (mean, dmean_dmu) = logit_posterior_meanwith_deriv(quadctx, mu, sigma)?;
             Ok(IntegratedMeanDerivative {
                 mean,
                 dmean_dmu,
                 mode: IntegratedExpectationMode::QuadratureFallback,
             })
         }
-        LinkFunction::CLogLog => Ok(cloglog_posterior_mean_with_deriv_controlled(quad_ctx, mu, sigma)),
+        LinkFunction::CLogLog => Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, mu, sigma)),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
@@ -1943,15 +1943,15 @@ pub fn integrated_inverse_link_mean_and_derivative(
 
 #[inline]
 pub fn integrated_inverse_link_jet(
-    quad_ctx: &QuadratureContext,
+    quadctx: &QuadratureContext,
     link: LinkFunction,
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedInverseLinkJet, EstimationError> {
     match link {
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
-        LinkFunction::Logit => Ok(integrated_logit_jet_ghq(quad_ctx, mu, sigma)),
-        LinkFunction::CLogLog => Ok(integrated_cloglog_jet_ghq(quad_ctx, mu, sigma)),
+        LinkFunction::Logit => Ok(integrated_logit_jet_ghq(quadctx, mu, sigma)),
+        LinkFunction::CLogLog => Ok(integrated_cloglog_jet_ghq(quadctx, mu, sigma)),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
@@ -2028,8 +2028,8 @@ fn integrated_beta_logistic_jet_ghq(
 
 /// State-aware inverse-link jet integration for Gaussian-uncertain predictors.
 #[inline]
-pub fn integrated_inverse_link_jet_with_state(
-    quad_ctx: &QuadratureContext,
+pub fn integrated_inverse_link_jetwith_state(
+    quadctx: &QuadratureContext,
     link: LinkFunction,
     mu: f64,
     sigma: f64,
@@ -2048,7 +2048,7 @@ pub fn integrated_inverse_link_jet_with_state(
                     .to_string(),
             )
         })?;
-        return Ok(integrated_sas_jet_ghq(quad_ctx, mu, sigma, sas));
+        return Ok(integrated_sas_jet_ghq(quadctx, mu, sigma, sas));
     }
     if matches!(link, LinkFunction::BetaLogistic) {
         let state = sas_link_state.ok_or_else(|| {
@@ -2057,9 +2057,9 @@ pub fn integrated_inverse_link_jet_with_state(
                     .to_string(),
             )
         })?;
-        return Ok(integrated_beta_logistic_jet_ghq(quad_ctx, mu, sigma, state));
+        return Ok(integrated_beta_logistic_jet_ghq(quadctx, mu, sigma, state));
     }
-    integrated_inverse_link_jet(quad_ctx, link, mu, sigma)
+    integrated_inverse_link_jet(quadctx, link, mu, sigma)
 }
 
 /// Family-level integration dispatcher for Gaussian-uncertain linear predictors.
@@ -2069,19 +2069,19 @@ pub fn integrated_inverse_link_jet_with_state(
 /// the quadrature domain.
 #[inline]
 pub fn integrated_family_moments_jet(
-    quad_ctx: &QuadratureContext,
+    quadctx: &QuadratureContext,
     family: LikelihoodFamily,
     eta: f64,
     se_eta: f64,
 ) -> Result<IntegratedMomentsJet, EstimationError> {
-    integrated_family_moments_jet_with_state(quad_ctx, family, eta, se_eta, None, None)
+    integrated_family_moments_jetwith_state(quadctx, family, eta, se_eta, None, None)
 }
 
 /// State-aware family-level integration dispatcher for Gaussian-uncertain
 /// linear predictors.
 #[inline]
-pub fn integrated_family_moments_jet_with_state(
-    quad_ctx: &QuadratureContext,
+pub fn integrated_family_moments_jetwith_state(
+    quadctx: &QuadratureContext,
     family: LikelihoodFamily,
     eta: f64,
     se_eta: f64,
@@ -2093,7 +2093,7 @@ pub fn integrated_family_moments_jet_with_state(
     let se = se_eta.max(0.0);
     match family {
         LikelihoodFamily::BinomialLogit => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Logit, e, se)?;
+            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
             let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
@@ -2105,7 +2105,7 @@ pub fn integrated_family_moments_jet_with_state(
             })
         }
         LikelihoodFamily::BinomialProbit => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Probit, e, se)?;
+            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Probit, e, se)?;
             let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
@@ -2117,7 +2117,7 @@ pub fn integrated_family_moments_jet_with_state(
             })
         }
         LikelihoodFamily::BinomialCLogLog => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::CLogLog, e, se)?;
+            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::CLogLog, e, se)?;
             let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
@@ -2129,8 +2129,8 @@ pub fn integrated_family_moments_jet_with_state(
             })
         }
         LikelihoodFamily::BinomialSas => {
-            let jet = integrated_inverse_link_jet_with_state(
-                quad_ctx,
+            let jet = integrated_inverse_link_jetwith_state(
+                quadctx,
                 LinkFunction::Sas,
                 e,
                 se,
@@ -2148,8 +2148,8 @@ pub fn integrated_family_moments_jet_with_state(
             })
         }
         LikelihoodFamily::BinomialBetaLogistic => {
-            let jet = integrated_inverse_link_jet_with_state(
-                quad_ctx,
+            let jet = integrated_inverse_link_jetwith_state(
+                quadctx,
                 LinkFunction::BetaLogistic,
                 e,
                 se,
@@ -2183,9 +2183,9 @@ pub fn integrated_family_moments_jet_with_state(
     }
 }
 
-/// Batch version of logit_posterior_mean_with_deriv.
+/// Batch version of logit_posterior_meanwith_deriv.
 /// Returns (mu_array, dmu_array)
-pub fn logit_posterior_mean_with_deriv_batch(
+pub fn logit_posterior_meanwith_deriv_batch(
     ctx: &QuadratureContext,
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
@@ -2223,7 +2223,7 @@ pub fn logit_posterior_mean_batch(
 
 trait GhqValue: Sized {
     fn zero() -> Self;
-    fn add_weighted(&mut self, weight: f64, value: Self);
+    fn addweighted(&mut self, weight: f64, value: Self);
     fn scale(self, factor: f64) -> Self;
 }
 
@@ -2234,7 +2234,7 @@ impl GhqValue for f64 {
     }
 
     #[inline]
-    fn add_weighted(&mut self, weight: f64, value: Self) {
+    fn addweighted(&mut self, weight: f64, value: Self) {
         *self += weight * value;
     }
 
@@ -2251,7 +2251,7 @@ impl GhqValue for (f64, f64) {
     }
 
     #[inline]
-    fn add_weighted(&mut self, weight: f64, value: Self) {
+    fn addweighted(&mut self, weight: f64, value: Self) {
         self.0 += weight * value.0;
         self.1 += weight * value.1;
     }
@@ -2269,7 +2269,7 @@ impl GhqValue for (f64, f64, f64, f64) {
     }
 
     #[inline]
-    fn add_weighted(&mut self, weight: f64, value: Self) {
+    fn addweighted(&mut self, weight: f64, value: Self) {
         self.0 += weight * value.0;
         self.1 += weight * value.1;
         self.2 += weight * value.2;
@@ -2297,11 +2297,11 @@ where
         return f(eta);
     }
     let n = adaptive_point_count_from_sd(se_eta.abs());
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+    with_gh_nodesweights(ctx, n, |nodes, weights| {
         let scale = SQRT_2 * se_eta;
         let mut sum = R::zero();
         for i in 0..n {
-            sum.add_weighted(weights[i], f(eta + scale * nodes[i]));
+            sum.addweighted(weights[i], f(eta + scale * nodes[i]));
         }
         sum.scale(1.0 / std::f64::consts::PI.sqrt())
     })
@@ -2435,7 +2435,7 @@ fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
 }
 
 #[inline]
-fn with_gh_nodes_weights<R>(
+fn with_gh_nodesweights<R>(
     ctx: &QuadratureContext,
     n: usize,
     f: impl FnOnce(&[f64], &[f64]) -> R,
@@ -2449,7 +2449,7 @@ fn with_gh_nodes_weights<R>(
     }
 }
 
-fn cholesky_with_jitter(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+fn choleskywith_jitter(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     let n = cov.len();
     if n == 0 || cov.iter().any(|r| r.len() != n) {
         return None;
@@ -2507,7 +2507,7 @@ fn array_cov_to_vec<const D: usize>(cov: &[[f64; D]; D]) -> Vec<Vec<f64>> {
 }
 
 #[inline]
-fn adaptive_point_count_with_cap(max_sd: f64, max_n: usize) -> usize {
+fn adaptive_point_countwith_cap(max_sd: f64, max_n: usize) -> usize {
     adaptive_point_count_from_sd(max_sd).min(max_n)
 }
 
@@ -2523,23 +2523,23 @@ where
     F: Fn([f64; D]) -> Result<R, E>,
     R: GhqValue,
 {
-    let mut max_var = 0.0_f64;
+    let mut maxvar = 0.0_f64;
     for (i, row) in cov.iter().enumerate() {
-        max_var = max_var.max(row[i]).max(0.0);
+        maxvar = maxvar.max(row[i]).max(0.0);
     }
-    let n = adaptive_point_count_with_cap(max_var.sqrt(), max_n);
+    let n = adaptive_point_countwith_cap(maxvar.sqrt(), max_n);
 
-    let mut cov_vec = array_cov_to_vec(&cov);
-    for (i, row) in cov_vec.iter_mut().enumerate() {
+    let mut covvec = array_cov_to_vec(&cov);
+    for (i, row) in covvec.iter_mut().enumerate() {
         row[i] = row[i].max(0.0);
     }
-    let l = match cholesky_with_jitter(&cov_vec) {
+    let l = match choleskywith_jitter(&covvec) {
         Some(v) => v,
         None => return Ok(None),
     };
     let norm = 1.0 / std::f64::consts::PI.powf(0.5 * D as f64);
 
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+    with_gh_nodesweights(ctx, n, |nodes, weights| {
         let mut acc = R::zero();
         let mut idx = [0usize; D];
         loop {
@@ -2558,7 +2558,7 @@ where
                 }
                 x[row] += dot;
             }
-            acc.add_weighted(weight, f(x)?);
+            acc.addweighted(weight, f(x)?);
 
             let mut carry = true;
             for d in (0..D).rev() {
@@ -2712,7 +2712,7 @@ pub fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
 }
 
 #[inline]
-pub fn logit_posterior_mean_variance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
+pub fn logit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
     let m1 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid);
     let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
         let p = sigmoid(x);
@@ -2723,7 +2723,7 @@ pub fn logit_posterior_mean_variance(ctx: &QuadratureContext, eta: f64, se_eta: 
 }
 
 #[inline]
-pub fn probit_posterior_mean_variance(
+pub fn probit_posterior_meanvariance(
     ctx: &QuadratureContext,
     eta: f64,
     se_eta: f64,
@@ -2738,7 +2738,7 @@ pub fn probit_posterior_mean_variance(
 }
 
 #[inline]
-pub fn cloglog_posterior_mean_variance(
+pub fn cloglog_posterior_meanvariance(
     ctx: &QuadratureContext,
     eta: f64,
     se_eta: f64,
@@ -2762,7 +2762,7 @@ pub fn cloglog_posterior_mean_variance(
     // Gaussian uncertainty; they only differ in whether the reported mean is
     // E[S] or 1 - E[S].
     let (survival, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
-    let (survival_sq, _) = cloglog_survival_second_moment_controlled(ctx, eta, se_eta);
+    let (survival_sq, _) = cloglog_survivalsecond_moment_controlled(ctx, eta, se_eta);
     let mean = cloglog_mean_from_survival(survival);
     let variance = (survival_sq - survival * survival).max(0.0);
     (mean, variance)
@@ -2829,13 +2829,13 @@ pub fn survival_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -
 }
 
 #[inline]
-pub fn survival_posterior_mean_variance(
+pub fn survival_posterior_meanvariance(
     ctx: &QuadratureContext,
     eta: f64,
     se_eta: f64,
 ) -> (f64, f64) {
     let (m1, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
-    let (m2, _) = cloglog_survival_second_moment_controlled(ctx, eta, se_eta);
+    let (m2, _) = cloglog_survivalsecond_moment_controlled(ctx, eta, se_eta);
     (m1.clamp(0.0, 1.0), (m2 - m1 * m1).max(0.0))
 }
 
@@ -2851,7 +2851,7 @@ pub fn survival_posterior_mean_variance(
 ///
 /// 1. prove machine-precision truncation criteria on the production domain,
 /// 2. expose the derivative d/dmu E[sigmoid(eta)] alongside the mean,
-/// 3. replace the GHQ loop in `logit_posterior_mean_with_deriv` once the exact
+/// 3. replace the GHQ loop in `logit_posterior_meanwith_deriv` once the exact
 ///    special-function path is benchmarked and regression-tested thoroughly.
 ///
 /// Deterministic integration-free equivalent representation:
@@ -3121,7 +3121,7 @@ mod tests {
     }
 
     #[test]
-    fn test_computed_weights_symmetric() {
+    fn test_computedweights_symmetric() {
         // Verify computed weights are symmetric
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -3132,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_weights_sum_to_sqrt_pi() {
+    fn testweights_sum_to_sqrt_pi() {
         // Verify weights sum to sqrt(pi) for physicist's Hermite
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -3141,7 +3141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clenshaw_curtis_weights_are_symmetric_and_integrate_constants() {
+    fn test_clenshaw_curtisweights_are_symmetric_and_integrate_constants() {
         let rule = compute_clenshaw_curtis_n(33);
         let m = rule.weights.len() - 1;
         for j in 0..=m / 2 {
@@ -3168,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wilkinson_shift_finite_when_d_is_zero() {
+    fn testwilkinson_shift_finitewhen_d_iszero() {
         // Trailing 2x2 with equal diagonal entries => d=0.
         // Regression: using f64::signum() would produce denominator 0 here.
         let shift = wilkinson_shift(0.0, 0.0, 1.25);
@@ -3187,7 +3187,7 @@ mod tests {
             1.673_551_628_767_471_4,
             2.651_961_356_835_233_4,
         ];
-        let known_weights = [
+        let knownweights = [
             0.000_971_781_245_099_519_1,
             0.054_515_582_819_127_03,
             0.425_607_252_610_127_8,
@@ -3201,12 +3201,12 @@ mod tests {
         let gh = ctx.gauss_hermite();
         for i in 0..N_POINTS {
             assert_relative_eq!(gh.nodes[i], known_nodes[i], epsilon = 1e-12);
-            assert_relative_eq!(gh.weights[i], known_weights[i], epsilon = 1e-12);
+            assert_relative_eq!(gh.weights[i], knownweights[i], epsilon = 1e-12);
         }
     }
 
     #[test]
-    fn test_zero_se_returns_mode() {
+    fn testzero_se_returns_mode() {
         // When SE is zero, posterior mean is expected to equal mode
         let eta = 1.5;
         let se = 0.0;
@@ -3217,7 +3217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_symmetric_at_zero() {
+    fn test_symmetric_atzero() {
         // At eta=0 (50% probability), mean is expected to be ~50%
         let eta = 0.0;
         let se = 1.0;
@@ -3354,7 +3354,7 @@ mod tests {
         let ctx = QuadratureContext::new();
         let eta = 20.0;
         let se = 0.0;
-        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se)
+        let (_, dmu) = logit_posterior_meanwith_deriv(&ctx, eta, se)
             .expect("logit posterior mean derivative should evaluate");
         assert!(dmu > 0.0);
         assert!(
@@ -3370,14 +3370,14 @@ mod tests {
         let se = 0.9;
         let h = 1e-5;
 
-        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se)
+        let (_, dmu) = logit_posterior_meanwith_deriv(&ctx, eta, se)
             .expect("logit posterior mean derivative should evaluate");
         let mu_plus = logit_posterior_mean(&ctx, eta + h, se);
         let mu_minus = logit_posterior_mean(&ctx, eta - h, se);
-        let dmu_fd = (mu_plus - mu_minus) / (2.0 * h);
+        let dmufd = (mu_plus - mu_minus) / (2.0 * h);
 
-        assert_eq!(dmu.signum(), dmu_fd.signum());
-        assert_relative_eq!(dmu, dmu_fd, epsilon = 5e-6, max_relative = 2e-4);
+        assert_eq!(dmu.signum(), dmufd.signum());
+        assert_relative_eq!(dmu, dmufd, epsilon = 5e-6, max_relative = 2e-4);
     }
 
     #[test]
@@ -3414,11 +3414,11 @@ mod tests {
     #[test]
     fn test_ghq7_matches_real_erfcx_series_oracle() {
         let ctx = QuadratureContext::new();
-        let m_values = [-3.0, -1.0, 0.0, 1.0, 3.0];
-        let s_values = [0.1, 0.5, 1.0, 2.0];
+        let mvalues = [-3.0, -1.0, 0.0, 1.0, 3.0];
+        let svalues = [0.1, 0.5, 1.0, 2.0];
 
-        for &m in &m_values {
-            for &s in &s_values {
+        for &m in &mvalues {
+            for &s in &svalues {
                 let ghq = logit_posterior_mean(&ctx, m, s);
                 let oracle = exact_logistic_expectation_erfcx_series(m, s);
                 assert_relative_eq!(ghq, oracle, epsilon = 2e-3, max_relative = 3e-3);
@@ -3427,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_probit_posterior_mean_reduces_to_map_at_zero_se() {
+    fn test_probit_posterior_mean_reduces_to_map_atzero_se() {
         let eta = 1.25;
         let p = probit_posterior_mean(eta, 0.0);
         let map = crate::probability::normal_cdf(eta);
@@ -3435,7 +3435,7 @@ mod tests {
     }
 
     #[test]
-    fn test_probit_posterior_mean_shrinks_extremes_with_uncertainty() {
+    fn test_probit_posterior_mean_shrinks_extremeswith_uncertainty() {
         let hi_eta = 3.0;
         let lo_eta = -3.0;
         let p_hi_map = probit_posterior_mean(hi_eta, 0.0);
@@ -3474,7 +3474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cloglog_and_survival_share_large_sigma_special_function_path() {
+    fn test_cloglog_and_survival_share_large_sigmaspecial_function_path() {
         let ctx = QuadratureContext::new();
         let eta = -0.2;
         let se = 0.8;
@@ -3492,24 +3492,24 @@ mod tests {
     }
 
     #[test]
-    fn test_cloglog_and_survival_posterior_variances_match() {
+    fn test_cloglog_and_survival_posteriorvariances_match() {
         let ctx = QuadratureContext::new();
         let cases = [(-3.0, 0.0), (-0.2, 0.1), (0.4, 0.8), (2.0, 1.5)];
         for (eta, se) in cases {
-            let (_, clog_var) = cloglog_posterior_mean_variance(&ctx, eta, se);
-            let (_, surv_var) = survival_posterior_mean_variance(&ctx, eta, se);
-            assert_relative_eq!(clog_var, surv_var, epsilon = 1e-12, max_relative = 1e-12);
+            let (_, clogvar) = cloglog_posterior_meanvariance(&ctx, eta, se);
+            let (_, survvar) = survival_posterior_meanvariance(&ctx, eta, se);
+            assert_relative_eq!(clogvar, survvar, epsilon = 1e-12, max_relative = 1e-12);
         }
     }
 
     #[test]
-    fn test_survival_variance_uses_exact_second_moment_shift() {
+    fn test_survivalvariance_uses_exactsecond_moment_shift() {
         let ctx = QuadratureContext::new();
         let eta = -0.2;
         let se = 0.8;
         let (survival, _) = cloglog_survival_term_controlled(&ctx, eta, se);
-        let (survival_sq, _) = cloglog_survival_second_moment_controlled(&ctx, eta, se);
-        let (_, variance) = survival_posterior_mean_variance(&ctx, eta, se);
+        let (survival_sq, _) = cloglog_survivalsecond_moment_controlled(&ctx, eta, se);
+        let (_, variance) = survival_posterior_meanvariance(&ctx, eta, se);
         assert_relative_eq!(
             variance,
             (survival_sq - survival * survival).max(0.0),
@@ -3519,7 +3519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lognormal_laplace_shift_matches_explicit_mu_plus_log_z() {
+    fn test_lognormal_laplace_shift_matches_explicitmu_plus_logz() {
         let ctx = QuadratureContext::new();
         let mu = -0.2;
         let sigma = 0.8;
@@ -3536,7 +3536,7 @@ mod tests {
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Probit, 0.7, 1.3)
             .expect("probit integrated inverse-link moments should evaluate");
         assert_eq!(out.mode, IntegratedExpectationMode::ExactClosedForm);
-        let direct = probit_posterior_mean_with_deriv_exact(0.7, 1.3);
+        let direct = probit_posterior_meanwith_deriv_exact(0.7, 1.3);
         assert_relative_eq!(out.mean, direct.mean, epsilon = 1e-12);
         assert_relative_eq!(out.dmean_dmu, direct.dmean_dmu, epsilon = 1e-12);
     }
@@ -3569,15 +3569,15 @@ mod tests {
             .expect("logit integrated inverse-link jet should evaluate");
         let minus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu - h, sigma)
             .expect("logit integrated inverse-link jet should evaluate");
-        let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
-        let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
-        let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
-        assert_eq!(out.d1.signum(), d1_fd.signum());
-        assert_eq!(out.d2.signum(), d2_fd.signum());
-        assert_eq!(out.d3.signum(), d3_fd.signum());
-        assert_relative_eq!(out.d1, d1_fd, epsilon = 2e-5, max_relative = 2e-4);
-        assert_relative_eq!(out.d2, d2_fd, epsilon = 4e-5, max_relative = 6e-4);
-        assert_relative_eq!(out.d3, d3_fd, epsilon = 8e-5, max_relative = 2e-3);
+        let d1fd = (plus.mean - minus.mean) / (2.0 * h);
+        let d2fd = (plus.d1 - minus.d1) / (2.0 * h);
+        let d3fd = (plus.d2 - minus.d2) / (2.0 * h);
+        assert_eq!(out.d1.signum(), d1fd.signum());
+        assert_eq!(out.d2.signum(), d2fd.signum());
+        assert_eq!(out.d3.signum(), d3fd.signum());
+        assert_relative_eq!(out.d1, d1fd, epsilon = 2e-5, max_relative = 2e-4);
+        assert_relative_eq!(out.d2, d2fd, epsilon = 4e-5, max_relative = 6e-4);
+        assert_relative_eq!(out.d3, d3fd, epsilon = 8e-5, max_relative = 2e-3);
     }
 
     #[test]
@@ -3592,25 +3592,25 @@ mod tests {
             .expect("cloglog integrated inverse-link jet should evaluate");
         let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma)
             .expect("cloglog integrated inverse-link jet should evaluate");
-        let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
-        let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
-        let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
-        assert_eq!(out.d1.signum(), d1_fd.signum());
-        assert_eq!(out.d2.signum(), d2_fd.signum());
-        assert_eq!(out.d3.signum(), d3_fd.signum());
-        assert_relative_eq!(out.d1, d1_fd, epsilon = 2e-5, max_relative = 3e-4);
-        assert_relative_eq!(out.d2, d2_fd, epsilon = 4e-5, max_relative = 8e-4);
-        assert_relative_eq!(out.d3, d3_fd, epsilon = 8e-5, max_relative = 2e-3);
+        let d1fd = (plus.mean - minus.mean) / (2.0 * h);
+        let d2fd = (plus.d1 - minus.d1) / (2.0 * h);
+        let d3fd = (plus.d2 - minus.d2) / (2.0 * h);
+        assert_eq!(out.d1.signum(), d1fd.signum());
+        assert_eq!(out.d2.signum(), d2fd.signum());
+        assert_eq!(out.d3.signum(), d3fd.signum());
+        assert_relative_eq!(out.d1, d1fd, epsilon = 2e-5, max_relative = 3e-4);
+        assert_relative_eq!(out.d2, d2fd, epsilon = 4e-5, max_relative = 8e-4);
+        assert_relative_eq!(out.d3, d3fd, epsilon = 8e-5, max_relative = 2e-3);
     }
 
     #[test]
     fn test_logit_exact_derivative_matches_finite_difference() {
-        let out = logit_posterior_mean_with_deriv_exact(1.1, 0.8).expect("exact logit");
+        let out = logit_posterior_meanwith_deriv_exact(1.1, 0.8).expect("exact logit");
         let h = 1e-5;
-        let plus = logit_posterior_mean_with_deriv_exact(1.1 + h, 0.8)
+        let plus = logit_posterior_meanwith_deriv_exact(1.1 + h, 0.8)
             .expect("exact logit plus")
             .mean;
-        let minus = logit_posterior_mean_with_deriv_exact(1.1 - h, 0.8)
+        let minus = logit_posterior_meanwith_deriv_exact(1.1 - h, 0.8)
             .expect("exact logit minus")
             .mean;
         let fd = (plus - minus) / (2.0 * h);
@@ -3621,8 +3621,8 @@ mod tests {
     #[test]
     fn test_cloglog_controlled_matches_ghq_small_sigma() {
         let ctx = QuadratureContext::new();
-        let approx = cloglog_posterior_mean_with_deriv_controlled(&ctx, 0.4, 0.1);
-        let exact = cloglog_posterior_mean_with_deriv_ghq(&ctx, 0.4, 0.1);
+        let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, 0.4, 0.1);
+        let exact = cloglog_posterior_meanwith_deriv_ghq(&ctx, 0.4, 0.1);
         assert_relative_eq!(approx.mean, exact.mean, epsilon = 2e-4, max_relative = 2e-4);
         assert_relative_eq!(
             approx.dmean_dmu,
@@ -3640,8 +3640,8 @@ mod tests {
 
         for &mu in &mus {
             for &sigma in &sigmas {
-                let approx = cloglog_posterior_mean_with_deriv_controlled(&ctx, mu, sigma);
-                let ghq = cloglog_posterior_mean_with_deriv_ghq(&ctx, mu, sigma);
+                let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
+                let ghq = cloglog_posterior_meanwith_deriv_ghq(&ctx, mu, sigma);
                 assert_relative_eq!(approx.mean, ghq.mean, epsilon = 2e-3, max_relative = 2e-3);
                 assert_relative_eq!(
                     approx.dmean_dmu,
@@ -3680,7 +3680,7 @@ mod tests {
         let mu = -0.2;
         let sigma = 0.8;
         let gamma =
-            cloglog_posterior_mean_with_deriv_gamma_reference(mu, sigma).expect("gamma reference");
+            cloglog_posterior_meanwith_deriv_gamma_reference(mu, sigma).expect("gamma reference");
         let mut rng_state = 0x9e3779b97f4a7c15u64;
         let mut mean_mc = 0.0f64;
         let mut deriv_mc = 0.0f64;
@@ -3730,13 +3730,13 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_batch_uses_same_dispatch_values() {
+    fn test_logit_batch_uses_same_dispatchvalues() {
         let ctx = QuadratureContext::new();
         let eta = ndarray::array![-2.0, 0.0, 1.25, 35.0];
         let se = ndarray::array![0.1, 0.5, 1.0, 1.0];
         let batch_mean = logit_posterior_mean_batch(&ctx, &eta, &se)
             .expect("logit posterior mean batch should evaluate");
-        let (batch_mu, batch_dmu) = logit_posterior_mean_with_deriv_batch(&ctx, &eta, &se)
+        let (batchmu, batch_dmu) = logit_posterior_meanwith_deriv_batch(&ctx, &eta, &se)
             .expect("logit posterior mean derivative batch should evaluate");
         for i in 0..eta.len() {
             let direct = integrated_inverse_link_mean_and_derivative(
@@ -3747,7 +3747,7 @@ mod tests {
             )
             .expect("logit integrated inverse-link moments should evaluate");
             assert_relative_eq!(batch_mean[i], direct.mean, epsilon = 1e-12);
-            assert_relative_eq!(batch_mu[i], direct.mean, epsilon = 1e-12);
+            assert_relative_eq!(batchmu[i], direct.mean, epsilon = 1e-12);
             assert_relative_eq!(batch_dmu[i], direct.dmean_dmu, epsilon = 1e-12);
         }
     }
@@ -3767,12 +3767,12 @@ mod tests {
     #[test]
     fn integrated_family_moments_supports_stateful_sas() {
         let ctx = QuadratureContext::new();
-        let sas = crate::mixture_link::state_from_sas_spec(crate::types::SasLinkSpec {
+        let sas = crate::mixture_link::state_from_sasspec(crate::types::SasLinkSpec {
             initial_epsilon: 0.3,
             initial_log_delta: -0.2,
         })
         .expect("sas state should reconstruct from raw parameters");
-        let out = integrated_family_moments_jet_with_state(
+        let out = integrated_family_moments_jetwith_state(
             &ctx,
             LikelihoodFamily::BinomialSas,
             0.2,

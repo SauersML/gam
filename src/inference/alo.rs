@@ -22,11 +22,11 @@ pub struct AloDiagnostics {
     pub se_sandwich: Array1<f64>,
     pub pred_identity: Array1<f64>,
     pub leverage: Array1<f64>,
-    pub fisher_weights: Array1<f64>,
+    pub fisherweights: Array1<f64>,
 }
 
 #[inline]
-fn alo_eta_update_with_offset(eta_hat: f64, z: f64, offset: f64, aii: f64) -> f64 {
+fn alo_eta_updatewith_offset(eta_hat: f64, z: f64, offset: f64, aii: f64) -> f64 {
     let denom = 1.0 - aii;
     // PIRLS solve is centered on offset:
     //   eta - offset = A (z - offset)
@@ -36,12 +36,12 @@ fn alo_eta_update_with_offset(eta_hat: f64, z: f64, offset: f64, aii: f64) -> f6
 }
 
 #[inline]
-fn bayes_var_eta(phi: f64, x_hinv_x: f64) -> f64 {
+fn bayesvar_eta(phi: f64, x_hinv_x: f64) -> f64 {
     phi * x_hinv_x
 }
 
 #[inline]
-fn sandwich_var_eta(phi: f64, x_hinv_x: f64, es_norm2: f64, ridge: f64, s_norm2: f64) -> f64 {
+fn sandwichvar_eta(phi: f64, x_hinv_x: f64, es_norm2: f64, ridge: f64, s_norm2: f64) -> f64 {
     // With H = X'WX + S + ridge*I and t = H^{-1}x_i:
     // t'X'WXt = t'Ht - t'St - ridge*||t||^2
     //         = x_i't - ||E t||^2 - ridge*||t||^2.
@@ -63,12 +63,12 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
 
-    let w = &base.final_weights;
+    let w = &base.finalweights;
 
     // Use the exact stabilized Hessian from PIRLS. This keeps ALO linearization
     // consistent with the curvature used in fitting and avoids adding a second,
     // ad-hoc ridge term in diagnostics.
-    let k = base.stabilized_hessian_transformed.clone();
+    let k = base.stabilizedhessian_transformed.clone();
     let p = k.nrows();
     let factor = StableSolver::new("alo stabilized hessian")
         .factorize(&k)
@@ -87,8 +87,8 @@ fn compute_alo_diagnostics_from_pirls_impl(
         LinkFunction::Identity => {
             let mut rss = 0.0;
             for i in 0..n {
-                let r = y[i] - base.final_mu[i];
-                let wi = base.final_weights[i];
+                let r = y[i] - base.finalmu[i];
+                let wi = base.finalweights[i];
                 rss += wi * r * r;
             }
             let dof = (n as f64) - base.edf;
@@ -99,14 +99,14 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
     let e = &base.reparam_result.e_transformed;
     let e_rank = e.nrows();
-    let e_view = FaerArrayView::new(e);
-    let ridge = base.ridge_passport.laplace_hessian_ridge().max(0.0);
+    let eview = FaerArrayView::new(e);
+    let ridge = base.ridge_passport.laplacehessianridge().max(0.0);
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_bayes = Array1::<f64>::zeros(n);
     let mut se_sandwich = Array1::<f64>::zeros(n);
     let eta_hat = base.final_eta.clone();
     let offset = &base.final_offset;
-    let z = &base.solve_working_response;
+    let z = &base.solveworking_response;
 
     let mut diag_counter = 0;
     let max_diag_samples = 5;
@@ -132,15 +132,15 @@ fn compute_alo_diagnostics_from_pirls_impl(
             .slice_mut(s![.., ..width])
             .assign(&xt.slice(s![.., chunk_start..chunk_end]));
 
-        let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
-        let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
+        let rhs_chunkview = rhs_chunk_buf.slice(s![.., ..width]);
+        let rhs_chunk = FaerArrayView::new(&rhs_chunkview);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
         let mut es_chunk_storage = FaerMat::<f64>::zeros(e_rank, width);
         if e_rank > 0 {
             matmul(
                 es_chunk_storage.as_mut(),
                 Accum::Replace,
-                e_view.as_ref(),
+                eview.as_ref(),
                 s_chunk.as_ref(),
                 1.0,
                 Par::Seq,
@@ -149,14 +149,14 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
         for local_col in 0..width {
             let obs = chunk_start + local_col;
-            let x_row = x_dense.row(obs);
+            let xrow = x_dense.row(obs);
             let mut x_hinv_x = 0.0f64;
             let mut s_norm2 = 0.0f64;
             for row in 0..p {
-                let s_val = s_chunk[(row, local_col)];
-                let x_val = x_row[row];
-                x_hinv_x = s_val.mul_add(x_val, x_hinv_x);
-                s_norm2 = s_val.mul_add(s_val, s_norm2);
+                let sval = s_chunk[(row, local_col)];
+                let xval = xrow[row];
+                x_hinv_x = sval.mul_add(xval, x_hinv_x);
+                s_norm2 = sval.mul_add(sval, s_norm2);
             }
             let ai = w[obs].max(0.0) * x_hinv_x;
             let mut es_norm2 = 0.0f64;
@@ -199,13 +199,13 @@ fn compute_alo_diagnostics_from_pirls_impl(
                 a_hi_99 += 1;
             }
 
-            let var_bayes = bayes_var_eta(phi, x_hinv_x);
-            let var_sandwich = sandwich_var_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
-            if var_sandwich == 0.0 && base.final_weights[obs] < 1e-10 {
+            let var_bayes = bayesvar_eta(phi, x_hinv_x);
+            let var_sandwich = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+            if var_sandwich == 0.0 && base.finalweights[obs] < 1e-10 {
                 log::warn!(
                     "[GAM ALO] obs {} has near-zero weight ({:.2e}) resulting in SE=0",
                     obs,
-                    base.final_weights[obs]
+                    base.finalweights[obs]
                 );
             }
             let var_sandwich_stable = var_sandwich.is_finite() && var_sandwich >= 0.0;
@@ -241,7 +241,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
             if diag_counter < max_diag_samples {
                 log::debug!("[GAM ALO] SE formula (obs {}):", obs);
-                log::debug!("  - w_i: {:.6e}", base.final_weights[obs]);
+                log::debug!("  - w_i: {:.6e}", base.finalweights[obs]);
                 log::debug!("  - a_ii: {:.6e}", ai);
                 log::debug!("  - x_i'H^-1 x_i: {:.6e}", x_hinv_x);
                 log::debug!("  - var_bayes: {:.6e}", var_bayes);
@@ -284,7 +284,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
             );
         }
 
-        eta_tilde[i] = alo_eta_update_with_offset(eta_hat[i], z[i], offset[i], aii[i]);
+        eta_tilde[i] = alo_eta_updatewith_offset(eta_hat[i], z[i], offset[i], aii[i]);
 
         if !eta_tilde[i].is_finite() {
             return Err(EstimationError::InvalidInput(format!(
@@ -312,7 +312,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
         0
     };
 
-    let mut percentile_value = |idx: usize| -> f64 {
+    let mut percentilevalue = |idx: usize| -> f64 {
         if percentiles.is_empty() {
             0.0
         } else {
@@ -324,9 +324,9 @@ fn compute_alo_diagnostics_from_pirls_impl(
     };
 
     let a_mean: f64 = if n == 0 { 0.0 } else { sum_aii / (n as f64) };
-    let a_median = percentile_value(p50_idx);
-    let a_p95 = percentile_value(p95_idx);
-    let a_p99 = percentile_value(p99_idx);
+    let a_median = percentilevalue(p50_idx);
+    let a_p95 = percentilevalue(p95_idx);
+    let a_p99 = percentilevalue(p99_idx);
     let a_max = if max_aii.is_finite() { max_aii } else { 0.0 };
 
     log::warn!(
@@ -389,7 +389,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
         se_sandwich,
         pred_identity: eta_hat,
         leverage: aii,
-        fisher_weights: base.final_weights.clone(),
+        fisherweights: base.finalweights.clone(),
     })
 }
 
@@ -428,7 +428,7 @@ pub fn compute_alo_diagnostics_from_pirls(
 
 #[cfg(test)]
 mod tests {
-    use super::{alo_eta_update_with_offset, bayes_var_eta, sandwich_var_eta};
+    use super::{alo_eta_updatewith_offset, bayesvar_eta, sandwichvar_eta};
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {
@@ -438,17 +438,17 @@ mod tests {
         let aii = 0.2;
         // centered: eta~=off + ((eta-off)-a(z-off))/(1-a)
         let expected = offset + ((eta_hat - offset) - aii * (z - offset)) / (1.0 - aii);
-        let got = alo_eta_update_with_offset(eta_hat, z, offset, aii);
+        let got = alo_eta_updatewith_offset(eta_hat, z, offset, aii);
         assert!((got - expected).abs() < 1e-12);
     }
 
     #[test]
-    fn alo_offset_update_reduces_to_classic_when_offset_zero() {
+    fn alo_offset_update_reduces_to_classicwhen_offsetzero() {
         let eta_hat = 1.25;
         let z = -0.5;
         let aii = 0.35;
         let expected = (eta_hat - aii * z) / (1.0 - aii);
-        let got = alo_eta_update_with_offset(eta_hat, z, 0.0, aii);
+        let got = alo_eta_updatewith_offset(eta_hat, z, 0.0, aii);
         assert!((got - expected).abs() < 1e-12);
     }
 
@@ -461,8 +461,8 @@ mod tests {
         let es_norm2 = 0.0;
         let ridge = 0.0;
         let s_norm2 = 0.0;
-        let vb = bayes_var_eta(phi, x_hinv_x);
-        let vs = sandwich_var_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+        let vb = bayesvar_eta(phi, x_hinv_x);
+        let vs = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
         assert!((vb - vs).abs() < 1e-12);
     }
 
@@ -475,7 +475,7 @@ mod tests {
         let es_norm2 = 0.05;
         let ridge = 1e-3;
         let s_norm2 = 2.0;
-        let got = sandwich_var_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+        let got = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
         let expected = phi * (x_hinv_x - es_norm2 - ridge * s_norm2);
         assert!((got - expected).abs() < 1e-12);
     }

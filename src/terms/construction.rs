@@ -73,17 +73,17 @@ impl PenaltyRepresentation {
                 dense
             }
             PenaltyRepresentation::Kronecker { left, right } => {
-                let (l_rows, l_cols) = left.dim();
-                let (r_rows, r_cols) = right.dim();
-                let mut result = Array2::zeros((l_rows * r_rows, l_cols * r_cols));
-                for i in 0..l_rows {
+                let (lrows, l_cols) = left.dim();
+                let (rrows, r_cols) = right.dim();
+                let mut result = Array2::zeros((lrows * rrows, l_cols * r_cols));
+                for i in 0..lrows {
                     for j in 0..l_cols {
                         let scale = left[(i, j)];
                         if scale == 0.0 {
                             continue;
                         }
                         let mut block = result.slice_mut(s![
-                            i * r_rows..(i + 1) * r_rows,
+                            i * rrows..(i + 1) * rrows,
                             j * r_cols..(j + 1) * r_cols
                         ]);
                         block.assign(&(right * scale));
@@ -139,16 +139,16 @@ impl PenaltyMatrix {
                 }
             }
             PenaltyRepresentation::Kronecker { left, right } => {
-                let (l_rows, l_cols) = left.dim();
-                let (r_rows, r_cols) = right.dim();
-                for i in 0..l_rows {
+                let (lrows, l_cols) = left.dim();
+                let (rrows, r_cols) = right.dim();
+                for i in 0..lrows {
                     for j in 0..l_cols {
                         let scale = left[(i, j)] * weight;
                         if scale == 0.0 {
                             continue;
                         }
                         let mut block = dest.slice_mut(s![
-                            i * r_rows..(i + 1) * r_rows,
+                            i * rrows..(i + 1) * rrows,
                             j * r_cols..(j + 1) * r_cols
                         ]);
                         block.scaled_add(scale, right);
@@ -189,16 +189,16 @@ fn mat_to_array(mat: &Mat<f64>) -> Array2<f64> {
 
 fn mat_max_abs_element(matrix: MatRef<'_, f64>) -> f64 {
     let (rows, cols) = matrix.shape();
-    let mut max_val = 0.0_f64;
+    let mut maxval = 0.0_f64;
     for i in 0..rows {
         for j in 0..cols {
             let val = matrix[(i, j)];
             if val.is_finite() {
-                max_val = max_val.max(val.abs());
+                maxval = maxval.max(val.abs());
             }
         }
     }
-    max_val
+    maxval
 }
 
 fn sanitize_symmetric_faer(matrix: &Mat<f64>) -> Mat<f64> {
@@ -307,14 +307,14 @@ fn clamp_eigenvalues_for_stability(eigenvalues: &mut [f64], context: &str) {
     }
 }
 
-fn robust_eigh_with_policy<M, V, E, Validate, Sanitize, EigCall, DiagScale, AddRidge, MapErr>(
+fn robust_eighwith_policy<M, V, E, Validate, Sanitize, EigCall, DiagScale, AddRidge, MapErr>(
     matrix: &M,
     context: &str,
     validate_input: Validate,
     sanitize: Sanitize,
     mut eig_call: EigCall,
     diag_scale: DiagScale,
-    mut add_ridge_to_diag: AddRidge,
+    mut addridge_to_diag: AddRidge,
     map_error: MapErr,
 ) -> Result<(Vec<f64>, V), EstimationError>
 where
@@ -348,7 +348,7 @@ where
                     1e-8
                 };
                 ridge = if ridge == 0.0 { base } else { ridge * 10.0 };
-                add_ridge_to_diag(&mut candidate, ridge);
+                addridge_to_diag(&mut candidate, ridge);
 
                 log::warn!(
                     "{} eigendecomposition failed on attempt {}. Added ridge {:.3e} before retrying.",
@@ -360,7 +360,7 @@ where
         }
     }
 
-    unreachable!("robust_eigh_with_policy should return or error within 4 attempts")
+    unreachable!("robust_eighwith_policy should return or error within 4 attempts")
 }
 
 fn robust_eigh_faer(
@@ -368,7 +368,7 @@ fn robust_eigh_faer(
     side: Side,
     context: &str,
 ) -> Result<(Vec<f64>, Mat<f64>), EstimationError> {
-    robust_eigh_with_policy(
+    robust_eighwith_policy(
         matrix,
         context,
         |mat, ctx| {
@@ -550,27 +550,27 @@ pub fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
 /// This is used to create tensor product penalties that enforce smoothness
 /// in multiple dimensions for interaction terms.
 pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    let (a_rows, a_cols) = a.dim();
-    let (b_rows, b_cols) = b.dim();
-    if a_rows == 0 || a_cols == 0 || b_rows == 0 || b_cols == 0 {
-        return Array2::zeros((a_rows * b_rows, a_cols * b_cols));
+    let (arows, a_cols) = a.dim();
+    let (brows, b_cols) = b.dim();
+    if arows == 0 || a_cols == 0 || brows == 0 || b_cols == 0 {
+        return Array2::zeros((arows * brows, a_cols * b_cols));
     }
-    let mut result = Array2::zeros((a_rows * b_rows, a_cols * b_cols));
+    let mut result = Array2::zeros((arows * brows, a_cols * b_cols));
 
     result
-        .axis_chunks_iter_mut(Axis(0), b_rows)
+        .axis_chunks_iter_mut(Axis(0), brows)
         .into_par_iter()
         .enumerate()
         .for_each(|(i, mut row_block)| {
-            let a_row = a.row(i);
+            let arow = a.row(i);
             let col_chunks = row_block.axis_chunks_iter_mut(Axis(1), b_cols);
             for (j, mut block) in col_chunks.into_iter().enumerate() {
-                let a_val = a_row[j];
-                if a_val == 0.0 {
+                let aval = arow[j];
+                if aval == 0.0 {
                     continue;
                 }
                 for (dest, &src) in block.iter_mut().zip(b.iter()) {
-                    *dest = a_val * src;
+                    *dest = aval * src;
                 }
             }
         });
@@ -584,7 +584,7 @@ pub fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
 }
 
 /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
-pub fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+pub fn rowwise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let n_samples = a.nrows();
     assert_eq!(
         n_samples,
@@ -1006,11 +1006,11 @@ pub fn stable_reparameterization(
     p: usize,
 ) -> Result<ReparamResult, EstimationError> {
     let invariant = precompute_reparam_invariant(rs_list, p)?;
-    stable_reparameterization_with_invariant(rs_list, lambdas, p, &invariant)
+    stable_reparameterizationwith_invariant(rs_list, lambdas, p, &invariant)
 }
 
 /// Apply stable reparameterization using precomputed lambda-invariant structures.
-pub fn stable_reparameterization_with_invariant(
+pub fn stable_reparameterizationwith_invariant(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     p: usize,
@@ -1213,7 +1213,7 @@ pub fn stable_reparameterization_with_invariant(
         .map(|&ev| ev.max(eigenvalue_floor).ln())
         .sum();
 
-    let mut det1_vec = vec![0.0; lambdas.len()];
+    let mut det1vec = vec![0.0; lambdas.len()];
 
     // Build S⁺ in TRANSFORMED coordinates:
     // diag(1/eig_i) on penalized coordinates, zero on null-space coordinates.
@@ -1232,14 +1232,14 @@ pub fn stable_reparameterization_with_invariant(
             // reduces to weighted diagonal entries on penalized coordinates.
             trace += s_plus[(i, i)] * s_k[(i, i)];
         }
-        det1_vec[k] = *lambda * trace;
+        det1vec[k] = *lambda * trace;
     }
 
     #[cfg(debug_assertions)]
     {
         // Algebraic guardrail: keep the optimized det1 path tied to the general
         // definition det1_k = lambda_k * tr(S⁺ S_k).
-        let mut max_det1_mismatch = 0.0_f64;
+        let mut maxdet1_mismatch = 0.0_f64;
         for (k, lambda) in lambdas.iter().enumerate() {
             let s_k = &s_k_transformed_cache[k];
             let mut product = Mat::<f64>::zeros(p, p);
@@ -1256,11 +1256,11 @@ pub fn stable_reparameterization_with_invariant(
                 trace += product[(i, i)];
             }
             let reference = *lambda * trace;
-            max_det1_mismatch = max_det1_mismatch.max((reference - det1_vec[k]).abs());
+            maxdet1_mismatch = maxdet1_mismatch.max((reference - det1vec[k]).abs());
         }
         assert!(
-            max_det1_mismatch <= 1e-9,
-            "det1 mismatch between optimized and reference formulas: max_abs={max_det1_mismatch:.3e}"
+            maxdet1_mismatch <= 1e-9,
+            "det1 mismatch between optimized and reference formulas: max_abs={maxdet1_mismatch:.3e}"
         );
     }
 
@@ -1306,7 +1306,7 @@ pub fn stable_reparameterization_with_invariant(
     Ok(ReparamResult {
         s_transformed: mat_to_array(&s_truncated),
         log_det,
-        det1: Array1::from(det1_vec),
+        det1: Array1::from(det1vec),
         qs: mat_to_array(&qs),
         rs_transformed: rs_transformed.iter().map(mat_to_array).collect(),
         rs_transposed: rs_transformed
@@ -1341,13 +1341,13 @@ pub fn stable_reparameterization_engine(
 }
 
 /// Engine-facing stable reparameterization API with precomputed invariant using only `(p, k)`.
-pub fn stable_reparameterization_with_invariant_engine(
+pub fn stable_reparameterizationwith_invariant_engine(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     dims: EngineDims,
     invariant: &ReparamInvariant,
 ) -> Result<ReparamResult, EstimationError> {
-    stable_reparameterization_with_invariant(rs_list, lambdas, dims.p, invariant)
+    stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, invariant)
 }
 
 /// Result of the stable penalized least squares solve
@@ -1434,7 +1434,7 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 mod tests {
     use super::{
         SubspaceLeakageMetrics, assess_subspace_leakage, precompute_reparam_invariant,
-        stable_reparameterization_with_invariant,
+        stable_reparameterizationwith_invariant,
     };
     use faer::Mat;
     use ndarray::{Array2, array};
@@ -1449,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn subspace_leakage_is_zero_for_clean_split() {
+    fn subspace_leakage_iszero_for_clean_split() {
         let p = 4usize;
         let structural_rank = 2usize;
         let qs = Mat::<f64>::identity(p, p);
@@ -1494,7 +1494,7 @@ mod tests {
         let rs_list = vec![array![[1.0, 0.0, 0.0]]];
         let lambdas = vec![2.0];
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
             .expect("stable reparam");
 
         let expected = rep.qs.t().dot(&inv.split.q_null);
@@ -1507,12 +1507,12 @@ mod tests {
     }
 
     #[test]
-    fn u_truncated_is_identity_when_no_penalties() {
+    fn u_truncated_is_identitywhen_no_penalties() {
         let p = 4usize;
         let rs_list: Vec<Array2<f64>> = Vec::new();
         let lambdas: Vec<f64> = Vec::new();
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
             .expect("stable reparam");
         assert_eq!(rep.u_truncated, Array2::<f64>::eye(p));
     }
@@ -1525,7 +1525,7 @@ mod tests {
         let rs_list = vec![array![[inv_sqrt2, inv_sqrt2, 0.0]]];
         let lambdas = vec![4.0];
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
             .expect("stable reparam");
 
         assert_eq!(rep.e_transformed.nrows(), 1);
@@ -1566,7 +1566,7 @@ mod tests {
         let lambdas = vec![5.0];
 
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
             .expect("stable reparam");
 
         assert_eq!(rep.e_transformed.nrows(), p);

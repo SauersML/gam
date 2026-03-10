@@ -1,5 +1,5 @@
 use gam::estimate::{
-    ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
     optimize_external_design,
 };
 use gam::types::{LikelihoodFamily, SasLinkSpec};
@@ -56,12 +56,12 @@ fn default_logit_opts() -> ExternalOptimOptions {
 }
 
 #[test]
-fn analytic_gradient_sign_matches_local_cost_trend() {
+fn analytic_gradient_sign_matches_localcost_trend() {
     let (x, y, w, s_list) = make_binary_external_problem(11, 120, 8);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = default_logit_opts();
 
-    let (analytic, _fd) = evaluate_external_gradients(
+    let (analytic, fd) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),
@@ -73,7 +73,7 @@ fn analytic_gradient_sign_matches_local_cost_trend() {
     .expect("gradients");
 
     let h = 0.25;
-    let c_minus = evaluate_external_cost_and_ridge(
+    let c_minus = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -84,7 +84,7 @@ fn analytic_gradient_sign_matches_local_cost_trend() {
     )
     .map(|(c, _)| c)
     .expect("cost-");
-    let c_plus = evaluate_external_cost_and_ridge(
+    let c_plus = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -113,13 +113,13 @@ fn analytic_gradient_sign_matches_local_cost_trend() {
 }
 
 #[test]
-fn optimizer_reduces_external_objective() {
+fn optimizer_reduces_externalobjective() {
     let (x, y, w, s_list) = make_binary_external_problem(12, 140, 10);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = default_logit_opts();
 
     let rho0 = array![0.0];
-    let c0 = evaluate_external_cost_and_ridge(
+    let c0 = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -142,7 +142,7 @@ fn optimizer_reduces_external_objective() {
     .expect("opt");
 
     let rho_opt = result.lambdas.mapv(f64::ln);
-    let c1 = evaluate_external_cost_and_ridge(
+    let c1 = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -166,7 +166,7 @@ fn gradient_components_remain_finite_across_rho_sweep() {
     let offset = Array1::<f64>::zeros(y.len());
     let opts = default_logit_opts();
     for rho in [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
-        let (analytic, fd) = evaluate_external_gradients(
+        let (analytic, fd) = evaluate_externalgradients(
             y.view(),
             w.view(),
             x.view(),
@@ -185,7 +185,7 @@ fn gradient_components_remain_finite_across_rho_sweep() {
 }
 
 #[test]
-fn sas_helper_cost_depends_on_link_state() {
+fn sas_helpercost_depends_on_link_state() {
     let (x, y, w, s_list) = make_binary_external_problem(21, 120, 6);
     let offset = Array1::<f64>::zeros(y.len());
     let rho = array![0.7];
@@ -203,7 +203,7 @@ fn sas_helper_cost_depends_on_link_state() {
         initial_log_delta: -0.6,
     });
 
-    let cost_a = evaluate_external_cost_and_ridge(
+    let cost_a = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -214,7 +214,7 @@ fn sas_helper_cost_depends_on_link_state() {
     )
     .map(|(cost, _)| cost)
     .expect("sas cost with baseline state");
-    let cost_b = evaluate_external_cost_and_ridge(
+    let cost_b = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -233,7 +233,7 @@ fn sas_helper_cost_depends_on_link_state() {
 }
 
 #[test]
-fn conditioned_helper_cost_matches_fitted_objective() {
+fn conditioned_helpercost_matches_fittedobjective() {
     let n = 160usize;
     let mut x = Array2::<f64>::zeros((n, 3));
     for i in 0..n {
@@ -275,7 +275,7 @@ fn conditioned_helper_cost_matches_fitted_objective() {
     )
     .expect("gaussian external fit");
     let rho = result.lambdas.mapv(f64::ln);
-    let helper_cost = evaluate_external_cost_and_ridge(
+    let helpercost = evaluate_externalcost_andridge(
         y.view(),
         w.view(),
         x.view(),
@@ -288,8 +288,8 @@ fn conditioned_helper_cost_matches_fitted_objective() {
     .expect("conditioned helper cost");
 
     assert!(
-        (helper_cost - result.reml_score).abs() < 1e-7,
-        "conditioned helper cost should match fitted REML score: helper={helper_cost} fit={}",
+        (helpercost - result.reml_score).abs() < 1e-7,
+        "conditioned helper cost should match fitted REML score: helper={helpercost} fit={}",
         result.reml_score
     );
 }

@@ -153,11 +153,11 @@ fn emit_stage_detail(detail: &str) {
 fn install_stage_panic_hook() {
     let tracker: &'static Mutex<String> = CURRENT_STAGE.get_or_init(|| Mutex::new(String::new()));
     std::panic::set_hook(Box::new(move |info| {
-        let stage_name = tracker
+        let stagename = tracker
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_else(|_| String::from("<stage lock poisoned>"));
-        eprintln!("\n⚠️ build script panic while processing stage: {stage_name}");
+        eprintln!("\n⚠️ build script panic while processing stage: {stagename}");
         eprintln!("{info}");
     }));
 }
@@ -175,9 +175,9 @@ fn detect_total_memory_bytes() -> Option<u64> {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
                 if let Some(rest) = line.strip_prefix("MemTotal:") {
-                    let mut parts = rest.split_whitespace();
-                    if let Some(raw_value) = parts.next() {
-                        if let Ok(kib) = raw_value.parse::<u64>() {
+                    let mut parts = rest.splitwhitespace();
+                    if let Some(rawvalue) = parts.next() {
+                        if let Ok(kib) = rawvalue.parse::<u64>() {
                             return Some(kib.saturating_mul(1024));
                         }
                     }
@@ -259,11 +259,11 @@ impl ViolationCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} underscore-prefixed variables in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -293,11 +293,11 @@ impl DisallowedLetCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} disallowed 'let _ =' patterns in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -328,11 +328,11 @@ impl TupleWildcardCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} tuple destructuring patterns discarding values in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -363,11 +363,11 @@ impl NoopTouchCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} no-op touch statements in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -397,11 +397,11 @@ impl ForbiddenCommentCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} forbidden comment patterns in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -433,11 +433,11 @@ impl CustomUppercaseCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} comments with excessive uppercase alphabetic characters in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -466,11 +466,11 @@ impl DashHeavyCommentCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} comments composed primarily of dashes in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -499,11 +499,11 @@ impl DeadCodeCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} forbidden 'allow(unused...)' attributes in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -515,7 +515,7 @@ impl DeadCodeCollector {
         error_msg.push_str("   - #[allow(dead_code)]\n");
         error_msg.push_str("   - #[allow(unused)] / #![allow(unused)]\n");
         error_msg.push_str("   - #[allow(unused_imports)]\n");
-        error_msg.push_str("   - #[allow(unused_variables)]\n");
+        error_msg.push_str("   - #[allow(unusedvariables)]\n");
         error_msg.push_str(
             "\n   Do not suppress these warnings. Delete or use the unused code/imports instead.\n",
         );
@@ -537,11 +537,11 @@ impl IgnoredTestCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} #[ignore] test attributes in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -570,11 +570,11 @@ impl DropUsageCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} disallowed drop(...) usages in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -601,11 +601,11 @@ impl EmptyBlockCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} empty control-flow blocks in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -632,11 +632,11 @@ impl DebugAssertCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} debug_assert! usages in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -663,11 +663,11 @@ impl TodoCommentCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} TODO/FIXME comments in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -695,11 +695,11 @@ impl MeaninglessConditionalCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} meaningless conditionals in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -732,11 +732,11 @@ impl NoEffectCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} #[allow(clippy::no_effect)] attributes in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -746,7 +746,7 @@ impl NoEffectCollector {
         error_msg
             .push_str("\n⚠️ #[allow(clippy::no_effect)] IS STRICTLY FORBIDDEN IN THIS PROJECT!\n");
         error_msg.push_str(
-            "   This is used to suppress warnings about no-op variable access like { variable_name; }\n",
+            "   This is used to suppress warnings about no-op variable access like { variablename; }\n",
         );
         error_msg.push_str(
             "   If a parameter is truly unused, delete it and refactor the function signature.\n",
@@ -770,11 +770,11 @@ impl OmittedForBrevityCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} \"omitted for brevity\" comments in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -805,11 +805,11 @@ impl DeprecatedCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} #[deprecated] attributes in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -838,11 +838,11 @@ impl PlaceholderStubCollector {
             return None;
         }
 
-        let file_name = self.file_path.to_str().unwrap_or("?");
+        let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
             "\n❌ ERROR: Found {} placeholder stub functions in {}:\n",
             self.violations.len(),
-            file_name
+            filename
         );
 
         for violation in &self.violations {
@@ -901,24 +901,24 @@ impl Sink for ViolationCollector {
             return Ok(true); // Skip this match and continue searching
         }
 
-        let mut has_violation = false;
+        let mut hasviolation = false;
         let mut token = String::new();
         for ch in line_text.chars() {
             if ch.is_ascii_alphanumeric() || ch == '_' {
                 token.push(ch);
             } else if !token.is_empty() {
                 if is_disallowed_underscore_token(&token) {
-                    has_violation = true;
+                    hasviolation = true;
                     break;
                 }
                 token.clear();
             }
         }
-        if !has_violation && !token.is_empty() && is_disallowed_underscore_token(&token) {
-            has_violation = true;
+        if !hasviolation && !token.is_empty() && is_disallowed_underscore_token(&token) {
+            hasviolation = true;
         }
 
-        if has_violation {
+        if hasviolation {
             // Format the violation string exactly as the `rg -n` command would.
             self.violations.push(format!("{line_number}:{line_text}"));
         }
@@ -1288,9 +1288,9 @@ impl Sink for CustomUppercaseCollector {
 
         // Find all alphabetic characters and non-whitespace characters for ratio checks.
         let alpha_count = comment_text.chars().filter(|c| c.is_alphabetic()).count();
-        let non_whitespace_count = comment_text.chars().filter(|c| !c.is_whitespace()).count();
+        let nonwhitespace_count = comment_text.chars().filter(|c| !c.is_whitespace()).count();
 
-        if alpha_count > 0 && non_whitespace_count > 0 {
+        if alpha_count > 0 && nonwhitespace_count > 0 {
             // Only count uppercase letters that are part of multi-letter words.
             let mut uppercase_count = 0usize;
             let mut run: Vec<char> = Vec::new();
@@ -1311,7 +1311,7 @@ impl Sink for CustomUppercaseCollector {
             flush_run(&mut run, &mut uppercase_count);
 
             let uppercase_ratio = uppercase_count as f64 / alpha_count as f64;
-            let alpha_ratio = alpha_count as f64 / non_whitespace_count as f64;
+            let alpha_ratio = alpha_count as f64 / nonwhitespace_count as f64;
 
             // Ignore math-heavy or single-letter comments by requiring enough alphabetic content.
             let has_enough_alpha = alpha_count >= 6 && alpha_ratio >= 0.6;
@@ -1352,14 +1352,14 @@ impl Sink for DashHeavyCommentCollector {
             return Ok(true);
         };
 
-        let non_whitespace_chars: Vec<char> = comment_text
+        let nonwhitespace_chars: Vec<char> = comment_text
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
 
-        if !non_whitespace_chars.is_empty() {
-            let dash_count = non_whitespace_chars.iter().filter(|c| **c == '-').count();
-            let dash_ratio = dash_count as f64 / non_whitespace_chars.len() as f64;
+        if !nonwhitespace_chars.is_empty() {
+            let dash_count = nonwhitespace_chars.iter().filter(|c| **c == '-').count();
+            let dash_ratio = dash_count as f64 / nonwhitespace_chars.len() as f64;
 
             if dash_ratio > 0.8 {
                 self.violations.push(format!("{line_number}:{line_text}"));
@@ -1534,11 +1534,11 @@ fn extract_if_else_branches(line: &str) -> Option<(String, String)> {
 
     // Find the opening brace after else
     let second_open = after_else.find('{')?;
-    let after_second_open = &after_else[second_open + 1..];
+    let aftersecond_open = &after_else[second_open + 1..];
 
     // Find the closing brace
-    let second_close = after_second_open.find('}')?;
-    let branch2 = &after_second_open[..second_close];
+    let second_close = aftersecond_open.find('}')?;
+    let branch2 = &aftersecond_open[..second_close];
 
     Some((branch1.to_string(), branch2.to_string()))
 }
@@ -1655,197 +1655,197 @@ fn main() {
 
     // Manually check for unused variables in the build script
     update_stage("manual lint self-check");
-    manually_check_for_unused_variables();
+    manually_check_for_unusedvariables();
 
     // Collect all violations from all checks
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     // Scan Rust source files for underscore prefixed variables
     update_stage("scan underscore-prefixed bindings");
-    let underscore_violations = scan_for_underscore_prefixes();
+    let underscoreviolations = scan_for_underscore_prefixes();
     let underscore_report = format!(
         "underscore scan identified {} violation groups",
-        underscore_violations.len()
+        underscoreviolations.len()
     );
     emit_stage_detail(&underscore_report);
-    all_violations.extend(underscore_violations);
+    allviolations.extend(underscoreviolations);
 
     // Scan Rust source files for disallowed `let _ = token;` patterns
     update_stage("scan disallowed let ignore patterns");
-    let disallowed_let_violations = scan_for_disallowed_let_patterns();
+    let disallowed_letviolations = scan_for_disallowed_let_patterns();
     let disallowed_let_report = format!(
         "disallowed let pattern scan identified {} violation groups",
-        disallowed_let_violations.len()
+        disallowed_letviolations.len()
     );
     emit_stage_detail(&disallowed_let_report);
-    all_violations.extend(disallowed_let_violations);
+    allviolations.extend(disallowed_letviolations);
 
     // Scan Rust source files for no-op touch statements
     update_stage("scan no-op touch statements");
-    let noop_touch_violations = scan_for_noop_touch_patterns();
+    let noop_touchviolations = scan_for_noop_touch_patterns();
     let noop_touch_report = format!(
         "no-op touch scan identified {} violation groups",
-        noop_touch_violations.len()
+        noop_touchviolations.len()
     );
     emit_stage_detail(&noop_touch_report);
-    all_violations.extend(noop_touch_violations);
+    allviolations.extend(noop_touchviolations);
 
     // Scan Rust source files for tuple destructuring patterns that discard values
     update_stage("scan tuple destructuring ignores");
-    let tuple_wildcard_violations = scan_for_tuple_wildcard_patterns();
-    let tuple_wildcard_report = format!(
+    let tuplewildcardviolations = scan_for_tuplewildcard_patterns();
+    let tuplewildcard_report = format!(
         "tuple destructuring ignore scan identified {} violation groups",
-        tuple_wildcard_violations.len()
+        tuplewildcardviolations.len()
     );
-    emit_stage_detail(&tuple_wildcard_report);
-    all_violations.extend(tuple_wildcard_violations);
+    emit_stage_detail(&tuplewildcard_report);
+    allviolations.extend(tuplewildcardviolations);
 
     // Scan Rust source files for forbidden comment patterns
     update_stage("scan forbidden comment patterns");
-    let comment_violations = scan_for_forbidden_comment_patterns();
+    let commentviolations = scan_for_forbidden_comment_patterns();
     let comment_report = format!(
         "forbidden comment scan identified {} violation groups",
-        comment_violations.len()
+        commentviolations.len()
     );
     emit_stage_detail(&comment_report);
-    all_violations.extend(comment_violations);
+    allviolations.extend(commentviolations);
 
     // Scan Rust source files for #[allow(dead_code)] attributes
     update_stage("scan allow(dead_code) attributes");
-    let dead_code_violations = scan_for_allow_dead_code();
+    let dead_codeviolations = scan_for_allow_dead_code();
     let dead_code_report = format!(
         "allow(dead_code) scan identified {} violation groups",
-        dead_code_violations.len()
+        dead_codeviolations.len()
     );
     emit_stage_detail(&dead_code_report);
-    all_violations.extend(dead_code_violations);
+    allviolations.extend(dead_codeviolations);
 
     // Scan Rust source files for #[ignore] test attributes
     update_stage("scan #[ignore] test annotations");
-    let ignored_test_violations = scan_for_ignored_tests();
+    let ignored_testviolations = scan_for_ignored_tests();
     let ignored_report = format!(
         "ignored test scan identified {} violation groups",
-        ignored_test_violations.len()
+        ignored_testviolations.len()
     );
     emit_stage_detail(&ignored_report);
-    all_violations.extend(ignored_test_violations);
+    allviolations.extend(ignored_testviolations);
 
     // Scan build scripts for forbidden drop(...) usage
     update_stage("scan build script drop usage");
-    let drop_usage_violations = scan_for_drop_in_build_scripts();
+    let drop_usageviolations = scan_for_drop_in_build_scripts();
     let drop_usage_report = format!(
         "build script drop scan identified {} violation groups",
-        drop_usage_violations.len()
+        drop_usageviolations.len()
     );
     emit_stage_detail(&drop_usage_report);
-    all_violations.extend(drop_usage_violations);
+    allviolations.extend(drop_usageviolations);
 
     // Scan Rust source files for forbidden drop(...) usage
     update_stage("scan drop usage");
-    let drop_usage_violations = scan_for_drop_usage();
+    let drop_usageviolations = scan_for_drop_usage();
     let drop_usage_report = format!(
         "drop usage scan identified {} violation groups",
-        drop_usage_violations.len()
+        drop_usageviolations.len()
     );
     emit_stage_detail(&drop_usage_report);
-    all_violations.extend(drop_usage_violations);
+    allviolations.extend(drop_usageviolations);
 
     update_stage("scan empty control-flow blocks");
-    let empty_block_violations = scan_for_empty_control_blocks();
+    let empty_blockviolations = scan_for_empty_control_blocks();
     let empty_block_report = format!(
         "empty control-flow block scan identified {} violation groups",
-        empty_block_violations.len()
+        empty_blockviolations.len()
     );
     emit_stage_detail(&empty_block_report);
-    all_violations.extend(empty_block_violations);
+    allviolations.extend(empty_blockviolations);
 
     update_stage("scan debug_assert usage");
-    let debug_assert_violations = scan_for_debug_assert_usage();
+    let debug_assertviolations = scan_for_debug_assert_usage();
     let debug_assert_report = format!(
         "debug_assert scan identified {} violation groups",
-        debug_assert_violations.len()
+        debug_assertviolations.len()
     );
     emit_stage_detail(&debug_assert_report);
-    all_violations.extend(debug_assert_violations);
+    allviolations.extend(debug_assertviolations);
 
     // Scan for TODO/FIXME/"for now" comments
     update_stage("scan TODO/FIXME comments");
-    let todo_violations = scan_for_todo_comments();
+    let todoviolations = scan_for_todo_comments();
     let todo_report = format!(
         "TODO/FIXME comment scan identified {} violation groups",
-        todo_violations.len()
+        todoviolations.len()
     );
     emit_stage_detail(&todo_report);
-    all_violations.extend(todo_violations);
+    allviolations.extend(todoviolations);
 
     // Scan for meaningless conditionals (same branches)
     update_stage("scan meaningless conditionals");
-    let meaningless_cond_violations = scan_for_meaningless_conditionals();
+    let meaningless_condviolations = scan_for_meaningless_conditionals();
     let meaningless_cond_report = format!(
         "meaningless conditional scan identified {} violation groups",
-        meaningless_cond_violations.len()
+        meaningless_condviolations.len()
     );
     emit_stage_detail(&meaningless_cond_report);
-    all_violations.extend(meaningless_cond_violations);
+    allviolations.extend(meaningless_condviolations);
 
     // Scan for fake usage patterns (dummy checks masking unused variables)
     update_stage("scan fake usage patterns");
-    let fake_usage_violations = scan_for_fake_usage();
+    let fake_usageviolations = scan_for_fake_usage();
     let fake_usage_report = format!(
         "fake usage scan identified {} violation groups",
-        fake_usage_violations.len()
+        fake_usageviolations.len()
     );
     emit_stage_detail(&fake_usage_report);
-    all_violations.extend(fake_usage_violations);
+    allviolations.extend(fake_usageviolations);
     // Scan for #[allow(clippy::no_effect)] attributes
     update_stage("scan #[allow(clippy::no_effect)] attributes");
-    let no_effect_violations = scan_for_no_effect_allow();
+    let no_effectviolations = scan_for_no_effect_allow();
     let no_effect_report = format!(
         "no_effect allow scan identified {} violation groups",
-        no_effect_violations.len()
+        no_effectviolations.len()
     );
     emit_stage_detail(&no_effect_report);
-    all_violations.extend(no_effect_violations);
+    allviolations.extend(no_effectviolations);
 
     // Scan for "omitted for brevity" and similar comments
     update_stage("scan omitted for brevity comments");
-    let omitted_violations = scan_for_omitted_for_brevity();
+    let omittedviolations = scan_for_omitted_for_brevity();
     let omitted_report = format!(
         "omitted for brevity scan identified {} violation groups",
-        omitted_violations.len()
+        omittedviolations.len()
     );
     emit_stage_detail(&omitted_report);
-    all_violations.extend(omitted_violations);
+    allviolations.extend(omittedviolations);
 
     // Scan for #[deprecated] attributes
     update_stage("scan #[deprecated] attributes");
-    let deprecated_violations = scan_for_deprecated();
+    let deprecatedviolations = scan_for_deprecated();
     let deprecated_report = format!(
         "deprecated attribute scan identified {} violation groups",
-        deprecated_violations.len()
+        deprecatedviolations.len()
     );
     emit_stage_detail(&deprecated_report);
-    all_violations.extend(deprecated_violations);
+    allviolations.extend(deprecatedviolations);
 
     // Scan for placeholder stub functions
     update_stage("scan placeholder stub functions");
-    let placeholder_violations = scan_for_placeholder_stubs();
+    let placeholderviolations = scan_for_placeholder_stubs();
     let placeholder_report = format!(
         "placeholder stub scan identified {} violation groups",
-        placeholder_violations.len()
+        placeholderviolations.len()
     );
     emit_stage_detail(&placeholder_report);
-    all_violations.extend(placeholder_violations);
+    allviolations.extend(placeholderviolations);
 
     // If any violations were found, print them all and exit with error
-    if !all_violations.is_empty() {
+    if !allviolations.is_empty() {
         update_stage("report validation errors");
         eprintln!("\n❌ VALIDATION ERRORS");
         eprintln!("====================");
 
-        let violation_count = all_violations.len();
+        let violation_count = allviolations.len();
 
-        for violation in all_violations {
+        for violation in allviolations {
             eprintln!("{violation}");
             eprintln!("--------------------");
         }
@@ -1862,8 +1862,8 @@ fn main() {
 }
 
 // This function manually checks for unused variables in the current file
-fn manually_check_for_unused_variables() {
-    // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
+fn manually_check_for_unusedvariables() {
+    // Force compilation to fail with unusedvariables, dead_code, and unused_imports lint
     // This ensures build.rs itself follows the strict coding policy
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
@@ -1909,21 +1909,21 @@ fn manually_check_for_unused_variables() {
     manual_lint_args.push(OsString::from("-L"));
     manual_lint_args.push(OsString::from(format!("dependency={}", deps_dir.display())));
 
-    for crate_name in ["grep", "walkdir"] {
-        match locate_build_dependency(&deps_dir, crate_name) {
+    for cratename in ["grep", "walkdir"] {
+        match locate_build_dependency(&deps_dir, cratename) {
             Some(artifact_path) => {
                 manual_lint_args.push(OsString::from("--extern"));
                 manual_lint_args.push(OsString::from(format!(
-                    "{crate_name}={}",
+                    "{cratename}={}",
                     artifact_path.display()
                 )));
             }
             None => {
                 emit_stage_detail(&format!(
-                    "manual lint self-check: missing rlib for dependency '{crate_name}'"
+                    "manual lint self-check: missing rlib for dependency '{cratename}'"
                 ));
                 eprintln!(
-                    "manual lint self-check fatal error: required dependency '{crate_name}' rlib not found in {:?}",
+                    "manual lint self-check fatal error: required dependency '{cratename}' rlib not found in {:?}",
                     deps_dir
                 );
                 std::process::exit(1);
@@ -2062,7 +2062,7 @@ fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
         OsString::from("--emit"),
         OsString::from("metadata"),
         OsString::from("-D"),
-        OsString::from("unused_variables"),
+        OsString::from("unusedvariables"),
         OsString::from("-D"),
         OsString::from("dead_code"),
         OsString::from("-D"),
@@ -2082,8 +2082,8 @@ fn build_dependencies_directory() -> Option<PathBuf> {
 }
 
 #[allow(clippy::collapsible_if)]
-fn locate_build_dependency(deps_dir: &Path, crate_name: &str) -> Option<PathBuf> {
-    let prefix = format!("lib{crate_name}-");
+fn locate_build_dependency(deps_dir: &Path, cratename: &str) -> Option<PathBuf> {
+    let prefix = format!("lib{cratename}-");
     let mut candidate: Option<PathBuf> = None;
     let mut candidate_mtime = std::time::SystemTime::UNIX_EPOCH;
 
@@ -2094,12 +2094,12 @@ fn locate_build_dependency(deps_dir: &Path, crate_name: &str) -> Option<PathBuf>
                 continue;
             }
 
-            let file_name = match path.file_name().and_then(|name| name.to_str()) {
+            let filename = match path.file_name().and_then(|name| name.to_str()) {
                 Some(name) => name,
                 None => continue,
             };
 
-            if file_name.starts_with(&prefix) {
+            if filename.starts_with(&prefix) {
                 if let Ok(metadata) = std::fs::metadata(&path) {
                     if let Ok(mtime) = metadata.modified() {
                         if candidate.is_none() || mtime > candidate_mtime {
@@ -2131,7 +2131,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
     // Allow SIMD intrinsics like _mm512_* while still flagging underscore-prefixed bindings.
     // (grep regex doesn't support look-around, so filtering happens in the collector.)
     let pattern = r"\b_[a-zA-Z0-9_]+\b";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2179,13 +2179,13 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
                 // Process results
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     // Add this error to our collection instead of returning immediately
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
             // If there's an error creating the matcher, report it but don't return early
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating regex matcher for underscore prefixes: {}",
                 e
             ));
@@ -2193,12 +2193,12 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
     }
 
     // Return all violations found
-    all_violations
+    allviolations
 }
 
 fn scan_for_disallowed_let_patterns() -> Vec<String> {
     let pattern = r"\blet\s+(?:mut\s+)?_\s*=";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2226,24 +2226,24 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating regex matcher for disallowed let patterns: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_noop_touch_patterns() -> Vec<String> {
     let pattern = r"^\s*[A-Za-z_][A-Za-z0-9_:<>]*\s*;\s*$|^\s*[^=]*\.\s*(as_ref|as_mut|as_ptr|clone|to_string|to_owned|as_bytes|as_str|len|is_empty)\s*\(\s*\)\s*;\s*$";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2271,24 +2271,24 @@ fn scan_for_noop_touch_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating regex matcher for no-op touch patterns: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
-fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
+fn scan_for_tuplewildcard_patterns() -> Vec<String> {
     let pattern = r"\blet\s*\([^)]*\b_\b[^)]*\)\s*(?::[^=]*)?=";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2316,19 +2316,19 @@ fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating regex matcher for tuple wildcard patterns: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn is_doc_comment(line: &str) -> bool {
@@ -2339,11 +2339,11 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     // Regex patterns to find forbidden comment patterns
     // Note: We specifically target comments by looking for // or /* */ patterns
     // This ensures we don't flag these terms in actual code
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     // Split into separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
-    let forbidden_words_pattern = r"(//|/\*|///).*(?:DEPRECATED|CRITICAL|FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
+    let forbiddenwords_pattern = r"(//|/\*|///).*(?:DEPRECATED|CRITICAL|FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
     // 3. Pattern to catch comments for uppercase ratio enforcement
@@ -2352,7 +2352,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     let dash_heavy_pattern = r"(//|/\*|///).*";
 
     // Check for forbidden words
-    match RegexMatcher::new_line_matcher(forbidden_words_pattern) {
+    match RegexMatcher::new_line_matcher(forbiddenwords_pattern) {
         Ok(forbidden_matcher) => {
             let mut searcher = Searcher::new();
 
@@ -2375,13 +2375,13 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
             // Record the error but continue checking other patterns
-            all_violations.push(format!("Error creating forbidden words regex: {}", e));
+            allviolations.push(format!("Error creating forbidden words regex: {}", e));
         }
     }
 
@@ -2410,13 +2410,13 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
             // Record the error but continue checking other patterns
-            all_violations.push(format!("Error creating stars pattern regex: {}", e));
+            allviolations.push(format!("Error creating stars pattern regex: {}", e));
         }
     }
 
@@ -2443,13 +2443,13 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = custom_collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
             // Record the error but don't return early
-            all_violations.push(format!("Error creating uppercase pattern regex: {}", e));
+            allviolations.push(format!("Error creating uppercase pattern regex: {}", e));
         }
     }
 
@@ -2476,16 +2476,16 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
                 }
 
                 if let Some(error_message) = dash_collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!("Error creating dash-heavy pattern regex: {}", e));
+            allviolations.push(format!("Error creating dash-heavy pattern regex: {}", e));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_allow_dead_code() -> Vec<String> {
@@ -2494,10 +2494,10 @@ fn scan_for_allow_dead_code() -> Vec<String> {
     // - #[allow(dead_code)] or #![allow(dead_code)]
     // - #[allow(unused)]
     // - #[allow(unused_imports)]
-    // - #[allow(unused_variables)]
+    // - #[allow(unusedvariables)]
     // - #[allow(..., unused, ...)] (inside lists)
-    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unused_variables)\b[^)]*\)\s*\]";
-    let mut all_violations = Vec::new();
+    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unusedvariables)\b[^)]*\)\s*\]";
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2533,18 +2533,18 @@ fn scan_for_allow_dead_code() -> Vec<String> {
                 // Process results
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     // Add this error to our collection instead of returning immediately
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
             // If there's an error creating the matcher, report it but don't return early
-            all_violations.push(format!("Error creating dead code regex matcher: {}", e));
+            allviolations.push(format!("Error creating dead code regex matcher: {}", e));
         }
     }
 
     // Return all violations found
-    all_violations
+    allviolations
 }
 
 fn scan_for_ignored_tests() -> Vec<String> {
@@ -2555,7 +2555,7 @@ fn scan_for_ignored_tests() -> Vec<String> {
     // - #[cfg_attr(..., ignore)]
     // - #[cfg_attr(..., ignore = "reason")]
     let pattern = r"#\s*\[.*\bignore\b";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2591,25 +2591,25 @@ fn scan_for_ignored_tests() -> Vec<String> {
                 // Process results
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     // Add this error to our collection instead of returning immediately
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
             // If there's an error creating the matcher, report it but don't return early
-            all_violations.push(format!("Error creating ignored tests regex matcher: {}", e));
+            allviolations.push(format!("Error creating ignored tests regex matcher: {}", e));
         }
     }
 
     // Return all violations found
-    all_violations
+    allviolations
 }
 
 fn scan_for_todo_comments() -> Vec<String> {
     // Regex pattern to find TODO/FIXME/"for now" comments (case insensitive)
     // Matches: TODO, FIXME, XXX, "for now" in comments
     let pattern = r"(?i)//.*\b(TODO|FIXME|XXX|for now)\b";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2639,21 +2639,21 @@ fn scan_for_todo_comments() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!("Error creating TODO comment regex matcher: {}", e));
+            allviolations.push(format!("Error creating TODO comment regex matcher: {}", e));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_drop_in_build_scripts() -> Vec<String> {
     let pattern = r"\bdrop\s*\(";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2685,24 +2685,24 @@ fn scan_for_drop_in_build_scripts() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating drop usage regex matcher for build scripts: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_drop_usage() -> Vec<String> {
     let pattern = r"\bdrop\s*\(";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2730,20 +2730,20 @@ fn scan_for_drop_usage() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!("Error creating drop usage regex matcher: {}", e));
+            allviolations.push(format!("Error creating drop usage regex matcher: {}", e));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_empty_control_blocks() -> Vec<String> {
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     for entry in WalkDir::new(".")
         .into_iter()
@@ -2762,16 +2762,16 @@ fn scan_for_empty_control_blocks() -> Vec<String> {
         collector.violations.extend(violations);
 
         if let Some(error_message) = collector.check_and_get_error_message() {
-            all_violations.push(error_message);
+            allviolations.push(error_message);
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_debug_assert_usage() -> Vec<String> {
     let pattern = r"\bdebug_assert!\s*\(";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2799,23 +2799,23 @@ fn scan_for_debug_assert_usage() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!("Error creating debug_assert regex matcher: {}", e));
+            allviolations.push(format!("Error creating debug_assert regex matcher: {}", e));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_meaningless_conditionals() -> Vec<String> {
     // Match single-line if-else expressions to find candidates
     // The Sink implementation will then compare the branches
     let pattern = r"if\s+.+\s*\{[^}]+\}\s*else\s*\{[^}]+\}";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2843,24 +2843,24 @@ fn scan_for_meaningless_conditionals() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating meaningless conditional regex matcher: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_no_effect_allow() -> Vec<String> {
     let pattern = r"#\s*\[\s*allow\s*\(\s*clippy\s*::\s*no_effect\s*\)\s*\]";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2889,26 +2889,26 @@ fn scan_for_no_effect_allow() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating no_effect allow regex matcher: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_omitted_for_brevity() -> Vec<String> {
     // Match various forms of "omitted for brevity" and similar placeholders
     // Pattern includes: "omitted for brevity", "not shown", "elided", "truncated", "abbreviated", etc.
     let pattern = r"(omitted\s+for\s+brevity|not\s+shown|elided\s+for|truncated\s+for|abbreviated\s+for|removed\s+for\s+brevity|excluded\s+for\s+brevity|skipped\s+for\s+brevity|hidden\s+for\s+brevity)";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2937,24 +2937,24 @@ fn scan_for_omitted_for_brevity() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating omitted for brevity regex matcher: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_deprecated() -> Vec<String> {
     let pattern = r"#\s*\[\s*deprecated";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -2983,26 +2983,26 @@ fn scan_for_deprecated() -> Vec<String> {
                 }
 
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating deprecated attribute regex matcher: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn scan_for_placeholder_stubs() -> Vec<String> {
     // Match functions returning Ok(Self { with empty collections
     // Pattern: Ok(Self { followed by lines with vec![], HashMap::new(), etc., and closing })
     let pattern = r"Ok\(Self\s*\{";
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
@@ -3034,19 +3034,19 @@ fn scan_for_placeholder_stubs() -> Vec<String> {
 
                 // Check if the collector found any violations
                 if let Some(error_message) = collector.check_and_get_error_message() {
-                    all_violations.push(error_message);
+                    allviolations.push(error_message);
                 }
             }
         }
         Err(e) => {
-            all_violations.push(format!(
+            allviolations.push(format!(
                 "Error creating placeholder stub regex matcher: {}",
                 e
             ));
         }
     }
 
-    all_violations
+    allviolations
 }
 
 fn find_empty_control_blocks(source: &str) -> Vec<String> {
@@ -3597,7 +3597,7 @@ fn scan_for_fake_usage() -> Vec<String> {
         Err(e) => return vec![format!("Error creating fake usage regex: {}", e)],
     };
 
-    let mut all_violations = Vec::new();
+    let mut allviolations = Vec::new();
 
     for entry in WalkDir::new(".")
         .into_iter()
@@ -3629,26 +3629,26 @@ fn scan_for_fake_usage() -> Vec<String> {
 
             // Count occurrences in the WHOLE file (sanitized)
             // We use word boundary check
-            let count = count_variable_occurrences(&sanitized, var);
+            let count = countvariable_occurrences(&sanitized, var);
 
             // If count is low (<= 2), it means it's likely only used in signature/let and this check
             // We use a threshold of 2: One for definition/signature, one for the check itself.
             // If it's used anywhere else, count would be >= 3.
             if count <= 2 {
-                let file_name = path.to_str().unwrap_or("?");
+                let filename = path.to_str().unwrap_or("?");
                 let mut msg = format!(
                     "\n❌ ERROR: Found fake usage of variable '{}' in {}:{}:\n",
-                    var, file_name, line_num
+                    var, filename, line_num
                 );
                 msg.push_str(&format!("   {}\n", line_text));
                 msg.push_str("\n⚠️ This looks like a dummy check to mask an unused variable.\n");
                 msg.push_str("   \"No-Op Variable Access\": The variable is checked but never referenced again.\n");
                 msg.push_str("   Remove the variable (or rename to _) and the check.\n");
-                all_violations.push(msg);
+                allviolations.push(msg);
             }
         }
     }
-    all_violations
+    allviolations
 }
 
 struct FakeUsageCandidateCollector {
@@ -3688,17 +3688,17 @@ impl Sink for FakeUsageCandidateCollector {
     }
 }
 
-fn count_variable_occurrences(text: &str, var: &str) -> usize {
+fn countvariable_occurrences(text: &str, var: &str) -> usize {
     let mut count = 0;
     for (idx, _) in text.match_indices(var) {
-        if is_word_boundary(text, idx, var.len()) {
+        if isword_boundary(text, idx, var.len()) {
             count += 1;
         }
     }
     count
 }
 
-fn is_word_boundary(text: &str, idx: usize, len: usize) -> bool {
+fn isword_boundary(text: &str, idx: usize, len: usize) -> bool {
     let before = if idx == 0 {
         None
     } else {
@@ -3706,12 +3706,12 @@ fn is_word_boundary(text: &str, idx: usize, len: usize) -> bool {
     };
     let after = text[idx + len..].chars().next();
 
-    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    let isword_char = |c: char| c.is_alphanumeric() || c == '_';
 
-    if before.is_some_and(is_word_char) {
+    if before.is_some_and(isword_char) {
         return false;
     }
-    if after.is_some_and(is_word_char) {
+    if after.is_some_and(isword_char) {
         return false;
     }
     true

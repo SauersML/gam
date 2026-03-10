@@ -129,7 +129,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
 }
 
 #[test]
-fn matern_fit_term_collection_gaussian_simulated_10d_with_exact_adaptive_regularization() {
+fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regularization() {
     let n = 72usize;
     let d = 10usize;
     let (x, y, y_true) = simulate_matern_regression(n, d);

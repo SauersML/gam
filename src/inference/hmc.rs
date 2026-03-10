@@ -57,7 +57,7 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let mut min_ess = f64::INFINITY;
 
     #[inline]
-    fn split_value(
+    fn splitvalue(
         samples: &Array3<f64>,
         n_chains: usize,
         half: usize,
@@ -90,13 +90,13 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
         for sc in 0..m {
             let mut sum = 0.0;
             for t in 0..n {
-                sum += split_value(samples, n_chains, half, dim, sc, t);
+                sum += splitvalue(samples, n_chains, half, dim, sc, t);
             }
             let mean = sum / n as f64;
             means[sc] = mean;
             let mut g0 = 0.0;
             for t in 0..n {
-                let d = split_value(samples, n_chains, half, dim, sc, t) - mean;
+                let d = splitvalue(samples, n_chains, half, dim, sc, t) - mean;
                 g0 += d * d;
             }
             gamma0[sc] = (g0 / n as f64).max(1e-16);
@@ -117,8 +117,8 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
                     let mut cov = 0.0;
                     let denom = (n - l) as f64;
                     for t in 0..(n - l) {
-                        let x0 = split_value(samples, n_chains, half, dim, sc, t);
-                        let x1 = split_value(samples, n_chains, half, dim, sc, t + l);
+                        let x0 = splitvalue(samples, n_chains, half, dim, sc, t);
+                        let x1 = splitvalue(samples, n_chains, half, dim, sc, t + l);
                         cov += (x0 - mu) * (x1 - mu);
                     }
                     cov /= denom;
@@ -141,7 +141,7 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     }
 
     let mut chain_means = vec![0.0_f64; n_split_chains];
-    let mut chain_vars = vec![0.0_f64; n_split_chains];
+    let mut chainvars = vec![0.0_f64; n_split_chains];
     for d in 0..dim {
         for chain in 0..n_chains {
             // First half
@@ -158,7 +158,7 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
             var1 /= (half - 1).max(1) as f64;
             let first_idx = chain;
             chain_means[first_idx] = mean1;
-            chain_vars[first_idx] = var1;
+            chainvars[first_idx] = var1;
 
             // Second half
             let mut sum2 = 0.0;
@@ -174,11 +174,11 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
             var2 /= (half - 1).max(1) as f64;
             let second_idx = n_chains + chain;
             chain_means[second_idx] = mean2;
-            chain_vars[second_idx] = var2;
+            chainvars[second_idx] = var2;
         }
 
         // Within-chain variance W
-        let w: f64 = chain_vars.iter().copied().sum::<f64>() / n_split_chains as f64;
+        let w: f64 = chainvars.iter().copied().sum::<f64>() / n_split_chains as f64;
 
         // Between-chain variance B
         let overall_mean: f64 = chain_means.iter().copied().sum::<f64>() / n_split_chains as f64;
@@ -275,7 +275,7 @@ pub struct NutsPosterior {
     /// Transform: L where L L^T = H^{-1} (computed from Hessian)
     /// This is the inverse-transpose of the Cholesky of H.
     chol: Array2<f64>,
-    /// L^T for gradient chain rule: ∇_z = L^T @ ∇_β
+    /// L^T for gradient chain rule: ∇z = L^T @ ∇_β
     chol_t: Array2<f64>,
     /// Link function type
     is_logit: bool,
@@ -375,7 +375,7 @@ impl NutsPosterior {
 
     /// Compute log-posterior and gradient analytically using ndarray.
     ///
-    /// Returns (log_posterior, gradient_z) where gradient_z is the gradient
+    /// Returns (log_posterior, gradientz) where gradientz is the gradient
     /// with respect to the whitened parameters z.
     fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         // === Step 1: Transform z (whitened) -> β (original) ===
@@ -405,12 +405,12 @@ impl NutsPosterior {
         let grad_beta = &grad_ll_beta - &grad_penalty_beta;
 
         // === Step 6: Chain rule to get gradient in z space ===
-        // ∇_z = L^T @ ∇_β
-        let grad_z = self.chol_t.dot(&grad_beta);
+        // ∇z = L^T @ ∇_β
+        let gradz = self.chol_t.dot(&grad_beta);
 
         let logp = ll - penalty;
 
-        (logp, grad_z)
+        (logp, gradz)
     }
 
     /// Logistic regression log-likelihood and gradient.
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn nuts_logit_gradient_matches_finite_difference() {
+    fn nuts_logitgradient_matches_finite_difference() {
         let x = array![[1.0, -0.5], [0.2, 0.7], [-1.0, 0.3], [0.5, -1.2]];
         let y = array![1.0, 0.0, 1.0, 0.0];
         let w = array![1.0, 1.5, 0.8, 1.2];
@@ -521,7 +521,7 @@ mod tests {
         .expect("posterior");
 
         let z = array![0.15, -0.35];
-        let (_logp, grad) = posterior.compute_logp_and_grad_nd(&z);
+        let (logp, grad) = posterior.compute_logp_and_grad_nd(&z);
 
         let eps = 1e-6;
         for j in 0..z.len() {
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_link_uses_c1_extension_outside_knot_range() {
+    fn joint_link_usesc1_extension_outside_knot_range() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3usize;
         let n_raw = knots.len() - degree - 1;
@@ -588,7 +588,7 @@ mod tests {
         // Outside [0,1] for first and third entries; middle is interior.
         let u = array![-0.25, 0.5, 1.2];
         let theta = mode_theta.clone();
-        let (b_eval, _eta) = posterior.evaluate_link(&u, &theta);
+        let (b_eval, eta) = posterior.evaluate_link(&u, &theta);
 
         let rw = 1.0;
         let z_raw = u.mapv(|ui| ui / rw);
@@ -670,7 +670,7 @@ mod tests {
 
         let u = array![-0.25, 0.5, 1.2];
         let g = posterior.compute_g_prime(&u, &mode_theta);
-        let (_z_raw, z_c, rw) = posterior.standardized_z(&u);
+        let (z_raw, z_c, rw) = posterior.standardized_z(&u);
         let (bp_arc, _) = create_basis::<Dense>(
             z_c.view(),
             KnotSource::Provided(knots.view()),
@@ -701,7 +701,7 @@ mod tests {
         let mode = array![0.0, 0.0];
         let cfg = NutsConfig {
             n_samples: 30,
-            n_warmup: 30,
+            nwarmup: 30,
             n_chains: 2,
             target_accept: 0.8,
             seed: 123,
@@ -729,10 +729,10 @@ mod tests {
         let w = array![1.0, 1.0, 1.0, 1.0];
         let penalty = array![[0.2, 0.0], [0.0, 0.4]];
         let mode = array![0.0, 0.0];
-        let non_spd_hessian = array![[0.0, 0.0], [0.0, 0.0]];
+        let non_spdhessian = array![[0.0, 0.0], [0.0, 0.0]];
         let cfg = NutsConfig {
             n_samples: 20,
-            n_warmup: 20,
+            nwarmup: 20,
             n_chains: 2,
             target_accept: 0.8,
             seed: 456,
@@ -745,7 +745,7 @@ mod tests {
                 weights: w.view(),
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
-                hessian: non_spd_hessian.view(),
+                hessian: non_spdhessian.view(),
                 firth_bias_reduction: false,
             }),
             &cfg,
@@ -762,10 +762,10 @@ mod tests {
         let w = array![1.0, 1.0, 1.0, 1.0];
         let penalty = array![[0.2, 0.0], [0.0, 0.4]];
         let mode = array![0.0, 0.0];
-        let non_spd_hessian = array![[0.0, 0.0], [0.0, 0.0]];
+        let non_spdhessian = array![[0.0, 0.0], [0.0, 0.0]];
         let cfg = NutsConfig {
             n_samples: 20,
-            n_warmup: 20,
+            nwarmup: 20,
             n_chains: 2,
             target_accept: 0.8,
             seed: 654,
@@ -779,7 +779,7 @@ mod tests {
                 weights: w.view(),
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
-                hessian: non_spd_hessian.view(),
+                hessian: non_spdhessian.view(),
                 firth_bias_reduction: false,
             }),
             &cfg,
@@ -802,7 +802,7 @@ mod tests {
         let roots = vec![array![[0.2_f64.sqrt(), 0.0], [0.0, 0.4_f64.sqrt()]]];
         let cfg = NutsConfig {
             n_samples: 30,
-            n_warmup: 30,
+            nwarmup: 30,
             n_chains: 2,
             target_accept: 0.8,
             seed: 789,
@@ -834,7 +834,7 @@ mod tests {
         let roots = vec![array![[0.2_f64.sqrt(), 0.0], [0.0, 0.4_f64.sqrt()]]];
         let cfg = NutsConfig {
             n_samples: 120,
-            n_warmup: 80,
+            nwarmup: 80,
             n_chains: 2,
             target_accept: 0.8,
             seed: 901,
@@ -882,12 +882,12 @@ mod tests {
     }
 
     #[test]
-    fn survival_hmc_structural_monotonic_fallback_returns_finite_values() {
+    fn survival_hmc_structural_monotonic_fallback_returns_finitevalues() {
         let age_entry = array![1.0];
         let age_exit = array![2.0];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[1.0, 0.2]];
         let x_exit = array![[1.0, 0.6]];
         let x_derivative = array![[0.0, 1.0]];
@@ -902,7 +902,7 @@ mod tests {
             age_exit.view(),
             event_target.view(),
             event_competing.view(),
-            sample_weight.view(),
+            sampleweight.view(),
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
@@ -932,7 +932,7 @@ mod tests {
         let age_exit = array![2.0];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[0.2, 0.1]];
         let x_exit = array![[0.6, 0.3]];
         let x_derivative = array![[1.0, 0.0]];
@@ -946,7 +946,7 @@ mod tests {
             age_exit.view(),
             event_target.view(),
             event_competing.view(),
-            sample_weight.view(),
+            sampleweight.view(),
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
@@ -970,7 +970,7 @@ mod tests {
             age_exit.view(),
             event_target.view(),
             event_competing.view(),
-            sample_weight.view(),
+            sampleweight.view(),
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
@@ -1005,7 +1005,7 @@ mod tests {
         let age_exit = array![2.0];
         let event_target = array![1u8];
         let event_competing = array![0u8];
-        let sample_weight = array![1.0];
+        let sampleweight = array![1.0];
         let x_entry = array![[1.0, 0.0]];
         let x_exit = array![[1.0, 0.0]];
         // Zero derivative design so derivative_offset_exit drives d_eta/dt.
@@ -1021,7 +1021,7 @@ mod tests {
             age_exit.view(),
             event_target.view(),
             event_competing.view(),
-            sample_weight.view(),
+            sampleweight.view(),
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
@@ -1041,12 +1041,12 @@ mod tests {
         let logp_no_offset =
             HamiltonianTarget::logp_and_grad(&posterior_no_offset, &z, &mut grad_no_offset);
 
-        let posterior_with_offset = super::survival_hmc::SurvivalPosterior::new(
+        let posteriorwith_offset = super::survival_hmc::SurvivalPosterior::new(
             age_entry.view(),
             age_exit.view(),
             event_target.view(),
             event_competing.view(),
-            sample_weight.view(),
+            sampleweight.view(),
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
@@ -1062,23 +1062,23 @@ mod tests {
             hessian.view(),
         )
         .expect("construct posterior with derivative offset");
-        let mut grad_with_offset = Array1::<f64>::zeros(2);
-        let logp_with_offset =
-            HamiltonianTarget::logp_and_grad(&posterior_with_offset, &z, &mut grad_with_offset);
+        let mut gradwith_offset = Array1::<f64>::zeros(2);
+        let logpwith_offset =
+            HamiltonianTarget::logp_and_grad(&posteriorwith_offset, &z, &mut gradwith_offset);
 
-        assert!(logp_no_offset.is_finite() && logp_with_offset.is_finite());
+        assert!(logp_no_offset.is_finite() && logpwith_offset.is_finite());
         assert!(grad_no_offset.iter().all(|v| v.is_finite()));
-        assert!(grad_with_offset.iter().all(|v| v.is_finite()));
+        assert!(gradwith_offset.iter().all(|v| v.is_finite()));
         // Larger derivative offset means a weaker surrogate barrier penalty.
-        assert!(logp_with_offset > logp_no_offset);
+        assert!(logpwith_offset > logp_no_offset);
     }
 }
 
 /// Implement HamiltonianTarget for NUTS with analytical gradients.
 impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
-        let (logp, grad_z) = self.compute_logp_and_grad_nd(position);
-        grad.assign(&grad_z);
+        let (logp, gradz) = self.compute_logp_and_grad_nd(position);
+        grad.assign(&gradz);
         logp
     }
 }
@@ -1089,7 +1089,7 @@ pub struct NutsConfig {
     /// Number of samples to collect (after warmup)
     pub n_samples: usize,
     /// Number of warmup samples to discard
-    pub n_warmup: usize,
+    pub nwarmup: usize,
     /// Number of parallel chains
     pub n_chains: usize,
     /// Target acceptance probability (0.6-0.9 recommended)
@@ -1103,13 +1103,13 @@ fn default_nuts_seed() -> u64 {
     42
 }
 
-fn robust_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMatrixConfig {
-    if n_warmup < 80 {
+fn robust_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig {
+    if nwarmup < 80 {
         return NUTSMassMatrixConfig::disabled();
     }
-    let start_buffer = (n_warmup / 10).clamp(25, 150);
-    let end_buffer = (n_warmup / 8).clamp(25, 150);
-    let initial_window = (n_warmup / 12).clamp(20, 120);
+    let start_buffer = (nwarmup / 10).clamp(25, 150);
+    let end_buffer = (nwarmup / 8).clamp(25, 150);
+    let initial_window = (nwarmup / 12).clamp(20, 120);
     let dense_allowed = dim <= 50;
     NUTSMassMatrixConfig {
         adaptation: if dense_allowed {
@@ -1126,15 +1126,15 @@ fn robust_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMatrixConfi
     }
 }
 
-fn robust_survival_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMatrixConfig {
-    if n_warmup < 80 {
+fn robust_survival_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig {
+    if nwarmup < 80 {
         return NUTSMassMatrixConfig::disabled();
     }
     // Survival posteriors with censoring/rare events are often skewed; this
     // configuration uses diagonal adaptation.
-    let start_buffer = (n_warmup / 8).clamp(30, 180);
-    let end_buffer = (n_warmup / 6).clamp(30, 180);
-    let initial_window = (n_warmup / 10).clamp(25, 140);
+    let start_buffer = (nwarmup / 8).clamp(30, 180);
+    let end_buffer = (nwarmup / 6).clamp(30, 180);
+    let initial_window = (nwarmup / 10).clamp(25, 140);
     NUTSMassMatrixConfig {
         adaptation: MassMatrixAdaptation::Diagonal,
         start_buffer,
@@ -1150,7 +1150,7 @@ impl Default for NutsConfig {
     fn default() -> Self {
         Self {
             n_samples: 1000,
-            n_warmup: 500,
+            nwarmup: 500,
             n_chains: 4,
             target_accept: 0.8,
             seed: 42,
@@ -1180,14 +1180,14 @@ impl NutsConfig {
         let n_samples = raw_samples.clamp(500, 10_000);
 
         // Warmup ≈ samples (standard practice for adaptation)
-        let n_warmup = n_samples;
+        let nwarmup = n_samples;
 
         // More chains for higher dims (better R-hat estimation)
         let n_chains = if n_params > 50 { 4 } else { 2 };
 
         Self {
             n_samples,
-            n_warmup,
+            nwarmup,
             n_chains,
             target_accept: 0.8,
             seed: 42,
@@ -1307,7 +1307,7 @@ pub fn run_logit_polya_gamma_gibbs(
         );
     }
 
-    let n_iter = config.n_warmup + config.n_samples;
+    let n_iter = config.nwarmup + config.n_samples;
     let mut rng = StdRng::seed_from_u64(config.seed);
 
     // b = X^T (y - 1/2), constant across iterations.
@@ -1345,7 +1345,7 @@ pub fn run_logit_polya_gamma_gibbs(
                 omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
             }
 
-            // Build X_weighted = diag(sqrt(ω)) X and compute X^T Ω X via faer GEMM.
+            // Build Xweighted = diag(sqrt(ω)) X and compute X^T Ω X via faer GEMM.
             for i in 0..n {
                 let s = omega[i].sqrt();
                 for j in 0..p {
@@ -1361,7 +1361,7 @@ pub fn run_logit_polya_gamma_gibbs(
             let factor = q
                 .cholesky(Side::Lower)
                 .map_err(|e| format!("PG Gibbs failed to factor Q: {:?}", e))?;
-            mean.assign(&factor.solve_vec(&rhs_b));
+            mean.assign(&factor.solvevec(&rhs_b));
 
             for j in 0..p {
                 z[j] = sample_standard_normal(&mut rng);
@@ -1370,8 +1370,8 @@ pub fn run_logit_polya_gamma_gibbs(
             forward_solve_lower_triangular(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
-            if iter >= config.n_warmup {
-                let keep_idx = iter - config.n_warmup;
+            if iter >= config.nwarmup {
+                let keep_idx = iter - config.nwarmup;
                 samples_array
                     .slice_mut(ndarray::s![chain, keep_idx, ..])
                     .assign(&beta);
@@ -1454,7 +1454,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
         penalty_roots.iter().map(|r| r.t().to_owned()).collect();
 
     let mut rng = StdRng::seed_from_u64(config.seed);
-    let n_iter = config.n_warmup + config.n_samples;
+    let n_iter = config.nwarmup + config.n_samples;
 
     // Logistic PG identity uses kappa_i = y_i - 1/2 so that
     // b = X^T kappa in the Gaussian conditional for beta|omega.
@@ -1510,7 +1510,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
                 .map_err(|e| format!("PG Rao-Blackwell failed to factor Q: {:?}", e))?;
             // Conditional mean:
             //   mu = Q^{-1} b,  b = X^T(y - 1/2).
-            mean.assign(&factor.solve_vec(&rhs_b));
+            mean.assign(&factor.solvevec(&rhs_b));
 
             // Draw beta for the next Gibbs state.
             for j in 0..p {
@@ -1520,7 +1520,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
             forward_solve_lower_triangular(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
-            if iter < config.n_warmup {
+            if iter < config.nwarmup {
                 continue;
             }
             kept += 1;
@@ -1531,8 +1531,8 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
                 }
 
                 // mu^T S_k mu via root form S_k = R_k^T R_k.
-                let r_mu = r_k.dot(&mean);
-                let mu_quad = r_mu.dot(&r_mu);
+                let rmu = r_k.dot(&mean);
+                let mu_quad = rmu.dot(&rmu);
 
                 // Batched trace solve:
                 //   V_k = Q^{-1} R_k^T  (single multi-RHS solve)
@@ -1611,7 +1611,7 @@ pub fn run_nuts_sampling(
         .collect();
 
     // Create GenericNUTS sampler - it auto-tunes step size!
-    let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
+    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial_positions,
@@ -1620,7 +1620,7 @@ pub fn run_nuts_sampling(
     );
 
     // Note: run_progress() has blocking issues in some contexts, using run() instead
-    let samples_array = sampler.run(config.n_samples, config.n_warmup);
+    let samples_array = sampler.run(config.n_samples, config.nwarmup);
 
     // Convert samples from whitened space back to original space
     // samples_array has shape [n_chains, n_samples, dim]
@@ -1633,8 +1633,8 @@ pub fn run_nuts_sampling(
     let mut z_buffer = Array1::<f64>::zeros(dim);
     for chain in 0..n_chains {
         for sample_i in 0..n_samples_out {
-            let z_view = samples_array.slice(ndarray::s![chain, sample_i, ..]);
-            z_buffer.assign(&z_view);
+            let zview = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+            z_buffer.assign(&zview);
             let beta = &mode_arr + &chol.dot(&z_buffer);
             let sample_idx = chain * n_samples_out + sample_i;
             samples.row_mut(sample_idx).assign(&beta);
@@ -1834,7 +1834,7 @@ mod survival_hmc {
         offset_eta_exit: Arc<Array1<f64>>,
         offset_derivative_exit: Arc<Array1<f64>>,
         /// Sample weights
-        sample_weight: Arc<Array1<f64>>,
+        sampleweight: Arc<Array1<f64>>,
         /// Event indicators (1 = event, 0 = censored)
         event_target: Arc<Array1<u8>>,
         /// Competing event indicators
@@ -1864,7 +1864,7 @@ mod survival_hmc {
         data: SharedSurvivalData,
         /// Transform: L where L L^T = H^{-1}
         chol: Array2<f64>,
-        /// L^T for gradient chain rule: ∇_z = L^T @ ∇_β
+        /// L^T for gradient chain rule: ∇z = L^T @ ∇_β
         chol_t: Array2<f64>,
     }
 
@@ -1901,20 +1901,20 @@ mod survival_hmc {
             // guard in WorkingModelSurvival::update_state:
             //   d_eta_dt = X_derivative * beta + derivative_offset_exit.
             // The offset shifts the barrier value but has zero beta-derivative.
-            let d_eta_dt =
-                self.data.x_derivative.dot(&beta) + self.data.offset_derivative_exit.as_ref();
+            let offset_derivative_exit = self.data.offset_derivative_exit.as_ref();
+            let d_eta_dt = self.data.x_derivative.dot(&beta) + offset_derivative_exit;
             let tol = self.data.monotonicity.tolerance.max(1e-12);
 
             // Barrier settings: smooth enough for HMC geometry, steep enough to
             // strongly repel invalid monotonicity proposals.
             let soft_scale = (0.1 * tol).max(1e-6);
-            let barrier_weight = 100.0_f64;
+            let barrierweight = 100.0_f64;
 
             let mut barrier = 0.0_f64;
             let mut grad_beta = Array1::<f64>::zeros(beta.len());
 
             for i in 0..d_eta_dt.len() {
-                let w = self.data.sample_weight[i];
+                let w = self.data.sampleweight[i];
                 if w <= 0.0 {
                     continue;
                 }
@@ -1923,22 +1923,22 @@ mod survival_hmc {
                 let sig = Self::sigmoid(u);
                 barrier += w * sp * sp;
 
-                // d/d(d_eta_dt) [-barrier_weight * w * softplus(u)^2]
+                // d/d(d_eta_dt) [-barrierweight * w * softplus(u)^2]
                 // where u = (tol - d_eta_dt)/soft_scale.
-                let dlogp_dd = barrier_weight * w * 2.0 * sp * sig / soft_scale;
-                let x_row = self.data.x_derivative.row(i);
+                let dlogp_dd = barrierweight * w * 2.0 * sp * sig / soft_scale;
+                let xrow = self.data.x_derivative.row(i);
                 for j in 0..grad_beta.len() {
-                    grad_beta[j] += dlogp_dd * x_row[j];
+                    grad_beta[j] += dlogp_dd * xrow[j];
                 }
             }
 
             // Weak quadratic anchor in whitened coordinates prevents runaway
             // excursions when the exact target is undefined.
             let z2 = z.dot(z);
-            let logp = -0.5 * z2 - barrier_weight * barrier;
-            let mut grad_z = self.chol_t.dot(&grad_beta);
-            grad_z -= z;
-            (logp, grad_z)
+            let logp = -0.5 * z2 - barrierweight * barrier;
+            let mut gradz = self.chol_t.dot(&grad_beta);
+            gradz -= z;
+            (logp, gradz)
         }
 
         /// Creates a new survival posterior target.
@@ -1948,7 +1948,7 @@ mod survival_hmc {
             age_exit: ArrayView1<'_, f64>,
             event_target: ArrayView1<'_, u8>,
             event_competing: ArrayView1<'_, u8>,
-            sample_weight: ArrayView1<'_, f64>,
+            sampleweight: ArrayView1<'_, f64>,
             x_entry: ArrayView2<'_, f64>,
             x_exit: ArrayView2<'_, f64>,
             x_derivative: ArrayView2<'_, f64>,
@@ -1991,7 +1991,7 @@ mod survival_hmc {
                 offset_eta_entry: Arc::new(off_eta_entry),
                 offset_eta_exit: Arc::new(off_eta_exit),
                 offset_derivative_exit: Arc::new(off_deriv_exit),
-                sample_weight: Arc::new(sample_weight.to_owned()),
+                sampleweight: Arc::new(sampleweight.to_owned()),
                 event_target: Arc::new(event_target.to_owned()),
                 event_competing: Arc::new(event_competing.to_owned()),
                 age_entry: Arc::new(age_entry.to_owned()),
@@ -2013,13 +2013,13 @@ mod survival_hmc {
             let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
             // Create a temporary working model to compute likelihood
-            let mut model = WorkingModelSurvival::from_engine_inputs_with_offsets(
+            let mut model = WorkingModelSurvival::from_engine_inputswith_offsets(
                 SurvivalEngineInputs {
                     age_entry: self.data.age_entry.view(),
                     age_exit: self.data.age_exit.view(),
                     event_target: self.data.event_target.view(),
                     event_competing: self.data.event_competing.view(),
-                    sample_weight: self.data.sample_weight.view(),
+                    sampleweight: self.data.sampleweight.view(),
                     x_entry: self.data.x_entry.view(),
                     x_exit: self.data.x_exit.view(),
                     x_derivative: self.data.x_derivative.view(),
@@ -2054,10 +2054,10 @@ mod survival_hmc {
             let logp = -0.5 * (state.deviance + state.penalty_term);
             let grad_beta = state.gradient.mapv(|g| -g);
 
-            // Chain rule to get gradient in z space: ∇_z = L^T @ ∇_β
-            let grad_z = self.chol_t.dot(&grad_beta);
+            // Chain rule to get gradient in z space: ∇z = L^T @ ∇_β
+            let gradz = self.chol_t.dot(&grad_beta);
 
-            Ok((logp, grad_z))
+            Ok((logp, gradz))
         }
 
         /// Get the Cholesky factor L for un-whitening samples
@@ -2074,14 +2074,14 @@ mod survival_hmc {
     impl HamiltonianTarget<Array1<f64>> for SurvivalPosterior {
         fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
             match self.compute_logp_and_grad(position) {
-                Ok((logp, grad_z)) => {
-                    grad.assign(&grad_z);
+                Ok((logp, gradz)) => {
+                    grad.assign(&gradz);
                     logp
                 }
                 Err(e) => {
                     if e.contains("monotonicity violated") {
-                        let (logp, grad_z) = self.monotonicity_surrogate_logp_and_grad(position);
-                        grad.assign(&grad_z);
+                        let (logp, gradz) = self.monotonicity_surrogate_logp_and_grad(position);
+                        grad.assign(&gradz);
                         log::debug!(
                             "Survival posterior monotonicity fallback engaged (smooth barrier): {}",
                             e
@@ -2105,7 +2105,7 @@ mod survival_hmc {
         age_exit: ArrayView1<'_, f64>,
         event_target: ArrayView1<'_, u8>,
         event_competing: ArrayView1<'_, u8>,
-        sample_weight: ArrayView1<'_, f64>,
+        sampleweight: ArrayView1<'_, f64>,
         x_entry: ArrayView2<'_, f64>,
         x_exit: ArrayView2<'_, f64>,
         x_derivative: ArrayView2<'_, f64>,
@@ -2129,7 +2129,7 @@ mod survival_hmc {
             age_exit,
             event_target,
             event_competing,
-            sample_weight,
+            sampleweight,
             x_entry,
             x_exit,
             x_derivative,
@@ -2163,7 +2163,7 @@ mod survival_hmc {
             .collect();
 
         // Create GenericNUTS sampler
-        let mass_cfg = robust_survival_mass_matrix_config(dim, config.n_warmup);
+        let mass_cfg = robust_survival_mass_matrix_config(dim, config.nwarmup);
         let mut sampler = GenericNUTS::new_with_mass_matrix(
             target,
             initial_positions,
@@ -2173,7 +2173,7 @@ mod survival_hmc {
 
         // Run sampling with progress bar
         let (samples_array, run_stats) = sampler
-            .run_progress(config.n_samples, config.n_warmup)
+            .run_progress(config.n_samples, config.nwarmup)
             .map_err(|e| format!("NUTS sampling failed: {}", e))?;
 
         log::info!("Survival NUTS sampling complete: {}", run_stats);
@@ -2188,8 +2188,8 @@ mod survival_hmc {
         let mut z_buffer = Array1::<f64>::zeros(dim);
         for chain in 0..n_chains {
             for sample_i in 0..n_samples_out {
-                let z_view = samples_array.slice(ndarray::s![chain, sample_i, ..]);
-                z_buffer.assign(&z_view);
+                let zview = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+                z_buffer.assign(&zview);
 
                 // Transform to β: β = μ + L @ z
                 let beta = &mode_arr + &chol.dot(&z_buffer);
@@ -2332,7 +2332,7 @@ impl JointLinkPosterior {
         let beta = q.slice(ndarray::s![0..self.p_base]).to_owned();
         let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
         let u = self.x.dot(&beta);
-        let (b_wiggle, eta) = self.evaluate_link(&u, &theta);
+        let (bwiggle, eta) = self.evaluate_link(&u, &theta);
         let mut ll = 0.0;
         let mut residual = Array1::<f64>::zeros(self.n_samples);
 
@@ -2368,7 +2368,7 @@ impl JointLinkPosterior {
         }
 
         let g_prime = self.compute_g_prime(&u, &theta);
-        let grad_theta = &b_wiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
+        let grad_theta = &bwiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
         let r_scaled: Array1<f64> = residual
             .iter()
             .zip(g_prime.iter())
@@ -2401,7 +2401,7 @@ impl JointLinkPosterior {
             return (Array2::zeros((n, 0)), u.clone());
         }
 
-        let (z_raw, z_c, _rw) = self.standardized_z(u);
+        let (z_raw, z_c, _) = self.standardized_z(u);
         let Ok((b_raw_arc, _)) = create_basis::<Dense>(
             z_c.view(),
             KnotSource::Provided(self.spline.knot_vector.view()),
@@ -2453,7 +2453,7 @@ impl JointLinkPosterior {
         use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
         let n = u.len();
         let mut g = Array1::<f64>::ones(n);
-        let (_z_raw, z_c, rw) = self.standardized_z(u);
+        let (_, z_c, rw) = self.standardized_z(u);
         let n_raw = self
             .spline
             .knot_vector
@@ -2479,9 +2479,9 @@ impl JointLinkPosterior {
             return g;
         }
         let b_prime_constrained = b_prime_raw.dot(&self.spline.link_transform);
-        let d_wiggle_dz = b_prime_constrained.dot(theta);
+        let dwiggle_dz = b_prime_constrained.dot(theta);
         for i in 0..n {
-            g[i] = 1.0 + d_wiggle_dz[i] / rw;
+            g[i] = 1.0 + dwiggle_dz[i] / rw;
         }
         g
     }
@@ -2551,14 +2551,14 @@ pub fn run_joint_nuts_sampling(
             })
         })
         .collect();
-    let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
+    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial_positions,
         config.target_accept,
         mass_cfg,
     );
-    let samples_array = sampler.run(config.n_samples, config.n_warmup);
+    let samples_array = sampler.run(config.n_samples, config.nwarmup);
     let (n_chains, n_samples_out) = (samples_array.shape()[0], samples_array.shape()[1]);
     let total_samples = n_chains * n_samples_out;
     let mut samples = Array2::<f64>::zeros((total_samples, dim));
@@ -2621,9 +2621,9 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
 /// Compute split R-hat and autocorrelation-based ESS diagnostics.
 fn compute_rhat_ess(
     samples: &Array3<f64>,
-    _n_chains: usize,
-    _n_samples: usize,
-    _dim: usize,
+    _: usize,
+    _: usize,
+    _: usize,
 ) -> (f64, f64) {
     compute_split_rhat_and_ess(samples)
 }

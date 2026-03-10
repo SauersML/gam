@@ -1,11 +1,11 @@
 use gam::families::royston_parmar::{
-    SurvivalLambdaOptimizerOptions, optimize_survival_lambdas_with_multistart,
-    optimize_survival_lambdas_with_multistart_fd,
+    SurvivalLambdaOptimizerOptions, optimize_survival_lambdaswithmultistart,
+    optimize_survival_lambdaswithmultistartfd,
 };
 use gam::{FitOptions, LikelihoodFamily, fit_gam};
 use ndarray::{Array1, array};
 
-fn quadratic_objective(rho: &Array1<f64>) -> f64 {
+fn quadraticobjective(rho: &Array1<f64>) -> f64 {
     // Minimum at [0.3, -0.7]
     let target = array![0.3, -0.7];
     let d = rho - &target;
@@ -13,7 +13,7 @@ fn quadratic_objective(rho: &Array1<f64>) -> f64 {
 }
 
 #[test]
-fn survival_optimizer_default_uses_exact_gradient_path() {
+fn survival_optimizer_default_uses_exactgradient_path() {
     let opts = SurvivalLambdaOptimizerOptions {
         max_iter: 120,
         tol: 1e-9,
@@ -22,22 +22,22 @@ fn survival_optimizer_default_uses_exact_gradient_path() {
     };
     let heuristic = vec![1.0, 1.0];
 
-    let exact = optimize_survival_lambdas_with_multistart(
+    let exact = optimize_survival_lambdaswithmultistart(
         2,
         Some(&heuristic),
         |rho| {
             let target = array![0.3, -0.7];
             let grad = rho - &target;
-            Ok((quadratic_objective(rho), grad))
+            Ok((quadraticobjective(rho), grad))
         },
         &opts,
     )
     .expect("exact-gradient optimizer");
 
-    let fd = optimize_survival_lambdas_with_multistart_fd(
+    let fd = optimize_survival_lambdaswithmultistartfd(
         2,
         Some(&heuristic),
-        |rho| Ok(quadratic_objective(rho)),
+        |rho| Ok(quadraticobjective(rho)),
         &opts,
     )
     .expect("fd-gradient optimizer");
@@ -62,7 +62,7 @@ fn survival_optimizer_default_uses_exact_gradient_path() {
 }
 
 #[test]
-fn survival_optimizer_exact_gradient_contract_is_rho_space() {
+fn survival_optimizer_exactgradient_contract_is_rho_space() {
     let opts = SurvivalLambdaOptimizerOptions {
         max_iter: 120,
         tol: 1e-9,
@@ -72,7 +72,7 @@ fn survival_optimizer_exact_gradient_contract_is_rho_space() {
     let heuristic = vec![1.0];
     let target = 0.3_f64;
 
-    let exact = optimize_survival_lambdas_with_multistart(
+    let exact = optimize_survival_lambdaswithmultistart(
         1,
         Some(&heuristic),
         |rho| {
@@ -83,7 +83,7 @@ fn survival_optimizer_exact_gradient_contract_is_rho_space() {
     )
     .expect("rho-gradient optimizer");
 
-    let fd = optimize_survival_lambdas_with_multistart_fd(
+    let fd = optimize_survival_lambdaswithmultistartfd(
         1,
         Some(&heuristic),
         |rho| {

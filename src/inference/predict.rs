@@ -2,8 +2,8 @@ use crate::estimate::{EstimationError, FitResult, FittedLinkState};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet, beta_logistic_inverse_link_jet_with_param_partials,
-    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet_with_param_partials,
+    InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
+    mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
 use crate::probability::standard_normal_quantile;
 use crate::types::InverseLink;
@@ -51,7 +51,7 @@ fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> Result<f64, EstimationErro
 }
 
 #[inline]
-fn quadratic_form_from_jet_mu(
+fn quadratic_form_from_jetmu(
     cov: &Array2<f64>,
     partials: &[InverseLinkJet],
 ) -> Result<f64, EstimationError> {
@@ -74,7 +74,7 @@ fn quadratic_form_from_jet_mu(
     Ok(acc.max(0.0))
 }
 
-fn linear_predictor_variance(
+fn linear_predictorvariance(
     x: &DesignMatrix,
     cov: &Array2<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
@@ -116,7 +116,7 @@ pub struct PredictUncertaintyOptions {
     pub mean_interval_method: MeanIntervalMethod,
     /// For Gaussian identity, also return observation intervals using
     /// Var(y_new | x) = Var(eta_hat) + sigma^2.
-    pub include_observation_interval: bool,
+    pub includeobservation_interval: bool,
 }
 
 impl Default for PredictUncertaintyOptions {
@@ -125,7 +125,7 @@ impl Default for PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
-            include_observation_interval: true,
+            includeobservation_interval: true,
         }
     }
 }
@@ -198,7 +198,7 @@ where
         ));
     }
 
-    let mut eta = x.matrix_vector_multiply(&beta.to_owned());
+    let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
 
     let mean = apply_family_inverse_link(&eta, family, None)?;
@@ -270,17 +270,17 @@ where
         ));
     }
 
-    let mut eta = x.matrix_vector_multiply(&beta.to_owned());
+    let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
 
-    let eta_var = linear_predictor_variance(&x, &covariance.to_owned())?;
-    let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
-    let quad_ctx = crate::quadrature::QuadratureContext::new();
+    let etavar = linear_predictorvariance(&x, &covariance.to_owned())?;
+    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
+    let quadctx = crate::quadrature::QuadratureContext::new();
     let strategy = strategy_for_family(family, None);
     let means: Result<Vec<f64>, EstimationError> = eta
         .iter()
         .zip(eta_standard_error.iter())
-        .map(|(&e, &se)| strategy.posterior_mean(&quad_ctx, e, se))
+        .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
         .collect();
     let mean = Array1::from_vec(means?);
 
@@ -295,7 +295,7 @@ where
 ///
 /// This mirrors `predict_gam_posterior_mean`, but also uses `fit` metadata for
 /// link families that require extra state (`BinomialSas`, `BinomialMixture`).
-pub fn predict_gam_posterior_mean_with_fit<X>(
+pub fn predict_gam_posterior_meanwith_fit<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
@@ -309,21 +309,21 @@ where
     let x = x.into();
     if x.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_mean_with_fit dimension mismatch: X has {} columns but beta has length {}",
+            "predict_gam_posterior_meanwith_fit dimension mismatch: X has {} columns but beta has length {}",
             x.ncols(),
             beta.len()
         )));
     }
     if x.nrows() != offset.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_mean_with_fit dimension mismatch: X has {} rows but offset has length {}",
+            "predict_gam_posterior_meanwith_fit dimension mismatch: X has {} rows but offset has length {}",
             x.nrows(),
             offset.len()
         )));
     }
     if covariance.nrows() != beta.len() || covariance.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_mean_with_fit covariance dimension mismatch: expected {}x{}, got {}x{}",
+            "predict_gam_posterior_meanwith_fit covariance dimension mismatch: expected {}x{}, got {}x{}",
             beta.len(),
             beta.len(),
             covariance.nrows(),
@@ -332,21 +332,21 @@ where
     }
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
-            "predict_gam_posterior_mean_with_fit does not support RoystonParmar; use survival prediction APIs"
+            "predict_gam_posterior_meanwith_fit does not support RoystonParmar; use survival prediction APIs"
                 .to_string(),
         ));
     }
 
-    let mut eta = x.matrix_vector_multiply(&beta.to_owned());
+    let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
-    let eta_var = linear_predictor_variance(&x, &covariance.to_owned())?;
-    let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
-    let quad_ctx = crate::quadrature::QuadratureContext::new();
+    let etavar = linear_predictorvariance(&x, &covariance.to_owned())?;
+    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
+    let quadctx = crate::quadrature::QuadratureContext::new();
     let strategy = strategy_from_fit(family, fit)?;
     let means: Result<Vec<f64>, EstimationError> = eta
         .iter()
         .zip(eta_standard_error.iter())
-        .map(|(&e, &se)| strategy.posterior_mean(&quad_ctx, e, se))
+        .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
         .collect();
     let mean = Array1::from_vec(means?);
 
@@ -399,7 +399,7 @@ where
 /// Exact analytic representation (Mellin-Barnes) for I(λ):
 ///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
 /// This Mellin-Barnes integral is mathematically exact.
-pub fn predict_gam_with_uncertainty<X>(
+pub fn predict_gamwith_uncertainty<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
@@ -413,14 +413,14 @@ where
     let x = x.into();
     if x.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_with_uncertainty dimension mismatch: X has {} columns but beta has length {}",
+            "predict_gamwith_uncertainty dimension mismatch: X has {} columns but beta has length {}",
             x.ncols(),
             beta.len()
         )));
     }
     if x.nrows() != offset.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_with_uncertainty dimension mismatch: X has {} rows but offset has length {}",
+            "predict_gamwith_uncertainty dimension mismatch: X has {} rows but offset has length {}",
             x.nrows(),
             offset.len()
         )));
@@ -437,7 +437,7 @@ where
 
     let requested_mode = options.covariance_mode;
     // Covariance selection corresponds to approximation order:
-    // - Conditional: uses only A(mu) = H_mu^{-1}
+    // - Conditional: uses only A(mu) = Hmu^{-1}
     // - Corrected: adds first-order Var(b(rho)) term J V_rho J^T
     let (cov, covariance_corrected_used) = match requested_mode {
         InferenceCovarianceMode::Conditional => (
@@ -479,7 +479,7 @@ where
         )));
     }
 
-    let mut eta = x.matrix_vector_multiply(&beta.to_owned());
+    let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
     let fitted_link_state = fit.fitted_link_state(family).ok();
     let mixture_state = match fitted_link_state.as_ref() {
@@ -503,14 +503,14 @@ where
     let strategy = strategy_for_family(family, link_kind.as_ref());
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
-    let eta_var = linear_predictor_variance(&x, cov)?;
-    let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
+    let etavar = linear_predictorvariance(&x, cov)?;
+    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
     let z = standard_normal_quantile(0.5 + 0.5 * options.confidence_level)
         .map_err(EstimationError::InvalidInput)?;
     let eta_lower = &eta - &eta_standard_error.mapv(|s| z * s);
     let eta_upper = &eta + &eta_standard_error.mapv(|s| z * s);
-    let quad_ctx = crate::quadrature::QuadratureContext::new();
+    let quadctx = crate::quadrature::QuadratureContext::new();
 
     // Derivative of inverse link g^{-1}(η) used for delta-method:
     //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
@@ -544,8 +544,8 @@ where
         })
         .unwrap_or_default();
     for i in 0..eta.len() {
-        let se_i = eta_var[i].max(0.0).sqrt();
-        let (_, mut mean_var) = strategy.posterior_mean_variance(&quad_ctx, eta[i], se_i)?;
+        let se_i = etavar[i].max(0.0).sqrt();
+        let (_, mut meanvar) = strategy.posterior_meanvariance(&quadctx, eta[i], se_i)?;
         if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
             && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                 FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
@@ -557,9 +557,9 @@ where
                     "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta".to_string(),
                 )
             })?;
-            let jets = sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
+            let jets = sas_inverse_link_jetwith_param_partials(eta[i], sas.epsilon, sas.log_delta);
             let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
-            mean_var += quadratic_form(cov_theta, &g)?;
+            meanvar += quadratic_form(cov_theta, &g)?;
         }
         if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
             && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
@@ -572,13 +572,13 @@ where
                     "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
                 )
             })?;
-            let jets = beta_logistic_inverse_link_jet_with_param_partials(
+            let jets = beta_logistic_inverse_link_jetwith_param_partials(
                 eta[i],
                 sas.log_delta,
                 sas.epsilon,
             );
             let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
-            mean_var += quadratic_form(cov_theta, &g)?;
+            meanvar += quadratic_form(cov_theta, &g)?;
         }
         if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
             && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
@@ -599,10 +599,10 @@ where
                 ];
             }
             let _ =
-                mixture_inverse_link_jet_with_rho_partials_into(state, eta[i], &mut mix_partials);
-            mean_var += quadratic_form_from_jet_mu(cov_theta, &mix_partials)?;
+                mixture_inverse_link_jetwith_rho_partials_into(state, eta[i], &mut mix_partials);
+            meanvar += quadratic_form_from_jetmu(cov_theta, &mix_partials)?;
         }
-        mean_standard_error[i] = mean_var.max(0.0).sqrt();
+        mean_standard_error[i] = meanvar.max(0.0).sqrt();
     }
 
     let (mut mean_lower, mut mean_upper) = match options.mean_interval_method {
@@ -629,11 +629,11 @@ where
         mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
     }
 
-    let (observation_lower, observation_upper) = if options.include_observation_interval
+    let (observation_lower, observation_upper) = if options.includeobservation_interval
         && matches!(family, crate::types::LikelihoodFamily::GaussianIdentity)
     {
-        let obs_var = fit.standard_deviation.max(0.0).powi(2);
-        let obs_se = eta_var.mapv(|v| (v + obs_var).max(0.0).sqrt());
+        let obsvar = fit.standard_deviation.max(0.0).powi(2);
+        let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
         let lower = &eta - &obs_se.mapv(|s| z * s);
         let upper = &eta + &obs_se.mapv(|s| z * s);
         (Some(lower), Some(upper))
@@ -663,11 +663,11 @@ pub fn coefficient_uncertainty(
     confidence_level: f64,
     covariance_mode: InferenceCovarianceMode,
 ) -> Result<CoefficientUncertaintyResult, EstimationError> {
-    coefficient_uncertainty_with_mode(fit, confidence_level, covariance_mode)
+    coefficient_uncertaintywith_mode(fit, confidence_level, covariance_mode)
 }
 
 /// Coefficient-level uncertainty and confidence intervals with explicit covariance mode.
-pub fn coefficient_uncertainty_with_mode(
+pub fn coefficient_uncertaintywith_mode(
     fit: &FitResult,
     confidence_level: f64,
     covariance_mode: InferenceCovarianceMode,
@@ -758,7 +758,7 @@ mod tests {
             covariance.view(),
         )
         .expect("predict posterior mean");
-        let expected = crate::quadrature::probit_posterior_mean_with_deriv_exact(0.7, 0.5).mean;
+        let expected = crate::quadrature::probit_posterior_meanwith_deriv_exact(0.7, 0.5).mean;
         assert!((out.mean[0] - expected).abs() <= 1e-12);
         assert!((out.mean[1] - expected).abs() <= 1e-12);
     }
@@ -777,9 +777,9 @@ mod tests {
             covariance.view(),
         )
         .expect("predict posterior mean");
-        let quad_ctx = crate::quadrature::QuadratureContext::new();
+        let quadctx = crate::quadrature::QuadratureContext::new();
         let expected = crate::quadrature::integrated_inverse_link_mean_and_derivative(
-            &quad_ctx,
+            &quadctx,
             LinkFunction::Logit,
             0.4,
             0.4,

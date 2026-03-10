@@ -13,7 +13,7 @@ fn minimal_fit_result(fitted_link_parameters: FittedLinkParameters) -> FitResult
         edf_by_block: vec![],
         edf_total: 0.0,
         iterations: 1,
-        final_grad_norm: 0.0,
+        finalgrad_norm: 0.0,
         pirls_status: PirlsStatus::Converged,
         deviance: 0.0,
         stable_penalty_term: 0.0,
@@ -61,7 +61,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     }));
     payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
     payload.training_headers = Some(vec![]);
-    payload.resolved_term_spec = Some(gam::smooth::TermCollectionSpec {
+    payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],
         random_effect_terms: vec![],

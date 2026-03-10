@@ -61,11 +61,11 @@ pub enum BasisError {
     InsufficientColumnsForConstraint { found: usize },
 
     #[error(
-        "Constraint matrix must have the same number of rows as the basis: basis has {basis_rows}, constraint has {constraint_rows}."
+        "Constraint matrix must have the same number of rows as the basis: basis has {basisrows}, constraint has {constraintrows}."
     )]
     ConstraintMatrixRowMismatch {
-        basis_rows: usize,
-        constraint_rows: usize,
+        basisrows: usize,
+        constraintrows: usize,
     },
 
     #[error(
@@ -259,7 +259,7 @@ pub fn create_basis<O: BasisOutputFormat>(
             .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?,
     };
 
-    let knot_vec: Array1<f64> = match knot_source {
+    let knotvec: Array1<f64> = match knot_source {
         KnotSource::Provided(view) => {
             validate_knots_for_degree(view, knot_degree)?;
             view.to_owned()
@@ -279,14 +279,14 @@ pub fn create_basis<O: BasisOutputFormat>(
     };
 
     match options.basis_family {
-        BasisFamily::BSpline => O::build_basis(data, degree, eval_kind, knot_vec),
+        BasisFamily::BSpline => O::build_basis(data, degree, eval_kind, knotvec),
         BasisFamily::MSpline => {
             if O::IS_SPARSE {
-                let sparse = create_mspline_sparse(data, knot_vec.view(), degree)?;
-                Ok((O::from_sparse(sparse)?, knot_vec))
+                let sparse = create_mspline_sparse(data, knotvec.view(), degree)?;
+                Ok((O::from_sparse(sparse)?, knotvec))
             } else {
-                let dense = create_mspline_dense(data, knot_vec.view(), degree)?;
-                Ok((O::from_dense(dense)?, knot_vec))
+                let dense = create_mspline_dense(data, knotvec.view(), degree)?;
+                Ok((O::from_dense(dense)?, knotvec))
             }
         }
         BasisFamily::ISpline => {
@@ -295,8 +295,8 @@ pub fn create_basis<O: BasisOutputFormat>(
                     "BasisFamily::ISpline does not support sparse output; use Dense".to_string(),
                 ));
             }
-            let dense = create_ispline_dense(data, knot_vec.view(), degree)?;
-            Ok((O::from_dense(dense)?, knot_vec))
+            let dense = create_ispline_dense(data, knotvec.view(), degree)?;
+            Ok((O::from_dense(dense)?, knotvec))
         }
     }
 }
@@ -305,21 +305,21 @@ pub fn create_basis<O: BasisOutputFormat>(
 /// that was evaluated at clamped coordinates.
 ///
 /// Given `z_raw` and `z_clamped = clamp(z_raw, left, right)`, this mutates
-/// `basis_values` in-place as:
+/// `basisvalues` in-place as:
 /// `B_ext(z_raw) = B(z_clamped) + (z_raw - z_clamped) * B'(z_clamped)`.
 pub fn apply_linear_extension_from_first_derivative(
     z_raw: ArrayView1<f64>,
     z_clamped: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
     degree: usize,
-    basis_values: &mut Array2<f64>,
+    basisvalues: &mut Array2<f64>,
 ) -> Result<(), BasisError> {
     if z_raw.len() != z_clamped.len() {
         return Err(BasisError::DimensionMismatch(
             "z_raw and z_clamped must have equal length".to_string(),
         ));
     }
-    if basis_values.nrows() != z_raw.len() {
+    if basisvalues.nrows() != z_raw.len() {
         return Err(BasisError::DimensionMismatch(
             "basis row count must match z length".to_string(),
         ));
@@ -343,7 +343,7 @@ pub fn apply_linear_extension_from_first_derivative(
         BasisOptions::first_derivative(),
     )?;
     let b_prime = b_prime_arc.as_ref();
-    if b_prime.nrows() != basis_values.nrows() || b_prime.ncols() != basis_values.ncols() {
+    if b_prime.nrows() != basisvalues.nrows() || b_prime.ncols() != basisvalues.ncols() {
         return Err(BasisError::DimensionMismatch(
             "basis derivative shape mismatch".to_string(),
         ));
@@ -354,8 +354,8 @@ pub fn apply_linear_extension_from_first_derivative(
         if dz.abs() <= 1e-12 {
             continue;
         }
-        for j in 0..basis_values.ncols() {
-            basis_values[[i, j]] += dz * b_prime[[i, j]];
+        for j in 0..basisvalues.ncols() {
+            basisvalues[[i, j]] += dz * b_prime[[i, j]];
         }
     }
     Ok(())
@@ -371,7 +371,7 @@ pub trait BasisOutputFormat {
         data: ArrayView1<f64>,
         degree: usize,
         eval_kind: BasisEvalKind,
-        knot_vec: Array1<f64>,
+        knotvec: Array1<f64>,
     ) -> Result<(Self::Output, Array1<f64>), BasisError>;
 
     fn from_dense(dense: Array2<f64>) -> Result<Self::Output, BasisError>;
@@ -386,18 +386,18 @@ impl BasisOutputFormat for Dense {
         data: ArrayView1<f64>,
         degree: usize,
         eval_kind: BasisEvalKind,
-        knot_vec: Array1<f64>,
+        knotvec: Array1<f64>,
     ) -> Result<(Self::Output, Array1<f64>), BasisError> {
-        let knot_view = knot_vec.view();
+        let knotview = knotvec.view();
 
-        let num_basis_functions = knot_view.len().saturating_sub(degree + 1);
+        let num_basis_functions = knotview.len().saturating_sub(degree + 1);
         let basis_matrix = if should_use_sparse_basis(num_basis_functions, degree, 1) {
-            let left = knot_view[degree];
-            let right = knot_view[num_basis_functions];
+            let left = knotview[degree];
+            let right = knotview[num_basis_functions];
             let data_clamped = data.mapv(|x| x.clamp(left, right));
             let sparse = generate_basis_internal::<SparseStorage>(
                 data_clamped.view(),
-                knot_view,
+                knotview,
                 degree,
                 eval_kind,
             )?;
@@ -412,13 +412,13 @@ impl BasisOutputFormat for Dense {
                     dense[[row_idx[idx], col]] += values[idx];
                 }
             }
-            apply_dense_bspline_extrapolation(data, knot_view, degree, eval_kind, &mut dense)?;
+            apply_dense_bspline_extrapolation(data, knotview, degree, eval_kind, &mut dense)?;
             dense
         } else {
-            generate_basis_internal::<DenseStorage>(data.view(), knot_view, degree, eval_kind)?
+            generate_basis_internal::<DenseStorage>(data.view(), knotview, degree, eval_kind)?
         };
 
-        Ok((Arc::new(basis_matrix), knot_vec))
+        Ok((Arc::new(basis_matrix), knotvec))
     }
 
     fn from_dense(dense: Array2<f64>) -> Result<Self::Output, BasisError> {
@@ -443,7 +443,7 @@ impl BasisOutputFormat for Dense {
 
 fn apply_dense_bspline_extrapolation(
     data: ArrayView1<f64>,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     degree: usize,
     eval_kind: BasisEvalKind,
     basis_matrix: &mut Array2<f64>,
@@ -453,11 +453,11 @@ fn apply_dense_bspline_extrapolation(
         return Ok(());
     }
 
-    let left = knot_view[degree];
-    let right = knot_view[num_basis_functions];
+    let left = knotview[degree];
+    let right = knotview[num_basis_functions];
 
     if matches!(eval_kind, BasisEvalKind::FirstDerivative) {
-        let num_basis_lower = knot_view.len().saturating_sub(degree);
+        let num_basis_lower = knotview.len().saturating_sub(degree);
         let mut lower_basis = vec![0.0; num_basis_lower];
         let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(1));
         for (i, &x) in data.iter().enumerate() {
@@ -471,7 +471,7 @@ fn apply_dense_bspline_extrapolation(
                 .expect("basis matrix rows should be contiguous");
             evaluate_bspline_derivative_scalar_into(
                 x_c,
-                knot_view,
+                knotview,
                 degree,
                 row_slice,
                 &mut lower_basis,
@@ -493,7 +493,7 @@ fn apply_dense_bspline_extrapolation(
         apply_linear_extension_from_first_derivative(
             data,
             z_clamped.view(),
-            knot_view,
+            knotview,
             degree,
             basis_matrix,
         )?;
@@ -510,12 +510,12 @@ impl BasisOutputFormat for Sparse {
         data: ArrayView1<f64>,
         degree: usize,
         eval_kind: BasisEvalKind,
-        knot_vec: Array1<f64>,
+        knotvec: Array1<f64>,
     ) -> Result<(Self::Output, Array1<f64>), BasisError> {
-        let knot_view = knot_vec.view();
+        let knotview = knotvec.view();
         let sparse =
-            generate_basis_internal::<SparseStorage>(data.view(), knot_view, degree, eval_kind)?;
-        Ok((sparse, knot_vec))
+            generate_basis_internal::<SparseStorage>(data.view(), knotview, degree, eval_kind)?;
+        Ok((sparse, knotvec))
     }
 
     fn from_dense(dense: Array2<f64>) -> Result<Self::Output, BasisError> {
@@ -632,19 +632,19 @@ impl BasisEvalScratch {
     }
 }
 
-fn evaluate_splines_derivative_sparse_into_with_lower(
+fn evaluate_splines_derivative_sparse_intowith_lower(
     x: f64,
     degree: usize,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     values: &mut [f64],
     basis_scratch: &mut internal::BsplineScratch,
-    lower_values: &mut [f64],
+    lowervalues: &mut [f64],
     lower_scratch: &mut internal::BsplineScratch,
 ) -> usize {
-    let num_basis = knot_view.len().saturating_sub(degree + 1);
+    let num_basis = knotview.len().saturating_sub(degree + 1);
     let x_eval = if num_basis > 0 {
-        let left = knot_view[degree];
-        let right = knot_view[num_basis];
+        let left = knotview[degree];
+        let right = knotview[num_basis];
         x.clamp(left, right)
     } else {
         x
@@ -653,7 +653,7 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
     // first derivatives clamp to the nearest boundary derivative value.
 
     let start_col =
-        internal::evaluate_splines_sparse_into(x_eval, degree, knot_view, values, basis_scratch);
+        internal::evaluate_splines_sparse_into(x_eval, degree, knotview, values, basis_scratch);
     if degree == 0 {
         values.fill(0.0);
         return start_col;
@@ -661,15 +661,15 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
 
     let lower_degree = degree - 1;
     let lower_support = lower_degree + 1;
-    if lower_values.len() != lower_support {
+    if lowervalues.len() != lower_support {
         return start_col;
     }
 
     let start_lower = internal::evaluate_splines_sparse_into(
         x_eval,
         lower_degree,
-        knot_view,
-        lower_values,
+        knotview,
+        lowervalues,
         lower_scratch,
     );
 
@@ -679,17 +679,17 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
         let left_idx = i as isize - start_lower as isize;
         let right_idx = (i + 1) as isize - start_lower as isize;
         let left = if left_idx >= 0 && (left_idx as usize) < lower_support {
-            lower_values[left_idx as usize]
+            lowervalues[left_idx as usize]
         } else {
             0.0
         };
         let right = if right_idx >= 0 && (right_idx as usize) < lower_support {
-            lower_values[right_idx as usize]
+            lowervalues[right_idx as usize]
         } else {
             0.0
         };
-        let denom_left = knot_view[i + degree] - knot_view[i];
-        let denom_right = knot_view[i + degree + 1] - knot_view[i + 1];
+        let denom_left = knotview[i + degree] - knotview[i];
+        let denom_right = knotview[i + degree + 1] - knotview[i + 1];
         let left_term = if denom_left.abs() > 1e-12 {
             left / denom_left
         } else {
@@ -709,7 +709,7 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
 fn evaluate_splines_derivative_sparse_into(
     x: f64,
     degree: usize,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     values: &mut [f64],
     scratch: &mut BasisEvalScratch,
 ) -> usize {
@@ -719,10 +719,10 @@ fn evaluate_splines_derivative_sparse_into(
         scratch.lower_basis.resize(lower_support, 0.0);
         scratch.lower_scratch.ensure_degree(lower_degree);
     }
-    evaluate_splines_derivative_sparse_into_with_lower(
+    evaluate_splines_derivative_sparse_intowith_lower(
         x,
         degree,
-        knot_view,
+        knotview,
         values,
         &mut scratch.basis,
         &mut scratch.lower_basis,
@@ -730,17 +730,17 @@ fn evaluate_splines_derivative_sparse_into(
     )
 }
 
-fn evaluate_splines_second_derivative_sparse_into(
+fn evaluate_splinessecond_derivative_sparse_into(
     x: f64,
     degree: usize,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     values: &mut [f64],
     scratch: &mut BasisEvalScratch,
 ) -> usize {
-    let num_basis = knot_view.len().saturating_sub(degree + 1);
+    let num_basis = knotview.len().saturating_sub(degree + 1);
     if num_basis > 0 {
-        let left = knot_view[degree];
-        let right = knot_view[num_basis];
+        let left = knotview[degree];
+        let right = knotview[num_basis];
         // Constant extrapolation outside the domain implies zero derivatives.
         if x < left || x > right {
             values.fill(0.0);
@@ -749,7 +749,7 @@ fn evaluate_splines_second_derivative_sparse_into(
     }
 
     let start_col =
-        internal::evaluate_splines_sparse_into(x, degree, knot_view, values, &mut scratch.basis);
+        internal::evaluate_splines_sparse_into(x, degree, knotview, values, &mut scratch.basis);
     if degree < 2 {
         values.fill(0.0);
         return start_col;
@@ -777,10 +777,10 @@ fn evaluate_splines_second_derivative_sparse_into(
     //                  -B'_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}) )
     //
     // So `scratch.lower_basis` below stores derivative values, not raw basis values.
-    let start_lower = evaluate_splines_derivative_sparse_into_with_lower(
+    let start_lower = evaluate_splines_derivative_sparse_intowith_lower(
         x,
         lower_degree,
-        knot_view,
+        knotview,
         &mut scratch.lower_basis,
         &mut scratch.lower_scratch,
         &mut scratch.lower_lower_basis,
@@ -803,8 +803,8 @@ fn evaluate_splines_second_derivative_sparse_into(
         } else {
             0.0
         };
-        let denom_left = knot_view[i + degree] - knot_view[i];
-        let denom_right = knot_view[i + degree + 1] - knot_view[i + 1];
+        let denom_left = knotview[i + degree] - knotview[i];
+        let denom_right = knotview[i + degree + 1] - knotview[i + 1];
         let left_term = if denom_left.abs() > 1e-12 {
             left / denom_left
         } else {
@@ -821,31 +821,31 @@ fn evaluate_splines_second_derivative_sparse_into(
     start_col
 }
 
-fn evaluate_splines_sparse_with_kind(
+fn evaluate_splines_sparsewith_kind(
     x: f64,
     degree: usize,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     eval_kind: BasisEvalKind,
     values: &mut [f64],
     scratch: &mut BasisEvalScratch,
 ) -> usize {
     match eval_kind {
         BasisEvalKind::Basis => {
-            internal::evaluate_splines_sparse_into(x, degree, knot_view, values, &mut scratch.basis)
+            internal::evaluate_splines_sparse_into(x, degree, knotview, values, &mut scratch.basis)
         }
         BasisEvalKind::FirstDerivative => {
-            evaluate_splines_derivative_sparse_into(x, degree, knot_view, values, scratch)
+            evaluate_splines_derivative_sparse_into(x, degree, knotview, values, scratch)
         }
         BasisEvalKind::SecondDerivative => {
-            evaluate_splines_second_derivative_sparse_into(x, degree, knot_view, values, scratch)
+            evaluate_splinessecond_derivative_sparse_into(x, degree, knotview, values, scratch)
         }
     }
 }
 
-fn evaluate_bspline_row_entries<F>(
+fn evaluate_bsplinerow_entries<F>(
     x: f64,
     degree: usize,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     eval_kind: BasisEvalKind,
     num_basis_functions: usize,
     scratch: &mut BasisEvalScratch,
@@ -855,7 +855,7 @@ fn evaluate_bspline_row_entries<F>(
     F: FnMut(usize, f64),
 {
     let start_col =
-        evaluate_splines_sparse_with_kind(x, degree, knot_view, eval_kind, values, scratch);
+        evaluate_splines_sparsewith_kind(x, degree, knotview, eval_kind, values, scratch);
     for (offset, &v) in values.iter().enumerate() {
         if v == 0.0 {
             continue;
@@ -872,7 +872,7 @@ trait BasisStorage {
 
     fn build(
         data: ArrayView1<f64>,
-        knot_view: ArrayView1<f64>,
+        knotview: ArrayView1<f64>,
         degree: usize,
         eval_kind: BasisEvalKind,
         num_basis_functions: usize,
@@ -888,7 +888,7 @@ impl BasisStorage for DenseStorage {
 
     fn build(
         data: ArrayView1<f64>,
-        knot_view: ArrayView1<f64>,
+        knotview: ArrayView1<f64>,
         degree: usize,
         eval_kind: BasisEvalKind,
         num_basis_functions: usize,
@@ -908,10 +908,10 @@ impl BasisStorage for DenseStorage {
                         let row_slice = row
                             .as_slice_mut()
                             .expect("basis matrix rows should be contiguous");
-                        evaluate_bspline_row_entries(
+                        evaluate_bsplinerow_entries(
                             x,
                             degree,
-                            knot_view,
+                            knotview,
                             eval_kind,
                             num_basis_functions,
                             scratch,
@@ -927,10 +927,10 @@ impl BasisStorage for DenseStorage {
                 let row_slice = row
                     .as_slice_mut()
                     .expect("basis matrix rows should be contiguous");
-                evaluate_bspline_row_entries(
+                evaluate_bsplinerow_entries(
                     x,
                     degree,
-                    knot_view,
+                    knotview,
                     eval_kind,
                     num_basis_functions,
                     &mut scratch,
@@ -940,7 +940,7 @@ impl BasisStorage for DenseStorage {
             }
         }
 
-        apply_dense_bspline_extrapolation(data, knot_view, degree, eval_kind, &mut basis_matrix)?;
+        apply_dense_bspline_extrapolation(data, knotview, degree, eval_kind, &mut basis_matrix)?;
 
         Ok(basis_matrix)
     }
@@ -953,7 +953,7 @@ impl BasisStorage for SparseStorage {
 
     fn build(
         data: ArrayView1<f64>,
-        knot_view: ArrayView1<f64>,
+        knotview: ArrayView1<f64>,
         degree: usize,
         eval_kind: BasisEvalKind,
         num_basis_functions: usize,
@@ -961,13 +961,13 @@ impl BasisStorage for SparseStorage {
         use_parallel: bool,
     ) -> Result<Self::Output, BasisError> {
         let nrows = data.len();
-        let left = knot_view[degree];
-        let right = knot_view[num_basis_functions];
+        let left = knotview[degree];
+        let right = knotview[num_basis_functions];
         let needs_extrapolation = data.iter().any(|&x| x < left || x > right);
         if needs_extrapolation {
             let dense = DenseStorage::build(
                 data,
-                knot_view,
+                knotview,
                 degree,
                 eval_kind,
                 num_basis_functions,
@@ -986,14 +986,14 @@ impl BasisStorage for SparseStorage {
                     .map_init(
                         || (BasisEvalScratch::new(degree), vec![0.0; support]),
                         |(scratch, values), (chunk_idx, chunk)| {
-                            let base_row = chunk_idx * CHUNK_SIZE;
+                            let baserow = chunk_idx * CHUNK_SIZE;
                             let mut local = Vec::with_capacity(chunk.len().saturating_mul(support));
                             for (i, &x) in chunk.iter().enumerate() {
-                                let row_i = base_row + i;
-                                evaluate_bspline_row_entries(
+                                let row_i = baserow + i;
+                                evaluate_bsplinerow_entries(
                                     x,
                                     degree,
-                                    knot_view,
+                                    knotview,
                                     eval_kind,
                                     num_basis_functions,
                                     scratch,
@@ -1017,10 +1017,10 @@ impl BasisStorage for SparseStorage {
                 let mut triplets = Vec::with_capacity(nrows.saturating_mul(support));
 
                 for (row_i, &x) in data.iter().enumerate() {
-                    evaluate_bspline_row_entries(
+                    evaluate_bsplinerow_entries(
                         x,
                         degree,
-                        knot_view,
+                        knotview,
                         eval_kind,
                         num_basis_functions,
                         &mut scratch,
@@ -1039,11 +1039,11 @@ impl BasisStorage for SparseStorage {
 
 fn generate_basis_internal<S: BasisStorage>(
     data: ArrayView1<f64>,
-    knot_view: ArrayView1<f64>,
+    knotview: ArrayView1<f64>,
     degree: usize,
     eval_kind: BasisEvalKind,
 ) -> Result<S::Output, BasisError> {
-    let num_basis_functions = knot_view.len().saturating_sub(degree + 1);
+    let num_basis_functions = knotview.len().saturating_sub(degree + 1);
     let support = degree + 1;
     // Parallel dispatch heuristic:
     // Lower degrees have cheaper per-row evaluation and need larger batches to
@@ -1057,7 +1057,7 @@ fn generate_basis_internal<S: BasisStorage>(
     let use_parallel = data.len() >= par_threshold && data.as_slice().is_some();
     S::build(
         data,
-        knot_view,
+        knotview,
         degree,
         eval_kind,
         num_basis_functions,
@@ -1066,7 +1066,7 @@ fn generate_basis_internal<S: BasisStorage>(
     )
 }
 
-fn validate_multi_dim_inputs(
+fn validatemulti_dim_inputs(
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
     degrees: &[usize],
@@ -1115,7 +1115,7 @@ fn compute_tensor_strides(num_basis: &[usize]) -> Result<Vec<usize>, BasisError>
     Ok(strides)
 }
 
-fn fill_tensor_row<F>(
+fn fill_tensorrow<F>(
     row_idx: usize,
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
@@ -1134,7 +1134,7 @@ fn fill_tensor_row<F>(
 {
     for dim in 0..data.len() {
         let x = data[dim][row_idx];
-        let start = evaluate_splines_sparse_with_kind(
+        let start = evaluate_splines_sparsewith_kind(
             x,
             degrees[dim],
             knot_vectors[dim],
@@ -1182,7 +1182,7 @@ fn generate_basis_nd_dense(
     degrees: &[usize],
     eval_kinds: &[BasisEvalKind],
 ) -> Result<Array2<f64>, BasisError> {
-    let (dims, nrows) = validate_multi_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
+    let (dims, nrows) = validatemulti_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
     let mut num_basis = Vec::with_capacity(dims);
     let mut supports = Vec::with_capacity(dims);
     for dim in 0..dims {
@@ -1229,7 +1229,7 @@ fn generate_basis_nd_dense(
                     let row_slice = row
                         .as_slice_mut()
                         .expect("basis matrix rows should be contiguous");
-                    fill_tensor_row(
+                    fill_tensorrow(
                         row_idx,
                         data,
                         knot_vectors,
@@ -1258,7 +1258,7 @@ fn generate_basis_nd_dense(
             let row_slice = row
                 .as_slice_mut()
                 .expect("basis matrix rows should be contiguous");
-            fill_tensor_row(
+            fill_tensorrow(
                 row_idx,
                 data,
                 knot_vectors,
@@ -1285,7 +1285,7 @@ fn generate_basis_nd_sparse(
     degrees: &[usize],
     eval_kinds: &[BasisEvalKind],
 ) -> Result<SparseColMat<usize, f64>, BasisError> {
-    let (dims, nrows) = validate_multi_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
+    let (dims, nrows) = validatemulti_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
     let mut num_basis = Vec::with_capacity(dims);
     let mut supports = Vec::with_capacity(dims);
     for dim in 0..dims {
@@ -1327,14 +1327,14 @@ fn generate_basis_nd_sparse(
                 },
                 |(scratch, values, starts, indices), chunk_start| {
                     let row_end = (chunk_start + CHUNK_SIZE).min(nrows);
-                    let per_row_nnz = supports.iter().fold(1usize, |acc, &s| acc * s);
+                    let perrow_nnz = supports.iter().fold(1usize, |acc, &s| acc * s);
                     let mut local = Vec::with_capacity(
                         row_end
                             .saturating_sub(chunk_start)
-                            .saturating_mul(per_row_nnz),
+                            .saturating_mul(perrow_nnz),
                     );
                     for row_idx in chunk_start..row_end {
-                        fill_tensor_row(
+                        fill_tensorrow(
                             row_idx,
                             data,
                             knot_vectors,
@@ -1369,7 +1369,7 @@ fn generate_basis_nd_sparse(
             nrows.saturating_mul(supports.iter().fold(1usize, |acc, &s| acc * s)),
         );
         for row_idx in 0..nrows {
-            fill_tensor_row(
+            fill_tensorrow(
                 row_idx,
                 data,
                 knot_vectors,
@@ -1398,8 +1398,8 @@ pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize)
         return false;
     }
 
-    let support_per_row = (degree + 1).saturating_pow(dim as u32) as f64;
-    let density = support_per_row / num_basis_cols as f64;
+    let support_perrow = (degree + 1).saturating_pow(dim as u32) as f64;
+    let density = support_perrow / num_basis_cols as f64;
 
     density < 0.20 && num_basis_cols > 32
 }
@@ -1418,68 +1418,68 @@ fn eval_kinds_from_orders(orders: &[usize]) -> Result<Vec<BasisEvalKind>, BasisE
         .collect()
 }
 
-fn create_bspline_basis_nd_with_knots_internal(
+fn create_bspline_basis_ndwith_knots_internal(
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
     degrees: &[usize],
     eval_kinds: &[BasisEvalKind],
 ) -> Result<(Arc<Array2<f64>>, Vec<Array1<f64>>), BasisError> {
-    validate_multi_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
-    let knot_vecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
-    let knot_views: Vec<ArrayView1<'_, f64>> = knot_vecs.iter().map(|v| v.view()).collect();
+    validatemulti_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
+    let knotvecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
+    let knotviews: Vec<ArrayView1<'_, f64>> = knotvecs.iter().map(|v| v.view()).collect();
 
-    let basis_matrix = generate_basis_nd_dense(data, &knot_views, degrees, eval_kinds)?;
-    Ok((Arc::new(basis_matrix), knot_vecs))
+    let basis_matrix = generate_basis_nd_dense(data, &knotviews, degrees, eval_kinds)?;
+    Ok((Arc::new(basis_matrix), knotvecs))
 }
 
 /// Creates a multi-dimensional tensor-product B-spline basis using pre-computed knot vectors.
-pub fn create_bspline_basis_nd_with_knots(
+pub fn create_bspline_basis_ndwith_knots(
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
     degrees: &[usize],
 ) -> Result<(Arc<Array2<f64>>, Vec<Array1<f64>>), BasisError> {
     let eval_kinds = vec![BasisEvalKind::Basis; degrees.len()];
-    create_bspline_basis_nd_with_knots_internal(data, knot_vectors, degrees, &eval_kinds)
+    create_bspline_basis_ndwith_knots_internal(data, knot_vectors, degrees, &eval_kinds)
 }
 
 /// Creates a multi-dimensional tensor-product B-spline basis using pre-computed knot vectors,
 /// allowing per-dimension derivative orders (0, 1, 2).
-pub fn create_bspline_basis_nd_with_knots_derivative(
+pub fn create_bspline_basis_ndwith_knots_derivative(
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
     degrees: &[usize],
     derivative_orders: &[usize],
 ) -> Result<(Arc<Array2<f64>>, Vec<Array1<f64>>), BasisError> {
     let eval_kinds = eval_kinds_from_orders(derivative_orders)?;
-    create_bspline_basis_nd_with_knots_internal(data, knot_vectors, degrees, &eval_kinds)
+    create_bspline_basis_ndwith_knots_internal(data, knot_vectors, degrees, &eval_kinds)
 }
 
 /// Creates a sparse multi-dimensional tensor-product B-spline basis using pre-computed knot vectors.
-pub fn create_bspline_basis_nd_sparse_with_knots(
+pub fn create_bspline_basis_nd_sparsewith_knots(
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
     degrees: &[usize],
 ) -> Result<(SparseColMat<usize, f64>, Vec<Array1<f64>>), BasisError> {
     let eval_kinds = vec![BasisEvalKind::Basis; degrees.len()];
-    let knot_vecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
-    let knot_views: Vec<ArrayView1<'_, f64>> = knot_vecs.iter().map(|v| v.view()).collect();
-    let sparse = generate_basis_nd_sparse(data, &knot_views, degrees, &eval_kinds)?;
-    Ok((sparse, knot_vecs))
+    let knotvecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
+    let knotviews: Vec<ArrayView1<'_, f64>> = knotvecs.iter().map(|v| v.view()).collect();
+    let sparse = generate_basis_nd_sparse(data, &knotviews, degrees, &eval_kinds)?;
+    Ok((sparse, knotvecs))
 }
 
 /// Creates a sparse multi-dimensional tensor-product B-spline basis using pre-computed knot vectors,
 /// allowing per-dimension derivative orders (0, 1, 2).
-pub fn create_bspline_basis_nd_sparse_with_knots_derivative(
+pub fn create_bspline_basis_nd_sparsewith_knots_derivative(
     data: &[ArrayView1<'_, f64>],
     knot_vectors: &[ArrayView1<'_, f64>],
     degrees: &[usize],
     derivative_orders: &[usize],
 ) -> Result<(SparseColMat<usize, f64>, Vec<Array1<f64>>), BasisError> {
     let eval_kinds = eval_kinds_from_orders(derivative_orders)?;
-    let knot_vecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
-    let knot_views: Vec<ArrayView1<'_, f64>> = knot_vecs.iter().map(|v| v.view()).collect();
-    let sparse = generate_basis_nd_sparse(data, &knot_views, degrees, &eval_kinds)?;
-    Ok((sparse, knot_vecs))
+    let knotvecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
+    let knotviews: Vec<ArrayView1<'_, f64>> = knotvecs.iter().map(|v| v.view()).collect();
+    let sparse = generate_basis_nd_sparse(data, &knotviews, degrees, &eval_kinds)?;
+    Ok((sparse, knotvecs))
 }
 
 /// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
@@ -1636,7 +1636,7 @@ pub fn penalty_greville_abscissae_for_knots(
 /// - zero lower-right block for unpenalized polynomial terms.
 ///
 /// For double-penalty GAMs, a second ridge penalty `I` is also returned so the
-/// caller can optimize `(lambda_bending, lambda_ridge)` jointly.
+/// caller can optimize `(lambda_bending, lambdaridge)` jointly.
 #[derive(Debug, Clone)]
 pub struct ThinPlateSplineBasis {
     pub basis: Array2<f64>,
@@ -1718,7 +1718,7 @@ pub enum BSplineKnotPlacement {
 pub struct BSplineBasisSpec {
     pub degree: usize,
     pub penalty_order: usize,
-    pub knot_spec: BSplineKnotSpec,
+    pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
 }
@@ -1903,7 +1903,7 @@ pub struct BasisBuildResult {
     pub design: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
-    pub penalty_info: Vec<PenaltyInfo>,
+    pub penaltyinfo: Vec<PenaltyInfo>,
     pub metadata: BasisMetadata,
 }
 
@@ -1951,7 +1951,7 @@ pub struct CanonicalPenaltyBlock {
     pub rank: usize,
     pub nullity: usize,
     pub tol: f64,
-    pub is_zero: bool,
+    pub iszero: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1962,8 +1962,8 @@ pub struct BasisPsiDerivativeResult {
 
 #[derive(Debug, Clone)]
 pub struct BasisPsiSecondDerivativeResult {
-    pub design_second_derivative: Array2<f64>,
-    pub penalties_second_derivative: Vec<Array2<f64>>,
+    pub designsecond_derivative: Array2<f64>,
+    pub penaltiessecond_derivative: Vec<Array2<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2020,18 +2020,18 @@ fn select_equal_mass_centers(
         let mut best_dim = 0usize;
         let mut best_span = f64::NEG_INFINITY;
         for j in 0..d {
-            let mut min_v = f64::INFINITY;
-            let mut max_v = f64::NEG_INFINITY;
+            let mut minv = f64::INFINITY;
+            let mut maxv = f64::NEG_INFINITY;
             for &idx in idxs {
                 let v = data[[idx, j]];
-                if v < min_v {
-                    min_v = v;
+                if v < minv {
+                    minv = v;
                 }
-                if v > max_v {
-                    max_v = v;
+                if v > maxv {
+                    maxv = v;
                 }
             }
-            let span = max_v - min_v;
+            let span = maxv - minv;
             if span > best_span {
                 best_span = span;
                 best_dim = j;
@@ -2211,9 +2211,9 @@ fn select_uniform_grid_centers(
     let mut axes = Vec::with_capacity(d);
     for c in 0..d {
         let col = data.column(c);
-        let min_v = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        let max_v = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        axes.push(Array::linspace(min_v, max_v, points_per_dim));
+        let minv = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let maxv = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        axes.push(Array::linspace(minv, maxv, points_per_dim));
     }
     cartesian_grid_axes(&axes)
 }
@@ -2257,7 +2257,7 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    let (basis, knots) = match &spec.knot_spec {
+    let (basis, knots) = match &spec.knotspec {
         BSplineKnotSpec::Generate {
             data_range,
             num_internal_knots,
@@ -2349,13 +2349,13 @@ pub fn build_bspline_basis_1d(
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
-    let (penalties, nullspace_dims, penalty_info) =
+    let (penalties, nullspace_dims, penaltyinfo) =
         filter_active_penalty_candidates(transformed_candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
-        penalty_info,
+        penaltyinfo,
         metadata: BasisMetadata::BSpline1D {
             knots,
             identifiability_transform,
@@ -2378,11 +2378,11 @@ fn apply_bspline_identifiability_policy(
             (b_c, Some(z))
         }
         BSplineIdentifiability::RemoveLinearTrend => {
-            let (z, _s_constrained) = compute_geometric_constraint_transform(knots, degree, 2)?;
+            let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
             (design.dot(&z), Some(z))
         }
         BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
-            let (b_c, z) = apply_weighted_orthogonality_constraint(
+            let (b_c, z) = applyweighted_orthogonality_constraint(
                 design.view(),
                 columns.view(),
                 weights.as_ref().map(|w| w.view()),
@@ -2525,7 +2525,7 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
             rank: 0,
             nullity: 0,
             tol: 1e-10,
-            is_zero: true,
+            iszero: true,
         });
     }
 
@@ -2542,7 +2542,7 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
         rank,
         nullity,
         tol,
-        is_zero: max_abs_eigenvalue <= tol,
+        iszero: max_abs_eigenvalue <= tol,
     })
 }
 
@@ -2551,12 +2551,12 @@ pub fn filter_active_penalty_candidates(
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
     let mut penalties = Vec::with_capacity(candidates.len());
     let mut nullspace_dims = Vec::with_capacity(candidates.len());
-    let mut penalty_info = Vec::with_capacity(candidates.len());
+    let mut penaltyinfo = Vec::with_capacity(candidates.len());
 
     for (original_index, candidate) in candidates.into_iter().enumerate() {
         let analysis = analyze_penalty_block(&candidate.matrix)?;
         let dropped_reason = if analysis.rank == 0 {
-            Some(if analysis.is_zero {
+            Some(if analysis.iszero {
                 PenaltyDropReason::ZeroMatrix
             } else {
                 PenaltyDropReason::NumericalRankZero
@@ -2583,7 +2583,7 @@ pub fn filter_active_penalty_candidates(
                 dropped_reason
             );
         }
-        penalty_info.push(PenaltyInfo {
+        penaltyinfo.push(PenaltyInfo {
             source: candidate.source,
             original_index,
             active,
@@ -2594,7 +2594,7 @@ pub fn filter_active_penalty_candidates(
         });
     }
 
-    Ok((penalties, nullspace_dims, penalty_info))
+    Ok((penalties, nullspace_dims, penaltyinfo))
 }
 
 /// Build the double-penalty ridge from the structural null space of a PSD penalty.
@@ -2628,7 +2628,7 @@ fn build_nullspace_shrinkage_penalty(
         rank: zero_idx.len(),
         nullity: 0,
         tol,
-        is_zero: false,
+        iszero: false,
     }))
 }
 
@@ -2652,17 +2652,17 @@ fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64), BasisError
             "automatic knot placement requires finite data values".to_string(),
         ));
     }
-    let mut min_v = f64::INFINITY;
-    let mut max_v = f64::NEG_INFINITY;
+    let mut minv = f64::INFINITY;
+    let mut maxv = f64::NEG_INFINITY;
     for &x in data {
-        if x < min_v {
-            min_v = x;
+        if x < minv {
+            minv = x;
         }
-        if x > max_v {
-            max_v = x;
+        if x > maxv {
+            maxv = x;
         }
     }
-    Ok((min_v, max_v))
+    Ok((minv, maxv))
 }
 
 /// Generic thin-plate builder returning design + penalty list.
@@ -2671,16 +2671,16 @@ pub fn build_thin_plate_basis(
     spec: &ThinPlateBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_thin_plate_basis_with_workspace(data, spec, &mut workspace)
+    build_thin_plate_basiswithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_thin_plate_basis_with_workspace(
+pub fn build_thin_plate_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let tps = create_thin_plate_spline_basis_with_workspace(data, centers.view(), workspace)?;
+    let tps = create_thin_plate_spline_basiswithworkspace(data, centers.view(), workspace)?;
     let identifiability_transform = spatial_identifiability_transform_from_design(
         data,
         tps.basis.view(),
@@ -2721,12 +2721,12 @@ pub fn build_thin_plate_basis_with_workspace(
             })
             .collect::<Result<Vec<_>, _>>()?;
     }
-    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
-        penalty_info,
+        penaltyinfo,
         metadata: BasisMetadata::ThinPlate {
             centers,
             identifiability_transform,
@@ -2831,7 +2831,7 @@ fn matern_kernel_log_kappa_derivative_from_distance(
 }
 
 #[inline(always)]
-fn matern_kernel_log_kappa_second_derivative_from_distance(
+fn matern_kernel_log_kappasecond_derivative_from_distance(
     r: f64,
     length_scale: f64,
     nu: MaternNu,
@@ -2931,7 +2931,7 @@ fn matern_kernel_radial_triplet(
 }
 
 #[inline(always)]
-fn matern_kernel_radial_triplet_with_safe_ratio(
+fn matern_kernel_radial_tripletwith_safe_ratio(
     r: f64,
     length_scale: f64,
     nu: MaternNu,
@@ -3090,7 +3090,7 @@ fn duchon_kernel_radial_triplet(
 
     let Some(length_scale) = length_scale else {
         let block_order = pure_duchon_block_order(p_order, s_order);
-        let (_v, mut first, second) = duchon_polyharmonic_block_triplet(r, block_order, k_dim)?;
+        let (_, mut first, second) = duchon_polyharmonic_block_triplet(r, block_order, k_dim)?;
         if r == 0.0 {
             first = 0.0;
         }
@@ -3117,7 +3117,7 @@ fn duchon_kernel_radial_triplet(
         if *coeff == 0.0 {
             continue;
         }
-        let (_vm, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+        let (_, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
         first += coeff * dm;
         second += coeff * d2m;
     }
@@ -3125,7 +3125,7 @@ fn duchon_kernel_radial_triplet(
         if *coeff == 0.0 {
             continue;
         }
-        let (_vn, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
+        let (_, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
         first += coeff * dn;
         second += coeff * d2n;
     }
@@ -3133,7 +3133,7 @@ fn duchon_kernel_radial_triplet(
     if r == 0.0 {
         first = 0.0;
         let (phi_rr, _, _) =
-            duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs_ref)?;
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs_ref)?;
         second = phi_rr;
     }
     if !first.is_finite() || !second.is_finite() {
@@ -3156,7 +3156,7 @@ fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
 fn build_collocation_operators_from_radial<F>(
     collocation: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
-    collocation_weights: Option<ArrayView1<'_, f64>>,
+    collocationweights: Option<ArrayView1<'_, f64>>,
     radial_triplet: F,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError>
 where
@@ -3181,7 +3181,7 @@ where
     //   theta^T D0^T D0 theta = sum_k w_k f(z_k)^2
     //   theta^T D1^T D1 theta = sum_k w_k |grad f(z_k)|^2
     //   theta^T D2^T D2 theta = sum_k w_k (Delta f(z_k))^2.
-    let row_scales = if let Some(w) = collocation_weights {
+    let row_scales = if let Some(w) = collocationweights {
         if w.len() != p {
             return Err(BasisError::DimensionMismatch(format!(
                 "collocation weight length mismatch: got {}, expected {p}",
@@ -3266,7 +3266,7 @@ fn operator_penalty_candidates_from_collocation(
 }
 
 fn active_operator_penalty_derivatives(
-    penalty_info: &[PenaltyInfo],
+    penaltyinfo: &[PenaltyInfo],
     operator_derivatives: &[Array2<f64>],
     label: &str,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
@@ -3277,7 +3277,7 @@ fn active_operator_penalty_derivatives(
         )));
     }
 
-    penalty_info
+    penaltyinfo
         .iter()
         .filter(|info| info.active)
         .map(|info| match &info.source {
@@ -3293,15 +3293,15 @@ fn active_operator_penalty_derivatives(
 
 fn frozen_spatial_identifiability_transform(
     identifiability: &SpatialIdentifiability,
-    expected_rows: usize,
+    expectedrows: usize,
     label: &str,
 ) -> Result<Option<Array2<f64>>, BasisError> {
     match identifiability {
         SpatialIdentifiability::None | SpatialIdentifiability::OrthogonalToParametric => Ok(None),
         SpatialIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != expected_rows {
+            if transform.nrows() != expectedrows {
                 return Err(BasisError::DimensionMismatch(format!(
-                    "frozen {label} identifiability transform mismatch: rows={}, expected {expected_rows}",
+                    "frozen {label} identifiability transform mismatch: rows={}, expected {expectedrows}",
                     transform.nrows()
                 )));
             }
@@ -3330,8 +3330,8 @@ fn spatial_identifiability_transform_from_design(
         SpatialIdentifiability::None => Ok(None),
         SpatialIdentifiability::OrthogonalToParametric => {
             let c = spatial_parametric_constraint_block(data);
-            let (_design_constrained, z) =
-                apply_weighted_orthogonality_constraint(design, c.view(), None)?;
+            let (_, z) =
+                applyweighted_orthogonality_constraint(design, c.view(), None)?;
             Ok(Some(z))
         }
         SpatialIdentifiability::FrozenTransform { .. } => {
@@ -3378,7 +3378,7 @@ fn normalize_penalty_candidate(
 
 pub fn build_matern_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
-    collocation_weights: Option<ArrayView1<'_, f64>>,
+    collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: f64,
     nu: MaternNu,
     include_intercept: bool,
@@ -3390,7 +3390,7 @@ pub fn build_matern_collocation_operator_matrices(
     // - exact Laplacian identity: Δphi = phi'' + (d-1) phi'/r.
     let p = centers.nrows();
     let d = centers.ncols();
-    let row_scales = if let Some(w) = collocation_weights {
+    let row_scales = if let Some(w) = collocationweights {
         if w.len() != p {
             return Err(BasisError::DimensionMismatch(format!(
                 "collocation weight length mismatch: got {}, expected {p}",
@@ -3428,14 +3428,14 @@ pub fn build_matern_collocation_operator_matrices(
                     "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
                 ));
             }
-            let (phi, _phi_r, phi_rr, phi_r_over_r) =
+            let (phi, _, phi_rr, phi_r_over_r) =
                 if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
                     // In 1D: Delta phi = phi'' and the singular phi'/r term is absent.
                     let s = 1.0 / length_scale;
                     let e = 1.0;
                     (e, -s * e, s * s * e, 0.0)
                 } else {
-                    matern_kernel_radial_triplet_with_safe_ratio(r, length_scale, nu)?
+                    matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?
                 };
             d0_raw[[k, j]] = scale_k * phi;
             if r > R_EPS {
@@ -3492,16 +3492,16 @@ pub fn build_matern_collocation_operator_matrices(
 
 pub fn build_duchon_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
-    collocation_weights: Option<ArrayView1<'_, f64>>,
+    collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_duchon_collocation_operator_matrices_with_workspace(
+    build_duchon_collocation_operator_matriceswithworkspace(
         centers,
-        collocation_weights,
+        collocationweights,
         length_scale,
         power,
         nullspace_order,
@@ -3510,9 +3510,9 @@ pub fn build_duchon_collocation_operator_matrices(
     )
 }
 
-pub fn build_duchon_collocation_operator_matrices_with_workspace(
+pub fn build_duchon_collocation_operator_matriceswithworkspace(
     centers: ArrayView2<'_, f64>,
-    collocation_weights: Option<ArrayView1<'_, f64>>,
+    collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
@@ -3525,7 +3525,7 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let (d0_raw, d1_raw, d2_raw) =
-        build_collocation_operators_from_radial(centers, centers, collocation_weights, |r| {
+        build_collocation_operators_from_radial(centers, centers, collocationweights, |r| {
             duchon_kernel_radial_triplet(
                 r,
                 length_scale,
@@ -3544,7 +3544,7 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
     let kernel_cols = d0_kernel.ncols();
     let poly_cols = poly.ncols();
     let total_cols = kernel_cols + poly_cols;
-    let row_scales = if let Some(w) = collocation_weights {
+    let row_scales = if let Some(w) = collocationweights {
         if w.len() != p_colloc {
             return Err(BasisError::DimensionMismatch(format!(
                 "collocation weight length mismatch: got {}, expected {p_colloc}",
@@ -4123,12 +4123,12 @@ fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SpatialDistanceCacheKey {
-    data_rows: usize,
+    datarows: usize,
     data_cols: usize,
     data_ptr: usize,
     data_stride0: isize,
     data_stride1: isize,
-    centers_rows: usize,
+    centersrows: usize,
     centers_cols: usize,
     centers_hash: u64,
 }
@@ -4150,7 +4150,7 @@ const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ConstraintNullspaceCacheKey {
-    centers_rows: usize,
+    centersrows: usize,
     centers_cols: usize,
     centers_hash: u64,
     order_code: u8,
@@ -4185,7 +4185,7 @@ impl BasisWorkspace {
     }
 }
 
-fn hash_array_view2(values: ArrayView2<'_, f64>) -> u64 {
+fn hash_arrayview2(values: ArrayView2<'_, f64>) -> u64 {
     let mut hasher = DefaultHasher::new();
     values.nrows().hash(&mut hasher);
     values.ncols().hash(&mut hasher);
@@ -4255,14 +4255,14 @@ fn spatial_distance_matrices(
     }
 
     let key = SpatialDistanceCacheKey {
-        data_rows: data.nrows(),
+        datarows: data.nrows(),
         data_cols: data.ncols(),
         data_ptr: data.as_ptr() as usize,
         data_stride0: data.strides()[0],
         data_stride1: data.strides()[1],
-        centers_rows: centers.nrows(),
+        centersrows: centers.nrows(),
         centers_cols: centers.ncols(),
-        centers_hash: hash_array_view2(centers),
+        centers_hash: hash_arrayview2(centers),
     };
 
     if let Some(hit) = cache.spatial_distance.map.get(&key) {
@@ -4287,8 +4287,8 @@ fn spatial_distance_matrices(
         if cache.spatial_distance.order.is_empty() {
             break;
         }
-        let old_key = cache.spatial_distance.order.remove(0);
-        cache.spatial_distance.map.remove(&old_key);
+        let oldkey = cache.spatial_distance.order.remove(0);
+        cache.spatial_distance.map.remove(&oldkey);
     }
     Ok((computed_dc, computed_cc))
 }
@@ -4306,9 +4306,9 @@ fn kernel_constraint_nullspace(
     cache: &mut BasisCacheContext,
 ) -> Result<Array2<f64>, BasisError> {
     let key = ConstraintNullspaceCacheKey {
-        centers_rows: centers.nrows(),
+        centersrows: centers.nrows(),
         centers_cols: centers.ncols(),
-        centers_hash: hash_array_view2(centers),
+        centers_hash: hash_arrayview2(centers),
         order_code: constraint_nullspace_order_code(order),
     };
 
@@ -4328,8 +4328,8 @@ fn kernel_constraint_nullspace(
         if cache.constraint_nullspace.order.is_empty() {
             break;
         }
-        let old_key = cache.constraint_nullspace.order.remove(0);
-        cache.constraint_nullspace.map.remove(&old_key);
+        let oldkey = cache.constraint_nullspace.order.remove(0);
+        cache.constraint_nullspace.map.remove(&oldkey);
     }
 
     Ok((*z).clone())
@@ -4422,7 +4422,7 @@ pub fn create_matern_spline_basis(
     include_intercept: bool,
 ) -> Result<MaternSplineBasis, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    create_matern_spline_basis_with_workspace(
+    create_matern_spline_basiswithworkspace(
         data,
         centers,
         length_scale,
@@ -4432,7 +4432,7 @@ pub fn create_matern_spline_basis(
     )
 }
 
-pub fn create_matern_spline_basis_with_workspace(
+pub fn create_matern_spline_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -4554,17 +4554,17 @@ pub fn build_matern_basis(
     spec: &MaternBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_matern_basis_with_workspace(data, spec, &mut workspace)
+    build_matern_basiswithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_matern_basis_with_workspace(
+pub fn build_matern_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let m = create_matern_spline_basis_with_workspace(
+    let m = create_matern_spline_basiswithworkspace(
         data,
         centers.view(),
         spec.length_scale,
@@ -4596,12 +4596,12 @@ pub fn build_matern_basis_with_workspace(
             z_opt.as_ref(),
         )?
     };
-    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
-        penalty_info,
+        penaltyinfo,
         metadata: BasisMetadata::Matern {
             centers,
             length_scale: spec.length_scale,
@@ -4613,7 +4613,7 @@ pub fn build_matern_basis_with_workspace(
 }
 
 #[inline(always)]
-fn eval_poly_with_derivatives(coeffs: &[f64], a: f64) -> (f64, f64, f64) {
+fn eval_polywith_derivatives(coeffs: &[f64], a: f64) -> (f64, f64, f64) {
     let mut p = 0.0;
     let mut p1 = 0.0;
     let mut p2 = 0.0;
@@ -4630,7 +4630,7 @@ fn eval_poly_with_derivatives(coeffs: &[f64], a: f64) -> (f64, f64, f64) {
 }
 
 #[inline(always)]
-fn matern_value_psi_triplet(
+fn maternvalue_psi_triplet(
     r: f64,
     length_scale: f64,
     nu: MaternNu,
@@ -4675,7 +4675,7 @@ fn matern_value_psi_triplet(
     };
     let a = s * r;
     let e = (-a).exp();
-    let (p0, p1, p2) = eval_poly_with_derivatives(p, a);
+    let (p0, p1, p2) = eval_polywith_derivatives(p, a);
     let value = e * p0;
     // Chain through psi=log(kappa): da/dpsi = a.
     let value_psi = e * a * (p1 - p0);
@@ -4699,7 +4699,7 @@ fn exp_poly_scaled_s2_psi_triplet(s: f64, a: f64, coeffs: &[f64], scalar: f64) -
     // - phi'(r)/r closed forms for nu>=3/2
     // under psi-derivatives.
     let e = (-a).exp();
-    let (p0, p1, p2) = eval_poly_with_derivatives(coeffs, a);
+    let (p0, p1, p2) = eval_polywith_derivatives(coeffs, a);
     let d = p1 - p0;
     let y = scalar * s * s * e * p0;
     let y_psi = scalar * s * s * e * (2.0 * p0 + a * d);
@@ -4719,8 +4719,8 @@ fn matern_operator_psi_triplet(
         f64, // phi_psi
         f64, // phi_psi_psi
         f64, // phi_r_over_r
-        f64, // (phi_r_over_r)_psi
-        f64, // (phi_r_over_r)_psi_psi
+        f64, // derivative of phi_r_over_r with respect to psi
+        f64, // second derivative of phi_r_over_r with respect to psi
         f64, // lap
         f64, // lap_psi
         f64, // lap_psi_psi
@@ -4740,7 +4740,7 @@ fn matern_operator_psi_triplet(
     //
     // Then psi-derivatives are obtained exactly through
     // exp_poly_scaled_s2_psi_triplet, avoiding finite differences.
-    let (phi, phi_psi, phi_psi_psi) = matern_value_psi_triplet(r, length_scale, nu)?;
+    let (phi, phi_psi, phi_psi_psi) = maternvalue_psi_triplet(r, length_scale, nu)?;
     let kappa = 1.0 / length_scale;
     let d = dimension as f64;
     let (s, q, rr): (f64, &[f64], &[f64]) = match nu {
@@ -4828,7 +4828,7 @@ fn trace_of_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     a.t().dot(b).diag().sum()
 }
 
-fn normalize_penalty_with_psi_derivatives(
+fn normalize_penaltywith_psi_derivatives(
     s: &Array2<f64>,
     s_psi: &Array2<f64>,
     s_psi_psi: &Array2<f64>,
@@ -5005,12 +5005,12 @@ fn build_matern_operator_penalty_psi_derivatives(
     let (s2, s2_psi, s2_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
 
-    let (_s0_norm, s0_norm_psi, s0_norm_psi_psi, _c0) =
-        normalize_penalty_with_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
-    let (_s1_norm, s1_norm_psi, s1_norm_psi_psi, _c1) =
-        normalize_penalty_with_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
-    let (_s2_norm, s2_norm_psi, s2_norm_psi_psi, _c2) =
-        normalize_penalty_with_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
+    let (_, s0_norm_psi, s0_norm_psi_psi, _) =
+        normalize_penaltywith_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
+    let (_, s1_norm_psi, s1_norm_psi_psi, _) =
+        normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
+    let (_, s2_norm_psi, s2_norm_psi_psi, _) =
+        normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
 
     Ok((
         vec![s0_norm_psi, s1_norm_psi, s2_norm_psi],
@@ -5088,14 +5088,14 @@ fn build_duchon_operator_penalty_psi_derivatives(
                     d2_raw_psi_psi[[k, col]] += lap_psi_psi * z_jc;
                 }
             } else {
-                let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = duchon_phi_rr_collision_psi_triplet(
+                let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = duchonphi_rr_collision_psi_triplet(
                     length_scale,
                     p_order,
                     s_order,
                     d,
                     &coeffs,
                 )?;
-                let (_q_collision, lap_collision) = duchon_collision_operator_core_from_phi_rr(
+                let (_, lap_collision) = duchon_collision_operator_core_fromphi_rr(
                     phi_rr,
                     phi_rr_psi,
                     phi_rr_psi_psi,
@@ -5174,12 +5174,12 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let (s2, s2_psi, s2_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
 
-    let (_s0_norm, s0_norm_psi, s0_norm_psi_psi, _c0) =
-        normalize_penalty_with_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
-    let (_s1_norm, s1_norm_psi, s1_norm_psi_psi, _c1) =
-        normalize_penalty_with_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
-    let (_s2_norm, s2_norm_psi, s2_norm_psi_psi, _c2) =
-        normalize_penalty_with_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
+    let (_, s0_norm_psi, s0_norm_psi_psi, _) =
+        normalize_penaltywith_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
+    let (_, s1_norm_psi, s1_norm_psi_psi, _) =
+        normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
+    let (_, s2_norm_psi, s2_norm_psi_psi, _) =
+        normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
 
     Ok((
         vec![s0_norm_psi, s1_norm_psi, s2_norm_psi],
@@ -5207,7 +5207,7 @@ fn build_matern_design_psi_derivatives(
             kernel_psi[[i, j]] =
                 matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
             kernel_psi_psi[[i, j]] =
-                matern_kernel_log_kappa_second_derivative_from_distance(r, length_scale, nu)?;
+                matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
         }
     }
     let (kernel_psi, kernel_psi_psi) = if let Some(z) = z_opt {
@@ -5226,7 +5226,7 @@ fn build_matern_design_psi_derivatives(
     Ok((out_psi, out_psi_psi))
 }
 
-fn build_matern_double_penalty_primary_with_psi_derivatives(
+fn build_matern_double_penalty_primarywith_psi_derivatives(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
     nu: MaternNu,
@@ -5250,7 +5250,7 @@ fn build_matern_double_penalty_primary_with_psi_derivatives(
             let r = dist2.sqrt();
             let value = matern_kernel_from_distance(r, length_scale, nu)?;
             let d1 = matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
-            let d2 = matern_kernel_log_kappa_second_derivative_from_distance(r, length_scale, nu)?;
+            let d2 = matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
             kernel[[i, j]] = value;
             kernel[[j, i]] = value;
             kernel_psi[[i, j]] = d1;
@@ -5281,15 +5281,15 @@ fn build_matern_double_penalty_primary_with_psi_derivatives(
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&kernel_psi_psi);
     let (s_norm, s_norm_psi, s_norm_psi_psi, c) =
-        normalize_penalty_with_psi_derivatives(&s, &s_psi, &s_psi_psi);
+        normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
     Ok((s_norm, s_norm_psi, s_norm_psi_psi, c))
 }
 
 fn active_matern_double_penalty_derivatives(
-    penalty_info: &[PenaltyInfo],
+    penaltyinfo: &[PenaltyInfo],
     primary_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
-    penalty_info
+    penaltyinfo
         .iter()
         .filter(|info| info.active)
         .map(|info| match &info.source {
@@ -5309,10 +5309,10 @@ pub fn build_matern_basis_log_kappa_derivative(
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_matern_basis_log_kappa_derivative_with_workspace(data, spec, &mut workspace)
+    build_matern_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_matern_basis_log_kappa_derivative_with_workspace(
+pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
@@ -5320,7 +5320,7 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
     // Analytic psi derivative assembly for the Matérn basis block.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let base = build_matern_basis_with_workspace(data, spec, workspace)?;
+    let base = build_matern_basiswithworkspace(data, spec, workspace)?;
     let (design_derivative, _) = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -5332,14 +5332,14 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
     )?;
     let penalties_derivative = if spec.double_penalty {
         let (_, primary_derivative, _, _) =
-            build_matern_double_penalty_primary_with_psi_derivatives(
+            build_matern_double_penalty_primarywith_psi_derivatives(
                 centers.view(),
                 spec.length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
             )?;
-        active_matern_double_penalty_derivatives(&base.penalty_info, &primary_derivative)?
+        active_matern_double_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?
     } else {
         let (all_penalty_deriv, _) = build_matern_operator_penalty_psi_derivatives(
             centers.view(),
@@ -5348,7 +5348,7 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
             spec.include_intercept,
             z_opt.as_ref(),
         )?;
-        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Matérn")?
+        active_operator_penalty_derivatives(&base.penaltyinfo, &all_penalty_deriv, "Matérn")?
     };
 
     Ok(BasisPsiDerivativeResult {
@@ -5357,15 +5357,15 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
     })
 }
 
-pub fn build_matern_basis_log_kappa_second_derivative(
+pub fn build_matern_basis_log_kappasecond_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_matern_basis_log_kappa_second_derivative_with_workspace(data, spec, &mut workspace)
+    build_matern_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
+pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
@@ -5374,8 +5374,8 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
     // mapping logic and constrained normalized penalty geometry.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let base = build_matern_basis_with_workspace(data, spec, workspace)?;
-    let (_, design_second_derivative) = build_matern_design_psi_derivatives(
+    let base = build_matern_basiswithworkspace(data, spec, workspace)?;
+    let (_, designsecond_derivative) = build_matern_design_psi_derivatives(
         data,
         centers.view(),
         spec.length_scale,
@@ -5384,18 +5384,18 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
         z_opt.as_ref(),
         workspace,
     )?;
-    let penalties_second_derivative = if spec.double_penalty {
-        let (_, _, primary_second_derivative, _) =
-            build_matern_double_penalty_primary_with_psi_derivatives(
+    let penaltiessecond_derivative = if spec.double_penalty {
+        let (_, _, primarysecond_derivative, _) =
+            build_matern_double_penalty_primarywith_psi_derivatives(
                 centers.view(),
                 spec.length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
             )?;
-        active_matern_double_penalty_derivatives(&base.penalty_info, &primary_second_derivative)?
+        active_matern_double_penalty_derivatives(&base.penaltyinfo, &primarysecond_derivative)?
     } else {
-        let (_, all_penalty_second_deriv) = build_matern_operator_penalty_psi_derivatives(
+        let (_, all_penaltysecond_deriv) = build_matern_operator_penalty_psi_derivatives(
             centers.view(),
             spec.length_scale,
             spec.nu,
@@ -5403,15 +5403,15 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
             z_opt.as_ref(),
         )?;
         active_operator_penalty_derivatives(
-            &base.penalty_info,
-            &all_penalty_second_deriv,
+            &base.penaltyinfo,
+            &all_penaltysecond_deriv,
             "Matérn",
         )?
     };
 
     Ok(BasisPsiSecondDerivativeResult {
-        design_second_derivative,
-        penalties_second_derivative,
+        designsecond_derivative,
+        penaltiessecond_derivative,
     })
 }
 
@@ -5434,7 +5434,7 @@ fn duchon_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize) -> f64 
 }
 
 #[inline(always)]
-fn duchon_has_classical_second_order_origin(p_order: usize, s_order: usize, k_dim: usize) -> bool {
+fn duchon_has_classicalsecond_order_origin(p_order: usize, s_order: usize, k_dim: usize) -> bool {
     2 * (p_order + s_order) > k_dim + 2
 }
 
@@ -5505,8 +5505,8 @@ fn duchon_matern_block_r3(
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
     let z = (kappa * r).max(1e-300);
     let k_nu_m2 = bessel_k_real_half_integer_or_integer((nu - 2.0).abs(), z)?;
-    let k_nu_m3 = bessel_k_real_half_integer_or_integer((nu - 3.0).abs(), z)?;
-    Ok(-c * kappa.powi(3) * r.powf(nu) * k_nu_m3
+    let k_num3 = bessel_k_real_half_integer_or_integer((nu - 3.0).abs(), z)?;
+    Ok(-c * kappa.powi(3) * r.powf(nu) * k_num3
         + 3.0 * c * kappa.powi(2) * r.powf(nu - 1.0) * k_nu_m2)
 }
 
@@ -5520,7 +5520,7 @@ fn duchon_matern_block_q_l_r_triplets(
     if r <= 0.0 {
         return Ok(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
     }
-    let (_value, first, second) = duchon_matern_block_triplet(r, kappa, n_order, k_dim)?;
+    let (_, first, second) = duchon_matern_block_triplet(r, kappa, n_order, k_dim)?;
     let third = duchon_matern_block_r3(r, kappa, n_order, k_dim)?;
     let q0 = first / r;
     let q1 = (second - q0) / r;
@@ -5539,7 +5539,7 @@ fn duchon_matern_block_q_l_r_triplets(
 }
 
 #[inline(always)]
-fn duchon_polyharmonic_second_collision_psi_triplet(
+fn duchon_polyharmonicsecond_collision_psi_triplet(
     length_scale: f64,
     m: usize,
     k_dim: usize,
@@ -5577,7 +5577,7 @@ fn duchon_polyharmonic_second_collision_psi_triplet(
 }
 
 #[inline(always)]
-fn duchon_matern_second_collision_psi_triplet(
+fn duchon_maternsecond_collision_psi_triplet(
     length_scale: f64,
     n_order: usize,
     k_dim: usize,
@@ -5586,14 +5586,12 @@ fn duchon_matern_second_collision_psi_triplet(
     // derivative at a length-scale-relative floor and propagate psi derivatives
     // analytically using the local scaling exponent.
     let kappa = 1.0 / length_scale;
-    let gamma = DUCHON_DERIVATIVE_R_FLOOR_REL;
     let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
-    let (_value, _first, second) = duchon_matern_block_triplet(r_eff, kappa, n_order, k_dim)?;
+    let (_, _, second) = duchon_matern_block_triplet(r_eff, kappa, n_order, k_dim)?;
     let n = n_order as f64;
     let nu = n - 0.5 * k_dim as f64;
     let scale = 2.0 - 2.0 * nu;
-    let _ = gamma;
-    Ok((second, scale * second, scale * scale * second))
+        Ok((second, scale * second, scale * scale * second))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5629,7 +5627,7 @@ struct DuchonRadialJets {
 fn scaled_log_kappa_derivatives(
     value: f64,
     radial_first: f64,
-    radial_second: f64,
+    radialsecond: f64,
     exponent: f64,
     r: f64,
 ) -> (f64, f64) {
@@ -5658,7 +5656,7 @@ fn scaled_log_kappa_derivatives(
     let first = exponent * value + r * radial_first;
     let second = exponent * exponent * value
         + (2.0 * exponent + 1.0) * r * radial_first
-        + r * r * radial_second;
+        + r * r * radialsecond;
     (first, second)
 }
 
@@ -5734,7 +5732,7 @@ fn duchon_laplacian_psi_triplet_from_jets(
 }
 
 #[inline(always)]
-fn duchon_collision_operator_core_from_phi_rr(
+fn duchon_collision_operator_core_fromphi_rr(
     phi_rr: f64,
     phi_rr_psi: f64,
     phi_rr_psi_psi: f64,
@@ -5797,7 +5795,7 @@ fn duchon_radial_jets(
         if *coeff == 0.0 {
             continue;
         }
-        let (_vm, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+        let (_, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
         let ((q0, q1, q2), (l0, l1, l2)) = duchon_polyharmonic_q_l_r_triplets(r_eval, m, k_dim);
         out.phi_r += coeff * dm;
         out.phi_rr += coeff * d2m;
@@ -5812,7 +5810,7 @@ fn duchon_radial_jets(
         if *coeff == 0.0 {
             continue;
         }
-        let (_vn, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
+        let (_, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
         let ((q0, q1, q2), (l0, l1, l2)) =
             duchon_matern_block_q_l_r_triplets(r_eval, kappa, n, k_dim)?;
         out.phi_r += coeff * dn;
@@ -5838,7 +5836,7 @@ fn duchon_radial_jets(
         // used by the higher-level Duchon operator and psi-derivative code.
         out.phi_r = 0.0;
         let (phi_rr, _, _) =
-            duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
         out.phi_rr = phi_rr;
         out.q = phi_rr;
         out.lap = k_dim as f64 * phi_rr;
@@ -5964,8 +5962,8 @@ fn duchon_radial_core_psi_triplet(
     #[cfg(test)]
     let (gradient_ratio, laplacian) = {
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
-            duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
-        duchon_collision_operator_core_from_phi_rr(phi_rr, phi_rr_psi, phi_rr_psi_psi, k_dim)
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
+        duchon_collision_operator_core_fromphi_rr(phi_rr, phi_rr_psi, phi_rr_psi_psi, k_dim)
     };
     Ok(DuchonRadialCore {
         phi: PsiTriplet {
@@ -5980,7 +5978,7 @@ fn duchon_radial_core_psi_triplet(
     })
 }
 
-fn duchon_phi_rr_collision_psi_triplet(
+fn duchonphi_rr_collision_psi_triplet(
     length_scale: f64,
     p_order: usize,
     s_order: usize,
@@ -6013,7 +6011,7 @@ fn duchon_phi_rr_collision_psi_triplet(
             continue;
         }
         let alpha_m = duchon_coeff_exponents(p_order, s_order, m);
-        let (g0, g1, g2) = duchon_polyharmonic_second_collision_psi_triplet(length_scale, m, k_dim);
+        let (g0, g1, g2) = duchon_polyharmonicsecond_collision_psi_triplet(length_scale, m, k_dim);
         phi_rr += a_m * g0;
         phi_rr_psi += alpha_m * a_m * g0 + a_m * g1;
         phi_rr_psi_psi += alpha_m * alpha_m * a_m * g0 + 2.0 * alpha_m * a_m * g1 + a_m * g2;
@@ -6023,19 +6021,19 @@ fn duchon_phi_rr_collision_psi_triplet(
             continue;
         }
         let beta_n = duchon_coeff_exponents(p_order, s_order, n);
-        let (g0, g1, g2) = duchon_matern_second_collision_psi_triplet(length_scale, n, k_dim)?;
+        let (g0, g1, g2) = duchon_maternsecond_collision_psi_triplet(length_scale, n, k_dim)?;
         phi_rr += b_n * g0;
         phi_rr_psi += beta_n * b_n * g0 + b_n * g1;
         phi_rr_psi_psi += beta_n * beta_n * b_n * g0 + 2.0 * beta_n * b_n * g1 + b_n * g2;
     }
-    if duchon_has_classical_second_order_origin(p_order, s_order, k_dim) {
+    if duchon_has_classicalsecond_order_origin(p_order, s_order, k_dim) {
         let scale = duchon_scaling_exponent(p_order, s_order, k_dim) + 2.0;
         return Ok((phi_rr, scale * phi_rr, scale * scale * phi_rr));
     }
     Ok((phi_rr, phi_rr_psi, phi_rr_psi_psi))
 }
 
-fn build_duchon_design_psi_derivatives_with_workspace(
+fn build_duchon_design_psi_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
@@ -6110,16 +6108,16 @@ pub fn build_duchon_basis_log_kappa_derivative(
     spec: &DuchonBasisSpec,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappa_derivative_with_workspace(data, spec, &mut workspace)
+    build_duchon_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
+pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
+    let base = build_duchon_basiswithworkspace(data, spec, workspace)?;
     let identifiability_transform = match &base.metadata {
         BasisMetadata::Duchon {
             identifiability_transform,
@@ -6127,7 +6125,7 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
         } => identifiability_transform.as_ref(),
         _ => None,
     };
-    let (design_derivative, _) = build_duchon_design_psi_derivatives_with_workspace(
+    let (design_derivative, _) = build_duchon_design_psi_derivativeswithworkspace(
         data,
         spec,
         identifiability_transform,
@@ -6140,28 +6138,28 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
         workspace,
     )?;
     let penalties_derivative =
-        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Duchon")?;
+        active_operator_penalty_derivatives(&base.penaltyinfo, &all_penalty_deriv, "Duchon")?;
     Ok(BasisPsiDerivativeResult {
         design_derivative,
         penalties_derivative,
     })
 }
 
-pub fn build_duchon_basis_log_kappa_second_derivative(
+pub fn build_duchon_basis_log_kappasecond_derivative(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappa_second_derivative_with_workspace(data, spec, &mut workspace)
+    build_duchon_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
+pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
+    let base = build_duchon_basiswithworkspace(data, spec, workspace)?;
     let identifiability_transform = match &base.metadata {
         BasisMetadata::Duchon {
             identifiability_transform,
@@ -6169,26 +6167,26 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
         } => identifiability_transform.as_ref(),
         _ => None,
     };
-    let (_, design_second_derivative) = build_duchon_design_psi_derivatives_with_workspace(
+    let (_, designsecond_derivative) = build_duchon_design_psi_derivativeswithworkspace(
         data,
         spec,
         identifiability_transform,
         workspace,
     )?;
-    let (_, all_penalty_second_deriv) = build_duchon_operator_penalty_psi_derivatives(
+    let (_, all_penaltysecond_deriv) = build_duchon_operator_penalty_psi_derivatives(
         centers.view(),
         spec,
         identifiability_transform,
         workspace,
     )?;
-    let penalties_second_derivative = active_operator_penalty_derivatives(
-        &base.penalty_info,
-        &all_penalty_second_deriv,
+    let penaltiessecond_derivative = active_operator_penalty_derivatives(
+        &base.penaltyinfo,
+        &all_penaltysecond_deriv,
         "Duchon",
     )?;
     Ok(BasisPsiSecondDerivativeResult {
-        design_second_derivative,
-        penalties_second_derivative,
+        designsecond_derivative,
+        penaltiessecond_derivative,
     })
 }
 
@@ -6214,7 +6212,7 @@ pub fn create_duchon_spline_basis(
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<DuchonSplineBasis, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    create_duchon_spline_basis_with_workspace(
+    create_duchon_spline_basiswithworkspace(
         data,
         centers,
         length_scale,
@@ -6224,7 +6222,7 @@ pub fn create_duchon_spline_basis(
     )
 }
 
-pub fn create_duchon_spline_basis_with_workspace(
+pub fn create_duchon_spline_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -6399,16 +6397,16 @@ pub fn build_duchon_basis(
     spec: &DuchonBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_with_workspace(data, spec, &mut workspace)
+    build_duchon_basiswithworkspace(data, spec, &mut workspace)
 }
 
-pub fn build_duchon_basis_with_workspace(
+pub fn build_duchon_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let d = create_duchon_spline_basis_with_workspace(
+    let d = create_duchon_spline_basiswithworkspace(
         data,
         centers.view(),
         spec.length_scale,
@@ -6427,7 +6425,7 @@ pub fn build_duchon_basis_with_workspace(
     } else {
         d.basis.clone()
     };
-    let ops = build_duchon_collocation_operator_matrices_with_workspace(
+    let ops = build_duchon_collocation_operator_matriceswithworkspace(
         centers.view(),
         None,
         spec.length_scale,
@@ -6437,12 +6435,12 @@ pub fn build_duchon_basis_with_workspace(
         workspace,
     )?;
     let candidates = operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2);
-    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
-        penalty_info,
+        penaltyinfo,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
@@ -6646,10 +6644,10 @@ pub fn create_thin_plate_spline_basis(
     knots: ArrayView2<f64>,
 ) -> Result<ThinPlateSplineBasis, BasisError> {
     let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basis_with_workspace(data, knots, &mut workspace)
+    create_thin_plate_spline_basiswithworkspace(data, knots, &mut workspace)
 }
 
-pub fn create_thin_plate_spline_basis_with_workspace(
+pub fn create_thin_plate_spline_basiswithworkspace(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
     workspace: &mut BasisWorkspace,
@@ -6771,16 +6769,16 @@ pub fn create_thin_plate_spline_basis_with_knot_count(
     num_knots: usize,
 ) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
     let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basis_with_knot_count_and_workspace(data, num_knots, &mut workspace)
+    create_thin_plate_spline_basis_with_knot_count_andworkspace(data, num_knots, &mut workspace)
 }
 
-pub fn create_thin_plate_spline_basis_with_knot_count_and_workspace(
+pub fn create_thin_plate_spline_basis_with_knot_count_andworkspace(
     data: ArrayView2<f64>,
     num_knots: usize,
     workspace: &mut BasisWorkspace,
 ) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
     let knots = select_thin_plate_knots(data, num_knots)?;
-    let basis = create_thin_plate_spline_basis_with_workspace(data, knots.view(), workspace)?;
+    let basis = create_thin_plate_spline_basiswithworkspace(data, knots.view(), workspace)?;
     Ok((basis, knots))
 }
 
@@ -6809,7 +6807,7 @@ pub fn apply_sum_to_zero_constraint(
     }
 
     // c = B^T w (weighted constraint) or B^T 1 (unweighted constraint)
-    let constraint_vector = match weights {
+    let constraintvector = match weights {
         Some(w) => {
             if w.len() != n {
                 return Err(BasisError::WeightsDimensionMismatch {
@@ -6821,7 +6819,7 @@ pub fn apply_sum_to_zero_constraint(
         }
         None => Array1::<f64>::ones(n),
     };
-    let c = basis_matrix.t().dot(&constraint_vector); // shape k
+    let c = basis_matrix.t().dot(&constraintvector); // shape k
 
     // Orthonormal basis for nullspace of c^T from a pivoted QR of the k×1
     // constraint matrix.
@@ -6863,7 +6861,7 @@ pub fn apply_sum_to_zero_constraint(
 ///
 /// The result enforces orthogonality by construction while retaining the largest possible
 /// smooth subspace under the given constraints.
-pub fn apply_weighted_orthogonality_constraint(
+pub fn applyweighted_orthogonality_constraint(
     basis_matrix: ArrayView2<f64>,
     constraint_matrix: ArrayView2<f64>,
     weights: Option<ArrayView1<f64>>,
@@ -6872,8 +6870,8 @@ pub fn apply_weighted_orthogonality_constraint(
     let k = basis_matrix.ncols();
     if constraint_matrix.nrows() != n {
         return Err(BasisError::ConstraintMatrixRowMismatch {
-            basis_rows: n,
-            constraint_rows: constraint_matrix.nrows(),
+            basisrows: n,
+            constraintrows: constraint_matrix.nrows(),
         });
     }
     if k == 0 {
@@ -6920,12 +6918,12 @@ fn stabilize_orthogonality_transform(
     transform: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let constrained_basis = fast_ab(&basis_matrix, transform);
-    let (u_opt, singular_values, vt_opt) = constrained_basis
+    let (u_opt, singularvalues, vt_opt) = constrained_basis
         .svd(true, true)
         .map_err(BasisError::LinalgError)?;
     let u = u_opt.expect("full SVD requested left singular vectors");
     let vt = vt_opt.expect("full SVD requested right singular vectors");
-    let max_sv = singular_values.iter().copied().fold(0.0_f64, f64::max);
+    let max_sv = singularvalues.iter().copied().fold(0.0_f64, f64::max);
     let tol = default_rrqr_rank_alpha()
         * f64::EPSILON
         * (constrained_basis
@@ -6933,7 +6931,7 @@ fn stabilize_orthogonality_transform(
             .max(constrained_basis.ncols())
             .max(1) as f64)
         * max_sv.max(1.0);
-    let keep = singular_values.iter().filter(|&&sv| sv > tol).count();
+    let keep = singularvalues.iter().filter(|&&sv| sv > tol).count();
     if keep == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
@@ -6942,7 +6940,7 @@ fn stabilize_orthogonality_transform(
     let v = vt.t().slice(s![.., 0..keep]).to_owned();
     let mut inv_sigma = Array2::<f64>::zeros((keep, keep));
     for i in 0..keep {
-        inv_sigma[[i, i]] = 1.0 / singular_values[i].max(tol);
+        inv_sigma[[i, i]] = 1.0 / singularvalues[i].max(tol);
     }
     let stabilized_transform = fast_ab(transform, &fast_ab(&v, &inv_sigma));
     Ok((basis_orthonormal, stabilized_transform))
@@ -7064,8 +7062,8 @@ pub fn compute_geometric_constraint_transform(
 
     // 3. Standardize linear row for numerical conditioning
     let g_mean = g.mean().unwrap_or(0.0);
-    let g_var = g.iter().map(|&x| (x - g_mean).powi(2)).sum::<f64>() / (k as f64);
-    let g_std = g_var.sqrt().max(1e-10);
+    let gvar = g.iter().map(|&x| (x - g_mean).powi(2)).sum::<f64>() / (k as f64);
+    let g_std = gvar.sqrt().max(1e-10);
     for j in 0..k {
         c_geom[[1, j]] = (c_geom[[1, j]] - g_mean) / g_std;
     }
@@ -7099,16 +7097,16 @@ pub fn compute_geometric_constraint_transform(
 /// * `s_1d`: The 1D penalty matrix (typically a difference penalty matrix)
 ///
 /// # Returns
-/// A tuple of transformation matrices: (Z_null, Z_range_whiten) where:
+/// A tuple of transformation matrices: (Z_null, Z_rangewhiten) where:
 /// - `Z_null`: Orthogonal basis for the null space (unpenalized functions)
-/// - `Z_range_whiten`: Whitened basis for the range space (penalized functions)
+/// - `Z_rangewhiten`: Whitened basis for the range space (penalized functions)
 ///   In these coordinates, the penalty becomes an identity matrix.
-pub fn null_range_whiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+pub fn null_rangewhiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let (evals, evecs) = s_1d.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
 
     // Calculate a relative tolerance based on the maximum eigenvalue
     // This is more robust than using a fixed absolute tolerance
-    let max_eig = evals.iter().fold(0.0f64, |max_val, &val| max_val.max(val));
+    let max_eig = evals.iter().fold(0.0f64, |maxval, &val| maxval.max(val));
     let relative_tol = if max_eig > 0.0 {
         max_eig * 1e-12
     } else {
@@ -7134,9 +7132,9 @@ pub fn null_range_whiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>
         // Use max(evals[i], 0.0) to ensure we don't try to take sqrt of a negative number
         d_inv_sqrt[[j, j]] = 1.0 / (evals[i].max(0.0)).sqrt();
     }
-    let z_range_whiten = fast_ab(&select_columns(&evecs, &idx_r), &d_inv_sqrt);
+    let z_rangewhiten = fast_ab(&select_columns(&evecs, &idx_r), &d_inv_sqrt);
 
-    Ok((z_null, z_range_whiten))
+    Ok((z_null, z_rangewhiten))
 }
 
 /// This is needed because ndarray doesn't have a direct way to select non-contiguous columns.
@@ -7198,32 +7196,32 @@ pub(crate) mod internal {
         num_internal_knots: usize,
         degree: usize,
     ) -> Result<Array1<f64>, BasisError> {
-        let (min_val, max_val) = data_range;
+        let (minval, maxval) = data_range;
 
         // Double-check for degenerate range - this should be caught by the public function
         // but we add it here as a defensive measure
-        if min_val == max_val && num_internal_knots > 0 {
+        if minval == maxval && num_internal_knots > 0 {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
 
-        let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
+        let h = (maxval - minval) / (num_internal_knots as f64 + 1.0);
         let total_knots = num_internal_knots + 2 * (degree + 1);
 
         let mut knots = Vec::with_capacity(total_knots);
 
-        // Clamped start: repeat min_val (degree + 1) times
+        // Clamped start: repeat minval (degree + 1) times
         for _ in 0..=degree {
-            knots.push(min_val);
+            knots.push(minval);
         }
 
         // Internal knots: uniformly spaced
         for i in 1..=num_internal_knots {
-            knots.push(min_val + i as f64 * h);
+            knots.push(minval + i as f64 * h);
         }
 
-        // Clamped end: repeat max_val (degree + 1) times
+        // Clamped end: repeat maxval (degree + 1) times
         for _ in 0..=degree {
-            knots.push(max_val);
+            knots.push(maxval);
         }
 
         Ok(Array::from_vec(knots))
@@ -7248,25 +7246,25 @@ pub(crate) mod internal {
 
         let mut sorted: Vec<f64> = data.iter().copied().collect();
         sorted.sort_by(f64::total_cmp);
-        let min_val = sorted[0];
-        let max_val = *sorted.last().unwrap_or(&min_val);
-        if min_val == max_val && num_internal_knots > 0 {
+        let minval = sorted[0];
+        let maxval = *sorted.last().unwrap_or(&minval);
+        if minval == maxval && num_internal_knots > 0 {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
-        let scale = (max_val - min_val).abs().max(1.0);
+        let scale = (maxval - minval).abs().max(1.0);
         let tol = 1e-12 * scale;
 
         let total_knots = num_internal_knots + 2 * (degree + 1);
         let mut knots = Vec::with_capacity(total_knots);
         for _ in 0..=degree {
-            knots.push(min_val);
+            knots.push(minval);
         }
 
         if num_internal_knots > 0 {
             let mut support = Vec::with_capacity(sorted.len());
             let mut last: Option<f64> = None;
             for &x in &sorted {
-                if x <= min_val + tol || x >= max_val - tol {
+                if x <= minval + tol || x >= maxval - tol {
                     continue;
                 }
                 if last.map(|prev| (x - prev).abs() <= tol).unwrap_or(false) {
@@ -7278,11 +7276,11 @@ pub(crate) mod internal {
             if support.is_empty() {
                 return Err(BasisError::InvalidInput(format!(
                     "quantile knot placement requires distinct interior support between {:.6e} and {:.6e}",
-                    min_val, max_val
+                    minval, maxval
                 )));
             }
             let n = support.len();
-            let mut prev_q = min_val;
+            let mut prev_q = minval;
             for j in 1..=num_internal_knots {
                 let p = j as f64 / (num_internal_knots + 1) as f64;
                 let pos = p * (n.saturating_sub(1) as f64);
@@ -7294,8 +7292,8 @@ pub(crate) mod internal {
                 } else {
                     support[lo] * (1.0 - frac) + support[hi] * frac
                 };
-                let q = q.clamp(min_val, max_val);
-                if q <= prev_q + tol || q >= max_val - tol {
+                let q = q.clamp(minval, maxval);
+                if q <= prev_q + tol || q >= maxval - tol {
                     return Err(BasisError::InvalidInput(format!(
                         "quantile knot placement produced a non-interior knot at index {}: {:.6e}",
                         j - 1,
@@ -7308,7 +7306,7 @@ pub(crate) mod internal {
         }
 
         for _ in 0..=degree {
-            knots.push(max_val);
+            knots.push(maxval);
         }
 
         Ok(Array::from_vec(knots))
@@ -7318,7 +7316,7 @@ pub(crate) mod internal {
     /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
     /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.
     ///
-    /// For x outside the spline domain [t_degree, t_num_basis], we apply constant
+    /// For x outside the spline domain [t_degree, tnum_basis], we apply constant
     /// boundary extrapolation by clamping x to the nearest boundary before running
     /// Cox-de Boor recursion.
     #[inline]
@@ -7326,14 +7324,14 @@ pub(crate) mod internal {
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
-        basis_values: &mut [f64],
+        basisvalues: &mut [f64],
         scratch: &mut BsplineScratch,
     ) {
         match degree {
-            3 => evaluate_splines_at_point_fixed::<3>(x, knots, basis_values, scratch),
-            2 => evaluate_splines_at_point_fixed::<2>(x, knots, basis_values, scratch),
-            1 => evaluate_splines_at_point_fixed::<1>(x, knots, basis_values, scratch),
-            _ => evaluate_splines_at_point_dynamic(x, degree, knots, basis_values, scratch),
+            3 => evaluate_splines_at_point_fixed::<3>(x, knots, basisvalues, scratch),
+            2 => evaluate_splines_at_point_fixed::<2>(x, knots, basisvalues, scratch),
+            1 => evaluate_splines_at_point_fixed::<1>(x, knots, basisvalues, scratch),
+            _ => evaluate_splines_at_point_dynamic(x, degree, knots, basisvalues, scratch),
         }
     }
 
@@ -7395,19 +7393,19 @@ pub(crate) mod internal {
     fn evaluate_splines_at_point_fixed<const DEGREE: usize>(
         x: f64,
         knots: ArrayView1<f64>,
-        basis_values: &mut [f64],
+        basisvalues: &mut [f64],
         scratch: &mut BsplineScratch,
     ) {
         let (mu, num_basis) = evaluate_spline_local_values(x, DEGREE, knots, scratch);
-        debug_assert_eq!(basis_values.len(), num_basis);
+        debug_assert_eq!(basisvalues.len(), num_basis);
         let n = &scratch.n;
-        basis_values.fill(0.0);
+        basisvalues.fill(0.0);
         for i in 0..=DEGREE {
             let gi = mu as isize + i as isize - DEGREE as isize;
             if gi >= 0 {
                 let global_idx = gi as usize;
                 if global_idx < num_basis {
-                    basis_values[global_idx] = n[i];
+                    basisvalues[global_idx] = n[i];
                 }
             }
         }
@@ -7418,19 +7416,19 @@ pub(crate) mod internal {
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
-        basis_values: &mut [f64],
+        basisvalues: &mut [f64],
         scratch: &mut BsplineScratch,
     ) {
         let (mu, num_basis) = evaluate_spline_local_values(x, degree, knots, scratch);
-        debug_assert_eq!(basis_values.len(), num_basis);
+        debug_assert_eq!(basisvalues.len(), num_basis);
         let n = &scratch.n;
-        basis_values.fill(0.0);
+        basisvalues.fill(0.0);
         for i in 0..=degree {
             let gi = mu as isize + i as isize - degree as isize;
             if gi >= 0 {
                 let global_idx = gi as usize;
                 if global_idx < num_basis {
-                    basis_values[global_idx] = n[i];
+                    basisvalues[global_idx] = n[i];
                 }
             }
         }
@@ -7446,7 +7444,7 @@ pub(crate) mod internal {
         values: &mut [f64],
         scratch: &mut BsplineScratch,
     ) -> usize {
-        let (mu, _num_basis) = evaluate_spline_local_values(x, degree, knots, scratch);
+        let (mu, _) = evaluate_spline_local_values(x, degree, knots, scratch);
         debug_assert_eq!(values.len(), degree + 1);
         let n = &scratch.n;
         for i in 0..=degree {
@@ -7464,18 +7462,18 @@ pub(crate) mod internal {
     ) -> Array1<f64> {
         let num_knots = knots.len();
         let num_basis = num_knots - degree - 1;
-        let mut basis_values = Array1::zeros(num_basis);
+        let mut basisvalues = Array1::zeros(num_basis);
         let mut scratch = BsplineScratch::new(degree);
         evaluate_splines_at_point_into(
             x,
             degree,
             knots,
-            basis_values
+            basisvalues
                 .as_slice_mut()
                 .expect("basis row should be contiguous"),
             &mut scratch,
         );
-        basis_values
+        basisvalues
     }
 }
 
@@ -7587,7 +7585,7 @@ pub fn evaluate_mspline_scalar(
 ///   `I_j(x) = sum_{m=j..end} B_m^{(degree+1)}(x)`.
 ///
 /// For clamped knot vectors, this yields monotone basis functions over the knot domain.
-pub fn evaluate_ispline_scalar_with_scratch(
+pub fn evaluate_ispline_scalarwith_scratch(
     x: f64,
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -7737,7 +7735,7 @@ pub fn evaluate_ispline_scalar(
         .checked_add(1)
         .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
     let mut scratch = SplineScratch::new(bs_degree);
-    evaluate_ispline_scalar_with_scratch(x, knot_vector, degree, out, &mut scratch)
+    evaluate_ispline_scalarwith_scratch(x, knot_vector, degree, out, &mut scratch)
 }
 
 /// Evaluates B-spline basis derivatives at a single scalar point `x` into a provided buffer.
@@ -8048,7 +8046,7 @@ fn create_ispline_dense(
 /// This returns derivatives in the raw spline basis. If a model uses an
 /// identifiability/constrained basis `BZ`, the caller must apply that same
 /// constraint transform in derivative space as `B''Z`.
-pub fn evaluate_bspline_second_derivative_scalar(
+pub fn evaluate_bsplinesecond_derivative_scalar(
     x: f64,
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -8068,7 +8066,7 @@ pub fn evaluate_bspline_second_derivative_scalar(
     let mut deriv_lower = vec![0.0; num_basis_lower];
     let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
     let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(2));
-    evaluate_bspline_second_derivative_scalar_into(
+    evaluate_bsplinesecond_derivative_scalar_into(
         x,
         knot_vector,
         degree,
@@ -8083,7 +8081,7 @@ pub fn evaluate_bspline_second_derivative_scalar(
 /// - `deriv_lower`: length = knot_vector.len() - (degree - 1) - 1
 /// - `lower_basis`: length = knot_vector.len() - (degree - 1)
 /// - `lower_scratch`: BsplineScratch for degree-2
-pub fn evaluate_bspline_second_derivative_scalar_into(
+pub fn evaluate_bsplinesecond_derivative_scalar_into(
     x: f64,
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -8175,7 +8173,7 @@ pub fn evaluate_bspline_second_derivative_scalar_into(
 /// This returns derivatives in the raw spline basis. If a model uses an
 /// identifiability/constrained basis `BZ`, the caller must apply that same
 /// constraint transform in derivative space as `B'''Z`.
-pub fn evaluate_bspline_third_derivative_scalar(
+pub fn evaluate_bsplinethird_derivative_scalar(
     x: f64,
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -8188,12 +8186,12 @@ pub fn evaluate_bspline_third_derivative_scalar(
             minimum_degree: 3,
         });
     }
-    let num_second_lower = knot_vector.len().saturating_sub(degree);
-    let mut second_lower = vec![0.0; num_second_lower];
+    let numsecond_lower = knot_vector.len().saturating_sub(degree);
+    let mut second_lower = vec![0.0; numsecond_lower];
     let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
     let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 2)];
     let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(3));
-    evaluate_bspline_third_derivative_scalar_into(
+    evaluate_bsplinethird_derivative_scalar_into(
         x,
         knot_vector,
         degree,
@@ -8210,7 +8208,7 @@ pub fn evaluate_bspline_third_derivative_scalar(
 /// - `deriv_lower`: length = knot_vector.len() - (degree - 1)
 /// - `lower_basis`: length = knot_vector.len() - (degree - 2)
 /// - `lower_scratch`: BsplineScratch for degree-3
-pub fn evaluate_bspline_third_derivative_scalar_into(
+pub fn evaluate_bsplinethird_derivative_scalar_into(
     x: f64,
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -8246,12 +8244,12 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
         }
     }
 
-    let expected_second_lower = knot_vector.len().saturating_sub(degree);
-    if second_lower.len() != expected_second_lower {
+    let expectedsecond_lower = knot_vector.len().saturating_sub(degree);
+    if second_lower.len() != expectedsecond_lower {
         return Err(BasisError::InvalidKnotVector(format!(
             "Lower-second-derivative buffer length {} does not match expected length {}",
             second_lower.len(),
-            expected_second_lower
+            expectedsecond_lower
         )));
     }
     let expected_deriv_lower = knot_vector.len().saturating_sub(degree - 1);
@@ -8271,7 +8269,7 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
         )));
     }
 
-    evaluate_bspline_second_derivative_scalar_into(
+    evaluate_bsplinesecond_derivative_scalar_into(
         x,
         knot_vector,
         degree - 1,
@@ -8322,8 +8320,8 @@ pub fn evaluate_bspline_fourth_derivative_scalar(
             minimum_degree: 4,
         });
     }
-    let num_third_lower = knot_vector.len().saturating_sub(degree);
-    let mut third_lower = vec![0.0; num_third_lower];
+    let numthird_lower = knot_vector.len().saturating_sub(degree);
+    let mut third_lower = vec![0.0; numthird_lower];
     let mut second_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
     let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 2)];
     let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 3)];
@@ -8384,20 +8382,20 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
         }
     }
 
-    let expected_third_lower = knot_vector.len().saturating_sub(degree);
-    if third_lower.len() != expected_third_lower {
+    let expectedthird_lower = knot_vector.len().saturating_sub(degree);
+    if third_lower.len() != expectedthird_lower {
         return Err(BasisError::InvalidKnotVector(format!(
             "Lower-third-derivative buffer length {} does not match expected length {}",
             third_lower.len(),
-            expected_third_lower
+            expectedthird_lower
         )));
     }
-    let expected_second_lower = knot_vector.len().saturating_sub(degree - 1);
-    if second_lower.len() != expected_second_lower {
+    let expectedsecond_lower = knot_vector.len().saturating_sub(degree - 1);
+    if second_lower.len() != expectedsecond_lower {
         return Err(BasisError::InvalidKnotVector(format!(
             "Lower-second-derivative buffer length {} does not match expected length {}",
             second_lower.len(),
-            expected_second_lower
+            expectedsecond_lower
         )));
     }
     let expected_deriv_lower = knot_vector.len().saturating_sub(degree - 2);
@@ -8417,7 +8415,7 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
         )));
     }
 
-    evaluate_bspline_third_derivative_scalar_into(
+    evaluate_bsplinethird_derivative_scalar_into(
         x,
         knot_vector,
         degree - 1,
@@ -8460,7 +8458,7 @@ mod tests {
         D::one() + t * t + t.powi(4)
     }
 
-    fn scaling_test_phi<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64) -> D {
+    fn scaling_testphi<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64) -> D {
         let kappa = psi.exp();
         let t = kappa * D::from(r);
         (psi * D::from(eta)).exp() * scaling_test_profile(t)
@@ -8533,7 +8531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_knot_generation_with_training_data_falls_back_to_uniform() {
+    fn test_knot_generationwith_training_data_falls_back_to_uniform() {
         // Note: training_data is no longer needed since we're not passing it to generate_full_knot_vector
         // let training_data = array![0., 1., 2., 5., 8., 9., 10.]; // 7 points
         let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
@@ -8581,7 +8579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_plate_kernel_m2_matches_dimension_specific_forms() {
+    fn test_thin_plate_kernel_m2_matches_dimensionspecific_forms() {
         let dist2 = 4.0;
         assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(dist2, 1).unwrap(), 8.0);
         assert_abs_diff_eq!(
@@ -8677,7 +8675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_plate_with_knot_count_constructor() {
+    fn test_thin_platewith_knot_count_constructor() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let (tps, knots) = create_thin_plate_spline_basis_with_knot_count(data.view(), 4).unwrap();
         assert_eq!(knots.shape(), &[4, 2]);
@@ -8753,7 +8751,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_psd_penalty_rejects_materially_indefinite_matrix() {
+    fn testvalidate_psd_penalty_rejects_materially_indefinite_matrix() {
         let bad = array![[1.0, 0.0], [0.0, -0.25]];
         match validate_psd_penalty(
             &bad,
@@ -8775,7 +8773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_plate_3d_bending_penalty_is_psd_with_positive_rank() {
+    fn test_thin_plate_3d_bending_penalty_is_psdwith_positive_rank() {
         let knots = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -8990,7 +8988,7 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Generate {
+            knotspec: BSplineKnotSpec::Generate {
                 data_range: (0.0, 1.0),
                 num_internal_knots: 6,
             },
@@ -9016,7 +9014,7 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 2,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Automatic {
+            knotspec: BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(3),
                 placement: BSplineKnotPlacement::Uniform,
             },
@@ -9040,7 +9038,7 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 2,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Automatic {
+            knotspec: BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(3),
                 placement: BSplineKnotPlacement::Quantile,
             },
@@ -9064,7 +9062,7 @@ mod tests {
     }
 
     #[test]
-    fn test_penalty_greville_selector_none_for_uniform_breakpoints() {
+    fn test_penalty_greville_selectornone_for_uniform_breakpoints() {
         let degree = 3usize;
         let knots = internal::generate_full_knot_vector((0.0, 1.0), 5, degree).unwrap();
         let g = penalty_greville_abscissae_for_knots(&knots, degree).unwrap();
@@ -9077,7 +9075,7 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 2,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Automatic {
+            knotspec: BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(3),
                 placement: BSplineKnotPlacement::Quantile,
             },
@@ -9119,7 +9117,7 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 2,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Automatic {
+            knotspec: BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(3),
                 placement: BSplineKnotPlacement::Quantile,
             },
@@ -9166,12 +9164,12 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_identifiability_default_weighted_sum_to_zero() {
+    fn test_bspline_identifiability_defaultweighted_sum_tozero() {
         let x = Array::linspace(0.0, 1.0, 40);
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Generate {
+            knotspec: BSplineKnotSpec::Generate {
                 data_range: (0.0, 1.0),
                 num_internal_knots: 5,
             },
@@ -9195,7 +9193,7 @@ mod tests {
         let raw = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Generate {
+            knotspec: BSplineKnotSpec::Generate {
                 data_range: (0.0, 1.0),
                 num_internal_knots: 6,
             },
@@ -9222,7 +9220,7 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knot_spec: BSplineKnotSpec::Generate {
+            knotspec: BSplineKnotSpec::Generate {
                 data_range: (0.0, 1.0),
                 num_internal_knots: 5,
             },
@@ -9273,7 +9271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_basis_sums_to_one_with_uniform_knots() {
+    fn test_bspline_basis_sums_to_onewith_uniform_knots() {
         // Create data with a non-uniform distribution
         // Since quantile knots are disabled for P-splines, this tests the fallback to uniform knots
         let mut data = Array::zeros(100);
@@ -9434,7 +9432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_boundary_value_handling() {
+    fn test_boundaryvalue_handling() {
         // Test for proper boundary value handling at the upper boundary.
         // This test ensures that evaluation at the upper boundary works correctly.
 
@@ -9445,12 +9443,12 @@ mod tests {
         let x = 10.0; // This is the value that caused the panic
         let degree = 3;
 
-        let basis_values = internal::evaluate_splines_at_point(x, degree, knots.view());
+        let basisvalues = internal::evaluate_splines_at_point(x, degree, knots.view());
 
         // Should not panic and should return valid results
-        assert_eq!(basis_values.len(), 8); // num_basis = 12 - 3 - 1 = 8
+        assert_eq!(basisvalues.len(), 8); // num_basis = 12 - 3 - 1 = 8
 
-        let sum = basis_values.sum();
+        let sum = basisvalues.sum();
         assert!(
             (sum - 1.0).abs() < 1e-9,
             "Basis functions should sum to 1.0 at boundary, got {}",
@@ -9459,7 +9457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_basis_boundary_values() {
+    fn test_basis_boundaryvalues() {
         // Property-based test: Verify boundary conditions using mathematical properties
         // This complements the cross-validation test by testing fundamental B-spline properties
 
@@ -9500,7 +9498,7 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_extrapolation_matches_boundary_basis_values() {
+    fn test_constant_extrapolation_matches_boundary_basisvalues() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
         let degree = 3usize;
         let left_boundary = internal::evaluate_splines_at_point(0.0, degree, knots.view());
@@ -9586,7 +9584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_basis_preserves_linear_extension_when_internal_builder_goes_sparse() {
+    fn test_dense_basis_preserves_linear_extensionwhen_internal_builder_goes_sparse() {
         let degree = 3usize;
         let knots = internal::generate_full_knot_vector((0.0, 10.0), 36, degree).unwrap();
         let x = array![-0.5, 10.5];
@@ -9677,7 +9675,7 @@ mod tests {
             assert_abs_diff_eq!(d1[i], d1_right[i], epsilon = 1e-12);
         }
 
-        let _ = evaluate_splines_second_derivative_sparse_into(
+        let _ = evaluate_splinessecond_derivative_sparse_into(
             -10.0,
             degree,
             knots.view(),
@@ -9685,7 +9683,7 @@ mod tests {
             &mut scratch,
         );
         assert!(d2.iter().all(|v| v.abs() < 1e-12));
-        let _ = evaluate_splines_second_derivative_sparse_into(
+        let _ = evaluate_splinessecond_derivative_sparse_into(
             10.0,
             degree,
             knots.view(),
@@ -9819,7 +9817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_basis_mspline_zero_outside_domain() {
+    fn test_create_basis_msplinezero_outside_domain() {
         let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
         let degree = 2usize;
         let x = array![-10.0, 1.0, 10.0];
@@ -9837,7 +9835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_basis_ispline_boundary_rows() {
+    fn test_create_basis_ispline_boundaryrows() {
         let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
         let degree = 1usize;
         let x = array![-10.0, 1.5, 10.0];
@@ -9859,7 +9857,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ispline_basis_drops_identically_zero_leading_column() {
+    fn test_ispline_basis_drops_identicallyzero_leading_column() {
         let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
         let degree = 1usize;
         let x = array![0.0, 0.5, 1.5, 2.5, 3.0];
@@ -9904,9 +9902,9 @@ mod tests {
                 x,
                 h,
                 |x_eval| {
-                    let mut i_v = vec![0.0; n_i];
-                    evaluate_ispline_scalar(x_eval, knots.view(), degree, &mut i_v).unwrap();
-                    i_v
+                    let mut iv = vec![0.0; n_i];
+                    evaluate_ispline_scalar(x_eval, knots.view(), degree, &mut iv).unwrap();
+                    iv
                 },
                 d_i,
                 2e-5
@@ -9915,7 +9913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_knots_for_degree_rejects_too_few_knots_for_degree_domain() {
+    fn testvalidate_knots_for_degree_rejects_too_few_knots_for_degree_domain() {
         let knots = array![0.0, 0.0, 1.0, 1.0];
         let err = create_basis::<Dense>(
             array![0.5].view(),
@@ -9939,7 +9937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_second_derivative_zeroes_outside_domain_even_on_sparse_heuristic_path() {
+    fn test_densesecond_derivativezeroes_outside_domain_even_on_sparse_heuristic_path() {
         let degree = 3usize;
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0];
         let mut xs = Vec::with_capacity(128);
@@ -9967,15 +9965,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_higher_derivatives_are_zero_outside_domain() {
+    fn test_scalar_higher_derivatives_arezero_outside_domain() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0];
         let mut second = vec![1.0; knots.len() - 3 - 1];
-        evaluate_bspline_second_derivative_scalar(-0.1, knots.view(), 3, &mut second)
+        evaluate_bsplinesecond_derivative_scalar(-0.1, knots.view(), 3, &mut second)
             .expect("second derivative");
         assert!(second.iter().all(|v| v.abs() <= 1e-12));
 
         let mut third = vec![1.0; knots.len() - 3 - 1];
-        evaluate_bspline_third_derivative_scalar(1.1, knots.view(), 3, &mut third)
+        evaluate_bsplinethird_derivative_scalar(1.1, knots.view(), 3, &mut third)
             .expect("third derivative");
         assert!(third.iter().all(|v| v.abs() <= 1e-12));
 
@@ -9987,10 +9985,10 @@ mod tests {
     }
 
     #[test]
-    fn test_higher_derivative_degree_errors_are_specific() {
+    fn test_higher_derivative_degree_errors_arespecific() {
         let knots = array![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let mut out = vec![0.0; knots.len() - 1 - 1];
-        let err = evaluate_bspline_second_derivative_scalar(0.5, knots.view(), 1, &mut out)
+        let err = evaluate_bsplinesecond_derivative_scalar(0.5, knots.view(), 1, &mut out)
             .expect_err("degree-1 second derivative should fail");
         match err {
             BasisError::InsufficientDegreeForDerivative {
@@ -10061,7 +10059,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mspline_rejects_zero_normalization_spans() {
+    fn test_mspline_rejectszero_normalization_spans() {
         // degree=2 with 4 repeated boundary knots makes t[3]-t[0]=0 for i=0.
         let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let x = array![0.25, 0.5, 0.75];
@@ -10097,8 +10095,8 @@ mod tests {
         const EPS: f64 = 1e-12;
 
         for i in 0..(knots.len() - 1) {
-            let interval_width = knots[i + 1] - knots[i];
-            let expected = if interval_width.abs() < EPS {
+            let intervalwidth = knots[i + 1] - knots[i];
+            let expected = if intervalwidth.abs() < EPS {
                 if i == knots.len() - 2 && (x - knots[i + 1]).abs() < EPS {
                     1.0
                 } else {
@@ -10127,25 +10125,25 @@ mod tests {
         let num_basis = knots.len() - degree - 1;
         let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
 
-        let recursive_values: Vec<f64> = (0..num_basis)
+        let recursivevalues: Vec<f64> = (0..num_basis)
             .map(|i| evaluate_bspline(x, &knots, i, degree))
             .collect();
         let expected = [0.0, 0.0, 1.0];
 
         assert_eq!(
-            recursive_values.len(),
+            recursivevalues.len(),
             expected.len(),
             "Recursive evaluation length mismatch"
         );
 
-        for (i, (&recursive, &expected_value)) in
-            recursive_values.iter().zip(expected.iter()).enumerate()
+        for (i, (&recursive, &expectedvalue)) in
+            recursivevalues.iter().zip(expected.iter()).enumerate()
         {
-            assert_abs_diff_eq!(recursive, expected_value, epsilon = 1e-12);
-            assert_abs_diff_eq!(iterative_basis[i], expected_value, epsilon = 1e-12);
+            assert_abs_diff_eq!(recursive, expectedvalue, epsilon = 1e-12);
+            assert_abs_diff_eq!(iterative_basis[i], expectedvalue, epsilon = 1e-12);
         }
 
-        let recursive_sum: f64 = recursive_values.iter().sum();
+        let recursive_sum: f64 = recursivevalues.iter().sum();
         let iterative_sum = iterative_basis.sum();
 
         assert_abs_diff_eq!(recursive_sum, 1.0, epsilon = 1e-12);
@@ -10175,9 +10173,9 @@ mod tests {
         assert_abs_diff_eq!(basis_at_1_5.sum(), 1.0, epsilon = 1e-9);
 
         // Validate that exactly 2 basis functions are non-zero with value 0.5 each
-        let non_zero_count = basis_at_1_5.iter().filter(|&&x| x > 1e-12).count();
+        let nonzero_count = basis_at_1_5.iter().filter(|&&x| x > 1e-12).count();
         assert_eq!(
-            non_zero_count, 2,
+            nonzero_count, 2,
             "Should have exactly 2 non-zero basis functions at x=1.5"
         );
 
@@ -10193,9 +10191,9 @@ mod tests {
         assert_abs_diff_eq!(basis_at_2_5.sum(), 1.0, epsilon = 1e-9);
 
         // Validate that exactly 2 basis functions are non-zero with value 0.5 each
-        let non_zero_count_2_5 = basis_at_2_5.iter().filter(|&&x| x > 1e-12).count();
+        let nonzero_count_2_5 = basis_at_2_5.iter().filter(|&&x| x > 1e-12).count();
         assert_eq!(
-            non_zero_count_2_5, 2,
+            nonzero_count_2_5, 2,
             "Should have exactly 2 non-zero basis functions at x=2.5"
         );
 
@@ -10445,7 +10443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_second_derivative_matches_finite_difference() {
+    fn testsecond_derivative_matches_finite_difference() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
         let num_basis = knots.len() - degree - 1;
@@ -10457,7 +10455,7 @@ mod tests {
 
         evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1)
             .expect("first derivative");
-        evaluate_bspline_second_derivative_scalar(x, knots.view(), degree, &mut d2)
+        evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, &mut d2)
             .expect("second derivative");
 
         crate::assert_central_difference_array!(
@@ -10474,7 +10472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_third_derivative_matches_finite_difference() {
+    fn testthird_derivative_matches_finite_difference() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
         let num_basis = knots.len() - degree - 1;
@@ -10483,7 +10481,7 @@ mod tests {
         let x = 0.37;
         let h = 1e-4;
 
-        evaluate_bspline_third_derivative_scalar(x, knots.view(), degree, &mut d3)
+        evaluate_bsplinethird_derivative_scalar(x, knots.view(), degree, &mut d3)
             .expect("third derivative");
 
         crate::assert_central_difference_array!(
@@ -10491,7 +10489,7 @@ mod tests {
             h,
             |x_eval| {
                 let mut v = vec![0.0; num_basis];
-                evaluate_bspline_second_derivative_scalar(x_eval, knots.view(), degree, &mut v)
+                evaluate_bsplinesecond_derivative_scalar(x_eval, knots.view(), degree, &mut v)
                     .unwrap();
                 v
             },
@@ -10518,7 +10516,7 @@ mod tests {
             h,
             |x_eval| {
                 let mut v = vec![0.0; num_basis];
-                evaluate_bspline_third_derivative_scalar(x_eval, knots.view(), degree, &mut v)
+                evaluate_bsplinethird_derivative_scalar(x_eval, knots.view(), degree, &mut v)
                     .unwrap();
                 v
             },
@@ -10528,29 +10526,29 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_second_derivative_matches_scalar() {
+    fn test_sparsesecond_derivative_matches_scalar() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
         let num_basis = knots.len() - degree - 1;
-        let mut sparse_values = vec![0.0; degree + 1];
-        let mut scalar_values = vec![0.0; num_basis];
+        let mut sparsevalues = vec![0.0; degree + 1];
+        let mut scalarvalues = vec![0.0; num_basis];
         let mut scratch = BasisEvalScratch::new(degree);
 
         let xs = [0.05, 0.2, 0.37, 0.61, 0.9];
         for &x in &xs {
-            let start = evaluate_splines_second_derivative_sparse_into(
+            let start = evaluate_splinessecond_derivative_sparse_into(
                 x,
                 degree,
                 knots.view(),
-                &mut sparse_values,
+                &mut sparsevalues,
                 &mut scratch,
             );
 
-            evaluate_bspline_second_derivative_scalar(x, knots.view(), degree, &mut scalar_values)
+            evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, &mut scalarvalues)
                 .expect("scalar second derivative");
 
             let mut reconstructed = vec![0.0; num_basis];
-            for (offset, &value) in sparse_values.iter().enumerate() {
+            for (offset, &value) in sparsevalues.iter().enumerate() {
                 let col = start + offset;
                 if col < num_basis {
                     reconstructed[col] = value;
@@ -10559,12 +10557,12 @@ mod tests {
 
             for j in 0..num_basis {
                 assert!(
-                    (reconstructed[j] - scalar_values[j]).abs() < 1e-11,
+                    (reconstructed[j] - scalarvalues[j]).abs() < 1e-11,
                     "sparse second derivative mismatch at x={}, basis {}: sparse={}, scalar={}",
                     x,
                     j,
                     reconstructed[j],
-                    scalar_values[j]
+                    scalarvalues[j]
                 );
             }
         }
@@ -10707,7 +10705,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_non_primary_case_builds_with_general_kernel() {
+    fn test_duchon_non_primary_case_buildswith_general_kernel() {
         let data = Array2::<f64>::zeros((4, 3));
         let centers = Array2::<f64>::zeros((3, 3));
         let out = create_duchon_spline_basis(
@@ -10724,7 +10722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_duchon_basis_freezes_default_spatial_identifiability() {
+    fn test_build_duchon_basisfreezes_default_spatial_identifiability() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
@@ -10802,24 +10800,24 @@ mod tests {
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 2);
-        assert_eq!(out.penalty_info.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 3);
         assert!(matches!(
-            out.penalty_info[0].source,
+            out.penaltyinfo[0].source,
             PenaltySource::OperatorMass
         ));
-        assert!(out.penalty_info[0].active);
+        assert!(out.penaltyinfo[0].active);
         assert!(matches!(
-            out.penalty_info[1].source,
+            out.penaltyinfo[1].source,
             PenaltySource::OperatorTension
         ));
-        assert!(out.penalty_info[1].active);
+        assert!(out.penaltyinfo[1].active);
         assert!(matches!(
-            out.penalty_info[2].source,
+            out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
         ));
-        assert!(!out.penalty_info[2].active);
+        assert!(!out.penaltyinfo[2].active);
         assert!(matches!(
-            out.penalty_info[2].dropped_reason,
+            out.penaltyinfo[2].dropped_reason,
             Some(PenaltyDropReason::ZeroMatrix)
         ));
     }
@@ -10835,18 +10833,18 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalty_info.len(), 3);
-        assert!(out.penalty_info.iter().all(|info| info.active));
+        assert_eq!(out.penaltyinfo.len(), 3);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
-            out.penalty_info[0].source,
+            out.penaltyinfo[0].source,
             PenaltySource::OperatorMass
         ));
         assert!(matches!(
-            out.penalty_info[1].source,
+            out.penaltyinfo[1].source,
             PenaltySource::OperatorTension
         ));
         assert!(matches!(
-            out.penalty_info[2].source,
+            out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
         ));
     }
@@ -10931,7 +10929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matern_center_sum_to_zero_produces_kernel_transform() {
+    fn test_matern_center_sum_tozero_produces_kernel_transform() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
@@ -10982,7 +10980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matern_double_penalty_drops_inactive_nullspace_block_without_intercept() {
+    fn test_matern_double_penalty_drops_inactive_nullspace_blockwithout_intercept() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
@@ -10996,9 +10994,9 @@ mod tests {
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
         assert_eq!(out.nullspace_dims.len(), 1);
-        assert_eq!(out.penalty_info.len(), 1);
-        assert!(out.penalty_info.iter().all(|info| info.active));
-        assert!(matches!(out.penalty_info[0].source, PenaltySource::Primary));
+        assert_eq!(out.penaltyinfo.len(), 1);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
     }
 
     #[test]
@@ -11016,17 +11014,17 @@ mod tests {
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
         assert_eq!(out.nullspace_dims.len(), 2);
-        assert_eq!(out.penalty_info.len(), 2);
-        assert!(out.penalty_info.iter().all(|info| info.active));
-        assert!(matches!(out.penalty_info[0].source, PenaltySource::Primary));
+        assert_eq!(out.penaltyinfo.len(), 2);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
         assert!(matches!(
-            out.penalty_info[1].source,
+            out.penaltyinfo[1].source,
             PenaltySource::DoublePenaltyNullspace
         ));
     }
 
     #[test]
-    fn test_matern_log_kappa_derivative_matches_fd() {
+    fn test_matern_log_kappa_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = MaternBasisSpec {
@@ -11092,7 +11090,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matern_double_penalty_log_kappa_derivative_matches_fd() {
+    fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = MaternBasisSpec {
@@ -11138,7 +11136,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_log_kappa_derivative_matches_fd() {
+    fn test_duchon_log_kappa_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
@@ -11149,7 +11147,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
         };
         let mut workspace = BasisWorkspace::default();
-        let derivative = build_duchon_basis_log_kappa_derivative_with_workspace(
+        let derivative = build_duchon_basis_log_kappa_derivativewithworkspace(
             data.view(),
             &spec,
             &mut workspace,
@@ -11204,7 +11202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_log_kappa_second_derivative_matches_fd() {
+    fn test_duchon_log_kappasecond_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
@@ -11215,7 +11213,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
         };
         let mut workspace = BasisWorkspace::default();
-        let second_derivative = build_duchon_basis_log_kappa_second_derivative_with_workspace(
+        let second_derivative = build_duchon_basis_log_kappasecond_derivativewithworkspace(
             data.view(),
             &spec,
             &mut workspace,
@@ -11234,7 +11232,7 @@ mod tests {
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
         let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
-        let design_err = (&second_derivative.design_second_derivative - &fd_design)
+        let design_err = (&second_derivative.designsecond_derivative - &fd_design)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
@@ -11245,13 +11243,13 @@ mod tests {
         );
 
         assert_eq!(
-            second_derivative.penalties_second_derivative.len(),
+            second_derivative.penaltiessecond_derivative.len(),
             base.penalties.len()
         );
         let fd_primary_penalty = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
             + &minus.penalties[0])
             / (eps * eps);
-        let primary_penalty_err = (&second_derivative.penalties_second_derivative[0]
+        let primary_penalty_err = (&second_derivative.penaltiessecond_derivative[0]
             - &fd_primary_penalty)
             .iter()
             .map(|v| v * v)
@@ -11261,12 +11259,12 @@ mod tests {
             primary_penalty_err < 5e-3,
             "Duchon mass penalty second derivative mismatch too large: {primary_penalty_err}"
         );
-        for penalty_idx in 1..second_derivative.penalties_second_derivative.len() {
+        for penalty_idx in 1..second_derivative.penaltiessecond_derivative.len() {
             let fd_penalty = (&plus.penalties[penalty_idx]
                 - &(base.penalties[penalty_idx].clone() * 2.0)
                 + &minus.penalties[penalty_idx])
                 / (eps * eps);
-            let penalty_err = (&second_derivative.penalties_second_derivative[penalty_idx]
+            let penalty_err = (&second_derivative.penaltiessecond_derivative[penalty_idx]
                 - &fd_penalty)
                 .iter()
                 .map(|v| v * v)
@@ -11290,7 +11288,7 @@ mod tests {
         let eta_q = eta + 2.0;
 
         let (phi, phi_psi_ad, phi_psi_psi_ad) =
-            second_derivative(|psi| scaling_test_phi(psi, r, eta), psi0);
+            second_derivative(|psi| scaling_testphi(psi, r, eta), psi0);
         let (q, q_psi_ad, q_psi_psi_ad) =
             second_derivative(|psi| scaling_test_q(psi, r, eta), psi0);
         let (lap, lap_psi_ad, lap_psi_psi_ad) =
@@ -11319,7 +11317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_spectral_scaling_matches_implementation() {
+    fn test_duchonspectral_scaling_matches_implementation() {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let k_dim = 4usize;
@@ -11384,7 +11382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_collision_operator_limits_match_phi_rr_identities() {
+    fn test_duchon_collision_operator_limits_matchphi_rr_identities() {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let k_dim = 4usize;
@@ -11396,7 +11394,7 @@ mod tests {
             duchon_radial_core_psi_triplet(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision core");
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
-            duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
 
         assert!((core.gradient_ratio.value - phi_rr).abs() < 1e-12);
@@ -11424,7 +11422,7 @@ mod tests {
         let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
         let (phi_rr, _, _) =
-            duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
 
         assert!(jets.phi_r.abs() < 1e-12);
@@ -11437,13 +11435,13 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_kernel_radial_triplet_uses_collision_phi_rr_at_origin() {
+    fn test_duchon_kernel_radial_triplet_uses_collisionphi_rr_at_origin() {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let (_phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+        let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             0.0,
             Some(length_scale),
             p_order,
@@ -11453,7 +11451,7 @@ mod tests {
         )
         .expect("radial triplet at origin");
         let (phi_rr_collision, _, _) =
-            duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
 
         assert!(phi_r.abs() < 1e-12);
@@ -11461,7 +11459,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gram_and_psi_derivatives_from_operator_matches_fd() {
+    fn test_gram_and_psi_derivatives_from_operator_matchesfd() {
         // Build D(psi) = D0 + psi D1 + 0.5 psi^2 D2 with nontrivial shape.
         let d0 = array![
             [0.9, -0.2, 0.3],
@@ -11496,19 +11494,19 @@ mod tests {
         };
         let s_plus = eval_s(psi0 + h);
         let s_minus = eval_s(psi0 - h);
-        let s_fd = (&s_plus - &s_minus) / (2.0 * h);
-        let s2_fd = (&s_plus - &(s.mapv(|v| 2.0 * v)) + &s_minus) / (h * h);
+        let sfd = (&s_plus - &s_minus) / (2.0 * h);
+        let s2fd = (&s_plus - &(s.mapv(|v| 2.0 * v)) + &s_minus) / (h * h);
 
-        let err1 = (&s_psi - &s_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
-        let err2 = (&s_psi_psi - &s2_fd)
+        let err1 = (&s_psi - &sfd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&s_psi_psi - &s2fd)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
         for i in 0..s_psi.nrows() {
             for j in 0..s_psi.ncols() {
-                assert_eq!(s_psi[[i, j]].signum(), s_fd[[i, j]].signum());
-                assert_eq!(s_psi_psi[[i, j]].signum(), s2_fd[[i, j]].signum());
+                assert_eq!(s_psi[[i, j]].signum(), sfd[[i, j]].signum());
+                assert_eq!(s_psi_psi[[i, j]].signum(), s2fd[[i, j]].signum());
             }
         }
 
@@ -11517,7 +11515,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_penalty_with_psi_derivatives_matches_fd() {
+    fn test_normalize_penaltywith_psi_derivatives_matchesfd() {
         // Build S(psi) = S0 + psi S1 + 0.5 psi^2 S2 and validate exact
         // normalization derivatives against finite differences of S/||S||_F.
         let s0 = array![[2.0, 0.3, -0.2], [0.3, 1.7, 0.4], [-0.2, 0.4, 1.4]];
@@ -11533,8 +11531,8 @@ mod tests {
         let s_psi = &s1 + &(s2.mapv(|v| psi0 * v));
         let s_psi_psi = s2.clone();
 
-        let (_sn, sn_psi, sn_psi_psi, _c) =
-            normalize_penalty_with_psi_derivatives(&s, &s_psi, &s_psi_psi);
+        let (sn, sn_psi, sn_psi_psi, c) =
+            normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
 
         let h = 1e-6;
         let eval_snorm = |psi: f64| {
@@ -11545,19 +11543,19 @@ mod tests {
         let sn = eval_snorm(psi0);
         let sn_plus = eval_snorm(psi0 + h);
         let sn_minus = eval_snorm(psi0 - h);
-        let sn_fd = (&sn_plus - &sn_minus) / (2.0 * h);
-        let sn2_fd = (&sn_plus - &(sn.mapv(|v| 2.0 * v)) + &sn_minus) / (h * h);
+        let snfd = (&sn_plus - &sn_minus) / (2.0 * h);
+        let sn2fd = (&sn_plus - &(sn.mapv(|v| 2.0 * v)) + &sn_minus) / (h * h);
 
-        let err1 = (&sn_psi - &sn_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
-        let err2 = (&sn_psi_psi - &sn2_fd)
+        let err1 = (&sn_psi - &snfd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&sn_psi_psi - &sn2fd)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
         for i in 0..sn_psi.nrows() {
             for j in 0..sn_psi.ncols() {
-                assert_eq!(sn_psi[[i, j]].signum(), sn_fd[[i, j]].signum());
-                assert_eq!(sn_psi_psi[[i, j]].signum(), sn2_fd[[i, j]].signum());
+                assert_eq!(sn_psi[[i, j]].signum(), snfd[[i, j]].signum());
+                assert_eq!(sn_psi_psi[[i, j]].signum(), sn2fd[[i, j]].signum());
             }
         }
 
@@ -11665,29 +11663,29 @@ mod tests {
         let h = 1e-6;
         let fp = matern_kernel_from_distance(r + h, length_scale, nu).expect("fp");
         let fm = matern_kernel_from_distance((r - h).max(0.0), length_scale, nu).expect("fm");
-        let first_fd = (fp - fm) / (2.0 * h);
-        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
-        assert_eq!(phi_r.signum(), first_fd.signum());
-        assert_eq!(phi_rr.signum(), second_fd.signum());
-        assert!((phi_r - first_fd).abs() < 5e-5);
-        assert!((phi_rr - second_fd).abs() < 1e-3);
+        let firstfd = (fp - fm) / (2.0 * h);
+        let secondfd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), firstfd.signum());
+        assert_eq!(phi_rr.signum(), secondfd.signum());
+        assert!((phi_r - firstfd).abs() < 5e-5);
+        assert!((phi_rr - secondfd).abs() < 1e-3);
     }
 
     #[test]
-    fn test_matern_safe_ratio_matches_closed_form_limits_at_zero() {
+    fn test_matern_safe_ratio_matches_closed_form_limits_atzero() {
         let ls = 1.7;
         let kappa = 1.0 / ls;
         let (_, _, _, r32) =
-            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::ThreeHalves)
+            matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::ThreeHalves)
                 .expect("three-halves");
         let (_, _, _, r52) =
-            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::FiveHalves)
+            matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::FiveHalves)
                 .expect("five-halves");
         let (_, _, _, r72) =
-            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::SevenHalves)
+            matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::SevenHalves)
                 .expect("seven-halves");
         let (_, _, _, r92) =
-            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::NineHalves)
+            matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::NineHalves)
                 .expect("nine-halves");
         assert!((r32 - (-3.0 * kappa * kappa)).abs() < 1e-12);
         assert!((r52 - (-(5.0 / 3.0) * kappa * kappa)).abs() < 1e-12);
@@ -11696,16 +11694,16 @@ mod tests {
     }
 
     #[test]
-    fn test_matern_safe_ratio_half_is_finite_with_floor() {
+    fn test_matern_safe_ratio_half_is_finitewith_floor() {
         let ls = 1.3;
-        let (_phi, _phi_r, _phi_rr, ratio) =
-            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::Half).expect("half");
+        let (phi, phi_r, phi_rr, ratio) =
+            matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::Half).expect("half");
         assert!(ratio.is_finite());
         assert!(ratio < 0.0);
     }
 
     #[test]
-    fn test_duchon_radial_triplet_matches_finite_difference_away_from_zero() {
+    fn test_duchon_radial_triplet_matches_finite_difference_away_fromzero() {
         let r = 0.42;
         let length_scale = 1.1;
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
@@ -11740,12 +11738,12 @@ mod tests {
             Some(&coeffs),
         )
         .expect("fm");
-        let first_fd = (fp - fm) / (2.0 * h);
-        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
-        assert_eq!(phi_r.signum(), first_fd.signum());
-        assert_eq!(phi_rr.signum(), second_fd.signum());
-        assert!((phi_r - first_fd).abs() < 1e-3);
-        assert!((phi_rr - second_fd).abs() < 1e-1);
+        let firstfd = (fp - fm) / (2.0 * h);
+        let secondfd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), firstfd.signum());
+        assert_eq!(phi_rr.signum(), secondfd.signum());
+        assert!((phi_r - firstfd).abs() < 1e-3);
+        assert!((phi_rr - secondfd).abs() < 1e-1);
     }
 
     #[test]
@@ -11785,13 +11783,13 @@ mod tests {
             Some(&coeffs),
         )
         .expect("fm");
-        let first_fd = (fp - fm) / (2.0 * h);
-        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
-        assert_eq!(phi_r.signum(), first_fd.signum());
-        assert_eq!(phi_rr.signum(), second_fd.signum());
-        assert!((phi_r - first_fd).abs() < 2e-3);
+        let firstfd = (fp - fm) / (2.0 * h);
+        let secondfd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), firstfd.signum());
+        assert_eq!(phi_rr.signum(), secondfd.signum());
+        assert!((phi_r - firstfd).abs() < 2e-3);
         assert!(phi_rr.is_finite());
-        assert!(second_fd.is_finite());
+        assert!(secondfd.is_finite());
     }
 
     #[test]
@@ -11830,16 +11828,16 @@ mod tests {
             Some(&coeffs),
         )
         .expect("fm");
-        let first_fd = (fp - fm) / (2.0 * h);
-        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
-        assert_eq!(phi_r.signum(), first_fd.signum());
-        assert_eq!(phi_rr.signum(), second_fd.signum());
-        assert!((phi_r - first_fd).abs() < 1e-6);
-        assert!((phi_rr - second_fd).abs() < 1e-4);
+        let firstfd = (fp - fm) / (2.0 * h);
+        let secondfd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), firstfd.signum());
+        assert_eq!(phi_rr.signum(), secondfd.signum());
+        assert!((phi_r - firstfd).abs() < 1e-6);
+        assert!((phi_rr - secondfd).abs() < 1e-4);
     }
 
     #[test]
-    fn test_collocation_derivatives_are_finite_at_r_zero() {
+    fn test_collocation_derivatives_are_finite_at_rzero() {
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let m_ops = build_matern_collocation_operator_matrices(
             centers.view(),
@@ -11867,7 +11865,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matern_collocation_weights_scale_rows_by_sqrt_weight() {
+    fn test_matern_collocationweights_scalerows_by_sqrtweight() {
         let centers = array![[0.0, 0.0], [1.0, 0.0]];
         let unit = build_matern_collocation_operator_matrices(
             centers.view(),

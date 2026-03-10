@@ -228,7 +228,7 @@ impl SymmetricMatrix {
         }
     }
 
-    pub fn add_ridge(&self, ridge: f64) -> Result<Self, String> {
+    pub fn addridge(&self, ridge: f64) -> Result<Self, String> {
         let n = self.nrows();
         let mut diagonal = Array2::<f64>::zeros((n, n));
         for i in 0..n {
@@ -368,7 +368,7 @@ pub trait FactorizedSystem: Send + Sync {
     fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String>;
 
     /// Solve $H X = B$ for multiple right-hand sides.
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String>;
+    fn solvemulti(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String>;
 
     /// Return the log-determinant of the factorized matrix.
     fn logdet(&self) -> f64;
@@ -377,13 +377,13 @@ pub trait FactorizedSystem: Send + Sync {
 pub trait LinearOperator {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
-    fn diag_xt_w_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
     fn factorize_system(
         &self,
         weights: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
     ) -> Result<Box<dyn FactorizedSystem>, String> {
-        let mut system = self.diag_xt_w_x(weights)?;
+        let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {
             if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
                 return Err(format!(
@@ -407,7 +407,7 @@ pub trait LinearOperator {
         rhs: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
     ) -> Result<Array1<f64>, String> {
-        self.solve_system_with_policy(
+        self.solve_systemwith_policy(
             weights,
             rhs,
             penalty,
@@ -415,7 +415,7 @@ pub trait LinearOperator {
             RidgePolicy::explicit_stabilization_pospart(),
         )
     }
-    fn solve_system_with_policy(
+    fn solve_systemwith_policy(
         &self,
         weights: &Array1<f64>,
         rhs: &Array1<f64>,
@@ -425,16 +425,16 @@ pub trait LinearOperator {
     ) -> Result<Array1<f64>, String> {
         if rhs.len() != self.ncols() {
             return Err(format!(
-                "solve_system_with_policy rhs dimension mismatch: rhs length {} != ncols {}",
+                "solve_systemwith_policy rhs dimension mismatch: rhs length {} != ncols {}",
                 rhs.len(),
                 self.ncols()
             ));
         }
-        let mut system = self.diag_xt_w_x(weights)?;
+        let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {
             if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
                 return Err(format!(
-                    "solve_system_with_policy penalty shape mismatch: got {}x{}, expected {}x{}",
+                    "solve_systemwith_policy penalty shape mismatch: got {}x{}, expected {}x{}",
                     pen.nrows(),
                     pen.ncols(),
                     system.nrows(),
@@ -443,14 +443,14 @@ pub trait LinearOperator {
             }
             system += pen;
         }
-        let base_ridge = if ridge_policy.include_laplace_hessian {
+        let baseridge = if ridge_policy.include_laplacehessian {
             ridge_floor.max(1e-15)
         } else {
             0.0
         };
         crate::linalg::utils::StableSolver::new("linear operator system")
-            .solve_vector_with_ridge_retries(&system, rhs, base_ridge)
-            .ok_or_else(|| "solve_system_with_policy failed after ridge retries".to_string())
+            .solvevectorwithridge_retries(&system, rhs, baseridge)
+            .ok_or_else(|| "solve_systemwith_policy failed after ridge retries".to_string())
     }
 
     // Backward-compatible aliases.
@@ -463,7 +463,7 @@ pub trait LinearOperator {
         self.apply_transpose(vector)
     }
     fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.diag_xt_w_x(weights)
+        self.diag_xtw_x(weights)
     }
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String>;
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String>;
@@ -529,7 +529,7 @@ impl LinearOperator for DesignMatrix {
         }
     }
 
-    fn diag_xt_w_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(format!(
                 "compute_xtwx dimension mismatch: weights length {} != nrows {}",
@@ -608,7 +608,7 @@ impl LinearOperator for DesignMatrix {
         match self {
             Self::Dense(_) => self.factorize_system_dense(weights, penalty),
             Self::Sparse(matrix) => {
-                let system = assemble_sparse_weighted_gram_system(matrix, weights, penalty)?;
+                let system = assemble_sparseweighted_gram_system(matrix, weights, penalty)?;
                 let factor = crate::linalg::sparse_exact::factorize_sparse_spd(&system)
                     .map_err(|e| format!("factorize_system failed: {e:?}"))?;
                 Ok(Box::new(factor))
@@ -686,7 +686,7 @@ impl DesignMatrix {
         weights: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
     ) -> Result<Box<dyn FactorizedSystem>, String> {
-        let mut system = self.diag_xt_w_x(weights)?;
+        let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {
             if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
                 return Err(format!(
@@ -706,7 +706,7 @@ impl DesignMatrix {
     }
 }
 
-fn assemble_sparse_weighted_gram_system(
+fn assemble_sparseweighted_gram_system(
     matrix: &SparseDesignMatrix,
     weights: &Array1<f64>,
     penalty: Option<&Array2<f64>>,
@@ -814,7 +814,7 @@ impl DesignMatrix {
         }
     }
 
-    pub fn matrix_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
+    pub fn matrixvectormultiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         <Self as LinearOperator>::apply(self, vector)
     }
 
@@ -823,7 +823,7 @@ impl DesignMatrix {
     }
 
     pub fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        <Self as LinearOperator>::diag_xt_w_x(self, weights)
+        <Self as LinearOperator>::diag_xtw_x(self, weights)
     }
 
     pub fn compute_xtwy(
@@ -847,7 +847,7 @@ impl DesignMatrix {
         <Self as LinearOperator>::solve_system(self, weights, rhs, penalty)
     }
 
-    pub fn solve_system_with_policy(
+    pub fn solve_systemwith_policy(
         &self,
         weights: &Array1<f64>,
         rhs: &Array1<f64>,
@@ -855,7 +855,7 @@ impl DesignMatrix {
         ridge_floor: f64,
         ridge_policy: RidgePolicy,
     ) -> Result<Array1<f64>, String> {
-        <Self as LinearOperator>::solve_system_with_policy(
+        <Self as LinearOperator>::solve_systemwith_policy(
             self,
             weights,
             rhs,
@@ -959,7 +959,7 @@ mod tests {
         assert!((dense[[0, 1]] + 1.0).abs() < 1e-12);
 
         let v = array![4.0, -2.0];
-        let y_sparse = design.matrix_vector_multiply(&v);
+        let y_sparse = design.matrixvectormultiply(&v);
         let y_dense = dense.dot(&v);
         for i in 0..y_sparse.len() {
             assert!((y_sparse[i] - y_dense[i]).abs() < 1e-12);

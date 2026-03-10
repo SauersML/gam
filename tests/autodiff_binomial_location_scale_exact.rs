@@ -195,7 +195,7 @@ fn psi_quantity_ad<T: AD>(psi: T, p: &CombinedLocationScaleParams, quantity: Psi
 struct PsiQuantityFn<T: AD> {
     params: CombinedLocationScaleParams,
     quantity: PsiQuantity,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> PsiQuantityFn<T> {
@@ -203,7 +203,7 @@ impl<T: AD> PsiQuantityFn<T> {
         Self {
             params,
             quantity,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -215,7 +215,7 @@ impl<T: AD> PsiQuantityFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for PsiQuantityFn<T> {
     const NAME: &'static str = "PsiQuantityFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         vec![psi_quantity_ad(inputs[0], &self.params, self.quantity)]
     }
 
@@ -228,7 +228,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for PsiQuantityFn<T> {
     }
 }
 
-fn manual_row_geometry(psi: f64, p: &CombinedLocationScaleParams) -> ManualRowGeometry {
+fn manualrow_geometry(psi: f64, p: &CombinedLocationScaleParams) -> ManualRowGeometry {
     let z1 = p.z1_0 + p.z1_1 * psi + 0.5 * p.z1_2 * psi * psi;
     let z2 = p.z2_0 + p.z2_1 * psi + 0.5 * p.z2_2 * psi * psi;
     let x = p.x_0 + p.x_1 * psi + 0.5 * p.x_2 * psi * psi;
@@ -353,7 +353,7 @@ fn expected_fixed_beta_quantity(manual: &ManualRowGeometry, quantity: PsiQuantit
     }
 }
 
-fn eps_hessian_psi_numdual<D: DualNum<f64> + Copy>(
+fn epshessian_psi_numdual<D: DualNum<f64> + Copy>(
     eps: D,
     psi0: f64,
     p: &CombinedLocationScaleParams,
@@ -401,7 +401,7 @@ fn eps_hessian_psi_numdual<D: DualNum<f64> + Copy>(
     nu * h * b[i] * b[j] + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j]) + r * r_a[i][j]
 }
 
-fn eps_hessian_psi_f1(
+fn epshessian_psi_f1(
     eps: F1,
     psi0: f64,
     p: &CombinedLocationScaleParams,
@@ -449,7 +449,7 @@ fn eps_hessian_psi_f1(
     nu * h * b[i] * b[j] + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j]) + r * r_a[i][j]
 }
 
-fn eps_hessian_psi_ad<T: AD>(
+fn epshessian_psi_ad<T: AD>(
     eps: T,
     psi0: f64,
     p: &CombinedLocationScaleParams,
@@ -503,7 +503,7 @@ struct EpsHessianPsiFn<T: AD> {
     psi0: f64,
     i: usize,
     j: usize,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> EpsHessianPsiFn<T> {
@@ -513,7 +513,7 @@ impl<T: AD> EpsHessianPsiFn<T> {
             psi0,
             i,
             j,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -525,8 +525,8 @@ impl<T: AD> EpsHessianPsiFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for EpsHessianPsiFn<T> {
     const NAME: &'static str = "EpsHessianPsiFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![eps_hessian_psi_ad(
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+        vec![epshessian_psi_ad(
             inputs[0],
             self.psi0,
             &self.params,
@@ -559,21 +559,21 @@ fn q_ad<T: AD>(eta_ls: T, eta_t: f64) -> T {
 #[derive(Clone)]
 struct QFn<T: AD> {
     eta_t: f64,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> QFn<T> {
     fn new(eta_t: f64) -> Self {
         Self {
             eta_t,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
     fn to_other_ad_type<T2: AD>(&self) -> QFn<T2> {
         QFn {
             eta_t: self.eta_t,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }
@@ -581,7 +581,7 @@ impl<T: AD> QFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for QFn<T> {
     const NAME: &'static str = "QFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         vec![q_ad(inputs[0], self.eta_t)]
     }
 
@@ -594,19 +594,19 @@ impl<T: AD> DifferentiableFunctionTrait<T> for QFn<T> {
     }
 }
 
-fn scaling_phi_numdual<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64) -> D {
+fn scalingphi_numdual<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64) -> D {
     let kappa = psi.exp();
     let t = kappa * D::from(r);
     (psi * D::from(eta)).exp() * (D::one() + t * t + t.powi(4))
 }
 
-fn scaling_phi_f1(psi: F1, r: f64, eta: f64) -> F1 {
+fn scalingphi_f1(psi: F1, r: f64, eta: f64) -> F1 {
     let kappa = psi.exp();
     let t = kappa * F1::cst(r);
     (psi * F1::cst(eta)).exp() * (F1::cst(1.0) + t * t + t.powi(4))
 }
 
-fn scaling_phi_ad<T: AD>(psi: T, r: f64, eta: f64) -> T {
+fn scalingphi_ad<T: AD>(psi: T, r: f64, eta: f64) -> T {
     let kappa = psi.exp();
     let t = kappa * T::constant(r);
     (psi * T::constant(eta)).exp() * (T::one() + t * t + t.powi(4))
@@ -616,7 +616,7 @@ fn scaling_phi_ad<T: AD>(psi: T, r: f64, eta: f64) -> T {
 struct ScalingPhiFn<T: AD> {
     r: f64,
     eta: f64,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> ScalingPhiFn<T> {
@@ -624,7 +624,7 @@ impl<T: AD> ScalingPhiFn<T> {
         Self {
             r,
             eta,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -632,7 +632,7 @@ impl<T: AD> ScalingPhiFn<T> {
         ScalingPhiFn {
             r: self.r,
             eta: self.eta,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }
@@ -640,8 +640,8 @@ impl<T: AD> ScalingPhiFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for ScalingPhiFn<T> {
     const NAME: &'static str = "ScalingPhiFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![scaling_phi_ad(inputs[0], self.r, self.eta)]
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+        vec![scalingphi_ad(inputs[0], self.r, self.eta)]
     }
 
     fn num_inputs(&self) -> usize {
@@ -671,7 +671,7 @@ fn nonwiggle_q_log_sigma_derivatives_match_three_autodiff_engines() {
         let (q_nd2, dq_nd2, d2q_nd) = second_derivative(|x| q_numdual(x, eta_t), eta_ls);
         let (q_nd3, dq_nd3, d2q_nd3, d3q_nd) = third_derivative(|x| q_numdual(x, eta_t), eta_ls);
         let dq_autodiff = diff(|x| q_f1(x, eta_t), eta_ls);
-        let (_value, jac) = engine.derivative(&[eta_ls]);
+        let (value, jac) = engine.derivative(&[eta_ls]);
 
         assert_manual_ad_band!("nonwiggle_q", eta_ls, "q", q,
             "num_dual_1" => q_nd1, "num_dual_2" => q_nd2, "num_dual_3" => q_nd3);
@@ -697,22 +697,22 @@ fn spatial_log_kappa_scaling_derivatives_match_three_autodiff_engines() {
     let phi_psi = eta * phi + r * phi_r;
     let phi_psi_psi = eta * eta * phi + (2.0 * eta + 1.0) * r * phi_r + r * r * phi_rr;
 
-    let (phi_nd1, phi_psi_nd1) = first_derivative(|x| scaling_phi_numdual(x, r, eta), psi0);
+    let (phi_nd1, phi_psi_nd1) = first_derivative(|x| scalingphi_numdual(x, r, eta), psi0);
     let (phi_nd2, phi_psi_nd2, phi_psi_psi_nd) =
-        second_derivative(|x| scaling_phi_numdual(x, r, eta), psi0);
-    let phi_psi_autodiff = diff(|x| scaling_phi_f1(x, r, eta), psi0);
+        second_derivative(|x| scalingphi_numdual(x, r, eta), psi0);
+    let phi_psi_autodiff = diff(|x| scalingphi_f1(x, r, eta), psi0);
 
     let f_std = ScalingPhiFn::<f64>::new(r, eta);
     let f_ad = f_std.to_other_ad_type::<adfn<1>>();
     let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
-    let (_value, jac) = engine.derivative(&[psi0]);
+    let (value, jac) = engine.derivative(&[psi0]);
 
-    assert_manual_ad_band!("spatial_log_kappa_phi", psi0, "phi", phi,
+    assert_manual_ad_band!("spatial_log_kappaphi", psi0, "phi", phi,
         "num_dual_1" => phi_nd1, "num_dual_2" => phi_nd2);
-    assert_manual_ad_band!("spatial_log_kappa_phi", psi0, "phi_psi", phi_psi,
+    assert_manual_ad_band!("spatial_log_kappaphi", psi0, "phi_psi", phi_psi,
         "num_dual_1" => phi_psi_nd1, "num_dual_2" => phi_psi_nd2,
         "autodiff" => phi_psi_autodiff, "ad_trait" => jac[(0, 0)]);
-    assert_manual_ad_band!("spatial_log_kappa_phi", psi0, "phi_psi_psi", phi_psi_psi,
+    assert_manual_ad_band!("spatial_log_kappaphi", psi0, "phi_psi_psi", phi_psi_psi,
         "num_dual" => phi_psi_psi_nd);
 }
 
@@ -750,7 +750,7 @@ fn combined_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
     ];
 
     for psi in points {
-        let manual = manual_row_geometry(psi, &params);
+        let manual = manualrow_geometry(psi, &params);
         for (name, quantity) in quantities {
             let expected = expected_fixed_beta_quantity(&manual, quantity);
             let (_, d1_nd) = first_derivative(|x| psi_quantity_numdual(x, &params, quantity), psi);
@@ -758,7 +758,7 @@ fn combined_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
             let f_std = PsiQuantityFn::<f64>::new(params, quantity);
             let f_ad = f_std.to_other_ad_type::<adfn<1>>();
             let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
-            let (_value, jac) = engine.derivative(&[psi]);
+            let (value, jac) = engine.derivative(&[psi]);
             assert_manual_ad_band!(
                 "combined_location_scale_joint_psi",
                 psi,
@@ -773,7 +773,7 @@ fn combined_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
 }
 
 #[test]
-fn combined_location_scale_joint_psi_hessian_drift_matches_three_autodiff_engines() {
+fn combined_location_scale_joint_psihessian_drift_matches_three_autodiff_engines() {
     let params = CombinedLocationScaleParams {
         beta_1: 0.8,
         beta_2: -0.35,
@@ -792,7 +792,7 @@ fn combined_location_scale_joint_psi_hessian_drift_matches_three_autodiff_engine
         u_ls: 0.35,
     };
     let psi0 = 0.37;
-    let manual = manual_row_geometry(psi0, &params);
+    let manual = manualrow_geometry(psi0, &params);
     let pairs = [
         ("T_psi_00", 0usize, 0usize),
         ("T_psi_01", 0, 1),
@@ -804,12 +804,12 @@ fn combined_location_scale_joint_psi_hessian_drift_matches_three_autodiff_engine
     for (name, i, j) in pairs {
         let expected = manual.hessian_psi_drift[i][j];
         let (_, d1_nd) =
-            first_derivative(|eps| eps_hessian_psi_numdual(eps, psi0, &params, i, j), 0.0);
-        let d1_autodiff = diff(|eps| eps_hessian_psi_f1(eps, psi0, &params, i, j), 0.0);
+            first_derivative(|eps| epshessian_psi_numdual(eps, psi0, &params, i, j), 0.0);
+        let d1_autodiff = diff(|eps| epshessian_psi_f1(eps, psi0, &params, i, j), 0.0);
         let f_std = EpsHessianPsiFn::<f64>::new(params, psi0, i, j);
         let f_ad = f_std.to_other_ad_type::<adfn<1>>();
         let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
-        let (_value, jac) = engine.derivative(&[0.0]);
+        let (value, jac) = engine.derivative(&[0.0]);
         assert_manual_ad_band!(
             "combined_location_scale_joint_psi_drift",
             psi0,

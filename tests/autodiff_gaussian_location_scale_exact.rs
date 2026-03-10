@@ -11,7 +11,7 @@ mod common;
 #[derive(Clone, Copy)]
 struct GaussianPsiParams {
     y: f64,
-    beta_mu: f64,
+    betamu: f64,
     beta_ls: f64,
     z_0: f64,
     z_1: f64,
@@ -19,7 +19,7 @@ struct GaussianPsiParams {
     x_0: f64,
     x_1: f64,
     x_2: f64,
-    u_mu: f64,
+    umu: f64,
     u_ls: f64,
 }
 
@@ -69,7 +69,7 @@ fn gaussian_psi_quantity_numdual<D: DualNum<f64> + Copy>(
 ) -> D {
     let z = z_numdual(psi, p);
     let x = x_numdual(psi, p);
-    let mu = D::from(p.beta_mu) * z;
+    let mu = D::from(p.betamu) * z;
     let eta = D::from(p.beta_ls) * x;
     let sigma = eta.exp();
     let r = D::from(p.y) - mu;
@@ -92,7 +92,7 @@ fn gaussian_psi_quantity_numdual<D: DualNum<f64> + Copy>(
 fn gaussian_psi_quantity_f1(psi: F1, p: &GaussianPsiParams, quantity: GaussianPsiQuantity) -> F1 {
     let z = z_f1(psi, p);
     let x = x_f1(psi, p);
-    let mu = F1::cst(p.beta_mu) * z;
+    let mu = F1::cst(p.betamu) * z;
     let eta = F1::cst(p.beta_ls) * x;
     let sigma = eta.exp();
     let r = F1::cst(p.y) - mu;
@@ -119,7 +119,7 @@ fn gaussian_psi_quantity_ad<T: AD>(
 ) -> T {
     let z = z_ad(psi, p);
     let x = x_ad(psi, p);
-    let mu = T::constant(p.beta_mu) * z;
+    let mu = T::constant(p.betamu) * z;
     let eta = T::constant(p.beta_ls) * x;
     let sigma = eta.exp();
     let r = T::constant(p.y) - mu;
@@ -143,7 +143,7 @@ fn gaussian_psi_quantity_ad<T: AD>(
 struct GaussianPsiFn<T: AD> {
     params: GaussianPsiParams,
     quantity: GaussianPsiQuantity,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> GaussianPsiFn<T> {
@@ -151,7 +151,7 @@ impl<T: AD> GaussianPsiFn<T> {
         Self {
             params,
             quantity,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -163,7 +163,7 @@ impl<T: AD> GaussianPsiFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for GaussianPsiFn<T> {
     const NAME: &'static str = "GaussianPsiFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         vec![gaussian_psi_quantity_ad(
             inputs[0],
             &self.params,
@@ -180,14 +180,14 @@ impl<T: AD> DifferentiableFunctionTrait<T> for GaussianPsiFn<T> {
     }
 }
 
-fn gaussian_manual_row_geometry(psi: f64, p: &GaussianPsiParams) -> GaussianManualRowGeometry {
+fn gaussian_manualrow_geometry(psi: f64, p: &GaussianPsiParams) -> GaussianManualRowGeometry {
     let z = p.z_0 + p.z_1 * psi + 0.5 * p.z_2 * psi * psi;
     let x = p.x_0 + p.x_1 * psi + 0.5 * p.x_2 * psi * psi;
     let z_a = p.z_1 + p.z_2 * psi;
     let x_a = p.x_1 + p.x_2 * psi;
-    let mu = p.beta_mu * z;
+    let mu = p.betamu * z;
     let eta = p.beta_ls * x;
-    let mu_a = p.beta_mu * z_a;
+    let mu_a = p.betamu * z_a;
     let eta_a = p.beta_ls * x_a;
     let sigma = eta.exp();
     let r = p.y - mu;
@@ -211,22 +211,22 @@ fn gaussian_manual_row_geometry(psi: f64, p: &GaussianPsiParams) -> GaussianManu
         ],
     ];
 
-    let dot_mu = z * p.u_mu;
+    let dotmu = z * p.umu;
     let dot_eta = x * p.u_ls;
-    let dot_mu_a = z_a * p.u_mu;
+    let dotmu_a = z_a * p.umu;
     let dot_eta_a = x_a * p.u_ls;
     let w_u = -2.0 * w * dot_eta;
-    let c_u = -2.0 * w * dot_mu - 4.0 * alpha * dot_eta;
-    let d_u = -4.0 * alpha * dot_mu - 4.0 * b * dot_eta;
+    let c_u = -2.0 * w * dotmu - 4.0 * alpha * dot_eta;
+    let d_u = -4.0 * alpha * dotmu - 4.0 * b * dot_eta;
     let w_a_u = 4.0 * w * dot_eta * eta_a - 2.0 * w * dot_eta_a;
-    let c_a_u = -2.0 * w * dot_mu_a
-        + 4.0 * w * (dot_eta * mu_a + dot_mu * eta_a)
+    let c_a_u = -2.0 * w * dotmu_a
+        + 4.0 * w * (dot_eta * mu_a + dotmu * eta_a)
         + 8.0 * alpha * dot_eta * eta_a
         - 4.0 * alpha * dot_eta_a;
-    let d_a_u = 4.0 * w * dot_mu * mu_a
-        + 8.0 * alpha * (dot_eta * mu_a + dot_mu * eta_a)
+    let d_a_u = 4.0 * w * dotmu * mu_a
+        + 8.0 * alpha * (dot_eta * mu_a + dotmu * eta_a)
         + 8.0 * b * dot_eta * eta_a
-        - 4.0 * alpha * dot_mu_a
+        - 4.0 * alpha * dotmu_a
         - 4.0 * b * dot_eta_a;
     let hessian_psi_drift = [
         [
@@ -258,23 +258,23 @@ fn expected_gaussian_fixed_beta_quantity(
     }
 }
 
-fn eps_gaussian_hessian_psi_numdual<D: DualNum<f64> + Copy>(
+fn eps_gaussianhessian_psi_numdual<D: DualNum<f64> + Copy>(
     eps: D,
     psi0: f64,
     p: &GaussianPsiParams,
     i: usize,
     j: usize,
 ) -> D {
-    let beta_mu = D::from(p.beta_mu) + D::from(p.u_mu) * eps;
+    let betamu = D::from(p.betamu) + D::from(p.umu) * eps;
     let beta_ls = D::from(p.beta_ls) + D::from(p.u_ls) * eps;
     let psi = D::from(psi0);
     let z = z_numdual(psi, p);
     let x = x_numdual(psi, p);
     let z_a = D::from(p.z_1 + p.z_2 * psi0);
     let x_a = D::from(p.x_1 + p.x_2 * psi0);
-    let mu = beta_mu * z;
+    let mu = betamu * z;
     let eta = beta_ls * x;
-    let mu_a = beta_mu * z_a;
+    let mu_a = betamu * z_a;
     let eta_a = beta_ls * x_a;
     let sigma = eta.exp();
     let r = D::from(p.y) - mu;
@@ -292,23 +292,23 @@ fn eps_gaussian_hessian_psi_numdual<D: DualNum<f64> + Copy>(
     }
 }
 
-fn eps_gaussian_hessian_psi_f1(
+fn eps_gaussianhessian_psi_f1(
     eps: F1,
     psi0: f64,
     p: &GaussianPsiParams,
     i: usize,
     j: usize,
 ) -> F1 {
-    let beta_mu = F1::cst(p.beta_mu) + F1::cst(p.u_mu) * eps;
+    let betamu = F1::cst(p.betamu) + F1::cst(p.umu) * eps;
     let beta_ls = F1::cst(p.beta_ls) + F1::cst(p.u_ls) * eps;
     let psi = F1::cst(psi0);
     let z = z_f1(psi, p);
     let x = x_f1(psi, p);
     let z_a = F1::cst(p.z_1 + p.z_2 * psi0);
     let x_a = F1::cst(p.x_1 + p.x_2 * psi0);
-    let mu = beta_mu * z;
+    let mu = betamu * z;
     let eta = beta_ls * x;
-    let mu_a = beta_mu * z_a;
+    let mu_a = betamu * z_a;
     let eta_a = beta_ls * x_a;
     let sigma = eta.exp();
     let r = F1::cst(p.y) - mu;
@@ -326,23 +326,23 @@ fn eps_gaussian_hessian_psi_f1(
     }
 }
 
-fn eps_gaussian_hessian_psi_ad<T: AD>(
+fn eps_gaussianhessian_psi_ad<T: AD>(
     eps: T,
     psi0: f64,
     p: &GaussianPsiParams,
     i: usize,
     j: usize,
 ) -> T {
-    let beta_mu = T::constant(p.beta_mu) + T::constant(p.u_mu) * eps;
+    let betamu = T::constant(p.betamu) + T::constant(p.umu) * eps;
     let beta_ls = T::constant(p.beta_ls) + T::constant(p.u_ls) * eps;
     let psi = T::constant(psi0);
     let z = z_ad(psi, p);
     let x = x_ad(psi, p);
     let z_a = T::constant(p.z_1 + p.z_2 * psi0);
     let x_a = T::constant(p.x_1 + p.x_2 * psi0);
-    let mu = beta_mu * z;
+    let mu = betamu * z;
     let eta = beta_ls * x;
-    let mu_a = beta_mu * z_a;
+    let mu_a = betamu * z_a;
     let eta_a = beta_ls * x_a;
     let sigma = eta.exp();
     let r = T::constant(p.y) - mu;
@@ -366,7 +366,7 @@ struct EpsGaussianHessianPsiFn<T: AD> {
     psi0: f64,
     i: usize,
     j: usize,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: AD> EpsGaussianHessianPsiFn<T> {
@@ -376,7 +376,7 @@ impl<T: AD> EpsGaussianHessianPsiFn<T> {
             psi0,
             i,
             j,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -388,8 +388,8 @@ impl<T: AD> EpsGaussianHessianPsiFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for EpsGaussianHessianPsiFn<T> {
     const NAME: &'static str = "EpsGaussianHessianPsiFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![eps_gaussian_hessian_psi_ad(
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+        vec![eps_gaussianhessian_psi_ad(
             inputs[0],
             self.psi0,
             &self.params,
@@ -411,7 +411,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for EpsGaussianHessianPsiFn<T> {
 fn gaussian_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engines() {
     let params = GaussianPsiParams {
         y: 1.4,
-        beta_mu: -0.6,
+        betamu: -0.6,
         beta_ls: 0.35,
         z_0: 1.2,
         z_1: -0.3,
@@ -419,21 +419,21 @@ fn gaussian_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
         x_0: -0.4,
         x_1: 0.8,
         x_2: -0.2,
-        u_mu: 0.25,
+        umu: 0.25,
         u_ls: -0.4,
     };
     let points = [-1.0, -0.2, 0.4, 1.1];
     let quantities = [
         ("objective_psi", GaussianPsiQuantity::Objective),
-        ("score_psi_mu", GaussianPsiQuantity::Score(0)),
+        ("score_psimu", GaussianPsiQuantity::Score(0)),
         ("score_psi_ls", GaussianPsiQuantity::Score(1)),
-        ("hessian_psi_mumu", GaussianPsiQuantity::Hessian(0, 0)),
-        ("hessian_psi_muls", GaussianPsiQuantity::Hessian(0, 1)),
+        ("hessian_psimumu", GaussianPsiQuantity::Hessian(0, 0)),
+        ("hessian_psimuls", GaussianPsiQuantity::Hessian(0, 1)),
         ("hessian_psi_lsls", GaussianPsiQuantity::Hessian(1, 1)),
     ];
 
     for psi in points {
-        let manual = gaussian_manual_row_geometry(psi, &params);
+        let manual = gaussian_manualrow_geometry(psi, &params);
         for (name, quantity) in quantities {
             let expected = expected_gaussian_fixed_beta_quantity(&manual, quantity);
             let (_, d1_nd) =
@@ -442,7 +442,7 @@ fn gaussian_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
             let f_std = GaussianPsiFn::<f64>::new(params, quantity);
             let f_ad = f_std.to_other_ad_type::<adfn<1>>();
             let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
-            let (_value, jac) = engine.derivative(&[psi]);
+            let (value, jac) = engine.derivative(&[psi]);
             assert_manual_ad_band!(
                 "gaussian_location_scale_joint_psi",
                 psi,
@@ -457,10 +457,10 @@ fn gaussian_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
 }
 
 #[test]
-fn gaussian_location_scale_joint_psi_hessian_drift_matches_three_autodiff_engines() {
+fn gaussian_location_scale_joint_psihessian_drift_matches_three_autodiff_engines() {
     let params = GaussianPsiParams {
         y: 1.4,
-        beta_mu: -0.6,
+        betamu: -0.6,
         beta_ls: 0.35,
         z_0: 1.2,
         z_1: -0.3,
@@ -468,30 +468,30 @@ fn gaussian_location_scale_joint_psi_hessian_drift_matches_three_autodiff_engine
         x_0: -0.4,
         x_1: 0.8,
         x_2: -0.2,
-        u_mu: 0.25,
+        umu: 0.25,
         u_ls: -0.4,
     };
     let psi0 = 0.37;
-    let manual = gaussian_manual_row_geometry(psi0, &params);
+    let manual = gaussian_manualrow_geometry(psi0, &params);
     let pairs = [
-        ("T_psi_mumu", 0usize, 0usize),
-        ("T_psi_muls", 0, 1),
+        ("T_psimumu", 0usize, 0usize),
+        ("T_psimuls", 0, 1),
         ("T_psi_lsls", 1, 1),
     ];
     for (name, i, j) in pairs {
         let expected = manual.hessian_psi_drift[i][j];
         let (_, d1_nd) = first_derivative(
-            |eps| eps_gaussian_hessian_psi_numdual(eps, psi0, &params, i, j),
+            |eps| eps_gaussianhessian_psi_numdual(eps, psi0, &params, i, j),
             0.0,
         );
         let d1_autodiff = diff(
-            |eps| eps_gaussian_hessian_psi_f1(eps, psi0, &params, i, j),
+            |eps| eps_gaussianhessian_psi_f1(eps, psi0, &params, i, j),
             0.0,
         );
         let f_std = EpsGaussianHessianPsiFn::<f64>::new(params, psi0, i, j);
         let f_ad = f_std.to_other_ad_type::<adfn<1>>();
         let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
-        let (_value, jac) = engine.derivative(&[0.0]);
+        let (value, jac) = engine.derivative(&[0.0]);
         assert_manual_ad_band!(
             "gaussian_location_scale_joint_psi_drift",
             psi0,
