@@ -48,11 +48,7 @@ impl SamplingVisualizer {
     fn new(stage: &str, total_chains: usize, warmup: usize, samples: usize) -> Self {
         let mut session = VisualizerSession::new(true);
         session.set_stage("sample", stage);
-        session.set_progress(
-            &format!("chains completed ({stage})"),
-            0,
-            Some(total_chains.max(1)),
-        );
+        session.start_workflow(&format!("chains completed ({stage})"), total_chains.max(1));
         Self {
             session,
             chain: 0,
@@ -66,18 +62,14 @@ impl SamplingVisualizer {
         self.chain = chain;
         self.session
             .set_stage("sample", &format!("[Chain {}] {label}", chain + 1));
+        self.session.start_workflow("chains completed", self.total_chains.max(1));
+        self.session.advance_workflow(chain);
         self.session
-            .set_progress("chains completed", chain, Some(self.total_chains.max(1)));
-        self.session
-            .set_secondary_progress(&format!("[Chain {}] Warmup", chain + 1), 0, Some(self.warmup));
+            .start_secondary_workflow(&format!("[Chain {}] Warmup", chain + 1), self.warmup);
     }
 
     fn warmup_step(&mut self, iter: usize) {
-        self.session.set_secondary_progress(
-            &format!("[Chain {}] Warmup", self.chain + 1),
-            iter.min(self.warmup),
-            Some(self.warmup),
-        );
+        self.session.advance_secondary_workflow(iter.min(self.warmup));
     }
 
     fn start_sampling(&mut self) {
@@ -85,19 +77,12 @@ impl SamplingVisualizer {
             "chain {} warmup complete",
             self.chain + 1
         ));
-        self.session.set_secondary_progress(
-            &format!("[Chain {}] Sample", self.chain + 1),
-            0,
-            Some(self.samples),
-        );
+        self.session
+            .start_secondary_workflow(&format!("[Chain {}] Sample", self.chain + 1), self.samples);
     }
 
     fn sample_step(&mut self, iter: usize) {
-        self.session.set_secondary_progress(
-            &format!("[Chain {}] Sample", self.chain + 1),
-            iter.min(self.samples),
-            Some(self.samples),
-        );
+        self.session.advance_secondary_workflow(iter.min(self.samples));
     }
 
     fn finish_chain(&mut self, accept_rate: f64) {
@@ -106,11 +91,8 @@ impl SamplingVisualizer {
             self.chain + 1,
             accept_rate * 100.0
         ));
-        self.session.set_progress(
-            "chains completed",
-            (self.chain + 1).min(self.total_chains),
-            Some(self.total_chains.max(1)),
-        );
+        self.session
+            .advance_workflow((self.chain + 1).min(self.total_chains));
     }
 
     fn finish_all(&mut self, rhat: f64, ess: f64) {

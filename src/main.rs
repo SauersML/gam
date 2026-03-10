@@ -568,9 +568,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         return run_survival(surv_args);
     }
     progress.set_stage("fit", "parsing csv and inferring schema");
-    progress.set_secondary_progress("Data Loading", 0, Some(3));
+    progress.start_secondary_workflow("Data Loading", 3);
     let ds = load_dataset(&args.data)?;
-    progress.set_secondary_progress("Data Loading", 1, Some(3));
+    progress.advance_secondary_workflow(1);
     progress.advance_workflow(1);
 
     let col_map: HashMap<String, usize> = ds
@@ -761,7 +761,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     progress.set_stage("fit", "building term specification");
     let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
-    progress.set_secondary_progress("Data Loading", 2, Some(3));
+    progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("dataset parsed and terms resolved");
     progress.advance_workflow(2);
     let mut spatial_usagewarnings =
@@ -778,10 +778,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         return Err("--firth is not yet supported with bounded() coefficients".to_string());
     }
     progress.set_stage("fit", "building design matrices");
-    progress.set_secondary_progress("Design Matrices", 0, Some(2));
+    progress.start_secondary_workflow("Design Matrices", 2);
     let initial_design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
-    progress.set_secondary_progress("Design Matrices", 1, Some(2));
+    progress.advance_secondary_workflow(1);
     let initial_frozenspec = freeze_term_collectionspec(&spec, &initial_design)?;
     progress.finish_secondary_progress("design matrices assembled");
     progress.advance_workflow(3);
@@ -1077,10 +1077,10 @@ fn run_fitwith_predict_noise(
         );
     }
     progress.set_stage("fit", "building mean/noise term specifications");
-    progress.set_secondary_progress("Mean/Noise Terms", 0, Some(2));
+    progress.start_secondary_workflow("Mean/Noise Terms", 2);
     let noisespec = build_termspec(&parsed_noise.terms, ds, col_map, inference_notes)?;
     let meanspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
-    progress.set_secondary_progress("Mean/Noise Terms", 2, Some(2));
+    progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("mean and noise terms resolved");
     progress.advance_workflow(2);
     let mut spatial_usagewarnings =
@@ -3320,6 +3320,30 @@ fn evaluate_survival_baseline(
     }
 }
 
+fn choose_survival_time_block_initial_coefficient(
+    constraints: &gam::pirls::LinearInequalityConstraints,
+    p_time: usize,
+) -> f64 {
+    const INIT_MARGIN_FACTOR: f64 = 1.5;
+    const INIT_DERIVATIVE_TARGET_FLOOR: f64 = 1e-6;
+
+    let mut min_uniform_time_coef = 0.0_f64;
+    for i in 0..constraints.a.nrows() {
+        let row = constraints.a.row(i);
+        let row_sum = row
+            .slice(s![0..p_time])
+            .iter()
+            .copied()
+            .fold(0.0_f64, |acc, v| acc + v);
+        if row_sum > 1e-12 {
+            let required_coef = (constraints.b[i] / row_sum).max(0.0);
+            let target_coef = (INIT_DERIVATIVE_TARGET_FLOOR / row_sum).max(required_coef);
+            min_uniform_time_coef = min_uniform_time_coef.max(target_coef);
+        }
+    }
+    min_uniform_time_coef * INIT_MARGIN_FACTOR
+}
+
 fn build_survival_baseline_offsets(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
@@ -4089,23 +4113,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut beta0 = Array1::<f64>::zeros(p);
     let linear_constraints = model.monotonicity_linear_constraints();
     if let Some(constraints) = linear_constraints.as_ref() {
-        let mut min_uniform_time_coef = 0.0_f64;
-        for i in 0..constraints.a.nrows() {
-            let row = constraints.a.row(i);
-            let row_sum = row
-                .slice(s![0..p_time])
-                .iter()
-                .copied()
-                .fold(0.0_f64, |acc, v| acc + v);
-            if row_sum > 1e-12 {
-                min_uniform_time_coef =
-                    min_uniform_time_coef.max((constraints.b[i] / row_sum).max(0.0));
-            }
-        }
-        if min_uniform_time_coef > 0.0 {
-            beta0
-                .slice_mut(s![0..p_time])
-                .fill(min_uniform_time_coef * 1.05);
+        let initial_time_coef = choose_survival_time_block_initial_coefficient(constraints, p_time);
+        if initial_time_coef > 0.0 {
+            beta0.slice_mut(s![0..p_time]).fill(initial_time_coef);
         }
     }
     let beta0_norm = beta0.dot(&beta0).sqrt();
@@ -10645,6 +10655,21 @@ mod tests {
         .expect_err("non-finite times should not retry through uniform knots");
 
         assert!(err.contains("survival time basis requires finite exit times (row 3)"));
+    }
+
+    #[test]
+    fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
+        let constraints = gam::pirls::LinearInequalityConstraints {
+            a: Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
+                .expect("constraint matrix"),
+            b: Array1::from_vec(vec![1e-12, 1e-12]),
+        };
+
+        let coef = choose_survival_time_block_initial_coefficient(&constraints, 2);
+
+        assert!(coef.is_finite());
+        assert!(coef > 0.0);
+        assert!(coef >= 1.5 * (1e-6 / 5e-5));
     }
 
     #[test]

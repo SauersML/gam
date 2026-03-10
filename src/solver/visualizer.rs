@@ -8,6 +8,7 @@ use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::env;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -144,10 +145,12 @@ struct InteractiveVisualizer {
 }
 
 struct DumbVisualizer {
-    multi: MultiProgress,
+    multi: Option<MultiProgress>,
     primary_bar: ProgressBar,
     secondary_bar: ProgressBar,
     last_draw: Instant,
+    text_only: bool,
+    last_lines: Vec<String>,
 }
 
 impl InteractiveVisualizer {
@@ -446,27 +449,36 @@ enum LaneTone {
 }
 
 impl DumbVisualizer {
-    fn new() -> Self {
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-        let primary_bar = multi.add(ProgressBar::hidden());
-        let secondary_bar = multi.add(ProgressBar::hidden());
-        primary_bar.set_style(primary_style());
-        secondary_bar.set_style(secondary_style());
-        install_multiprogress(Some(multi.clone()));
+    fn new(text_only: bool) -> Self {
+        let (multi, primary_bar, secondary_bar) = if text_only {
+            (None, ProgressBar::hidden(), ProgressBar::hidden())
+        } else {
+            let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+            let primary_bar = multi.add(ProgressBar::hidden());
+            let secondary_bar = multi.add(ProgressBar::hidden());
+            primary_bar.set_style(primary_style());
+            secondary_bar.set_style(secondary_style());
+            install_multiprogress(Some(multi.clone()));
+            (Some(multi), primary_bar, secondary_bar)
+        };
         Self {
             multi,
             primary_bar,
             secondary_bar,
             last_draw: Instant::now() - DUMB_DRAW_INTERVAL,
+            text_only,
+            last_lines: Vec::new(),
         }
     }
 
     fn maybe_draw(&mut self, model: &VisualizerModel, force: bool) {
-        self.sync_bars(model);
+        if !self.text_only {
+            self.sync_bars(model);
+        }
         if !force && self.last_draw.elapsed() < DUMB_DRAW_INTERVAL {
             return;
         }
-        self.draw(model);
+        self.draw(model, force);
         self.last_draw = Instant::now();
     }
 
@@ -475,16 +487,28 @@ impl DumbVisualizer {
         sync_bar(&self.secondary_bar, &model.secondary_lane, &model);
     }
 
-    fn draw(&self, model: &VisualizerModel) {
+    fn draw(&mut self, model: &VisualizerModel, force: bool) {
         let lines = dumb_render_lines(model);
-        for line in lines {
-            let _ = self.multi.println(line);
+        if !force && lines == self.last_lines {
+            return;
+        }
+        self.last_lines = lines.clone();
+        if let Some(multi) = &self.multi {
+            for line in lines {
+                let _ = multi.println(line);
+            }
+        } else {
+            for line in lines {
+                let _ = writeln!(io::stderr(), "{line}");
+            }
         }
     }
 
     fn teardown(&mut self, model: &VisualizerModel) {
         self.maybe_draw(model, true);
-        let _ = self.multi.clear();
+        if let Some(multi) = &self.multi {
+            let _ = multi.clear();
+        }
         install_multiprogress(None);
     }
 }
@@ -565,14 +589,17 @@ impl VisualizerSession {
         if !enabled {
             return Self::default();
         }
-        let interactive = io::stdout().is_terminal() && io::stderr().is_terminal();
+        let notebook_or_noninteractive = should_use_text_only_progress();
+        let interactive = !notebook_or_noninteractive
+            && io::stdout().is_terminal()
+            && io::stderr().is_terminal();
         let state = if interactive {
             match InteractiveVisualizer::new() {
                 Ok(v) => VisualizerState::Interactive(v),
-                Err(_) => VisualizerState::Dumb(DumbVisualizer::new()),
+                Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
             }
         } else {
-            VisualizerState::Dumb(DumbVisualizer::new())
+            VisualizerState::Dumb(DumbVisualizer::new(true))
         };
         Self {
             state,
@@ -636,12 +663,7 @@ impl VisualizerSession {
     }
 
     pub fn start_workflow(&mut self, label: &str, total: usize) {
-        self.model.primary_lane = LaneState {
-            label: label.to_string(),
-            current: 0,
-            total: Some(total),
-            done: false,
-        };
+        self.model.primary_lane = started_lane(label, total);
         self.redraw(true);
     }
 
@@ -649,31 +671,20 @@ impl VisualizerSession {
         if self.model.primary_lane.label.is_empty() {
             return;
         }
-        self.model.primary_lane.current = match self.model.primary_lane.total {
-            Some(total) => current.min(total),
-            None => current,
-        };
-        self.model.primary_lane.done = false;
+        advance_lane(&mut self.model.primary_lane, current);
         self.redraw(false);
     }
 
-    pub fn set_progress(&mut self, label: &str, current: usize, total: Option<usize>) {
-        self.model.primary_lane = LaneState {
-            label: label.to_string(),
-            current,
-            total,
-            done: false,
-        };
-        self.redraw(false);
+    pub fn start_secondary_workflow(&mut self, label: &str, total: usize) {
+        self.model.secondary_lane = started_lane(label, total);
+        self.redraw(true);
     }
 
-    pub fn set_secondary_progress(&mut self, label: &str, current: usize, total: Option<usize>) {
-        self.model.secondary_lane = LaneState {
-            label: label.to_string(),
-            current,
-            total,
-            done: false,
-        };
+    pub fn advance_secondary_workflow(&mut self, current: usize) {
+        if self.model.secondary_lane.label.is_empty() {
+            return;
+        }
+        advance_lane(&mut self.model.secondary_lane, current);
         self.redraw(false);
     }
 
@@ -1022,6 +1033,42 @@ fn unicode_bar(ratio: f64, width: usize) -> String {
     out
 }
 
+fn normalize_total(total: usize) -> usize {
+    total.max(1)
+}
+
+fn should_use_text_only_progress() -> bool {
+    if !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+        return true;
+    }
+    [
+        "JPY_PARENT_PID",
+        "IPYKERNEL_CELL_NAME",
+        "COLAB_RELEASE_TAG",
+        "GITHUB_ACTIONS",
+    ]
+    .iter()
+    .any(|key| env::var_os(key).is_some())
+}
+
+fn started_lane(label: &str, total: usize) -> LaneState {
+    LaneState {
+        label: label.to_string(),
+        current: 0,
+        total: Some(normalize_total(total)),
+        done: false,
+    }
+}
+
+fn advance_lane(lane: &mut LaneState, current: usize) {
+    let next = match lane.total {
+        Some(total) => current.min(total),
+        None => current,
+    };
+    lane.current = lane.current.max(next);
+    lane.done = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,7 +1085,8 @@ mod tests {
         let mut session = VisualizerSession::new(false);
         session.model.start_time = Instant::now() - Duration::from_secs(4);
         session.set_stage("fit", "optimizing");
-        session.set_progress("REML", 4, Some(10));
+        session.start_workflow("REML", 10);
+        session.advance_workflow(4);
         session.update(42.0, 1e-3, "optimizing", 4.0, "accepted", Some(10));
         let lines = dumb_render_lines(&session.model);
         assert!(lines.iter().any(|line| line.contains("Outer Opt:")));
@@ -1058,7 +1106,8 @@ mod tests {
     #[test]
     fn finishing_secondary_progress_clears_inner_lane() {
         let mut session = VisualizerSession::new(false);
-        session.set_secondary_progress("inner", 2, Some(5));
+        session.start_secondary_workflow("inner", 5);
+        session.advance_secondary_workflow(2);
         assert_eq!(session.model.secondary_lane.label, "inner");
         session.finish_secondary_progress("done");
         assert!(session.model.secondary_lane.label.is_empty());
@@ -1078,7 +1127,8 @@ mod tests {
     #[test]
     fn finish_progress_keeps_completion_diagnostic() {
         let mut session = VisualizerSession::new(false);
-        session.set_progress("outer", 5, Some(10));
+        session.start_workflow("outer", 10);
+        session.advance_workflow(5);
         session.finish_progress("outer complete");
         assert_eq!(
             session.model.diagnostics_lines.last().map(String::as_str),
@@ -1086,6 +1136,26 @@ mod tests {
         );
         assert!(session.model.primary_lane.done);
         assert_eq!(session.model.primary_lane.current, 10);
+    }
+
+    #[test]
+    fn workflow_normalizes_zero_total_and_never_goes_backwards() {
+        let mut session = VisualizerSession::new(false);
+        session.start_workflow("outer", 0);
+        assert_eq!(session.model.primary_lane.total, Some(1));
+        session.advance_workflow(1);
+        session.advance_workflow(0);
+        assert_eq!(session.model.primary_lane.current, 1);
+    }
+
+    #[test]
+    fn secondary_workflow_ignores_advances_before_start() {
+        let mut session = VisualizerSession::new(false);
+        session.advance_secondary_workflow(3);
+        assert!(session.model.secondary_lane.label.is_empty());
+        session.start_secondary_workflow("inner", 2);
+        session.advance_secondary_workflow(5);
+        assert_eq!(session.model.secondary_lane.current, 2);
     }
 
     #[test]

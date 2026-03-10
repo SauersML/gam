@@ -313,39 +313,6 @@ impl ParametricColumnConditioning {
         })
     }
 
-    fn transform_directional_hyper_to_internal(
-        &self,
-        hyper_dir: &DirectionalHyperParam,
-    ) -> Result<DirectionalHyperParam, EstimationError> {
-        let x_tau_original = self.transform_matrix_columnswith_a(&hyper_dir.x_tau_original);
-        let x_tau_tau_original = hyper_dir.x_tau_tau_original.as_ref().map(|rows| {
-            rows.iter()
-                .map(|mat| self.transform_matrix_columnswith_a(mat))
-                .collect::<Vec<_>>()
-        });
-        let penalty_first_components = hyper_dir
-            .penalty_first_components()
-            .iter()
-            .map(|component| (component.penalty_index, component.matrix.clone()))
-            .collect::<Vec<_>>();
-        let penaltysecond_components = hyper_dir.penaltysecond_componentrows().map(|rows| {
-            rows.iter()
-                .map(|components| {
-                    components
-                        .iter()
-                        .map(|component| (component.penalty_index, component.matrix.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        });
-        DirectionalHyperParam::new(
-            x_tau_original,
-            penalty_first_components,
-            x_tau_tau_original,
-            penaltysecond_components,
-        )
-    }
-
     fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
         let mut beta = beta_internal.clone();
         for &(j, mean, scale) in &self.columns {
@@ -359,11 +326,19 @@ impl ParametricColumnConditioning {
 
     fn transform_matrix_columnswith_a(&self, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = mat.clone();
+        self.transform_matrix_columnswith_a_inplace(&mut out);
+        out
+    }
+
+    fn transform_matrix_columnswith_a_inplace(&self, mat: &mut Array2<f64>) {
+        if !self.is_active() {
+            return;
+        }
+        let intercept_col = self.intercept_idx.map(|idx| mat.column(idx).to_owned());
         for &(j, mean, scale) in &self.columns {
-            let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
-            let mut target = out.column_mut(j);
+            let mut target = mat.column_mut(j);
             if mean != 0.0
-                && let Some(intercept_col) = intercept_col
+                && let Some(intercept_col) = intercept_col.as_ref()
             {
                 target -= &(intercept_col * mean);
             }
@@ -371,7 +346,6 @@ impl ParametricColumnConditioning {
                 target.mapv_inplace(|v| v / scale);
             }
         }
-        out
     }
 
     fn transform_matrixrowswith_a_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
@@ -2087,7 +2061,7 @@ fn validate_and_build_reml_state<X, T, F>(
     s_list: Vec<Array2<f64>>,
     theta: &Array1<f64>,
     rho_dim: usize,
-    hyper_dirs: &[DirectionalHyperParam],
+    mut hyper_dirs: Vec<DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
     context: &str,
@@ -2166,6 +2140,9 @@ where
                 )));
             }
             for (j, x_ij) in x2.iter().enumerate() {
+                let Some(x_ij) = x_ij.as_ref() else {
+                    continue;
+                };
                 if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
                     return Err(EstimationError::InvalidInput(format!(
                         "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
@@ -2186,6 +2163,9 @@ where
                 )));
             }
             for (j, components) in s2.iter().enumerate() {
+                let Some(components) = components.as_ref() else {
+                    continue;
+                };
                 RemlState::validate_penalty_component_shapes(
                     components,
                     p,
@@ -2199,12 +2179,16 @@ where
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
-    let conditioned_hyper_dirs = hyper_dirs
-        .iter()
-        .map(|dir| conditioning.transform_directional_hyper_to_internal(dir))
-        .collect::<Result<Vec<_>, _>>()?;
+    for dir in &mut hyper_dirs {
+        conditioning.transform_matrix_columnswith_a_inplace(&mut dir.x_tau_original);
+        if let Some(rows) = dir.x_tau_tau_original.as_mut() {
+            for mat in rows.iter_mut().flatten() {
+                conditioning.transform_matrix_columnswith_a_inplace(mat);
+            }
+        }
+    }
     let (cfg, _) = resolved_external_config(opts)?;
-    let has_design_drift = conditioned_hyper_dirs
+    let has_design_drift = hyper_dirs
         .iter()
         .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
     ensure_exact_directional_hyper_supported(
@@ -2233,7 +2217,7 @@ where
         cfg.link_kind.sas_state().copied(),
     );
     reml_state.setwarm_start_original_beta(warm_start_beta);
-    eval(&reml_state, &conditioned_hyper_dirs)
+    eval(&reml_state, &hyper_dirs)
 }
 
 pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
@@ -2244,7 +2228,7 @@ pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
     s_list: Vec<Array2<f64>>,
     theta: &Array1<f64>,
     rho_dim: usize,
-    hyper_dirs: &[DirectionalHyperParam],
+    hyper_dirs: Vec<DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
 ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError>

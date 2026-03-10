@@ -3579,9 +3579,15 @@ fn is_in_hidden_directory(path: impl AsRef<Path>) -> bool {
 }
 
 fn is_in_target_directory(path: impl AsRef<Path>) -> bool {
-    path.as_ref()
-        .components()
-        .any(|component| matches!(component, Component::Normal(name) if name == "target"))
+    path.as_ref().components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name)
+                if name
+                    .to_str()
+                    .is_some_and(|segment| segment == "target" || segment.starts_with("target-"))
+        )
+    })
 }
 
 fn is_in_ignored_directory(path: impl AsRef<Path>) -> bool {

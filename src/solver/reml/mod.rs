@@ -861,7 +861,7 @@ mod tests {
                 Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 vec![(0, Array2::<f64>::zeros((x.ncols(), x.ncols())))],
                 None,
-                Some(vec![vec![(1, Array2::<f64>::eye(x.ncols()))]]),
+                Some(vec![Some(vec![(1, Array2::<f64>::eye(x.ncols()))])]),
             )
             .expect("hyper direction with invalid second-order penalty index"),
         ];
@@ -1197,12 +1197,12 @@ pub(crate) struct DirectionalHyperParam {
     // base-penalty derivatives. There is no separate "assembled total" path.
     penalty_first_components: Vec<PenaltyDerivativeComponent>,
     // Optional pairwise second hyper-derivatives against all tau directions.
-    // If provided, each vector must have length psi_dim and hold X_{tau_i,tau_j}
-    // in original coordinates.
-    pub x_tau_tau_original: Option<Vec<Array2<f64>>>,
+    // If provided, each vector must have length psi_dim and hold an optional
+    // X_{tau_i,tau_j} entry in original coordinates.
+    pub x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
     // Pairwise second derivatives are stored in the same canonical base-penalty
     // decomposition as the first derivatives.
-    penaltysecond_components: Option<Vec<Vec<PenaltyDerivativeComponent>>>,
+    penaltysecond_components: Option<Vec<Option<Vec<PenaltyDerivativeComponent>>>>,
 }
 
 impl DirectionalHyperParam {
@@ -1228,8 +1228,8 @@ impl DirectionalHyperParam {
     pub(crate) fn new(
         x_tau_original: Array2<f64>,
         penalty_first_components: Vec<(usize, Array2<f64>)>,
-        x_tau_tau_original: Option<Vec<Array2<f64>>>,
-        penaltysecond_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+        x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
+        penaltysecond_components: Option<Vec<Option<Vec<(usize, Array2<f64>)>>>>,
     ) -> Result<Self, EstimationError> {
         let penalty_first_components =
             Self::canonicalize_penalty_components(penalty_first_components)?;
@@ -1237,7 +1237,10 @@ impl DirectionalHyperParam {
             Some(rows) => {
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    out.push(Self::canonicalize_penalty_components(row)?);
+                    out.push(match row {
+                        Some(components) => Some(Self::canonicalize_penalty_components(components)?),
+                        None => None,
+                    });
                 }
                 Some(out)
             }
@@ -1256,12 +1259,12 @@ impl DirectionalHyperParam {
         penalty_index: usize,
         x_tau_original: Array2<f64>,
         s_tau_original: Array2<f64>,
-        x_tau_tau_original: Option<Vec<Array2<f64>>>,
-        s_tau_tau_original: Option<Vec<Array2<f64>>>,
+        x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
+        s_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
     ) -> Result<Self, EstimationError> {
         let penaltysecond_components = s_tau_tau_original.map(|rows| {
             rows.into_iter()
-                .map(|mat| vec![(penalty_index, mat)])
+                .map(|mat| mat.map(|mat| vec![(penalty_index, mat)]))
                 .collect::<Vec<_>>()
         });
         Self::new(
@@ -1283,10 +1286,12 @@ impl DirectionalHyperParam {
         self.penaltysecond_components
             .as_ref()
             .and_then(|rows| rows.get(j))
-            .map(|row| row.as_slice())
+            .and_then(|row| row.as_deref())
     }
 
-    pub(crate) fn penaltysecond_componentrows(&self) -> Option<&[Vec<PenaltyDerivativeComponent>]> {
+    pub(crate) fn penaltysecond_componentrows(
+        &self,
+    ) -> Option<&[Option<Vec<PenaltyDerivativeComponent>>]> {
         self.penaltysecond_components.as_deref()
     }
 
