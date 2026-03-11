@@ -1,5 +1,5 @@
-use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
-use faer::Side;
+use crate::faer_ndarray::FaerArrayView;
+use faer::prelude::Solve;
 use ndarray::{Array1, Array2, ArrayView1};
 
 const COLUMN_TOL: f64 = 1e-12;
@@ -41,12 +41,12 @@ fn weighted_centered_ss(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Resu
 }
 
 /// Solve the weighted least-squares projection `argmin_c || W^{1/2}(y - X c) ||^2`
-/// using eigendecomposition of `X^T W X`.
+/// using column-pivoted QR on `W^{1/2} X`.
 ///
-/// Eigenvalues below a relative tolerance are truncated, yielding the
-/// minimum-norm solution when the system is rank-deficient. This gracefully
-/// handles collinear columns (e.g. saturated I-spline columns that duplicate
-/// the intercept) without failing.
+/// Column-pivoted QR is a direct method (no iterative convergence issues)
+/// that handles rank-deficiency naturally through pivoting, gracefully
+/// dealing with collinear columns (e.g. saturated I-spline columns that
+/// duplicate the intercept) without failing.
 fn solveweighted_projection_dense(
     design: &Array2<f64>,
     target: &Array1<f64>,
@@ -56,37 +56,26 @@ fn solveweighted_projection_dense(
     if target.len() != n || weights.len() != n {
         return Err("weighted projection dimension mismatch".to_string());
     }
-    // X^T W X via faer-accelerated path.
-    let xtwx = fast_xt_diag_x(design, weights);
-    // X^T W y.
-    let mut xtwy = Array1::<f64>::zeros(p);
+    // Form W^{1/2} X and W^{1/2} y, then solve via column-pivoted QR.
+    // This is a direct method (no convergence issues) and handles
+    // rank-deficiency naturally through the pivoting.
+    let mut wx = Array2::<f64>::zeros((n, p));
+    let mut wy = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let wi = weights[i];
-        if wi == 0.0 {
-            continue;
-        }
-        for a in 0..p {
-            xtwy[a] += wi * design[[i, a]] * target[i];
+        let sw = weights[i].sqrt();
+        wy[i] = sw * target[i];
+        for j in 0..p {
+            wx[[i, j]] = sw * design[[i, j]];
         }
     }
-    // Eigendecomposition: X^T W X = V diag(lambda) V^T.
-    // Truncate small eigenvalues for rank-deficient systems.
-    let (eigenvalues, eigenvectors) = xtwx
-        .eigh(Side::Lower)
-        .map_err(|e| format!("weighted projection eigendecomposition failed: {e}"))?;
-    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = COLUMN_TOL * max_eval.max(1.0);
-    let vt_rhs = eigenvectors.t().dot(&xtwy);
-    let mut result = Array1::<f64>::zeros(p);
-    for j in 0..p {
-        if eigenvalues[j] > tol {
-            let scale = vt_rhs[j] / eigenvalues[j];
-            for i in 0..p {
-                result[i] += eigenvectors[[i, j]] * scale;
-            }
-        }
-    }
-    Ok(result)
+    let wx_faer = FaerArrayView::new(&wx);
+    let qr = wx_faer.as_ref().col_piv_qr();
+    // solve_in_place needs an n-length rhs and writes the p-length solution
+    // into the first p entries.
+    let mut rhs = wy;
+    let mut rhs_mat = crate::faer_ndarray::array1_to_col_matmut(&mut rhs);
+    qr.solve_in_place(rhs_mat.as_mut());
+    Ok(rhs.slice(ndarray::s![..p]).to_owned())
 }
 
 pub fn infer_non_intercept_start(design: &Array2<f64>, weights: &Array1<f64>) -> usize {

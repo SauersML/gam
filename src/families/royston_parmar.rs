@@ -254,7 +254,7 @@ where
     let wrappedobjective = |rho: &Array1<f64>| {
         eval_count += 1;
         let elapsed = reml_start.elapsed().as_secs_f64();
-        log::info!(
+        log::debug!(
             "[REML] eval {:>3} | rho=[{}] | {:.1}s",
             eval_count,
             rho.iter()
@@ -272,7 +272,7 @@ where
             );
         }
         let (value, grad) = objectivewithgradient(rho)?;
-        log::info!(
+        log::debug!(
             "[REML] eval {:>3} | LAML={:.6e} | |grad|={:.3e} | {:.1}s",
             eval_count,
             value,
@@ -350,7 +350,7 @@ where
     let wrappedobjective = |rho: &Array1<f64>| {
         let eval_idx = eval_count.fetch_add(1, Ordering::Relaxed) + 1;
         if eval_idx % 5 == 1 {
-            log::info!(
+            log::debug!(
                 "[REML/fd] eval {:>3} | rho=[{}] | {:.1}s",
                 eval_idx,
                 rho.iter()
