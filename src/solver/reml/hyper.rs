@@ -1948,6 +1948,7 @@ impl<'a> RemlState<'a> {
                     //                 - D(Hphi)[beta_tau].
                     //
                     // We apply both terms explicitly.
+                    let x_psi_t_dense = x_psi_t.clone();
                     if x_psi_t_dense.iter().any(|v| *v != 0.0) {
                         let kernel = tau_kernel_opt.as_ref().expect(
                             "exact directional assembly requires cached tau kernel for Hphi,tau",
