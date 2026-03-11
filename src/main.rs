@@ -14,6 +14,7 @@ use gam::basis::{
     build_bspline_basis_1d, compute_geometric_constraint_transform, create_basis,
     create_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
 };
+use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FittedLinkParameters,
@@ -63,10 +64,10 @@ use gam::smooth::{
 use gam::smoothing::{SmoothingBfgsOptions, optimize_log_smoothingwithmultistart};
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
-    CovariateBlockInput, LinkWiggleBlockInput, ResidualDistribution,
-    SurvivalLocationScalePredictInput, SurvivalLocationScaleSpec, TimeBlockInput,
-    fit_survival_location_scale, predict_survival_location_scale,
-    residual_distribution_inverse_link,
+    CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
+    SurvivalLocationScalePredictInput, SurvivalLocationScaleSpec,
+    TimeDependentCovariateBlockInput, TimeBlockInput, fit_survival_location_scale,
+    predict_survival_location_scale, residual_distribution_inverse_link,
 };
 use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
@@ -253,6 +254,22 @@ struct FitArgs {
     /// Ridge regularization for survival solver.
     #[arg(long = "ridge-lambda", default_value_t = 1e-6)]
     ridge_lambda: f64,
+    /// Number of B-spline basis functions for the time margin of the threshold
+    /// tensor product (enables time-varying threshold). When omitted, threshold
+    /// depends on covariates only.
+    #[arg(long = "threshold-time-k")]
+    threshold_time_k: Option<usize>,
+    /// B-spline degree for the time margin of the threshold tensor product.
+    #[arg(long = "threshold-time-degree", default_value_t = 3)]
+    threshold_time_degree: usize,
+    /// Number of B-spline basis functions for the time margin of the log-sigma
+    /// tensor product (enables time-varying scale). When omitted, scale depends
+    /// on covariates only.
+    #[arg(long = "sigma-time-k")]
+    sigma_time_k: Option<usize>,
+    /// B-spline degree for the time margin of the log-sigma tensor product.
+    #[arg(long = "sigma-time-degree", default_value_t = 3)]
+    sigma_time_degree: usize,
     /// Enable MM-based spatial adaptive regularization for compatible smooth terms.
     #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = true)]
     adaptive_regularization: bool,
@@ -300,6 +317,10 @@ struct SurvivalArgs {
     time_num_internal_knots: usize,
     time_smooth_lambda: f64,
     ridge_lambda: f64,
+    threshold_time_k: Option<usize>,
+    threshold_time_degree: usize,
+    sigma_time_k: Option<usize>,
+    sigma_time_degree: usize,
     out: Option<PathBuf>,
 }
 
@@ -565,6 +586,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             time_num_internal_knots: args.time_num_internal_knots,
             time_smooth_lambda: args.time_smooth_lambda,
             ridge_lambda: args.ridge_lambda,
+            threshold_time_k: args.threshold_time_k,
+            threshold_time_degree: args.threshold_time_degree,
+            sigma_time_k: args.sigma_time_k,
+            sigma_time_degree: args.sigma_time_degree,
             out: args.out.clone(),
         };
         return run_survival(surv_args);
@@ -3918,6 +3943,113 @@ fn saved_survival_timewiggle_components(
     }
 }
 
+/// Build a time-varying covariate block by tensoring the covariate design
+/// with a 1D B-spline basis on log(time).
+///
+/// The B-spline time basis is evaluated at `log(t_entry)` and `log(t_exit)`.
+/// Kronecker penalties are constructed for the covariate and time marginals
+/// following the standard tensor product penalty structure.
+fn build_time_varying_covariate_block(
+    cov_design: &Array2<f64>,
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_k: usize,
+    time_degree: usize,
+    block_name: &str,
+) -> Result<CovariateBlockKind, String> {
+    let n = cov_design.nrows();
+    let p_cov = cov_design.ncols();
+    if time_k < time_degree + 1 {
+        return Err(format!(
+            "--{block_name}-time-k must be >= degree + 1 = {}, got {time_k}",
+            time_degree + 1
+        ));
+    }
+    // Number of internal knots = k - (degree + 1).
+    let num_internal_knots = time_k - (time_degree + 1);
+
+    // Use log(time) as the B-spline variable. This is the natural scale for
+    // location-scale survival models (e.g. log-normal, log-logistic).
+    let log_entry = age_entry.mapv(|t| t.max(1e-12).ln());
+    let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
+
+    // Build the time-margin basis spec. We use the exit times to determine
+    // the knot placement since they span the full range.
+    let time_spec = BSplineBasisSpec {
+        degree: time_degree,
+        penalty_order: 2,
+        knotspec: BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(num_internal_knots),
+            placement: gam::basis::BSplineKnotPlacement::Quantile,
+        },
+        double_penalty: false,
+        identifiability: BSplineIdentifiability::None,
+    };
+
+    // Build time-margin basis on the exit times to get knots and design.
+    let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
+        .map_err(|e| format!("failed to build {block_name} time-margin B-spline basis: {e}"))?;
+    let time_design_exit = time_build.design;
+    let p_time = time_design_exit.ncols();
+
+    // Extract the knot vector so we can evaluate the basis at entry times too.
+    let knots = match &time_build.metadata {
+        BasisMetadata::BSpline1D { knots, .. } => knots.clone(),
+        _ => {
+            return Err(format!(
+                "{block_name} time-margin basis returned unexpected metadata type"
+            ));
+        }
+    };
+
+    // Evaluate at entry times using the same knot vector.
+    let time_build_entry = build_bspline_basis_1d(
+        log_entry.view(),
+        &BSplineBasisSpec {
+            degree: time_degree,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Provided(knots),
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        },
+    )
+    .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
+    let time_design_entry = time_build_entry.design;
+
+    // Tensor product Kronecker penalties:
+    //   S_cov = S_cov_marginal ⊗ I_time
+    //   S_time = I_cov ⊗ S_time_marginal
+    // The covariate marginal gets a small ridge penalty (identity) since the
+    // covariates typically have no dedicated penalty at this point.
+    let i_cov = Array2::<f64>::eye(p_cov);
+    let i_time = Array2::<f64>::eye(p_time);
+
+    // Time marginal penalty
+    let s_time = time_build
+        .penalties
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Array2::<f64>::zeros((p_time, p_time)));
+    let penalty_time = kronecker_product(&i_cov, &s_time);
+
+    // Covariate marginal penalty (ridge on covariate dimension)
+    let penalty_cov = kronecker_product(&i_cov, &i_time);
+
+    let penalties = vec![penalty_time, penalty_cov];
+
+    Ok(CovariateBlockKind::TimeVarying(
+        TimeDependentCovariateBlockInput {
+            design_covariates: DesignMatrix::Dense(cov_design.clone()),
+            time_basis_entry: time_design_entry,
+            time_basis_exit: time_design_exit,
+            penalties,
+            initial_log_lambdas: None,
+            initial_beta: None,
+            offset: Array1::zeros(n),
+        },
+    ))
+}
+
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
@@ -4129,6 +4261,56 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let lambda0 = time_build.smooth_lambda.unwrap_or(1e-2).max(1e-12).ln();
             time_initial_log_lambdas = Some(Array1::from_elem(time_penalties.len(), lambda0));
         }
+
+        // Build threshold block: time-varying if --threshold-time-k is specified,
+        // otherwise time-invariant (covariate-only).
+        let threshold_block = if let Some(tk) = effective_args.threshold_time_k {
+            eprintln!(
+                "[survival location-scale] building time-varying threshold: k={tk}, degree={}",
+                effective_args.threshold_time_degree
+            );
+            build_time_varying_covariate_block(
+                &cov_design.design,
+                &age_entry,
+                &age_exit,
+                tk,
+                effective_args.threshold_time_degree,
+                "threshold",
+            )?
+        } else {
+            CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::Dense(cov_design.design.clone()),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            })
+        };
+
+        // Build log-sigma block: time-varying if --sigma-time-k is specified.
+        let log_sigma_block = if let Some(sk) = effective_args.sigma_time_k {
+            eprintln!(
+                "[survival location-scale] building time-varying sigma: k={sk}, degree={}",
+                effective_args.sigma_time_degree
+            );
+            build_time_varying_covariate_block(
+                &cov_design.design,
+                &age_entry,
+                &age_exit,
+                sk,
+                effective_args.sigma_time_degree,
+                "sigma",
+            )?
+        } else {
+            CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::Dense(cov_design.design.clone()),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            })
+        };
+
         let buildspec = |inverse_link: InverseLink,
                          linkwiggle_block: Option<LinkWiggleBlockInput>|
          -> SurvivalLocationScaleSpec {
@@ -4154,20 +4336,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
                     initial_beta: None,
                 },
-                threshold_block: CovariateBlockInput {
-                    design: DesignMatrix::Dense(cov_design.design.clone()),
-                    offset: Array1::zeros(n),
-                    penalties: Vec::new(),
-                    initial_log_lambdas: None,
-                    initial_beta: None,
-                },
-                log_sigma_block: CovariateBlockInput {
-                    design: DesignMatrix::Dense(cov_design.design.clone()),
-                    offset: Array1::zeros(n),
-                    penalties: Vec::new(),
-                    initial_log_lambdas: None,
-                    initial_beta: None,
-                },
+                threshold_block: threshold_block.clone(),
+                log_sigma_block: log_sigma_block.clone(),
                 linkwiggle_block,
             }
         };
@@ -9742,6 +9912,10 @@ mod tests {
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
             ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
             adaptive_regularization: true,
             out: Some(model_path.clone()),
         };
@@ -9807,6 +9981,10 @@ mod tests {
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
             ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
             adaptive_regularization: false,
             out: Some(model_path.clone()),
         };
@@ -11158,6 +11336,10 @@ mod tests {
             time_num_internal_knots: 6,
             time_smooth_lambda: 1e-2,
             ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
             out: None,
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
@@ -11189,6 +11371,10 @@ mod tests {
             time_num_internal_knots: 6,
             time_smooth_lambda: 1e-2,
             ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
             out: None,
         };
         let err = parse_survival_time_basis_config(&args)
@@ -11610,6 +11796,10 @@ mod tests {
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
             ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
             out: None,
         }
     }
@@ -11736,6 +11926,10 @@ mod tests {
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
             ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
             out: None,
         };
         let link = parse_survival_inverse_link(&args).expect("loglog survival link");

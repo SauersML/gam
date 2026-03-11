@@ -47,7 +47,8 @@ pub use families::strategy::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
 };
 pub use families::survival_location_scale::{
-    CovariateBlockInput, LinkWiggleBlockInput, ResidualDistribution, ResidualDistributionOps,
+    CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
+    ResidualDistributionOps, TimeDependentCovariateBlockInput,
     SurvivalLocationScaleFitResult, SurvivalLocationScalePredictInput,
     SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
     SurvivalLocationScaleSpec, TimeBlockInput, fit_survival_location_scale,

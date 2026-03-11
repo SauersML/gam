@@ -194,6 +194,40 @@ pub struct CovariateBlockInput {
     pub initial_beta: Option<Array1<f64>>,
 }
 
+/// A covariate block whose linear predictor depends on the survival time axis
+/// via a tensor product: covariate design (n x p_cov) ⊗ B-spline on log(time).
+///
+/// At row i the linear predictor evaluated at time t is
+///
+///   eta(t) = [ x_cov(i,:) ⊗ B_time(t) ] @ beta
+///
+/// where B_time(t) is a B-spline basis row evaluated at log(t).
+/// The entry and exit tensor designs are precomputed:
+///   X_entry[i,:] = x_cov(i,:) ⊗ B_time(t_entry_i)
+///   X_exit[i,:]  = x_cov(i,:) ⊗ B_time(t_exit_i)
+#[derive(Clone)]
+pub struct TimeDependentCovariateBlockInput {
+    /// Covariate design matrix (n x p_cov), same for all time points.
+    pub design_covariates: DesignMatrix,
+    /// B-spline time basis at entry times (n x p_time).
+    pub time_basis_entry: Array2<f64>,
+    /// B-spline time basis at exit times (n x p_time).
+    pub time_basis_exit: Array2<f64>,
+    /// Combined Kronecker penalties for the tensor product.
+    pub penalties: Vec<Array2<f64>>,
+    pub initial_log_lambdas: Option<Array1<f64>>,
+    pub initial_beta: Option<Array1<f64>>,
+    pub offset: Array1<f64>,
+}
+
+/// Whether a covariate block (threshold or log-sigma) is time-invariant or
+/// depends on the survival time axis via a tensor product.
+#[derive(Clone)]
+pub enum CovariateBlockKind {
+    Static(CovariateBlockInput),
+    TimeVarying(TimeDependentCovariateBlockInput),
+}
+
 #[derive(Clone)]
 pub struct LinkWiggleBlockInput {
     pub design: DesignMatrix,
@@ -219,8 +253,8 @@ pub struct SurvivalLocationScaleSpec {
     pub max_iter: usize,
     pub tol: f64,
     pub time_block: TimeBlockInput,
-    pub threshold_block: CovariateBlockInput,
-    pub log_sigma_block: CovariateBlockInput,
+    pub threshold_block: CovariateBlockKind,
+    pub log_sigma_block: CovariateBlockKind,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
 }
 
@@ -279,8 +313,15 @@ struct SurvivalLocationScaleFamily {
     x_time_exit: Array2<f64>,
     x_time_deriv: Array2<f64>,
     offset_time_deriv: Array1<f64>,
+    /// Exit design for threshold block (always present; used as main design).
     x_threshold: DesignMatrix,
+    /// Entry design for threshold block when time-varying.
+    /// When `None`, the block is time-invariant: q0 = q1 (current behavior).
+    x_threshold_entry: Option<DesignMatrix>,
+    /// Exit design for log-sigma block (always present; used as main design).
     x_log_sigma: DesignMatrix,
+    /// Entry design for log-sigma block when time-varying.
+    x_log_sigma_entry: Option<DesignMatrix>,
     x_link_wiggle: Option<DesignMatrix>,
 }
 
@@ -289,15 +330,34 @@ struct SurvivalPredictorState {
     h0: f64,
     h1: f64,
     d_raw: f64,
-    q: f64,
+    /// q evaluated at entry time. When the threshold/sigma blocks are
+    /// time-invariant, q0 == q1.
+    q0: f64,
+    /// q evaluated at exit time.
+    q1: f64,
 }
 
 #[derive(Clone, Copy)]
 struct SurvivalRowDerivatives {
     ll: f64,
+    /// d ell / dq summed over entry+exit (= d1_q0 + d1_q1).
     d1_q: f64,
+    /// d² ell / dq² summed (= d2_q0 + d2_q1 when q0=q1; used for time-invariant blocks).
     d2_q: f64,
+    /// d³ ell / dq³ summed.
     d3_q: f64,
+    /// Entry-only derivative: d ell / dq0 = w * r(u0).
+    d1_q0: f64,
+    /// Entry-only second derivative: d² ell / dq0² = w * r'(u0).
+    d2_q0: f64,
+    /// Entry-only third derivative: d³ ell / dq0³ = w * r''(u0).
+    d3_q0: f64,
+    /// Exit-only derivative: d ell / dq1.
+    d1_q1: f64,
+    /// Exit-only second derivative: d² ell / dq1².
+    d2_q1: f64,
+    /// Exit-only third derivative: d³ ell / dq1³.
+    d3_q1: f64,
     grad_time_eta_h0: f64,
     grad_time_eta_h1: f64,
     grad_time_eta_d: f64,
@@ -313,18 +373,36 @@ struct SurvivalJointQuantities {
     d1_q: Array1<f64>,
     d2_q: Array1<f64>,
     d3_q: Array1<f64>,
+    /// Entry-only derivatives of ell w.r.t. q0.
+    d1_q0: Array1<f64>,
+    d2_q0: Array1<f64>,
+    d3_q0: Array1<f64>,
+    /// Exit-only derivatives of ell w.r.t. q1.
+    d1_q1: Array1<f64>,
+    d2_q1: Array1<f64>,
+    d3_q1: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,
     d_h_h0: Array1<f64>,
     d_h_h1: Array1<f64>,
     d_h_d: Array1<f64>,
+    /// Exit-side dq/d(eta_t) = -1/sigma_exit.
     dq_t: Array1<f64>,
+    /// Exit-side dq/d(eta_ls).
     dq_ls: Array1<f64>,
     d2q_tls: Array1<f64>,
     d2q_ls: Array1<f64>,
     d3q_tls_ls: Array1<f64>,
     d3q_ls: Array1<f64>,
+    /// Entry-side dq0/d(eta_t_entry) = -1/sigma_entry (only for time-varying).
+    dq_t_entry: Option<Array1<f64>>,
+    /// Entry-side chain-rule derivatives for sigma at entry (only for time-varying sigma).
+    dq_ls_entry: Option<Array1<f64>>,
+    d2q_tls_entry: Option<Array1<f64>>,
+    d2q_ls_entry: Option<Array1<f64>>,
+    d3q_tls_ls_entry: Option<Array1<f64>>,
+    d3q_ls_entry: Option<Array1<f64>>,
 }
 
 impl SurvivalLocationScaleFamily {
@@ -364,6 +442,12 @@ impl SurvivalLocationScaleFamily {
         offsets
     }
 
+    /// Returns `(h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw)`.
+    ///
+    /// For time-invariant blocks, `eta_t_entry == eta_t_exit` and likewise for ls.
+    /// For time-varying blocks, the block eta is 2n long: `[exit; entry]`.
+    /// The solver's ParameterBlockSpec uses the EXIT design, so exit comes first
+    /// in the stacked eta.
     #[allow(clippy::type_complexity)]
     fn validate_joint_states<'a>(
         &self,
@@ -373,8 +457,10 @@ impl SurvivalLocationScaleFamily {
             ndarray::ArrayView1<'a, f64>,
             ndarray::ArrayView1<'a, f64>,
             ndarray::ArrayView1<'a, f64>,
-            &'a Array1<f64>,
-            &'a Array1<f64>,
+            ndarray::ArrayView1<'a, f64>,
+            ndarray::ArrayView1<'a, f64>,
+            ndarray::ArrayView1<'a, f64>,
+            ndarray::ArrayView1<'a, f64>,
             Option<&'a Array1<f64>>,
         ),
         String,
@@ -388,15 +474,53 @@ impl SurvivalLocationScaleFamily {
         }
         let n = self.n;
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
-        let eta_t = &block_states[Self::BLOCK_THRESHOLD].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let eta_t_raw = &block_states[Self::BLOCK_THRESHOLD].eta;
+        let eta_ls_raw = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = self
             .x_link_wiggle
             .as_ref()
             .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
-        if eta_time.len() != 3 * n || eta_t.len() != n || eta_ls.len() != n {
-            return Err("survival location-scale eta dimension mismatch".to_string());
+        if eta_time.len() != 3 * n {
+            return Err("survival location-scale time eta dimension mismatch".to_string());
         }
+        // For time-varying blocks the stacked design is [exit_design; entry_design],
+        // giving eta of length 2n. For time-invariant blocks eta is length n.
+        let (eta_t_exit, eta_t_entry) = if self.x_threshold_entry.is_some() {
+            if eta_t_raw.len() != 2 * n {
+                return Err(format!(
+                    "time-varying threshold eta length mismatch: got {}, expected {}",
+                    eta_t_raw.len(),
+                    2 * n
+                ));
+            }
+            (eta_t_raw.slice(s![0..n]), eta_t_raw.slice(s![n..2 * n]))
+        } else {
+            if eta_t_raw.len() != n {
+                return Err(format!(
+                    "threshold eta length mismatch: got {}, expected {n}",
+                    eta_t_raw.len()
+                ));
+            }
+            (eta_t_raw.slice(s![0..n]), eta_t_raw.slice(s![0..n]))
+        };
+        let (eta_ls_exit, eta_ls_entry) = if self.x_log_sigma_entry.is_some() {
+            if eta_ls_raw.len() != 2 * n {
+                return Err(format!(
+                    "time-varying log-sigma eta length mismatch: got {}, expected {}",
+                    eta_ls_raw.len(),
+                    2 * n
+                ));
+            }
+            (eta_ls_raw.slice(s![0..n]), eta_ls_raw.slice(s![n..2 * n]))
+        } else {
+            if eta_ls_raw.len() != n {
+                return Err(format!(
+                    "log-sigma eta length mismatch: got {}, expected {n}",
+                    eta_ls_raw.len()
+                ));
+            }
+            (eta_ls_raw.slice(s![0..n]), eta_ls_raw.slice(s![0..n]))
+        };
         if let Some(w) = etaw
             && w.len() != n
         {
@@ -406,8 +530,10 @@ impl SurvivalLocationScaleFamily {
             eta_time.slice(s![0..n]),
             eta_time.slice(s![n..2 * n]),
             eta_time.slice(s![2 * n..3 * n]),
-            eta_t,
-            eta_ls,
+            eta_t_exit,
+            eta_ls_exit,
+            eta_t_entry,
+            eta_ls_entry,
             etaw,
         ))
     }
@@ -417,11 +543,25 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
-        let (h0, h1, d_raw, eta_t, eta_ls, etaw) = self.validate_joint_states(block_states)?;
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
+            self.validate_joint_states(block_states)?;
+        // For joint Hessian / D_u H we use the EXIT evaluations of sigma and its
+        // derivatives (the exit design is the solver's primary design).
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
+        let sigma_entry = if self.x_log_sigma_entry.is_some() {
+            Some(eta_ls_entry.mapv(f64::exp))
+        } else {
+            None
+        };
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
+        let mut d1_q0 = Array1::<f64>::zeros(n);
+        let mut d2_q0 = Array1::<f64>::zeros(n);
+        let mut d3_q0 = Array1::<f64>::zeros(n);
+        let mut d1_q1 = Array1::<f64>::zeros(n);
+        let mut d2_q1 = Array1::<f64>::zeros(n);
+        let mut d3_q1 = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
@@ -430,11 +570,14 @@ impl SurvivalLocationScaleFamily {
         let mut d_h_d = Array1::<f64>::zeros(n);
 
         for i in 0..n {
+            let sigma_entry_i = sigma_entry.as_ref().map_or(sigma[i], |se| se[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t[i],
+                eta_t_entry[i],
+                eta_t_exit[i],
+                sigma_entry_i,
                 sigma[i],
                 etaw.map(|w| w[i]),
             );
@@ -444,6 +587,12 @@ impl SurvivalLocationScaleFamily {
             d1_q[i] = row.d1_q;
             d2_q[i] = row.d2_q;
             d3_q[i] = row.d3_q;
+            d1_q0[i] = row.d1_q0;
+            d2_q0[i] = row.d2_q0;
+            d3_q0[i] = row.d3_q0;
+            d1_q1[i] = row.d1_q1;
+            d2_q1[i] = row.d2_q1;
+            d3_q1[i] = row.d3_q1;
             h_time_h0[i] = row.h_time_h0;
             h_time_h1[i] = row.h_time_h1;
             h_time_d[i] = row.h_time_d;
@@ -453,6 +602,11 @@ impl SurvivalLocationScaleFamily {
         }
 
         // q(eta_t, eta_ls, etaw) = -eta_t / sigma(eta_ls) + etaw.
+        //
+        // For the joint Hessian and D_u H, the partial derivatives of q
+        // w.r.t. the block parameters are evaluated at the EXIT linear predictor
+        // (the solver's primary design). The entry contribution is handled
+        // separately by the h0 branch of the time-side derivatives.
         //
         // The exact derivatives used in the joint Hessian and D_u H are:
         //
@@ -480,17 +634,59 @@ impl SurvivalLocationScaleFamily {
             let s4 = (s3 * s).max(1e-12);
             dq_t[i] = -1.0 / s;
             d2q_tls[i] = ds[i] / s2;
-            dq_ls[i] = eta_t[i] * d2q_tls[i];
+            dq_ls[i] = eta_t_exit[i] * d2q_tls[i];
             d3q_tls_ls[i] = d2s[i] / s2 - 2.0 * ds[i] * ds[i] / s3;
-            d2q_ls[i] = eta_t[i] * d3q_tls_ls[i];
-            d3q_ls[i] =
-                eta_t[i] * (d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i].powi(3) / s4);
+            d2q_ls[i] = eta_t_exit[i] * d3q_tls_ls[i];
+            d3q_ls[i] = eta_t_exit[i]
+                * (d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i].powi(3) / s4);
         }
+
+        // Entry-side chain rule derivatives for time-varying blocks.
+        let dq_t_entry = if self.x_threshold_entry.is_some() {
+            let se = sigma_entry.as_ref().unwrap();
+            Some(se.mapv(|s| -1.0 / s.max(1e-12)))
+        } else {
+            None
+        };
+        let (dq_ls_entry, d2q_tls_entry, d2q_ls_entry, d3q_tls_ls_entry, d3q_ls_entry) =
+            if self.x_log_sigma_entry.is_some() {
+                let se = sigma_entry.as_ref().unwrap();
+                let ds_e = se.clone(); // sigma' = sigma for exp link
+                let d2s_e = se.clone();
+                let d3s_e = se.clone();
+                let mut dq = Array1::<f64>::zeros(n);
+                let mut d2q_tls_e = Array1::<f64>::zeros(n);
+                let mut d2q_e = Array1::<f64>::zeros(n);
+                let mut d3q_tls_e = Array1::<f64>::zeros(n);
+                let mut d3q_e = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let s = se[i].max(1e-12);
+                    let s2 = (s * s).max(1e-12);
+                    let s3 = (s2 * s).max(1e-12);
+                    let s4 = (s3 * s).max(1e-12);
+                    d2q_tls_e[i] = ds_e[i] / s2;
+                    dq[i] = eta_t_entry[i] * d2q_tls_e[i];
+                    d3q_tls_e[i] = d2s_e[i] / s2 - 2.0 * ds_e[i] * ds_e[i] / s3;
+                    d2q_e[i] = eta_t_entry[i] * d3q_tls_e[i];
+                    d3q_e[i] = eta_t_entry[i]
+                        * (d3s_e[i] / s2 - 6.0 * ds_e[i] * d2s_e[i] / s3
+                            + 6.0 * ds_e[i].powi(3) / s4);
+                }
+                (Some(dq), Some(d2q_tls_e), Some(d2q_e), Some(d3q_tls_e), Some(d3q_e))
+            } else {
+                (None, None, None, None, None)
+            };
 
         Ok(SurvivalJointQuantities {
             d1_q,
             d2_q,
             d3_q,
+            d1_q0,
+            d2_q0,
+            d3_q0,
+            d1_q1,
+            d2_q1,
+            d3_q1,
             h_time_h0,
             h_time_h1,
             h_time_d,
@@ -503,6 +699,12 @@ impl SurvivalLocationScaleFamily {
             d2q_ls,
             d3q_tls_ls,
             d3q_ls,
+            dq_t_entry,
+            dq_ls_entry,
+            d2q_tls_entry,
+            d2q_ls_entry,
+            d3q_tls_ls_entry,
+            d3q_ls_entry,
         })
     }
 
@@ -622,21 +824,29 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
+    /// Build the row predictor state with possibly distinct entry/exit
+    /// evaluations of threshold and sigma.
+    ///
+    /// For time-invariant blocks, the caller passes the same value for both
+    /// entry and exit.
     fn row_predictor_state(
         &self,
         h0: f64,
         h1: f64,
         d_raw: f64,
-        eta_t: f64,
-        sigma: f64,
+        eta_t_entry: f64,
+        eta_t_exit: f64,
+        sigma_entry: f64,
+        sigma_exit: f64,
         etaw: Option<f64>,
     ) -> SurvivalPredictorState {
-        let base = -eta_t / sigma.max(1e-12);
+        let w = etaw.unwrap_or(0.0);
         SurvivalPredictorState {
             h0,
             h1,
             d_raw,
-            q: base + etaw.unwrap_or(0.0),
+            q0: -eta_t_entry / sigma_entry.max(1e-12) + w,
+            q1: -eta_t_exit / sigma_exit.max(1e-12) + w,
         }
     }
 
@@ -650,8 +860,8 @@ impl SurvivalLocationScaleFamily {
             return Ok(None);
         }
         let d = self.y[row].clamp(0.0, 1.0);
-        let u0 = -state.h0 + state.q;
-        let u1 = -state.h1 + state.q;
+        let u0 = -state.h0 + state.q0;
+        let u1 = -state.h1 + state.q1;
         let j0 = inverse_link_jet_for_inverse_link(&self.inverse_link, u0)
             .map_err(|e| format!("inverse link evaluation failed at row {row} entry: {e}"))?;
         let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
@@ -714,40 +924,53 @@ impl SurvivalLocationScaleFamily {
         // With
         //
         //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ],
-        //   u0 = q - h0,
-        //   u1 = q - h1,
+        //   u0 = q0 - h0,
+        //   u1 = q1 - h1,
         //
-        // the rowwise derivatives from the audit are
+        // the entry-only derivatives (w.r.t. q0):
         //
-        //   ell_q   = w [ r(u0) + d d/du log f(u1) - (1-d) r(u1) ]
-        //   ell_qq  = w [ r'(u0) + d d²/du² log f(u1) - (1-d) r'(u1) ]
-        //   ell_qqq = w [ r''(u0) + d d³/du³ log f(u1) - (1-d) r''(u1) ]
+        //   ell_q0   = w r(u0)
+        //   ell_q0q0 = w r'(u0)
+        //   ell_q0q0q0 = w r''(u0)
         //
-        // where r(u) = f(u) / S(u) = d/du[-log S(u)].
+        // and exit-only derivatives (w.r.t. q1):
         //
-        // The time-side partials follow from u0 = q - h0 and u1 = q - h1:
+        //   ell_q1   = w [ d d/du log f(u1) + (1-d) (-r(u1)) ]
+        //   ell_q1q1 = w [ d d²/du² log f(u1) + (1-d) (-r'(u1)) ]
+        //   ell_q1q1q1 = w [ d d³/du³ log f(u1) + (1-d) (-r''(u1)) ]
         //
-        //   ell_h0   = -w r(u0)
-        //   ell_h1   = -w [ d d/du log f(u1) - (1-d) r(u1) ]
-        //   ell_h0q  = -w r'(u0)
-        //   ell_h1q  = -w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
+        // When q0 = q1 = q (time-invariant blocks), ell_q = ell_q0 + ell_q1.
         //
-        // so the exact identities
+        // Cross-Hessian d²ell/(dq0 dq1) = 0 because u0 depends only on q0
+        // and u1 depends only on q1.
         //
-        //   ell_q  = -ell_h0 - ell_h1
-        //   ell_qq = -ell_h0q - ell_h1q
+        // The time-side partials follow from u0 = q0 - h0 and u1 = q1 - h1:
         //
-        // should hold rowwise for every inverse link. The permanent tests below
-        // lock those identities in directly.
-        let d1_q = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
-        let d2_q = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
-        let d3_q = w * (ddr0 + d * d3logphi1 + (1.0 - d) * (-ddr1));
+        //   ell_h0   = -ell_q0 = -w r(u0)
+        //   ell_h1   = -ell_q1
+        //   ell_h0q0 = -w r'(u0)
+        //   ell_h1q1 = -w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
+        let d1_q0 = w * r0;
+        let d2_q0 = w * dr0;
+        let d3_q0 = w * ddr0;
+        let d1_q1 = w * (d * dlogphi1 + (1.0 - d) * (-r1));
+        let d2_q1 = w * (d * d2logphi1 + (1.0 - d) * (-dr1));
+        let d3_q1 = w * (d * d3logphi1 + (1.0 - d) * (-ddr1));
+        let d1_q = d1_q0 + d1_q1;
+        let d2_q = d2_q0 + d2_q1;
+        let d3_q = d3_q0 + d3_q1;
 
         Ok(Some(SurvivalRowDerivatives {
             ll: w * (d * (logphi1 + log_g_safe) + (1.0 - d) * s1.ln() - s0.ln()),
             d1_q,
             d2_q,
             d3_q,
+            d1_q0,
+            d2_q0,
+            d3_q0,
+            d1_q1,
+            d2_q1,
+            d3_q1,
             grad_time_eta_h0: -w * r0,
             grad_time_eta_h1: -w * (d * dlogphi1 + (1.0 - d) * (-r1)),
             grad_time_eta_d: w * d * d_log_g,
@@ -759,6 +982,35 @@ impl SurvivalLocationScaleFamily {
             d_h_d: -w * d * d3_log_g,
         }))
     }
+}
+
+/// Compute the chain-rule derivatives dq/d(eta_ls), d²q/d(eta_ls)², d³q/d(eta_ls)³
+/// for q = -eta_t / sigma(eta_ls), where sigma = exp(eta_ls).
+///
+/// Returns (dq, d2q, d3q) as length-n arrays.
+fn sigma_log_chain_derivs(
+    eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
+    sigma: &Array1<f64>,
+    ds: &Array1<f64>,
+    d2s: &Array1<f64>,
+    d3s: &Array1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let n = eta_t.len();
+    let mut dq = Array1::<f64>::zeros(n);
+    let mut d2q = Array1::<f64>::zeros(n);
+    let mut d3q = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = eta_t[i];
+        let s = sigma[i].max(1e-12);
+        let s2 = (s * s).max(1e-12);
+        let s3 = (s2 * s).max(1e-12);
+        let s4 = (s3 * s).max(1e-12);
+        dq[i] = t * ds[i] / s2;
+        d2q[i] = t * (d2s[i] / s2 - 2.0 * ds[i] * ds[i] / s3);
+        d3q[i] = t * (d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3
+            + 6.0 * ds[i].powi(3) / s4);
+    }
+    (dq, d2q, d3q)
 }
 
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {
@@ -799,6 +1051,227 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
         }
     }
     Ok(())
+}
+
+fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Result<(), String> {
+    match bk {
+        CovariateBlockKind::Static(b) => validate_cov_block(name, n, b),
+        CovariateBlockKind::TimeVarying(tv) => {
+            if tv.design_covariates.nrows() != n {
+                return Err(format!(
+                    "{name} time-varying covariate design row mismatch: got {}, expected {n}",
+                    tv.design_covariates.nrows()
+                ));
+            }
+            if tv.time_basis_entry.nrows() != n || tv.time_basis_exit.nrows() != n {
+                return Err(format!(
+                    "{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
+                    tv.time_basis_entry.nrows(),
+                    tv.time_basis_exit.nrows()
+                ));
+            }
+            if tv.offset.len() != n {
+                return Err(format!(
+                    "{name} time-varying offset length mismatch: got {}, expected {n}",
+                    tv.offset.len()
+                ));
+            }
+            let p_cov = tv.design_covariates.ncols();
+            let p_time = tv.time_basis_exit.ncols();
+            if tv.time_basis_entry.ncols() != p_time {
+                return Err(format!(
+                    "{name} time-varying time basis column mismatch: entry={}, exit={}",
+                    tv.time_basis_entry.ncols(),
+                    p_time
+                ));
+            }
+            let p_tensor = p_cov * p_time;
+            let k = tv.penalties.len();
+            if let Some(beta0) = &tv.initial_beta
+                && beta0.len() != p_tensor
+            {
+                return Err(format!(
+                    "{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
+                    beta0.len()
+                ));
+            }
+            if let Some(rho0) = &tv.initial_log_lambdas
+                && rho0.len() != k
+            {
+                return Err(format!(
+                    "{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
+                    rho0.len()
+                ));
+            }
+            for (idx, s) in tv.penalties.iter().enumerate() {
+                let (r, c) = s.dim();
+                if r != p_tensor || c != p_tensor {
+                    return Err(format!(
+                        "{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Build row-wise Kronecker product: each row of the result is
+/// kron(cov_row[i,:], time_row[i,:]).
+fn rowwise_kronecker(
+    cov_design: &DesignMatrix,
+    time_basis: &Array2<f64>,
+) -> DesignMatrix {
+    let n = cov_design.nrows();
+    let p_cov = cov_design.ncols();
+    let p_time = time_basis.ncols();
+    let p_tensor = p_cov * p_time;
+
+    // For B-spline time basis with degree d, each row has d+1 nonzeros.
+    // If covariate design is dense: density = (d+1)/p_time ≈ 4/12 ≈ 33% → sparse.
+    // If covariate design is also sparse: even sparser.
+    // Use sparse when estimated density < 50%.
+    let cov_is_sparse = matches!(cov_design, DesignMatrix::Sparse(_));
+    let max_time_nnz_per_row = p_time.min(8); // B-spline degree 3 → 4 nonzero
+    let estimated_nnz_per_row = if cov_is_sparse {
+        // Conservative estimate
+        p_cov.min(p_cov) * max_time_nnz_per_row
+    } else {
+        p_cov * max_time_nnz_per_row
+    };
+    let use_sparse = estimated_nnz_per_row * 2 < p_tensor;
+
+    if use_sparse {
+        let mut triplets = Vec::with_capacity(n * estimated_nnz_per_row);
+        match cov_design {
+            DesignMatrix::Dense(x_cov) => {
+                for i in 0..n {
+                    for jc in 0..p_cov {
+                        let cv = x_cov[[i, jc]];
+                        if cv == 0.0 {
+                            continue;
+                        }
+                        for jt in 0..p_time {
+                            let tv = time_basis[[i, jt]];
+                            if tv == 0.0 {
+                                continue;
+                            }
+                            triplets.push(faer::sparse::Triplet::new(
+                                i,
+                                jc * p_time + jt,
+                                cv * tv,
+                            ));
+                        }
+                    }
+                }
+            }
+            DesignMatrix::Sparse(xs) => {
+                let csr = xs.to_csr_arc().expect("CSR view for rowwise kronecker");
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..n {
+                    for ptr in row_ptr[i]..row_ptr[i + 1] {
+                        let jc = col_idx[ptr];
+                        let cv = vals[ptr];
+                        if cv == 0.0 {
+                            continue;
+                        }
+                        for jt in 0..p_time {
+                            let tv = time_basis[[i, jt]];
+                            if tv == 0.0 {
+                                continue;
+                            }
+                            triplets.push(faer::sparse::Triplet::new(
+                                i,
+                                jc * p_time + jt,
+                                cv * tv,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        DesignMatrix::from(
+            faer::sparse::SparseColMat::try_new_from_triplets(n, p_tensor, &triplets)
+                .expect("build sparse tensor product design"),
+        )
+    } else {
+        let mut out = Array2::<f64>::zeros((n, p_tensor));
+        match cov_design {
+            DesignMatrix::Dense(x_cov) => {
+                for i in 0..n {
+                    for jc in 0..p_cov {
+                        let cv = x_cov[[i, jc]];
+                        if cv == 0.0 {
+                            continue;
+                        }
+                        for jt in 0..p_time {
+                            out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
+                        }
+                    }
+                }
+            }
+            DesignMatrix::Sparse(xs) => {
+                let csr = xs.to_csr_arc().expect("CSR view for rowwise kronecker");
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..n {
+                    for ptr in row_ptr[i]..row_ptr[i + 1] {
+                        let jc = col_idx[ptr];
+                        let cv = vals[ptr];
+                        for jt in 0..p_time {
+                            out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
+                        }
+                    }
+                }
+            }
+        }
+        DesignMatrix::Dense(out)
+    }
+}
+
+/// Prepared covariate block data for the family struct.
+struct PreparedCovBlock {
+    /// Exit design (used as the solver's primary).
+    design_exit: DesignMatrix,
+    /// Entry design, only for time-varying blocks.
+    design_entry: Option<DesignMatrix>,
+    /// Offset (same for both entry/exit since it comes from other terms).
+    offset: Array1<f64>,
+    penalties: Vec<Array2<f64>>,
+    initial_log_lambdas: Option<Array1<f64>>,
+    initial_beta: Option<Array1<f64>>,
+}
+
+fn prepare_cov_block_kind(
+    bk: &CovariateBlockKind,
+) -> Result<PreparedCovBlock, String> {
+    match bk {
+        CovariateBlockKind::Static(b) => Ok(PreparedCovBlock {
+            design_exit: b.design.clone(),
+            design_entry: None,
+            offset: b.offset.clone(),
+            penalties: b.penalties.clone(),
+            initial_log_lambdas: b.initial_log_lambdas.clone(),
+            initial_beta: b.initial_beta.clone(),
+        }),
+        CovariateBlockKind::TimeVarying(tv) => {
+            let design_exit = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_exit);
+            let design_entry = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_entry);
+            Ok(PreparedCovBlock {
+                design_exit,
+                design_entry: Some(design_entry),
+                offset: tv.offset.clone(),
+                penalties: tv.penalties.clone(),
+                initial_log_lambdas: tv.initial_log_lambdas.clone(),
+                initial_beta: tv.initial_beta.clone(),
+            })
+        }
+    }
 }
 
 fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String> {
@@ -1360,8 +1833,14 @@ fn lift_conditional_covariance(
 impl CustomFamily for SurvivalLocationScaleFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let n = self.n;
-        let (h0, h1, d_raw, eta_t, eta_ls, etaw) = self.validate_joint_states(block_states)?;
-        let (sigma, ds, d2s, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
+            self.validate_joint_states(block_states)?;
+        let (sigma_exit, ds_exit, d2s_exit, _) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
+        let sigma_entry = if self.x_log_sigma_entry.is_some() {
+            Some(eta_ls_entry.mapv(f64::exp))
+        } else {
+            None
+        };
         let mut ll = 0.0;
 
         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
@@ -1373,14 +1852,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
+        let mut d1_q0 = Array1::<f64>::zeros(n);
+        let mut d2_q0 = Array1::<f64>::zeros(n);
+        let mut d1_q1 = Array1::<f64>::zeros(n);
+        let mut d2_q1 = Array1::<f64>::zeros(n);
 
         for i in 0..n {
+            let sigma_entry_i = sigma_entry.as_ref().map_or(sigma_exit[i], |se| se[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t[i],
-                sigma[i],
+                eta_t_entry[i],
+                eta_t_exit[i],
+                sigma_entry_i,
+                sigma_exit[i],
                 etaw.map(|w| w[i]),
             );
             let Some(row) = self.row_derivatives(i, state)? else {
@@ -1389,6 +1875,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             ll += row.ll;
             d1_q[i] = row.d1_q;
             d2_q[i] = row.d2_q;
+            d1_q0[i] = row.d1_q0;
+            d2_q0[i] = row.d2_q0;
+            d1_q1[i] = row.d1_q1;
+            d2_q1[i] = row.d2_q1;
             grad_time_eta_h0[i] = row.grad_time_eta_h0;
             grad_time_eta_h1[i] = row.grad_time_eta_h1;
             grad_time_eta_d[i] = row.grad_time_eta_d;
@@ -1405,35 +1895,123 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             + fast_xt_diag_x(&self.x_time_exit, &h_time_h1)
             + fast_xt_diag_x(&self.x_time_deriv, &h_time_d);
 
-        // Block 1: threshold eta_t enters q linearly with dq/deta_t = -1/sigma.
-        let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
-        let grad_eta_t = &d1_q * &dq_t;
-        let h_eta_t = -(&d2_q * &dq_t.mapv(|v| v * v));
-        let grad_t = self.x_threshold.transpose_vector_multiply(&grad_eta_t);
-        let hess_t = xt_diag_x_symmetric(&self.x_threshold, &h_eta_t)?;
+        // Block 1: threshold.
+        //
+        // For time-invariant blocks: dq/deta_t = -1/sigma (exit sigma).
+        // For time-varying blocks: the entry and exit designs contribute
+        // separately. The exit design is the primary (solver) design, and the
+        // entry design provides additional gradient/Hessian contributions.
+        let (grad_t, hess_t) = if let Some(x_t_entry) = self.x_threshold_entry.as_ref() {
+            // Time-varying threshold: grad = X_exit' w_exit + X_entry' w_entry
+            // where w_exit = d ell/dq1 * dq1/deta_t_exit, w_entry = d ell/dq0 * dq0/deta_t_entry
+            let dq_t_exit = sigma_exit.mapv(|s| -1.0 / s.max(1e-12));
+            let dq_t_entry = sigma_entry
+                .as_ref()
+                .map(|se| se.mapv(|s| -1.0 / s.max(1e-12)))
+                .unwrap_or_else(|| dq_t_exit.clone());
+            let grad_eta_t_exit = &d1_q1 * &dq_t_exit;
+            let grad_eta_t_entry = &d1_q0 * &dq_t_entry;
+            let h_eta_t_exit = -(&d2_q1 * &dq_t_exit.mapv(|v| v * v));
+            let h_eta_t_entry = -(&d2_q0 * &dq_t_entry.mapv(|v| v * v));
+            let grad = self.x_threshold.transpose_vector_multiply(&grad_eta_t_exit)
+                + x_t_entry.transpose_vector_multiply(&grad_eta_t_entry);
+            let hess_exit = xt_diag_x_symmetric(&self.x_threshold, &h_eta_t_exit)?;
+            let hess_entry = xt_diag_x_symmetric(x_t_entry, &h_eta_t_entry)?;
+            let hess = hess_exit.add(&hess_entry)?;
+            (grad, hess)
+        } else {
+            let dq_t = sigma_exit.mapv(|s| -1.0 / s.max(1e-12));
+            let grad_eta_t = &d1_q * &dq_t;
+            let h_eta_t = -(&d2_q * &dq_t.mapv(|v| v * v));
+            let grad = self.x_threshold.transpose_vector_multiply(&grad_eta_t);
+            let hess = xt_diag_x_symmetric(&self.x_threshold, &h_eta_t)?;
+            (grad, hess)
+        };
 
-        // Block 2: eta_ls enters q via bounded sigma map.
-        let dq_ls = Array1::from_iter(
-            eta_t
-                .iter()
-                .zip(sigma.iter())
-                .zip(ds.iter())
-                .map(|((&t, &s), &d1)| t * d1 / (s * s).max(1e-12)),
-        );
-        let d2q_ls = Array1::from_iter(
-            eta_t
-                .iter()
-                .zip(sigma.iter())
-                .zip(ds.iter())
-                .zip(d2s.iter())
-                .map(|(((&t, &s), &d1), &d2)| {
-                    t * (d2 / (s * s).max(1e-12) - 2.0 * d1 * d1 / (s * s * s).max(1e-12))
-                }),
-        );
-        let grad_eta_ls = &d1_q * &dq_ls;
-        let h_eta_ls = -(&d2_q * &dq_ls.mapv(|v| v * v) + &(&d1_q * &d2q_ls));
-        let grad_ls = self.x_log_sigma.transpose_vector_multiply(&grad_eta_ls);
-        let hess_ls = xt_diag_x_symmetric(&self.x_log_sigma, &h_eta_ls)?;
+        // Block 2: log-sigma.
+        let (grad_ls, hess_ls) = if let Some(x_ls_entry) = self.x_log_sigma_entry.as_ref() {
+            // Time-varying sigma: entry and exit contribute separately.
+            // Exit side: q1 = -eta_t_exit / sigma_exit, so
+            //   dq1/deta_ls_exit = eta_t_exit * sigma'_exit / sigma_exit^2
+            let sigma_e = sigma_entry.as_ref().unwrap();
+            let ds_entry = eta_ls_entry.mapv(f64::exp);
+            let d2s_entry = ds_entry.clone();
+            let dq_ls_exit = Array1::from_iter(
+                eta_t_exit
+                    .iter()
+                    .zip(sigma_exit.iter())
+                    .zip(ds_exit.iter())
+                    .map(|((&t, &s), &d1)| t * d1 / (s * s).max(1e-12)),
+            );
+            let d2q_ls_exit = Array1::from_iter(
+                eta_t_exit
+                    .iter()
+                    .zip(sigma_exit.iter())
+                    .zip(ds_exit.iter())
+                    .zip(d2s_exit.iter())
+                    .map(|(((&t, &s), &d1), &d2)| {
+                        t * (d2 / (s * s).max(1e-12)
+                            - 2.0 * d1 * d1 / (s * s * s).max(1e-12))
+                    }),
+            );
+            // Entry side: q0 = -eta_t_entry / sigma_entry
+            let dq_ls_entry = Array1::from_iter(
+                eta_t_entry
+                    .iter()
+                    .zip(sigma_e.iter())
+                    .zip(ds_entry.iter())
+                    .map(|((&t, &s), &d1)| t * d1 / (s * s).max(1e-12)),
+            );
+            let d2q_ls_entry = Array1::from_iter(
+                eta_t_entry
+                    .iter()
+                    .zip(sigma_e.iter())
+                    .zip(ds_entry.iter())
+                    .zip(d2s_entry.iter())
+                    .map(|(((&t, &s), &d1), &d2)| {
+                        t * (d2 / (s * s).max(1e-12)
+                            - 2.0 * d1 * d1 / (s * s * s).max(1e-12))
+                    }),
+            );
+            let grad_eta_ls_exit = &d1_q1 * &dq_ls_exit;
+            let h_eta_ls_exit = -(
+                &d2_q1 * &dq_ls_exit.mapv(|v| v * v) + &(&d1_q1 * &d2q_ls_exit)
+            );
+            let grad_eta_ls_entry = &d1_q0 * &dq_ls_entry;
+            let h_eta_ls_entry = -(
+                &d2_q0 * &dq_ls_entry.mapv(|v| v * v) + &(&d1_q0 * &d2q_ls_entry)
+            );
+            let grad = self.x_log_sigma.transpose_vector_multiply(&grad_eta_ls_exit)
+                + x_ls_entry.transpose_vector_multiply(&grad_eta_ls_entry);
+            let hess_exit = xt_diag_x_symmetric(&self.x_log_sigma, &h_eta_ls_exit)?;
+            let hess_entry = xt_diag_x_symmetric(x_ls_entry, &h_eta_ls_entry)?;
+            let hess = hess_exit.add(&hess_entry)?;
+            (grad, hess)
+        } else {
+            let dq_ls = Array1::from_iter(
+                eta_t_exit
+                    .iter()
+                    .zip(sigma_exit.iter())
+                    .zip(ds_exit.iter())
+                    .map(|((&t, &s), &d1)| t * d1 / (s * s).max(1e-12)),
+            );
+            let d2q_ls = Array1::from_iter(
+                eta_t_exit
+                    .iter()
+                    .zip(sigma_exit.iter())
+                    .zip(ds_exit.iter())
+                    .zip(d2s_exit.iter())
+                    .map(|(((&t, &s), &d1), &d2)| {
+                        t * (d2 / (s * s).max(1e-12)
+                            - 2.0 * d1 * d1 / (s * s * s).max(1e-12))
+                    }),
+            );
+            let grad_eta_ls = &d1_q * &dq_ls;
+            let h_eta_ls = -(&d2_q * &dq_ls.mapv(|v| v * v) + &(&d1_q * &d2q_ls));
+            let grad = self.x_log_sigma.transpose_vector_multiply(&grad_eta_ls);
+            let hess = xt_diag_x_symmetric(&self.x_log_sigma, &h_eta_ls)?;
+            (grad, hess)
+        };
 
         let mut blockworking_sets = vec![
             BlockWorkingSet::ExactNewton {
@@ -1471,21 +2049,36 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let n = self.n;
-        let (h0, h1, d_raw, eta_t, eta_ls, etaw) = self.validate_joint_states(block_states)?;
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
+            self.validate_joint_states(block_states)?;
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
+        let sigma_entry_vec = if self.x_log_sigma_entry.is_some() {
+            Some(eta_ls_entry.mapv(f64::exp))
+        } else {
+            None
+        };
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
+        let mut d1_q0 = Array1::<f64>::zeros(n);
+        let mut d2_q0 = Array1::<f64>::zeros(n);
+        let mut d3_q0 = Array1::<f64>::zeros(n);
+        let mut d1_q1 = Array1::<f64>::zeros(n);
+        let mut d2_q1 = Array1::<f64>::zeros(n);
+        let mut d3_q1 = Array1::<f64>::zeros(n);
         let mut d_h_h0 = Array1::<f64>::zeros(n);
         let mut d_h_h1 = Array1::<f64>::zeros(n);
         let mut d_h_d = Array1::<f64>::zeros(n);
 
         for i in 0..n {
+            let sigma_entry_i = sigma_entry_vec.as_ref().map_or(sigma[i], |se| se[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t[i],
+                eta_t_entry[i],
+                eta_t_exit[i],
+                sigma_entry_i,
                 sigma[i],
                 etaw.map(|w| w[i]),
             );
@@ -1495,6 +2088,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             d1_q[i] = row.d1_q;
             d2_q[i] = row.d2_q;
             d3_q[i] = row.d3_q;
+            d1_q0[i] = row.d1_q0;
+            d2_q0[i] = row.d2_q0;
+            d3_q0[i] = row.d3_q0;
+            d1_q1[i] = row.d1_q1;
+            d2_q1[i] = row.d2_q1;
+            d3_q1[i] = row.d3_q1;
             d_h_h0[i] = row.d_h_h0;
             d_h_h1[i] = row.d_h_h1;
             d_h_d[i] = row.d_h_d;
@@ -1528,13 +2127,29 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                         self.x_threshold.ncols()
                     ));
                 }
-                let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
-                let d_eta_t = self.x_threshold.matrixvectormultiply(d_beta);
-                // Since q(eta_t) is linear in eta_t, only dq_t is nonzero:
-                // H = -d²ℓ/deta², so dH[u] picks up the leading minus too.
-                let d_h_eta = -(&d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t);
-                let d_h = xt_diag_x_symmetric(&self.x_threshold, &d_h_eta)?;
-                Ok(Some(d_h.to_dense()))
+                if let Some(x_t_entry) = self.x_threshold_entry.as_ref() {
+                    // Time-varying threshold: D_u H = X_exit' diag(dh_exit) X_exit
+                    //                                + X_entry' diag(dh_entry) X_entry
+                    // where dh_exit = -d3_q1 * (dq_t_exit)^3 * d_eta_exit
+                    //       dh_entry = -d3_q0 * (dq_t_entry)^3 * d_eta_entry
+                    let sigma_e = sigma_entry_vec.as_ref().unwrap();
+                    let dq_t_exit = sigma.mapv(|s| -1.0 / s.max(1e-12));
+                    let dq_t_entry = sigma_e.mapv(|s| -1.0 / s.max(1e-12));
+                    let d_eta_exit = self.x_threshold.matrixvectormultiply(d_beta);
+                    let d_eta_entry = x_t_entry.matrixvectormultiply(d_beta);
+                    let dh_exit = -(&d3_q1 * &dq_t_exit.mapv(|v| v * v * v) * &d_eta_exit);
+                    let dh_entry = -(&d3_q0 * &dq_t_entry.mapv(|v| v * v * v) * &d_eta_entry);
+                    let d_h_exit = xt_diag_x_symmetric(&self.x_threshold, &dh_exit)?;
+                    let d_h_entry = xt_diag_x_symmetric(x_t_entry, &dh_entry)?;
+                    Ok(Some(d_h_exit.add(&d_h_entry)?.to_dense()))
+                } else {
+                    // Time-invariant threshold: use combined d3_q and exit sigma.
+                    let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
+                    let d_eta_t = self.x_threshold.matrixvectormultiply(d_beta);
+                    let d_h_eta = -(&d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t);
+                    let d_h = xt_diag_x_symmetric(&self.x_threshold, &d_h_eta)?;
+                    Ok(Some(d_h.to_dense()))
+                }
             }
             Self::BLOCK_LOG_SIGMA => {
                 if d_beta.len() != self.x_log_sigma.ncols() {
@@ -1544,45 +2159,53 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                         self.x_log_sigma.ncols()
                     ));
                 }
-                let dq = Array1::from_iter(
-                    eta_t
-                        .iter()
-                        .zip(sigma.iter())
-                        .zip(ds.iter())
-                        .map(|((&t, &s), &d1)| t * d1 / (s * s).max(1e-12)),
-                );
-                let d2q = Array1::from_iter(
-                    eta_t
-                        .iter()
-                        .zip(sigma.iter())
-                        .zip(ds.iter())
-                        .zip(d2s.iter())
-                        .map(|(((&t, &s), &d1), &d2)| {
-                            t * (d2 / (s * s).max(1e-12) - 2.0 * d1 * d1 / (s * s * s).max(1e-12))
-                        }),
-                );
-                let d3q = Array1::from_iter(
-                    eta_t
-                        .iter()
-                        .zip(sigma.iter())
-                        .zip(ds.iter())
-                        .zip(d2s.iter())
-                        .zip(d3s.iter())
-                        .map(|((((&t, &s), &d1), &d2), &d3)| {
-                            t * (d3 / (s * s).max(1e-12) - 6.0 * d1 * d2 / (s * s * s).max(1e-12)
-                                + 6.0 * d1 * d1 * d1 / (s * s * s * s).max(1e-12))
-                        }),
-                );
-                let d_eta_ls = self.x_log_sigma.matrixvectormultiply(d_beta);
-                // Full third-order chain rule for H = -d²ℓ/deta²:
-                // dH/deta = -[ d³ℓ/dq³ (dq)^3 + 3 d²ℓ/dq² dq d²q + dℓ/dq d³q ].
-                let d_h_eta = (&d3_q * &dq.mapv(|v| v * v * v)
-                    + &(&d2_q * &(3.0 * &dq * &d2q))
-                    + &(&d1_q * &d3q))
-                    * &d_eta_ls;
-                let d_h_eta = -d_h_eta;
-                let d_h = xt_diag_x_symmetric(&self.x_log_sigma, &d_h_eta)?;
-                Ok(Some(d_h.to_dense()))
+                if let Some(x_ls_entry) = self.x_log_sigma_entry.as_ref() {
+                    // Time-varying log-sigma: split exit/entry contributions.
+                    let sigma_e = sigma_entry_vec.as_ref().unwrap();
+                    let ds_entry = sigma_e.clone(); // exp(eta) derivative = exp(eta)
+                    let d2s_entry = sigma_e.clone();
+                    let d3s_entry = sigma_e.clone();
+                    // Exit side chain rule derivatives of q w.r.t. eta_ls
+                    let (dq_exit, d2q_exit, d3q_exit) = sigma_log_chain_derivs(
+                        &eta_t_exit, &sigma, &ds, &d2s, &d3s,
+                    );
+                    // Entry side chain rule derivatives of q w.r.t. eta_ls
+                    let (dq_entry, d2q_entry, d3q_entry) = sigma_log_chain_derivs(
+                        &eta_t_entry.to_owned(), &sigma_e, &ds_entry, &d2s_entry, &d3s_entry,
+                    );
+                    let d_eta_exit = self.x_log_sigma.matrixvectormultiply(d_beta);
+                    let d_eta_entry = x_ls_entry.matrixvectormultiply(d_beta);
+                    // D_u H for exit contribution
+                    let dh_exit = -(
+                        &d3_q1 * &dq_exit.mapv(|v| v * v * v)
+                        + &(&d2_q1 * &(3.0 * &dq_exit * &d2q_exit))
+                        + &(&d1_q1 * &d3q_exit)
+                    ) * &d_eta_exit;
+                    // D_u H for entry contribution
+                    let dh_entry = -(
+                        &d3_q0 * &dq_entry.mapv(|v| v * v * v)
+                        + &(&d2_q0 * &(3.0 * &dq_entry * &d2q_entry))
+                        + &(&d1_q0 * &d3q_entry)
+                    ) * &d_eta_entry;
+                    let d_h_exit = xt_diag_x_symmetric(&self.x_log_sigma, &dh_exit)?;
+                    let d_h_entry = xt_diag_x_symmetric(x_ls_entry, &dh_entry)?;
+                    Ok(Some(d_h_exit.add(&d_h_entry)?.to_dense()))
+                } else {
+                    // Time-invariant log-sigma: use combined derivatives.
+                    let (dq, d2q, d3q) = sigma_log_chain_derivs(
+                        &eta_t_exit, &sigma, &ds, &d2s, &d3s,
+                    );
+                    let d_eta_ls = self.x_log_sigma.matrixvectormultiply(d_beta);
+                    // Full third-order chain rule for H = -d²ℓ/deta²:
+                    // dH/deta = -[ d³ℓ/dq³ (dq)^3 + 3 d²ℓ/dq² dq d²q + dℓ/dq d³q ].
+                    let d_h_eta = -(
+                        &d3_q * &dq.mapv(|v| v * v * v)
+                        + &(&d2_q * &(3.0 * &dq * &d2q))
+                        + &(&d1_q * &d3q)
+                    ) * &d_eta_ls;
+                    let d_h = xt_diag_x_symmetric(&self.x_log_sigma, &d_h_eta)?;
+                    Ok(Some(d_h.to_dense()))
+                }
             }
             Self::BLOCK_LINK_WIGGLE => {
                 let xw = self.x_link_wiggle.as_ref().ok_or_else(|| {
@@ -1614,8 +2237,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let p_total = *offsets
             .last()
             .ok_or_else(|| "missing joint block offsets".to_string())?;
-        let x_threshold = self.x_threshold.to_dense();
-        let x_log_sigma = self.x_log_sigma.to_dense();
+        let x_threshold_exit = self.x_threshold.to_dense();
+        let x_threshold_entry = self.x_threshold_entry.as_ref().map(DesignMatrix::to_dense);
+        let x_log_sigma_exit = self.x_log_sigma.to_dense();
+        let x_log_sigma_entry = self.x_log_sigma_entry.as_ref().map(DesignMatrix::to_dense);
         let xw = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense);
         let mut joint = Array2::<f64>::zeros((p_total, p_total));
 
@@ -1625,68 +2250,183 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         //
         // The time block contributes through three distinct linear predictors
         // (entry h0, exit h1, derivative d), while the remaining blocks enter
-        // through the single scalar coupled predictor
+        // through the scalar coupled predictor
         //
         //   q(eta_t, eta_ls, etaw) = -eta_t / sigma(eta_ls) + etaw.
         //
-        // For any q-block pair (b, c) in {threshold, log_sigma, wiggle},
-        // the exact negative Hessian weight is
+        // For time-varying blocks, q0 (entry) and q1 (exit) evaluate at
+        // different designs but share the same beta. The Hessian for a
+        // coefficient-block pair (b, c) splits:
         //
-        //   H_bc = -[ d²ℓ/dq² * q_b q_c + dℓ/dq * q_bc ].
+        //   H_bc = H_bc^{exit} + H_bc^{entry}
         //
-        // For the cross terms between h0/h1 and a q-block b:
+        // where H_bc^{exit}  = X_b_exit'  diag(w_exit)  X_c_exit
+        //       H_bc^{entry} = X_b_entry' diag(w_entry) X_c_entry
         //
-        //   H_h0,b = -d²ℓ/(dh0 dq) * q_b = -h_h0 * q_b
-        //   H_h1,b = -d²ℓ/(dh1 dq) * q_b = -h_h1 * q_b.
+        // with w_exit  = -[ d²ℓ/dq1² * q1_b * q1_c + dℓ/dq1 * q1_bc ]
+        //      w_entry = -[ d²ℓ/dq0² * q0_b * q0_c + dℓ/dq0 * q0_bc ].
         //
-        // This is exactly the full coupled H(beta^) that the outer LAML
-        // gradient derivation requires. The blockwise fallback previously used
-        // only the diagonal H_bb pieces and therefore discarded the
-        // threshold/scale/wiggle response to smoothing changes.
+        // For time-invariant blocks, q0=q1=q, X_entry=X_exit, and entry is
+        // omitted (the combined d1_q etc. are used).
         let h_time = fast_xt_diag_x(&self.x_time_entry, &q.h_time_h0)
             + fast_xt_diag_x(&self.x_time_exit, &q.h_time_h1)
             + fast_xt_diag_x(&self.x_time_deriv, &q.h_time_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
 
-        let h_t = -(&q.d2_q * &q.dq_t.mapv(|v| v * v));
-        let h_tt = weighted_crossprod_dense(&x_threshold, &h_t, &x_threshold)?;
-        assign_symmetric_block(&mut joint, offsets[1], offsets[1], &h_tt);
+        // Threshold-threshold block.
+        if let (Some(x_t_en), Some(dq_t_en)) =
+            (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
+        {
+            let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| v * v));
+            let h_entry = -(&q.d2_q0 * &dq_t_en.mapv(|v| v * v));
+            let h_tt = weighted_crossprod_dense(&x_threshold_exit, &h_exit, &x_threshold_exit)?
+                + weighted_crossprod_dense(x_t_en, &h_entry, x_t_en)?;
+            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &h_tt);
+        } else {
+            let h_t = -(&q.d2_q * &q.dq_t.mapv(|v| v * v));
+            let h_tt = weighted_crossprod_dense(&x_threshold_exit, &h_t, &x_threshold_exit)?;
+            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &h_tt);
+        }
 
-        let h_ls = -(&q.d2_q * &q.dq_ls.mapv(|v| v * v) + &(&q.d1_q * &q.d2q_ls));
-        let h_ll = weighted_crossprod_dense(&x_log_sigma, &h_ls, &x_log_sigma)?;
-        assign_symmetric_block(&mut joint, offsets[2], offsets[2], &h_ll);
+        // Log-sigma-log-sigma block.
+        if let (Some(x_ls_en), Some(dq_ls_en), Some(d2q_ls_en)) = (
+            x_log_sigma_entry.as_ref(),
+            q.dq_ls_entry.as_ref(),
+            q.d2q_ls_entry.as_ref(),
+        ) {
+            let h_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| v * v) + &(&q.d1_q1 * &q.d2q_ls));
+            let h_entry =
+                -(&q.d2_q0 * &dq_ls_en.mapv(|v| v * v) + &(&q.d1_q0 * d2q_ls_en));
+            let h_ll =
+                weighted_crossprod_dense(&x_log_sigma_exit, &h_exit, &x_log_sigma_exit)?
+                    + weighted_crossprod_dense(x_ls_en, &h_entry, x_ls_en)?;
+            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &h_ll);
+        } else {
+            let h_ls = -(&q.d2_q * &q.dq_ls.mapv(|v| v * v) + &(&q.d1_q * &q.d2q_ls));
+            let h_ll = weighted_crossprod_dense(&x_log_sigma_exit, &h_ls, &x_log_sigma_exit)?;
+            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &h_ll);
+        }
 
-        let h_tlweights = -(&q.d2_q * &(&q.dq_t * &q.dq_ls) + &(&q.d1_q * &q.d2q_tls));
-        let h_tl = weighted_crossprod_dense(&x_threshold, &h_tlweights, &x_log_sigma)?;
-        assign_symmetric_block(&mut joint, offsets[1], offsets[2], &h_tl);
+        // Threshold-log-sigma cross block.
+        {
+            let has_t_entry = x_threshold_entry.is_some();
+            let has_ls_entry = x_log_sigma_entry.is_some();
+            if has_t_entry || has_ls_entry {
+                // At least one block is time-varying. We need to sum the
+                // separate exit and entry contributions.
+                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
+                let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+                let x_t_en = x_threshold_entry.as_ref().unwrap_or(&x_threshold_exit);
+                let x_ls_en = x_log_sigma_entry.as_ref().unwrap_or(&x_log_sigma_exit);
+                let w_exit =
+                    -(&q.d2_q1 * &(&q.dq_t * &q.dq_ls) + &(&q.d1_q1 * &q.d2q_tls));
+                let w_entry =
+                    -(&q.d2_q0 * &(dq_t_en * dq_ls_en) + &(&q.d1_q0 * d2q_tls_en));
+                let h_tl =
+                    weighted_crossprod_dense(&x_threshold_exit, &w_exit, &x_log_sigma_exit)?
+                        + weighted_crossprod_dense(x_t_en, &w_entry, x_ls_en)?;
+                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &h_tl);
+            } else {
+                let h_tlweights =
+                    -(&q.d2_q * &(&q.dq_t * &q.dq_ls) + &(&q.d1_q * &q.d2q_tls));
+                let h_tl = weighted_crossprod_dense(
+                    &x_threshold_exit,
+                    &h_tlweights,
+                    &x_log_sigma_exit,
+                )?;
+                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &h_tl);
+            }
+        }
 
-        let h_h0_t =
-            weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0 * &q.dq_t), &x_threshold)?;
-        let h_h1_t =
-            weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1 * &q.dq_t), &x_threshold)?;
-        assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(h_h0_t + h_h1_t));
+        // Time-threshold cross block.
+        // H_h0,t = X_time_entry' diag(-h_time_h0 * dq_t) X_threshold
+        // For time-varying threshold: entry u0 depends on h0 AND q0, and the
+        // cross is d²ℓ/(dh0 dq0) * dq0/d(eta_t). But h_time_h0 already encodes
+        // d²ℓ/(dh0 du0) = -d²ℓ/(dh0 dq0). So the cross with threshold is
+        // h_time_h0 * dq_t evaluated at the appropriate (exit or entry) sigma.
+        //
+        // h0 only couples with q0 (entry), and h1 only couples with q1 (exit).
+        // For time-varying threshold, h0's cross uses dq_t_entry and X_threshold_entry,
+        // while h1's cross uses dq_t_exit and X_threshold_exit.
+        if let (Some(x_t_en), Some(dq_t_en)) =
+            (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
+        {
+            // h0 couples with entry q0: uses entry designs/sigma
+            let h_h0_t = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-&q.h_time_h0 * dq_t_en),
+                x_t_en,
+            )?;
+            // h1 couples with exit q1: uses exit designs/sigma
+            let h_h1_t = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-&q.h_time_h1 * &q.dq_t),
+                &x_threshold_exit,
+            )?;
+            assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(h_h0_t + h_h1_t));
+        } else {
+            let h_h0_t = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-&q.h_time_h0 * &q.dq_t),
+                &x_threshold_exit,
+            )?;
+            let h_h1_t = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-&q.h_time_h1 * &q.dq_t),
+                &x_threshold_exit,
+            )?;
+            assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(h_h0_t + h_h1_t));
+        }
 
-        let h_h0_ls = weighted_crossprod_dense(
-            &self.x_time_entry,
-            &(-&q.h_time_h0 * &q.dq_ls),
-            &x_log_sigma,
-        )?;
-        let h_h1_ls =
-            weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1 * &q.dq_ls), &x_log_sigma)?;
-        assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(h_h0_ls + h_h1_ls));
+        // Time-log-sigma cross block.
+        if let (Some(x_ls_en), Some(dq_ls_en)) =
+            (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
+        {
+            let h_h0_ls = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-&q.h_time_h0 * dq_ls_en),
+                x_ls_en,
+            )?;
+            let h_h1_ls = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-&q.h_time_h1 * &q.dq_ls),
+                &x_log_sigma_exit,
+            )?;
+            assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(h_h0_ls + h_h1_ls));
+        } else {
+            let h_h0_ls = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-&q.h_time_h0 * &q.dq_ls),
+                &x_log_sigma_exit,
+            )?;
+            let h_h1_ls = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-&q.h_time_h1 * &q.dq_ls),
+                &x_log_sigma_exit,
+            )?;
+            assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(h_h0_ls + h_h1_ls));
+        }
 
         if let (Some(xw_dense), Some(w_offset)) = (xw.as_ref(), offsets.get(3).copied()) {
             let hww = weighted_crossprod_dense(xw_dense, &(-&q.d2_q), xw_dense)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &hww);
 
-            let h_tw = weighted_crossprod_dense(&x_threshold, &(-&q.d2_q * &q.dq_t), xw_dense)?;
+            let h_tw =
+                weighted_crossprod_dense(&x_threshold_exit, &(-&q.d2_q * &q.dq_t), xw_dense)?;
             assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
 
-            let h_lw = weighted_crossprod_dense(&x_log_sigma, &(-&q.d2_q * &q.dq_ls), xw_dense)?;
+            let h_lw = weighted_crossprod_dense(
+                &x_log_sigma_exit,
+                &(-&q.d2_q * &q.dq_ls),
+                xw_dense,
+            )?;
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
 
-            let h_h0w = weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0), xw_dense)?;
-            let h_h1w = weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1), xw_dense)?;
+            let h_h0w =
+                weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0), xw_dense)?;
+            let h_h1w =
+                weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1), xw_dense)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &(h_h0w + h_h1w));
         }
 
@@ -1722,128 +2462,312 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let delta_h0 = self.x_time_entry.dot(&time_dir);
         let delta_h1 = self.x_time_exit.dot(&time_dir);
         let delta_d = self.x_time_deriv.dot(&time_dir);
-        let delta_t = self.x_threshold.matrixvectormultiply(&threshold_dir);
-        let delta_ls = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
+        // Exit predictor-space deltas (always present).
+        let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
+        let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
         let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
             (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
             _ => Array1::zeros(self.n),
         };
 
-        // Full refit-path directional contractions.
-        //
-        // The exact outer derivative needs D_u H along the joint mode
-        // sensitivity u = d beta^ / d rho. In predictor space that direction is
-        // summarized by:
-        //
-        //   delta_h0 = X_entry u_time
-        //   delta_h1 = X_exit  u_time
-        //   delta_d  = X_deriv u_time
-        //   delta_t  = X_t     u_threshold
-        //   delta_ls = X_ls    u_log_sigma
-        //   deltaw  = Xw     uwiggle
-        //
-        // and therefore
-        //
-        //   delta_q = q_t delta_t + q_ls delta_ls + deltaw.
-        //
-        // Every Hessian block drifts through this full direction; the previous
-        // blockwise path effectively set delta_t = delta_ls = deltaw = 0,
-        // which is exactly the bug the finite-difference test exposed.
-        let delta_q = &q.dq_t * &delta_t + &q.dq_ls * &delta_ls + &deltaw;
-        let delta_q_t = &q.d2q_tls * &delta_ls;
-        let delta_q_ls = &q.d2q_tls * &delta_t + &q.d2q_ls * &delta_ls;
-        let delta_q_tls = &q.d3q_tls_ls * &delta_ls;
-        let delta_q_ls_ls = &q.d3q_tls_ls * &delta_t + &q.d3q_ls * &delta_ls;
-        let d_d1_q = &q.d2_q * &delta_q + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
-        let d_d2_q = &q.d3_q * &delta_q - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+        // Exit-side chain-rule deltas.
+        let delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit + &deltaw;
+        let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
+        let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
+        let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
+        let delta_q_ls_ls_exit = &q.d3q_tls_ls * &delta_t_exit + &q.d3q_ls * &delta_ls_exit;
 
-        let x_threshold = self.x_threshold.to_dense();
-        let x_log_sigma = self.x_log_sigma.to_dense();
+        // For the time block's D_u H we need the full combined delta_q that
+        // includes both exit and entry contributions through h0 and h1.
+        // For time-invariant blocks delta_q = delta_q_exit already.
+        // For time-varying blocks, h0 couples through entry q0 and h1 through
+        // exit q1, so the time block sees combined delta_q through both paths.
+        let d_d1_q_exit =
+            &q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1;
+        let d_d2_q_exit =
+            &q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1;
+
+        let x_threshold_exit = self.x_threshold.to_dense();
+        let x_threshold_entry = self.x_threshold_entry.as_ref().map(DesignMatrix::to_dense);
+        let x_log_sigma_exit = self.x_log_sigma.to_dense();
+        let x_log_sigma_entry = self.x_log_sigma_entry.as_ref().map(DesignMatrix::to_dense);
         let xw = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense);
         let mut joint = Array2::<f64>::zeros((p_total, p_total));
 
-        let dh_h0 = &q.d_h_h0 * &(&delta_h0 - &delta_q);
-        let dh_h1 = &q.d_h_h1 * &(&delta_h1 - &delta_q);
+        // Entry-side predictor-space deltas and chain-rule deltas.
+        // When time-varying blocks are present, we compute entry-side counterparts
+        // of all exit-side delta quantities. When no block is time-varying, these
+        // are zero placeholders that are never consumed.
+        struct EntryDeltas {
+            delta_q: Array1<f64>,
+            delta_q_t: Array1<f64>,
+            delta_q_ls: Array1<f64>,
+            delta_q_tls: Array1<f64>,
+            delta_q_ls_ls: Array1<f64>,
+            d_d1_q: Array1<f64>,
+            d_d2_q: Array1<f64>,
+        }
+        let entry_deltas = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
+            let dt_en = self.x_threshold_entry.as_ref()
+                .map(|x| x.matrixvectormultiply(&threshold_dir))
+                .unwrap_or_else(|| delta_t_exit.clone());
+            let dls_en = self.x_log_sigma_entry.as_ref()
+                .map(|x| x.matrixvectormultiply(&log_sigma_dir))
+                .unwrap_or_else(|| delta_ls_exit.clone());
+            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
+            let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+            let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
+            let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
+            let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
+            let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + &deltaw;
+            EntryDeltas {
+                delta_q_t: d2q_tls_en * &dls_en,
+                delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
+                delta_q_tls: d3q_tls_ls_en * &dls_en,
+                delta_q_ls_ls: d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en,
+                d_d1_q: &q.d2_q0 * &dq_en + &q.h_time_h0 * &delta_h0,
+                d_d2_q: &q.d3_q0 * &dq_en - &q.d_h_h0 * &delta_h0,
+                delta_q: dq_en,
+            }
+        } else {
+            let z = Array1::zeros(self.n);
+            EntryDeltas {
+                delta_q: z.clone(),
+                delta_q_t: z.clone(),
+                delta_q_ls: z.clone(),
+                delta_q_tls: z.clone(),
+                delta_q_ls_ls: z.clone(),
+                d_d1_q: z.clone(),
+                d_d2_q: z,
+            }
+        };
+
+        // Time block D_u H.
+        // The combined delta_q for the time block's cross term:
+        // d_h_h0 couples through delta_q via entry path, d_h_h1 through exit.
+        let dh_h0 = &q.d_h_h0 * &(&delta_h0 - &entry_deltas.delta_q);
+        let dh_h1 = &q.d_h_h1 * &(&delta_h1 - &delta_q_exit);
         let dh_d = &q.d_h_d * &delta_d;
         let d_h_time = fast_xt_diag_x(&self.x_time_entry, &dh_h0)
             + fast_xt_diag_x(&self.x_time_exit, &dh_h1)
             + fast_xt_diag_x(&self.x_time_deriv, &dh_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
 
-        // q-only blocks use the exact scalar third-order contraction
-        //
-        //   D_u H_bc
-        //   = -[ d³ℓ/dq³ * delta_q * q_b q_c
-        //        + d²ℓ/dq² * (delta_q_b q_c + q_b delta_q_c + delta_q q_bc)
-        //        + dℓ/dq * delta_q_bc ].
-        //
-        // This is the family-specific specialization of the generic formula
-        //   D_u H = sum_i [ w^(3) delta_i a_i a_i^T
-        //                 + w^(2)(...) + w^(1) C_i[u] ]
-        // from the derivation.
-        let d_h_t =
-            -(&d_d2_q * &q.dq_t.mapv(|v| v * v) + &(&q.d2_q * &(2.0 * &delta_q_t * &q.dq_t)));
-        let d_h_tt = weighted_crossprod_dense(&x_threshold, &d_h_t, &x_threshold)?;
-        assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
+        // Threshold-threshold D_u H.
+        if let Some(x_t_en) = x_threshold_entry.as_ref() {
+            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+            let d_h_exit = -(
+                &d_d2_q_exit * &q.dq_t.mapv(|v| v * v)
+                + &(&q.d2_q1 * &(2.0 * &delta_q_t_exit * &q.dq_t))
+            );
+            let d_h_entry = -(
+                &entry_deltas.d_d2_q * &dq_t_en.mapv(|v| v * v)
+                + &(&q.d2_q0 * &(2.0 * &entry_deltas.delta_q_t * dq_t_en))
+            );
+            let d_h_tt =
+                weighted_crossprod_dense(&x_threshold_exit, &d_h_exit, &x_threshold_exit)?
+                + weighted_crossprod_dense(x_t_en, &d_h_entry, x_t_en)?;
+            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
+        } else {
+            let d_d2_q_ti = &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+            let d_h_t = -(
+                &d_d2_q_ti * &q.dq_t.mapv(|v| v * v)
+                + &(&q.d2_q * &(2.0 * &delta_q_t_exit * &q.dq_t))
+            );
+            let d_h_tt =
+                weighted_crossprod_dense(&x_threshold_exit, &d_h_t, &x_threshold_exit)?;
+            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
+        }
 
-        let d_h_tlweights = -(&d_d2_q * &(&q.dq_t * &q.dq_ls)
-            + &(&q.d2_q * &(&delta_q_t * &q.dq_ls + &q.dq_t * &delta_q_ls))
-            + &(&d_d1_q * &q.d2q_tls)
-            + &(&q.d1_q * &delta_q_tls));
-        let d_h_tl = weighted_crossprod_dense(&x_threshold, &d_h_tlweights, &x_log_sigma)?;
-        assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
+        // Threshold-log-sigma cross D_u H.
+        {
+            let has_t_entry = x_threshold_entry.is_some();
+            let has_ls_entry = x_log_sigma_entry.is_some();
+            if has_t_entry || has_ls_entry {
+                let x_t_en = x_threshold_entry.as_ref().unwrap_or(&x_threshold_exit);
+                let x_ls_en = x_log_sigma_entry.as_ref().unwrap_or(&x_log_sigma_exit);
+                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
+                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
+                let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+                let w_exit = -(
+                    &d_d2_q_exit * &(&q.dq_t * &q.dq_ls)
+                    + &(&q.d2_q1 * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
+                    + &(&d_d1_q_exit * &q.d2q_tls)
+                    + &(&q.d1_q1 * &delta_q_tls_exit)
+                );
+                let w_entry = -(
+                    &entry_deltas.d_d2_q * &(dq_t_en * dq_ls_en)
+                    + &(&q.d2_q0 * &(&entry_deltas.delta_q_t * dq_ls_en + dq_t_en * &entry_deltas.delta_q_ls))
+                    + &(&entry_deltas.d_d1_q * d2q_tls_en)
+                    + &(&q.d1_q0 * &entry_deltas.delta_q_tls)
+                );
+                let d_h_tl =
+                    weighted_crossprod_dense(&x_threshold_exit, &w_exit, &x_log_sigma_exit)?
+                    + weighted_crossprod_dense(x_t_en, &w_entry, x_ls_en)?;
+                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
+            } else {
+                let d_d1_q = &q.d2_q * &delta_q_exit + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
+                let d_d2_q = &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+                let d_h_tlweights = -(
+                    &d_d2_q * &(&q.dq_t * &q.dq_ls)
+                    + &(&q.d2_q * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
+                    + &(&d_d1_q * &q.d2q_tls)
+                    + &(&q.d1_q * &delta_q_tls_exit)
+                );
+                let d_h_tl = weighted_crossprod_dense(
+                    &x_threshold_exit,
+                    &d_h_tlweights,
+                    &x_log_sigma_exit,
+                )?;
+                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
+            }
+        }
 
-        let d_h_l = -(&d_d2_q * &q.dq_ls.mapv(|v| v * v)
-            + &(&q.d2_q * &(2.0 * &delta_q_ls * &q.dq_ls))
-            + &(&d_d1_q * &q.d2q_ls)
-            + &(&q.d1_q * &delta_q_ls_ls));
-        let d_h_ll = weighted_crossprod_dense(&x_log_sigma, &d_h_l, &x_log_sigma)?;
-        assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
+        // Log-sigma-log-sigma D_u H.
+        if let Some(x_ls_en) = x_log_sigma_entry.as_ref() {
+            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap();
+            let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap();
+            let d_h_exit = -(
+                &d_d2_q_exit * &q.dq_ls.mapv(|v| v * v)
+                + &(&q.d2_q1 * &(2.0 * &delta_q_ls_exit * &q.dq_ls))
+                + &(&d_d1_q_exit * &q.d2q_ls)
+                + &(&q.d1_q1 * &delta_q_ls_ls_exit)
+            );
+            let d_h_entry = -(
+                &entry_deltas.d_d2_q * &dq_ls_en.mapv(|v| v * v)
+                + &(&q.d2_q0 * &(2.0 * &entry_deltas.delta_q_ls * dq_ls_en))
+                + &(&entry_deltas.d_d1_q * d2q_ls_en)
+                + &(&q.d1_q0 * &entry_deltas.delta_q_ls_ls)
+            );
+            let d_h_ll =
+                weighted_crossprod_dense(&x_log_sigma_exit, &d_h_exit, &x_log_sigma_exit)?
+                + weighted_crossprod_dense(x_ls_en, &d_h_entry, x_ls_en)?;
+            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
+        } else {
+            let d_d1_q = &q.d2_q * &delta_q_exit + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
+            let d_d2_q = &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+            let d_h_l = -(
+                &d_d2_q * &q.dq_ls.mapv(|v| v * v)
+                + &(&q.d2_q * &(2.0 * &delta_q_ls_exit * &q.dq_ls))
+                + &(&d_d1_q * &q.d2q_ls)
+                + &(&q.d1_q * &delta_q_ls_ls_exit)
+            );
+            let d_h_ll =
+                weighted_crossprod_dense(&x_log_sigma_exit, &d_h_l, &x_log_sigma_exit)?;
+            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
+        }
 
-        let d_h_h0_t = weighted_crossprod_dense(
-            &self.x_time_entry,
-            &(-(&dh_h0 * &q.dq_t + &q.h_time_h0 * &delta_q_t)),
-            &x_threshold,
-        )?;
-        let d_h_h1_t = weighted_crossprod_dense(
-            &self.x_time_exit,
-            &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * &delta_q_t)),
-            &x_threshold,
-        )?;
-        assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(d_h_h0_t + d_h_h1_t));
+        // Time-threshold cross D_u H.
+        if let (Some(x_t_en), Some(dq_t_en)) =
+            (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
+        {
+            // h0 couples with entry: delta_q_t pertains to entry sigma derivatives.
+            let d_h_h0_t = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-(&dh_h0 * dq_t_en + &q.h_time_h0 * &entry_deltas.delta_q_t)),
+                x_t_en,
+            )?;
+            let d_h_h1_t = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * &delta_q_t_exit)),
+                &x_threshold_exit,
+            )?;
+            assign_symmetric_block(
+                &mut joint,
+                offsets[0],
+                offsets[1],
+                &(d_h_h0_t + d_h_h1_t),
+            );
+        } else {
+            let delta_q_t = &delta_q_t_exit;
+            let d_h_h0_t = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-(&dh_h0 * &q.dq_t + &q.h_time_h0 * delta_q_t)),
+                &x_threshold_exit,
+            )?;
+            let d_h_h1_t = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * delta_q_t)),
+                &x_threshold_exit,
+            )?;
+            assign_symmetric_block(
+                &mut joint,
+                offsets[0],
+                offsets[1],
+                &(d_h_h0_t + d_h_h1_t),
+            );
+        }
 
-        let d_h_h0_l = weighted_crossprod_dense(
-            &self.x_time_entry,
-            &(-(&dh_h0 * &q.dq_ls + &q.h_time_h0 * &delta_q_ls)),
-            &x_log_sigma,
-        )?;
-        let d_h_h1_l = weighted_crossprod_dense(
-            &self.x_time_exit,
-            &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * &delta_q_ls)),
-            &x_log_sigma,
-        )?;
-        assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(d_h_h0_l + d_h_h1_l));
+        // Time-log-sigma cross D_u H.
+        if let (Some(x_ls_en), Some(dq_ls_en)) =
+            (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
+        {
+            let d_h_h0_l = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-(&dh_h0 * dq_ls_en + &q.h_time_h0 * &entry_deltas.delta_q_ls)),
+                x_ls_en,
+            )?;
+            let d_h_h1_l = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * &delta_q_ls_exit)),
+                &x_log_sigma_exit,
+            )?;
+            assign_symmetric_block(
+                &mut joint,
+                offsets[0],
+                offsets[2],
+                &(d_h_h0_l + d_h_h1_l),
+            );
+        } else {
+            let delta_q_ls = &delta_q_ls_exit;
+            let d_h_h0_l = weighted_crossprod_dense(
+                &self.x_time_entry,
+                &(-(&dh_h0 * &q.dq_ls + &q.h_time_h0 * delta_q_ls)),
+                &x_log_sigma_exit,
+            )?;
+            let d_h_h1_l = weighted_crossprod_dense(
+                &self.x_time_exit,
+                &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * delta_q_ls)),
+                &x_log_sigma_exit,
+            )?;
+            assign_symmetric_block(
+                &mut joint,
+                offsets[0],
+                offsets[2],
+                &(d_h_h0_l + d_h_h1_l),
+            );
+        }
 
         if let (Some(xw_dense), Some(w_offset)) = (xw.as_ref(), offsets.get(3).copied()) {
+            // For wiggle cross-terms, use combined d_d2_q and d2_q.
+            let d_d2_q_combined = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
+                &d_d2_q_exit + &entry_deltas.d_d2_q
+            } else {
+                &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1
+            };
             let d_h_tw = weighted_crossprod_dense(
-                &x_threshold,
-                &(-(&d_d2_q * &q.dq_t + &q.d2_q * &delta_q_t)),
+                &x_threshold_exit,
+                &(-(&d_d2_q_combined * &q.dq_t + &q.d2_q * &delta_q_t_exit)),
                 xw_dense,
             )?;
             assign_symmetric_block(&mut joint, offsets[1], w_offset, &d_h_tw);
 
             let d_h_lw = weighted_crossprod_dense(
-                &x_log_sigma,
-                &(-(&d_d2_q * &q.dq_ls + &q.d2_q * &delta_q_ls)),
+                &x_log_sigma_exit,
+                &(-(&d_d2_q_combined * &q.dq_ls + &q.d2_q * &delta_q_ls_exit)),
                 xw_dense,
             )?;
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
 
-            let d_hww = weighted_crossprod_dense(xw_dense, &(-&d_d2_q), xw_dense)?;
+            let d_hww =
+                weighted_crossprod_dense(xw_dense, &(-&d_d2_q_combined), xw_dense)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &d_hww);
 
-            let d_h_h0w = weighted_crossprod_dense(&self.x_time_entry, &(-&dh_h0), xw_dense)?;
-            let d_h_h1w = weighted_crossprod_dense(&self.x_time_exit, &(-&dh_h1), xw_dense)?;
+            let d_h_h0w =
+                weighted_crossprod_dense(&self.x_time_entry, &(-&dh_h0), xw_dense)?;
+            let d_h_h1w =
+                weighted_crossprod_dense(&self.x_time_exit, &(-&dh_h1), xw_dense)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d_h_h0w + d_h_h1w));
         }
 
@@ -1901,8 +2825,8 @@ pub fn fit_survival_location_scale(
         return Err("fit_survival_location_scale: max_iter must be > 0".to_string());
     }
     validate_time_block(n, &spec.time_block)?;
-    validate_cov_block("threshold_block", n, &spec.threshold_block)?;
-    validate_cov_block("log_sigma_block", n, &spec.log_sigma_block)?;
+    validate_cov_block_kind("threshold_block", n, &spec.threshold_block)?;
+    validate_cov_block_kind("log_sigma_block", n, &spec.log_sigma_block)?;
     if let Some(w) = spec.linkwiggle_block.as_ref() {
         validatewiggle_block(n, w)?;
     }
@@ -1961,19 +2885,49 @@ pub fn fit_survival_location_scale(
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
     };
+    // Prepare threshold block.
+    let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
+    // For time-varying threshold: the solver sees a stacked design [exit; entry]
+    // so that eta has length 2n. For time-invariant: eta has length n.
+    let (threshold_solver_design, threshold_solver_offset) =
+        if let Some(x_entry) = threshold_prep.design_entry.as_ref() {
+            // Stack exit on top, entry on bottom → eta = [exit_eta; entry_eta]
+            let exit_dense = threshold_prep.design_exit.to_dense();
+            let entry_dense = x_entry.to_dense();
+            let p = exit_dense.ncols();
+            let mut stacked = Array2::<f64>::zeros((2 * n, p));
+            stacked.slice_mut(s![0..n, ..]).assign(&exit_dense);
+            stacked.slice_mut(s![n..2 * n, ..]).assign(&entry_dense);
+            let mut offset_stacked = Array1::<f64>::zeros(2 * n);
+            offset_stacked
+                .slice_mut(s![0..n])
+                .assign(&threshold_prep.offset);
+            offset_stacked
+                .slice_mut(s![n..2 * n])
+                .assign(&threshold_prep.offset);
+            (DesignMatrix::Dense(stacked), offset_stacked)
+        } else {
+            (
+                threshold_prep.design_exit.clone(),
+                threshold_prep.offset.clone(),
+            )
+        };
     let thresholdspec = ParameterBlockSpec {
         name: "threshold".to_string(),
-        design: spec.threshold_block.design.clone(),
-        offset: spec.threshold_block.offset.clone(),
-        penalties: spec.threshold_block.penalties.clone(),
+        design: threshold_solver_design,
+        offset: threshold_solver_offset,
+        penalties: threshold_prep.penalties.clone(),
         initial_log_lambdas: initial_log_lambdas(
-            &spec.threshold_block.penalties,
-            spec.threshold_block.initial_log_lambdas.clone(),
+            &threshold_prep.penalties,
+            threshold_prep.initial_log_lambdas.clone(),
         )?,
-        initial_beta: spec.threshold_block.initial_beta.clone(),
+        initial_beta: threshold_prep.initial_beta.clone(),
     };
+
+    // Build survival primary design for scale deviation transform.
+    // Use exit designs for both time and threshold.
     let time_primary_design = time_prepared.design_exit.clone();
-    let threshold_primary_design = spec.threshold_block.design.to_dense();
+    let threshold_primary_design = threshold_prep.design_exit.to_dense();
     let mut survival_primary_design = Array2::<f64>::zeros((
         n,
         time_primary_design.ncols() + threshold_primary_design.ncols(),
@@ -1984,7 +2938,10 @@ pub fn fit_survival_location_scale(
     survival_primary_design
         .slice_mut(s![.., time_primary_design.ncols()..])
         .assign(&threshold_primary_design);
-    let raw_log_sigma_design = spec.log_sigma_block.design.to_dense();
+
+    // Prepare log-sigma block.
+    let log_sigma_prep = prepare_cov_block_kind(&spec.log_sigma_block)?;
+    let raw_log_sigma_design = log_sigma_prep.design_exit.to_dense();
     let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_design, &spec.weights);
     let log_sigma_design = apply_scale_deviation_transform(
         &survival_primary_design,
@@ -1996,16 +2953,53 @@ pub fn fit_survival_location_scale(
             non_intercept_start,
         )?,
     )?;
+    // If time-varying, also transform the entry design.
+    let log_sigma_entry_design = if let Some(x_ls_entry) = log_sigma_prep.design_entry.as_ref() {
+        let raw_entry = x_ls_entry.to_dense();
+        let entry_transformed = apply_scale_deviation_transform(
+            &survival_primary_design,
+            &raw_entry,
+            &build_scale_deviation_transform(
+                &survival_primary_design,
+                &raw_entry,
+                &spec.weights,
+                non_intercept_start,
+            )?,
+        )?;
+        Some(entry_transformed)
+    } else {
+        None
+    };
+    let (log_sigma_solver_design, log_sigma_solver_offset) =
+        if let Some(ref ls_entry) = log_sigma_entry_design {
+            let p = log_sigma_design.ncols();
+            let mut stacked = Array2::<f64>::zeros((2 * n, p));
+            stacked.slice_mut(s![0..n, ..]).assign(&log_sigma_design);
+            stacked.slice_mut(s![n..2 * n, ..]).assign(ls_entry);
+            let mut offset_stacked = Array1::<f64>::zeros(2 * n);
+            offset_stacked
+                .slice_mut(s![0..n])
+                .assign(&log_sigma_prep.offset);
+            offset_stacked
+                .slice_mut(s![n..2 * n])
+                .assign(&log_sigma_prep.offset);
+            (DesignMatrix::Dense(stacked), offset_stacked)
+        } else {
+            (
+                DesignMatrix::Dense(log_sigma_design.clone()),
+                log_sigma_prep.offset.clone(),
+            )
+        };
     let log_sigmaspec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
-        design: DesignMatrix::Dense(log_sigma_design.clone()),
-        offset: spec.log_sigma_block.offset.clone(),
-        penalties: spec.log_sigma_block.penalties.clone(),
+        design: log_sigma_solver_design,
+        offset: log_sigma_solver_offset,
+        penalties: log_sigma_prep.penalties.clone(),
         initial_log_lambdas: initial_log_lambdas(
-            &spec.log_sigma_block.penalties,
-            spec.log_sigma_block.initial_log_lambdas.clone(),
+            &log_sigma_prep.penalties,
+            log_sigma_prep.initial_log_lambdas.clone(),
         )?,
-        initial_beta: spec.log_sigma_block.initial_beta.clone(),
+        initial_beta: log_sigma_prep.initial_beta.clone(),
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
@@ -2020,6 +3014,10 @@ pub fn fit_survival_location_scale(
         None
     };
 
+    // Build the family struct. Exit designs are the "main" designs;
+    // entry designs are stored separately for time-varying blocks.
+    let x_log_sigma_exit = DesignMatrix::Dense(log_sigma_design);
+    let x_log_sigma_entry = log_sigma_entry_design.map(DesignMatrix::Dense);
     let family = SurvivalLocationScaleFamily {
         n,
         y: spec.event_target,
@@ -2031,8 +3029,10 @@ pub fn fit_survival_location_scale(
         x_time_exit: time_prepared.design_exit,
         x_time_deriv: time_prepared.design_derivative_exit,
         offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
-        x_threshold: spec.threshold_block.design.clone(),
-        x_log_sigma: DesignMatrix::Dense(log_sigma_design),
+        x_threshold: threshold_prep.design_exit.clone(),
+        x_threshold_entry: threshold_prep.design_entry.clone(),
+        x_log_sigma: x_log_sigma_exit,
+        x_log_sigma_entry,
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
     };
 
@@ -2051,8 +3051,8 @@ pub fn fit_survival_location_scale(
     let fit: BlockwiseFitResult = fit_custom_family(&family, &blockspecs, &options)?;
 
     let k_time = spec.time_block.penalties.len();
-    let k_t = spec.threshold_block.penalties.len();
-    let k_ls = spec.log_sigma_block.penalties.len();
+    let k_t = threshold_prep.penalties.len();
+    let k_ls = log_sigma_prep.penalties.len();
     let lambdas = fit.log_lambdas.mapv(f64::exp);
     let lambdas_time = lambdas.slice(s![0..k_time]).to_owned();
     let lambdas_threshold = lambdas.slice(s![k_time..k_time + k_t]).to_owned();
@@ -2696,7 +3696,9 @@ mod tests {
             x_time_deriv: array![[1.0], [1.0], [1.0]],
             offset_time_deriv: array![0.5, 0.7, 0.6],
             x_threshold: DesignMatrix::Dense(array![[1.0], [0.4], [-0.6]]),
+            x_threshold_entry: None,
             x_log_sigma: DesignMatrix::Dense(array![[1.0], [-0.3], [0.5]]),
+            x_log_sigma_entry: None,
             x_link_wiggle: None,
         }
     }
@@ -3674,16 +4676,20 @@ mod tests {
             let family = survival_exact_newton_test_familywith_inverse_link(inverse_link);
             let states =
                 survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
-            let (h0, h1, d_raw, eta_t_full, eta_ls_full, etaw) =
+            let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
                 family.validate_joint_states(&states).expect("joint states");
-            let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_full.view());
+            // For time-invariant blocks, eta_ls_entry == eta_ls_exit.
+            let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
+            let (sigma_entry, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_entry.view());
 
             for i in 0..family.n {
                 let state = family.row_predictor_state(
                     h0[i],
                     h1[i],
                     d_raw[i],
-                    eta_t_full[i],
+                    eta_t_entry[i],
+                    eta_t_exit[i],
+                    sigma_entry[i],
                     sigma[i],
                     etaw.map(|w| w[i]),
                 );

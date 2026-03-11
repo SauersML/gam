@@ -396,6 +396,32 @@ impl SymmetricMatrix {
         }
     }
 
+    pub fn add(&self, other: &SymmetricMatrix) -> Result<Self, String> {
+        if self.nrows() != other.nrows() || self.ncols() != other.ncols() {
+            return Err(format!(
+                "SymmetricMatrix::add shape mismatch: lhs {}x{}, rhs {}x{}",
+                self.nrows(),
+                self.ncols(),
+                other.nrows(),
+                other.ncols()
+            ));
+        }
+        match (self, other) {
+            (Self::Dense(a), Self::Dense(b)) => Ok(Self::Dense(a + b)),
+            (Self::Dense(a), Self::Sparse(_)) => {
+                let b_dense = other.to_dense();
+                Ok(Self::Dense(a + &b_dense))
+            }
+            (Self::Sparse(_), Self::Dense(b)) => {
+                let a_dense = self.to_dense();
+                Ok(Self::Dense(&a_dense + b))
+            }
+            (Self::Sparse(a), Self::Sparse(b)) => {
+                Ok(Self::Sparse(add_sparse_symmetric_upper(a, b)?))
+            }
+        }
+    }
+
     pub fn add_dense(&self, other: &Array2<f64>) -> Result<Self, String> {
         if self.nrows() != other.nrows() || self.ncols() != other.ncols() {
             return Err(format!(
