@@ -657,6 +657,26 @@ impl FittedModel {
                     .to_string(),
             );
         }
+
+        // Structural invariant: nonlinear models MUST have beta covariance
+        // stored so that posterior-mean prediction (the default) works.
+        // Gaussian identity is the only linear family exempt from this.
+        let needs_covariance = !matches!(
+            self.family_state.likelihood(),
+            LikelihoodFamily::GaussianIdentity
+        );
+        if needs_covariance {
+            if let Some(fit) = self.fit_result.as_ref() {
+                if fit.beta_covariance().is_none() {
+                    return Err(
+                        "nonlinear model is missing beta_covariance in fit_result; \
+                         posterior-mean prediction requires covariance at save time"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 

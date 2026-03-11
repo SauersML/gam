@@ -1408,7 +1408,18 @@ fn prepare_identified_time_block(
     // Identifiability: enforce h(t_anchor)=0 by constraining c^T beta = 0,
     // where c is the time basis row at anchor time. Reparameterize beta = Z theta
     // with columns of Z spanning null(c^T), so the constraint is exact for all theta.
-    let c = input.design_entry.row(anchorrow).to_owned();
+    //
+    // When entry times are degenerate (no left truncation, all entry = 0),
+    // the entry design row is all zeros (I-splines = 0 at the left boundary),
+    // making the constraint trivial. Fall back to the exit design row,
+    // which always has non-trivial basis values.
+    let c_entry = input.design_entry.row(anchorrow);
+    let entry_norm = c_entry.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let c = if entry_norm > 1e-12 {
+        c_entry.to_owned()
+    } else {
+        input.design_exit.row(anchorrow).to_owned()
+    };
     let c_col = c.view().insert_axis(Axis(1)).to_owned();
     let (z, rank) = rrqr_nullspace_basis(&c_col, default_rrqr_rank_alpha())
         .map_err(|e| format!("time_block identifiability RRQR failed: {e}"))?;
@@ -4018,6 +4029,40 @@ mod tests {
             prepared.design_exit.ncols(),
             p - 1,
             "prepared exit design should keep the p-1 nullspace basis columns"
+        );
+    }
+
+    #[test]
+    fn identified_time_block_degenerate_entry_uses_exit_design() {
+        // When entry design row is all zeros (degenerate entry times),
+        // the identifiability constraint should fall back to the exit design.
+        let design_entry = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let design_exit = array![[0.1, 0.5, 0.9], [0.2, 0.6, 1.0], [0.3, 0.7, 1.0]];
+        let design_derivative_exit = array![[0.1, 0.1, 0.0], [0.1, 0.1, 0.0], [0.1, 0.1, 0.0]];
+        let time_block = TimeBlockInput {
+            design_entry,
+            design_exit,
+            design_derivative_exit,
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::zeros(3),
+            penalties: vec![Array2::eye(3)],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+        let prepared = prepare_identified_time_block(&time_block, 0).expect("prepare time block");
+        // With a non-trivial exit design row, one dimension should be removed.
+        assert_eq!(
+            prepared.design_exit.ncols(),
+            2,
+            "degenerate entry should still remove one dimension using exit design"
+        );
+        // The exit anchor row (after transform) should be zeroed by the constraint.
+        let exit_anchor = prepared.design_exit.row(0);
+        let exit_anchor_max = exit_anchor.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            exit_anchor_max < 1e-10,
+            "exit anchor row should be near zero after constraint: max_abs={exit_anchor_max}"
         );
     }
 
