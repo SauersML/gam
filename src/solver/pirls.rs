@@ -1284,29 +1284,56 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    fn compute_xtwx_for_design(
-        &self,
+    /// Compute X^T W X via the workspace BLAS-accelerated streaming path.
+    /// Falls back to the scalar loop for sparse matrices.
+    fn compute_xtwx_blas(
+        workspace: &mut PirlsWorkspace,
         design: &DesignMatrix,
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        design
-            .diag_xtw_x(weights)
-            .map_err(EstimationError::InvalidInput)
+        match design {
+            DesignMatrix::Dense(x) => {
+                let p = x.ncols();
+                workspace.fill_sqrtweights(weights);
+                let mut xtwx = Array2::<f64>::zeros((p, p).f());
+                workspace.add_dense_xtwx_streaming_from_sqrt(
+                    x,
+                    &mut xtwx,
+                    get_global_parallelism(),
+                );
+                Ok(xtwx)
+            }
+            _ => design
+                .diag_xtw_x(weights)
+                .map_err(EstimationError::InvalidInput),
+        }
     }
 
-    fn penalized_hessian(&self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+    fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                let xtwx = self.compute_xtwx_for_design(x_transformed, weights)?;
+                let xtwx = Self::compute_xtwx_blas(
+                    &mut self.workspace,
+                    x_transformed,
+                    weights,
+                )?;
                 Ok(xtwx + &self.s_transformed)
             }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
-                let xtwx = self.compute_xtwx_for_design(&self.x_original, weights)?;
+                let xtwx = Self::compute_xtwx_blas(
+                    &mut self.workspace,
+                    &self.x_original,
+                    weights,
+                )?;
                 let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);
                 Ok(fast_ab(&tmp, qs) + &self.s_transformed)
             }
             WorkingCoordinateDesign::OriginalSparseNative => {
-                let xtwx = self.compute_xtwx_for_design(&self.x_original, weights)?;
+                let xtwx = Self::compute_xtwx_blas(
+                    &mut self.workspace,
+                    &self.x_original,
+                    weights,
+                )?;
                 Ok(xtwx + &self.s_transformed)
             }
         }
