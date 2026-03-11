@@ -4,6 +4,118 @@ use crate::linalg::utils::StableSolver;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 
 impl<'a> RemlState<'a> {
+    fn third_derivative_projection_from_design(
+        &self,
+        design: &DesignMatrix,
+        d_vec: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if let Some(x_sparse) = design.as_sparse() {
+            let mut out = Array1::<f64>::zeros(x_sparse.ncols());
+            let (symbolic, values) = x_sparse.as_ref().parts();
+            let col_ptr = symbolic.col_ptr();
+            let row_idx = symbolic.row_idx();
+            for col in 0..x_sparse.ncols() {
+                let mut acc = 0.0;
+                for ptr in col_ptr[col]..col_ptr[col + 1] {
+                    let xij = values[ptr];
+                    acc += d_vec[row_idx[ptr]] * xij * xij * xij;
+                }
+                out[col] = acc;
+            }
+            Ok(out)
+        } else {
+            let x_dense = design.as_dense().ok_or_else(|| {
+                EstimationError::InvalidInput("design matrix should be dense or sparse".to_string())
+            })?;
+            let mut out = Array1::<f64>::zeros(x_dense.ncols());
+            for j in 0..x_dense.ncols() {
+                let mut acc = 0.0;
+                for i in 0..x_dense.nrows() {
+                    let xij = x_dense[[i, j]];
+                    acc += d_vec[i] * xij * xij * xij;
+                }
+                out[j] = acc;
+            }
+            Ok(out)
+        }
+    }
+
+    fn tierney_kadane_laml_correction(
+        &self,
+        pirls_result: &PirlsResult,
+        h_eff_eval: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<f64, EstimationError> {
+        let mut d_vec = pirls_result.solve_c_array.clone();
+        if d_vec.is_empty() {
+            return Ok(0.0);
+        }
+        for val in &mut d_vec {
+            if !val.is_finite() {
+                *val = 0.0;
+            }
+        }
+
+        let p_eff = h_eff_eval.ncols();
+        if p_eff == 0 {
+            return Ok(0.0);
+        }
+
+        let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+        if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            for j in 0..p_eff {
+                let mut e_j = Array1::<f64>::zeros(p_eff);
+                e_j[j] = 1.0;
+                h_inv_diag[j] = chol.solvevec(&e_j)[j];
+            }
+        } else {
+            let (evals, evecs) = h_eff_eval
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = 1e-12;
+            for j in 0..p_eff {
+                let mut acc = 0.0;
+                for k in 0..evals.len() {
+                    let ev = evals[k];
+                    if ev > floor {
+                        let u = evecs[[j, k]];
+                        acc += (u * u) / ev;
+                    }
+                }
+                h_inv_diag[j] = acc;
+            }
+        }
+
+        let third_deriv = if let Some(z) = free_basis_opt {
+            let mut out = Array1::<f64>::zeros(z.ncols());
+            for j in 0..z.ncols() {
+                let xz_col = pirls_result
+                    .x_transformed
+                    .matrixvectormultiply(&z.column(j).to_owned());
+                out[j] = d_vec
+                    .iter()
+                    .zip(xz_col.iter())
+                    .map(|(&d, &x)| d * x * x * x)
+                    .sum();
+            }
+            out
+        } else {
+            self.third_derivative_projection_from_design(&pirls_result.x_transformed, &d_vec)?
+        };
+
+        let correction = -h_inv_diag
+            .iter()
+            .zip(third_deriv.iter())
+            .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
+            .sum::<f64>()
+            / 6.0;
+        if correction.is_finite() {
+            Ok(correction)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
         // Keep expensive diagnostics out of the hot path unless they can
         // be surfaced. This has zero effect on optimization math.
@@ -1593,8 +1705,14 @@ impl<'a> RemlState<'a> {
                 let p_eff_dim = h_eff.ncols();
                 let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
+                let tk_correction = self.tierney_kadane_laml_correction(
+                    pirls_result,
+                    &h_eff_eval,
+                    free_basis_opt.as_ref(),
+                )?;
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
-                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
+                    + tk_correction;
 
                 // Diagnostics below are expensive and not needed for objective value.
                 let (edf, trace_h_inv_s_lambda, stab_cond) = if want_hot_diag {
