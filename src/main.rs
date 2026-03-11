@@ -12276,8 +12276,8 @@ mod tests {
     /// constrained PIRLS fitting.  The user never specifies a penalty — REML
     /// picks it automatically.
     ///
-    /// Currently fails because PIRLS cannot converge on the small,
-    /// underdetermined I-spline problem that REML produces.
+    /// Exercises the PIRLS eta-guard and stall-detection on a small,
+    /// underdetermined I-spline survival problem.
     #[test]
     fn survival_integration_small_dataset_converges() {
         let dir = tempdir().expect("tempdir");
