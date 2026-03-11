@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::linalg::utils::{default_slq_parameters, stochastic_lanczos_logdet_spd};
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
@@ -476,6 +476,97 @@ impl WorkingModelSurvival {
         }
     }
 
+    /// Compute the full p×p Hessian contribution for the interval terms:
+    ///   H = X_exit^T diag(w_exit) X_exit - X_entry^T diag(w_entry) X_entry
+    /// using faer-accelerated BLAS on the stored design matrix blocks.
+    fn interval_hessian_blas(
+        &self,
+        w_exit: &Array1<f64>,
+        w_entry: &Array1<f64>,
+    ) -> Array2<f64> {
+        match &self.design {
+            SurvivalDesign::Flat {
+                x_entry, x_exit, ..
+            } => {
+                let mut h = fast_xt_diag_x(x_exit, w_exit);
+                h -= &fast_xt_diag_x(x_entry, w_entry);
+                h
+            }
+            SurvivalDesign::TimeCovariateShared {
+                time_entry,
+                time_exit,
+                covariates,
+                ..
+            } => {
+                let p_time = time_exit.ncols();
+                let p_cov = covariates.ncols();
+                let p = p_time + p_cov;
+                let mut h = Array2::<f64>::zeros((p, p));
+                // time-time block: T_exit^T W_exit T_exit - T_entry^T W_entry T_entry
+                let tt = {
+                    let mut block = fast_xt_diag_x(time_exit, w_exit);
+                    block -= &fast_xt_diag_x(time_entry, w_entry);
+                    block
+                };
+                h.slice_mut(ndarray::s![..p_time, ..p_time]).assign(&tt);
+                if p_cov > 0 {
+                    // time-cov block: T_exit^T W_exit C - T_entry^T W_entry C
+                    let tc = {
+                        let mut block = fast_xt_diag_y(time_exit, w_exit, covariates);
+                        block -= &fast_xt_diag_y(time_entry, w_entry, covariates);
+                        block
+                    };
+                    h.slice_mut(ndarray::s![..p_time, p_time..]).assign(&tc);
+                    h.slice_mut(ndarray::s![p_time.., ..p_time]).assign(&tc.t());
+                    // cov-cov block: C^T (W_exit - W_entry) C
+                    let w_diff = w_exit - w_entry;
+                    let cc = fast_xt_diag_x(covariates, &w_diff);
+                    h.slice_mut(ndarray::s![p_time.., p_time..]).assign(&cc);
+                }
+                h
+            }
+        }
+    }
+
+    /// Compute the gradient contribution for the interval terms:
+    ///   grad = X_exit^T w_exit_grad - X_entry^T w_entry_grad
+    fn interval_gradient_blas(
+        &self,
+        w_exit_grad: &Array1<f64>,
+        w_entry_grad: &Array1<f64>,
+    ) -> Array1<f64> {
+        match &self.design {
+            SurvivalDesign::Flat {
+                x_entry, x_exit, ..
+            } => {
+                let mut g = fast_atv(x_exit, w_exit_grad);
+                g -= &fast_atv(x_entry, w_entry_grad);
+                g
+            }
+            SurvivalDesign::TimeCovariateShared {
+                time_entry,
+                time_exit,
+                covariates,
+                ..
+            } => {
+                let p_time = time_exit.ncols();
+                let p_cov = covariates.ncols();
+                let mut g = Array1::<f64>::zeros(p_time + p_cov);
+                {
+                    let mut gt = fast_atv(time_exit, w_exit_grad);
+                    gt -= &fast_atv(time_entry, w_entry_grad);
+                    g.slice_mut(ndarray::s![..p_time]).assign(&gt);
+                }
+                if p_cov > 0 {
+                    let w_diff = w_exit_grad - w_entry_grad;
+                    g.slice_mut(ndarray::s![p_time..])
+                        .assign(&fast_atv(covariates, &w_diff));
+                }
+                g
+            }
+        }
+    }
+
     fn stabilized_structural_derivative(&self, deriv: f64) -> Option<f64> {
         const STRUCTURAL_MONO_ROUNDOFF_TOL: f64 = 1e-7;
         if !self.structurally_monotonic {
@@ -533,7 +624,10 @@ impl WorkingModelSurvival {
 
     fn derivative_guard(&self) -> f64 {
         if self.structurally_monotonic {
-            return 1e-12;
+            // I-spline basis is monotone by construction when coefficients ≥ 0.
+            // A derivative of zero (flat hazard) is valid, so the guard only
+            // rejects genuinely negative derivatives from floating-point noise.
+            return 0.0;
         }
         self.monotonicity.tolerance.max(0.0)
     }
@@ -541,7 +635,9 @@ impl WorkingModelSurvival {
     fn derivative_guard_numerical(&self) -> f64 {
         let derivative_guard = self.derivative_guard();
         if derivative_guard <= 0.0 {
-            0.0
+            // For structural monotonicity (guard = 0), allow tiny negative
+            // values from floating-point arithmetic.
+            -1e-10
         } else {
             (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12)
         }
@@ -905,16 +1001,18 @@ impl WorkingModelSurvival {
         let derivative_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
 
         let mut nll = 0.0;
-        let mut grad = Array1::<f64>::zeros(p);
-        let mut h = Array2::<f64>::zeros((p, p));
         let mut w_event = Array1::<f64>::zeros(n);
         let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
         let mut w_event_outer = Array1::<f64>::zeros(n);
+        // Per-observation weights for the BLAS Hessian/gradient:
+        //   w_exit[i]  = sampleweight * exp(eta_exit)
+        //   w_entry[i] = sampleweight * exp(eta_entry)  (0 when entry is at origin)
+        let mut w_hess_exit = Array1::<f64>::zeros(n);
+        let mut w_hess_entry = Array1::<f64>::zeros(n);
 
         let derivative_guard = self.derivative_guard();
         let derivative_guard_numerical = self.derivative_guard_numerical();
-        let mut row_exit = vec![0.0_f64; p];
-        let mut row_entry = vec![0.0_f64; p];
+        // Phase 1: Scalar loop — compute per-observation weights, NLL, validation.
         for i in 0..n {
             let w = self.sampleweight[i];
             if w <= 0.0 {
@@ -969,23 +1067,22 @@ impl WorkingModelSurvival {
             }
             nll += w * interval;
 
-            self.fill_exit_row(i, &mut row_exit);
-            self.fill_entry_row(i, &mut row_entry);
-            for r in 0..p {
-                let interval_grad_r = Self::scaled_exp_component(
-                    interval_scale,
-                    h_e_scaled * row_exit[r] - h_s_scaled * row_entry[r],
-                )?;
-                grad[r] += w * interval_grad_r;
-                for c in 0..p {
-                    let interval_h_rc = Self::scaled_exp_component(
-                        interval_scale,
-                        h_e_scaled * row_exit[r] * row_exit[c]
-                            - h_s_scaled * row_entry[r] * row_entry[c],
-                    )?;
-                    h[[r, c]] += w * interval_h_rc;
-                }
+            // Per-observation weights for BLAS phase.
+            // scaled_exp_component(interval_scale, h_e_scaled * x[r]) = exp(interval_scale) * h_e_scaled * x[r]
+            // so the Hessian weight is w * exp(interval_scale) * h_e_scaled = w * exp(eta_exit).
+            let w_exit_i = w * eta_exit[i].exp();
+            let w_entry_i = if has_entry_interval {
+                w * eta_entry[i].exp()
+            } else {
+                0.0
+            };
+            if !w_exit_i.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "survival interval term exceeds f64 range at row {i} (w*exp(eta_exit)={w_exit_i:.3e})"
+                )));
             }
+            w_hess_exit[i] = w_exit_i;
+            w_hess_entry[i] = w_entry_i;
 
             if d > 0.0 {
                 let inv_deriv = 1.0 / deriv;
@@ -995,6 +1092,12 @@ impl WorkingModelSurvival {
                 w_event_outer[i] = w * inv_deriv * inv_deriv;
             }
         }
+
+        // Phase 2: BLAS-accelerated Hessian and gradient via faer.
+        //   H_interval = X_exit^T diag(w_exit) X_exit - X_entry^T diag(w_entry) X_entry
+        //   grad_interval = X_exit^T w_exit - X_entry^T w_entry
+        let mut h = self.interval_hessian_blas(&w_hess_exit, &w_hess_entry);
+        let mut grad = self.interval_gradient_blas(&w_hess_exit, &w_hess_entry);
 
         grad -= &self.exit_transpose_vector_multiply(&w_event);
         grad -= &self.derivative_transpose_vector_multiply(&w_event_inv_deriv);
@@ -2215,7 +2318,8 @@ mod tests {
         assert_eq!(constraints.a.nrows(), 1);
         assert_eq!(constraints.a.ncols(), 1);
         assert!((constraints.a[[0, 0]] - 1.0).abs() <= 1e-12);
-        assert!((constraints.b[0] - 1e-12).abs() <= 1e-18);
+        // Structural monotonicity uses derivative_guard() == 0.0
+        assert!(constraints.b[0].abs() <= 1e-12);
         let state = model
             .update_state(&array![1e-6])
             .expect("small positive derivative coefficient should remain feasible");
@@ -2337,7 +2441,8 @@ mod tests {
         assert_eq!(constraints.a.ncols(), 3);
         assert_eq!(constraints.a.row(0).to_vec(), vec![0.3, 0.2, 0.0]);
         assert_eq!(constraints.a.row(1).to_vec(), vec![0.4, 0.1, 0.0]);
-        assert!(constraints.b.iter().all(|&v| (v - 1e-12).abs() <= 1e-18));
+        // Structural monotonicity uses derivative_guard() == 0.0
+        assert!(constraints.b.iter().all(|&v| v.abs() <= 1e-12));
     }
 
     #[test]
