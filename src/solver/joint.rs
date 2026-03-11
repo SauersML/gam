@@ -356,6 +356,8 @@ pub struct JointModelResult {
     /// Ridge stabilization used in the final IRLS solve.
     /// Included in the cost function as 0.5*δ||β||² to satisfy the Envelope Theorem.
     pub ridge_used: f64,
+    /// Posterior covariance for base coefficients: (X'W_eff X + S_λ)^{-1}
+    pub beta_base_covariance: Option<Array2<f64>>,
 }
 
 impl<'a> JointModelState<'a> {
@@ -2926,20 +2928,99 @@ impl<'a> JointRemlState<'a> {
     }
 
     /// Extract final result after optimization
-    pub fn into_result(self) -> JointModelResult {
+    pub fn into_result(mut self) -> JointModelResult {
         let cached_edf = self.eval.cached_edf;
         let cached_iters = self.eval.last_backfit_iterations;
         let cached_converged = self.eval.last_converged;
-        let state = self.core.state;
+        let state = &mut self.core.state;
         let rho = state.rho.clone();
         let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
         let knot_vector = state
             .knot_vector
             .clone()
             .unwrap_or_else(|| Array1::zeros(0));
-        let bwiggle = state.build_link_basis_from_state(&state.base_linear_predictor());
-        let eta = state.compute_eta_full(&state.base_linear_predictor(), &bwiggle);
+        let u = state.base_linear_predictor();
+        let bwiggle = state.build_link_basis_from_state(&u);
+        let eta = state.compute_eta_full(&u, &bwiggle);
         let deviance = state.recompute_deviance_from_eta(&eta);
+
+        // Compute base-coefficient covariance: (X' W_eff X + S_λ + δI)^{-1}
+        // where W_eff = w_glm * g_prime^2, accounting for the chain rule through
+        // the link wiggle.
+        let beta_base_covariance = (|| -> Option<Array2<f64>> {
+            use crate::faer_ndarray::{FaerCholesky, fast_ata};
+            use faer::Side;
+
+            let n = state.nobs();
+            let p = state.x_base.ncols();
+            if p == 0 {
+                return None;
+            }
+
+            // Compute GLM working weights at converged eta
+            let mut mu = Array1::<f64>::zeros(n);
+            let mut w_glm = Array1::<f64>::zeros(n);
+            let mut z_glm = Array1::<f64>::zeros(n);
+            crate::pirls::update_glmvectors(
+                state.y,
+                &eta,
+                &InverseLink::Standard(state.link.clone()),
+                state.weights,
+                &mut mu,
+                &mut w_glm,
+                &mut z_glm,
+                None,
+            )
+            .ok()?;
+
+            // Compute link derivative g'(u) = 1 + B'(u) · θ
+            let g_prime = compute_link_derivative_from_state(state, &u, &bwiggle);
+
+            // Effective weights: w_eff_i = w_glm_i * g'(u_i)^2
+            let w_eff = &w_glm * &(&g_prime * &g_prime);
+
+            // Build X' diag(w_eff) X via sqrt-weighted design
+            let mut x_weighted = state.x_base.to_owned();
+            let sqrt_w = w_eff.mapv(|wi| wi.max(0.0).sqrt());
+            ndarray::Zip::from(x_weighted.rows_mut())
+                .and(sqrt_w.view())
+                .for_each(|mut row, &wi| row *= wi);
+            let mut h = fast_ata(&x_weighted);
+
+            // Add penalty: S_λ = Σ λ_k S_k
+            let penalty_layout = JointPenaltyLayout::for_state(state);
+            let (lambda_base, _) = penalty_layout.lambdas(&rho);
+            for (idx, s_k) in state.s_base.iter().enumerate() {
+                let lam = lambda_base.get(idx).cloned().unwrap_or(0.0);
+                if s_k.nrows() == p && s_k.ncols() == p && lam > 0.0 {
+                    h.scaled_add(lam, s_k);
+                }
+            }
+
+            // Add ridge stabilization matching what was used in the fit
+            if state.ridge_base_used > 0.0 {
+                for i in 0..p {
+                    h[[i, i]] += state.ridge_base_used;
+                }
+            }
+
+            // Invert via Cholesky
+            match h.cholesky(Side::Lower) {
+                Ok(chol) => {
+                    let eye = Array2::<f64>::eye(p);
+                    let cov = chol.solve_mat(&eye);
+                    // Verify all finite
+                    if cov.iter().all(|v: &f64| v.is_finite()) {
+                        Some(cov)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        })();
+
+        let state = self.core.state;
         JointModelResult {
             beta_base: state.beta_base,
             beta_link: state.beta_link,
@@ -2959,6 +3040,7 @@ impl<'a> JointRemlState<'a> {
                 Array2::zeros((state.n_constrained_basis, state.n_constrained_basis))
             }),
             ridge_used: state.ridge_used,
+            beta_base_covariance,
         }
     }
 }
@@ -3561,6 +3643,7 @@ mod tests {
             link: LinkFunction::Logit,
             s_link_constrained: Array2::eye(num_basis),
             ridge_used: 0.0,
+            beta_base_covariance: None,
         };
 
         // Test with base eta values
@@ -3616,6 +3699,7 @@ mod tests {
             link: LinkFunction::Logit,
             s_link_constrained: Array2::eye(num_basis),
             ridge_used: 0.0,
+            beta_base_covariance: None,
         };
 
         let eta_base = Array1::from_vec(vec![0.0, 1.0, 2.0]);
@@ -3653,6 +3737,7 @@ mod tests {
             link: LinkFunction::Sas,
             s_link_constrained: Array2::eye(num_basis),
             ridge_used: 0.0,
+            beta_base_covariance: None,
         };
         let eta_base = Array1::zeros(2);
         match predict_joint(&result, &eta_base, None) {

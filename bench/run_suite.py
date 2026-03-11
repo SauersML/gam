@@ -4571,8 +4571,23 @@ def _feature_should_be_smooth(ds: dict, col: str) -> bool:
 def _sigma_feature_terms(ds: dict, *, scenario_name: str | None, backend: str) -> list[str]:
     knot_count = _scenario_knot_count(scenario_name)
     knot_expr = f"max(1, min({knot_count}, nrow(train_df)-1))"
-    mgcv_k = f"min({knot_count + 4}, nrow(train_df)-1)"
-    brms_k = str(knot_count)
+    # For gaulss-type models the sigma smooths share DoF budget with the mu
+    # smooths.  Cap per-smooth k so that total basis (mu + sigma) stays below
+    # ~80% of training rows.  Assumes mu has roughly the same number of
+    # smooths as sigma (common case).
+    n_sigma_smooth = sum(
+        1 for col in [str(c) for c in ds.get("features", [])]
+        if _feature_should_be_smooth(ds, col)
+    )
+    gaulss_total = 2 * max(1, n_sigma_smooth)
+    mgcv_k = (
+        f"min({knot_count + 4}, "
+        f"max(4L, as.integer(floor(nrow(train_df) * 0.8 / {gaulss_total}))))"
+    )
+    brms_k = (
+        f"min({knot_count}, "
+        f"max(4L, as.integer(floor(nrow(train_df) * 0.8 / {gaulss_total}))))"
+    )
     terms: list[str] = []
     for col in [str(c) for c in ds.get("features", [])]:
         if _feature_should_be_smooth(ds, col):
@@ -5252,6 +5267,21 @@ def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list
     rust_cfg = _rust_fit_mapping(scenario["name"])
     use_select = bool((rust_cfg or {}).get("double_penalty", True))
 
+    # For gaulss, cap the mu formula k values too so the combined mu + sigma
+    # basis stays within the training-set budget.  The sigma formula already
+    # has the same cap (see _sigma_feature_terms).  Only kicks in for small
+    # datasets; for large datasets the cap is above the configured k.
+    n_smooth_features = sum(
+        1 for c in ds.get("features", []) if _feature_should_be_smooth(ds, str(c))
+    )
+    gaulss_total = 2 * max(1, n_smooth_features)
+    gaulss_k_cap = f"max(4L, as.integer(floor(nrow(train_df) * 0.8 / {gaulss_total})))"
+    mu_formula = re.sub(
+        r"k=min\((\d+),\s*nrow\(train_df\)-1\)",
+        rf"k=min(\1, {gaulss_k_cap})",
+        mu_formula,
+    )
+
     with _workspace_tempdir(prefix="gam_bench_mgcv_gaulss_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
@@ -5766,6 +5796,18 @@ def _bamlss_formulas_for_scenario(scenario_name: str, ds):
     mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None, None
+    # Cap mu formula k for combined location-scale models (same logic as
+    # run_external_mgcv_gaulss_cv) so total basis stays within nrow budget.
+    n_smooth_features = sum(
+        1 for c in ds.get("features", []) if _feature_should_be_smooth(ds, str(c))
+    )
+    gaulss_total = 2 * max(1, n_smooth_features)
+    gaulss_k_cap = f"max(4L, as.integer(floor(nrow(train_df) * 0.8 / {gaulss_total})))"
+    mu_formula = re.sub(
+        r"k=min\((\d+),\s*nrow\(train_df\)-1\)",
+        rf"k=min(\1, {gaulss_k_cap})",
+        mu_formula,
+    )
     sigma_formula = _sigma_feature_formula(ds, scenario_name=scenario_name, backend="bamlss")
     return mu_formula, sigma_formula
 
@@ -5776,6 +5818,17 @@ def _brms_formulas_for_scenario(scenario_name: str, ds):
     mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None, None
+    # Cap mu formula k for location-scale models (same as mgcv gaulss / bamlss).
+    n_smooth_features = sum(
+        1 for c in ds.get("features", []) if _feature_should_be_smooth(ds, str(c))
+    )
+    gaulss_total = 2 * max(1, n_smooth_features)
+    gaulss_k_cap = f"max(4L, as.integer(floor(nrow(train_df) * 0.8 / {gaulss_total})))"
+    mu_formula = re.sub(
+        r"k=min\((\d+),\s*nrow\(train_df\)-1\)",
+        rf"k=min(\1, {gaulss_k_cap})",
+        mu_formula,
+    )
     sigma_formula = _sigma_feature_formula(ds, scenario_name=scenario_name, backend="brms")
     return mu_formula, sigma_formula
 
