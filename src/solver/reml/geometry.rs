@@ -138,6 +138,22 @@ impl<'a> RemlState<'a> {
                 let phi = 1.0;
                 let laml = penalised_ll + 0.5 * sparse.logdet_s_pos - 0.5 * sparse.logdet_h
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+
+                // Tierney-Kadane third-order skew correction on the sparse-exact path.
+                // Use ∂³ℓ/∂η³ = -c from PIRLS, map to coefficient-wise third derivative via
+                // Σ_i (∂³ℓ/∂η_i³) X_{ij}³, then apply κ3_j = -[H^{-1}]_{jj}^3 * ∂³ℓ/∂β_j³.
+                let third_ll_eta = pirls_result.solve_c_array.mapv(|v| -v);
+                let third_beta = self.sparse_cube_transpose_times(self.x(), &third_ll_eta)?;
+                let p_dim = sparse.h_sparse.ncols();
+                let identity = Array2::<f64>::eye(p_dim);
+                let h_inv = solve_sparse_spdmulti(&sparse.factor, &identity)?;
+                let h_inv_diag = h_inv.diag().to_owned();
+                let mut tk_sum = 0.0;
+                for j in 0..p_dim {
+                    let v = h_inv_diag[j];
+                    tk_sum += -(v * v * v) * third_beta[j];
+                }
+                let laml = laml + tk_sum / 6.0;
                 Ok(-laml + priorcost)
             }
         }

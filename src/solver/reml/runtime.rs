@@ -4,6 +4,87 @@ use crate::linalg::utils::StableSolver;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 
 impl<'a> RemlState<'a> {
+    fn sparse_cube_transpose_times(
+        &self,
+        design: &DesignMatrix,
+        weights: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if design.nrows() != weights.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "sparse cube transpose multiply mismatch: X has {} rows, weights has {}",
+                design.nrows(),
+                weights.len()
+            )));
+        }
+        match design {
+            DesignMatrix::Dense(x) => {
+                let mut out = Array1::<f64>::zeros(x.ncols());
+                for j in 0..x.ncols() {
+                    let mut acc = 0.0;
+                    for i in 0..x.nrows() {
+                        let xij = x[[i, j]];
+                        acc += weights[i] * xij * xij * xij;
+                    }
+                    out[j] = acc;
+                }
+                Ok(out)
+            }
+            DesignMatrix::Sparse(xs) => {
+                let mut out = Array1::<f64>::zeros(xs.ncols());
+                let (symbolic, values) = xs.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..xs.ncols() {
+                    let mut acc = 0.0;
+                    for idx in col_ptr[col]..col_ptr[col + 1] {
+                        let row = row_idx[idx];
+                        let xij = values[idx];
+                        acc += weights[row] * xij * xij * xij;
+                    }
+                    out[col] = acc;
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    pub(super) fn tierney_kadane_laml_correction_dense(
+        &self,
+        design: &DesignMatrix,
+        h_spd: &Array2<f64>,
+        third_ll_eta: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        if h_spd.nrows() != h_spd.ncols() {
+            return Err(EstimationError::LayoutError(format!(
+                "Tierney-Kadane correction requires square H, got {}x{}",
+                h_spd.nrows(),
+                h_spd.ncols()
+            )));
+        }
+        if design.ncols() != h_spd.ncols() {
+            return Err(EstimationError::LayoutError(format!(
+                "Tierney-Kadane correction dimension mismatch: X has {} columns, H has {}",
+                design.ncols(),
+                h_spd.ncols()
+            )));
+        }
+
+        let chol = h_spd
+            .cholesky(Side::Lower)
+            .map_err(|_| EstimationError::FactorizationFailed)?;
+        let identity = Array2::<f64>::eye(h_spd.nrows());
+        let h_inv = chol.solve_mat(&identity);
+        let h_inv_diag = h_inv.diag().to_owned();
+
+        let third_beta = self.sparse_cube_transpose_times(design, third_ll_eta)?;
+        let mut accum = 0.0;
+        for j in 0..third_beta.len() {
+            let v = h_inv_diag[j];
+            accum += -(v * v * v) * third_beta[j];
+        }
+        Ok(accum / 6.0)
+    }
+
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
         // Keep expensive diagnostics out of the hot path unless they can
         // be surfaced. This has zero effect on optimization math.
@@ -1595,6 +1676,19 @@ impl<'a> RemlState<'a> {
 
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+
+                // Tierney-Kadane third-order skew correction:
+                //   + (1/6) Σ_j κ3_j,   κ3_j = -[H^{-1}]_{jj}^3 * ∂^3ℓ/∂β_j^3.
+                // PIRLS already provides c_i = dW_i/dη_i = -ℓ'''_i, so ℓ''' = -c.
+                // We therefore use third_ll_eta = -c and accumulate
+                // ∂^3ℓ/∂β_j^3 = Σ_i third_ll_eta_i * X_{ij}^3.
+                let third_ll_eta = pirls_result.solve_c_array.mapv(|v| -v);
+                let tk_correction = self.tierney_kadane_laml_correction_dense(
+                    &pirls_result.x_transformed,
+                    h_eff,
+                    &third_ll_eta,
+                )?;
+                let laml = laml + tk_correction;
 
                 // Diagnostics below are expensive and not needed for objective value.
                 let (edf, trace_h_inv_s_lambda, stab_cond) = if want_hot_diag {
