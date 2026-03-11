@@ -1,5 +1,5 @@
 use super::*;
-use crate::matrix::{DenseRightProductView, DenseRowScaledView, LinearOperator};
+use crate::matrix::{DenseRightProductView, DenseRowScaledView};
 
 struct JointHyperThetaBlocks<'a> {
     theta: &'a Array1<f64>,
@@ -51,7 +51,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<Vec<(usize, Array2<f64>)>, EstimationError> {
         let mut out: Vec<(usize, Array2<f64>)> = base
             .iter()
-            .map(|component| (component.penalty_index, component.matrix.clone()))
+            .map(|component| (component.penalty_index, component.matrix.materialize()))
             .collect();
         if let Some(extra_components) = extra {
             for component in extra_components {
@@ -68,11 +68,11 @@ impl<'a> RemlState<'a> {
                     .iter_mut()
                     .find(|(penalty_index, _)| *penalty_index == component.penalty_index)
                 {
-                    existing.scaled_add(scale, &component.matrix);
+                    existing.scaled_add(scale, &component.matrix.materialize());
                 } else {
                     out.push((
                         component.penalty_index,
-                        component.matrix.mapv(|v| scale * v),
+                        component.matrix.materialize().mapv(|v| scale * v),
                     ));
                 }
             }
@@ -88,11 +88,11 @@ impl<'a> RemlState<'a> {
         let psi_dim = hyper_dirs.len();
         let mut out = Vec::with_capacity(psi_dim);
         for j in 0..psi_dim {
-            let mut x_j = hyper_dirs[j].x_tau_original.clone();
+            let mut x_j = hyper_dirs[j].x_tau_dense();
             let mut s_j = hyper_dirs[j]
                 .penalty_first_components()
                 .iter()
-                .map(|component| (component.penalty_index, component.matrix.clone()))
+                .map(|component| (component.penalty_index, component.matrix.materialize()))
                 .collect::<Vec<_>>();
             for i in 0..psi_dim {
                 let amp = psi[i];
@@ -100,7 +100,7 @@ impl<'a> RemlState<'a> {
                     continue;
                 }
                 if let Some(x_ji) = Self::get_pairwisesecond_derivative(hyper_dirs, j, i, true) {
-                    x_j.scaled_add(amp, x_ji);
+                    x_j.scaled_add(amp, &x_ji);
                 }
                 let extra = hyper_dirs[j].penaltysecond_components_for(i).or_else(|| {
                     hyper_dirs
@@ -190,46 +190,31 @@ impl<'a> RemlState<'a> {
     ) -> Vec<PenaltyDerivativeComponent> {
         components
             .iter()
-            .map(|component| {
-                let mut transformed = qs.t().dot(&component.matrix).dot(qs);
-                if let Some(z) = free_basis_opt {
-                    transformed = z.t().dot(&transformed).dot(z);
-                }
-                PenaltyDerivativeComponent {
-                    penalty_index: component.penalty_index,
-                    matrix: transformed,
-                }
+            .map(|component| PenaltyDerivativeComponent {
+                penalty_index: component.penalty_index,
+                matrix: HyperPenaltyDerivative::from(
+                    component
+                        .matrix
+                        .transformed(qs, free_basis_opt)
+                        .expect("valid transformed hyper penalty component"),
+                ),
             })
             .collect()
     }
 
-    fn get_pairwisesecond_derivative<'b>(
-        hyper_dirs: &'b [DirectionalHyperParam],
+    fn get_pairwisesecond_derivative(
+        hyper_dirs: &[DirectionalHyperParam],
         i: usize,
         j: usize,
         x_term: bool,
-    ) -> Option<&'b Array2<f64>> {
-        let from_i = if x_term {
-            hyper_dirs
-                .get(i)
-                .and_then(|d| d.x_tau_tau_original.as_ref())
-                .and_then(|v| v.get(j))
-                .and_then(|mat| mat.as_ref())
-        } else {
-            None
-        };
-        if from_i.is_some() {
-            return from_i;
+    ) -> Option<Array2<f64>> {
+        if !x_term {
+            return None;
         }
-        if x_term {
-            hyper_dirs
-                .get(j)
-                .and_then(|d| d.x_tau_tau_original.as_ref())
-                .and_then(|v| v.get(i))
-                .and_then(|mat| mat.as_ref())
-        } else {
-            None
-        }
+        hyper_dirs
+            .get(i)
+            .and_then(|d| d.x_tau_tau_nth_dense(j))
+            .or_else(|| hyper_dirs.get(j).and_then(|d| d.x_tau_tau_nth_dense(i)))
     }
 
     pub(super) fn validate_joint_hyper_inputs(
@@ -349,7 +334,13 @@ impl<'a> RemlState<'a> {
             false
         });
         let mut x_mod_dense = if has_design_drift {
-            Some(self.x().to_dense_arc().as_ref().clone())
+            Some(
+                self.x()
+                    .try_to_dense_arc("perturbed REML state requires dense design for design drift")
+                    .map_err(EstimationError::InvalidInput)?
+                    .as_ref()
+                    .clone(),
+            )
         } else {
             None
         };
@@ -399,7 +390,7 @@ impl<'a> RemlState<'a> {
                 if let Some(x_ij) = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true)
                     && let Some(x_mod) = x_mod_dense.as_mut()
                 {
-                    x_mod.scaled_add(amp, x_ij);
+                    x_mod.scaled_add(amp, &x_ij);
                 }
                 let second_components =
                     Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
@@ -604,16 +595,16 @@ impl<'a> RemlState<'a> {
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         let mut rs_eval = reparam_result.rs_transformed.clone();
-        let x_eval_dense = pirls_result.x_transformed.to_dense_arc();
+        let x_eval_dense = pirls_result
+            .x_transformed
+            .try_to_dense_arc("exact tau directional calculus requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
         let x_eval = DenseRightProductView::new(x_eval_dense.as_ref())
             .with_optional_factor(free_basis_opt.as_ref())
             .materialize();
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
-        let x_tau_t = DenseRightProductView::new(&hyper_dir.x_tau_original)
-            .with_factor(&reparam_result.qs)
-            .with_optional_factor(free_basis_opt.as_ref())
-            .materialize();
+        let x_tau_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
 
         if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
@@ -1001,7 +992,10 @@ impl<'a> RemlState<'a> {
         let free_basis_opt = pert_state.active_constraint_free_basis(pirls_result);
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
-        let x_eval_dense = pirls_result.x_transformed.to_dense_arc();
+        let x_eval_dense = pirls_result
+            .x_transformed
+            .try_to_dense_arc("exact tau/tau calculus requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
         let x_eval = DenseRightProductView::new(x_eval_dense.as_ref())
             .with_optional_factor(free_basis_opt.as_ref())
             .materialize();
@@ -1013,19 +1007,20 @@ impl<'a> RemlState<'a> {
             h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
         }
         let transform_x_tau = |dir: &DirectionalHyperParam| -> Array2<f64> {
-            DenseRightProductView::new(&dir.x_tau_original)
-                .with_factor(&reparam_result.qs)
-                .with_optional_factor(free_basis_opt.as_ref())
-                .materialize()
+            dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())
+                .expect("valid transformed X_tau in exact tau/tau path")
         };
         let transform_x_tau_tau = |i: usize, j: usize| -> Option<Array2<f64>> {
-            let x_ij = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true)?;
-            Some(
-                DenseRightProductView::new(&x_ij)
-                    .with_factor(&reparam_result.qs)
-                    .with_optional_factor(free_basis_opt.as_ref())
-                    .materialize(),
-            )
+            hyper_dirs[i]
+                .transformed_x_tau_tau_at(j, &reparam_result.qs, free_basis_opt.as_ref())
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    hyper_dirs[j]
+                        .transformed_x_tau_tau_at(i, &reparam_result.qs, free_basis_opt.as_ref())
+                        .ok()
+                        .flatten()
+                })
         };
 
         let p_dim = beta_eval.len();
@@ -1266,8 +1261,8 @@ impl<'a> RemlState<'a> {
             )? {
                 DirectionalWorkingCurvature::Diagonal(diag) => diag,
             };
-            let mut h_j = x_tau_j.t().dot(&Self::row_scale(&x_eval, w_diag));
-            h_j += &x_eval.t().dot(&Self::row_scale(&x_tau_j, w_diag));
+            let mut h_j = Self::weighted_cross(&x_tau_j, &x_eval, w_diag);
+            h_j += &Self::weighted_cross(&x_eval, &x_tau_j, w_diag);
             h_j += &Self::xt_diag_x_dense_into(&x_eval, &w_tau_j, &mut weighted);
             h_j += &a_tau[j];
             if let Some(op) = firth_op.as_ref() {
@@ -1399,31 +1394,15 @@ impl<'a> RemlState<'a> {
 
                 let mut h_ij = Array2::<f64>::zeros((p_dim, p_dim));
                 if let Some(xij) = x_tau_tau_ij.as_ref() {
-                    h_ij += &xij
-                        .t()
-                        .dot(&DenseRowScaledView::new(&x_eval, w_diag).materialize());
-                    h_ij += &x_eval
-                        .t()
-                        .dot(&DenseRowScaledView::new(xij, w_diag).materialize());
+                    h_ij += &Self::weighted_cross(xij, &x_eval, w_diag);
+                    h_ij += &Self::weighted_cross(&x_eval, xij, w_diag);
                 }
-                h_ij += &x_tau_i
-                    .t()
-                    .dot(&DenseRowScaledView::new(&x_eval, &diag_j).materialize());
-                h_ij += &x_eval
-                    .t()
-                    .dot(&DenseRowScaledView::new(&x_tau_i, &diag_j).materialize());
-                h_ij += &x_tau_i.t().dot(
-                    &DenseRowScaledView::new(&x_tau_j, &pirls_result.solveweights).materialize(),
-                );
-                h_ij += &x_tau_j.t().dot(
-                    &DenseRowScaledView::new(&x_tau_i, &pirls_result.solveweights).materialize(),
-                );
-                h_ij += &x_tau_j
-                    .t()
-                    .dot(&DenseRowScaledView::new(&x_eval, &diag_i).materialize());
-                h_ij += &x_eval
-                    .t()
-                    .dot(&DenseRowScaledView::new(&x_tau_j, &diag_i).materialize());
+                h_ij += &Self::weighted_cross(&x_tau_i, &x_eval, &diag_j);
+                h_ij += &Self::weighted_cross(&x_eval, &x_tau_i, &diag_j);
+                h_ij += &Self::weighted_cross(&x_tau_i, &x_tau_j, &pirls_result.solveweights);
+                h_ij += &Self::weighted_cross(&x_tau_j, &x_tau_i, &pirls_result.solveweights);
+                h_ij += &Self::weighted_cross(&x_tau_j, &x_eval, &diag_i);
+                h_ij += &Self::weighted_cross(&x_eval, &x_tau_j, &diag_i);
                 h_ij += &Self::xt_diag_x_dense_into(&x_eval, &diag_ij, &mut weighted);
                 if let Some(aij) = a_tau_tau[i][j].as_ref() {
                     h_ij += aij;
@@ -1603,15 +1582,18 @@ impl<'a> RemlState<'a> {
         let mut x_transformed_eval = pirls_result.x_transformed.clone();
         let mut e_eval = reparam_result.e_transformed.clone();
 
-        let x_psi_t = DenseRightProductView::new(&hyper_dir.x_tau_original)
-            .with_factor(&reparam_result.qs)
-            .with_optional_factor(free_basis_opt.as_ref());
+        let x_psi_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
 
         if let Some(z) = free_basis_opt.as_ref() {
             h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
             h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
-            let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
+            let x_dense_arc = pirls_result
+                .x_transformed
+                .try_to_dense_arc(
+                    "directional hyper-gradient with active constraints requires dense transformed design",
+                )
+                .map_err(EstimationError::InvalidInput)?;
             x_transformed_eval = DesignMatrix::Dense(
                 DenseRightProductView::new(x_dense_arc.as_ref())
                     .with_factor(z)
@@ -1658,7 +1640,9 @@ impl<'a> RemlState<'a> {
             )));
         }
         let s_psi_total_t = s_psi_t.clone();
-        let x_dense_arc = x_transformed_eval.to_dense_arc();
+        let x_dense_arc = x_transformed_eval
+            .try_to_dense_arc("exact directional hyper-gradient requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
         let x_dense = x_dense_arc.as_ref();
         let firth_op = if firth_logit_active {
             if let Some(cached) = bundle.firth_dense_operator.as_ref() {
@@ -1789,7 +1773,7 @@ impl<'a> RemlState<'a> {
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // `u` is the current predictor-space score contribution g pulled through
         // the PIRLS linearization, so X_τ^T g is represented by x_psi_t^T u.
-        let xpsi_beta = x_psi_t.apply(&beta_eval);
+        let xpsi_beta = x_psi_t.dot(&beta_eval);
         let weighted_xpsi_beta = &pirls_result.solveweights * &xpsi_beta;
         // Differentiate the stationarity equation
         //   0 = X^T g - S β̂
@@ -1812,7 +1796,7 @@ impl<'a> RemlState<'a> {
         //   Phi = 0.5 log|I_r|_+, I_r = X_r^T W X_r.
         // This RHS is exactly `g_psi`, and `solve_hvec(g_psi)` computes B
         // without ever forming H^{-1} explicitly.
-        let mut g_psi = x_psi_t.apply_transpose(&u)
+        let mut g_psi = x_psi_t.t().dot(&u)
             - x_dense.t().dot(&weighted_xpsi_beta)
             - s_psi_total_t.dot(&beta_eval);
         let mut fit_firth_partial = 0.0_f64;
@@ -1829,7 +1813,7 @@ impl<'a> RemlState<'a> {
             //     + 0.5 X'((w'' ⊙ (X_tau β)) ⊙ h + w' ⊙ h_tau|beta),
             //   Phi_tau|beta = 0.5 tr(I_r^{-1} I_{r,tau}),
             // with I_r = X_r' W X_r and h_i = x_{r,i}' I_r^{-1} x_{r,i}.
-            let x_psi_t_dense = x_psi_t.materialize();
+            let x_psi_t_dense = x_psi_t.clone();
             let need_tau_kernel = x_psi_t_dense.iter().any(|v| *v != 0.0);
             let tau_bundle =
                 Self::firth_exact_tau_kernel(op, &x_psi_t_dense, &beta_eval, need_tau_kernel);
@@ -1876,7 +1860,7 @@ impl<'a> RemlState<'a> {
 
         let w = &pirls_result.solveweights;
         let wx = Self::row_scale(&x_dense, w);
-        let x_psi_t_dense = x_psi_t.materialize();
+        let x_psi_t_dense = x_psi_t.clone();
         let wx_psi = Self::row_scale(&x_psi_t_dense, w);
 
         let mut h_psi = x_psi_t_dense.t().dot(&wx);
@@ -1964,13 +1948,13 @@ impl<'a> RemlState<'a> {
                     //                 - D(Hphi)[beta_tau].
                     //
                     // We apply both terms explicitly.
-                    if x_psi_t.iter().any(|v| *v != 0.0) {
+                    if x_psi_t_dense.iter().any(|v| *v != 0.0) {
                         let kernel = tau_kernel_opt.as_ref().expect(
                             "exact directional assembly requires cached tau kernel for Hphi,tau",
                         );
                         let eye = Array2::<f64>::eye(beta_eval.len());
                         let hphi_tau_partial =
-                            Self::firth_hphi_tau_partial_apply(op, &x_psi_t, kernel, &eye);
+                            Self::firth_hphi_tau_partial_apply(op, &x_psi_t_dense, kernel, &eye);
                         h_psi -= &hphi_tau_partial;
                     }
                     let firth_dir = Self::firth_direction(op, &beta_psi);

@@ -208,7 +208,7 @@ fn pirls_decision_repetition_count(log_key: String) -> usize {
 }
 
 fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
-    repetition_count.is_power_of_two()
+    repetition_count > 1 && repetition_count.is_power_of_two()
 }
 
 const SPARSE_NATIVE_MIN_P: usize = 256;
@@ -1525,7 +1525,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             Some(&self.s_transformed),
                         )?
                     } else {
-                        let x_dense = self.x_original.to_dense_arc();
+                        let x_dense = self
+                            .x_original
+                            .try_to_dense_arc(
+                                "Firth diagnostics require dense access to the original design",
+                            )
+                            .map_err(EstimationError::InvalidInput)?;
                         compute_firth_hat_and_half_logdet(
                             x_dense.view(),
                             weights.view(),
@@ -2034,7 +2039,9 @@ fn estimate_sparse_native_decision(
     let x_sparse = if let Some(sparse) = x_original.as_sparse() {
         sparse
     } else {
-        let dense = x_original.to_dense_arc();
+        let dense = x_original
+            .as_dense()
+            .expect("non-sparse design should expose dense storage");
         return dense_reject(
             "design_not_sparse",
             dense.iter().filter(|v| v.abs() > 1e-12).count(),
@@ -3597,12 +3604,111 @@ pub struct PirlsResult {
     // Cached X·Qs for this PIRLS result (transformed design matrix)
     pub x_transformed: DesignMatrix,
     pub coordinate_frame: PirlsCoordinateFrame,
+    /// True when this result was compacted for REML LRU storage and needs
+    /// cold artifacts (for example `x_transformed`) rehydrated before exact
+    /// bundle construction.
+    pub cache_compacted: bool,
 }
 
 impl PirlsResult {
     #[inline]
     pub fn firth_log_det(&self) -> Option<f64> {
         self.firth.log_det()
+    }
+
+    pub(crate) fn compact_for_reml_cache(&self) -> Self {
+        Self {
+            beta_transformed: self.beta_transformed.clone(),
+            penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
+            stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
+            ridge_passport: self.ridge_passport,
+            ridge_used: self.ridge_used,
+            deviance: self.deviance,
+            edf: self.edf,
+            stable_penalty_term: self.stable_penalty_term,
+            firth: self.firth.clone(),
+            finalweights: Array1::zeros(0),
+            final_offset: Array1::zeros(0),
+            final_eta: self.final_eta.clone(),
+            finalmu: Array1::zeros(0),
+            solveweights: self.solveweights.clone(),
+            solveworking_response: self.solveworking_response.clone(),
+            solvemu: self.solvemu.clone(),
+            solve_dmu_deta: Array1::zeros(0),
+            solve_d2mu_deta2: Array1::zeros(0),
+            solve_d3mu_deta3: Array1::zeros(0),
+            solve_c_array: self.solve_c_array.clone(),
+            solve_d_array: self.solve_d_array.clone(),
+            status: self.status,
+            iteration: self.iteration,
+            max_abs_eta: self.max_abs_eta,
+            lastgradient_norm: self.lastgradient_norm,
+            last_deviance_change: self.last_deviance_change,
+            last_step_halving: self.last_step_halving,
+            constraint_kkt: self.constraint_kkt.clone(),
+            linear_constraints_transformed: self.linear_constraints_transformed.clone(),
+            reparam_result: self.reparam_result.clone(),
+            x_transformed: DesignMatrix::Dense(Array2::zeros((0, 0))),
+            coordinate_frame: self.coordinate_frame.clone(),
+            cache_compacted: true,
+        }
+    }
+
+    pub(crate) fn rehydrate_after_reml_cache(
+        &self,
+        x_original: &DesignMatrix,
+        offset: ArrayView1<'_, f64>,
+        inverse_link: &InverseLink,
+    ) -> Result<Self, EstimationError> {
+        if !self.cache_compacted {
+            return Ok(self.clone());
+        }
+
+        let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
+            computeworkingweight_derivatives_from_eta(
+                inverse_link,
+                &self.final_eta,
+                self.solveweights.view(),
+            )?;
+        let x_dense = x_original
+            .try_to_dense_arc("rehydrating compact REML PIRLS cache entry requires dense design")
+            .map_err(EstimationError::InvalidInput)?;
+        let x_transformed_dense = x_dense.dot(&self.reparam_result.qs);
+        Ok(Self {
+            beta_transformed: self.beta_transformed.clone(),
+            penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
+            stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
+            ridge_passport: self.ridge_passport,
+            ridge_used: self.ridge_used,
+            deviance: self.deviance,
+            edf: self.edf,
+            stable_penalty_term: self.stable_penalty_term,
+            firth: self.firth.clone(),
+            finalweights: self.solveweights.clone(),
+            final_offset: offset.to_owned(),
+            final_eta: self.final_eta.clone(),
+            finalmu: self.solvemu.clone(),
+            solveweights: self.solveweights.clone(),
+            solveworking_response: self.solveworking_response.clone(),
+            solvemu: self.solvemu.clone(),
+            solve_dmu_deta,
+            solve_d2mu_deta2,
+            solve_d3mu_deta3,
+            solve_c_array,
+            solve_d_array,
+            status: self.status,
+            iteration: self.iteration,
+            max_abs_eta: self.max_abs_eta,
+            lastgradient_norm: self.lastgradient_norm,
+            last_deviance_change: self.last_deviance_change,
+            last_step_halving: self.last_step_halving,
+            constraint_kkt: self.constraint_kkt.clone(),
+            linear_constraints_transformed: self.linear_constraints_transformed.clone(),
+            reparam_result: self.reparam_result.clone(),
+            x_transformed: maybe_sparse_design(&x_transformed_dense),
+            coordinate_frame: self.coordinate_frame.clone(),
+            cache_compacted: false,
+        })
     }
 }
 
@@ -3664,6 +3770,7 @@ fn assemble_pirls_result(
         reparam_result,
         x_transformed,
         coordinate_frame,
+        cache_compacted: false,
     }
 }
 
@@ -3920,7 +4027,9 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 None,
             )
         } else {
-            let dense_x = x_original.to_dense_arc();
+            let dense_x = x_original
+                .try_to_dense_arc("PIRLS transformed-basis path requires dense original design")
+                .map_err(EstimationError::InvalidInput)?;
             let x_transformed = dense_x.dot(&reparam_result.qs);
             (
                 maybe_sparse_design(&x_transformed),
@@ -4053,6 +4162,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             reparam_result,
             x_transformed: x_transformed_design,
             coordinate_frame: PirlsCoordinateFrame::TransformedQs,
+            cache_compacted: false,
         };
 
         return Ok((pirls_result, working_summary));
@@ -5663,8 +5773,7 @@ mod tests {
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut,
         bernoulli_geometry_from_jet, calculate_scale, compress_activeworking_set,
         compute_constraint_kkt_diagnostics, default_beta_guess_external, fit_model_for_fixed_rho,
-        logit_clampzero_enabled, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls,
+        logit_clampzero_enabled, should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
         update_glmvectors_integrated_for_link, working_set_kkt_diagnostics_frommultipliers,
     };

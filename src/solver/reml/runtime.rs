@@ -826,7 +826,12 @@ impl<'a> RemlState<'a> {
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
-            let x_dense = pirls_result.x_transformed.to_dense_arc();
+            let x_dense = pirls_result
+                .x_transformed
+                .try_to_dense_arc(
+                    "dense REML eval bundle requires dense transformed design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
             let firth_op = Arc::new(Self::build_firth_dense_operator(
                 x_dense.as_ref(),
                 &pirls_result.final_eta,
@@ -1004,7 +1009,12 @@ impl<'a> RemlState<'a> {
         let firth_dense_operator = if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
-            let x_dense = self.x().to_dense_arc();
+            let x_dense = self
+                .x()
+                .try_to_dense_arc(
+                    "sparse exact REML runtime requires dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
             Some(Arc::new(Self::build_firth_dense_operator(
                 x_dense.as_ref(),
                 &pirls_result.final_eta,
@@ -1055,6 +1065,26 @@ impl<'a> RemlState<'a> {
             // Line search / multi-eval outer loops revisit older rho keys and
             // replacing a recent nearby beta with an older cached mode can
             // materially slow subsequent PIRLS convergence.
+            if cached.cache_compacted {
+                let mut pirls_config = self.config.as_pirls_config();
+                pirls_config.link_kind =
+                    if let Some(state) = self.runtime_mixture_link_state.clone() {
+                        InverseLink::Mixture(state)
+                    } else if let Some(state) = self.runtime_sas_link_state {
+                        if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
+                            InverseLink::BetaLogistic(state)
+                        } else {
+                            InverseLink::Sas(state)
+                        }
+                    } else {
+                        InverseLink::Standard(self.config.link_function())
+                    };
+                return Ok(Arc::new(cached.rehydrate_after_reml_cache(
+                    self.x(),
+                    self.offset.view(),
+                    &pirls_config.link_kind,
+                )?));
+            }
             return Ok(cached);
         }
 
@@ -1125,7 +1155,7 @@ impl<'a> RemlState<'a> {
                         .pirls_cache
                         .write()
                         .unwrap()
-                        .insert(key, Arc::clone(&pirls_result));
+                        .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
                 }
                 Ok(pirls_result)
             }
@@ -1589,8 +1619,10 @@ impl<'a> RemlState<'a> {
                 // Raw-condition diagnostics are rate-limited in this loop.
                 // We only refresh occasionally, and keep the last snapshot otherwise.
                 let raw_cond = if self.x().as_sparse().is_none() && want_hot_diag {
-                    let x_orig_arc = self.x().to_dense_arc();
-                    let x_orig = x_orig_arc.as_ref();
+                    let x_orig = self
+                        .x()
+                        .as_dense()
+                        .expect("non-sparse original design should expose dense storage");
                     let w_orig = self.weights();
                     let sqrtw = w_orig.mapv(|w| w.max(0.0).sqrt());
                     let wx = x_orig * &sqrtw.insert_axis(Axis(1));

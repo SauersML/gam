@@ -16,7 +16,9 @@ use crate::families::sigma_link::{
     SigmaJet1, exp_sigma_derivs_up_to_third, exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
-use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
+use crate::matrix::{
+    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, SymmetricMatrix, xt_diag_x_symmetric,
+};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
@@ -555,34 +557,70 @@ fn build_block_spatial_psi_derivatives(
             .into_iter()
             .enumerate()
             .map(|(psi_idx, info)| {
-                let x_shape = info.x_psi_local.raw_dim();
-                let s_shape = info.s_psi_local.raw_dim();
+                let x_full = EmbeddedColumnBlock::new(
+                    &info.x_psi_local,
+                    info.global_range.clone(),
+                    info.total_p,
+                )
+                .materialize();
+                let s_full = EmbeddedSquareBlock::new(
+                    &info.s_psi_local,
+                    info.global_range.clone(),
+                    info.total_p,
+                )
+                .materialize();
                 let penalty_indices = info.penalty_indices.clone();
                 CustomFamilyBlockPsiDerivative {
                     penalty_index: Some(info.penalty_index),
-                    x_psi: info.x_psi_local,
-                    s_psi: info.s_psi_local,
+                    x_psi: x_full.clone(),
+                    s_psi: s_full,
                     s_psi_components: Some(
                         info.penalty_indices
                             .into_iter()
-                            .zip(info.s_psi_components_local)
+                            .zip(info.s_psi_components_local.into_iter().map(|local| {
+                                EmbeddedSquareBlock::new(
+                                    &local,
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                                .materialize()
+                            }))
                             .collect(),
                     ),
                     x_psi_psi: Some({
-                        let mut rows = vec![Array2::<f64>::zeros(x_shape); psi_dim];
-                        rows[psi_idx] = info.x_psi_psi_local;
+                        let mut rows =
+                            vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
+                        rows[psi_idx] = EmbeddedColumnBlock::new(
+                            &info.x_psi_psi_local,
+                            info.global_range.clone(),
+                            info.total_p,
+                        )
+                        .materialize();
                         rows
                     }),
                     s_psi_psi: Some({
-                        let mut rows = vec![Array2::<f64>::zeros(s_shape); psi_dim];
-                        rows[psi_idx] = info.s_psi_psi_local;
+                        let mut rows =
+                            vec![Array2::<f64>::zeros((info.total_p, info.total_p)); psi_dim];
+                        rows[psi_idx] = EmbeddedSquareBlock::new(
+                            &info.s_psi_psi_local,
+                            info.global_range.clone(),
+                            info.total_p,
+                        )
+                        .materialize();
                         rows
                     }),
                     s_psi_psi_components: Some({
                         let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
                         rows[psi_idx] = penalty_indices
                             .into_iter()
-                            .zip(info.s_psi_psi_components_local)
+                            .zip(info.s_psi_psi_components_local.into_iter().map(|local| {
+                                EmbeddedSquareBlock::new(
+                                    &local,
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                                .materialize()
+                            }))
                             .collect();
                         rows
                     }),
@@ -1389,10 +1427,11 @@ pub fn fit_binomial_mean_wiggle(
     validate_binomial_response(&spec.y, "fit_binomial_mean_wiggle")?;
     validate_blockrows("eta", n, &spec.eta_block)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    if matches!(spec.link_kind, InverseLink::Standard(LinkFunction::Identity)) {
-        return Err(
-            "fit_binomial_mean_wiggle does not support identity link".to_string(),
-        );
+    if matches!(
+        spec.link_kind,
+        InverseLink::Standard(LinkFunction::Identity)
+    ) {
+        return Err("fit_binomial_mean_wiggle does not support identity link".to_string());
     }
     if spec.wiggle_degree < 1 {
         return Err(format!(
@@ -4811,12 +4850,9 @@ impl BinomialMeanWiggleFamily {
         )
         .map_err(|e| e.to_string())?;
         let full = (*basis).clone();
-        let (z, _) = compute_geometric_constraint_transform(
-            &self.wiggle_knots,
-            self.wiggle_degree,
-            2,
-        )
-        .map_err(|e| e.to_string())?;
+        let (z, _) =
+            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
+                .map_err(|e| e.to_string())?;
         if full.ncols() != z.nrows() {
             return Err(format!(
                 "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
@@ -4836,8 +4872,7 @@ impl BinomialMeanWiggleFamily {
         q0: ArrayView1<'_, f64>,
         betawiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
-        let d_constrained =
-            self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
+        let d_constrained = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
         if d_constrained.ncols() != betawiggle.len() {
             return Err(format!(
                 "wiggle derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",

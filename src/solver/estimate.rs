@@ -2167,10 +2167,14 @@ where
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
     for dir in &mut hyper_dirs {
-        conditioning.transform_matrix_columnswith_a_inplace(&mut dir.x_tau_original);
+        let mut x_tau = dir.x_tau_dense();
+        conditioning.transform_matrix_columnswith_a_inplace(&mut x_tau);
+        dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
         if let Some(rows) = dir.x_tau_tau_original.as_mut() {
             for mat in rows.iter_mut().flatten() {
-                conditioning.transform_matrix_columnswith_a_inplace(mat);
+                let mut dense = mat.materialize();
+                conditioning.transform_matrix_columnswith_a_inplace(&mut dense);
+                *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
             }
         }
     }

@@ -2,7 +2,7 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
-use crate::faer_ndarray::{FaerSvd, fast_xt_diag_x};
+use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
@@ -936,29 +936,17 @@ fn prepare_identified_time_block(
     // where c is the time basis row at anchor time. Reparameterize beta = Z theta
     // with columns of Z spanning null(c^T), so the constraint is exact for all theta.
     let c = input.design_entry.row(anchorrow).to_owned();
-    let c_mat = c.view().insert_axis(Axis(0)).to_owned();
-    let (_, singularvalues, vt_opt) = c_mat
-        .svd(false, true)
-        .map_err(|e| format!("time_block identifiability SVD failed: {e}"))?;
-    let vt = vt_opt.ok_or_else(|| "time_block identifiability SVD returned no V^T".to_string())?;
-    let max_sigma = singularvalues
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    let tol = (p.max(1) as f64) * f64::EPSILON * max_sigma.max(1.0);
-    let rank = singularvalues
-        .iter()
-        .filter(|&&sigma| sigma.abs() > tol)
-        .count();
-    if rank >= p {
+    let c_col = c.view().insert_axis(Axis(1)).to_owned();
+    let (z, rank) = rrqr_nullspace_basis(&c_col, default_rrqr_rank_alpha())
+        .map_err(|e| format!("time_block identifiability RRQR failed: {e}"))?;
+    if rank >= p || z.ncols() == 0 {
         return Err(
             "time_block identifiability constraint removed all columns; add richer time basis"
                 .to_string(),
         );
     }
     // For a single anchor constraint c^T beta = 0, the admissible coefficient
-    // space is the right nullspace of the 1 x p row matrix c^T.
-    let z = vt.slice(s![rank.., ..]).t().to_owned();
+    // space is the nullspace of the p x 1 column matrix c.
     let design_entry = input.design_entry.dot(&z);
     let design_exit = input.design_exit.dot(&z);
     let design_derivative_exit = input.design_derivative_exit.dot(&z);
