@@ -4774,6 +4774,19 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         coefficient_lower_bounds: None,
         linear_constraints: None,
     };
+    let pirls_start = std::time::Instant::now();
+    let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
+        let elapsed = pirls_start.elapsed().as_secs_f64();
+        log::info!(
+            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
+            info.iteration,
+            info.deviance,
+            info.gradient_norm,
+            info.step_size,
+            info.step_halving,
+            elapsed,
+        );
+    };
     let (summary, beta, state, constraint_mode) =
         if learn_timewiggle || likelihood_mode == SurvivalLikelihoodMode::Weibull {
             let mut plain_model = model;
@@ -4781,7 +4794,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 &mut plain_model,
                 gam::types::Coefficients::new(beta0.clone()),
                 &pirls_opts,
-                |_| {},
+                pirls_callback,
             )
             .map_err(|e| format!("survival PIRLS failed: {e}"))?;
             let beta = summary.beta.as_ref().to_owned();
@@ -4799,7 +4812,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 &mut constrained_model,
                 gam::types::Coefficients::new(beta0.clone()),
                 &constrained_opts,
-                |_| {},
+                pirls_callback,
             )
             .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
             let beta = summary.beta.as_ref().to_owned();
@@ -4813,6 +4826,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "constrained-structural-time".to_string(),
             )
         };
+    log::info!(
+        "[PIRLS] finished: {:?} after {} iterations, deviance={:.6e}, {:.1}s total",
+        summary.status,
+        summary.iterations,
+        state.deviance,
+        pirls_start.elapsed().as_secs_f64(),
+    );
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {

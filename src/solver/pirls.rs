@@ -4260,7 +4260,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
-        log::debug!(
+        log::info!(
             "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
             info.iteration,
             info.deviance,

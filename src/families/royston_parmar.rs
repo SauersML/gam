@@ -249,29 +249,47 @@ where
     let mut warned_rho_extreme = false;
     let mut warned_nonfinitevalue = false;
     let mut warned_nonfinitegrad = false;
+    let reml_start = std::time::Instant::now();
     let mut objectivewithgradient = objectivewithgradient;
     let wrappedobjective = |rho: &Array1<f64>| {
         eval_count += 1;
+        let elapsed = reml_start.elapsed().as_secs_f64();
+        log::info!(
+            "[REML] eval {:>3} | rho=[{}] | {:.1}s",
+            eval_count,
+            rho.iter()
+                .map(|r| format!("{:.2}", r))
+                .collect::<Vec<_>>()
+                .join(", "),
+            elapsed,
+        );
         if !warned_rho_extreme && rho.iter().any(|r| r.abs() > 12.0) {
             warned_rho_extreme = true;
             log::warn!(
-                "[survival lambda opt/exact] exploring extreme rho region at eval {} (max|rho|={:.3e})",
+                "[REML] exploring extreme rho region at eval {} (max|rho|={:.3e})",
                 eval_count,
                 rho.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
             );
         }
         let (value, grad) = objectivewithgradient(rho)?;
+        log::info!(
+            "[REML] eval {:>3} | LAML={:.6e} | |grad|={:.3e} | {:.1}s",
+            eval_count,
+            value,
+            grad.dot(&grad).sqrt(),
+            reml_start.elapsed().as_secs_f64(),
+        );
         if !warned_nonfinitevalue && !value.is_finite() {
             warned_nonfinitevalue = true;
             log::warn!(
-                "[survival lambda opt/exact] non-finite objective value at eval {}",
+                "[REML] non-finite objective value at eval {}",
                 eval_count
             );
         }
         if !warned_nonfinitegrad && grad.iter().any(|g| !g.is_finite()) {
             warned_nonfinitegrad = true;
             log::warn!(
-                "[survival lambda opt/exact] non-finite rho-gradient at eval {}",
+                "[REML] non-finite rho-gradient at eval {}",
                 eval_count
             );
         }
@@ -294,6 +312,14 @@ where
         wrappedobjective,
         &core_opts,
     )?;
+    log::info!(
+        "[REML] finished: {} iterations, {} evals, LAML={:.6e}, |grad|={:.3e}, {:.1}s",
+        result.iterations,
+        eval_count,
+        result.final_value,
+        result.finalgrad_norm,
+        reml_start.elapsed().as_secs_f64(),
+    );
     warn_survival_lambda_optimization_health("exact", &result, options);
     let lambdas = result.rho.mapv(f64::exp);
     Ok(SurvivalLambdaOptimizerResult {
@@ -320,14 +346,26 @@ where
     let eval_count = AtomicUsize::new(0usize);
     let warned_rho_extreme = AtomicBool::new(false);
     let warned_nonfinitevalue = AtomicBool::new(false);
+    let reml_start = std::time::Instant::now();
     let wrappedobjective = |rho: &Array1<f64>| {
         let eval_idx = eval_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if eval_idx % 5 == 1 {
+            log::info!(
+                "[REML/fd] eval {:>3} | rho=[{}] | {:.1}s",
+                eval_idx,
+                rho.iter()
+                    .map(|r| format!("{:.2}", r))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                reml_start.elapsed().as_secs_f64(),
+            );
+        }
         if !warned_rho_extreme.load(Ordering::Relaxed)
             && rho.iter().any(|r| r.abs() > 12.0)
             && !warned_rho_extreme.swap(true, Ordering::Relaxed)
         {
             log::warn!(
-                "[survival lambda opt/fd] exploring extreme rho region at eval {} (max|rho|={:.3e})",
+                "[REML/fd] exploring extreme rho region at eval {} (max|rho|={:.3e})",
                 eval_idx,
                 rho.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
             );
@@ -338,7 +376,7 @@ where
             && !warned_nonfinitevalue.swap(true, Ordering::Relaxed)
         {
             log::warn!(
-                "[survival lambda opt/fd] non-finite objective value at eval {}",
+                "[REML/fd] non-finite objective value at eval {}",
                 eval_idx
             );
         }
