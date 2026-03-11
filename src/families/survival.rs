@@ -1905,6 +1905,78 @@ mod tests {
     }
 
     #[test]
+    fn derivative_offset_must_clear_nonstructural_monotonicity_threshold() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sampleweight = array![1.0];
+        let x_entry = array![[1.0, 0.0]];
+        let x_exit = array![[1.0, 0.0]];
+        let x_derivative = array![[0.0, 0.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let offsets_below_guard = SurvivalBaselineOffsets {
+            eta_entry: array![0.0].view(),
+            eta_exit: array![0.0].view(),
+            derivative_exit: array![2.0].view(),
+        };
+        let offsets_above_guard = SurvivalBaselineOffsets {
+            eta_entry: array![0.0].view(),
+            eta_exit: array![0.0].view(),
+            derivative_exit: array![3.1].view(),
+        };
+
+        let model_below_guard = WorkingModelSurvival::from_engine_inputswith_offsets(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            Some(offsets_below_guard),
+            penalties.clone(),
+            monotonicity,
+            SurvivalSpec::Net,
+        )
+        .expect("construct model with derivative offset below guard");
+        let err = model_below_guard
+            .update_state(&array![0.0, 0.0])
+            .expect_err("derivative offset below guard should be rejected");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("d_eta/dt=2.000e0") && err_text.contains("tolerance=3.000e0"),
+            "expected derivative guard rejection to report the offset-driven derivative: {err_text}"
+        );
+
+        let model_above_guard = WorkingModelSurvival::from_engine_inputswith_offsets(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            Some(offsets_above_guard),
+            penalties,
+            MonotonicityPenalty { tolerance: 3.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct model with derivative offset above guard");
+        let state = model_above_guard
+            .update_state(&array![0.0, 0.0])
+            .expect("derivative offset above guard should remain feasible");
+        assert!(state.deviance.is_finite());
+    }
+
+    #[test]
     fn structural_monotonicity_emits_rowwise_constraints() {
         let age_entry = array![1.0_f64, 1.5_f64];
         let age_exit = array![2.0_f64, 3.0_f64];
