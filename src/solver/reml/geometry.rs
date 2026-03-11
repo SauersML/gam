@@ -136,7 +136,7 @@ impl<'a> RemlState<'a> {
                 }
                 let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
                 let phi = 1.0;
-                let p_eff = sparse.factor.dimension();
+                let p_eff = self.x().ncols();
                 let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
                 for j in 0..p_eff {
                     let mut e_j = Array1::<f64>::zeros(p_eff);

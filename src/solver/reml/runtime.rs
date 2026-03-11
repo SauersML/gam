@@ -4,7 +4,7 @@ use crate::linalg::utils::StableSolver;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 
 impl<'a> RemlState<'a> {
-    fn third_derivative_projection_from_design(
+    pub(super) fn third_derivative_projection_from_design(
         &self,
         design: &DesignMatrix,
         d_vec: &Array1<f64>,
