@@ -12269,6 +12269,69 @@ mod tests {
         );
     }
 
+    /// Integration test: a small survival dataset (6 rows, intercept-only
+    /// formula) run through the full `run_survival` pipeline must converge.
+    /// This exercises the entire path a real user hits: CSV loading, I-spline
+    /// time basis construction, REML smoothing parameter selection, and
+    /// constrained PIRLS fitting.  The user never specifies a penalty — REML
+    /// picks it automatically.
+    ///
+    /// Currently fails because PIRLS cannot converge on the small,
+    /// underdetermined I-spline problem that REML produces.
+    #[test]
+    fn survival_integration_small_dataset_converges() {
+        let dir = tempdir().expect("tempdir");
+        let csv_path = dir.path().join("small_surv.csv");
+        let out_path = dir.path().join("model.json");
+        std::fs::write(
+            &csv_path,
+            "entry,exit,event\n\
+             10,15,1\n\
+             20,35,0\n\
+             40,60,1\n\
+             80,100,0\n\
+             120,150,1\n\
+             160,220,1\n",
+        )
+        .expect("write csv");
+        let args = SurvivalArgs {
+            data: csv_path,
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "transformation".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: None,
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 2,
+            time_num_internal_knots: 4,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: Some(out_path.clone()),
+        };
+        let result = super::run_survival(args);
+        assert!(
+            result.is_ok(),
+            "survival integration fit failed on 6-row dataset: {}",
+            result.unwrap_err()
+        );
+        assert!(out_path.exists(), "model output file should be written");
+    }
+
     #[test]
     fn ispline_time_basis_inference_falls_backwhen_quantile_knots_degenerate() {
         let age_entry = Array1::from_vec(vec![1e-9; 8]);
