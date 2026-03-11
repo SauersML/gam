@@ -24,7 +24,7 @@ use crate::estimate::{
 };
 use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
-use crate::matrix::{DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
@@ -6467,21 +6467,21 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     let log_kappa_dim = info_list.len();
     for (i, info) in info_list.into_iter().enumerate() {
         let mut xsecond = vec![None; log_kappa_dim];
-        xsecond[i] = Some(
-            EmbeddedColumnBlock::new(
-                &info.x_psi_psi_local,
-                info.global_range.clone(),
-                info.total_p,
-            )
-            .materialize(),
-        );
+        xsecond[i] = Some(crate::estimate::reml::HyperDesignDerivative::from_embedded(
+            info.x_psi_psi_local.clone(),
+            info.global_range.clone(),
+            info.total_p,
+        ));
         let s_components = info
             .penalty_indices
             .iter()
             .copied()
             .zip(info.s_psi_components_local.iter().map(|local| {
-                EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
-                    .materialize()
+                crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                    local.clone(),
+                    info.global_range.clone(),
+                    info.total_p,
+                )
             }))
             .collect::<Vec<_>>();
         let s2_components = info
@@ -6489,15 +6489,21 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .iter()
             .copied()
             .zip(info.s_psi_psi_components_local.iter().map(|local| {
-                EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
-                    .materialize()
+                crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                    local.clone(),
+                    info.global_range.clone(),
+                    info.total_p,
+                )
             }))
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
-        hyper_dirs.push(DirectionalHyperParam::new(
-            EmbeddedColumnBlock::new(&info.x_psi_local, info.global_range.clone(), info.total_p)
-                .materialize(),
+        hyper_dirs.push(DirectionalHyperParam::new_compact(
+            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                info.x_psi_local.clone(),
+                info.global_range.clone(),
+                info.total_p,
+            ),
             s_components,
             Some(xsecond),
             Some(ssecond_components),

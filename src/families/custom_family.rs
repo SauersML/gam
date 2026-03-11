@@ -6830,6 +6830,7 @@ mod tests {
             initial_beta: Some(array![0.0]),
         };
         let options = BlockwiseFitOptions {
+            use_remlobjective: false,
             compute_covariance: true,
             ..BlockwiseFitOptions::default()
         };
@@ -6838,9 +6839,8 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains(
-                "joint covariance computation failed: synthetic covariance assembly failure"
-            ),
+            err.to_string()
+                .contains("synthetic covariance assembly failure"),
             "expected covariance root cause in fit error, got: {err}"
         );
     }

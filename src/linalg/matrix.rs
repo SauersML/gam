@@ -10,6 +10,8 @@ use std::sync::{Arc, OnceLock};
 const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
+const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SPARSE_TO_DENSE_BYTES: usize = 1024 * 1024 * 1024;
 
 pub use crate::linalg::utils::PcgSolveInfo;
 
@@ -253,23 +255,58 @@ impl SparseDesignMatrix {
         }
     }
 
-    pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
-        self.dense_cache
-            .get_or_init(|| {
-                let mut out = Array2::<f64>::zeros((self.matrix.nrows(), self.matrix.ncols()));
-                let (symbolic, values) = self.matrix.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                for col in 0..self.matrix.ncols() {
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    for idx in start..end {
-                        out[[row_idx[idx], col]] += values[idx];
-                    }
-                }
-                Arc::new(out)
+    fn dense_nbytes(&self) -> Result<usize, String> {
+        self.matrix
+            .nrows()
+            .checked_mul(self.matrix.ncols())
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| {
+                format!(
+                    "dense size overflow for sparse design {}x{}",
+                    self.matrix.nrows(),
+                    self.matrix.ncols()
+                )
             })
-            .clone()
+    }
+
+    fn materialize_dense_arc(&self) -> Arc<Array2<f64>> {
+        let mut out = Array2::<f64>::zeros((self.matrix.nrows(), self.matrix.ncols()));
+        let (symbolic, values) = self.matrix.parts();
+        let col_ptr = symbolic.col_ptr();
+        let row_idx = symbolic.row_idx();
+        for col in 0..self.matrix.ncols() {
+            let start = col_ptr[col];
+            let end = col_ptr[col + 1];
+            for idx in start..end {
+                out[[row_idx[idx], col]] += values[idx];
+            }
+        }
+        Arc::new(out)
+    }
+
+    pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        let dense_bytes = self.dense_nbytes()?;
+        if dense_bytes > MAX_SPARSE_TO_DENSE_BYTES {
+            let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            return Err(format!(
+                "{context}: refusing to densify sparse design {}x{} (~{gib:.2} GiB); use sparse or matrix-free code",
+                self.matrix.nrows(),
+                self.matrix.ncols(),
+            ));
+        }
+        if dense_bytes <= MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES {
+            Ok(self
+                .dense_cache
+                .get_or_init(|| self.materialize_dense_arc())
+                .clone())
+        } else {
+            Ok(self.materialize_dense_arc())
+        }
+    }
+
+    pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
+        self.try_to_dense_arc("SparseDesignMatrix::to_dense_arc")
+            .unwrap_or_else(|msg| panic!("{msg}"))
     }
 
     pub fn to_csr_arc(&self) -> Option<Arc<SparseRowMat<usize, f64>>> {
@@ -1385,14 +1422,34 @@ impl DesignMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(matrix) => matrix.clone(),
-            Self::Sparse(matrix) => matrix.to_dense_arc().as_ref().clone(),
+            Self::Sparse(matrix) => matrix
+                .try_to_dense_arc("DesignMatrix::to_dense")
+                .unwrap_or_else(|msg| panic!("{msg}"))
+                .as_ref()
+                .clone(),
+        }
+    }
+
+    pub fn try_to_dense(&self, context: &str) -> Result<Array2<f64>, String> {
+        match self {
+            Self::Dense(matrix) => Ok(matrix.clone()),
+            Self::Sparse(matrix) => Ok(matrix.try_to_dense_arc(context)?.as_ref().clone()),
         }
     }
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Dense(matrix) => Arc::new(matrix.clone()),
-            Self::Sparse(matrix) => matrix.to_dense_arc(),
+            Self::Sparse(matrix) => matrix
+                .try_to_dense_arc("DesignMatrix::to_dense_arc")
+                .unwrap_or_else(|msg| panic!("{msg}")),
+        }
+    }
+
+    pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        match self {
+            Self::Dense(matrix) => Ok(Arc::new(matrix.clone())),
+            Self::Sparse(matrix) => matrix.try_to_dense_arc(context),
         }
     }
 
@@ -1552,7 +1609,7 @@ impl From<&DesignMatrix> for DesignMatrix {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesignMatrix, dense_matvec, dense_transpose_matvec};
+    use super::{DesignMatrix, SparseDesignMatrix, dense_matvec, dense_transpose_matvec};
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
@@ -1627,6 +1684,17 @@ mod tests {
         for i in 0..y_sparse.len() {
             assert!((y_sparse[i] - y_dense[i]).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn huge_sparse_densification_is_rejected_before_allocation() {
+        let sparse = SparseColMat::try_new_from_triplets(500_000, 10_000, &[])
+            .expect("empty sparse matrix should build");
+        let design = SparseDesignMatrix::new(sparse);
+        let err = design
+            .try_to_dense_arc("matrix test")
+            .expect_err("huge sparse densification should be rejected");
+        assert!(err.contains("refusing to densify sparse design"));
     }
 
     #[test]

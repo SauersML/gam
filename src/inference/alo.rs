@@ -59,7 +59,10 @@ fn compute_alo_diagnostics_from_pirls_impl(
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    let x_dense_arc = base.x_transformed.to_dense_arc();
+    let x_dense_arc = base
+        .x_transformed
+        .try_to_dense_arc("ALO diagnostics require dense transformed design")
+        .map_err(EstimationError::InvalidInput)?;
     let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
 

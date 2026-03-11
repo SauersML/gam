@@ -13,6 +13,8 @@ use crate::types::SasLinkState;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::Solve as FaerSolve;
+use ndarray::s;
+use std::ops::Range;
 
 mod cache;
 mod eval;
@@ -1197,21 +1199,222 @@ trait PenalizedGeometry {
 }
 
 #[derive(Clone)]
+pub(crate) struct HyperDesignDerivative {
+    dense: Array2<f64>,
+    embedded: Option<(Array2<f64>, Range<usize>, usize)>,
+}
+
+impl HyperDesignDerivative {
+    pub(crate) fn from_embedded(
+        local: Array2<f64>,
+        global_range: Range<usize>,
+        total_cols: usize,
+    ) -> Self {
+        let mut dense = Array2::<f64>::zeros((local.nrows(), total_cols));
+        dense.slice_mut(s![.., global_range.clone()]).assign(&local);
+        Self {
+            dense,
+            embedded: Some((local, global_range, total_cols)),
+        }
+    }
+
+    pub(crate) fn nrows(&self) -> usize {
+        self.dense.nrows()
+    }
+
+    pub(crate) fn ncols(&self) -> usize {
+        self.dense.ncols()
+    }
+
+    pub(crate) fn materialize(&self) -> Array2<f64> {
+        self.dense.clone()
+    }
+
+    pub(crate) fn transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
+            if *total_cols != qs.nrows() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "embedded design derivative width mismatch: total_cols={}, qs rows={}",
+                    total_cols,
+                    qs.nrows()
+                )));
+            }
+            let qs_local = qs.slice(s![global_range.clone(), ..]).to_owned();
+            Ok(crate::matrix::DenseRightProductView::new(local)
+                .with_factor(&qs_local)
+                .with_optional_factor(free_basis_opt)
+                .materialize())
+        } else {
+            Ok(crate::matrix::DenseRightProductView::new(&self.dense)
+                .with_factor(qs)
+                .with_optional_factor(free_basis_opt)
+                .materialize())
+        }
+    }
+
+    pub(crate) fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        if let Some((local, global_range, _)) = self.embedded.as_ref() {
+            let rhs_local = rhs.slice(s![global_range.clone()]).to_owned();
+            local.dot(&rhs_local)
+        } else {
+            self.dense.dot(rhs)
+        }
+    }
+}
+
+impl From<Array2<f64>> for HyperDesignDerivative {
+    fn from(value: Array2<f64>) -> Self {
+        Self {
+            dense: value,
+            embedded: None,
+        }
+    }
+}
+
+impl std::ops::Deref for HyperDesignDerivative {
+    type Target = Array2<f64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dense
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HyperPenaltyDerivative {
+    dense: Array2<f64>,
+    embedded: Option<(Array2<f64>, Range<usize>, usize)>,
+}
+
+impl HyperPenaltyDerivative {
+    pub(crate) fn from_embedded(
+        local: Array2<f64>,
+        global_range: Range<usize>,
+        total_dim: usize,
+    ) -> Self {
+        let mut dense = Array2::<f64>::zeros((total_dim, total_dim));
+        dense
+            .slice_mut(s![global_range.clone(), global_range.clone()])
+            .assign(&local);
+        Self {
+            dense,
+            embedded: Some((local, global_range, total_dim)),
+        }
+    }
+
+    pub(crate) fn nrows(&self) -> usize {
+        self.dense.nrows()
+    }
+
+    pub(crate) fn ncols(&self) -> usize {
+        self.nrows()
+    }
+
+    pub(crate) fn materialize(&self) -> Array2<f64> {
+        self.dense.clone()
+    }
+
+    pub(crate) fn transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        if let Some((local, global_range, total_dim)) = self.embedded.as_ref() {
+            if *total_dim != qs.nrows() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "embedded penalty derivative width mismatch: total_dim={}, qs rows={}",
+                    total_dim,
+                    qs.nrows()
+                )));
+            }
+            let qs_local = qs.slice(s![global_range.clone(), ..]).to_owned();
+            let mut transformed = qs_local.t().dot(local).dot(&qs_local);
+            if let Some(z) = free_basis_opt {
+                transformed = z.t().dot(&transformed).dot(z);
+            }
+            Ok(transformed)
+        } else {
+            let mut transformed = qs.t().dot(&self.dense).dot(qs);
+            if let Some(z) = free_basis_opt {
+                transformed = z.t().dot(&transformed).dot(z);
+            }
+            Ok(transformed)
+        }
+    }
+
+    pub(crate) fn scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        match self.embedded.as_ref() {
+            None => {
+                if target.raw_dim() != self.dense.raw_dim() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
+                        target.nrows(),
+                        target.ncols(),
+                        self.dense.nrows(),
+                        self.dense.ncols()
+                    )));
+                }
+                target.scaled_add(amp, &self.dense);
+            }
+            Some((local, global_range, total_dim)) => {
+                if target.nrows() != *total_dim || target.ncols() != *total_dim {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded hyper penalty derivative shape mismatch: target={}x{}, expected {}x{}",
+                        target.nrows(),
+                        target.ncols(),
+                        total_dim,
+                        total_dim
+                    )));
+                }
+                target
+                    .slice_mut(s![global_range.clone(), global_range.clone()])
+                    .scaled_add(amp, local);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<Array2<f64>> for HyperPenaltyDerivative {
+    fn from(value: Array2<f64>) -> Self {
+        Self {
+            dense: value,
+            embedded: None,
+        }
+    }
+}
+
+impl std::ops::Deref for HyperPenaltyDerivative {
+    type Target = Array2<f64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dense
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct PenaltyDerivativeComponent {
     pub(crate) penalty_index: usize,
-    pub(crate) matrix: Array2<f64>,
+    pub(crate) matrix: HyperPenaltyDerivative,
 }
 
 #[derive(Clone)]
 pub(crate) struct DirectionalHyperParam {
-    pub x_tau_original: Array2<f64>,
+    pub(crate) x_tau_original: HyperDesignDerivative,
     // Canonical penalty representation: every tau direction is decomposed into
     // base-penalty derivatives. There is no separate "assembled total" path.
     penalty_first_components: Vec<PenaltyDerivativeComponent>,
     // Optional pairwise second hyper-derivatives against all tau directions.
     // If provided, each vector must have length psi_dim and hold an optional
     // X_{tau_i,tau_j} entry in original coordinates.
-    pub x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
+    pub(crate) x_tau_tau_original: Option<Vec<Option<HyperDesignDerivative>>>,
     // Pairwise second derivatives are stored in the same canonical base-penalty
     // decomposition as the first derivatives.
     penaltysecond_components: Option<Vec<Option<Vec<PenaltyDerivativeComponent>>>>,
@@ -1219,7 +1422,7 @@ pub(crate) struct DirectionalHyperParam {
 
 impl DirectionalHyperParam {
     fn canonicalize_penalty_components(
-        components: Vec<(usize, Array2<f64>)>,
+        components: Vec<(usize, HyperPenaltyDerivative)>,
     ) -> Result<Vec<PenaltyDerivativeComponent>, EstimationError> {
         let mut out: Vec<PenaltyDerivativeComponent> = Vec::with_capacity(components.len());
         for (penalty_index, matrix) in components {
@@ -1242,6 +1445,41 @@ impl DirectionalHyperParam {
         penalty_first_components: Vec<(usize, Array2<f64>)>,
         x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
         penaltysecond_components: Option<Vec<Option<Vec<(usize, Array2<f64>)>>>>,
+    ) -> Result<Self, EstimationError> {
+        let x_tau_tau_original = x_tau_tau_original.map(|rows| {
+            rows.into_iter()
+                .map(|entry| entry.map(HyperDesignDerivative::from))
+                .collect::<Vec<_>>()
+        });
+        let penalty_first_components = penalty_first_components
+            .into_iter()
+            .map(|(idx, matrix)| (idx, HyperPenaltyDerivative::from(matrix)))
+            .collect();
+        let penaltysecond_components = penaltysecond_components.map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    row.map(|components| {
+                        components
+                            .into_iter()
+                            .map(|(idx, matrix)| (idx, HyperPenaltyDerivative::from(matrix)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        Self::new_compact(
+            HyperDesignDerivative::from(x_tau_original),
+            penalty_first_components,
+            x_tau_tau_original,
+            penaltysecond_components,
+        )
+    }
+
+    pub(crate) fn new_compact(
+        x_tau_original: HyperDesignDerivative,
+        penalty_first_components: Vec<(usize, HyperPenaltyDerivative)>,
+        x_tau_tau_original: Option<Vec<Option<HyperDesignDerivative>>>,
+        penaltysecond_components: Option<Vec<Option<Vec<(usize, HyperPenaltyDerivative)>>>>,
     ) -> Result<Self, EstimationError> {
         let penalty_first_components =
             Self::canonicalize_penalty_components(penalty_first_components)?;
@@ -1266,6 +1504,41 @@ impl DirectionalHyperParam {
             x_tau_tau_original,
             penaltysecond_components,
         })
+    }
+
+    pub(crate) fn x_tau_dense(&self) -> Array2<f64> {
+        self.x_tau_original.materialize()
+    }
+
+    pub(crate) fn transformed_x_tau(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.x_tau_original.transformed(qs, free_basis_opt)
+    }
+
+    pub(crate) fn transformed_x_tau_tau_at(
+        &self,
+        j: usize,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Option<Array2<f64>>, EstimationError> {
+        Ok(self
+            .x_tau_tau_original
+            .as_ref()
+            .and_then(|rows| rows.get(j))
+            .and_then(|entry| entry.as_ref())
+            .map(|entry| entry.transformed(qs, free_basis_opt))
+            .transpose()?)
+    }
+
+    pub(crate) fn x_tau_tau_nth_dense(&self, j: usize) -> Option<Array2<f64>> {
+        self.x_tau_tau_original
+            .as_ref()
+            .and_then(|rows| rows.get(j))
+            .and_then(|entry| entry.as_ref())
+            .map(HyperDesignDerivative::materialize)
     }
 
     #[cfg(test)]
@@ -1323,7 +1596,9 @@ impl DirectionalHyperParam {
                     rho.len()
                 )));
             }
-            total.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+            component
+                .matrix
+                .scaled_add_to(&mut total, rho[component.penalty_index].exp())?;
         }
         Ok(total)
     }
@@ -1390,7 +1665,6 @@ struct FirthDenseOperator {
     w4: Array1<f64>,
     // B = diag(w') X used in D Hphi and D^2 Hphi contractions.
     b_base: Array2<f64>,
-    b_base_t: Array2<f64>,
     // Cached invariant contraction P*B where P = (X_r K_r X_r') ⊙ (X_r K_r X_r').
     // This avoids recomputing the same O(n r^2 p) block in every directional call.
     p_b_base: Array2<f64>,
@@ -1402,13 +1676,8 @@ struct FirthDirection {
     g_u_reduced: Array2<f64>,
     a_u_reduced: Array2<f64>,
     dh: Array1<f64>,
-    // B_u = diag(w'' ⊙ δη_u) X and invariant contractions derived from it.
+    // B_u = diag(w'' ⊙ δη_u) X is represented by the row-scaling vector only.
     b_uvec: Array1<f64>,
-    b_u_base: Array2<f64>,
-    b_u_base_t: Array2<f64>,
-    p_bu_base: Array2<f64>,
-    // P_u B = -2 (M ⊙ N_u) B in matrix-free reduced form.
-    p_u_b_base: Array2<f64>,
 }
 
 #[derive(Clone)]

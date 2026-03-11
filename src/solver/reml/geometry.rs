@@ -212,7 +212,10 @@ impl<'a> RemlState<'a> {
             if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                 Some(cached.as_ref().clone())
             } else {
-                let x_dense = self.x().to_dense_arc();
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc("sparse exact REML gradient requires dense design")
+                    .map_err(EstimationError::InvalidInput)?;
                 Some(Self::build_firth_dense_operator(
                     x_dense.as_ref(),
                     &pirls_result.final_eta,
@@ -473,7 +476,12 @@ impl<'a> RemlState<'a> {
             let op = if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                 cached.as_ref().clone()
             } else {
-                let x_dense_arc = self.x().to_dense_arc();
+                let x_dense_arc = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact REML directional hyper-gradient requires dense design",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
                 Self::build_firth_dense_operator(x_dense_arc.as_ref(), &pirls_result.final_eta)?
             };
             let need_tau_kernel = hyper_dir.x_tau_original.iter().any(|v| *v != 0.0);
@@ -783,7 +791,10 @@ impl<'a> RemlState<'a> {
             if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                 Some(cached.as_ref().clone())
             } else {
-                let x_dense = self.x().to_dense_arc();
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc("sparse exact REML outer Hessian requires dense design")
+                    .map_err(EstimationError::InvalidInput)?;
                 Some(Self::build_firth_dense_operator(
                     x_dense.as_ref(),
                     &pirls_result.final_eta,

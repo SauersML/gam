@@ -612,7 +612,11 @@ impl WorkingModelSurvival {
             }
             b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
         }
-        Some(compress_positive_collinear_constraints(&a, &b))
+        if self.structurally_monotonic {
+            Some(LinearInequalityConstraints { a, b })
+        } else {
+            Some(compress_positive_collinear_constraints(&a, &b))
+        }
     }
 
     pub fn from_engine_inputs(
