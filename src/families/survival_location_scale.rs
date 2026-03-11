@@ -2412,16 +2412,62 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let hww = weighted_crossprod_dense(xw_dense, &(-&q.d2_q), xw_dense)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &hww);
 
-            let h_tw =
-                weighted_crossprod_dense(&x_threshold_exit, &(-&q.d2_q * &q.dq_t), xw_dense)?;
-            assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
+            // Threshold-wiggle cross block.
+            // d²ℓ/(d(eta_t) dw) = d²ℓ/dq² * dq/d(eta_t) * dq/dw
+            // where dq/dw = 1. For time-varying threshold, split entry/exit.
+            if let (Some(x_t_en), Some(dq_t_en)) =
+                (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
+            {
+                let h_tw_exit = weighted_crossprod_dense(
+                    &x_threshold_exit,
+                    &(-&q.d2_q1 * &q.dq_t),
+                    xw_dense,
+                )?;
+                let h_tw_entry =
+                    weighted_crossprod_dense(x_t_en, &(-&q.d2_q0 * dq_t_en), xw_dense)?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[1],
+                    w_offset,
+                    &(h_tw_exit + h_tw_entry),
+                );
+            } else {
+                let h_tw = weighted_crossprod_dense(
+                    &x_threshold_exit,
+                    &(-&q.d2_q * &q.dq_t),
+                    xw_dense,
+                )?;
+                assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
+            }
 
-            let h_lw = weighted_crossprod_dense(
-                &x_log_sigma_exit,
-                &(-&q.d2_q * &q.dq_ls),
-                xw_dense,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
+            // Log-sigma-wiggle cross block.
+            // d²ℓ/(d(eta_ls) dw) = d²ℓ/dq² * dq/d(eta_ls) * dq/dw + dℓ/dq * d²q/(d(eta_ls) dw)
+            // The second term is zero (d²q/(d(eta_ls)dw) = 0 since dq/dw=1 is
+            // independent of eta_ls). So only the first term remains.
+            if let (Some(x_ls_en), Some(dq_ls_en)) =
+                (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
+            {
+                let h_lw_exit = weighted_crossprod_dense(
+                    &x_log_sigma_exit,
+                    &(-&q.d2_q1 * &q.dq_ls),
+                    xw_dense,
+                )?;
+                let h_lw_entry =
+                    weighted_crossprod_dense(x_ls_en, &(-&q.d2_q0 * dq_ls_en), xw_dense)?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[2],
+                    w_offset,
+                    &(h_lw_exit + h_lw_entry),
+                );
+            } else {
+                let h_lw = weighted_crossprod_dense(
+                    &x_log_sigma_exit,
+                    &(-&q.d2_q * &q.dq_ls),
+                    xw_dense,
+                )?;
+                assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
+            }
 
             let h_h0w =
                 weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0), xw_dense)?;
@@ -2748,19 +2794,63 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             } else {
                 &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1
             };
-            let d_h_tw = weighted_crossprod_dense(
-                &x_threshold_exit,
-                &(-(&d_d2_q_combined * &q.dq_t + &q.d2_q * &delta_q_t_exit)),
-                xw_dense,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[1], w_offset, &d_h_tw);
+            // Threshold-wiggle D_u H cross block.
+            if let (Some(x_t_en), Some(dq_t_en)) =
+                (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
+            {
+                let d_h_tw_exit = weighted_crossprod_dense(
+                    &x_threshold_exit,
+                    &(-(&d_d2_q_exit * &q.dq_t + &q.d2_q1 * &delta_q_t_exit)),
+                    xw_dense,
+                )?;
+                let d_h_tw_entry = weighted_crossprod_dense(
+                    x_t_en,
+                    &(-(&entry_deltas.d_d2_q * dq_t_en + &q.d2_q0 * &entry_deltas.delta_q_t)),
+                    xw_dense,
+                )?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[1],
+                    w_offset,
+                    &(d_h_tw_exit + d_h_tw_entry),
+                );
+            } else {
+                let d_h_tw = weighted_crossprod_dense(
+                    &x_threshold_exit,
+                    &(-(&d_d2_q_combined * &q.dq_t + &q.d2_q * &delta_q_t_exit)),
+                    xw_dense,
+                )?;
+                assign_symmetric_block(&mut joint, offsets[1], w_offset, &d_h_tw);
+            }
 
-            let d_h_lw = weighted_crossprod_dense(
-                &x_log_sigma_exit,
-                &(-(&d_d2_q_combined * &q.dq_ls + &q.d2_q * &delta_q_ls_exit)),
-                xw_dense,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
+            // Log-sigma-wiggle D_u H cross block.
+            if let (Some(x_ls_en), Some(dq_ls_en)) =
+                (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
+            {
+                let d_h_lw_exit = weighted_crossprod_dense(
+                    &x_log_sigma_exit,
+                    &(-(&d_d2_q_exit * &q.dq_ls + &q.d2_q1 * &delta_q_ls_exit)),
+                    xw_dense,
+                )?;
+                let d_h_lw_entry = weighted_crossprod_dense(
+                    x_ls_en,
+                    &(-(&entry_deltas.d_d2_q * dq_ls_en + &q.d2_q0 * &entry_deltas.delta_q_ls)),
+                    xw_dense,
+                )?;
+                assign_symmetric_block(
+                    &mut joint,
+                    offsets[2],
+                    w_offset,
+                    &(d_h_lw_exit + d_h_lw_entry),
+                );
+            } else {
+                let d_h_lw = weighted_crossprod_dense(
+                    &x_log_sigma_exit,
+                    &(-(&d_d2_q_combined * &q.dq_ls + &q.d2_q * &delta_q_ls_exit)),
+                    xw_dense,
+                )?;
+                assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
+            }
 
             let d_hww =
                 weighted_crossprod_dense(xw_dense, &(-&d_d2_q_combined), xw_dense)?;
