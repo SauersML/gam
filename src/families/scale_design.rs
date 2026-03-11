@@ -1,6 +1,7 @@
-use ndarray::{Array1, Array2, ArrayView1, s};
+use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
+use faer::Side;
+use ndarray::{Array1, Array2, ArrayView1};
 
-const PROJECTION_RIDGE: f64 = 1e-10;
 const COLUMN_TOL: f64 = 1e-12;
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,13 @@ fn weighted_centered_ss(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Resu
         .sum())
 }
 
+/// Solve the weighted least-squares projection `argmin_c || W^{1/2}(y - X c) ||^2`
+/// using eigendecomposition of `X^T W X`.
+///
+/// Eigenvalues below a relative tolerance are truncated, yielding the
+/// minimum-norm solution when the system is rank-deficient. This gracefully
+/// handles collinear columns (e.g. saturated I-spline columns that duplicate
+/// the intercept) without failing.
 fn solveweighted_projection_dense(
     design: &Array2<f64>,
     target: &Array1<f64>,
@@ -48,7 +56,9 @@ fn solveweighted_projection_dense(
     if target.len() != n || weights.len() != n {
         return Err("weighted projection dimension mismatch".to_string());
     }
-    let mut xtwx = Array2::<f64>::zeros((p, p));
+    // X^T W X via faer-accelerated path.
+    let xtwx = fast_xt_diag_x(design, weights);
+    // X^T W y.
     let mut xtwy = Array1::<f64>::zeros(p);
     for i in 0..n {
         let wi = weights[i];
@@ -56,59 +66,27 @@ fn solveweighted_projection_dense(
             continue;
         }
         for a in 0..p {
-            let xa = design[[i, a]];
-            xtwy[a] += wi * xa * target[i];
-            for b in 0..p {
-                xtwx[[a, b]] += wi * xa * design[[i, b]];
-            }
+            xtwy[a] += wi * design[[i, a]] * target[i];
         }
     }
+    // Eigendecomposition: X^T W X = V diag(lambda) V^T.
+    // Truncate small eigenvalues for rank-deficient systems.
+    let (eigenvalues, eigenvectors) = xtwx
+        .eigh(Side::Lower)
+        .map_err(|e| format!("weighted projection eigendecomposition failed: {e}"))?;
+    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    let tol = COLUMN_TOL * max_eval.max(1.0);
+    let vt_rhs = eigenvectors.t().dot(&xtwy);
+    let mut result = Array1::<f64>::zeros(p);
     for j in 0..p {
-        xtwx[[j, j]] += PROJECTION_RIDGE;
-    }
-    // Dense SPD solve via faer-backed ndarray path used elsewhere is not exposed
-    // here, so use ndarray-linalg-free Gauss-Jordan on these tiny projection systems.
-    let mut aug = Array2::<f64>::zeros((p, p + 1));
-    aug.slice_mut(s![.., 0..p]).assign(&xtwx);
-    aug.slice_mut(s![.., p]).assign(&xtwy);
-    for col in 0..p {
-        let mut pivot = col;
-        let mut pivot_abs = aug[[pivot, col]].abs();
-        for row in col + 1..p {
-            let cand = aug[[row, col]].abs();
-            if cand > pivot_abs {
-                pivot = row;
-                pivot_abs = cand;
-            }
-        }
-        if !pivot_abs.is_finite() || pivot_abs <= COLUMN_TOL {
-            return Err("weighted projection encountered singular system".to_string());
-        }
-        if pivot != col {
-            for k in col..=p {
-                let tmp = aug[[col, k]];
-                aug[[col, k]] = aug[[pivot, k]];
-                aug[[pivot, k]] = tmp;
-            }
-        }
-        let diag = aug[[col, col]];
-        for k in col..=p {
-            aug[[col, k]] /= diag;
-        }
-        for row in 0..p {
-            if row == col {
-                continue;
-            }
-            let factor = aug[[row, col]];
-            if factor == 0.0 {
-                continue;
-            }
-            for k in col..=p {
-                aug[[row, k]] -= factor * aug[[col, k]];
+        if eigenvalues[j] > tol {
+            let scale = vt_rhs[j] / eigenvalues[j];
+            for i in 0..p {
+                result[i] += eigenvectors[[i, j]] * scale;
             }
         }
     }
-    Ok(aug.slice(s![.., p]).to_owned())
+    Ok(result)
 }
 
 pub fn infer_non_intercept_start(design: &Array2<f64>, weights: &Array1<f64>) -> usize {

@@ -3046,6 +3046,33 @@ fn build_survival_time_basis(
     let log_entry = checked_log_survival_times(age_entry, "entry")?;
     let log_exit = checked_log_survival_times(age_exit, "exit")?;
 
+    // When entry times are degenerate (all identical, e.g. no left truncation),
+    // including them in knot placement would set the boundary knot far from
+    // actual observation times, creating saturated I-spline columns collinear
+    // with the intercept. Use only exit times in that case.
+    fn survival_time_knot_input(
+        log_entry: &Array1<f64>,
+        log_exit: &Array1<f64>,
+    ) -> Array1<f64> {
+        let n = log_entry.len();
+        let entry_range = log_entry
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        let entry_degenerate = (entry_range.1 - entry_range.0).abs() < 1e-8;
+        if entry_degenerate {
+            log_exit.clone()
+        } else {
+            let mut combined = Array1::<f64>::zeros(2 * n);
+            for i in 0..n {
+                combined[i] = log_entry[i];
+                combined[n + i] = log_exit[i];
+            }
+            combined
+        }
+    }
+
     fn infer_survival_time_knots(
         combined: &Array1<f64>,
         degree: usize,
@@ -3195,11 +3222,7 @@ fn build_survival_time_basis(
                 let (num_internal_knots, _) = infer_knots_if_needed.ok_or_else(|| {
                     "internal error: bspline time basis requested without knot source".to_string()
                 })?;
-                let mut combined = Array1::<f64>::zeros(2 * n);
-                for i in 0..n {
-                    combined[i] = log_entry[i];
-                    combined[n + i] = log_exit[i];
-                }
+                let combined = survival_time_knot_input(&log_entry, &log_exit);
                 infer_survival_time_knots(
                     &combined,
                     degree,
@@ -3276,11 +3299,7 @@ fn build_survival_time_basis(
                 let (num_internal_knots, _) = infer_knots_if_needed.ok_or_else(|| {
                     "internal error: ispline time basis requested without knot source".to_string()
                 })?;
-                let mut combined = Array1::<f64>::zeros(2 * n);
-                for i in 0..n {
-                    combined[i] = log_entry[i];
-                    combined[n + i] = log_exit[i];
-                }
+                let combined = survival_time_knot_input(&log_entry, &log_exit);
                 infer_survival_time_knots(
                     &combined,
                     bspline_degree,
@@ -8955,6 +8974,7 @@ fn load_joint_result(
         link,
         s_link_constrained: s_link,
         ridge_used: model.jointridge_used.unwrap_or(0.0),
+        beta_base_covariance: None,
     }))
 }
 
