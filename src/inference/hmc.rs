@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_hmc_structural_monotonic_uses_derivative_offset() {
+    fn survival_hmc_fallback_barrier_rejects_offsets_below_monotonicity_threshold() {
         let age_entry = array![1.0];
         let age_exit = array![2.0];
         let event_target = array![1u8];
@@ -1135,11 +1135,82 @@ mod tests {
         let logpwith_offset =
             HamiltonianTarget::logp_and_grad(&posteriorwith_offset, &z, &mut gradwith_offset);
 
-        assert!(logp_no_offset.is_finite() && logpwith_offset.is_finite());
-        assert!(grad_no_offset.iter().all(|v| v.is_finite()));
-        assert!(gradwith_offset.iter().all(|v| v.is_finite()));
-        // Larger derivative offset means a weaker surrogate barrier penalty.
-        assert!(logpwith_offset > logp_no_offset);
+        assert!(!logp_no_offset.is_finite());
+        assert!(!logpwith_offset.is_finite());
+        assert!(grad_no_offset.iter().all(|v| *v == 0.0));
+        assert!(gradwith_offset.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn survival_hmc_fallback_barrier_becomes_finite_once_offset_clears_guard() {
+        let age_entry = array![1.0];
+        let age_exit = array![2.0];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sampleweight = array![1.0];
+        let x_entry = array![[1.0, 0.0]];
+        let x_exit = array![[1.0, 0.0]];
+        let x_derivative = array![[0.0, 0.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let mode = array![0.0, 0.0];
+        let hessian = Array2::<f64>::eye(2);
+        let z = array![0.0, 0.0];
+
+        let posterior_below_guard = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sampleweight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            None,
+            None,
+            Some(array![2.0].view()),
+            penalties.clone(),
+            monotonicity.clone(),
+            SurvivalSpec::Net,
+            false,
+            0,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct posterior below derivative guard");
+        let mut grad_below_guard = Array1::<f64>::zeros(2);
+        let logp_below_guard =
+            HamiltonianTarget::logp_and_grad(&posterior_below_guard, &z, &mut grad_below_guard);
+
+        let posterior_above_guard = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sampleweight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            None,
+            None,
+            Some(array![3.1].view()),
+            penalties,
+            monotonicity,
+            SurvivalSpec::Net,
+            false,
+            0,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct posterior above derivative guard");
+        let mut grad_above_guard = Array1::<f64>::zeros(2);
+        let logp_above_guard =
+            HamiltonianTarget::logp_and_grad(&posterior_above_guard, &z, &mut grad_above_guard);
+
+        assert!(!logp_below_guard.is_finite());
+        assert!(logp_above_guard.is_finite());
+        assert!(grad_below_guard.iter().all(|v| *v == 0.0));
+        assert!(grad_above_guard.iter().all(|v| v.is_finite()));
     }
 
     #[test]

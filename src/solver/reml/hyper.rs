@@ -1,4 +1,5 @@
 use super::*;
+use crate::matrix::{DenseRightProductView, DenseRowScaledView, LinearOperator};
 
 struct JointHyperThetaBlocks<'a> {
     theta: &'a Array1<f64>,
@@ -603,14 +604,16 @@ impl<'a> RemlState<'a> {
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         let mut rs_eval = reparam_result.rs_transformed.clone();
-        let mut x_eval = pirls_result
-            .x_transformed
-            .to_dense_arc()
-            .as_ref()
-            .to_owned();
+        let x_eval_dense = pirls_result.x_transformed.to_dense_arc();
+        let x_eval = DenseRightProductView::new(x_eval_dense.as_ref())
+            .with_optional_factor(free_basis_opt.as_ref())
+            .materialize();
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
-        let mut x_tau_t = hyper_dir.x_tau_original.dot(&reparam_result.qs);
+        let x_tau_t = DenseRightProductView::new(&hyper_dir.x_tau_original)
+            .with_factor(&reparam_result.qs)
+            .with_optional_factor(free_basis_opt.as_ref())
+            .materialize();
 
         if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
@@ -619,10 +622,8 @@ impl<'a> RemlState<'a> {
                 .iter()
                 .map(|r| r.dot(z))
                 .collect();
-            x_eval = x_eval.dot(z);
             h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
             h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
-            x_tau_t = x_tau_t.dot(z);
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
@@ -837,8 +838,8 @@ impl<'a> RemlState<'a> {
         let d = &pirls_result.solve_d_array;
         let c_tau = d * &eta_tau;
         let mut weighted = Array2::<f64>::zeros(x_eval.raw_dim());
-        let wx = Self::row_scale(&x_eval, &pirls_result.solveweights);
-        let wx_tau = Self::row_scale(&x_tau_t, &pirls_result.solveweights);
+        let wx = DenseRowScaledView::new(&x_eval, &pirls_result.solveweights).materialize();
+        let wx_tau = DenseRowScaledView::new(&x_tau_t, &pirls_result.solveweights).materialize();
         let mut h_tau = x_tau_t.t().dot(&wx)
             + x_eval.t().dot(&wx_tau)
             + Self::xt_diag_x_dense_into(&x_eval, &w_tau, &mut weighted)
@@ -923,8 +924,12 @@ impl<'a> RemlState<'a> {
             // d/dτ [c ⊙ u_k] = c_τ ⊙ u_k + c ⊙ (X_τ B_k) + c ⊙ (X B_{k,τ}).
             let diag_q_tau = &(&c_tau * &u_k) + &(c * &x_tau_bk) + &(c * &u_k_tau);
             let mut h_k_tau = a_k_tau.clone();
-            h_k_tau += &x_tau_t.t().dot(&Self::row_scale(&x_eval, &diag_q));
-            h_k_tau += &x_eval.t().dot(&Self::row_scale(&x_tau_t, &diag_q));
+            h_k_tau += &x_tau_t
+                .t()
+                .dot(&DenseRowScaledView::new(&x_eval, &diag_q).materialize());
+            h_k_tau += &x_eval
+                .t()
+                .dot(&DenseRowScaledView::new(&x_tau_t, &diag_q).materialize());
             h_k_tau += &Self::xt_diag_x_dense_into(&x_eval, &diag_q_tau, &mut weighted);
             let mut d1_trace_correction = 0.0_f64;
             let mut d2_trace_correction = 0.0_f64;
@@ -996,41 +1001,32 @@ impl<'a> RemlState<'a> {
         let free_basis_opt = pert_state.active_constraint_free_basis(pirls_result);
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
-        let mut x_eval = pirls_result
-            .x_transformed
-            .to_dense_arc()
-            .as_ref()
-            .to_owned();
+        let x_eval_dense = pirls_result.x_transformed.to_dense_arc();
+        let x_eval = DenseRightProductView::new(x_eval_dense.as_ref())
+            .with_optional_factor(free_basis_opt.as_ref())
+            .materialize();
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
-        let mut x_tau_t = Vec::<Array2<f64>>::with_capacity(psi_dim);
-        for dir in hyper_dirs {
-            x_tau_t.push(dir.x_tau_original.dot(&reparam_result.qs));
-        }
-        let mut x_tau_tau_t = vec![vec![None; psi_dim]; psi_dim];
-        for i in 0..psi_dim {
-            for j in 0..psi_dim {
-                if let Some(x_ij) = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true) {
-                    x_tau_tau_t[i][j] = Some(x_ij.dot(&reparam_result.qs));
-                }
-            }
-        }
         if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
-            x_eval = x_eval.dot(z);
             h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
             h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
-            for j in 0..psi_dim {
-                x_tau_t[j] = x_tau_t[j].dot(z);
-            }
-            for i in 0..psi_dim {
-                for j in 0..psi_dim {
-                    if let Some(x_ij) = x_tau_tau_t[i][j].as_mut() {
-                        *x_ij = x_ij.dot(z);
-                    }
-                }
-            }
         }
+        let transform_x_tau = |dir: &DirectionalHyperParam| -> Array2<f64> {
+            DenseRightProductView::new(&dir.x_tau_original)
+                .with_factor(&reparam_result.qs)
+                .with_optional_factor(free_basis_opt.as_ref())
+                .materialize()
+        };
+        let transform_x_tau_tau = |i: usize, j: usize| -> Option<Array2<f64>> {
+            let x_ij = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true)?;
+            Some(
+                DenseRightProductView::new(&x_ij)
+                    .with_factor(&reparam_result.qs)
+                    .with_optional_factor(free_basis_opt.as_ref())
+                    .materialize(),
+            )
+        };
 
         let p_dim = beta_eval.len();
         if p_dim == 0 {
@@ -1241,13 +1237,14 @@ impl<'a> RemlState<'a> {
         let mut x_tau_beta = vec![Array1::<f64>::zeros(x_eval.nrows()); psi_dim];
         let mut weighted = Array2::<f64>::zeros(x_eval.raw_dim());
         for j in 0..psi_dim {
-            x_tau_beta[j] = x_tau_t[j].dot(&beta_eval);
+            let x_tau_j = transform_x_tau(&hyper_dirs[j]);
+            x_tau_beta[j] = x_tau_j.dot(&beta_eval);
             let weighted_x_tau_beta = w_diag * &x_tau_beta[j];
-            let mut g_tau = x_tau_t[j].t().dot(&u)
+            let mut g_tau = x_tau_j.t().dot(&u)
                 - x_eval.t().dot(&weighted_x_tau_beta)
                 - a_tau[j].dot(&beta_eval);
             if let Some(op) = firth_op.as_ref() {
-                let tau_bundle = Self::firth_exact_tau_kernel(op, &x_tau_t[j], &beta_eval, true);
+                let tau_bundle = Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, true);
                 g_tau -= &tau_bundle.gphi_tau;
                 if let Some(v) = firth_tau_kernels.as_mut() {
                     let kernel = tau_bundle.tau_kernel.expect(
@@ -1269,12 +1266,12 @@ impl<'a> RemlState<'a> {
             )? {
                 DirectionalWorkingCurvature::Diagonal(diag) => diag,
             };
-            let mut h_j = x_tau_t[j].t().dot(&Self::row_scale(&x_eval, w_diag));
-            h_j += &x_eval.t().dot(&Self::row_scale(&x_tau_t[j], w_diag));
+            let mut h_j = x_tau_j.t().dot(&Self::row_scale(&x_eval, w_diag));
+            h_j += &x_eval.t().dot(&Self::row_scale(&x_tau_j, w_diag));
             h_j += &Self::xt_diag_x_dense_into(&x_eval, &w_tau_j, &mut weighted);
             h_j += &a_tau[j];
             if let Some(op) = firth_op.as_ref() {
-                if x_tau_t[j].iter().any(|v| *v != 0.0) {
+                if x_tau_j.iter().any(|v| *v != 0.0) {
                     let k = firth_tau_kernels
                         .as_ref()
                         .and_then(|v| v.get(j))
@@ -1282,7 +1279,7 @@ impl<'a> RemlState<'a> {
                         .clone();
                     h_j -= &Self::firth_hphi_tau_partial_apply(
                         op,
-                        &x_tau_t[j],
+                        &x_tau_j,
                         &k,
                         &Array2::<f64>::eye(p_dim),
                     );
@@ -1330,6 +1327,7 @@ impl<'a> RemlState<'a> {
         let sdag_a: Vec<Array2<f64>> = a_tau.iter().map(|a| s_dag.dot(a)).collect();
 
         for i in 0..psi_dim {
+            let x_tau_i = transform_x_tau(&hyper_dirs[i]);
             for j in i..psi_dim {
                 // Coupled IFT second derivative:
                 //   H * beta_{tau_i,tau_j} = -(H_{tau_j} beta_{tau_i} + g_{tau_i,tau_j})
@@ -1346,15 +1344,22 @@ impl<'a> RemlState<'a> {
                 //   term2a+term2b+term2c = d/dτ_j [ X^T W(X_{τ_i}β) ]
                 //   a_tau[i].dot(beta_tau[j]) = S_{τ_i} β_{τ_j}.
                 let u_tau_j = -(w_diag * &eta_tau[j]);
-                let term1 = x_tau_t[i].t().dot(&u_tau_j);
-                let x_tau_tau_ij = x_tau_tau_t[i][j].as_ref();
+                let x_tau_j = if j == i {
+                    x_tau_i.clone()
+                } else {
+                    transform_x_tau(&hyper_dirs[j])
+                };
+                let term1 = x_tau_i.t().dot(&u_tau_j);
+                let x_tau_tau_ij = transform_x_tau_tau(i, j);
                 let term1_xij = x_tau_tau_ij
+                    .as_ref()
                     .map(|xij| xij.t().dot(&u))
                     .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
-                let term2a = x_tau_t[j].t().dot(&(w_diag * &x_tau_beta[i]));
+                let term2a = x_tau_j.t().dot(&(w_diag * &x_tau_beta[i]));
                 let term2b = x_eval.t().dot(&((&(c * &eta_tau[j])) * &x_tau_beta[i]));
-                let term2c = x_eval.t().dot(&(w_diag * &x_tau_t[i].dot(&beta_tau[j])));
+                let term2c = x_eval.t().dot(&(w_diag * &x_tau_i.dot(&beta_tau[j])));
                 let xij_beta = x_tau_tau_ij
+                    .as_ref()
                     .map(|xij| xij.dot(&beta_eval))
                     .unwrap_or_else(|| Array1::<f64>::zeros(x_eval.nrows()));
                 let term2d = x_eval.t().dot(&(w_diag * &xij_beta));
@@ -1372,20 +1377,19 @@ impl<'a> RemlState<'a> {
                     let mut btj = Array2::<f64>::zeros((p_dim, 1));
                     btj.column_mut(0).assign(&beta_tau[j]);
                     let gphi_ij =
-                        Self::firth_hphi_tau_partial_apply(op, &x_tau_t[i], &kernels[i], &btj)
+                        Self::firth_hphi_tau_partial_apply(op, &x_tau_i, &kernels[i], &btj)
                             .column(0)
                             .to_owned();
                     g_ij -= &gphi_ij;
-                    if let Some(xij) = x_tau_tau_ij {
+                    if let Some(xij) = x_tau_tau_ij.as_ref() {
                         let xij_bundle = Self::firth_exact_tau_kernel(op, xij, &beta_eval, true);
                         g_ij -= &xij_bundle.gphi_tau;
                     }
                 }
                 let rhs_ij = -(&h_tau[j].dot(&beta_tau[i]) + &g_ij);
                 let beta_ij = solve_hvec(&rhs_ij);
-                let mut eta_ij = x_tau_t[i].dot(&beta_tau[j])
-                    + x_tau_t[j].dot(&beta_tau[i])
-                    + x_eval.dot(&beta_ij);
+                let mut eta_ij =
+                    x_tau_i.dot(&beta_tau[j]) + x_tau_j.dot(&beta_tau[i]) + x_eval.dot(&beta_ij);
                 eta_ij += &xij_beta;
 
                 let diag_i = c * &eta_tau[i];
@@ -1394,20 +1398,32 @@ impl<'a> RemlState<'a> {
                 let diag_ij = &(&c_tau_j * &eta_tau[i]) + &(c * &eta_ij);
 
                 let mut h_ij = Array2::<f64>::zeros((p_dim, p_dim));
-                if let Some(xij) = x_tau_tau_ij {
-                    h_ij += &xij.t().dot(&Self::row_scale(&x_eval, w_diag));
-                    h_ij += &x_eval.t().dot(&Self::row_scale(xij, w_diag));
+                if let Some(xij) = x_tau_tau_ij.as_ref() {
+                    h_ij += &xij
+                        .t()
+                        .dot(&DenseRowScaledView::new(&x_eval, w_diag).materialize());
+                    h_ij += &x_eval
+                        .t()
+                        .dot(&DenseRowScaledView::new(xij, w_diag).materialize());
                 }
-                h_ij += &x_tau_t[i].t().dot(&Self::row_scale(&x_eval, &diag_j));
-                h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[i], &diag_j));
-                h_ij += &x_tau_t[i]
+                h_ij += &x_tau_i
                     .t()
-                    .dot(&Self::row_scale(&x_tau_t[j], &pirls_result.solveweights));
-                h_ij += &x_tau_t[j]
+                    .dot(&DenseRowScaledView::new(&x_eval, &diag_j).materialize());
+                h_ij += &x_eval
                     .t()
-                    .dot(&Self::row_scale(&x_tau_t[i], &pirls_result.solveweights));
-                h_ij += &x_tau_t[j].t().dot(&Self::row_scale(&x_eval, &diag_i));
-                h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[j], &diag_i));
+                    .dot(&DenseRowScaledView::new(&x_tau_i, &diag_j).materialize());
+                h_ij += &x_tau_i.t().dot(
+                    &DenseRowScaledView::new(&x_tau_j, &pirls_result.solveweights).materialize(),
+                );
+                h_ij += &x_tau_j.t().dot(
+                    &DenseRowScaledView::new(&x_tau_i, &pirls_result.solveweights).materialize(),
+                );
+                h_ij += &x_tau_j
+                    .t()
+                    .dot(&DenseRowScaledView::new(&x_eval, &diag_i).materialize());
+                h_ij += &x_eval
+                    .t()
+                    .dot(&DenseRowScaledView::new(&x_tau_j, &diag_i).materialize());
                 h_ij += &Self::xt_diag_x_dense_into(&x_eval, &diag_ij, &mut weighted);
                 if let Some(aij) = a_tau_tau[i][j].as_ref() {
                     h_ij += aij;
@@ -1420,23 +1436,23 @@ impl<'a> RemlState<'a> {
                     let dir_ij = Self::firth_direction(op, &beta_ij);
                     d1_trace_correction = trace_hdag_firth_first(op, &dir_ij);
                     d2_trace_correction = trace_hdag_firthsecond(op, &dirs[i], &dirs[j]);
-                    if let Some(xij) = x_tau_tau_ij {
+                    if let Some(xij) = x_tau_tau_ij.as_ref() {
                         let xij_bundle = Self::firth_exact_tau_kernel(op, xij, &beta_eval, true);
                         if let Some(kernel) = xij_bundle.tau_kernel.as_ref() {
                             dtau_trace_correction += trace_hdag_firth_tau_partial(op, xij, kernel);
                         }
                     }
-                    if x_tau_t[i].iter().any(|v| *v != 0.0) {
+                    if x_tau_i.iter().any(|v| *v != 0.0) {
                         let k_i_jtau =
-                            Self::firth_hphi_tau_partial_prepare(op, &x_tau_t[i], &beta_tau[j]);
+                            Self::firth_hphi_tau_partial_prepare(op, &x_tau_i, &beta_tau[j]);
                         dtau_trace_correction +=
-                            trace_hdag_firth_tau_partial(op, &x_tau_t[i], &k_i_jtau);
+                            trace_hdag_firth_tau_partial(op, &x_tau_i, &k_i_jtau);
                     }
-                    if x_tau_t[j].iter().any(|v| *v != 0.0) {
+                    if x_tau_j.iter().any(|v| *v != 0.0) {
                         let k_j_itau =
-                            Self::firth_hphi_tau_partial_prepare(op, &x_tau_t[j], &beta_tau[i]);
+                            Self::firth_hphi_tau_partial_prepare(op, &x_tau_j, &beta_tau[i]);
                         dtau_trace_correction +=
-                            trace_hdag_firth_tau_partial(op, &x_tau_t[j], &k_j_itau);
+                            trace_hdag_firth_tau_partial(op, &x_tau_j, &k_j_itau);
                     }
                 }
 
@@ -1587,16 +1603,21 @@ impl<'a> RemlState<'a> {
         let mut x_transformed_eval = pirls_result.x_transformed.clone();
         let mut e_eval = reparam_result.e_transformed.clone();
 
-        let mut x_psi_t = hyper_dir.x_tau_original.dot(&reparam_result.qs);
+        let x_psi_t = DenseRightProductView::new(&hyper_dir.x_tau_original)
+            .with_factor(&reparam_result.qs)
+            .with_optional_factor(free_basis_opt.as_ref());
 
         if let Some(z) = free_basis_opt.as_ref() {
             h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
             h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
-            x_transformed_eval = DesignMatrix::Dense(x_dense_arc.as_ref().dot(z));
+            x_transformed_eval = DesignMatrix::Dense(
+                DenseRightProductView::new(x_dense_arc.as_ref())
+                    .with_factor(z)
+                    .materialize(),
+            );
             e_eval = reparam_result.e_transformed.dot(z);
-            x_psi_t = x_psi_t.dot(z);
         }
         let transformed_penalty_components = Self::transform_penalty_components(
             hyper_dir.penalty_first_components(),
@@ -1768,7 +1789,7 @@ impl<'a> RemlState<'a> {
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
         // `u` is the current predictor-space score contribution g pulled through
         // the PIRLS linearization, so X_τ^T g is represented by x_psi_t^T u.
-        let xpsi_beta = x_psi_t.dot(&beta_eval);
+        let xpsi_beta = x_psi_t.apply(&beta_eval);
         let weighted_xpsi_beta = &pirls_result.solveweights * &xpsi_beta;
         // Differentiate the stationarity equation
         //   0 = X^T g - S β̂
@@ -1791,7 +1812,7 @@ impl<'a> RemlState<'a> {
         //   Phi = 0.5 log|I_r|_+, I_r = X_r^T W X_r.
         // This RHS is exactly `g_psi`, and `solve_hvec(g_psi)` computes B
         // without ever forming H^{-1} explicitly.
-        let mut g_psi = x_psi_t.t().dot(&u)
+        let mut g_psi = x_psi_t.apply_transpose(&u)
             - x_dense.t().dot(&weighted_xpsi_beta)
             - s_psi_total_t.dot(&beta_eval);
         let mut fit_firth_partial = 0.0_f64;
@@ -1808,9 +1829,10 @@ impl<'a> RemlState<'a> {
             //     + 0.5 X'((w'' ⊙ (X_tau β)) ⊙ h + w' ⊙ h_tau|beta),
             //   Phi_tau|beta = 0.5 tr(I_r^{-1} I_{r,tau}),
             // with I_r = X_r' W X_r and h_i = x_{r,i}' I_r^{-1} x_{r,i}.
-            let need_tau_kernel = x_psi_t.iter().any(|v| *v != 0.0);
+            let x_psi_t_dense = x_psi_t.materialize();
+            let need_tau_kernel = x_psi_t_dense.iter().any(|v| *v != 0.0);
             let tau_bundle =
-                Self::firth_exact_tau_kernel(op, &x_psi_t, &beta_eval, need_tau_kernel);
+                Self::firth_exact_tau_kernel(op, &x_psi_t_dense, &beta_eval, need_tau_kernel);
             g_psi -= &tau_bundle.gphi_tau;
             fit_firth_partial = tau_bundle.phi_tau_partial;
             if need_tau_kernel {
@@ -1854,9 +1876,10 @@ impl<'a> RemlState<'a> {
 
         let w = &pirls_result.solveweights;
         let wx = Self::row_scale(&x_dense, w);
-        let wx_psi = Self::row_scale(&x_psi_t, w);
+        let x_psi_t_dense = x_psi_t.materialize();
+        let wx_psi = Self::row_scale(&x_psi_t_dense, w);
 
-        let mut h_psi = x_psi_t.t().dot(&wx);
+        let mut h_psi = x_psi_t_dense.t().dot(&wx);
         h_psi += &x_dense.t().dot(&wx_psi);
 
         match self.config.link_function() {

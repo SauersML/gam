@@ -1,4 +1,5 @@
 use super::*;
+use crate::matrix::DenseRightProductView;
 use ndarray::ShapeBuilder;
 
 impl<'a> RemlState<'a> {
@@ -472,7 +473,9 @@ impl<'a> RemlState<'a> {
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         let mut rs_eval = reparam_result.rs_transformed.clone();
         let x_dense_orig_arc = pirls_result.x_transformed.to_dense_arc();
-        let mut x_dense_eval = x_dense_orig_arc.as_ref().to_owned();
+        let x_dense_eval = DenseRightProductView::new(x_dense_orig_arc.as_ref())
+            .with_optional_factor(free_basis_opt.as_ref())
+            .materialize();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let mut e_eval = reparam_result.e_transformed.clone();
 
@@ -484,7 +487,6 @@ impl<'a> RemlState<'a> {
                 .iter()
                 .map(|r| r.dot(z))
                 .collect();
-            x_dense_eval = x_dense_orig_arc.as_ref().dot(z);
             e_eval = reparam_result.e_transformed.dot(z);
         }
 
@@ -1676,7 +1678,11 @@ impl<'a> RemlState<'a> {
                 .map(|r| r.dot(z))
                 .collect();
             let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
-            x_transformed_eval = DesignMatrix::Dense(x_dense_arc.as_ref().dot(z));
+            x_transformed_eval = DesignMatrix::Dense(
+                DenseRightProductView::new(x_dense_arc.as_ref())
+                    .with_factor(z)
+                    .materialize(),
+            );
 
             let (eigvals, eigvecs) = h_eff_eval
                 .eigh(Side::Lower)
