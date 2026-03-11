@@ -2019,6 +2019,35 @@ fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &A
     }
 }
 
+/// Compute the projected gradient norm for bound-constrained optimization.
+///
+/// At a constrained optimum, gradient components for variables at their lower
+/// bound that point into the infeasible direction (gradient > 0 for minimization)
+/// are KKT multipliers, not convergence defects.  Zeroing them gives the
+/// standard "projected gradient" used to test stationarity.
+fn projected_gradient_norm(
+    gradient: &Array1<f64>,
+    beta: &Array1<f64>,
+    lower_bounds: Option<&Array1<f64>>,
+) -> f64 {
+    let Some(lb) = lower_bounds else {
+        return gradient.dot(gradient).sqrt();
+    };
+    let bound_tol = 1e-10;
+    let mut sum_sq = 0.0;
+    for i in 0..gradient.len() {
+        let g = gradient[i];
+        // If variable is at its lower bound and gradient points into infeasible
+        // region (positive gradient = descent wants to decrease, but can't),
+        // this component is a constraint force, not a convergence defect.
+        if lb[i].is_finite() && (beta[i] - lb[i]).abs() < bound_tol && g > 0.0 {
+            continue;
+        }
+        sum_sq += g * g;
+    }
+    sum_sq.sqrt()
+}
+
 fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
@@ -3376,6 +3405,13 @@ where
                         final_state = Some(candidate_state.clone());
 
                         // Check Convergence
+                        // For bound-constrained problems, use the projected gradient
+                        // (excludes KKT multiplier components at active bounds).
+                        let convergence_grad_norm = projected_gradient_norm(
+                            &candidate_state.gradient,
+                            beta.as_ref(),
+                            options.coefficient_lower_bounds.as_ref(),
+                        );
                         let deviance_scale = current_penalized
                             .abs()
                             .max(candidate_penalized.abs())
@@ -3383,13 +3419,13 @@ where
                         let grad_tol = options.convergence_tolerance; // Absolute norm check
                         let dev_tol = options.convergence_tolerance * deviance_scale;
 
-                        if candidategrad_norm < grad_tol {
+                        if convergence_grad_norm < grad_tol {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
                         if deviance_change.abs() < dev_tol
                             && deviance_change >= 0.0
-                            && candidategrad_norm < grad_tol
+                            && convergence_grad_norm < grad_tol
                         {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
@@ -3399,6 +3435,13 @@ where
                     } else {
                         // Reject Step
                         let stategrad_norm = state.gradient.dot(&state.gradient).sqrt();
+                        // For bound-constrained problems, use the projected gradient
+                        // to judge stationarity (excludes KKT multiplier components).
+                        let projected_grad = projected_gradient_norm(
+                            &state.gradient,
+                            beta.as_ref(),
+                            options.coefficient_lower_bounds.as_ref(),
+                        );
                         let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 50.0;
                         let reduction_noise_floor = (current_penalized
                             .abs()
@@ -3410,7 +3453,7 @@ where
                         // noise and LM gain-ratio logic may reject every candidate indefinitely.
                         // Treat this as a valid stalled optimum rather than escalating damping.
                         if candidate_penalized.is_finite()
-                            && stategrad_norm <= near_stationary_tol
+                            && projected_grad <= near_stationary_tol
                             && predicted_reduction.abs() <= reduction_noise_floor
                             && actual_reduction >= -reduction_noise_floor
                         {
@@ -3431,7 +3474,7 @@ where
                                 lastgradient_norm = stategrad_norm;
                                 // Only accept "stalled but valid" when we are near stationarity.
                                 // Otherwise report MaxIterationsReached so callers can fail fast.
-                                if stategrad_norm <= near_stationary_tol {
+                                if projected_grad <= near_stationary_tol {
                                     status = PirlsStatus::StalledAtValidMinimum;
                                 } else {
                                     status = PirlsStatus::MaxIterationsReached;
@@ -3457,8 +3500,14 @@ where
         last_change: lastgradient_norm,
     })?;
 
+    // Post-loop rescue: use projected gradient for bound-constrained problems.
+    let final_projected_grad = projected_gradient_norm(
+        &state.gradient,
+        beta.as_ref(),
+        options.coefficient_lower_bounds.as_ref(),
+    );
     if matches!(status, PirlsStatus::MaxIterationsReached)
-        && lastgradient_norm < options.convergence_tolerance
+        && final_projected_grad < options.convergence_tolerance
     {
         status = PirlsStatus::StalledAtValidMinimum;
     }
