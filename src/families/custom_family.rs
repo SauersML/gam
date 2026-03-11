@@ -4863,6 +4863,23 @@ fn compute_joint_covariance<F: CustomFamily>(
     }
 }
 
+fn compute_joint_covariance_required<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    per_block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+) -> Result<Option<Array2<f64>>, CustomFamilyError> {
+    if !options.compute_covariance {
+        return Ok(None);
+    }
+    compute_joint_covariance(family, specs, states, per_block_log_lambdas, options)
+        .map(Some)
+        .map_err(|e| {
+            CustomFamilyError::InvalidInput(format!("joint covariance computation failed: {e}"))
+        })
+}
+
 #[allow(clippy::type_complexity)]
 pub fn fit_custom_family<F: CustomFamily>(
     family: &F,
@@ -4881,18 +4898,13 @@ pub fn fit_custom_family<F: CustomFamily>(
             None,
         )?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-        let covariance_conditional = if options.compute_covariance {
-            compute_joint_covariance(
-                family,
-                specs,
-                &inner.block_states,
-                &vec![Array1::zeros(0); specs.len()],
-                options,
-            )
-            .ok()
-        } else {
-            None
-        };
+        let covariance_conditional = compute_joint_covariance_required(
+            family,
+            specs,
+            &inner.block_states,
+            &vec![Array1::zeros(0); specs.len()],
+            options,
+        )?;
         let reml_term = if options.use_remlobjective {
             0.5 * (inner.block_logdet_h - inner.block_logdet_s)
         } else {
@@ -4958,11 +4970,13 @@ pub fn fit_custom_family<F: CustomFamily>(
         let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
         let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-        let covariance_conditional = if options.compute_covariance {
-            compute_joint_covariance(family, specs, &inner.block_states, &per_block, options).ok()
-        } else {
-            None
-        };
+        let covariance_conditional = compute_joint_covariance_required(
+            family,
+            specs,
+            &inner.block_states,
+            &per_block,
+            options,
+        )?;
         let reml_term = if include_exact_newton_logdet_h(family) {
             0.5 * inner.block_logdet_h
         } else {
@@ -5153,11 +5167,8 @@ pub fn fit_custom_family<F: CustomFamily>(
             details = last_eval_error()
         )
     })?;
-    let covariance_conditional = if options.compute_covariance {
-        compute_joint_covariance(family, specs, &inner.block_states, &per_block, options).ok()
-    } else {
-        None
-    };
+    let covariance_conditional =
+        compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
     Ok(BlockwiseFitResult {
         block_states: inner.block_states,
@@ -5636,6 +5647,35 @@ mod tests {
         ) -> Result<FamilyEvaluation, String> {
             let _ = block_states;
             Err("synthetic outer objective failure: block[0] evaluate()".to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneBlockCovarianceErrorFamily;
+
+    impl CustomFamily for OneBlockCovarianceErrorFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states[0].eta.len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn exact_newton_joint_hessian_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+        ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = specs;
+            Err("synthetic covariance assembly failure".to_string())
         }
     }
 
@@ -6776,6 +6816,32 @@ mod tests {
                 "last objective error: synthetic outer objective failure: block[0] evaluate()"
             ),
             "expected preserved root-cause context in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fit_fails_when_requested_covariance_cannot_be_computed() {
+        let spec = ParameterBlockSpec {
+            name: "cov_block".to_string(),
+            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.0],
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        };
+        let options = BlockwiseFitOptions {
+            compute_covariance: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let err = match fit_custom_family(&OneBlockCovarianceErrorFamily, &[spec], &options) {
+            Ok(_) => panic!("fit should fail when covariance computation fails"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains(
+                "joint covariance computation failed: synthetic covariance assembly failure"
+            ),
+            "expected covariance root cause in fit error, got: {err}"
         );
     }
 }

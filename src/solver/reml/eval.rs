@@ -1,4 +1,5 @@
 use super::*;
+use ndarray::ShapeBuilder;
 
 impl<'a> RemlState<'a> {
     pub(super) fn structural_penalty_logdet_derivatives(
@@ -980,207 +981,333 @@ impl<'a> RemlState<'a> {
             }
             let b_kl_all = solve_h(&rhs_kl_all);
             let u_kl_all = fast_ab(x_dense, &b_kl_all);
-            let compute_entry = |k: usize| -> f64 {
-                // H_{k,l} = delta_{k,l} A_k
-                //          + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
-                //
-                // Split into Fréchet pieces:
-                //   delta_{k,l} A_k                      -> penalty second derivative
-                //   X' diag(d ⊙ u_k ⊙ u_l) X            -> D²(-∇²ℓ)[B_k,B_l]
-                //   X' diag(c ⊙ u_{k,l}) X              -> D(-∇²ℓ)[B_{k,l}]
-                // so this is exactly the required
-                //   J_{k,l} = dH[u_{k,l}] + d²H[u_l,u_k]
-                // non-Gaussian curvature term.
-                let mut diag = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    // Per-observation decomposition:
-                    //   diag_i = d_i u_{i,k} u_{i,l} + c_i u_{i,k,l},
-                    // where
-                    //   u_{i,k}   = (X B_k)_i,
-                    //   u_{i,k,l} = (X B_{k,l})_i.
-                    // This is the scalar weight multiplying x_i x_i^T in
-                    // X' diag(diag) X for the H_{k,l} likelihood part.
-                    diag[i] = d[i] * u_mat[[i, k]] * u_mat[[i, l]] + c[i] * u_kl_all[[i, k]];
-                }
-
-                // Quadratic beta contribution:
-                //   Q_{k,l} = B_l' A_k beta + 0.5 delta_{k,l} beta' A_k beta.
-                // `a_k_beta[k]` stores A_k beta and `q_diag[k]` stores beta' A_k beta.
-                let q = bl.dot(&a_k_beta[k]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
-
-                // Quadratic logdet trace piece:
-                //   t1 = tr(H^{-1} H_l H^{-1} H_k).
-                // `t1_mat` is preassembled from exact or stochastic contractions.
-                let t1 = t1_mat[[l, k]];
-                let t2 = if exact_trace_mode {
-                    if projected_exact_mode {
-                        let z_mat = z_mat_projected
-                            .as_ref()
-                            .expect("projected exact Z available");
-                        let w_pos = w_pos_projected
-                            .as_ref()
-                            .expect("projected exact W available");
-                        Self::dense_projected_trace_hinv_hkl(
-                            z_mat,
-                            w_pos,
-                            if k == l {
-                                Some(&rs_transformed[k])
-                            } else {
-                                None
-                            },
-                            lambdas[k],
-                            &diag,
-                        )
-                    } else {
-                        // Linear logdet trace piece in exact mode:
-                        //   t2 = tr(H^{-1} H_{k,l}).
-                        let mut h_kl = if k == l {
-                            a_k_mats[k].clone()
-                        } else {
-                            Array2::<f64>::zeros((p_dim, p_dim))
-                        };
-                        // Add X' diag(diag) X to complete
-                        //   H_{k,l} = delta_{k,l} A_k + X' diag(diag) X
-                        // before optional Firth corrections.
-                        let mut weighted_xtdx_kl = Array2::<f64>::zeros(x_dense.raw_dim());
-                        h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
-                        let mut d2_trace_correction = 0.0_f64;
-                        if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_dirs.as_ref()) {
-                            // Reuse already-batched eta sensitivities u_{k,l} = X B_{k,l}
-                            // from `u_kl_all` to avoid redundant X.dot(B_{k,l}) work.
-                            let deta_kl = u_kl_all.column(k).to_owned();
-                            let dir_kl = Self::firth_direction_from_deta(op, deta_kl);
-                            // Firth second-order correction:
-                            //   H_{k,l} <- H_{k,l}
-                            //             - D H_φ[B_{k,l}]
-                            //             - D² H_φ[B_k,B_l].
-                            h_kl -= &Self::firth_hphi_direction(op, &dir_kl);
-                            if spectral_exact_mode {
-                                let w_pos = w_posspectral
-                                    .as_ref()
-                                    .expect("spectral W present in spectral exact mode");
-                                let w_pos_t = w_posspectral_t
-                                    .as_ref()
-                                    .expect("spectral W^T present in spectral exact mode");
-                                let d2_aw = Self::firth_hphisecond_direction_apply(
-                                    op, &dirs[k], &dirs[l], w_pos,
-                                );
-                                d2_trace_correction = Self::trace_product(w_pos_t, &d2_aw);
-                            } else {
-                                // Exact dense-solve fallback for tr(H^{-1} D²Hphi[B_k,B_l])
-                                // without materializing the full p×p D²Hphi matrix.
-                                const BLOCK: usize = 32;
-                                let mut acc = 0.0_f64;
-                                let mut start = 0usize;
-                                while start < p_dim {
-                                    let width = (p_dim - start).min(BLOCK);
-                                    let mut basis = Array2::<f64>::zeros((p_dim, width));
-                                    for j in 0..width {
-                                        basis[[start + j, j]] = 1.0;
-                                    }
-                                    let d2_block = Self::firth_hphisecond_direction_apply(
-                                        op, &dirs[k], &dirs[l], &basis,
-                                    );
-                                    let solved_block = solve_h(&d2_block);
-                                    for j in 0..width {
-                                        acc += solved_block[[start + j, j]];
-                                    }
-                                    start += width;
-                                }
-                                d2_trace_correction = acc;
-                            }
-                        }
-                        if spectral_exact_mode {
-                            let w_pos = w_posspectral
-                                .as_ref()
-                                .expect("spectral W present in spectral exact mode");
-                            let w_pos_t = w_posspectral_t
-                                .as_ref()
-                                .expect("spectral W^T present in spectral exact mode");
-                            let wt_hkl = fast_ab(w_pos_t, &h_kl);
-                            let g_kl = fast_ab(&wt_hkl, w_pos);
-                            // t2 = tr(H_+^dagger H_kl) = tr(W^T H_kl W).
-                            g_kl.diag().sum() - d2_trace_correction
-                        } else {
-                            // Dense exact fallback without explicit inverse:
-                            //   tr(H^{-1} H_kl) = tr(solve(H, H_kl)).
-                            // If H is SPD and solve(H,·)=H^{-1}(·), diagonal sum of the
-                            // solved block is exactly the required trace.
-                            let solved_hkl = solve_h(&h_kl);
-                            solved_hkl.diag().sum()
-                        }
-                    }
-                } else {
-                    let mut t2_acc = 0.0_f64;
-                    if let (Some(q), Some(uq), Some(xq), Some(xuq)) = (
-                        sketch_q.as_ref(),
-                        sketch_uq.as_ref(),
-                        sketch_xq.as_ref(),
-                        sketch_xuq.as_ref(),
-                    ) {
-                        for j in 0..q.ncols() {
-                            let qj = q.column(j);
-                            let uqj = uq.column(j);
-                            let xqj = xq.column(j);
-                            let xuqj = xuq.column(j);
-                            let mut term = 0.0_f64;
-                            if k == l {
-                                term += Self::bilinear_form(&a_k_mats[k], uqj, qj);
-                            }
-                            let mut quad = 0.0_f64;
-                            for i in 0..n {
-                                quad += xuqj[i] * diag[i] * xqj[i];
-                            }
-                            term += quad;
-                            t2_acc += term;
-                        }
-                    }
-                    let z = probez.as_ref().expect("probes present in stochastic mode");
-                    let u = probe_u
-                        .as_ref()
-                        .expect("solved probes present in stochastic mode");
-                    let xz = probe_xz
-                        .as_ref()
-                        .expect("X probes present in stochastic mode");
-                    let xu = probe_xu
-                        .as_ref()
-                        .expect("X solved probes present in stochastic mode");
-                    let mut res = 0.0_f64;
-                    for r in 0..n_probe {
-                        let zr = z.column(r);
-                        let ur = u.column(r);
-                        let xzr = xz.column(r);
-                        let xur = xu.column(r);
-                        let mut term = 0.0_f64;
-                        if k == l {
-                            term += Self::bilinear_form(&a_k_mats[k], ur, zr);
-                        }
-                        let mut quad = 0.0_f64;
-                        for i in 0..n {
-                            quad += xur[i] * diag[i] * xzr[i];
-                        }
-                        term += quad;
-                        res += term;
-                    }
-                    t2_acc + res / (n_probe as f64)
-                };
-                // L_{k,l} = 0.5 [ -t1 + t2 ]
-                let l_term = 0.5 * (-t1 + t2);
-                // P_{k,l} = -0.5 * d²/drho_k drho_l log|S|_+.
-                // `d2logs[[k,l]]` is ∂² log|S|_+ /(∂ρ_k∂ρ_l), computed on the
-                // fixed structural active penalty subspace.
-                let p_term = -0.5 * d2logs[[k, l]];
-                // Final exact dense transformed Hessian entry:
-                //   V_{k,l} = Q_{k,l} + L_{k,l} + P_{k,l}.
-                q + l_term + p_term
-            };
-
             let row_entries: Vec<(usize, f64)> = if dense_exact_inner_solve_mode {
-                (l..k_count).map(|k| (k, compute_entry(k))).collect()
+                let mut weighted_xtdx_kl = Array2::<f64>::zeros((0, 0).f());
+                (l..k_count)
+                    .map(|k| {
+                        let val = {
+                            // Inline the only per-k mutable scratch so the sequential
+                            // branch can reuse one bounded chunk buffer too.
+                            let mut diag = Array1::<f64>::zeros(n);
+                            for i in 0..n {
+                                diag[i] =
+                                    d[i] * u_mat[[i, k]] * u_mat[[i, l]] + c[i] * u_kl_all[[i, k]];
+                            }
+
+                            let q =
+                                bl.dot(&a_k_beta[k]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
+                            let t1 = t1_mat[[l, k]];
+                            let t2 = if exact_trace_mode {
+                                if projected_exact_mode {
+                                    let z_mat = z_mat_projected
+                                        .as_ref()
+                                        .expect("projected exact Z available");
+                                    let w_pos = w_pos_projected
+                                        .as_ref()
+                                        .expect("projected exact W available");
+                                    Self::dense_projected_trace_hinv_hkl(
+                                        z_mat,
+                                        w_pos,
+                                        if k == l {
+                                            Some(&rs_transformed[k])
+                                        } else {
+                                            None
+                                        },
+                                        lambdas[k],
+                                        &diag,
+                                    )
+                                } else {
+                                    let mut h_kl = if k == l {
+                                        a_k_mats[k].clone()
+                                    } else {
+                                        Array2::<f64>::zeros((p_dim, p_dim))
+                                    };
+                                    h_kl += &Self::xt_diag_x_dense_chunked_into(
+                                        x_dense,
+                                        &diag,
+                                        &mut weighted_xtdx_kl,
+                                    );
+                                    let mut d2_trace_correction = 0.0_f64;
+                                    if let (Some(op), Some(dirs)) =
+                                        (firth_op.as_ref(), firth_dirs.as_ref())
+                                    {
+                                        let deta_kl = u_kl_all.column(k).to_owned();
+                                        let dir_kl = Self::firth_direction_from_deta(op, deta_kl);
+                                        h_kl -= &Self::firth_hphi_direction(op, &dir_kl);
+                                        if spectral_exact_mode {
+                                            let w_pos = w_posspectral.as_ref().expect(
+                                                "spectral W present in spectral exact mode",
+                                            );
+                                            let w_pos_t = w_posspectral_t.as_ref().expect(
+                                                "spectral W^T present in spectral exact mode",
+                                            );
+                                            let d2_aw = Self::firth_hphisecond_direction_apply(
+                                                op, &dirs[k], &dirs[l], w_pos,
+                                            );
+                                            d2_trace_correction =
+                                                Self::trace_product(w_pos_t, &d2_aw);
+                                        } else {
+                                            const BLOCK: usize = 32;
+                                            let mut acc = 0.0_f64;
+                                            let mut start = 0usize;
+                                            while start < p_dim {
+                                                let width = (p_dim - start).min(BLOCK);
+                                                let mut basis =
+                                                    Array2::<f64>::zeros((p_dim, width));
+                                                for j in 0..width {
+                                                    basis[[start + j, j]] = 1.0;
+                                                }
+                                                let d2_block =
+                                                    Self::firth_hphisecond_direction_apply(
+                                                        op, &dirs[k], &dirs[l], &basis,
+                                                    );
+                                                let solved_block = solve_h(&d2_block);
+                                                for j in 0..width {
+                                                    acc += solved_block[[start + j, j]];
+                                                }
+                                                start += width;
+                                            }
+                                            d2_trace_correction = acc;
+                                        }
+                                    }
+                                    if spectral_exact_mode {
+                                        let w_pos = w_posspectral
+                                            .as_ref()
+                                            .expect("spectral W present in spectral exact mode");
+                                        let w_pos_t = w_posspectral_t
+                                            .as_ref()
+                                            .expect("spectral W^T present in spectral exact mode");
+                                        let wt_hkl = fast_ab(w_pos_t, &h_kl);
+                                        let g_kl = fast_ab(&wt_hkl, w_pos);
+                                        g_kl.diag().sum() - d2_trace_correction
+                                    } else {
+                                        let solved_hkl = solve_h(&h_kl);
+                                        solved_hkl.diag().sum()
+                                    }
+                                }
+                            } else {
+                                let mut t2_acc = 0.0_f64;
+                                if let (Some(q), Some(uq), Some(xq), Some(xuq)) = (
+                                    sketch_q.as_ref(),
+                                    sketch_uq.as_ref(),
+                                    sketch_xq.as_ref(),
+                                    sketch_xuq.as_ref(),
+                                ) {
+                                    for j in 0..q.ncols() {
+                                        let qj = q.column(j);
+                                        let uqj = uq.column(j);
+                                        let xqj = xq.column(j);
+                                        let xuqj = xuq.column(j);
+                                        let mut term = 0.0_f64;
+                                        if k == l {
+                                            term += Self::bilinear_form(&a_k_mats[k], uqj, qj);
+                                        }
+                                        let mut quad = 0.0_f64;
+                                        for i in 0..n {
+                                            quad += xuqj[i] * diag[i] * xqj[i];
+                                        }
+                                        term += quad;
+                                        t2_acc += term;
+                                    }
+                                }
+                                let z = probez.as_ref().expect("probes present in stochastic mode");
+                                let u = probe_u
+                                    .as_ref()
+                                    .expect("solved probes present in stochastic mode");
+                                let xz = probe_xz
+                                    .as_ref()
+                                    .expect("X probes present in stochastic mode");
+                                let xu = probe_xu
+                                    .as_ref()
+                                    .expect("X solved probes present in stochastic mode");
+                                let mut res = 0.0_f64;
+                                for r in 0..n_probe {
+                                    let zr = z.column(r);
+                                    let ur = u.column(r);
+                                    let xzr = xz.column(r);
+                                    let xur = xu.column(r);
+                                    let mut term = 0.0_f64;
+                                    if k == l {
+                                        term += Self::bilinear_form(&a_k_mats[k], ur, zr);
+                                    }
+                                    let mut quad = 0.0_f64;
+                                    for i in 0..n {
+                                        quad += xur[i] * diag[i] * xzr[i];
+                                    }
+                                    term += quad;
+                                    res += term;
+                                }
+                                t2_acc + res / (n_probe as f64)
+                            };
+                            let l_term = 0.5 * (-t1 + t2);
+                            let p_term = -0.5 * d2logs[[k, l]];
+                            q + l_term + p_term
+                        };
+                        (k, val)
+                    })
+                    .collect()
             } else {
                 (l..k_count)
                     .into_par_iter()
-                    .map(|k| (k, compute_entry(k)))
+                    .map_init(
+                        || Array2::<f64>::zeros((0, 0).f()),
+                        |weighted_xtdx_kl, k| {
+                            let mut diag = Array1::<f64>::zeros(n);
+                            for i in 0..n {
+                                diag[i] =
+                                    d[i] * u_mat[[i, k]] * u_mat[[i, l]] + c[i] * u_kl_all[[i, k]];
+                            }
+
+                            let q =
+                                bl.dot(&a_k_beta[k]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
+                            let t1 = t1_mat[[l, k]];
+                            let t2 = if exact_trace_mode {
+                                if projected_exact_mode {
+                                    let z_mat = z_mat_projected
+                                        .as_ref()
+                                        .expect("projected exact Z available");
+                                    let w_pos = w_pos_projected
+                                        .as_ref()
+                                        .expect("projected exact W available");
+                                    Self::dense_projected_trace_hinv_hkl(
+                                        z_mat,
+                                        w_pos,
+                                        if k == l {
+                                            Some(&rs_transformed[k])
+                                        } else {
+                                            None
+                                        },
+                                        lambdas[k],
+                                        &diag,
+                                    )
+                                } else {
+                                    let mut h_kl = if k == l {
+                                        a_k_mats[k].clone()
+                                    } else {
+                                        Array2::<f64>::zeros((p_dim, p_dim))
+                                    };
+                                    h_kl += &Self::xt_diag_x_dense_chunked_into(
+                                        x_dense,
+                                        &diag,
+                                        weighted_xtdx_kl,
+                                    );
+                                    let mut d2_trace_correction = 0.0_f64;
+                                    if let (Some(op), Some(dirs)) =
+                                        (firth_op.as_ref(), firth_dirs.as_ref())
+                                    {
+                                        let deta_kl = u_kl_all.column(k).to_owned();
+                                        let dir_kl = Self::firth_direction_from_deta(op, deta_kl);
+                                        h_kl -= &Self::firth_hphi_direction(op, &dir_kl);
+                                        if spectral_exact_mode {
+                                            let w_pos = w_posspectral.as_ref().expect(
+                                                "spectral W present in spectral exact mode",
+                                            );
+                                            let w_pos_t = w_posspectral_t.as_ref().expect(
+                                                "spectral W^T present in spectral exact mode",
+                                            );
+                                            let d2_aw = Self::firth_hphisecond_direction_apply(
+                                                op, &dirs[k], &dirs[l], w_pos,
+                                            );
+                                            d2_trace_correction =
+                                                Self::trace_product(w_pos_t, &d2_aw);
+                                        } else {
+                                            const BLOCK: usize = 32;
+                                            let mut acc = 0.0_f64;
+                                            let mut start = 0usize;
+                                            while start < p_dim {
+                                                let width = (p_dim - start).min(BLOCK);
+                                                let mut basis =
+                                                    Array2::<f64>::zeros((p_dim, width));
+                                                for j in 0..width {
+                                                    basis[[start + j, j]] = 1.0;
+                                                }
+                                                let d2_block =
+                                                    Self::firth_hphisecond_direction_apply(
+                                                        op, &dirs[k], &dirs[l], &basis,
+                                                    );
+                                                let solved_block = solve_h(&d2_block);
+                                                for j in 0..width {
+                                                    acc += solved_block[[start + j, j]];
+                                                }
+                                                start += width;
+                                            }
+                                            d2_trace_correction = acc;
+                                        }
+                                    }
+                                    if spectral_exact_mode {
+                                        let w_pos = w_posspectral
+                                            .as_ref()
+                                            .expect("spectral W present in spectral exact mode");
+                                        let w_pos_t = w_posspectral_t
+                                            .as_ref()
+                                            .expect("spectral W^T present in spectral exact mode");
+                                        let wt_hkl = fast_ab(w_pos_t, &h_kl);
+                                        let g_kl = fast_ab(&wt_hkl, w_pos);
+                                        g_kl.diag().sum() - d2_trace_correction
+                                    } else {
+                                        let solved_hkl = solve_h(&h_kl);
+                                        solved_hkl.diag().sum()
+                                    }
+                                }
+                            } else {
+                                let mut t2_acc = 0.0_f64;
+                                if let (Some(q), Some(uq), Some(xq), Some(xuq)) = (
+                                    sketch_q.as_ref(),
+                                    sketch_uq.as_ref(),
+                                    sketch_xq.as_ref(),
+                                    sketch_xuq.as_ref(),
+                                ) {
+                                    for j in 0..q.ncols() {
+                                        let qj = q.column(j);
+                                        let uqj = uq.column(j);
+                                        let xqj = xq.column(j);
+                                        let xuqj = xuq.column(j);
+                                        let mut term = 0.0_f64;
+                                        if k == l {
+                                            term += Self::bilinear_form(&a_k_mats[k], uqj, qj);
+                                        }
+                                        let mut quad = 0.0_f64;
+                                        for i in 0..n {
+                                            quad += xuqj[i] * diag[i] * xqj[i];
+                                        }
+                                        term += quad;
+                                        t2_acc += term;
+                                    }
+                                }
+                                let z = probez.as_ref().expect("probes present in stochastic mode");
+                                let u = probe_u
+                                    .as_ref()
+                                    .expect("solved probes present in stochastic mode");
+                                let xz = probe_xz
+                                    .as_ref()
+                                    .expect("X probes present in stochastic mode");
+                                let xu = probe_xu
+                                    .as_ref()
+                                    .expect("X solved probes present in stochastic mode");
+                                let mut res = 0.0_f64;
+                                for r in 0..n_probe {
+                                    let zr = z.column(r);
+                                    let ur = u.column(r);
+                                    let xzr = xz.column(r);
+                                    let xur = xu.column(r);
+                                    let mut term = 0.0_f64;
+                                    if k == l {
+                                        term += Self::bilinear_form(&a_k_mats[k], ur, zr);
+                                    }
+                                    let mut quad = 0.0_f64;
+                                    for i in 0..n {
+                                        quad += xur[i] * diag[i] * xzr[i];
+                                    }
+                                    term += quad;
+                                    res += term;
+                                }
+                                t2_acc + res / (n_probe as f64)
+                            };
+                            let l_term = 0.5 * (-t1 + t2);
+                            let p_term = -0.5 * d2logs[[k, l]];
+                            (k, q + l_term + p_term)
+                        },
+                    )
                     .collect()
             };
             for (k, val) in row_entries {

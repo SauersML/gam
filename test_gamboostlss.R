@@ -1,0 +1,5 @@
+library(gamboostLSS)
+library(mboost)
+df <- data.frame(y=rnorm(100), x1=rnorm(100), x2=rnorm(100))
+fit <- gamboostLSS(formula=list(mu=y~bbs(x1)+bbs(x2), sigma=~bbs(x1)+bbs(x2)), data=df, families=GaussianLSS(), control=boost_control(mstop=10))
+cat("Worked.\n")

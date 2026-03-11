@@ -417,6 +417,7 @@ struct ParsedFormula {
     response: String,
     terms: Vec<ParsedTerm>,
     linkwiggle: Option<LinkWiggleFormulaSpec>,
+    timewiggle: Option<LinkWiggleFormulaSpec>,
     linkspec: Option<LinkFormulaSpec>,
     survivalspec: Option<SurvivalFormulaSpec>,
 }
@@ -445,6 +446,9 @@ enum ParsedTerm {
         options: BTreeMap<String, String>,
     },
     LinkWiggle {
+        options: BTreeMap<String, String>,
+    },
+    TimeWiggle {
         options: BTreeMap<String, String>,
     },
     LinkConfig {
@@ -724,14 +728,17 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         );
     }
     let formula_linkwiggle = parsed.linkwiggle.clone();
+    if parsed.timewiggle.is_some() {
+        return Err("timewiggle(...) is only supported for survival models".to_string());
+    }
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), link_choice.as_ref());
     let learn_linkwiggle = effective_linkwiggle.is_some();
     let mean_only_flexible_linkwiggle = link_choice
         .as_ref()
         .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible));
-    let mean_only_binomial_linkwiggle =
-        args.predict_noise.is_none() && binomial_mean_linkwiggle_supports_family(family, link_choice.as_ref());
+    let mean_only_binomial_linkwiggle = args.predict_noise.is_none()
+        && binomial_mean_linkwiggle_supports_family(family, link_choice.as_ref());
     if learn_linkwiggle
         && args.predict_noise.is_none()
         && !mean_only_flexible_linkwiggle
@@ -1029,14 +1036,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sas_linkspec.as_ref(),
             "binomial mean-only link wiggle",
         )?;
-        let wiggle_fit = fit_standard_binomial_linkwiggle(
-            &design,
-            &fit,
-            &y,
-            link_kind,
-            wiggle_cfg,
-            &args,
-        )?;
+        let wiggle_fit =
+            fit_standard_binomial_linkwiggle(&design, &fit, &y, link_kind, wiggle_cfg, &args)?;
         let q0_final = design.design.dot(&wiggle_fit.fit_result.beta);
         let domain = summarizewiggle_domain(
             q0_final.view(),
@@ -1568,14 +1569,27 @@ fn run_predict_survival(
             .as_deref()
             .unwrap_or("transformation"),
     )?;
-    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull {
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
+        && !survival_timewiggle_is_present(model)
+    {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
-    let saved_likelihood_mode = parse_survival_likelihood_mode(
-        model
-            .survival_likelihood
-            .as_deref()
-            .unwrap_or("transformation"),
+    let baseline_cfg = survival_baseline_config_from_model(model)?;
+    let mut eta_offset_entry = Array1::<f64>::zeros(n);
+    let mut eta_offset_exit = Array1::<f64>::zeros(n);
+    let mut derivative_offset_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let (eta_entry, _) = evaluate_survival_baseline(age_entry[i], &baseline_cfg)?;
+        let (eta_exit_i, deriv_exit_i) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
+        eta_offset_entry[i] = eta_entry;
+        eta_offset_exit[i] = eta_exit_i;
+        derivative_offset_exit[i] = deriv_exit_i;
+    }
+    let saved_timewiggle = saved_survival_timewiggle_components(
+        &eta_offset_entry,
+        &eta_offset_exit,
+        &derivative_offset_exit,
+        model,
     )?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let beta_time = Array1::from_vec(model.survival_beta_time.clone().ok_or_else(|| {
@@ -1589,12 +1603,6 @@ fn run_predict_survival(
             Array1::from_vec(model.survival_beta_log_sigma.clone().ok_or_else(|| {
                 "saved location-scale survival model missing survival_beta_log_sigma".to_string()
             })?);
-        let baseline_cfg = survival_baseline_config_from_model(model)?;
-        let mut eta_offset_exit = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
-            eta_offset_exit[i] = eta0;
-        }
         let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
         let eta_t =
             DesignMatrix::Dense(cov_design.design.clone()).matrixvectormultiply(&beta_threshold);
@@ -1604,15 +1612,23 @@ fn run_predict_survival(
             &model.survival_noise_scale,
             model.survival_noise_non_intercept_start,
         )?;
-        let mut survival_primary_design = Array2::<f64>::zeros((
-            n,
-            time_build.x_exit_time.ncols() + cov_design.design.ncols(),
-        ));
+        let x_time_exit = if let Some((_, exit, _)) = saved_timewiggle.as_ref() {
+            let mut full = Array2::<f64>::zeros((n, time_build.x_exit_time.ncols() + exit.ncols()));
+            full.slice_mut(s![.., 0..time_build.x_exit_time.ncols()])
+                .assign(&time_build.x_exit_time);
+            full.slice_mut(s![.., time_build.x_exit_time.ncols()..])
+                .assign(exit);
+            full
+        } else {
+            time_build.x_exit_time.clone()
+        };
+        let mut survival_primary_design =
+            Array2::<f64>::zeros((n, x_time_exit.ncols() + cov_design.design.ncols()));
         survival_primary_design
-            .slice_mut(s![.., 0..time_build.x_exit_time.ncols()])
-            .assign(&time_build.x_exit_time);
+            .slice_mut(s![.., 0..x_time_exit.ncols()])
+            .assign(&x_time_exit);
         survival_primary_design
-            .slice_mut(s![.., time_build.x_exit_time.ncols()..])
+            .slice_mut(s![.., x_time_exit.ncols()..])
             .assign(&cov_design.design);
         let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
             apply_scale_deviation_transform(
@@ -1642,7 +1658,7 @@ fn run_predict_survival(
             None
         };
         let pred_input = SurvivalLocationScalePredictInput {
-            x_time_exit: time_build.x_exit_time.clone(),
+            x_time_exit: x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
             x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
             eta_threshold_offset: Array1::zeros(n),
@@ -1751,14 +1767,23 @@ fn run_predict_survival(
     }
 
     let p_time = time_build.x_exit_time.ncols();
-    let p = p_time + p_cov;
+    let p_timewiggle = saved_timewiggle
+        .as_ref()
+        .map(|(_, exit, _)| exit.ncols())
+        .unwrap_or(0);
+    let p = p_time + p_timewiggle + p_cov;
     let mut x_exit = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for j in 0..p_time {
             x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
         }
+        if let Some((_, exit_w, _)) = saved_timewiggle.as_ref() {
+            for j in 0..p_timewiggle {
+                x_exit[[i, p_time + j]] = exit_w[[i, j]];
+            }
+        }
         for j in 0..p_cov {
-            x_exit[[i, p_time + j]] = cov_design.design[[i, j]];
+            x_exit[[i, p_time + p_timewiggle + j]] = cov_design.design[[i, j]];
         }
     }
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
@@ -1769,12 +1794,6 @@ fn run_predict_survival(
             beta.len(),
             p
         ));
-    }
-    let baseline_cfg = survival_baseline_config_from_model(model)?;
-    let mut eta_offset_exit = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
-        eta_offset_exit[i] = eta0;
     }
     let eta = x_exit.dot(&beta) + eta_offset_exit;
     let (mean, se_default) = if args.mode == PredictModeArg::PosteriorMean {
@@ -2642,6 +2661,7 @@ struct SurvivalBaselineConfig {
 
 #[derive(Clone, Debug)]
 enum SurvivalTimeBasisConfig {
+    None,
     Linear,
     BSpline {
         degree: usize,
@@ -2651,6 +2671,7 @@ enum SurvivalTimeBasisConfig {
     ISpline {
         degree: usize,
         knots: Array1<f64>,
+        keep_cols: Vec<usize>,
         smooth_lambda: f64,
     },
 }
@@ -2664,6 +2685,7 @@ struct SurvivalTimeBuildOutput {
     basisname: String,
     degree: Option<usize>,
     knots: Option<Vec<f64>>,
+    keep_cols: Option<Vec<usize>>,
     smooth_lambda: Option<f64>,
 }
 
@@ -2877,6 +2899,7 @@ fn parse_survival_time_basis_config(
     args: &SurvivalArgs,
 ) -> Result<SurvivalTimeBasisConfig, String> {
     match args.time_basis.to_ascii_lowercase().as_str() {
+        "none" => Ok(SurvivalTimeBasisConfig::None),
         "ispline" => {
             if args.time_degree < 1 {
                 return Err("--time-degree must be >= 1 for ispline time basis".to_string());
@@ -2892,6 +2915,7 @@ fn parse_survival_time_basis_config(
             Ok(SurvivalTimeBasisConfig::ISpline {
                 degree: args.time_degree,
                 knots: Array1::zeros(0),
+                keep_cols: Vec::new(),
                 smooth_lambda: args.time_smooth_lambda,
             })
         }
@@ -2916,6 +2940,7 @@ fn load_survival_time_basis_config_from_model(
         .to_ascii_lowercase()
         .as_str()
     {
+        "none" => Ok(SurvivalTimeBasisConfig::None),
         "linear" => Ok(SurvivalTimeBasisConfig::Linear),
         "bspline" => {
             let degree = model.survival_time_degree.ok_or_else(|| {
@@ -2941,13 +2966,17 @@ fn load_survival_time_basis_config_from_model(
             let knots = model.survival_time_knots.clone().ok_or_else(|| {
                 "saved survival ispline model missing survival_time_knots".to_string()
             })?;
+            let keep_cols = model.survival_time_keep_cols.clone().ok_or_else(|| {
+                "saved survival ispline model missing survival_time_keep_cols".to_string()
+            })?;
             let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
-            if degree < 1 || knots.is_empty() {
+            if degree < 1 || knots.is_empty() || keep_cols.is_empty() {
                 return Err("saved survival ispline time basis metadata is invalid".to_string());
             }
             Ok(SurvivalTimeBasisConfig::ISpline {
                 degree,
                 knots: Array1::from_vec(knots),
+                keep_cols,
                 smooth_lambda,
             })
         }
@@ -3098,6 +3127,17 @@ fn build_survival_time_basis(
     }
 
     match cfg {
+        SurvivalTimeBasisConfig::None => Ok(SurvivalTimeBuildOutput {
+            x_entry_time: Array2::zeros((n, 0)),
+            x_exit_time: Array2::zeros((n, 0)),
+            x_derivative_time: Array2::zeros((n, 0)),
+            penalties: Vec::new(),
+            basisname: "none".to_string(),
+            degree: None,
+            knots: None,
+            keep_cols: None,
+            smooth_lambda: None,
+        }),
         SurvivalTimeBasisConfig::Linear => {
             let mut x_entry_time = Array2::<f64>::zeros((n, 2));
             let mut x_exit_time = Array2::<f64>::zeros((n, 2));
@@ -3117,6 +3157,7 @@ fn build_survival_time_basis(
                 basisname: "linear".to_string(),
                 degree: None,
                 knots: None,
+                keep_cols: None,
                 smooth_lambda: None,
             })
         }
@@ -3193,12 +3234,14 @@ fn build_survival_time_basis(
                 basisname: "bspline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
+                keep_cols: None,
                 smooth_lambda: Some(smooth_lambda),
             })
         }
         SurvivalTimeBasisConfig::ISpline {
             degree,
             knots,
+            keep_cols,
             smooth_lambda,
         } => {
             let bspline_degree = degree
@@ -3259,25 +3302,33 @@ fn build_survival_time_basis(
                 );
             }
 
-            let constant_tol = 1e-12_f64;
-            let mut keep_cols: Vec<usize> = Vec::new();
-            for j in 0..p_time_full {
-                let mut minv = f64::INFINITY;
-                let mut maxv = f64::NEG_INFINITY;
-                for i in 0..n {
-                    let ve = x_exit_time_full[[i, j]];
-                    let vs = x_entry_time_full[[i, j]];
-                    minv = minv.min(ve.min(vs));
-                    maxv = maxv.max(ve.max(vs));
+            let keep_cols = if keep_cols.is_empty() {
+                let constant_tol = 1e-12_f64;
+                let mut inferred_keep_cols: Vec<usize> = Vec::new();
+                for j in 0..p_time_full {
+                    let mut minv = f64::INFINITY;
+                    let mut maxv = f64::NEG_INFINITY;
+                    for i in 0..n {
+                        let ve = x_exit_time_full[[i, j]];
+                        let vs = x_entry_time_full[[i, j]];
+                        minv = minv.min(ve.min(vs));
+                        maxv = maxv.max(ve.max(vs));
+                    }
+                    if (maxv - minv) > constant_tol {
+                        inferred_keep_cols.push(j);
+                    }
                 }
-                if (maxv - minv) > constant_tol {
-                    keep_cols.push(j);
-                }
-            }
+                inferred_keep_cols
+            } else {
+                keep_cols
+            };
             if keep_cols.is_empty() {
                 return Err(
                     "internal error: ispline basis has no shape-varying time columns".to_string(),
                 );
+            }
+            if keep_cols.iter().any(|&j| j >= p_time_full) {
+                return Err("saved survival ispline keep_cols exceed basis width".to_string());
             }
 
             let p_time = keep_cols.len();
@@ -3348,6 +3399,7 @@ fn build_survival_time_basis(
                 basisname: "ispline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
+                keep_cols: Some(keep_cols),
                 smooth_lambda: Some(smooth_lambda),
             })
         }
@@ -3417,9 +3469,45 @@ fn evaluate_survival_baseline(
     }
 }
 
-fn choose_survival_time_block_initial_coefficient(min_uniform_time_coef: f64) -> f64 {
-    const INIT_MARGIN_FACTOR: f64 = 1.5;
-    min_uniform_time_coef.max(0.0) * INIT_MARGIN_FACTOR
+fn build_survival_feasible_initial_beta(
+    dim: usize,
+    constraints: Option<&gam::pirls::LinearInequalityConstraints>,
+) -> Array1<f64> {
+    let Some(constraints) = constraints else {
+        return Array1::zeros(dim);
+    };
+    if constraints.a.ncols() != dim || constraints.a.nrows() == 0 {
+        return Array1::zeros(dim);
+    }
+
+    // Dykstra projection of 0 onto the feasible intersection A * beta >= b.
+    let mut beta = Array1::<f64>::zeros(dim);
+    let mut corrections = Array2::<f64>::zeros((constraints.a.nrows(), dim));
+    for _ in 0..100 {
+        let mut max_violation = 0.0_f64;
+        for i in 0..constraints.a.nrows() {
+            let row = constraints.a.row(i);
+            let row_norm_sq = row.dot(&row);
+            if row_norm_sq <= 1e-18 {
+                continue;
+            }
+            let y = &beta + &corrections.row(i);
+            let slack = row.dot(&y) - constraints.b[i];
+            max_violation = max_violation.max((-slack).max(0.0));
+            if slack >= 0.0 {
+                corrections.row_mut(i).assign(&(&y - &beta));
+                continue;
+            }
+            let step = (constraints.b[i] - row.dot(&y)) / row_norm_sq;
+            let projected = &y + &(row.to_owned() * step);
+            corrections.row_mut(i).assign(&(&y - &projected));
+            beta.assign(&projected);
+        }
+        if max_violation <= 1e-10 {
+            break;
+        }
+    }
+    beta
 }
 
 fn build_survival_baseline_offsets(
@@ -3447,6 +3535,153 @@ fn build_survival_baseline_offsets(
         derivative_exit[i] = d1;
     }
     Ok((eta_entry, eta_exit, derivative_exit))
+}
+
+struct SurvivalTimeWiggleBuild {
+    design_entry: Array2<f64>,
+    design_exit: Array2<f64>,
+    design_derivative_exit: Array2<f64>,
+    penalties: Vec<Array2<f64>>,
+    knots: Array1<f64>,
+    degree: usize,
+}
+
+fn build_survival_timewiggle_from_baseline(
+    eta_entry: &Array1<f64>,
+    eta_exit: &Array1<f64>,
+    derivative_exit: &Array1<f64>,
+    cfg: &LinkWiggleFormulaSpec,
+) -> Result<SurvivalTimeWiggleBuild, String> {
+    if eta_entry.len() != eta_exit.len() || eta_exit.len() != derivative_exit.len() {
+        return Err(
+            "survival time wiggle requires matching entry/exit/derivative lengths".to_string(),
+        );
+    }
+    let n = eta_exit.len();
+    let mut seed = Array1::<f64>::zeros(2 * n);
+    for i in 0..n {
+        seed[i] = eta_entry[i];
+        seed[n + i] = eta_exit[i];
+    }
+    let wiggle_cfg = WiggleBlockConfig {
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_order: 2,
+        double_penalty: cfg.double_penalty,
+    };
+    let (mut combined_block, knots) = buildwiggle_block_input_from_seed(seed.view(), &wiggle_cfg)?;
+    augmentwiggle_penaltieswith_orders(&mut combined_block, &cfg.penalty_orders)?;
+    let design_entry =
+        match buildwiggle_block_input_from_knots(eta_entry.view(), &knots, cfg.degree, 2, false)?
+            .design
+        {
+            DesignMatrix::Dense(m) => m,
+            _ => return Err("survival time wiggle entry design must be dense".to_string()),
+        };
+    let design_exit =
+        match buildwiggle_block_input_from_knots(eta_exit.view(), &knots, cfg.degree, 2, false)?
+            .design
+        {
+            DesignMatrix::Dense(m) => m,
+            _ => return Err("survival time wiggle exit design must be dense".to_string()),
+        };
+    let knot_arr = knots.clone();
+    let (basis_derivative, _) = create_basis::<Dense>(
+        eta_exit.view(),
+        KnotSource::Provided(knot_arr.view()),
+        cfg.degree,
+        BasisOptions::first_derivative(),
+    )
+    .map_err(|e| format!("failed to build survival time wiggle derivative basis: {e}"))?;
+    let full_derivative = basis_derivative.as_ref();
+    let (z, _) = compute_geometric_constraint_transform(&knot_arr, cfg.degree, 2)
+        .map_err(|e| format!("failed to build survival time wiggle constraint transform: {e}"))?;
+    if full_derivative.ncols() != z.nrows() {
+        return Err(format!(
+            "survival time wiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
+            full_derivative.ncols(),
+            z.nrows()
+        ));
+    }
+    let constrained_derivative = full_derivative.dot(&z);
+    let mut design_derivative_exit = constrained_derivative;
+    for i in 0..n {
+        let chain = derivative_exit[i];
+        for j in 0..design_derivative_exit.ncols() {
+            design_derivative_exit[[i, j]] *= chain;
+        }
+    }
+    Ok(SurvivalTimeWiggleBuild {
+        design_entry,
+        design_exit,
+        design_derivative_exit,
+        penalties: combined_block.penalties,
+        knots,
+        degree: cfg.degree,
+    })
+}
+
+fn survival_timewiggle_is_present(model: &SavedModel) -> bool {
+    model.timewiggle_knots.is_some()
+        || model.timewiggle_degree.is_some()
+        || model.timewiggle_penalty_orders.is_some()
+        || model.timewiggle_double_penalty.is_some()
+        || model.betatimewiggle.is_some()
+}
+
+fn saved_survival_timewiggle_spec(model: &SavedModel) -> Result<Option<LinkWiggleFormulaSpec>, String> {
+    match (
+        model.timewiggle_knots.as_ref(),
+        model.timewiggle_degree,
+        model.timewiggle_penalty_orders.as_ref(),
+        model.timewiggle_double_penalty,
+        model.betatimewiggle.as_ref(),
+    ) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(knots), Some(degree), Some(penalty_orders), Some(double_penalty), Some(_)) => {
+            Ok(Some(LinkWiggleFormulaSpec {
+                degree,
+                num_internal_knots: knots.len().saturating_sub(2 * (degree + 1)),
+                penalty_orders: penalty_orders.clone(),
+                double_penalty,
+            }))
+        }
+        _ => Err(
+            "saved model has partial survival timewiggle metadata; expected knots+degree+penalty_order+double_penalty+betatimewiggle together"
+                .to_string(),
+        ),
+    }
+}
+
+fn append_survival_timewiggle_columns(
+    x_entry: &mut Array2<f64>,
+    x_exit: &mut Array2<f64>,
+    x_derivative: &mut Array2<f64>,
+    wiggle: &SurvivalTimeWiggleBuild,
+) {
+    let p_base = x_entry.ncols();
+    let p_w = wiggle.design_exit.ncols();
+    let n = x_entry.nrows();
+    let mut new_entry = Array2::<f64>::zeros((n, p_base + p_w));
+    let mut new_exit = Array2::<f64>::zeros((n, p_base + p_w));
+    let mut new_derivative = Array2::<f64>::zeros((n, p_base + p_w));
+    new_entry.slice_mut(s![.., 0..p_base]).assign(x_entry);
+    new_exit.slice_mut(s![.., 0..p_base]).assign(x_exit);
+    new_derivative
+        .slice_mut(s![.., 0..p_base])
+        .assign(x_derivative);
+    new_entry
+        .slice_mut(s![.., p_base..])
+        .assign(&wiggle.design_entry);
+    new_exit
+        .slice_mut(s![.., p_base..])
+        .assign(&wiggle.design_exit);
+    new_derivative
+        .slice_mut(s![.., p_base..])
+        .assign(&wiggle.design_derivative_exit);
+    *x_entry = new_entry;
+    *x_exit = new_exit;
+    *x_derivative = new_derivative;
 }
 
 fn apply_saved_probitwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
@@ -3602,6 +3837,85 @@ fn saved_probitwiggle_derivative_q0(
     }
 }
 
+fn saved_survival_timewiggle_components(
+    eta_entry: &Array1<f64>,
+    eta_exit: &Array1<f64>,
+    derivative_exit: &Array1<f64>,
+    model: &SavedModel,
+) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
+    match (
+        model.timewiggle_knots.as_ref(),
+        model.timewiggle_degree,
+        model.timewiggle_penalty_orders.as_ref(),
+        model.timewiggle_double_penalty,
+        model.betatimewiggle.as_ref(),
+    ) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(knots), Some(degree), Some(_), Some(_), Some(betaw)) => {
+            let knots = Array1::from_vec(knots.clone());
+            let entry = match buildwiggle_block_input_from_knots(
+                eta_entry.view(),
+                &knots,
+                degree,
+                2,
+                false,
+            )?
+            .design
+            {
+                DesignMatrix::Dense(m) => m,
+                _ => return Err("saved survival time wiggle entry design must be dense".to_string()),
+            };
+            let exit = match buildwiggle_block_input_from_knots(
+                eta_exit.view(),
+                &knots,
+                degree,
+                2,
+                false,
+            )?
+            .design
+            {
+                DesignMatrix::Dense(m) => m,
+                _ => return Err("saved survival time wiggle exit design must be dense".to_string()),
+            };
+            if entry.ncols() != betaw.len() || exit.ncols() != betaw.len() {
+                return Err(format!(
+                    "saved survival time wiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
+                    betaw.len(),
+                    entry.ncols(),
+                    exit.ncols()
+                ));
+            }
+            let (basis_derivative, _) = create_basis::<Dense>(
+                eta_exit.view(),
+                KnotSource::Provided(knots.view()),
+                degree,
+                BasisOptions::first_derivative(),
+            )
+            .map_err(|e| format!("failed to evaluate saved survival time wiggle derivative basis: {e}"))?;
+            let (z, _) = compute_geometric_constraint_transform(&knots, degree, 2)
+                .map_err(|e| format!("failed to reconstruct saved survival time wiggle transform: {e}"))?;
+            let mut derivative = basis_derivative.as_ref().dot(&z);
+            if derivative.ncols() != betaw.len() {
+                return Err(format!(
+                    "saved survival time wiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
+                    betaw.len(),
+                    derivative.ncols()
+                ));
+            }
+            for i in 0..derivative.nrows() {
+                for j in 0..derivative.ncols() {
+                    derivative[[i, j]] *= derivative_exit[i];
+                }
+            }
+            Ok(Some((entry, exit, derivative)))
+        }
+        _ => Err(
+            "saved model has partial survival timewiggle metadata; expected knots+degree+penalty_order+double_penalty+betatimewiggle together"
+                .to_string(),
+        ),
+    }
+}
+
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
@@ -3636,6 +3950,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let formula_surv = parsed.survivalspec.clone();
     let formula_link = parsed.linkspec.clone();
     let formula_linkwiggle = parsed.linkwiggle.clone();
+    let formula_timewiggle = parsed.timewiggle.clone();
     let effectivespec = formula_surv
         .as_ref()
         .and_then(|s| s.spec.clone())
@@ -3656,6 +3971,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), survival_link_choice.as_ref());
     let learn_linkwiggle = effective_linkwiggle.is_some();
+    let effective_timewiggle = formula_timewiggle.clone();
+    let learn_timewiggle = effective_timewiggle.is_some();
 
     let survivalspec = match effectivespec.to_ascii_lowercase().as_str() {
         "net" => SurvivalSpec::Net,
@@ -3681,14 +3998,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     parse_survival_distribution(&effective_survival_distribution)?;
     let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
     if likelihood_mode == SurvivalLikelihoodMode::Weibull {
-        if !effective_args
+        let baseline_args_requested = !effective_args
             .baseline_target
             .eq_ignore_ascii_case("linear")
             || effective_args.baseline_scale.is_some()
             || effective_args.baseline_shape.is_some()
             || effective_args.baseline_rate.is_some()
-            || effective_args.baseline_makeham.is_some()
-        {
+            || effective_args.baseline_makeham.is_some();
+        if baseline_args_requested && !learn_timewiggle {
             return Err(
                 "--survival-likelihood weibull uses the built-in parametric baseline; do not set --baseline-target/--baseline-scale/--baseline-shape/--baseline-rate/--baseline-makeham"
                     .to_string(),
@@ -3705,18 +4022,49 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 effective_args.baseline_makeham,
             )?
         }
+        SurvivalLikelihoodMode::Weibull if learn_timewiggle => parse_survival_baseline_config(
+            "weibull",
+            effective_args.baseline_scale,
+            effective_args.baseline_shape,
+            None,
+            None,
+        )?,
         SurvivalLikelihoodMode::Weibull => {
             parse_survival_baseline_config("linear", None, None, None, None)?
         }
     };
+    if learn_timewiggle {
+        if baseline_cfg.target == SurvivalBaselineTarget::Linear {
+            return Err(
+                "timewiggle(...) requires a non-linear scalar survival baseline target; use --baseline-target weibull|gompertz|gompertz-makeham, or combine it with --survival-likelihood weibull and explicit --baseline-scale/--baseline-shape"
+                    .to_string(),
+            );
+        }
+        if likelihood_mode == SurvivalLikelihoodMode::LocationScale && learn_linkwiggle {
+            return Err(
+                "combining timewiggle(...) and linkwiggle(...) in one survival fit is not implemented"
+                    .to_string(),
+            );
+        }
+    }
     if !effective_args.ridge_lambda.is_finite() || effective_args.ridge_lambda < 0.0 {
         return Err("--ridge-lambda must be finite and >= 0".to_string());
     }
     let time_basis_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::LocationScale => {
-            parse_survival_time_basis_config(&effective_args)?
+            if learn_timewiggle {
+                SurvivalTimeBasisConfig::None
+            } else {
+                parse_survival_time_basis_config(&effective_args)?
+            }
         }
-        SurvivalLikelihoodMode::Weibull => SurvivalTimeBasisConfig::Linear,
+        SurvivalLikelihoodMode::Weibull => {
+            if learn_timewiggle {
+                SurvivalTimeBasisConfig::None
+            } else {
+                SurvivalTimeBasisConfig::Linear
+            }
+        }
     };
     let mut inference_notes = Vec::new();
     progress.set_stage("fit", "building survival design matrices");
@@ -3742,6 +4090,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+    let timewiggle_build = if let Some(cfg) = effective_timewiggle.as_ref() {
+        Some(build_survival_timewiggle_from_baseline(
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            cfg,
+        )?)
+    } else {
+        None
+    };
     let time_build = build_survival_time_basis(
         &age_entry,
         &age_exit,
@@ -3752,7 +4110,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         )),
     )?;
     progress.advance_workflow(2);
-    if likelihood_mode != SurvivalLikelihoodMode::Weibull {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
     }
     let p_time = time_build.x_exit_time.ncols();
@@ -3772,12 +4130,29 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             x_exit[[i, p_time + j]] = z;
         }
     }
+    if let Some(wiggle) = timewiggle_build.as_ref() {
+        append_survival_timewiggle_columns(&mut x_entry, &mut x_exit, &mut x_derivative, wiggle);
+    }
+    let p = x_exit.ncols();
+    let mut time_design_entry = time_build.x_entry_time.clone();
+    let mut time_design_exit = time_build.x_exit_time.clone();
+    let mut time_design_derivative_exit = time_build.x_derivative_time.clone();
+    let mut time_penalties = time_build.penalties.clone();
+    if let Some(wiggle) = timewiggle_build.as_ref() {
+        append_survival_timewiggle_columns(
+            &mut time_design_entry,
+            &mut time_design_exit,
+            &mut time_design_derivative_exit,
+            wiggle,
+        );
+        time_penalties.extend(wiggle.penalties.clone());
+    }
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let mut time_initial_log_lambdas = None;
-        if !time_build.penalties.is_empty() {
+        if !time_penalties.is_empty() {
             let lambda0 = time_build.smooth_lambda.unwrap_or(1e-2).max(1e-12).ln();
-            time_initial_log_lambdas = Some(Array1::from_elem(time_build.penalties.len(), lambda0));
+            time_initial_log_lambdas = Some(Array1::from_elem(time_penalties.len(), lambda0));
         }
         let buildspec = |inverse_link: InverseLink,
                          linkwiggle_block: Option<LinkWiggleBlockInput>|
@@ -3794,13 +4169,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 max_iter: 400,
                 tol: 1e-6,
                 time_block: TimeBlockInput {
-                    design_entry: time_build.x_entry_time.clone(),
-                    design_exit: time_build.x_exit_time.clone(),
-                    design_derivative_exit: time_build.x_derivative_time.clone(),
+                    design_entry: time_design_entry.clone(),
+                    design_exit: time_design_exit.clone(),
+                    design_derivative_exit: time_design_derivative_exit.clone(),
                     offset_entry: eta_offset_entry.clone(),
                     offset_exit: eta_offset_exit.clone(),
                     derivative_offset_exit: derivative_offset_exit.clone(),
-                    penalties: time_build.penalties.clone(),
+                    penalties: time_penalties.clone(),
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
                     initial_beta: None,
                 },
@@ -4071,6 +4446,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .map(|_| effective_linkwiggle.as_ref().map(|w| w.degree).unwrap_or(3));
             payload.betawiggle = fit.beta_link_wiggle.as_ref().map(|b| b.to_vec());
             payload.probitwiggle_knots = wiggle_knots.as_ref().map(|k| k.to_vec());
+            payload.timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
+            payload.timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+            payload.timewiggle_penalty_orders = effective_timewiggle
+                .as_ref()
+                .map(|cfg| cfg.penalty_orders.clone());
+            payload.timewiggle_double_penalty =
+                effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
+            payload.betatimewiggle = timewiggle_build.as_ref().map(|_| {
+                fit.beta_time
+                    .slice(s![time_build.x_exit_time.ncols()..])
+                    .to_vec()
+            });
             payload.survival_entry = Some(args.entry);
             payload.survival_exit = Some(args.exit);
             payload.survival_event = Some(args.event);
@@ -4084,6 +4471,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_basis = Some(time_build.basisname.clone());
             payload.survival_time_degree = time_build.degree;
             payload.survival_time_knots = time_build.knots.clone();
+            payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
@@ -4091,15 +4479,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_beta_time = Some(fit.beta_time.to_vec());
             payload.survival_beta_threshold = Some(fit.beta_threshold.to_vec());
             payload.survival_beta_log_sigma = Some(fit.beta_log_sigma.to_vec());
-            let mut survival_primary_design = Array2::<f64>::zeros((
-                n,
-                time_build.x_exit_time.ncols() + cov_design.design.ncols(),
-            ));
+            let mut survival_primary_design =
+                Array2::<f64>::zeros((n, time_design_exit.ncols() + cov_design.design.ncols()));
             survival_primary_design
-                .slice_mut(s![.., 0..time_build.x_exit_time.ncols()])
-                .assign(&time_build.x_exit_time);
+                .slice_mut(s![.., 0..time_design_exit.ncols()])
+                .assign(&time_design_exit);
             survival_primary_design
-                .slice_mut(s![.., time_build.x_exit_time.ncols()..])
+                .slice_mut(s![.., time_design_exit.ncols()..])
                 .assign(&cov_design.design);
             let survival_noise_transform = build_scale_deviation_transform(
                 &survival_primary_design,
@@ -4132,17 +4518,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Ok(());
     }
 
+    let p_time_total = time_design_exit.ncols();
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
-    for s in &time_build.penalties {
-        if s.nrows() == p_time && s.ncols() == p_time {
+    for s in &time_penalties {
+        if s.nrows() == p_time_total && s.ncols() == p_time_total {
             penalty_blocks.push(PenaltyBlock {
                 matrix: s.clone(),
                 lambda: time_build.smooth_lambda.unwrap_or(1e-2),
-                range: 0..p_time,
+                range: 0..p_time_total,
             });
         }
     }
-    let ridge_range_start = if time_build.basisname == "linear" {
+    let ridge_range_start = if time_build.basisname == "linear" && !learn_timewiggle {
         1
     } else {
         0
@@ -4182,47 +4569,22 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if likelihood_mode != SurvivalLikelihoodMode::Weibull {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         model
-            .set_structural_monotonicity(true, p_time)
+            .set_structural_monotonicity(true, p_time_total)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
     }
 
     let mut beta0 = Array1::<f64>::zeros(p);
-    let structural_time_lower_bounds = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
-        model.structural_time_coefficient_lower_bounds()
-    } else {
-        None
-    };
-    let structural_time_initial_floor = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
-        model
-            .structural_time_initial_coefficient_floor(1e-6)
-            .ok_or_else(|| {
-                "structural survival fit requires structural monotone time-coefficient initialization"
-                    .to_string()
-            })?
-    } else {
-        0.0
-    };
-    let initial_time_coef =
-        choose_survival_time_block_initial_coefficient(structural_time_initial_floor);
-    if initial_time_coef > 0.0 {
-        beta0.slice_mut(s![0..p_time]).fill(initial_time_coef);
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+        let feasible_start = build_survival_feasible_initial_beta(
+            p_time_total,
+            model.monotonicity_linear_constraints().as_ref(),
+        );
+        beta0.slice_mut(s![0..p_time_total]).assign(&feasible_start);
     }
     let beta0_norm = beta0.dot(&beta0).sqrt();
     progress.set_stage("fit", "running survival pirls");
-    structural_time_lower_bounds.ok_or_else(|| {
-        "exact survival training requires structural monotone time coefficients; non-structural training paths are not supported"
-            .to_string()
-    })?;
-    let mut latent_model = model
-        .into_structural_time_latent_model()
-        .map_err(|e| format!("failed to construct structural survival latent model: {e}"))?;
-    let latent_beta0 = latent_model
-        .user_to_latent_coefficients(&beta0)
-        .map_err(|e| {
-            format!("failed to map structural survival start point to latent coordinates: {e}")
-        })?;
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -4232,21 +4594,45 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         coefficient_lower_bounds: None,
         linear_constraints: None,
     };
-    let summary = gam::pirls::runworking_model_pirls(
-        &mut latent_model,
-        gam::types::Coefficients::new(latent_beta0),
-        &pirls_opts,
-        |_| {},
-    )
-    .map_err(|e| format!("survival latent-coordinate PIRLS failed: {e}"))?;
-    let beta = latent_model
-        .latent_to_user_coefficients(summary.beta.as_ref())
-        .map_err(|e| {
-            format!("failed to map structural survival optimum back to spline coefficients: {e}")
-        })?;
-    let state = latent_model.evaluate_user_state(&beta).map_err(|e| {
-        format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
-    })?;
+    let (summary, beta, state, constraint_mode) =
+        if learn_timewiggle || likelihood_mode == SurvivalLikelihoodMode::Weibull {
+            let mut plain_model = model;
+            let summary = gam::pirls::runworking_model_pirls(
+                &mut plain_model,
+                gam::types::Coefficients::new(beta0.clone()),
+                &pirls_opts,
+                |_| {},
+            )
+            .map_err(|e| format!("survival PIRLS failed: {e}"))?;
+            let beta = summary.beta.as_ref().to_owned();
+            let state = plain_model.update_state(&beta).map_err(|e| {
+                format!("failed to evaluate survival optimum in coefficient coordinates: {e}")
+            })?;
+            (summary, beta, state, "baseline-timewiggle".to_string())
+        } else {
+            let mut constrained_model = model;
+            let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
+                linear_constraints: constrained_model.monotonicity_linear_constraints(),
+                ..pirls_opts
+            };
+            let summary = gam::pirls::runworking_model_pirls(
+                &mut constrained_model,
+                gam::types::Coefficients::new(beta0.clone()),
+                &constrained_opts,
+                |_| {},
+            )
+            .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
+            let beta = summary.beta.as_ref().to_owned();
+            let state = constrained_model.update_state(&beta).map_err(|e| {
+                format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
+            })?;
+            (
+                summary,
+                beta,
+                state,
+                "constrained-structural-time".to_string(),
+            )
+        };
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {
@@ -4259,9 +4645,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let min_entry = age_entry.iter().copied().fold(f64::INFINITY, f64::min);
             let max_exit = age_exit.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let beta_norm = beta.dot(&beta).sqrt();
-            let constraint_mode = "latent-structural-time".to_string();
             return Err(format!(
-                "survival latent PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}, last_deviance_change={:.3e}, last_step_size={:.3e}, last_step_halving={}, max_abs_eta={:.3e}, beta0_norm={:.3e}, beta_norm={:.3e}; run[likelihood={}, spec={}, baseline_target={}, time_basis={}, constraint_mode={}, n={}, events={}, event_rate={:.4}, time_range=[{:.3e}, {:.3e}], p_time={}, p_cov={}, formula=\"{}\"]",
+                "survival constrained PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}, last_deviance_change={:.3e}, last_step_size={:.3e}, last_step_halving={}, max_abs_eta={:.3e}, beta0_norm={:.3e}, beta_norm={:.3e}; run[likelihood={}, spec={}, baseline_target={}, time_basis={}, constraint_mode={}, n={}, events={}, event_rate={:.4}, time_range=[{:.3e}, {:.3e}], p_time={}, p_cov={}, formula=\"{}\"]",
                 summary.lastgradient_norm,
                 summary.iterations,
                 state.deviance,
@@ -4281,7 +4666,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 event_rate,
                 min_entry,
                 max_exit,
-                p_time,
+                p_time_total,
                 p_cov,
                 formula
             ));
@@ -4346,7 +4731,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_time_basis = Some(time_build.basisname.clone());
         payload.survival_time_degree = time_build.degree;
         payload.survival_time_knots = time_build.knots.clone();
+        payload.survival_time_keep_cols = time_build.keep_cols.clone();
         payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+        payload.timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
+        payload.timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+        payload.timewiggle_penalty_orders = effective_timewiggle
+            .as_ref()
+            .map(|cfg| cfg.penalty_orders.clone());
+        payload.timewiggle_double_penalty =
+            effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
+        payload.betatimewiggle = timewiggle_build.as_ref().map(|w| {
+            let start = time_build.x_exit_time.ncols();
+            let end = start + w.design_exit.ncols();
+            beta.slice(s![start..end]).to_vec()
+        });
         payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
         payload.survival_likelihood =
             Some(survival_likelihood_modename(likelihood_mode).to_string());
@@ -4498,8 +4896,21 @@ fn run_sample_survival(
     }
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+    let baseline_cfg = survival_baseline_config_from_model(model)?;
+    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+    let saved_timewiggle = saved_survival_timewiggle_components(
+        &eta_offset_entry,
+        &eta_offset_exit,
+        &derivative_offset_exit,
+        model,
+    )?;
     let p_time = time_build.x_exit_time.ncols();
-    let p = p_time + p_cov;
+    let p_timewiggle = saved_timewiggle
+        .as_ref()
+        .map(|(_, exit, _)| exit.ncols())
+        .unwrap_or(0);
+    let p = p_time + p_timewiggle + p_cov;
     let mut x_entry = Array2::<f64>::zeros((n, p));
     let mut x_exit = Array2::<f64>::zeros((n, p));
     let mut x_derivative = Array2::<f64>::zeros((n, p));
@@ -4509,10 +4920,17 @@ fn run_sample_survival(
             x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
             x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
         }
+        if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref() {
+            for j in 0..p_timewiggle {
+                x_entry[[i, p_time + j]] = entry_w[[i, j]];
+                x_exit[[i, p_time + j]] = exit_w[[i, j]];
+                x_derivative[[i, p_time + j]] = deriv_w[[i, j]];
+            }
+        }
         for j in 0..p_cov {
             let z = cov_design.design[[i, j]];
-            x_entry[[i, p_time + j]] = z;
-            x_exit[[i, p_time + j]] = z;
+            x_entry[[i, p_time + p_timewiggle + j]] = z;
+            x_exit[[i, p_time + p_timewiggle + j]] = z;
         }
     }
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
@@ -4525,12 +4943,56 @@ fn run_sample_survival(
             });
         }
     }
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    if let Some((_, exit_w, _)) = saved_timewiggle.as_ref() {
+        let start = p_time;
+        let end = start + exit_w.ncols();
+        let wiggle_lambda_offset = penalty_blocks.len();
+        let wiggle_cfg = saved_survival_timewiggle_spec(model)?.ok_or_else(|| {
+            "saved survival timewiggle model missing timewiggle metadata".to_string()
+        })?;
+        let wiggle_degree = wiggle_cfg.degree;
+        let wiggle_knots = Array1::from_vec(model.timewiggle_knots.clone().ok_or_else(|| {
+            "saved survival timewiggle model missing timewiggle_knots".to_string()
+        })?);
+        let mut seed = Array1::<f64>::zeros(2 * n);
+        for i in 0..n {
+            seed[i] = eta_offset_entry[i];
+            seed[n + i] = eta_offset_exit[i];
+        }
+        let mut block = buildwiggle_block_input_from_knots(
+            seed.view(),
+            &wiggle_knots,
+            wiggle_degree,
+            2,
+            wiggle_cfg.double_penalty,
+        )?;
+        augmentwiggle_penaltieswith_orders(&mut block, &wiggle_cfg.penalty_orders)?;
+        for s in &block.penalties {
+            if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
+                penalty_blocks.push(PenaltyBlock {
+                    matrix: s.clone(),
+                    lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+                    range: start..end,
+                });
+            }
+        }
+        for (local_idx, block_penalty) in penalty_blocks[wiggle_lambda_offset..]
+            .iter_mut()
+            .enumerate()
+        {
+            if let Some(&lam) = fit_saved.lambdas.get(wiggle_lambda_offset + local_idx) {
+                block_penalty.lambda = lam;
+            }
+        }
+    }
     let ridge_lambda = model.survivalridge_lambda.unwrap_or(1e-4);
-    let ridge_range_start = if time_build.basisname == "linear" {
-        1
-    } else {
-        0
-    };
+    let ridge_range_start =
+        if time_build.basisname == "linear" && !survival_timewiggle_is_present(model) {
+            1
+        } else {
+            0
+        };
     if ridge_lambda > 0.0 && p > ridge_range_start {
         let dim = p - ridge_range_start;
         let mut ridge = Array2::<f64>::zeros((dim, dim));
@@ -4543,7 +5005,6 @@ fn run_sample_survival(
             range: ridge_range_start..p,
         });
     }
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     for (idx, block) in penalty_blocks.iter_mut().enumerate() {
         if let Some(&lam) = fit_saved.lambdas.get(idx) {
             block.lambda = lam;
@@ -4567,9 +5028,6 @@ fn run_sample_survival(
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
-    let baseline_cfg = survival_baseline_config_from_model(model)?;
-    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
     let mut model_surv = gam::families::royston_parmar::working_model_from_flattened(
         penalties.clone(),
         monotonicity,
@@ -4589,7 +5047,9 @@ fn run_sample_survival(
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull {
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
+        && !survival_timewiggle_is_present(model)
+    {
         model_surv
             .set_structural_monotonicity(true, p_time)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
@@ -4616,7 +5076,8 @@ fn run_sample_survival(
         penalties,
         monotonicity,
         survivalspec,
-        saved_likelihood_mode != SurvivalLikelihoodMode::Weibull,
+        saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
+            && !survival_timewiggle_is_present(model),
         p_time,
         beta0.view(),
         hessian.view(),
@@ -4947,7 +5408,8 @@ fn run_generate_standard_or_flexible(
         .map_err(|e| format!("failed to build design: {e}"))?;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let family = model.likelihood();
-    if is_standard_binomial_linkwiggle_model(model, family, model.resolved_inverse_link()?.as_ref()) {
+    if is_standard_binomial_linkwiggle_model(model, family, model.resolved_inverse_link()?.as_ref())
+    {
         let saved_link_kind = model
             .resolved_inverse_link()?
             .ok_or_else(|| "standard binomial wiggle model is missing link metadata".to_string())?;
@@ -5737,7 +6199,16 @@ fn predict_standard_binomial_linkwiggle(
     saved_sas: Option<&SasLinkState>,
     saved_mixture_param_cov: Option<&Array2<f64>>,
     saved_sas_param_cov: Option<&Array2<f64>>,
-) -> Result<(Array1<f64>, Array1<f64>, Option<Array1<f64>>, Option<Array1<f64>>, Option<Array1<f64>>), String> {
+) -> Result<
+    (
+        Array1<f64>,
+        Array1<f64>,
+        Option<Array1<f64>>,
+        Option<Array1<f64>>,
+        Option<Array1<f64>>,
+    ),
+    String,
+> {
     let eta_base = design.dot(beta);
     let eta = apply_saved_probitwiggle(&eta_base, model)?;
     let mean_mode = Array1::from_iter(
@@ -5789,9 +6260,9 @@ fn predict_standard_binomial_linkwiggle(
         mean_mode.clone()
     };
     let (mean_lo, mean_hi) = if args.uncertainty {
-        let se = eta_se
-            .as_ref()
-            .ok_or_else(|| "internal error: eta SE unavailable for uncertainty interval".to_string())?;
+        let se = eta_se.as_ref().ok_or_else(|| {
+            "internal error: eta SE unavailable for uncertainty interval".to_string()
+        })?;
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         let response_sd = response_sd_from_eta_for_family(
             family,
@@ -5802,13 +6273,8 @@ fn predict_standard_binomial_linkwiggle(
             saved_mixture_param_cov,
             saved_sas_param_cov,
         )?;
-        let (lo, hi) = response_interval_from_mean_sd(
-            mean.view(),
-            response_sd.view(),
-            z,
-            1e-10,
-            1.0 - 1e-10,
-        );
+        let (lo, hi) =
+            response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
         (Some(lo), Some(hi))
     } else {
         (None, None)
@@ -6549,6 +7015,7 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
     }
     let mut terms = Vec::<ParsedTerm>::new();
     let mut linkwiggle: Option<LinkWiggleFormulaSpec> = None;
+    let mut timewiggle: Option<LinkWiggleFormulaSpec> = None;
     let mut linkspec: Option<LinkFormulaSpec> = None;
     let mut survivalspec: Option<SurvivalFormulaSpec> = None;
     for raw in parsed_dsl.rhs_terms {
@@ -6567,6 +7034,12 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
                     return Err("formula can include at most one linkwiggle(...) term".to_string());
                 }
                 linkwiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
+            }
+            ParsedTerm::TimeWiggle { options } => {
+                if timewiggle.is_some() {
+                    return Err("formula can include at most one timewiggle(...) term".to_string());
+                }
+                timewiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
             }
             ParsedTerm::LinkConfig { options } => {
                 if linkspec.is_some() {
@@ -6588,6 +7061,7 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
         response: lhs.to_string(),
         terms,
         linkwiggle,
+        timewiggle,
         linkspec,
         survivalspec,
     })
@@ -6757,6 +7231,14 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 return Ok(ParsedTerm::LinkWiggle { options });
             }
+            "timewiggle" => {
+                if !vars.is_empty() {
+                    return Err(format!(
+                        "timewiggle() takes named options only; positional args are not supported: {raw}"
+                    ));
+                }
+                return Ok(ParsedTerm::TimeWiggle { options });
+            }
             "link" => {
                 if !vars.is_empty() {
                     return Err(format!(
@@ -6788,7 +7270,7 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }
@@ -7244,6 +7726,9 @@ fn build_termspec(
             }
             ParsedTerm::LinkWiggle { .. } => {
                 // linkwiggle() is parsed and consumed at formula level, not a design term.
+            }
+            ParsedTerm::TimeWiggle { .. } => {
+                // timewiggle() is parsed and consumed at formula level, not a design term.
             }
             ParsedTerm::LinkConfig { .. } => {
                 // link() is parsed and consumed at formula level, not a design term.
@@ -7942,18 +8427,16 @@ fn resolve_binomial_inverse_link_for_fit(
 ) -> Result<InverseLink, String> {
     match family {
         LikelihoodFamily::BinomialMixture => {
-            let spec = mixture_linkspec.ok_or_else(|| {
-                format!("{context} requires link(type=blended(...))")
-            })?;
-            let state =
-                state_fromspec(spec).map_err(|e| format!("invalid blended link configuration: {e}"))?;
+            let spec = mixture_linkspec
+                .ok_or_else(|| format!("{context} requires link(type=blended(...))"))?;
+            let state = state_fromspec(spec)
+                .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             Ok(InverseLink::Mixture(state))
         }
         LikelihoodFamily::BinomialSas => {
-            let spec = *sas_linkspec
-                .ok_or_else(|| format!("{context} requires link(type=sas)"))?;
-            let state =
-                state_from_sasspec(spec).map_err(|e| format!("invalid SAS link configuration: {e}"))?;
+            let spec = *sas_linkspec.ok_or_else(|| format!("{context} requires link(type=sas)"))?;
+            let state = state_from_sasspec(spec)
+                .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
             Ok(InverseLink::Sas(state))
         }
         LikelihoodFamily::BinomialBetaLogistic => {
@@ -9079,28 +9562,26 @@ mod tests {
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, FAMILY_GAUSSIAN_LOCATION_SCALE,
         LikelihoodFamily, LinkMode, MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel,
         SurvivalArgs, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
-        apply_saved_probitwiggle, build_survival_time_basis, chi_square_survival_approx,
-        choose_survival_time_block_initial_coefficient, classify_cli_error,
-        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
-        compute_probit_q0_from_eta, core_saved_fit_result, effectivelinkwiggle_formulaspec,
-        evaluate_survival_baseline, family_to_string, linkname, parse_duchon_order,
-        parse_duchon_power, parse_formula,
-        parse_link_choice, parse_surv_response, parse_survival_baseline_config,
-        parse_survival_inverse_link, parse_survival_time_basis_config, pretty_familyname,
-        predict_standard_binomial_linkwiggle, run_generate_standard_or_flexible,
-        run_generate_gaussian_location_scale, run_predict_binomial_location_scale,
-        run_predict_gaussian_location_scale, saved_probitwiggle_derivative_q0,
-        saved_probitwiggle_design, summarizewiggle_domain,
+        apply_saved_probitwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
+        chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
+        collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
+        effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
+        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
+        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
+        parse_survival_time_basis_config, predict_standard_binomial_linkwiggle, pretty_familyname,
+        run_generate_gaussian_location_scale, run_generate_standard_or_flexible,
+        run_predict_binomial_location_scale, run_predict_gaussian_location_scale,
+        saved_probitwiggle_derivative_q0, saved_probitwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use crate::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
-    use gam::buildwiggle_block_input_from_knots;
     use csv::StringRecord;
     use gam::basis::{
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
+    use gam::buildwiggle_block_input_from_knots;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
@@ -9118,9 +9599,9 @@ mod tests {
     use rand_distr::{Distribution, StandardNormal};
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
-    use std::path::PathBuf;
 
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
@@ -9154,6 +9635,7 @@ mod tests {
             SurvivalTimeBasisConfig::ISpline {
                 degree: 2,
                 knots,
+                keep_cols: Vec::new(),
                 smooth_lambda: 1e-2,
             },
             None,
@@ -9201,15 +9683,11 @@ mod tests {
             .expect("enable structural monotonicity");
         let mut beta0 = Array1::<f64>::zeros(p_time);
         beta0.fill(0.25);
-        let mut latent_model = model
-            .into_structural_time_latent_model()
-            .expect("construct latent structural survival model");
-        let latent_beta0 = latent_model
-            .user_to_latent_coefficients(&beta0)
-            .expect("map structural beta start to latent coordinates");
+        let mut constrained_model = model;
+        let linear_constraints = constrained_model.monotonicity_linear_constraints();
         let summary = gam::pirls::runworking_model_pirls(
-            &mut latent_model,
-            gam::types::Coefficients::new(latent_beta0),
+            &mut constrained_model,
+            gam::types::Coefficients::new(beta0),
             &gam::pirls::WorkingModelPirlsOptions {
                 max_iterations: 400,
                 convergence_tolerance: 1e-8,
@@ -9217,7 +9695,7 @@ mod tests {
                 min_step_size: 1e-12,
                 firth_bias_reduction: false,
                 coefficient_lower_bounds: None,
-                linear_constraints: None,
+                linear_constraints,
             },
             |_| {},
         )
@@ -9226,13 +9704,11 @@ mod tests {
             summary.status,
             gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum
         ));
-        let beta = latent_model
-            .latent_to_user_coefficients(summary.beta.as_ref())
-            .expect("map latent optimum to structural coefficients");
+        let beta = summary.beta.as_ref().to_owned();
         let eta = time_build.x_exit_time.dot(&beta);
         let surv = survival_probability_from_eta(eta.view());
-        let state = latent_model
-            .evaluate_user_state(&beta)
+        let state = constrained_model
+            .update_state(&beta)
             .expect("evaluate fitted structural survival state");
         (eta, surv, state.deviance)
     }
@@ -9433,6 +9909,9 @@ mod tests {
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -9445,6 +9924,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
@@ -9509,6 +9989,9 @@ mod tests {
             probitwiggle_knots: wiggle_knots,
             probitwiggle_degree: wiggle_degree,
             betawiggle,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -9521,6 +10004,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
@@ -9588,6 +10072,9 @@ mod tests {
             probitwiggle_knots: Some(wiggle_knots),
             probitwiggle_degree: Some(wiggle_degree),
             betawiggle: Some(betawiggle),
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -9600,6 +10087,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
@@ -9655,14 +10143,8 @@ mod tests {
     fn standard_fixed_link_wiggle_prediction_runs() {
         let q_seed = array![0.0];
         let knots = Array1::from_vec(vec![-2.0, -2.0, -2.0, 2.0, 2.0, 2.0]);
-        let wiggle_block = buildwiggle_block_input_from_knots(
-            q_seed.view(),
-            &knots,
-            2,
-            2,
-            false,
-        )
-        .expect("wiggle block");
+        let wiggle_block = buildwiggle_block_input_from_knots(q_seed.view(), &knots, 2, 2, false)
+            .expect("wiggle block");
         let betawiggle = vec![0.05; wiggle_block.design.ncols()];
         let cov = Array2::eye(1 + betawiggle.len()) * 1e-2;
         let model = intercept_only_binomial_mean_wiggle_model(
@@ -9710,14 +10192,8 @@ mod tests {
     fn standard_fixed_link_wiggle_generation_uses_wiggle_path() {
         let q_seed = array![0.0];
         let knots = Array1::from_vec(vec![-2.0, -2.0, -2.0, 2.0, 2.0, 2.0]);
-        let wiggle_block = buildwiggle_block_input_from_knots(
-            q_seed.view(),
-            &knots,
-            2,
-            2,
-            false,
-        )
-        .expect("wiggle block");
+        let wiggle_block = buildwiggle_block_input_from_knots(q_seed.view(), &knots, 2, 2, false)
+            .expect("wiggle block");
         let betawiggle = vec![0.02; wiggle_block.design.ncols()];
         let cov = Array2::eye(1 + betawiggle.len()) * 1e-2;
         let model = intercept_only_binomial_mean_wiggle_model(
@@ -10365,6 +10841,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_timewiggle_defaults_to_all_penalty_orders() {
+        let parsed =
+            parse_formula("Surv(entry, exit, event) ~ timewiggle(degree=4, internal_knots=9)")
+                .expect("formula");
+        let tw = parsed.timewiggle.expect("expected timewiggle config");
+        assert_eq!(tw.degree, 4);
+        assert_eq!(tw.num_internal_knots, 9);
+        assert_eq!(tw.penalty_orders, vec![1, 2, 3]);
+        assert!(tw.double_penalty);
+    }
+
+    #[test]
     fn parse_link_formula_config_extracts_link_and_inits() {
         let parsed = parse_formula(
             "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\", rho=\"0.3\", beta_logistic_init=\"0.0,0.0\")",
@@ -10787,6 +11275,9 @@ mod tests {
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: Some("start".to_string()),
             survival_exit: Some("stop".to_string()),
             survival_event: Some("event".to_string()),
@@ -10799,6 +11290,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: Some("transformation".to_string()),
@@ -10819,6 +11311,217 @@ mod tests {
         let err = super::load_survival_time_basis_config_from_model(&model)
             .expect_err("survival model without basis metadata should fail");
         assert!(err.contains("missing survival_time_basis"));
+    }
+
+    #[test]
+    fn saved_survival_timewiggle_components_return_none_without_metadata() {
+        let eta = array![0.1, 0.2];
+        let deriv = array![0.3, 0.4];
+        let model = SavedModel::from_payload(FittedModelPayload {
+            version: MODEL_VERSION,
+            formula: "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=5)"
+                .to_string(),
+            model_kind: ModelKind::Survival,
+            family_state: FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("transformation".to_string()),
+                survival_distribution: Some("gaussian".to_string()),
+            },
+            family: "survival".to_string(),
+            fit_result: None,
+            data_schema: None,
+            link: None,
+            mixture_link_param_covariance: None,
+            sas_param_covariance: None,
+            formula_noise: None,
+            beta_noise: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
+            gaussian_response_scale: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            jointridge_used: None,
+            probitwiggle_knots: None,
+            probitwiggle_degree: None,
+            betawiggle: None,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
+            survival_entry: Some("entry".to_string()),
+            survival_exit: Some("exit".to_string()),
+            survival_event: Some("event".to_string()),
+            survivalspec: Some("net".to_string()),
+            survival_baseline_target: Some("weibull".to_string()),
+            survival_baseline_scale: Some(10.0),
+            survival_baseline_shape: Some(1.2),
+            survival_baseline_rate: None,
+            survival_baseline_makeham: None,
+            survival_time_basis: Some("none".to_string()),
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_keep_cols: None,
+            survival_time_smooth_lambda: None,
+            survivalridge_lambda: None,
+            survival_likelihood: Some("transformation".to_string()),
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
+            survival_distribution: Some("gaussian".to_string()),
+            training_headers: Some(vec![]),
+            resolved_termspec: Some(empty_termspec()),
+            resolved_termspec_noise: None,
+            adaptive_regularization_diagnostics: None,
+        });
+        let got = super::saved_survival_timewiggle_components(&eta, &eta, &deriv, &model)
+            .expect("timewiggle metadata check");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn run_predict_survival_supports_saved_timewiggle_model() {
+        let age_entry = array![10.0, 12.0];
+        let age_exit = array![20.0, 24.0];
+        let baseline_cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(15.0),
+            shape: Some(1.3),
+            rate: None,
+            makeham: None,
+        };
+        let (eta_entry, eta_exit, derivative_exit) =
+            super::build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
+                .expect("baseline offsets");
+        let wiggle_cfg = super::parse_linkwiggle_formulaspec(
+            &BTreeMap::from([
+                ("degree".to_string(), "3".to_string()),
+                ("internal_knots".to_string(), "4".to_string()),
+            ]),
+            "timewiggle(degree=3, internal_knots=4)",
+        )
+        .expect("timewiggle cfg");
+        let built = super::build_survival_timewiggle_from_baseline(
+            &eta_entry,
+            &eta_exit,
+            &derivative_exit,
+            &wiggle_cfg,
+        )
+        .expect("timewiggle build");
+        let beta = Array1::<f64>::zeros(built.design_exit.ncols() + 1);
+        let fit_result = core_saved_fit_result(
+            beta.clone(),
+            Array1::zeros(built.penalties.len()),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_stub(),
+        );
+        let model = SavedModel::from_payload(FittedModelPayload {
+            version: MODEL_VERSION,
+            formula: "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)"
+                .to_string(),
+            model_kind: ModelKind::Survival,
+            family_state: FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("transformation".to_string()),
+                survival_distribution: Some("gaussian".to_string()),
+            },
+            family: "survival".to_string(),
+            fit_result: Some(fit_result),
+            data_schema: None,
+            link: None,
+            mixture_link_param_covariance: None,
+            sas_param_covariance: None,
+            formula_noise: None,
+            beta_noise: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
+            gaussian_response_scale: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            jointridge_used: None,
+            probitwiggle_knots: None,
+            probitwiggle_degree: None,
+            betawiggle: None,
+            timewiggle_knots: Some(built.knots.to_vec()),
+            timewiggle_degree: Some(built.degree),
+            timewiggle_penalty_orders: Some(wiggle_cfg.penalty_orders.clone()),
+            timewiggle_double_penalty: Some(wiggle_cfg.double_penalty),
+            betatimewiggle: Some(Array1::<f64>::zeros(built.design_exit.ncols()).to_vec()),
+            survival_entry: Some("entry".to_string()),
+            survival_exit: Some("exit".to_string()),
+            survival_event: Some("event".to_string()),
+            survivalspec: Some("net".to_string()),
+            survival_baseline_target: Some("weibull".to_string()),
+            survival_baseline_scale: Some(15.0),
+            survival_baseline_shape: Some(1.3),
+            survival_baseline_rate: None,
+            survival_baseline_makeham: None,
+            survival_time_basis: Some("none".to_string()),
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_keep_cols: None,
+            survival_time_smooth_lambda: None,
+            survivalridge_lambda: Some(1e-4),
+            survival_likelihood: Some("transformation".to_string()),
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
+            survival_distribution: Some("gaussian".to_string()),
+            training_headers: Some(vec!["entry".to_string(), "exit".to_string()]),
+            resolved_termspec: Some(empty_termspec()),
+            resolved_termspec_noise: None,
+            adaptive_regularization_diagnostics: None,
+        });
+        let data = array![[10.0, 20.0], [12.0, 24.0]];
+        let col_map = HashMap::from([("entry".to_string(), 0usize), ("exit".to_string(), 1usize)]);
+        let out_dir = tempdir().expect("tempdir");
+        let out_path = out_dir.path().join("survival_timewiggle_pred.csv");
+        let args = PredictArgs {
+            model: PathBuf::from("unused.model.json"),
+            new_data: PathBuf::from("unused.csv"),
+            out: out_path.clone(),
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        };
+        let mut progress = gam::visualizer::VisualizerSession::new(false);
+        super::run_predict_survival(
+            &mut progress,
+            &args,
+            &model,
+            data.view(),
+            &col_map,
+            model.training_headers.as_ref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("survival predict with timewiggle");
+        let csv = fs::read_to_string(&out_path).expect("prediction csv");
+        let lines = csv.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("mean"));
     }
 
     #[test]
@@ -11120,6 +11823,7 @@ mod tests {
             SurvivalTimeBasisConfig::ISpline {
                 degree,
                 knots: knots.clone(),
+                keep_cols: Vec::new(),
                 smooth_lambda: 1e-2,
             },
             None,
@@ -11198,6 +11902,7 @@ mod tests {
             SurvivalTimeBasisConfig::ISpline {
                 degree,
                 knots: knots_days.clone(),
+                keep_cols: Vec::new(),
                 smooth_lambda: 1e-2,
             },
             None,
@@ -11214,6 +11919,7 @@ mod tests {
             SurvivalTimeBasisConfig::ISpline {
                 degree,
                 knots: knots_scaled,
+                keep_cols: Vec::new(),
                 smooth_lambda: 1e-2,
             },
             None,
@@ -11316,6 +12022,7 @@ mod tests {
             SurvivalTimeBasisConfig::ISpline {
                 degree: 3,
                 knots: Array1::zeros(0),
+                keep_cols: Vec::new(),
                 smooth_lambda: 1e-2,
             },
             Some((6, 1e-6)),
@@ -11409,15 +12116,49 @@ mod tests {
         model
             .set_structural_monotonicity(true, 2)
             .expect("enable structural monotonicity");
-        let min_uniform_time_coef = model
-            .structural_time_initial_coefficient_floor(1e-6)
-            .expect("structural initial coefficient floor");
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("structural derivative constraints");
+        let beta0 = build_survival_feasible_initial_beta(2, Some(&constraints));
 
-        let coef = choose_survival_time_block_initial_coefficient(min_uniform_time_coef);
+        assert!(beta0.iter().all(|v| v.is_finite()));
+        for i in 0..constraints.a.nrows() {
+            let slack = constraints.a.row(i).dot(&beta0) - constraints.b[i];
+            assert!(slack >= -1e-10, "constraint {i} violated by {slack}");
+        }
+        assert!(beta0[0] >= 0.0);
+        assert!(beta0[1] >= 0.0);
+    }
 
-        assert!(coef.is_finite());
-        assert!(coef > 0.0);
-        assert!(coef >= 1.5 * (1e-6 / 5e-5));
+    #[test]
+    fn survival_feasible_initial_beta_handles_sparse_overlapping_constraints() {
+        let constraints = gam::pirls::LinearInequalityConstraints {
+            a: Array2::from_shape_vec((3, 3), vec![1.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0])
+                .expect("constraint rows"),
+            b: Array1::from_vec(vec![0.25, 0.5, 0.75]),
+        };
+
+        let beta0 = build_survival_feasible_initial_beta(3, Some(&constraints));
+
+        assert!(beta0.iter().all(|v| v.is_finite()));
+        for i in 0..constraints.a.nrows() {
+            let slack = constraints.a.row(i).dot(&beta0) - constraints.b[i];
+            assert!(slack >= -1e-9, "constraint {i} violated by {slack}");
+        }
+    }
+
+    #[test]
+    fn survival_feasible_initial_beta_respects_offset_shifted_constraints() {
+        let constraints = gam::pirls::LinearInequalityConstraints {
+            a: Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.25, 1.0]).expect("constraint rows"),
+            b: Array1::from_vec(vec![-0.5, 0.4]),
+        };
+
+        let beta0 = build_survival_feasible_initial_beta(2, Some(&constraints));
+
+        assert!(beta0.iter().all(|v| v.is_finite()));
+        assert!(constraints.a.row(0).dot(&beta0) - constraints.b[0] >= -1e-9);
+        assert!(constraints.a.row(1).dot(&beta0) - constraints.b[1] >= -1e-9);
     }
 
     #[test]
@@ -11471,6 +12212,7 @@ mod tests {
             SurvivalTimeBasisConfig::ISpline {
                 degree,
                 knots: knots.clone(),
+                keep_cols: Vec::new(),
                 smooth_lambda: 1e-2,
             },
             None,
@@ -11487,6 +12229,49 @@ mod tests {
             }
             assert!(maxv - minv > 1e-12);
         }
+    }
+
+    #[test]
+    fn ispline_time_basis_reuses_saved_keep_cols_on_narrow_prediction_range() {
+        let train_entry = Array1::from_vec(vec![1.0, 1.5, 2.0, 2.5, 3.5, 4.5]);
+        let train_exit = Array1::from_vec(vec![1.2, 1.9, 2.8, 3.1, 4.2, 5.0]);
+        let knots = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.8, 1.2, 1.6, 1.9, 1.9, 1.9, 1.9]);
+
+        let trained = build_survival_time_basis(
+            &train_entry,
+            &train_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots: knots.clone(),
+                keep_cols: Vec::new(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build training ispline basis");
+
+        let pred_entry = Array1::from_vec(vec![1.0, 1.1, 1.2]);
+        let pred_exit = Array1::from_vec(vec![1.25, 1.3, 1.35]);
+        let rebuilt = build_survival_time_basis(
+            &pred_entry,
+            &pred_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots,
+                keep_cols: trained.keep_cols.clone().expect("saved keep cols"),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("rebuild prediction ispline basis");
+
+        assert_eq!(rebuilt.x_entry_time.ncols(), trained.x_entry_time.ncols());
+        assert_eq!(rebuilt.x_exit_time.ncols(), trained.x_exit_time.ncols());
+        assert_eq!(
+            rebuilt.x_derivative_time.ncols(),
+            trained.x_derivative_time.ncols()
+        );
+        assert_eq!(rebuilt.keep_cols, trained.keep_cols);
     }
 
     #[test]
@@ -11541,6 +12326,9 @@ mod tests {
             probitwiggle_knots: Some(knots),
             probitwiggle_degree: Some(3),
             betawiggle: Some(betawiggle.clone()),
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -11553,6 +12341,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
@@ -11736,6 +12525,9 @@ mod tests {
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -11748,6 +12540,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
@@ -11801,6 +12594,9 @@ mod tests {
             probitwiggle_knots: Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
             probitwiggle_degree: Some(2),
             betawiggle: None,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -11813,6 +12609,7 @@ mod tests {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,

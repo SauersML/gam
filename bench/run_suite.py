@@ -4932,6 +4932,28 @@ suppressPackageStartupMessages({
   library(jsonlite)
 })
 
+patch_mgcv_gam_fit5_matrix_drop <- function() {
+  ns <- asNamespace("mgcv")
+  gam_fit5 <- get("gam.fit5", envir=ns)
+  body_txt <- paste(deparse(body(gam_fit5)), collapse="\n")
+  patched_body_txt <- gsub(
+    "\\(D \\*\\s*A\\)\\[piv, \\]",
+    "(D * A)[piv, , drop = FALSE]",
+    body_txt,
+    perl=TRUE
+  )
+  if (identical(body_txt, patched_body_txt)) {
+    stop("failed to patch mgcv::gam.fit5 matrix indexing bug")
+  }
+  body(gam_fit5) <- parse(text=patched_body_txt)[[1]]
+  gam_fit5 <- compiler::cmpfun(gam_fit5)
+  unlockBinding("gam.fit5", ns)
+  assign("gam.fit5", gam_fit5, envir=ns)
+  lockBinding("gam.fit5", ns)
+}
+
+patch_mgcv_gam_fit5_matrix_drop()
+
 payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
@@ -5256,6 +5278,28 @@ suppressPackageStartupMessages({
   library(mgcv)
   library(jsonlite)
 })
+
+patch_mgcv_gam_fit5_matrix_drop <- function() {
+  ns <- asNamespace("mgcv")
+  gam_fit5 <- get("gam.fit5", envir=ns)
+  body_txt <- paste(deparse(body(gam_fit5)), collapse="\n")
+  patched_body_txt <- gsub(
+    "\\(D \\*\\s*A\\)\\[piv, \\]",
+    "(D * A)[piv, , drop = FALSE]",
+    body_txt,
+    perl=TRUE
+  )
+  if (identical(body_txt, patched_body_txt)) {
+    stop("failed to patch mgcv::gam.fit5 matrix indexing bug")
+  }
+  body(gam_fit5) <- parse(text=patched_body_txt)[[1]]
+  gam_fit5 <- compiler::cmpfun(gam_fit5)
+  unlockBinding("gam.fit5", ns)
+  assign("gam.fit5", gam_fit5, envir=ns)
+  lockBinding("gam.fit5", ns)
+}
+
+patch_mgcv_gam_fit5_matrix_drop()
 
 payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)

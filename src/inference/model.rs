@@ -83,6 +83,16 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub betawiggle: Option<Vec<f64>>,
     #[serde(default)]
+    pub timewiggle_knots: Option<Vec<f64>>,
+    #[serde(default)]
+    pub timewiggle_degree: Option<usize>,
+    #[serde(default)]
+    pub timewiggle_penalty_orders: Option<Vec<usize>>,
+    #[serde(default)]
+    pub timewiggle_double_penalty: Option<bool>,
+    #[serde(default)]
+    pub betatimewiggle: Option<Vec<f64>>,
+    #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
     pub survival_exit: Option<String>,
@@ -106,6 +116,8 @@ pub struct FittedModelPayload {
     pub survival_time_degree: Option<usize>,
     #[serde(default)]
     pub survival_time_knots: Option<Vec<f64>>,
+    #[serde(default)]
+    pub survival_time_keep_cols: Option<Vec<usize>>,
     #[serde(default)]
     pub survival_time_smooth_lambda: Option<f64>,
     #[serde(default)]
@@ -173,6 +185,11 @@ impl FittedModelPayload {
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
+            timewiggle_knots: None,
+            timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
+            betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -185,6 +202,7 @@ impl FittedModelPayload {
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
+            survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
@@ -755,6 +773,9 @@ impl FittedModel {
         }
         if let Some(v) = self.betawiggle.as_ref() {
             validate_all_finite("betawiggle", v.iter().copied())?;
+        }
+        if let Some(v) = self.betatimewiggle.as_ref() {
+            validate_all_finite("betatimewiggle", v.iter().copied())?;
         }
         if let Some(v) = self.survival_beta_time.as_ref() {
             validate_all_finite("survival_beta_time", v.iter().copied())?;
