@@ -20,6 +20,7 @@ use crate::types::{
     MixtureLinkState, RidgePassport, RidgePolicy, SasLinkSpec, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::sparse::linalg::matmul::{
@@ -804,6 +805,8 @@ pub struct PirlsWorkspace {
     pub weighted_xvalues: Vec<f64>,
     // Dense chunk buffer for streaming X'WX assembly on very large n.
     pub weighted_x_chunk: Array2<f64>,
+    // Reusable p×p buffer for Hessian assembly (avoids per-iteration allocation).
+    pub hessian_buf: Array2<f64>,
 }
 
 impl PirlsWorkspace {
@@ -843,14 +846,15 @@ impl PirlsWorkspace {
             factorization_matrix: Array2::zeros((0, 0)),
             weighted_xvalues: Vec::new(),
             weighted_x_chunk: Array2::zeros((0, 0).f()),
+            hessian_buf: Array2::zeros((0, 0).f()),
         }
     }
 
     #[inline]
     fn dense_xtwx_chunkrows(p: usize) -> usize {
         const MIN_ROWS: usize = 512;
-        const MAX_ROWS: usize = 2048;
-        const TARGET_BYTES: usize = 2 * 1024 * 1024;
+        const MAX_ROWS: usize = 131_072; // 128K rows — let faer handle cache blocking
+        const TARGET_BYTES: usize = 64 * 1024 * 1024; // 64MB
         let bytes_perrow = p.max(1) * std::mem::size_of::<f64>();
         (TARGET_BYTES / bytes_perrow).clamp(MIN_ROWS, MAX_ROWS)
     }
@@ -861,7 +865,7 @@ impl PirlsWorkspace {
         out: &mut Array2<f64>,
         par: Par,
     ) where
-        S: Data<Elem = f64>,
+        S: Data<Elem = f64> + Sync,
     {
         let n = x.nrows();
         let p = x.ncols();
@@ -874,33 +878,75 @@ impl PirlsWorkspace {
             "sqrtw length must match row count for streamed XtWX"
         );
         let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
-        if self.weighted_x_chunk.ncols() != p || self.weighted_x_chunk.nrows() != chunkrows {
-            self.weighted_x_chunk = Array2::zeros((chunkrows, p).f());
-        }
 
-        let mut outview = array2_to_matmut(out);
-        for start in (0..n).step_by(chunkrows) {
-            let rows = (n - start).min(chunkrows);
-            {
-                let mut chunk = self.weighted_x_chunk.slice_mut(s![0..rows, ..]);
-                for localrow in 0..rows {
-                    let srcrow = start + localrow;
-                    let sqrtw = self.sqrtw[srcrow];
-                    for col in 0..p {
-                        chunk[[localrow, col]] = x[[srcrow, col]] * sqrtw;
-                    }
-                }
+        let num_chunks = (n + chunkrows - 1) / chunkrows;
+        let use_parallel = num_chunks >= 4 && (n as u64) * (p as u64) >= 200_000;
+
+        if use_parallel {
+            // Parallel: each rayon task owns a chunk buffer + p×p accumulator.
+            // Individual matmuls use Par::No since parallelism is at the chunk level.
+            let sqrtw = &self.sqrtw;
+            let partial_sums: Vec<Array2<f64>> = (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let start = ci * chunkrows;
+                    let rows = (n - start).min(chunkrows);
+                    let mut chunk_buf = Array2::<f64>::zeros((rows, p).f());
+                    let x_slice = x.slice(s![start..start + rows, ..]);
+                    let w_slice = sqrtw.slice(s![start..start + rows]);
+                    Zip::from(chunk_buf.rows_mut())
+                        .and(x_slice.rows())
+                        .and(&w_slice)
+                        .for_each(|mut dst, src, &w| {
+                            Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
+                        });
+                    let mut acc = Array2::<f64>::zeros((p, p).f());
+                    let mut accview = array2_to_matmut(&mut acc);
+                    let chunkview = FaerArrayView::new(&chunk_buf.view());
+                    matmul(
+                        accview.as_mut(),
+                        Accum::Add,
+                        chunkview.as_ref().transpose(),
+                        chunkview.as_ref(),
+                        1.0,
+                        Par::No,
+                    );
+                    acc
+                })
+                .collect();
+            for partial in &partial_sums {
+                Zip::from(out).and(partial).for_each(|o, &p_val| *o += p_val);
             }
-            let chunkrowsview = self.weighted_x_chunk.slice(s![0..rows, ..]);
-            let chunkview = FaerArrayView::new(&chunkrowsview);
-            matmul(
-                outview.as_mut(),
-                Accum::Add,
-                chunkview.as_ref().transpose(),
-                chunkview.as_ref(),
-                1.0,
-                par,
-            );
+        } else {
+            // Sequential: reuse workspace chunk buffer
+            if self.weighted_x_chunk.ncols() != p || self.weighted_x_chunk.nrows() != chunkrows {
+                self.weighted_x_chunk = Array2::zeros((chunkrows, p).f());
+            }
+            let mut outview = array2_to_matmut(out);
+            for start in (0..n).step_by(chunkrows) {
+                let rows = (n - start).min(chunkrows);
+                {
+                    let mut chunk = self.weighted_x_chunk.slice_mut(s![0..rows, ..]);
+                    let x_slice = x.slice(s![start..start + rows, ..]);
+                    let w_slice = self.sqrtw.slice(s![start..start + rows]);
+                    Zip::from(chunk.rows_mut())
+                        .and(x_slice.rows())
+                        .and(&w_slice)
+                        .for_each(|mut dst, src, &w| {
+                            Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
+                        });
+                }
+                let chunkrowsview = self.weighted_x_chunk.slice(s![0..rows, ..]);
+                let chunkview = FaerArrayView::new(&chunkrowsview);
+                matmul(
+                    outview.as_mut(),
+                    Accum::Add,
+                    chunkview.as_ref().transpose(),
+                    chunkview.as_ref(),
+                    1.0,
+                    par,
+                );
+            }
         }
     }
 
@@ -1309,15 +1355,33 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
+    /// Compute X^T W X + S_λ, reusing `workspace.hessian_buf` to avoid per-iteration allocation
+    /// for the common (TransformedExplicit / OriginalSparseNative) paths.
     fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                let xtwx = Self::compute_xtwx_blas(
-                    &mut self.workspace,
-                    x_transformed,
-                    weights,
-                )?;
-                Ok(xtwx + &self.s_transformed)
+                let x = x_transformed;
+                if let DesignMatrix::Dense(xd) = x {
+                    let p = xd.ncols();
+                    self.workspace.fill_sqrtweights(weights);
+                    // Reuse hessian_buf: start from penalty, accumulate XtWX in-place
+                    if self.workspace.hessian_buf.nrows() != p
+                        || self.workspace.hessian_buf.ncols() != p
+                    {
+                        self.workspace.hessian_buf = self.s_transformed.clone();
+                    } else {
+                        self.workspace.hessian_buf.assign(&self.s_transformed);
+                    }
+                    self.workspace.add_dense_xtwx_streaming_from_sqrt(
+                        xd,
+                        &mut self.workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                    Ok(self.workspace.hessian_buf.clone())
+                } else {
+                    let xtwx = Self::compute_xtwx_blas(&mut self.workspace, x, weights)?;
+                    Ok(xtwx + &self.s_transformed)
+                }
             }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
                 let xtwx = Self::compute_xtwx_blas(
@@ -1329,12 +1393,27 @@ impl<'a> GamWorkingModel<'a> {
                 Ok(fast_ab(&tmp, qs) + &self.s_transformed)
             }
             WorkingCoordinateDesign::OriginalSparseNative => {
-                let xtwx = Self::compute_xtwx_blas(
-                    &mut self.workspace,
-                    &self.x_original,
-                    weights,
-                )?;
-                Ok(xtwx + &self.s_transformed)
+                let x = &self.x_original;
+                if let DesignMatrix::Dense(xd) = x {
+                    let p = xd.ncols();
+                    self.workspace.fill_sqrtweights(weights);
+                    if self.workspace.hessian_buf.nrows() != p
+                        || self.workspace.hessian_buf.ncols() != p
+                    {
+                        self.workspace.hessian_buf = self.s_transformed.clone();
+                    } else {
+                        self.workspace.hessian_buf.assign(&self.s_transformed);
+                    }
+                    self.workspace.add_dense_xtwx_streaming_from_sqrt(
+                        xd,
+                        &mut self.workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                    Ok(self.workspace.hessian_buf.clone())
+                } else {
+                    let xtwx = Self::compute_xtwx_blas(&mut self.workspace, x, weights)?;
+                    Ok(xtwx + &self.s_transformed)
+                }
             }
         }
     }

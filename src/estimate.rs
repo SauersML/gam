@@ -1283,14 +1283,13 @@ where
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
-    // Clone inputs to own their storage and unify lifetimes inside this function
+    // Own the input views so they live long enough for REML + final PIRLS eval
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = x.clone();
     let offset_o = offset.to_owned();
     let reml_state = internal::RemlState::new_with_offset(
         y_o.view(),
-        x_o.clone(),
+        x.clone(),
         w_o.view(),
         offset_o.view(),
         s_list,
@@ -1356,7 +1355,7 @@ where
     let final_rho = to_rho_from_z(&final_point);
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
         LogSmoothingParamsView::new(final_rho.view()),
-        &x_o,
+        &x,
         offset_o.view(),
         y_o.view(),
         w_o.view(),
@@ -1380,7 +1379,7 @@ where
     let weighted_rss = if matches!(link, LinkFunction::Identity) {
         let fitted = {
             let mut eta = offset_o.clone();
-            eta += &x_o.matrix_vector_multiply(&beta_orig);
+            eta += &x.matrix_vector_multiply(&beta_orig);
             eta
         };
         let resid = y_o.to_owned() - &fitted;
