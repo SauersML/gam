@@ -4,6 +4,7 @@ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::BTreeMap;
 use std::ops::Deref;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 const MATRIX_FREE_PCG_MIN_P: usize = 2048;
@@ -11,6 +12,129 @@ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 
 pub use crate::linalg::utils::PcgSolveInfo;
+
+pub struct DenseRightProductView<'a> {
+    base: &'a Array2<f64>,
+    first: Option<&'a Array2<f64>>,
+    second: Option<&'a Array2<f64>>,
+}
+
+impl<'a> DenseRightProductView<'a> {
+    pub fn new(base: &'a Array2<f64>) -> Self {
+        Self {
+            base,
+            first: None,
+            second: None,
+        }
+    }
+
+    pub fn with_factor(mut self, factor: &'a Array2<f64>) -> Self {
+        if self.first.is_none() {
+            self.first = Some(factor);
+        } else if self.second.is_none() {
+            self.second = Some(factor);
+        } else {
+            panic!("DenseRightProductView supports at most two right factors");
+        }
+        self
+    }
+
+    pub fn with_optional_factor(self, factor: Option<&'a Array2<f64>>) -> Self {
+        match factor {
+            Some(factor) => self.with_factor(factor),
+            None => self,
+        }
+    }
+
+    pub fn materialize(&self) -> Array2<f64> {
+        let mut out = self.base.clone();
+        if let Some(factor) = self.first {
+            out = out.dot(factor);
+        }
+        if let Some(factor) = self.second {
+            out = out.dot(factor);
+        }
+        out
+    }
+
+    fn transformed_ncols(&self) -> usize {
+        if let Some(factor) = self.second {
+            factor.ncols()
+        } else if let Some(factor) = self.first {
+            factor.ncols()
+        } else {
+            self.base.ncols()
+        }
+    }
+}
+
+pub struct DenseRowScaledView<'a> {
+    matrix: &'a Array2<f64>,
+    scale: &'a Array1<f64>,
+}
+
+impl<'a> DenseRowScaledView<'a> {
+    pub fn new(matrix: &'a Array2<f64>, scale: &'a Array1<f64>) -> Self {
+        Self { matrix, scale }
+    }
+
+    pub fn materialize(&self) -> Array2<f64> {
+        let mut out = self.matrix.clone();
+        for (mut row, &weight) in out.outer_iter_mut().zip(self.scale.iter()) {
+            row *= weight;
+        }
+        out
+    }
+}
+
+pub struct EmbeddedColumnBlock<'a> {
+    local: &'a Array2<f64>,
+    global_range: Range<usize>,
+    total_cols: usize,
+}
+
+impl<'a> EmbeddedColumnBlock<'a> {
+    pub fn new(local: &'a Array2<f64>, global_range: Range<usize>, total_cols: usize) -> Self {
+        Self {
+            local,
+            global_range,
+            total_cols,
+        }
+    }
+
+    pub fn materialize(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.local.nrows(), self.total_cols));
+        out.slice_mut(ndarray::s![.., self.global_range.clone()])
+            .assign(self.local);
+        out
+    }
+}
+
+pub struct EmbeddedSquareBlock<'a> {
+    local: &'a Array2<f64>,
+    global_range: Range<usize>,
+    total_dim: usize,
+}
+
+impl<'a> EmbeddedSquareBlock<'a> {
+    pub fn new(local: &'a Array2<f64>, global_range: Range<usize>, total_dim: usize) -> Self {
+        Self {
+            local,
+            global_range,
+            total_dim,
+        }
+    }
+
+    pub fn materialize(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.total_dim, self.total_dim));
+        out.slice_mut(ndarray::s![
+            self.global_range.clone(),
+            self.global_range.clone()
+        ])
+        .assign(self.local);
+        out
+    }
+}
 
 struct PenalizedWeightedNormalOperator<'a, O: LinearOperator + ?Sized> {
     operator: &'a O,
@@ -934,6 +1058,228 @@ impl LinearOperator for DesignMatrix {
             }
         }
         Ok(out)
+    }
+}
+
+impl LinearOperator for DenseRightProductView<'_> {
+    fn nrows(&self) -> usize {
+        self.base.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.transformed_ncols()
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut rhs = vector.clone();
+        if let Some(factor) = self.second {
+            rhs = factor.dot(&rhs);
+        }
+        if let Some(factor) = self.first {
+            rhs = factor.dot(&rhs);
+        }
+        dense_matvec(self.base, &rhs)
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = dense_transpose_matvec(self.base, vector);
+        if let Some(factor) = self.first {
+            out = factor.t().dot(&out);
+        }
+        if let Some(factor) = self.second {
+            out = factor.t().dot(&out);
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let mut gram = fast_xt_diag_x(self.base, weights);
+        if let Some(factor) = self.first {
+            gram = factor.t().dot(&gram).dot(factor);
+        }
+        if let Some(factor) = self.second {
+            gram = factor.t().dot(&gram).dot(factor);
+        }
+        Ok(gram)
+    }
+
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        Ok(self.diag_xtw_x(weights)?.diag().to_owned())
+    }
+
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() || y.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.nrows()
+            ));
+        }
+        let mut wy = y.clone();
+        for i in 0..wy.len() {
+            wy[i] *= weights[i].max(0.0);
+        }
+        Ok(self.apply_transpose(&wy))
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        let dense = self.materialize();
+        DesignMatrix::Dense(dense).quadratic_form_diag(middle)
+    }
+}
+
+impl LinearOperator for DenseRowScaledView<'_> {
+    fn nrows(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.matrix.ncols()
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = dense_matvec(self.matrix, vector);
+        for i in 0..out.len() {
+            out[i] *= self.scale[i];
+        }
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut scaled = vector.clone();
+        for i in 0..scaled.len() {
+            scaled[i] *= self.scale[i];
+        }
+        dense_transpose_matvec(self.matrix, &scaled)
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let mut combined = weights.clone();
+        for i in 0..combined.len() {
+            combined[i] *= self.scale[i] * self.scale[i];
+        }
+        Ok(fast_xt_diag_x(self.matrix, &combined))
+    }
+
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        Ok(self.diag_xtw_x(weights)?.diag().to_owned())
+    }
+
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() || y.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.nrows()
+            ));
+        }
+        let mut combined = y.clone();
+        for i in 0..combined.len() {
+            combined[i] *= weights[i].max(0.0) * self.scale[i];
+        }
+        Ok(dense_transpose_matvec(self.matrix, &combined))
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        let mut out = DesignMatrix::Dense(self.matrix.clone()).quadratic_form_diag(middle)?;
+        for i in 0..out.len() {
+            out[i] *= self.scale[i] * self.scale[i];
+        }
+        Ok(out)
+    }
+}
+
+impl LinearOperator for EmbeddedColumnBlock<'_> {
+    fn nrows(&self) -> usize {
+        self.local.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        dense_matvec(
+            self.local,
+            &vector
+                .slice(ndarray::s![self.global_range.clone()])
+                .to_owned(),
+        )
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.total_cols);
+        out.slice_mut(ndarray::s![self.global_range.clone()])
+            .assign(&dense_transpose_matvec(self.local, vector));
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let mut out = Array2::<f64>::zeros((self.total_cols, self.total_cols));
+        let local = fast_xt_diag_x(self.local, weights);
+        out.slice_mut(ndarray::s![
+            self.global_range.clone(),
+            self.global_range.clone()
+        ])
+        .assign(&local);
+        Ok(out)
+    }
+
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let mut out = Array1::<f64>::zeros(self.total_cols);
+        let local = DesignMatrix::Dense(self.local.clone()).diag_gram(weights)?;
+        out.slice_mut(ndarray::s![self.global_range.clone()])
+            .assign(&local);
+        Ok(out)
+    }
+
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() || y.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.nrows()
+            ));
+        }
+        let mut wy = y.clone();
+        for i in 0..wy.len() {
+            wy[i] *= weights[i].max(0.0);
+        }
+        Ok(self.apply_transpose(&wy))
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        let middle_local = middle
+            .slice(ndarray::s![
+                self.global_range.clone(),
+                self.global_range.clone()
+            ])
+            .to_owned();
+        DesignMatrix::Dense(self.local.clone()).quadratic_form_diag(&middle_local)
     }
 }
 

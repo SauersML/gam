@@ -5663,7 +5663,8 @@ mod tests {
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut,
         bernoulli_geometry_from_jet, calculate_scale, compress_activeworking_set,
         compute_constraint_kkt_diagnostics, default_beta_guess_external, fit_model_for_fixed_rho,
-        logit_clampzero_enabled, should_use_sparse_native_pirls,
+        logit_clampzero_enabled, should_log_pirls_decision_summary,
+        should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
         update_glmvectors_integrated_for_link, working_set_kkt_diagnostics_frommultipliers,
     };

@@ -13,7 +13,7 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, Axis, s};
 
 const MIN_PROB: f64 = 1e-12;
 
@@ -936,12 +936,11 @@ fn prepare_identified_time_block(
     // where c is the time basis row at anchor time. Reparameterize beta = Z theta
     // with columns of Z spanning null(c^T), so the constraint is exact for all theta.
     let c = input.design_entry.row(anchorrow).to_owned();
-    let mut c_mat = Array2::<f64>::zeros((p, 1));
-    c_mat.column_mut(0).assign(&c);
-    let (u_opt, singularvalues, _) = c_mat
-        .svd(true, false)
+    let c_mat = c.view().insert_axis(Axis(0)).to_owned();
+    let (_, singularvalues, vt_opt) = c_mat
+        .svd(false, true)
         .map_err(|e| format!("time_block identifiability SVD failed: {e}"))?;
-    let u = u_opt.ok_or_else(|| "time_block identifiability SVD returned no U".to_string())?;
+    let vt = vt_opt.ok_or_else(|| "time_block identifiability SVD returned no V^T".to_string())?;
     let max_sigma = singularvalues
         .iter()
         .copied()
@@ -957,11 +956,9 @@ fn prepare_identified_time_block(
                 .to_string(),
         );
     }
-    let z = if rank == 0 {
-        Array2::<f64>::eye(p)
-    } else {
-        u.slice(s![.., rank..]).to_owned()
-    };
+    // For a single anchor constraint c^T beta = 0, the admissible coefficient
+    // space is the right nullspace of the 1 x p row matrix c^T.
+    let z = vt.slice(s![rank.., ..]).t().to_owned();
     let design_entry = input.design_entry.dot(&z);
     let design_exit = input.design_exit.dot(&z);
     let design_derivative_exit = input.design_derivative_exit.dot(&z);
@@ -1099,17 +1096,76 @@ fn rowwise_cross_quadratic_dense_design(
     middle: &Array2<f64>,
     right: &DesignMatrix,
 ) -> Result<Array1<f64>, String> {
-    if left_dense.ncols() != middle.nrows() {
+    if left_dense.ncols() != middle.nrows() || middle.ncols() != right.ncols() {
         return Err(format!(
-            "rowwise_cross_quadratic_dense_design shape mismatch: left is {}x{}, middle is {}x{}",
+            "rowwise_cross_quadratic_dense_design shape mismatch: left is {}x{}, middle is {}x{}, right is {}x{}",
             left_dense.nrows(),
             left_dense.ncols(),
             middle.nrows(),
-            middle.ncols()
+            middle.ncols(),
+            right.nrows(),
+            right.ncols()
         ));
     }
-    let left_middle = left_dense.dot(middle);
-    rowwise_dot_designwith_dense(right, &left_middle)
+    if left_dense.nrows() != right.nrows() {
+        return Err(format!(
+            "rowwise_cross_quadratic_dense_design row mismatch: left has {} rows, right has {} rows",
+            left_dense.nrows(),
+            right.nrows()
+        ));
+    }
+
+    let mut out = Array1::<f64>::zeros(left_dense.nrows());
+    let mut row_scratch = vec![0.0_f64; middle.ncols()];
+    match right {
+        DesignMatrix::Dense(x_right) => {
+            for i in 0..left_dense.nrows() {
+                row_scratch.fill(0.0);
+                for j in 0..left_dense.ncols() {
+                    let left_ij = left_dense[[i, j]];
+                    if left_ij == 0.0 {
+                        continue;
+                    }
+                    for k in 0..middle.ncols() {
+                        row_scratch[k] += left_ij * middle[[j, k]];
+                    }
+                }
+                let mut acc = 0.0_f64;
+                for k in 0..x_right.ncols() {
+                    acc += row_scratch[k] * x_right[[i, k]];
+                }
+                out[i] = acc;
+            }
+        }
+        DesignMatrix::Sparse(xs) => {
+            let csr = xs.to_csr_arc().ok_or_else(|| {
+                "rowwise_cross_quadratic_dense_design: failed to obtain CSR view".to_string()
+            })?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+            for i in 0..left_dense.nrows() {
+                row_scratch.fill(0.0);
+                for j in 0..left_dense.ncols() {
+                    let left_ij = left_dense[[i, j]];
+                    if left_ij == 0.0 {
+                        continue;
+                    }
+                    for k in 0..middle.ncols() {
+                        row_scratch[k] += left_ij * middle[[j, k]];
+                    }
+                }
+                let mut acc = 0.0_f64;
+                for ptr in row_ptr[i]..row_ptr[i + 1] {
+                    let k = col_idx[ptr];
+                    acc += vals[ptr] * row_scratch[k];
+                }
+                out[i] = acc;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn rowwise_cross_quadratic_design(

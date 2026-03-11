@@ -63,6 +63,19 @@ pub struct SurvivalEngineInputs<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct SurvivalTimeCovarInputs<'a> {
+    pub age_entry: ArrayView1<'a, f64>,
+    pub age_exit: ArrayView1<'a, f64>,
+    pub event_target: ArrayView1<'a, u8>,
+    pub event_competing: ArrayView1<'a, u8>,
+    pub sampleweight: ArrayView1<'a, f64>,
+    pub time_entry: ArrayView2<'a, f64>,
+    pub time_exit: ArrayView2<'a, f64>,
+    pub time_derivative: ArrayView2<'a, f64>,
+    pub covariates: ArrayView2<'a, f64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SurvivalBaselineOffsets<'a> {
     /// Baseline target contribution to eta at entry time: eta_target(t_entry).
     pub eta_entry: ArrayView1<'a, f64>,
@@ -223,15 +236,28 @@ impl Default for MonotonicityPenalty {
 }
 
 #[derive(Debug, Clone)]
+enum SurvivalDesign {
+    Flat {
+        x_entry: Array2<f64>,
+        x_exit: Array2<f64>,
+        x_derivative: Array2<f64>,
+    },
+    TimeCovariateShared {
+        time_entry: Array2<f64>,
+        time_exit: Array2<f64>,
+        time_derivative: Array2<f64>,
+        covariates: Array2<f64>,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
     age_exit: Array1<f64>,
     entry_at_origin: Array1<bool>,
     event_target: Array1<u8>,
     sampleweight: Array1<f64>,
-    x_entry: Array2<f64>,
-    x_exit: Array2<f64>,
-    x_derivative: Array2<f64>,
+    design: SurvivalDesign,
     offset_eta_entry: Array1<f64>,
     offset_eta_exit: Array1<f64>,
     offset_derivative_exit: Array1<f64>,
@@ -265,6 +291,189 @@ impl WorkingModelSurvival {
 
     fn row_derivative_constraint_lower_bound(&self, _: usize) -> f64 {
         self.derivative_guard()
+    }
+
+    fn coefficient_dim(&self) -> usize {
+        match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => x_exit.ncols(),
+            SurvivalDesign::TimeCovariateShared {
+                time_exit,
+                covariates,
+                ..
+            } => time_exit.ncols() + covariates.ncols(),
+        }
+    }
+
+    fn nrows(&self) -> usize {
+        self.sampleweight.len()
+    }
+
+    fn entry_dot(&self, beta: &Array1<f64>) -> Array1<f64> {
+        match &self.design {
+            SurvivalDesign::Flat { x_entry, .. } => x_entry.dot(beta),
+            SurvivalDesign::TimeCovariateShared {
+                time_entry,
+                covariates,
+                ..
+            } => {
+                let p_time = time_entry.ncols();
+                let mut out = time_entry.dot(&beta.slice(ndarray::s![..p_time]));
+                if covariates.ncols() > 0 {
+                    out += &covariates.dot(&beta.slice(ndarray::s![p_time..]));
+                }
+                out
+            }
+        }
+    }
+
+    fn exit_dot(&self, beta: &Array1<f64>) -> Array1<f64> {
+        match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => x_exit.dot(beta),
+            SurvivalDesign::TimeCovariateShared {
+                time_exit,
+                covariates,
+                ..
+            } => {
+                let p_time = time_exit.ncols();
+                let mut out = time_exit.dot(&beta.slice(ndarray::s![..p_time]));
+                if covariates.ncols() > 0 {
+                    out += &covariates.dot(&beta.slice(ndarray::s![p_time..]));
+                }
+                out
+            }
+        }
+    }
+
+    fn derivative_dot(&self, beta: &Array1<f64>) -> Array1<f64> {
+        match &self.design {
+            SurvivalDesign::Flat { x_derivative, .. } => x_derivative.dot(beta),
+            SurvivalDesign::TimeCovariateShared {
+                time_derivative, ..
+            } => time_derivative.dot(&beta.slice(ndarray::s![..time_derivative.ncols()])),
+        }
+    }
+
+    fn fill_entry_row(&self, i: usize, out: &mut [f64]) {
+        match &self.design {
+            SurvivalDesign::Flat { x_entry, .. } => {
+                for (dst, &src) in out.iter_mut().zip(x_entry.row(i).iter()) {
+                    *dst = src;
+                }
+            }
+            SurvivalDesign::TimeCovariateShared {
+                time_entry,
+                covariates,
+                ..
+            } => {
+                let p_time = time_entry.ncols();
+                for j in 0..p_time {
+                    out[j] = time_entry[[i, j]];
+                }
+                for j in 0..covariates.ncols() {
+                    out[p_time + j] = covariates[[i, j]];
+                }
+            }
+        }
+    }
+
+    fn fill_exit_row(&self, i: usize, out: &mut [f64]) {
+        match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => {
+                for (dst, &src) in out.iter_mut().zip(x_exit.row(i).iter()) {
+                    *dst = src;
+                }
+            }
+            SurvivalDesign::TimeCovariateShared {
+                time_exit,
+                covariates,
+                ..
+            } => {
+                let p_time = time_exit.ncols();
+                for j in 0..p_time {
+                    out[j] = time_exit[[i, j]];
+                }
+                for j in 0..covariates.ncols() {
+                    out[p_time + j] = covariates[[i, j]];
+                }
+            }
+        }
+    }
+
+    fn fill_derivative_row(&self, i: usize, out: &mut [f64]) {
+        match &self.design {
+            SurvivalDesign::Flat { x_derivative, .. } => {
+                for (dst, &src) in out.iter_mut().zip(x_derivative.row(i).iter()) {
+                    *dst = src;
+                }
+            }
+            SurvivalDesign::TimeCovariateShared {
+                time_derivative, ..
+            } => {
+                let p_time = time_derivative.ncols();
+                for j in 0..p_time {
+                    out[j] = time_derivative[[i, j]];
+                }
+                for dst in out.iter_mut().skip(p_time) {
+                    *dst = 0.0;
+                }
+            }
+        }
+    }
+
+    fn derivative_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        match &self.design {
+            SurvivalDesign::Flat { x_derivative, .. } => fast_atv(x_derivative, vector),
+            SurvivalDesign::TimeCovariateShared {
+                time_derivative,
+                covariates,
+                ..
+            } => {
+                let mut out = Array1::<f64>::zeros(time_derivative.ncols() + covariates.ncols());
+                out.slice_mut(ndarray::s![..time_derivative.ncols()])
+                    .assign(&fast_atv(time_derivative, vector));
+                out
+            }
+        }
+    }
+
+    fn exit_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => fast_atv(x_exit, vector),
+            SurvivalDesign::TimeCovariateShared {
+                time_exit,
+                covariates,
+                ..
+            } => {
+                let p_time = time_exit.ncols();
+                let mut out = Array1::<f64>::zeros(p_time + covariates.ncols());
+                out.slice_mut(ndarray::s![..p_time])
+                    .assign(&fast_atv(time_exit, vector));
+                if covariates.ncols() > 0 {
+                    out.slice_mut(ndarray::s![p_time..])
+                        .assign(&fast_atv(covariates, vector));
+                }
+                out
+            }
+        }
+    }
+
+    fn derivative_xt_diag_x(&self, weights: &Array1<f64>) -> Array2<f64> {
+        match &self.design {
+            SurvivalDesign::Flat { x_derivative, .. } => fast_xt_diag_x(x_derivative, weights),
+            SurvivalDesign::TimeCovariateShared {
+                time_derivative,
+                covariates,
+                ..
+            } => {
+                let p_time = time_derivative.ncols();
+                let p_cov = covariates.ncols();
+                let mut out = Array2::<f64>::zeros((p_time + p_cov, p_time + p_cov));
+                let time_block = fast_xt_diag_x(time_derivative, weights);
+                out.slice_mut(ndarray::s![..p_time, ..p_time])
+                    .assign(&time_block);
+                out
+            }
+        }
     }
 
     fn stabilized_structural_derivative(&self, deriv: f64) -> Option<f64> {
@@ -352,17 +561,18 @@ impl WorkingModelSurvival {
         }
         let derivative_target_floor = derivative_target_floor.max(self.derivative_guard());
         let mut min_uniform_time_coef = 0.0_f64;
+        let p = self.coefficient_dim();
+        let mut row = vec![0.0_f64; p];
 
-        for i in 0..self.x_derivative.nrows() {
+        for i in 0..self.nrows() {
             if self.sampleweight[i] <= 0.0 {
                 continue;
             }
-            let row = self.x_derivative.row(i);
-            let row_sum = row
-                .slice(ndarray::s![0..self.structural_time_columns])
+            self.fill_derivative_row(i, &mut row);
+            let row_sum = row[0..self.structural_time_columns]
                 .iter()
                 .copied()
-                .fold(0.0_f64, |acc, v| acc + v);
+                .sum::<f64>();
             if row_sum <= 1e-12 {
                 continue;
             }
@@ -374,17 +584,17 @@ impl WorkingModelSurvival {
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
-        let p = self.x_derivative.ncols();
+        let p = self.coefficient_dim();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
             return None;
         }
-        let activerows: Vec<usize> = (0..self.x_derivative.nrows())
+        let mut derivative_row = vec![0.0_f64; p];
+        let activerows: Vec<usize> = (0..self.nrows())
             .filter(|&i| {
+                self.fill_derivative_row(i, &mut derivative_row);
                 self.sampleweight[i] > 0.0
-                    && self
-                        .x_derivative
-                        .row(i)
+                    && derivative_row
                         .iter()
                         .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
                         > DERIVATIVE_ROW_NORM_TOL
@@ -396,7 +606,10 @@ impl WorkingModelSurvival {
         let mut a = Array2::<f64>::zeros((activerows.len(), p));
         let mut b = Array1::<f64>::zeros(activerows.len());
         for (r, &i) in activerows.iter().enumerate() {
-            a.row_mut(r).assign(&self.x_derivative.row(i));
+            self.fill_derivative_row(i, &mut derivative_row);
+            for j in 0..p {
+                a[[r, j]] = derivative_row[j];
+            }
             b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
         }
         Some(compress_positive_collinear_constraints(&a, &b))
@@ -492,9 +705,102 @@ impl WorkingModelSurvival {
             entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
             event_target: inputs.event_target.to_owned(),
             sampleweight: inputs.sampleweight.to_owned(),
-            x_entry: inputs.x_entry.to_owned(),
-            x_exit: inputs.x_exit.to_owned(),
-            x_derivative: inputs.x_derivative.to_owned(),
+            design: SurvivalDesign::Flat {
+                x_entry: inputs.x_entry.to_owned(),
+                x_exit: inputs.x_exit.to_owned(),
+                x_derivative: inputs.x_derivative.to_owned(),
+            },
+            offset_eta_entry,
+            offset_eta_exit,
+            offset_derivative_exit,
+            penalties,
+            monotonicity,
+            structurally_monotonic: false,
+            structural_time_columns: 0,
+        })
+    }
+
+    pub fn from_time_covariate_inputswith_offsets(
+        inputs: SurvivalTimeCovarInputs<'_>,
+        offsets: Option<SurvivalBaselineOffsets<'_>>,
+        penalties: PenaltyBlocks,
+        monotonicity: MonotonicityPenalty,
+        spec: SurvivalSpec,
+    ) -> Result<Self, SurvivalError> {
+        if spec == SurvivalSpec::Crude {
+            return Err(SurvivalError::UnsupportedSpec("crude"));
+        }
+        let n = inputs.age_entry.len();
+        let p_time = inputs.time_entry.ncols();
+        let p_cov = inputs.covariates.ncols();
+        let p = p_time + p_cov;
+        if inputs.age_exit.len() != n
+            || inputs.event_target.len() != n
+            || inputs.event_competing.len() != n
+            || inputs.sampleweight.len() != n
+            || inputs.time_entry.nrows() != n
+            || inputs.time_exit.nrows() != n
+            || inputs.time_derivative.nrows() != n
+            || inputs.covariates.nrows() != n
+            || inputs.time_entry.ncols() != inputs.time_exit.ncols()
+            || inputs.time_entry.ncols() != inputs.time_derivative.ncols()
+        {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        Self::validate_penalties(&penalties, p)?;
+        if inputs.age_entry.iter().any(|v| !v.is_finite())
+            || inputs.age_exit.iter().any(|v| !v.is_finite())
+            || inputs
+                .sampleweight
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.0)
+            || inputs.time_entry.iter().any(|v| !v.is_finite())
+            || inputs.time_exit.iter().any(|v| !v.is_finite())
+            || inputs.time_derivative.iter().any(|v| !v.is_finite())
+            || inputs.covariates.iter().any(|v| !v.is_finite())
+            || inputs.event_target.iter().any(|&v| v > 1)
+            || inputs.event_competing.iter().any(|&v| v > 1)
+            || inputs
+                .event_target
+                .iter()
+                .zip(inputs.event_competing.iter())
+                .any(|(&target, &competing)| target > 0 && competing > 0)
+        {
+            return Err(SurvivalError::NonFiniteInput);
+        }
+        let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) = if let Some(off) = offsets
+        {
+            if off.eta_entry.len() != n || off.eta_exit.len() != n || off.derivative_exit.len() != n
+            {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            if off.eta_entry.iter().any(|v| !v.is_finite())
+                || off.eta_exit.iter().any(|v| !v.is_finite())
+                || off.derivative_exit.iter().any(|v| !v.is_finite())
+            {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+            (
+                off.eta_entry.to_owned(),
+                off.eta_exit.to_owned(),
+                off.derivative_exit.to_owned(),
+            )
+        } else {
+            (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n))
+        };
+
+        Ok(Self {
+            age_entry: inputs.age_entry.to_owned(),
+            age_exit: inputs.age_exit.to_owned(),
+            entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
+            event_target: inputs.event_target.to_owned(),
+            sampleweight: inputs.sampleweight.to_owned(),
+            design: SurvivalDesign::TimeCovariateShared {
+                time_entry: inputs.time_entry.to_owned(),
+                time_exit: inputs.time_exit.to_owned(),
+                time_derivative: inputs.time_derivative.to_owned(),
+                covariates: inputs.covariates.to_owned(),
+            },
             offset_eta_entry,
             offset_eta_exit,
             offset_derivative_exit,
@@ -515,7 +821,7 @@ impl WorkingModelSurvival {
         enabled: bool,
         time_columns: usize,
     ) -> Result<(), EstimationError> {
-        let p = self.x_exit.ncols();
+        let p = self.coefficient_dim();
         if time_columns > p {
             return Err(EstimationError::InvalidInput(format!(
                 "structural time columns {} exceed coefficient dimension {}",
@@ -529,9 +835,11 @@ impl WorkingModelSurvival {
         }
         if enabled {
             const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
-            for i in 0..self.x_derivative.nrows() {
+            let mut derivative_row = vec![0.0_f64; p];
+            for i in 0..self.nrows() {
+                self.fill_derivative_row(i, &mut derivative_row);
                 for j in 0..time_columns {
-                    let v = self.x_derivative[[i, j]];
+                    let v = derivative_row[j];
                     if v < -STRUCTURAL_DERIV_TOL {
                         return Err(EstimationError::InvalidInput(format!(
                             "structural monotonicity requires nonnegative time-derivative basis entries; found x_derivative[{i},{j}]={v:.3e}"
@@ -539,7 +847,7 @@ impl WorkingModelSurvival {
                     }
                 }
                 for j in time_columns..p {
-                    let v = self.x_derivative[[i, j]];
+                    let v = derivative_row[j];
                     if v.abs() > STRUCTURAL_DERIV_TOL {
                         return Err(EstimationError::InvalidInput(format!(
                             "structural monotonicity requires zero derivative contribution outside the time block; found x_derivative[{i},{j}]={v:.3e}"
@@ -554,14 +862,14 @@ impl WorkingModelSurvival {
     }
 
     pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
-        if beta.len() != self.x_exit.ncols() {
+        if beta.len() != self.coefficient_dim() {
             return Err(EstimationError::InvalidInput(
                 "survival beta dimension mismatch".to_string(),
             ));
         }
 
-        let n = self.x_exit.nrows();
-        let p = self.x_exit.ncols();
+        let n = self.nrows();
+        let p = self.coefficient_dim();
 
         // Royston-Parmar contract used throughout the engine:
         //   eta(t) = log(H(t)), where H(t) is cumulative hazard.
@@ -588,9 +896,9 @@ impl WorkingModelSurvival {
         // Total predictor = target offset + learned deviation.
         // This is the same architecture used for flexible binary links:
         // principled default, plus penalized wiggle/deviation.
-        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
-        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
-        let derivative_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
+        let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.exit_dot(beta) + &self.offset_eta_exit;
+        let derivative_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
 
         let mut nll = 0.0;
         let mut grad = Array1::<f64>::zeros(p);
@@ -601,6 +909,8 @@ impl WorkingModelSurvival {
 
         let derivative_guard = self.derivative_guard();
         let derivative_guard_numerical = self.derivative_guard_numerical();
+        let mut row_exit = vec![0.0_f64; p];
+        let mut row_entry = vec![0.0_f64; p];
         for i in 0..n {
             let w = self.sampleweight[i];
             if w <= 0.0 {
@@ -655,18 +965,19 @@ impl WorkingModelSurvival {
             }
             nll += w * interval;
 
-            let x_e = self.x_exit.row(i);
-            let x_s = self.x_entry.row(i);
+            self.fill_exit_row(i, &mut row_exit);
+            self.fill_entry_row(i, &mut row_entry);
             for r in 0..p {
                 let interval_grad_r = Self::scaled_exp_component(
                     interval_scale,
-                    h_e_scaled * x_e[r] - h_s_scaled * x_s[r],
+                    h_e_scaled * row_exit[r] - h_s_scaled * row_entry[r],
                 )?;
                 grad[r] += w * interval_grad_r;
                 for c in 0..p {
                     let interval_h_rc = Self::scaled_exp_component(
                         interval_scale,
-                        h_e_scaled * x_e[r] * x_e[c] - h_s_scaled * x_s[r] * x_s[c],
+                        h_e_scaled * row_exit[r] * row_exit[c]
+                            - h_s_scaled * row_entry[r] * row_entry[c],
                     )?;
                     h[[r, c]] += w * interval_h_rc;
                 }
@@ -681,10 +992,10 @@ impl WorkingModelSurvival {
             }
         }
 
-        grad -= &fast_atv(&self.x_exit, &w_event);
-        grad -= &fast_atv(&self.x_derivative, &w_event_inv_deriv);
+        grad -= &self.exit_transpose_vector_multiply(&w_event);
+        grad -= &self.derivative_transpose_vector_multiply(&w_event_inv_deriv);
 
-        h += &fast_xt_diag_x(&self.x_derivative, &w_event_outer);
+        h += &self.derivative_xt_diag_x(&w_event_outer);
 
         let penaltygrad = self.penalties.gradient(beta);
         let penalty_dev = self.penalties.deviance(beta);
@@ -849,14 +1160,17 @@ impl WorkingModelSurvival {
 
         // Keep outer gradient contractions consistent with the fitted inner state:
         // the working predictor includes target baseline offsets plus learned deviation.
-        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
-        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
-        let deriv_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
+        let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.exit_dot(beta) + &self.offset_eta_exit;
+        let deriv_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.derivative_guard();
         let guard_numerical = self.derivative_guard_numerical();
-        let n = self.x_exit.nrows();
+        let n = self.nrows();
+        let mut row_exit = vec![0.0_f64; p];
+        let mut row_entry = vec![0.0_f64; p];
+        let mut row_derivative = vec![0.0_f64; p];
         let mut b_dir = Array2::<f64>::zeros((p, p));
         let mut ge = vec![0.0_f64; p];
         let mut gs = vec![0.0_f64; p];
@@ -945,19 +1259,19 @@ impl WorkingModelSurvival {
                 let mut deta_e = 0.0_f64;
                 let mut deta_s = 0.0_f64;
                 let mut ds = 0.0_f64;
-                let x_e = self.x_exit.row(i);
-                let x_s = self.x_entry.row(i);
-                let drow = self.x_derivative.row(i);
+                self.fill_exit_row(i, &mut row_exit);
+                self.fill_entry_row(i, &mut row_entry);
+                self.fill_derivative_row(i, &mut row_derivative);
                 for j in 0..p {
-                    ge[j] = x_e[j] * jac[j];
-                    gs[j] = x_s[j] * jac[j];
-                    gsd[j] = drow[j] * jac[j];
-                    he[j] = x_e[j] * curvature[j];
-                    hs[j] = x_s[j] * curvature[j];
-                    hsd[j] = drow[j] * curvature[j];
-                    te[j] = x_e[j] * third[j];
-                    ts[j] = x_s[j] * third[j];
-                    tsd[j] = drow[j] * third[j];
+                    ge[j] = row_exit[j] * jac[j];
+                    gs[j] = row_entry[j] * jac[j];
+                    gsd[j] = row_derivative[j] * jac[j];
+                    he[j] = row_exit[j] * curvature[j];
+                    hs[j] = row_entry[j] * curvature[j];
+                    hsd[j] = row_derivative[j] * curvature[j];
+                    te[j] = row_exit[j] * third[j];
+                    ts[j] = row_entry[j] * third[j];
+                    tsd[j] = row_derivative[j] * third[j];
                     deta_e += ge[j] * u_k[j];
                     if has_entry {
                         deta_s += gs[j] * u_k[j];
@@ -1916,15 +2230,19 @@ mod tests {
         let x_derivative = array![[0.0, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
         let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let eta_entry_offset = array![0.0];
+        let eta_exit_offset = array![0.0];
+        let derivative_offset_below_guard = array![2.0];
+        let derivative_offset_above_guard = array![3.1];
         let offsets_below_guard = SurvivalBaselineOffsets {
-            eta_entry: array![0.0].view(),
-            eta_exit: array![0.0].view(),
-            derivative_exit: array![2.0].view(),
+            eta_entry: eta_entry_offset.view(),
+            eta_exit: eta_exit_offset.view(),
+            derivative_exit: derivative_offset_below_guard.view(),
         };
         let offsets_above_guard = SurvivalBaselineOffsets {
-            eta_entry: array![0.0].view(),
-            eta_exit: array![0.0].view(),
-            derivative_exit: array![3.1].view(),
+            eta_entry: eta_entry_offset.view(),
+            eta_exit: eta_exit_offset.view(),
+            derivative_exit: derivative_offset_above_guard.view(),
         };
 
         let model_below_guard = WorkingModelSurvival::from_engine_inputswith_offsets(

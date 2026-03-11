@@ -1205,16 +1205,15 @@ where
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
-    // Clone inputs to own their storage and unify lifetimes inside this function
+    // Own the external arrays once; the conditioned design is shared through `reml_state`.
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = x.clone();
-    let x_fit_o = x_fit.clone();
+    let x_o = x;
     let offset_o = offset.to_owned();
     let s_list_shared = Arc::new(s_list);
-    let reml_state = RemlState::newwith_offset_shared(
+    let mut reml_state = RemlState::newwith_offset_shared(
         y_o.view(),
-        x_fit_o.clone(),
+        x_fit,
         w_o.view(),
         offset_o.view(),
         Arc::clone(&s_list_shared),
@@ -1352,18 +1351,6 @@ where
         let mut smoothing_options_mix = smoothing_options.clone();
         smoothing_options_mix.fdhessian_max_dim = 0;
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
-        let mut reml_eval = RemlState::newwith_offset_shared(
-            y_o.view(),
-            x_fit_o.clone(),
-            w_o.view(),
-            offset_o.view(),
-            Arc::clone(&s_list_shared),
-            p,
-            &cfg,
-            Some(active_nullspace_dims.clone()),
-            None,
-            fit_linear_constraints.clone(),
-        )?;
         let mut rho_buf = Array1::<f64>::zeros(k);
         let mut mix_rho_buf = if use_mixture {
             Some(Array1::<f64>::zeros(mixture_dim))
@@ -1450,12 +1437,12 @@ where
                             )
                         };
                     }
-                    reml_eval.set_link_states(
+                    let tcost = Instant::now();
+                    reml_state.set_link_states(
                         cfg_eval.link_kind.mixture_state().cloned(),
                         cfg_eval.link_kind.sas_state().copied(),
                     );
-                    let tcost = Instant::now();
-                    let mut cost = reml_eval.compute_cost(&rho_buf)?;
+                    let mut cost = reml_state.compute_cost(&rho_buf)?;
                     let sasridge = if use_sas && !use_beta_logistic {
                         sasridgeweight
                     } else {
@@ -1473,9 +1460,9 @@ where
 
                     let tgrad = Instant::now();
                     let mut grad = Array1::<f64>::zeros(theta_dim);
-                    let grad_rho = reml_eval.compute_gradient(&rho_buf)?;
+                    let grad_rho = reml_state.compute_gradient(&rho_buf)?;
                     grad.slice_mut(s![..k]).assign(&grad_rho);
-                    let (pirls_mix, h_posw) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
+                    let (pirls_mix, h_posw) = reml_state.pirls_result_and_hpos_for_rho(&rho_buf)?;
                     if cfg_eval.firth_bias_reduction {
                         return Err(EstimationError::InvalidInput(
                         "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
@@ -1703,7 +1690,7 @@ where
                     let mix_state = state_fromspec(&spec_eval).map_err(|e| {
                         EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                     })?;
-                    reml_eval.set_link_states(Some(mix_state), None);
+                    reml_state.set_link_states(Some(mix_state), None);
                 } else if use_sas {
                     let epsilon_eff = if use_beta_logistic {
                         aux[0]
@@ -1730,9 +1717,9 @@ where
                             EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
                         })?
                     };
-                    reml_eval.set_link_states(None, Some(sas_state));
+                    reml_state.set_link_states(None, Some(sas_state));
                 }
-                let mut cost = reml_eval.compute_cost(&final_rho)?;
+                let mut cost = reml_state.compute_cost(&final_rho)?;
                 if use_sas && !use_beta_logistic && sasridgeweight > 0.0 {
                     let log_delta = aux[1];
                     cost += 0.5 * sasridgeweight * log_delta * log_delta;
@@ -1812,7 +1799,7 @@ where
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
-            x: &x_fit_o,
+            x: reml_state.x(),
             offset: offset_o.view(),
             y: y_o.view(),
             priorweights: w_o.view(),

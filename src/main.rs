@@ -3629,7 +3629,9 @@ fn survival_timewiggle_is_present(model: &SavedModel) -> bool {
         || model.betatimewiggle.is_some()
 }
 
-fn saved_survival_timewiggle_spec(model: &SavedModel) -> Result<Option<LinkWiggleFormulaSpec>, String> {
+fn saved_survival_timewiggle_spec(
+    model: &SavedModel,
+) -> Result<Option<LinkWiggleFormulaSpec>, String> {
     match (
         model.timewiggle_knots.as_ref(),
         model.timewiggle_degree,
@@ -4040,12 +4042,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
-        if likelihood_mode == SurvivalLikelihoodMode::LocationScale && learn_linkwiggle {
-            return Err(
-                "combining timewiggle(...) and linkwiggle(...) in one survival fit is not implemented"
-                    .to_string(),
-            );
-        }
     }
     if !effective_args.ridge_lambda.is_finite() || effective_args.ridge_lambda < 0.0 {
         return Err("--ridge-lambda must be finite and >= 0".to_string());
@@ -4113,27 +4109,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
     }
-    let p_time = time_build.x_exit_time.ncols();
-    let p = p_time + p_cov;
-    let mut x_entry = Array2::<f64>::zeros((n, p));
-    let mut x_exit = Array2::<f64>::zeros((n, p));
-    let mut x_derivative = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        for j in 0..p_time {
-            x_entry[[i, j]] = time_build.x_entry_time[[i, j]];
-            x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
-            x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
-        }
-        for j in 0..p_cov {
-            let z = cov_design.design[[i, j]];
-            x_entry[[i, p_time + j]] = z;
-            x_exit[[i, p_time + j]] = z;
-        }
-    }
-    if let Some(wiggle) = timewiggle_build.as_ref() {
-        append_survival_timewiggle_columns(&mut x_entry, &mut x_exit, &mut x_derivative, wiggle);
-    }
-    let p = x_exit.ncols();
     let mut time_design_entry = time_build.x_entry_time.clone();
     let mut time_design_exit = time_build.x_exit_time.clone();
     let mut time_design_derivative_exit = time_build.x_derivative_time.clone();
@@ -4519,6 +4494,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
 
     let p_time_total = time_design_exit.ncols();
+    let p = p_time_total + p_cov;
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
     for s in &time_penalties {
         if s.nrows() == p_time_total && s.ncols() == p_time_total {
@@ -4550,19 +4526,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
 
-    let mut model = gam::families::royston_parmar::working_model_from_flattened(
+    let mut model = gam::families::royston_parmar::working_model_from_time_covariateshared(
         penalties,
         monotonicity,
         survivalspec,
-        gam::families::royston_parmar::RoystonParmarInputs {
+        gam::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
             age_entry: age_entry.view(),
             age_exit: age_exit.view(),
             event_target: event_target.view(),
             event_competing: event_competing.view(),
             weights: weights.view(),
-            x_entry: x_entry.view(),
-            x_exit: x_exit.view(),
-            x_derivative: x_derivative.view(),
+            time_entry: time_design_entry.view(),
+            time_exit: time_design_exit.view(),
+            time_derivative: time_design_derivative_exit.view(),
+            covariates: cov_design.design.view(),
             eta_offset_entry: Some(eta_offset_entry.view()),
             eta_offset_exit: Some(eta_offset_exit.view()),
             derivative_offset_exit: Some(derivative_offset_exit.view()),
@@ -9911,6 +9888,8 @@ mod tests {
             betawiggle: None,
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
@@ -9991,6 +9970,8 @@ mod tests {
             betawiggle,
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
@@ -10074,6 +10055,8 @@ mod tests {
             betawiggle: Some(betawiggle),
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
@@ -10853,6 +10836,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_survival_formula_allows_timewiggle_and_linkwiggle_together() {
+        let parsed = parse_formula(
+            "Surv(entry, exit, event) ~ x + timewiggle(degree=3, internal_knots=5) + linkwiggle(degree=4, internal_knots=6)",
+        )
+        .expect("formula should parse");
+        assert!(parsed.timewiggle.is_some());
+        assert!(parsed.linkwiggle.is_some());
+    }
+
+    #[test]
     fn parse_link_formula_config_extracts_link_and_inits() {
         let parsed = parse_formula(
             "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\", rho=\"0.3\", beta_logistic_init=\"0.0,0.0\")",
@@ -11277,6 +11270,8 @@ mod tests {
             betawiggle: None,
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: Some("start".to_string()),
             survival_exit: Some("stop".to_string()),
@@ -11351,6 +11346,8 @@ mod tests {
             betawiggle: None,
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: Some("entry".to_string()),
             survival_exit: Some("exit".to_string()),
@@ -12328,6 +12325,8 @@ mod tests {
             betawiggle: Some(betawiggle.clone()),
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
@@ -12527,6 +12526,8 @@ mod tests {
             betawiggle: None,
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
@@ -12596,6 +12597,8 @@ mod tests {
             betawiggle: None,
             timewiggle_knots: None,
             timewiggle_degree: None,
+            timewiggle_penalty_orders: None,
+            timewiggle_double_penalty: None,
             betatimewiggle: None,
             survival_entry: None,
             survival_exit: None,
