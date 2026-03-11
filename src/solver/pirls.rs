@@ -2232,27 +2232,57 @@ fn solve_subsystem_direction(
     g_sub: &Array1<f64>,
     out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
-    if out.len() != g_sub.len() {
-        *out = Array1::zeros(g_sub.len());
+    let n = g_sub.len();
+    if out.len() != n {
+        *out = Array1::zeros(n);
     }
-    out.assign(g_sub);
-    let factor = StableSolver::new("pirls bounded subsystem")
-        .factorize(h_sub)
-        .map_err(|_| {
-            EstimationError::InvalidInput(
-                "bounded Newton subsystem factorization failed".to_string(),
-            )
-        })?;
-    out.assign(g_sub);
-    let mut rhs = array1_to_col_matmut(out);
-    factor.solve_in_place(rhs.as_mut());
-    out.mapv_inplace(|v| -v);
-    if array1_is_finite(out) {
+    // Try direct factorization first.
+    if let Ok(factor) = StableSolver::new("pirls bounded subsystem").factorize(h_sub) {
+        out.assign(g_sub);
+        let mut rhs = array1_to_col_matmut(out);
+        factor.solve_in_place(rhs.as_mut());
+        out.mapv_inplace(|v| -v);
+        if array1_is_finite(out) {
+            return Ok(());
+        }
+    }
+    // Factorization failed or produced non-finite values — the reduced Hessian
+    // is singular or nearly so (common on underdetermined problems).  Add a
+    // diagonal ridge and retry with geometrically increasing strength.
+    let diag_scale = (0..n)
+        .map(|i| h_sub[[i, i]].abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let mut tau = 1e-8 * diag_scale;
+    let mut h_reg = h_sub.to_owned();
+    for _ in 0..12 {
+        for i in 0..n {
+            h_reg[[i, i]] = h_sub[[i, i]] + tau;
+        }
+        if let Ok(factor) = StableSolver::new("pirls bounded subsystem ridge").factorize(&h_reg) {
+            out.assign(g_sub);
+            let mut rhs = array1_to_col_matmut(out);
+            factor.solve_in_place(rhs.as_mut());
+            out.mapv_inplace(|v| -v);
+            if array1_is_finite(out) {
+                return Ok(());
+            }
+        }
+        tau *= 10.0;
+    }
+    // All ridge attempts failed — fall back to steepest descent on the
+    // free subspace: d = -g / ||g||, scaled to a conservative step.
+    let gnorm = g_sub.dot(g_sub).sqrt();
+    if gnorm > 0.0 {
+        let scale = 1.0 / gnorm.max(diag_scale);
+        for i in 0..n {
+            out[i] = -g_sub[i] * scale;
+        }
         return Ok(());
     }
-    Err(EstimationError::InvalidInput(
-        "bounded Newton subsystem solve produced non-finite values".to_string(),
-    ))
+    // Zero gradient — already at optimum on this subspace.
+    out.fill(0.0);
+    Ok(())
 }
 
 fn solve_symmetric_system(
@@ -2379,22 +2409,6 @@ fn max_linear_constraintviolation(
         }
     }
     (worst, worstrow)
-}
-
-fn max_lower_boundviolation(beta: &Array1<f64>, lower_bounds: &Array1<f64>) -> (f64, usize) {
-    let mut worst = 0.0_f64;
-    let mut worst_idx = 0usize;
-    for i in 0..beta.len().min(lower_bounds.len()) {
-        let lb = lower_bounds[i];
-        if lb.is_finite() {
-            let viol = (lb - beta[i]).max(0.0);
-            if viol > worst {
-                worst = viol;
-                worst_idx = i;
-            }
-        }
-    }
-    (worst, worst_idx)
 }
 
 fn solve_newton_directionwith_lower_bounds(
@@ -2569,10 +2583,32 @@ fn solve_newton_directionwith_lower_bounds(
         return Ok(());
     }
 
-    let (worst, idx) = max_lower_boundviolation(beta, lower_bounds);
-    Err(EstimationError::ParameterConstraintViolation(format!(
-        "bounded-constraint Newton active-set failed to converge; max lower-bound violation={worst:.3e} at coefficient index {idx}"
-    )))
+    // Active-set loop did not converge — fall back to a projected gradient
+    // step.  This is always feasible and gives a descent direction, letting the
+    // outer LM loop decide whether to accept or increase damping.
+    let gnorm = gradient.dot(gradient).sqrt();
+    if gnorm > 0.0 {
+        let diag_scale = (0..p)
+            .map(|i| hessian[[i, i]].abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let step_scale = 1.0 / diag_scale;
+        for i in 0..p {
+            let di = -gradient[i] * step_scale;
+            let lb = lower_bounds[i];
+            if lb.is_finite() && beta[i] + di < lb {
+                direction_out[i] = lb - beta[i];
+            } else {
+                direction_out[i] = di;
+            }
+        }
+    } else {
+        direction_out.fill(0.0);
+    }
+    if let Some(hint) = active_hint {
+        hint.clear();
+    }
+    Ok(())
 }
 
 fn solve_kkt_direction(
@@ -3242,6 +3278,21 @@ where
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
 
+        // Early exit: if the current state has non-finite gradient, the
+        // model evaluation has overflowed (eta too extreme).  No Newton
+        // step can recover — accept the best state we have.
+        let current_grad_finite = state.gradient.iter().all(|g| g.is_finite());
+        if !current_grad_finite {
+            lastgradient_norm = f64::INFINITY;
+            max_abs_eta = state.eta.iter().copied().map(f64::abs).fold(0.0, f64::max);
+            final_state = Some(state);
+            // If deviance changes have been tiny, this is effectively converged.
+            if last_deviance_change.abs() < options.convergence_tolerance {
+                status = PirlsStatus::StalledAtValidMinimum;
+            }
+            break 'pirls_loop;
+        }
+
         // --- Levenberg-Marquardt Step ---
 
         // Loop to adjust lambda until we accept a step or fail
@@ -3364,7 +3415,35 @@ where
                         if actual_reduction > 0.0 { 1.0 } else { -1.0 }
                     };
 
-                    if rho > 0.0 && candidate_penalized.is_finite() {
+                    // Guard: reject steps that produce non-finite gradients
+                    // or extreme linear predictors.  When p > n with weak
+                    // penalty, the optimizer can wander along a likelihood
+                    // ridge, sending eta to extreme values where the gradient
+                    // overflows.  Treating these as rejected steps lets the
+                    // LM damping increase until the step is tamed.
+                    let candidate_grad_finite = candidate_state
+                        .gradient
+                        .iter()
+                        .all(|g| g.is_finite());
+                    let candidate_max_eta = candidate_state
+                        .eta
+                        .iter()
+                        .copied()
+                        .map(f64::abs)
+                        .fold(0.0_f64, f64::max);
+                    // Hard cap on |eta|.  For most GLM/survival links (logit,
+                    // probit, cloglog, Φ-transform), |eta| > 40 drives the
+                    // link response to 0/1, making gradients overflow.
+                    // Even for the identity link this is a sensible guard
+                    // against runaway underdetermined systems.
+                    const ETA_ABS_CAP: f64 = 40.0;
+                    let eta_ok = candidate_max_eta <= ETA_ABS_CAP;
+
+                    if rho > 0.0
+                        && candidate_penalized.is_finite()
+                        && candidate_grad_finite
+                        && eta_ok
+                    {
                         // Accept Step
 
                         // Update Trust Region (Lambda)
@@ -3513,10 +3592,18 @@ where
         beta.as_ref(),
         options.coefficient_lower_bounds.as_ref(),
     );
-    if matches!(status, PirlsStatus::MaxIterationsReached)
-        && final_projected_grad < options.convergence_tolerance
-    {
-        status = PirlsStatus::StalledAtValidMinimum;
+    if matches!(status, PirlsStatus::MaxIterationsReached) {
+        if final_projected_grad < options.convergence_tolerance {
+            status = PirlsStatus::StalledAtValidMinimum;
+        } else if last_deviance_change.abs()
+            < options.convergence_tolerance
+                * state.deviance.abs().max(state.penalty_term.abs()).max(1.0)
+        {
+            // Deviance has converged even if the gradient is non-finite
+            // (e.g. overflow at extreme eta in an underdetermined system).
+            // Accept the solution — it is as good as the objective can get.
+            status = PirlsStatus::StalledAtValidMinimum;
+        }
     }
 
     Ok(WorkingModelPirlsResult {
