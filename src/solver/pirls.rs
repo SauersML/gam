@@ -3249,17 +3249,24 @@ where
         let mut loop_lambda = lambda;
         let mut attempts = 0;
 
+        // Clone the hessian once before the LM loop; adjust diagonal in-place.
+        let mut regularized = state.hessian.clone();
+        let mut applied_lambda = 0.0_f64;
+        // Cache for sparse regularized hessian (reuse for predicted reduction).
+        let mut cached_sparse_regularized: Option<SparseColMat<usize, f64>> = None;
+
         loop {
             attempts += 1;
 
             // 1. Solve (H + λI)δ = -g
-            // We clone the Hessian effectively implementing H_damped = H + λI
-            let mut regularized = state.hessian.clone();
+            // Update diagonal in-place: add (loop_lambda - applied_lambda) to diagonal
             if let crate::linalg::matrix::SymmetricMatrix::Dense(ref mut dense) = regularized {
+                let delta_lambda = loop_lambda - applied_lambda;
                 let dim = dense.nrows();
                 for i in 0..dim {
-                    dense[[i, i]] += loop_lambda;
+                    dense[[i, i]] += delta_lambda;
                 }
+                applied_lambda = loop_lambda;
             }
 
             let has_constraints =
@@ -3270,10 +3277,11 @@ where
                         "sparse-native PIRLS does not support constrained solves".to_string(),
                     ))
                 } else {
-                    let regularized = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
-                    let factor = factorize_sparse_spd(&regularized)?;
+                    let sparse_reg = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
+                    let factor = factorize_sparse_spd(&sparse_reg)?;
                     newton_direction.assign(&solve_sparse_spd(&factor, &state.gradient)?);
                     newton_direction.mapv_inplace(|g| -g);
+                    cached_sparse_regularized = Some(sparse_reg);
                     Ok(())
                 }
             } else if let Some(lin) = options.linear_constraints.as_ref() {
@@ -3326,9 +3334,8 @@ where
             // Actually, we should check against the model: m(0) - m(δ)
             // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
             // Reduction = -(g'δ + 0.5 δ'Hδ)
-            let q_term = if let Some(h_sparse) = state.sparsehessian.as_ref() {
-                let regularized = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
-                sparse_symmetric_upper_matvec_public(&regularized, direction)
+            let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
+                sparse_symmetric_upper_matvec_public(sparse_reg, direction)
             } else {
                 regularized.dot(direction)
             };
@@ -3399,11 +3406,6 @@ where
                             .map(f64::abs)
                             .fold(0.0, f64::max);
 
-                        // Preserve the structural ridge computed by the model.
-                        // LM damping is a transient solver detail and must not
-                        // redefine the objective's stabilization ridge.
-                        final_state = Some(candidate_state.clone());
-
                         // Check Convergence
                         // For bound-constrained problems, use the projected gradient
                         // (excludes KKT multiplier components at active bounds).
@@ -3412,6 +3414,11 @@ where
                             beta.as_ref(),
                             options.coefficient_lower_bounds.as_ref(),
                         );
+
+                        // Preserve the structural ridge computed by the model.
+                        // LM damping is a transient solver detail and must not
+                        // redefine the objective's stabilization ridge.
+                        final_state = Some(candidate_state);
                         let deviance_scale = current_penalized
                             .abs()
                             .max(candidate_penalized.abs())

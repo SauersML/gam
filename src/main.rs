@@ -9908,6 +9908,13 @@ mod tests {
             |_| {},
         )
         .expect("fit structural survival model");
+        eprintln!(
+            "[TEST-DEBUG] status={:?} iterations={} grad_norm={:.3e} deviance={:.6e}",
+            summary.status,
+            summary.iterations,
+            summary.lastgradient_norm,
+            summary.last_deviance
+        );
         assert!(matches!(
             summary.status,
             gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum
@@ -11660,11 +11667,12 @@ mod tests {
         )
         .expect("timewiggle build");
         let beta = Array1::<f64>::zeros(built.design_exit.ncols() + 1);
+        let p = beta.len();
         let fit_result = core_saved_fit_result(
             beta.clone(),
             Array1::zeros(built.penalties.len()),
             1.0,
-            None,
+            Some(Array2::<f64>::eye(p)),
             None,
             saved_fit_summary_stub(),
         );
