@@ -7536,7 +7536,9 @@ def main():
             )
             if rust_gamlss_row is not None:
                 results.append(rust_gamlss_row)
-                if ds["family"] == "binomial":
+                if ds["family"] == "binomial" and _is_contender_enabled(
+                    s_cfg, "rust_gamlss_flexible"
+                ):
                     results.append(
                         run_rust_gamlss_scenario_cv(
                             s_cfg,
