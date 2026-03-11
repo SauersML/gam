@@ -136,8 +136,34 @@ impl<'a> RemlState<'a> {
                 }
                 let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
                 let phi = 1.0;
+                let p_eff = sparse.factor.dimension();
+                let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+                for j in 0..p_eff {
+                    let mut e_j = Array1::<f64>::zeros(p_eff);
+                    e_j[j] = 1.0;
+                    let solved = solve_sparse_spd(&sparse.factor, &e_j)?;
+                    h_inv_diag[j] = solved[j];
+                }
+                let mut d_vec = pirls_result.solve_c_array.clone();
+                for val in &mut d_vec {
+                    if !val.is_finite() {
+                        *val = 0.0;
+                    }
+                }
+                let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
+                let tk_correction = -h_inv_diag
+                    .iter()
+                    .zip(third_deriv.iter())
+                    .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
+                    .sum::<f64>()
+                    / 6.0;
                 let laml = penalised_ll + 0.5 * sparse.logdet_s_pos - 0.5 * sparse.logdet_h
-                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
+                    + if tk_correction.is_finite() {
+                        tk_correction
+                    } else {
+                        0.0
+                    };
                 Ok(-laml + priorcost)
             }
         }
