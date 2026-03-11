@@ -1,5 +1,5 @@
 use crate::faer_ndarray::FaerArrayView;
-use faer::prelude::Solve;
+use faer::prelude::SolveLstsq;
 use ndarray::{Array1, Array2, ArrayView1};
 
 const COLUMN_TOL: f64 = 1e-12;
@@ -70,11 +70,12 @@ fn solveweighted_projection_dense(
     }
     let wx_faer = FaerArrayView::new(&wx);
     let qr = wx_faer.as_ref().col_piv_qr();
-    // solve_in_place needs an n-length rhs and writes the p-length solution
-    // into the first p entries.
+    // solve_lstsq_in_place solves the least-squares problem for the n×p
+    // overdetermined system; the p-length solution is written into the first
+    // p entries of the n-length rhs vector.
     let mut rhs = wy;
     let mut rhs_mat = crate::faer_ndarray::array1_to_col_matmut(&mut rhs);
-    qr.solve_in_place(rhs_mat.as_mut());
+    qr.solve_lstsq_in_place(rhs_mat.as_mut());
     Ok(rhs.slice(ndarray::s![..p]).to_owned())
 }
 
