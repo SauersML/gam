@@ -899,7 +899,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     joint.beta_base.clone(),
                     Array1::from_vec(joint.lambdas.clone()),
                     1.0,
-                    None,
+                    joint.beta_base_covariance.clone(),
                     None,
                     SavedFitSummary::from_joint_result(&joint)?,
                 );
