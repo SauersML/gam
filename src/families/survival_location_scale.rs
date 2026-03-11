@@ -2531,15 +2531,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q: dq_en,
             }
         } else {
-            let z = Array1::zeros(self.n);
+            // Time-invariant: entry and exit designs are identical, so
+            // delta_q_entry = delta_q_exit.  The h0 branch of the time block
+            // needs the entry-side delta_q to correctly compute D_d(u0).
             EntryDeltas {
-                delta_q: z.clone(),
-                delta_q_t: z.clone(),
-                delta_q_ls: z.clone(),
-                delta_q_tls: z.clone(),
-                delta_q_ls_ls: z.clone(),
-                d_d1_q: z.clone(),
-                d_d2_q: z,
+                delta_q: delta_q_exit.clone(),
+                delta_q_t: delta_q_t_exit.clone(),
+                delta_q_ls: delta_q_ls_exit.clone(),
+                delta_q_tls: delta_q_tls_exit.clone(),
+                delta_q_ls_ls: delta_q_ls_ls_exit.clone(),
+                d_d1_q: &q.d2_q0 * &delta_q_exit + &q.h_time_h0 * &delta_h0,
+                d_d2_q: &q.d3_q0 * &delta_q_exit - &q.d_h_h0 * &delta_h0,
             }
         };
 
