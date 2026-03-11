@@ -1622,7 +1622,7 @@ where
                         }
                     }
                     let grad_sec = tgrad.elapsed().as_secs_f64();
-                    log::info!(
+                    log::debug!(
                         "[outer-eval {eval_idx}] theta_dim={} aux_dim={} hessian=false time_sec(cost={:.3}, grad={:.3})",
                         theta_dim,
                         aux_dim,

@@ -2426,11 +2426,16 @@ fn run_predict_standard_or_flexible(
         }
         progress.advance_workflow(4);
         progress.set_stage("predict", "writing joint predictions");
+        let out_se = if args.uncertainty {
+            pred.effective_se.as_ref().map(|a| a.view())
+        } else {
+            None
+        };
         write_prediction_csv(
             &args.out,
             pred.eta.view(),
             pred.probabilities.view(),
-            pred.effective_se.as_ref().map(|a| a.view()),
+            out_se,
             mean_lo.as_ref().map(|a| a.view()),
             mean_hi.as_ref().map(|a| a.view()),
         )?;
@@ -4777,7 +4782,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let pirls_start = std::time::Instant::now();
     let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
         let elapsed = pirls_start.elapsed().as_secs_f64();
-        log::info!(
+        log::debug!(
             "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
             info.iteration,
             info.deviance,

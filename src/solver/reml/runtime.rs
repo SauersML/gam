@@ -156,7 +156,7 @@ impl<'a> RemlState<'a> {
                 if *repeat >= GAM_REPEAT_EMIT
                     && eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP
                 {
-                    log::info!("[GAM COST] {}", last.format_summary());
+                    log::debug!("[GAM COST] {}", last.format_summary());
                     *repeat = 0;
                     *last_emit = eval_idx;
                 }
@@ -166,14 +166,14 @@ impl<'a> RemlState<'a> {
             let emit_prev =
                 last.count > 1 && eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP;
             if emit_prev {
-                log::info!("[GAM COST] {}", last.format_summary());
+                log::debug!("[GAM COST] {}", last.format_summary());
                 *last_emit = eval_idx;
             }
         }
 
         let new_agg = CostAgg::new(key, laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
         if eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP {
-            log::info!("[GAM COST] {}", new_agg.format_summary());
+            log::debug!("[GAM COST] {}", new_agg.format_summary());
             *last_emit = eval_idx;
         }
         *last_opt = Some(new_agg);
