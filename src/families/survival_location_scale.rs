@@ -2804,7 +2804,7 @@ mod tests {
     #[test]
     fn identified_time_blockzeroes_anchorrow() {
         let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
-        let design_exit = array![[0.0, 1.0, 0.0], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
+        let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry,
@@ -2838,6 +2838,48 @@ mod tests {
         assert!(
             exit_max_abs > 1e-6,
             "test setup should keep exit anchor row distinct from zero to detect anchor mixups"
+        );
+    }
+
+    #[test]
+    fn identified_time_block_preserves_expected_nullspace_dimension() {
+        let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
+        let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
+        let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
+        let time_block = TimeBlockInput {
+            design_entry,
+            design_exit,
+            design_derivative_exit,
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::zeros(3),
+            penalties: vec![Array2::eye(3)],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+
+        let prepared = prepare_identified_time_block(&time_block, 0).expect("prepare time block");
+        let p = time_block.design_entry.ncols();
+
+        assert_eq!(
+            prepared.transform.z.nrows(),
+            p,
+            "identifiability transform must stay in the original coefficient space"
+        );
+        assert_eq!(
+            prepared.transform.z.ncols(),
+            p - 1,
+            "a single nonzero anchor row should remove exactly one time coefficient dimension"
+        );
+        assert_eq!(
+            prepared.design_entry.ncols(),
+            p - 1,
+            "prepared entry design should keep the p-1 nullspace basis columns"
+        );
+        assert_eq!(
+            prepared.design_exit.ncols(),
+            p - 1,
+            "prepared exit design should keep the p-1 nullspace basis columns"
         );
     }
 

@@ -2,6 +2,7 @@
 name = "gam"
 version = "0.1.12"
 edition = "2024"
+rust-version = "1.93"
 autobins = false
 default-run = "gam"
 description = "Generalized penalized likelihood engine"

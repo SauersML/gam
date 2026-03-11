@@ -1,4 +1,5 @@
 use super::*;
+use ndarray::ShapeBuilder;
 
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
@@ -11,6 +12,51 @@ impl<'a> RemlState<'a> {
             .and(diag.view())
             .for_each(|mut row, w| row *= *w);
         fast_atb(x, weighted)
+    }
+
+    #[inline]
+    fn dense_diag_gram_chunkrows(p: usize) -> usize {
+        const MIN_ROWS: usize = 512;
+        const MAX_ROWS: usize = 2048;
+        const TARGET_BYTES: usize = 2 * 1024 * 1024;
+        let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
+        (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
+    }
+
+    pub(crate) fn xt_diag_x_dense_chunked_into(
+        x: &Array2<f64>,
+        diag: &Array1<f64>,
+        weighted_chunk: &mut Array2<f64>,
+    ) -> Array2<f64> {
+        let (n, p) = x.dim();
+        debug_assert_eq!(diag.len(), n, "diag length must match row count");
+        if n == 0 || p == 0 {
+            return Array2::<f64>::zeros((p, p));
+        }
+
+        let chunkrows = Self::dense_diag_gram_chunkrows(p).min(n);
+        if weighted_chunk.nrows() != chunkrows || weighted_chunk.ncols() != p {
+            *weighted_chunk = Array2::zeros((chunkrows, p).f());
+        }
+
+        let mut out = Array2::<f64>::zeros((p, p));
+        for row_start in (0..n).step_by(chunkrows) {
+            let rows = (n - row_start).min(chunkrows);
+            {
+                let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+                for local_row in 0..rows {
+                    let src_row = row_start + local_row;
+                    let scale = diag[src_row];
+                    for col in 0..p {
+                        chunk[[local_row, col]] = x[[src_row, col]] * scale;
+                    }
+                }
+            }
+            let x_chunk = x.slice(s![row_start..row_start + rows, ..]);
+            let weighted_view = weighted_chunk.slice(s![0..rows, ..]);
+            out += &fast_atb(&x_chunk, &weighted_view);
+        }
+        out
     }
 
     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {

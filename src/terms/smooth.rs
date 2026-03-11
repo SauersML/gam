@@ -393,12 +393,14 @@ pub(crate) struct SpatialPsiDerivative {
     // These are derivatives with respect to psi = log(kappa), not log(length_scale).
     pub penalty_index: usize,
     pub penalty_indices: Vec<usize>,
-    pub x_psi: Array2<f64>,
-    pub s_psi: Array2<f64>,
-    pub s_psi_components: Vec<Array2<f64>>,
-    pub x_psi_psi: Array2<f64>,
-    pub s_psi_psi: Array2<f64>,
-    pub s_psi_psi_components: Vec<Array2<f64>>,
+    pub global_range: Range<usize>,
+    pub total_p: usize,
+    pub x_psi_local: Array2<f64>,
+    pub s_psi_local: Array2<f64>,
+    pub s_psi_components_local: Vec<Array2<f64>>,
+    pub x_psi_psi_local: Array2<f64>,
+    pub s_psi_psi_local: Array2<f64>,
+    pub s_psi_psi_components_local: Vec<Array2<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -5909,8 +5911,15 @@ struct TwoBlockHyperEval<FitOut: Clone> {
     fit: FitOut,
 }
 
+#[derive(Clone)]
+struct TwoBlockHyperScore {
+    theta: Array1<f64>,
+    cost: f64,
+}
+
 struct TwoBlockSpatialHyperState<FitOut: Clone> {
-    evals: Vec<TwoBlockHyperEval<FitOut>>,
+    evals: Vec<TwoBlockHyperScore>,
+    realized: Option<TwoBlockHyperEval<FitOut>>,
     max_evals: usize,
 }
 
@@ -5918,30 +5927,48 @@ impl<FitOut: Clone> TwoBlockSpatialHyperState<FitOut> {
     fn new(max_evals: usize) -> Self {
         Self {
             evals: Vec::new(),
+            realized: None,
             max_evals: max_evals.max(1),
         }
     }
 
-    fn get(&self, theta: &Array1<f64>) -> Option<TwoBlockHyperEval<FitOut>> {
+    fn get(&self, theta: &Array1<f64>) -> Option<f64> {
+        if let Some(realized) = self.realized.as_ref()
+            && approx_same_point(&realized.theta, theta)
+        {
+            return Some(realized.cost);
+        }
         self.evals
             .iter()
             .find(|entry| approx_same_point(&entry.theta, theta))
-            .cloned()
+            .map(|entry| entry.cost)
     }
 
-    fn remember(&mut self, eval: TwoBlockHyperEval<FitOut>) {
+    fn remember(&mut self, theta: Array1<f64>, cost: f64) {
         if let Some(idx) = self
             .evals
             .iter()
-            .position(|entry| approx_same_point(&entry.theta, &eval.theta))
+            .position(|entry| approx_same_point(&entry.theta, &theta))
         {
-            self.evals[idx] = eval;
+            self.evals[idx].cost = cost;
             return;
         }
-        self.evals.push(eval);
+        self.evals.push(TwoBlockHyperScore { theta, cost });
         if self.evals.len() > self.max_evals {
             self.evals.remove(0);
         }
+    }
+
+    fn remember_realized(&mut self, eval: TwoBlockHyperEval<FitOut>) {
+        self.remember(eval.theta.clone(), eval.cost);
+        self.realized = Some(eval);
+    }
+
+    fn realized(&self, theta: &Array1<f64>) -> Option<TwoBlockHyperEval<FitOut>> {
+        self.realized
+            .as_ref()
+            .filter(|entry| approx_same_point(&entry.theta, theta))
+            .cloned()
     }
 }
 
@@ -5954,8 +5981,15 @@ struct SpatialHyperEval<FitOut: Clone> {
     fit: FitOut,
 }
 
+#[derive(Clone)]
+struct SpatialHyperScore {
+    theta: Array1<f64>,
+    cost: f64,
+}
+
 struct SpatialHyperState<FitOut: Clone> {
-    evals: Vec<SpatialHyperEval<FitOut>>,
+    evals: Vec<SpatialHyperScore>,
+    realized: Option<SpatialHyperEval<FitOut>>,
     max_evals: usize,
 }
 
@@ -5963,33 +5997,51 @@ impl<FitOut: Clone> SpatialHyperState<FitOut> {
     fn new(max_evals: usize) -> Self {
         Self {
             evals: Vec::new(),
+            realized: None,
             max_evals: max_evals.max(1),
         }
     }
 
-    fn get(&self, theta: &Array1<f64>) -> Option<SpatialHyperEval<FitOut>> {
+    fn get(&self, theta: &Array1<f64>) -> Option<f64> {
+        if let Some(realized) = self.realized.as_ref()
+            && approx_same_point(&realized.theta, theta)
+        {
+            return Some(realized.cost);
+        }
         self.evals
             .iter()
             .find(|entry| approx_same_point(&entry.theta, theta))
-            .cloned()
+            .map(|entry| entry.cost)
     }
 
-    fn remember(&mut self, eval: SpatialHyperEval<FitOut>) {
+    fn remember(&mut self, theta: Array1<f64>, cost: f64) {
         if let Some(idx) = self
             .evals
             .iter()
-            .position(|entry| approx_same_point(&entry.theta, &eval.theta))
+            .position(|entry| approx_same_point(&entry.theta, &theta))
         {
-            self.evals[idx] = eval;
+            self.evals[idx].cost = cost;
             return;
         }
-        self.evals.push(eval);
+        self.evals.push(SpatialHyperScore { theta, cost });
         if self.evals.len() > self.max_evals {
             self.evals.remove(0);
         }
     }
 
-    fn best(&self) -> Option<SpatialHyperEval<FitOut>> {
+    fn remember_realized(&mut self, eval: SpatialHyperEval<FitOut>) {
+        self.remember(eval.theta.clone(), eval.cost);
+        self.realized = Some(eval);
+    }
+
+    fn realized(&self, theta: &Array1<f64>) -> Option<SpatialHyperEval<FitOut>> {
+        self.realized
+            .as_ref()
+            .filter(|entry| approx_same_point(&entry.theta, theta))
+            .cloned()
+    }
+
+    fn best_score(&self) -> Option<SpatialHyperScore> {
         self.evals
             .iter()
             .filter(|entry| entry.cost.is_finite())
@@ -6082,38 +6134,48 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
     design: &TermCollectionDesign,
     term_idx: usize,
 ) -> Result<Option<SpatialPsiDerivative>, EstimationError> {
-    let Some((x_psi, s_psi, x_psi_psi, s_psi_psi, s_psi_components, s_psi_psi_components)) =
-        try_build_spatial_term_log_kappa_derivative(data, resolvedspec, design, term_idx)?
+    let Some((
+        global_range,
+        total_p,
+        x_psi_local,
+        s_psi_local,
+        x_psi_psi_local,
+        s_psi_psi_local,
+        s_psi_components_local,
+        s_psi_psi_components_local,
+    )) = try_build_spatial_term_log_kappa_derivative(data, resolvedspec, design, term_idx)?
     else {
         return Ok(None);
     };
     let Some(penalty_start) = smooth_term_penalty_index(resolvedspec, design, term_idx) else {
         return Ok(None);
     };
-    if s_psi_components.is_empty() || s_psi_psi_components.is_empty() {
+    if s_psi_components_local.is_empty() || s_psi_psi_components_local.is_empty() {
         return Ok(None);
     }
-    if s_psi_components.len() != s_psi_psi_components.len() {
+    if s_psi_components_local.len() != s_psi_psi_components_local.len() {
         return Ok(None);
     }
-    let penalty_indices = (0..s_psi_components.len())
+    let penalty_indices = (0..s_psi_components_local.len())
         .map(|j| penalty_start + j)
         .collect::<Vec<_>>();
     let penalty_index = penalty_indices[0];
-    let s_psi0 = s_psi;
-    let s_psi_psi0 = s_psi_psi;
+    let s_psi0 = s_psi_local;
+    let s_psi_psi0 = s_psi_psi_local;
     if s_psi0.nrows() == 0 || s_psi_psi0.nrows() == 0 {
         return Ok(None);
     }
     Ok(Some(SpatialPsiDerivative {
         penalty_index,
         penalty_indices,
-        x_psi,
-        s_psi: s_psi0,
-        s_psi_components,
-        x_psi_psi,
-        s_psi_psi: s_psi_psi0,
-        s_psi_psi_components,
+        global_range,
+        total_p,
+        x_psi_local,
+        s_psi_local: s_psi0,
+        s_psi_components_local,
+        x_psi_psi_local,
+        s_psi_psi_local: s_psi_psi0,
+        s_psi_psi_components_local,
     }))
 }
 
@@ -6142,6 +6204,8 @@ fn try_build_spatial_term_log_kappa_derivative(
     term_idx: usize,
 ) -> Result<
     Option<(
+        Range<usize>,
+        usize,
         Array2<f64>,
         Array2<f64>,
         Array2<f64>,
@@ -6218,46 +6282,43 @@ fn try_build_spatial_term_log_kappa_derivative(
     let global_range = (smooth_start + smooth_term.coeff_range.start)
         ..(smooth_start + smooth_term.coeff_range.end);
 
-    let mut x_psi = Array2::<f64>::zeros((design.design.nrows(), p_total));
-    x_psi
-        .slice_mut(s![.., global_range.clone()])
-        .assign(&local_x_psi);
-    let mut x_psi_psi = Array2::<f64>::zeros((design.design.nrows(), p_total));
-    x_psi_psi
-        .slice_mut(s![.., global_range.clone()])
-        .assign(&local_x_psi_psi);
-
-    let mut s_psi_components = Vec::<Array2<f64>>::with_capacity(local_s_psi.len());
-    let mut s_psi_psi_components = Vec::<Array2<f64>>::with_capacity(local_s_psi_psi.len());
-    for s_loc in &local_s_psi {
-        let mut s_glob = Array2::<f64>::zeros((p_total, p_total));
-        s_glob
-            .slice_mut(s![global_range.clone(), global_range.clone()])
-            .assign(s_loc);
-        s_psi_components.push(s_glob);
-    }
-    for s2_loc in &local_s_psi_psi {
-        let mut s2_glob = Array2::<f64>::zeros((p_total, p_total));
-        s2_glob
-            .slice_mut(s![global_range.clone(), global_range.clone()])
-            .assign(s2_loc);
-        s_psi_psi_components.push(s2_glob);
-    }
-    let s_psi = s_psi_components
-        .iter()
-        .fold(Array2::<f64>::zeros((p_total, p_total)), |acc, m| acc + m);
-    let s_psi_psi = s_psi_psi_components
-        .iter()
-        .fold(Array2::<f64>::zeros((p_total, p_total)), |acc, m| acc + m);
-
     Ok(Some((
-        x_psi,
-        s_psi,
-        x_psi_psi,
-        s_psi_psi,
-        s_psi_components,
-        s_psi_psi_components,
+        global_range,
+        p_total,
+        local_x_psi,
+        local_s_psi.iter().fold(
+            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
+            |acc, m| acc + m,
+        ),
+        local_x_psi_psi,
+        local_s_psi_psi.iter().fold(
+            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
+            |acc, m| acc + m,
+        ),
+        local_s_psi,
+        local_s_psi_psi,
     )))
+}
+
+fn embed_local_column_block(
+    local: &Array2<f64>,
+    global_range: &Range<usize>,
+    total_p: usize,
+) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((local.nrows(), total_p));
+    out.slice_mut(s![.., global_range.clone()]).assign(local);
+    out
+}
+
+fn embed_local_square_block(
+    local: &Array2<f64>,
+    global_range: &Range<usize>,
+    total_p: usize,
+) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((total_p, total_p));
+    out.slice_mut(s![global_range.clone(), global_range.clone()])
+        .assign(local);
+    out
 }
 
 fn try_build_spatial_log_kappa_hyper_dirs(
@@ -6287,23 +6348,35 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     let log_kappa_dim = info_list.len();
     for (i, info) in info_list.into_iter().enumerate() {
         let mut xsecond = vec![None; log_kappa_dim];
-        xsecond[i] = Some(info.x_psi_psi);
+        xsecond[i] = Some(embed_local_column_block(
+            &info.x_psi_psi_local,
+            &info.global_range,
+            info.total_p,
+        ));
         let s_components = info
             .penalty_indices
             .iter()
             .copied()
-            .zip(info.s_psi_components.iter().cloned())
+            .zip(
+                info.s_psi_components_local
+                    .iter()
+                    .map(|local| embed_local_square_block(local, &info.global_range, info.total_p)),
+            )
             .collect::<Vec<_>>();
         let s2_components = info
             .penalty_indices
             .iter()
             .copied()
-            .zip(info.s_psi_psi_components.iter().cloned())
+            .zip(
+                info.s_psi_psi_components_local
+                    .iter()
+                    .map(|local| embed_local_square_block(local, &info.global_range, info.total_p)),
+            )
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
         hyper_dirs.push(DirectionalHyperParam::new(
-            info.x_psi,
+            embed_local_column_block(&info.x_psi_local, &info.global_range, info.total_p),
             s_components,
             Some(xsecond),
             Some(ssecond_components),
@@ -6572,8 +6645,9 @@ where
             .ln();
     }
 
-    let mut hyper_state = SpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
-    hyper_state.remember(SpatialHyperEval {
+    let mut hyper_state =
+        SpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
+    hyper_state.remember_realized(SpatialHyperEval {
         theta: theta0.clone(),
         cost: if baseline_score.is_finite() {
             baseline_score
@@ -6585,32 +6659,53 @@ where
         fit: baseline_fit.clone(),
     });
 
-    let mut evalvalue = |hyper_state: &mut SpatialHyperState<FitOut>,
-                         theta: &Array1<f64>|
-     -> Result<
-        (f64, TermCollectionSpec, TermCollectionDesign, FitOut),
-        EstimationError,
-    > {
-        if let Some(cached) = hyper_state.get(theta) {
-            return Ok((cached.cost, cached.spec, cached.design, cached.fit));
-        }
-        let candspec = apply_spatial_log_length_scales(resolvedspec, spatial_terms, theta)?;
-        let (cand_design, cand_fit) = fit_fn(&candspec)?;
-        let cand_score = score_fn(&cand_fit);
-        let eval = SpatialHyperEval {
-            theta: theta.clone(),
-            cost: if cand_score.is_finite() {
+    let mut evalcost =
+        |hyper_state: &mut SpatialHyperState<FitOut>, theta: &Array1<f64>| -> Result<f64, EstimationError> {
+            if let Some(cached_cost) = hyper_state.get(theta) {
+                return Ok(cached_cost);
+            }
+            let candspec = apply_spatial_log_length_scales(resolvedspec, spatial_terms, theta)?;
+            let (cand_design, cand_fit) = fit_fn(&candspec)?;
+            let cand_score = score_fn(&cand_fit);
+            let cost = if cand_score.is_finite() {
                 cand_score
             } else {
                 f64::INFINITY
-            },
-            spec: candspec,
-            design: cand_design,
-            fit: cand_fit,
+            };
+            hyper_state.remember_realized(SpatialHyperEval {
+                theta: theta.clone(),
+                cost,
+                spec: candspec,
+                design: cand_design,
+                fit: cand_fit,
+            });
+            Ok(cost)
         };
-        hyper_state.remember(eval.clone());
-        Ok((eval.cost, eval.spec, eval.design, eval.fit))
-    };
+
+    let mut realize_eval =
+        |hyper_state: &mut SpatialHyperState<FitOut>,
+         theta: &Array1<f64>|
+         -> Result<SpatialHyperEval<FitOut>, EstimationError> {
+            if let Some(realized) = hyper_state.realized(theta) {
+                return Ok(realized);
+            }
+            let candspec = apply_spatial_log_length_scales(resolvedspec, spatial_terms, theta)?;
+            let (cand_design, cand_fit) = fit_fn(&candspec)?;
+            let cand_score = score_fn(&cand_fit);
+            let eval = SpatialHyperEval {
+                theta: theta.clone(),
+                cost: if cand_score.is_finite() {
+                    cand_score
+                } else {
+                    f64::INFINITY
+                },
+                spec: candspec,
+                design: cand_design,
+                fit: cand_fit,
+            };
+            hyper_state.remember_realized(eval.clone());
+            Ok(eval)
+        };
 
     let mut current_theta = theta0.clone();
     let mut current_cost = if baseline_score.is_finite() {
@@ -6618,11 +6713,9 @@ where
     } else {
         f64::INFINITY
     };
-    let mut best_eval = hyper_state.best().ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "single-block spatial optimization produced no finite evaluations".to_string(),
-        )
-    })?;
+    let mut best_eval = hyper_state
+        .realized(&theta0)
+        .expect("baseline spatial evaluation must be realized");
 
     for _ in 0..kappa_options.max_outer_iter {
         let mut pass_improved = false;
@@ -6637,12 +6730,12 @@ where
             let leftcost = if approx_same_point(&left_probe, &current_theta) {
                 f64::INFINITY
             } else {
-                evalvalue(&mut hyper_state, &left_probe)?.0
+                evalcost(&mut hyper_state, &left_probe)?
             };
             let rightcost = if approx_same_point(&right_probe, &current_theta) {
                 f64::INFINITY
             } else {
-                evalvalue(&mut hyper_state, &right_probe)?.0
+                evalcost(&mut hyper_state, &right_probe)?
             };
 
             if leftcost.is_finite() && rightcost.is_finite() {
@@ -6654,17 +6747,12 @@ where
                         && interiorvalue < leftvalue.max(rightvalue) - 1e-12
                     {
                         let interior_theta = coordinate_probe(&current_theta, coord, interiorvalue);
-                        let interiorcost = evalvalue(&mut hyper_state, &interior_theta)?.0;
+                        let interiorcost = evalcost(&mut hyper_state, &interior_theta)?;
                         if spatial_score_improves(interiorcost, current_cost, kappa_options.rel_tol)
                         {
                             current_theta = interior_theta;
                             current_cost = interiorcost;
-                            best_eval = hyper_state.best().ok_or_else(|| {
-                                EstimationError::RemlOptimizationFailed(
-                                    "single-block spatial optimization produced no finite evaluations"
-                                        .to_string(),
-                                )
-                            })?;
+                            best_eval = realize_eval(&mut hyper_state, &current_theta)?;
                             pass_improved = true;
                             continue;
                         }
@@ -6693,7 +6781,7 @@ where
                 if approx_same_point(&next_theta, &candidate_theta) {
                     break;
                 }
-                let nextcost = evalvalue(&mut hyper_state, &next_theta)?.0;
+                let nextcost = evalcost(&mut hyper_state, &next_theta)?;
                 if !spatial_score_improves(nextcost, candidatecost, kappa_options.rel_tol) {
                     break;
                 }
@@ -6704,12 +6792,7 @@ where
             if spatial_score_improves(candidatecost, current_cost, kappa_options.rel_tol) {
                 current_theta = candidate_theta;
                 current_cost = candidatecost;
-                best_eval = hyper_state.best().ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(
-                        "single-block spatial optimization produced no finite evaluations"
-                            .to_string(),
-                    )
-                })?;
+                best_eval = realize_eval(&mut hyper_state, &current_theta)?;
                 pass_improved = true;
             }
         }
@@ -6936,26 +7019,23 @@ where
         let mut hyper_state =
             TwoBlockSpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
 
-        let mut evalvalue = |theta: &Array1<f64>| -> Result<
-            (
-                f64,
-                TermCollectionSpec,
-                TermCollectionSpec,
-                TermCollectionDesign,
-                TermCollectionDesign,
-                FitOut,
-            ),
-            EstimationError,
-        > {
-            if let Some(cached) = hyper_state.get(theta) {
-                return Ok((
-                    cached.cost,
-                    cached.meanspec,
-                    cached.noisespec,
-                    cached.mean_design,
-                    cached.noise_design,
-                    cached.fit,
-                ));
+        hyper_state.remember_realized(TwoBlockHyperEval {
+            theta: theta0.clone(),
+            cost: if initial_score.is_finite() {
+                initial_score
+            } else {
+                f64::INFINITY
+            },
+            meanspec: best_meanspec.clone(),
+            noisespec: best_noisespec.clone(),
+            mean_design: bestmean_design.clone(),
+            noise_design: bestnoise_design.clone(),
+            fit: best_fit.clone(),
+        });
+
+        let mut evalcost = |theta: &Array1<f64>| -> Result<f64, EstimationError> {
+            if let Some(cached_cost) = hyper_state.get(theta) {
+                return Ok(cached_cost);
             }
             let mean_theta = theta.slice(s![0..mean_terms.len()]).to_owned();
             let noise_theta = theta.slice(s![mean_terms.len()..]).to_owned();
@@ -6981,16 +7061,44 @@ where
                 noise_design: candnoise_design,
                 fit: cand_fit,
             };
-            hyper_state.remember(eval.clone());
-            Ok((
-                eval.cost,
-                eval.meanspec,
-                eval.noisespec,
-                eval.mean_design,
-                eval.noise_design,
-                eval.fit,
-            ))
+            let cost = eval.cost;
+            hyper_state.remember_realized(eval);
+            Ok(cost)
         };
+
+        let mut realize_eval =
+            |theta: &Array1<f64>| -> Result<TwoBlockHyperEval<FitOut>, EstimationError> {
+                if let Some(realized) = hyper_state.realized(theta) {
+                    return Ok(realized);
+                }
+                let mean_theta = theta.slice(s![0..mean_terms.len()]).to_owned();
+                let noise_theta = theta.slice(s![mean_terms.len()..]).to_owned();
+                let cand_meanspec =
+                    apply_spatial_log_length_scales(&best_meanspec, &mean_terms, &mean_theta)?;
+                let cand_noisespec =
+                    apply_spatial_log_length_scales(&best_noisespec, &noise_terms, &noise_theta)?;
+                let (candmean_design, candnoise_design) =
+                    build_pair(&cand_meanspec, &cand_noisespec)
+                        .map_err(EstimationError::InvalidInput)?;
+                let cand_fit = fit_fn(&candmean_design, &candnoise_design)
+                    .map_err(EstimationError::InvalidInput)?;
+                let cand_score = score_fn(&cand_fit);
+                let eval = TwoBlockHyperEval {
+                    theta: theta.clone(),
+                    cost: if cand_score.is_finite() {
+                        cand_score
+                    } else {
+                        f64::INFINITY
+                    },
+                    meanspec: cand_meanspec,
+                    noisespec: cand_noisespec,
+                    mean_design: candmean_design,
+                    noise_design: candnoise_design,
+                    fit: cand_fit,
+                };
+                hyper_state.remember_realized(eval.clone());
+                Ok(eval)
+            };
 
         let mut current_theta = theta0.clone();
         let mut current_cost = if initial_score.is_finite() {
@@ -6998,15 +7106,9 @@ where
         } else {
             f64::INFINITY
         };
-        let mut best_eval = TwoBlockHyperEval {
-            theta: theta0.clone(),
-            cost: current_cost,
-            meanspec: best_meanspec.clone(),
-            noisespec: best_noisespec.clone(),
-            mean_design: bestmean_design.clone(),
-            noise_design: bestnoise_design.clone(),
-            fit: best_fit.clone(),
-        };
+        let mut best_eval = hyper_state
+            .realized(&theta0)
+            .expect("baseline two-block spatial evaluation must be realized");
 
         for _ in 0..kappa_options.max_outer_iter {
             let mut pass_improved = false;
@@ -7021,12 +7123,12 @@ where
                 let leftcost = if approx_same_point(&left_probe, &current_theta) {
                     f64::INFINITY
                 } else {
-                    evalvalue(&left_probe).map_err(|e| e.to_string())?.0
+                    evalcost(&left_probe).map_err(|e| e.to_string())?
                 };
                 let rightcost = if approx_same_point(&right_probe, &current_theta) {
                     f64::INFINITY
                 } else {
-                    evalvalue(&right_probe).map_err(|e| e.to_string())?.0
+                    evalcost(&right_probe).map_err(|e| e.to_string())?
                 };
 
                 if leftcost.is_finite() && rightcost.is_finite() {
@@ -7040,7 +7142,7 @@ where
                             let interior_theta =
                                 coordinate_probe(&current_theta, coord, interiorvalue);
                             let interiorcost =
-                                evalvalue(&interior_theta).map_err(|e| e.to_string())?.0;
+                                evalcost(&interior_theta).map_err(|e| e.to_string())?;
                             if spatial_score_improves(
                                 interiorcost,
                                 current_cost,
@@ -7048,23 +7150,8 @@ where
                             ) {
                                 current_theta = interior_theta;
                                 current_cost = interiorcost;
-                                let (
-                                    cost,
-                                    meanspec_c,
-                                    noisespec_c,
-                                    mean_design_c,
-                                    noise_design_c,
-                                    fit_c,
-                                ) = evalvalue(&current_theta).map_err(|e| e.to_string())?;
-                                best_eval = TwoBlockHyperEval {
-                                    theta: current_theta.clone(),
-                                    cost,
-                                    meanspec: meanspec_c,
-                                    noisespec: noisespec_c,
-                                    mean_design: mean_design_c,
-                                    noise_design: noise_design_c,
-                                    fit: fit_c,
-                                };
+                                best_eval =
+                                    realize_eval(&current_theta).map_err(|e| e.to_string())?;
                                 pass_improved = true;
                                 continue;
                             }
@@ -7093,7 +7180,7 @@ where
                     if approx_same_point(&next_theta, &candidate_theta) {
                         break;
                     }
-                    let nextcost = evalvalue(&next_theta).map_err(|e| e.to_string())?.0;
+                    let nextcost = evalcost(&next_theta).map_err(|e| e.to_string())?;
                     if !spatial_score_improves(nextcost, candidatecost, kappa_options.rel_tol) {
                         break;
                     }
@@ -7104,17 +7191,7 @@ where
                 if spatial_score_improves(candidatecost, current_cost, kappa_options.rel_tol) {
                     current_theta = candidate_theta;
                     current_cost = candidatecost;
-                    let (cost, meanspec_c, noisespec_c, mean_design_c, noise_design_c, fit_c) =
-                        evalvalue(&current_theta).map_err(|e| e.to_string())?;
-                    best_eval = TwoBlockHyperEval {
-                        theta: current_theta.clone(),
-                        cost,
-                        meanspec: meanspec_c,
-                        noisespec: noisespec_c,
-                        mean_design: mean_design_c,
-                        noise_design: noise_design_c,
-                        fit: fit_c,
-                    };
+                    best_eval = realize_eval(&current_theta).map_err(|e| e.to_string())?;
                     pass_improved = true;
                 }
             }

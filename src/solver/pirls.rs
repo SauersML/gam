@@ -40,6 +40,8 @@ use faer::{Auto, MatRef, Spec};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // Local alias used by internal tests/helpers.
 #[cfg(test)]
@@ -144,9 +146,41 @@ impl SparsePirlsDecision {
             PirlsLinearSolvePath::DenseTransformed => "dense_transformed",
             PirlsLinearSolvePath::SparseNative => "sparse_native",
         };
-        log::info!(
-            "[pirls-path] path={} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
-            path,
+        let repetition_count = pirls_decision_repetition_count(self.log_key(path));
+        if repetition_count == 1 {
+            log::info!(
+                "[pirls-path] path={} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
+                path,
+                self.reason,
+                self.p,
+                self.nnz_x,
+                self.nnz_xtwx_symbolic
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "na".to_string()),
+                self.nnz_s_lambda,
+                self.nnz_h_est
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "na".to_string()),
+                self.density_h_est
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| "na".to_string()),
+            );
+            return;
+        }
+
+        if should_log_pirls_decision_summary(repetition_count) {
+            log::info!(
+                "[pirls-path] repeated path={} reason={} count={} (suppressing identical decisions)",
+                path,
+                self.reason,
+                repetition_count,
+            );
+        }
+    }
+
+    fn log_key(&self, path: &'static str) -> String {
+        format!(
+            "path={path} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
             self.reason,
             self.p,
             self.nnz_x,
@@ -160,8 +194,21 @@ impl SparsePirlsDecision {
             self.density_h_est
                 .map(|v| format!("{v:.4}"))
                 .unwrap_or_else(|| "na".to_string()),
-        );
+        )
     }
+}
+
+fn pirls_decision_repetition_count(log_key: String) -> usize {
+    static PIRLS_DECISION_LOG_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let counts = PIRLS_DECISION_LOG_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut counts = counts.lock().expect("pirls decision log counter poisoned");
+    let count = counts.entry(log_key).or_insert(0);
+    *count += 1;
+    *count
+}
+
+fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
+    repetition_count.is_power_of_two()
 }
 
 const SPARSE_NATIVE_MIN_P: usize = 256;
@@ -725,9 +772,9 @@ impl WorkingState {
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
-    // Common IRLS buffers (n, p sizes)
+    // Common IRLS buffers. Only O(n) state is kept persistently; any
+    // design-weighted n x p scratch must be streamed through bounded chunks.
     pub sqrtw: Array1<f64>,
-    pub wx: Array2<f64>,
     pub wz: Array1<f64>,
     pub eta_buf: Array1<f64>,
     // Stage 2/4 assembly (use max needed sizes)
@@ -769,7 +816,6 @@ impl PirlsWorkspace {
 
         PirlsWorkspace {
             sqrtw: Array1::zeros(n),
-            wx: Array2::zeros((n, p).f()),
             wz: Array1::zeros(n),
             eta_buf: Array1::zeros(n),
             scaled_matrix: Array2::zeros((0, 0).f()),
@@ -5827,6 +5873,16 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
+    }
+
+    #[test]
+    fn pirls_decision_summary_logs_on_power_of_two_repetitions() {
+        assert!(!should_log_pirls_decision_summary(1));
+        assert!(should_log_pirls_decision_summary(2));
+        assert!(!should_log_pirls_decision_summary(3));
+        assert!(should_log_pirls_decision_summary(4));
+        assert!(!should_log_pirls_decision_summary(6));
+        assert!(should_log_pirls_decision_summary(8));
     }
 
     #[test]

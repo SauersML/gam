@@ -95,12 +95,13 @@ A bare column name on the RHS is interpreted by column type:
 - Formula-level configs:
   - `link(type=..., rho=..., sas_init=..., beta_logistic_init=...)`
   - `linkwiggle(degree=..., internal_knots=..., penalty_order=..., double_penalty=...)`
+  - `timewiggle(degree=..., internal_knots=..., penalty_order=..., double_penalty=...)`
   - `survmodel(spec=..., distribution=...)`
 
 Constraints:
 
 - Intercept removal (`0`, `-1`) is not supported.
-- At most one `link(...)`, one `linkwiggle(...)`, and one `survmodel(...)` per formula.
+- At most one `link(...)`, one `linkwiggle(...)`, one `timewiggle(...)`, and one `survmodel(...)` per formula.
 
 ### Smooth basis behavior
 
@@ -197,6 +198,8 @@ Survival-specific behavior:
 - `survmodel(distribution=...)` supports `gaussian|gumbel|logistic` (aliases: `probit|cloglog|logit`).
 - `--time-basis` for survival currently supports `ispline` in structural mode.
 - Weibull likelihood mode uses built-in parametric baseline handling and rejects extra baseline-target parameterization flags.
+- `timewiggle(...)` is a baseline-target deformation for survival models.
+  Current support: transformation survival with `--baseline-target weibull|gompertz|gompertz-makeham`, and Weibull survival when you supply explicit `--baseline-scale` and `--baseline-shape`.
 
 ### Fit-time constraints and incompatibilities
 

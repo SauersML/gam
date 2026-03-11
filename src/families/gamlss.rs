@@ -555,34 +555,34 @@ fn build_block_spatial_psi_derivatives(
             .into_iter()
             .enumerate()
             .map(|(psi_idx, info)| {
-                let x_shape = info.x_psi.raw_dim();
-                let s_shape = info.s_psi.raw_dim();
+                let x_shape = info.x_psi_local.raw_dim();
+                let s_shape = info.s_psi_local.raw_dim();
                 let penalty_indices = info.penalty_indices.clone();
                 CustomFamilyBlockPsiDerivative {
                     penalty_index: Some(info.penalty_index),
-                    x_psi: info.x_psi,
-                    s_psi: info.s_psi,
+                    x_psi: info.x_psi_local,
+                    s_psi: info.s_psi_local,
                     s_psi_components: Some(
                         info.penalty_indices
                             .into_iter()
-                            .zip(info.s_psi_components)
+                            .zip(info.s_psi_components_local)
                             .collect(),
                     ),
                     x_psi_psi: Some({
                         let mut rows = vec![Array2::<f64>::zeros(x_shape); psi_dim];
-                        rows[psi_idx] = info.x_psi_psi;
+                        rows[psi_idx] = info.x_psi_psi_local;
                         rows
                     }),
                     s_psi_psi: Some({
                         let mut rows = vec![Array2::<f64>::zeros(s_shape); psi_dim];
-                        rows[psi_idx] = info.s_psi_psi;
+                        rows[psi_idx] = info.s_psi_psi_local;
                         rows
                     }),
                     s_psi_psi_components: Some({
                         let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
                         rows[psi_idx] = penalty_indices
                             .into_iter()
-                            .zip(info.s_psi_psi_components)
+                            .zip(info.s_psi_psi_components_local)
                             .collect();
                         rows
                     }),
