@@ -199,7 +199,8 @@ Survival-specific behavior:
 - `--time-basis` for survival currently supports `ispline` in structural mode.
 - Weibull likelihood mode uses built-in parametric baseline handling and rejects extra baseline-target parameterization flags.
 - `timewiggle(...)` is a baseline-target deformation for survival models.
-  Current support: transformation survival with `--baseline-target weibull|gompertz|gompertz-makeham`, and Weibull survival when you supply explicit `--baseline-scale` and `--baseline-shape`.
+  Current support: transformation or location-scale survival with `--baseline-target weibull|gompertz|gompertz-makeham`, and Weibull survival when you supply explicit `--baseline-scale` and `--baseline-shape`.
+  In survival `location-scale`, `timewiggle(...)` may be combined with `linkwiggle(...)`; the two features act on different parts of the model.
 
 ### Fit-time constraints and incompatibilities
 
