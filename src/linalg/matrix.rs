@@ -1,7 +1,9 @@
-use crate::faer_ndarray::fast_xt_diag_x;
+use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_xt_diag_x};
 use crate::types::RidgePolicy;
+use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use ndarray::{Array1, Array2, ArrayView2};
+use faer::Accum;
+use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder, s};
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::ops::Range;
@@ -937,22 +939,7 @@ impl LinearOperator for DesignMatrix {
         let mut xtwx = Array2::<f64>::zeros((p, p));
         match self {
             Self::Dense(x) => {
-                for i in 0..x.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    for a in 0..p {
-                        let xa = x[[i, a]];
-                        for b in a..p {
-                            let v = wi * xa * x[[i, b]];
-                            xtwx[[a, b]] += v;
-                            if a != b {
-                                xtwx[[b, a]] += v;
-                            }
-                        }
-                    }
-                }
+                streaming_blas_xt_diag_x(x, weights, &mut xtwx);
             }
             Self::Sparse(xs) => {
                 let csr = xs
@@ -1343,6 +1330,56 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
             ])
             .to_owned();
         DesignMatrix::Dense(self.local.clone()).quadratic_form_diag(&middle_local)
+    }
+}
+
+/// Streaming chunked BLAS computation of X^T * diag(W) * X.
+///
+/// Processes rows in cache-friendly chunks, scaling each chunk by sqrt(w)
+/// and accumulating via BLAS matmul.  Peak intermediate allocation is
+/// chunk_size × p × 8 bytes (~8 MB) instead of n × p × 8 bytes.
+fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Array2<f64>) {
+    let n = x.nrows();
+    let p = x.ncols();
+    if n == 0 || p == 0 {
+        return;
+    }
+
+    // Target ~2MB working set per chunk
+    const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    const MIN_ROWS: usize = 512;
+    const MAX_ROWS: usize = 2048;
+    let chunk_rows = (TARGET_BYTES / (p * 8))
+        .max(MIN_ROWS)
+        .min(MAX_ROWS)
+        .min(n);
+
+    let par = faer::get_global_parallelism();
+    let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut out_view = array2_to_matmut(out);
+
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+            for local in 0..rows {
+                let src = start + local;
+                let sqrtw = weights[src].max(0.0).sqrt();
+                for col in 0..p {
+                    chunk[[local, col]] = x[[src, col]] * sqrtw;
+                }
+            }
+        }
+        let chunk_slice = weighted_chunk.slice(s![0..rows, ..]);
+        let chunk_view = FaerArrayView::new(&chunk_slice);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            chunk_view.as_ref().transpose(),
+            chunk_view.as_ref(),
+            1.0,
+            par,
+        );
     }
 }
 

@@ -1008,6 +1008,20 @@ fn refresh_all_block_etas<F: CustomFamily>(
     Ok(())
 }
 
+fn refresh_single_block_eta<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &mut [ParameterBlockState],
+    block_idx: usize,
+) -> Result<(), String> {
+    let spec = &specs[block_idx];
+    let beta = states[block_idx].beta.clone();
+    states[block_idx].eta = with_block_geometry(family, states, spec, block_idx, |x, off| {
+        Ok(x.matrixvectormultiply(&beta) + off)
+    })?;
+    Ok(())
+}
+
 fn weighted_normal_equations(
     x: &DesignMatrix,
     w: &Array1<f64>,
@@ -2181,7 +2195,9 @@ fn inner_blockwise_fit<F: CustomFamily>(
         let mut objective_cycle_prev = lastobjective;
         for b in 0..specs.len() {
             // Keep all blocks synchronized with any dynamic geometry.
-            refresh_all_block_etas(family, specs, &mut states)?;
+            if family.block_geometry_is_dynamic() {
+                refresh_all_block_etas(family, specs, &mut states)?;
+            }
             let eval = family.evaluate(&states)?;
             if eval.blockworking_sets.len() != specs.len() {
                 return Err(format!(
@@ -2228,7 +2244,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 let trial_beta_raw = &beta_old + &delta.mapv(|v| alpha * v);
                 let trial_beta = family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
                 states[b].beta = trial_beta;
-                refresh_all_block_etas(family, specs, &mut states)?;
+                refresh_single_block_eta(family, specs, &mut states, b)?;
                 let trial_eval = family.evaluate(&states)?;
                 let trial_block_penalty =
                     block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
@@ -2243,7 +2259,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
             if !accepted {
                 states[b].beta = beta_old.clone();
-                refresh_all_block_etas(family, specs, &mut states)?;
+                refresh_single_block_eta(family, specs, &mut states, b)?;
                 if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
                     let descent_dir = gradient - &s_lambda.dot(&beta_old);
                     let dir_norm = descent_dir.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
@@ -2254,7 +2270,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                             let trial_beta =
                                 family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
                             states[b].beta = trial_beta;
-                            refresh_all_block_etas(family, specs, &mut states)?;
+                            refresh_single_block_eta(family, specs, &mut states, b)?;
                             let trial_eval = family.evaluate(&states)?;
                             let trial_block_penalty = block_quadratic_penalty(
                                 &states[b].beta,
@@ -2274,14 +2290,14 @@ fn inner_blockwise_fit<F: CustomFamily>(
                                 break;
                             }
                             states[b].beta = beta_old.clone();
-                            refresh_all_block_etas(family, specs, &mut states)?;
+                            refresh_single_block_eta(family, specs, &mut states, b)?;
                         }
                     }
                 }
             }
             if !accepted {
                 states[b].beta = beta_old;
-                refresh_all_block_etas(family, specs, &mut states)?;
+                refresh_single_block_eta(family, specs, &mut states, b)?;
             }
         }
 
