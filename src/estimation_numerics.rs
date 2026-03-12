@@ -330,8 +330,8 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
         if derivative.is_none() {
             let same_sign = fd_same_sign(d_small, d_big);
             if same_sign && !ridge_jitter_seen {
-                derivative =
-                    best_derivative.or_else(|| Some(select_fd_derivative(d_small, d_big, same_sign)));
+                derivative = best_derivative
+                    .or_else(|| Some(select_fd_derivative(d_small, d_big, same_sign)));
             } else if !ridge_jitter_seen {
                 derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
             }
