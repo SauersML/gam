@@ -713,22 +713,6 @@ impl VisualizerSession {
         self.redraw(true);
     }
 
-    pub fn set_edf_terms(&mut self, terms: &[(String, f64, f64)]) {
-        self.model.edf_terms = terms.to_vec();
-        self.redraw(false);
-    }
-
-    pub fn set_diagnostics(
-        &mut self,
-        condition_number: Option<f64>,
-        step_size: Option<f64>,
-        ridge: Option<f64>,
-    ) {
-        self.model.diagnostics_condition = condition_number;
-        self.model.diagnostics_step_size = step_size;
-        self.model.diagnostics_ridge = ridge;
-        self.redraw(false);
-    }
 
     pub fn push_diagnostic(&mut self, message: &str) {
         self.model.diagnostics_lines.push(message.to_string());

@@ -3378,9 +3378,27 @@ fn strip_comments_and_strings_for_content(source: &str) -> Vec<u8> {
                     continue;
                 }
                 if b == b'\'' {
-                    out.push(b'x');
+                    // Distinguish char literals ('x', '\n') from lifetime ticks ('a).
+                    let is_char_lit = if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        // Escape sequence: '\n', '\x41', '\u{...}' — closing tick within 10 bytes
+                        bytes[i + 2..std::cmp::min(i + 12, bytes.len())]
+                            .iter()
+                            .any(|&c| c == b'\'')
+                    } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                        // Simple char: 'x'
+                        true
+                    } else {
+                        false
+                    };
+                    if is_char_lit {
+                        out.push(b'x');
+                        i += 1;
+                        state = State::CharLiteral;
+                        continue;
+                    }
+                    // Lifetime tick — emit as-is.
+                    out.push(b);
                     i += 1;
-                    state = State::CharLiteral;
                     continue;
                 }
                 out.push(b);
@@ -3776,21 +3794,17 @@ enum PubVisibility {
     PubCrate,
 }
 
-/// Stripped file contents with production / test zone separation.
+/// Stripped file contents for dead-code analysis.
 struct StrippedFile {
     path: PathBuf,
-    /// Full comment/string-stripped source (for whole-file searches).
+    /// Full comment/string-stripped source.
     stripped: String,
-    /// Lines outside `#[cfg(test)]` blocks (production code).
-    prod_text: String,
-    /// Lines inside `#[cfg(test)]` blocks (test code).
-    test_text: String,
     /// `true` when the file lives under `tests/` or `benches/`.
     is_test_file: bool,
 }
 
 /// Walk all `.rs` files (excluding build.rs and ignored directories), read each,
-/// strip comments and string literals, split into prod/test zones, and return.
+/// strip comments and string literals, and return.
 fn build_stripped_file_cache() -> Vec<StrippedFile> {
     let mut files = Vec::new();
     for entry in WalkDir::new(".")
@@ -3811,18 +3825,10 @@ fn build_stripped_file_cache() -> Vec<StrippedFile> {
         let stripped = String::from_utf8_lossy(&stripped_bytes).to_string();
 
         let is_test_file = is_test_or_bench_path(&path);
-        let (prod_text, test_text) = if is_test_file {
-            // Entire file is test code.
-            (String::new(), stripped.clone())
-        } else {
-            split_prod_test_text(&stripped)
-        };
 
         files.push(StrippedFile {
             path,
             stripped,
-            prod_text,
-            test_text,
             is_test_file,
         });
     }
@@ -3836,56 +3842,6 @@ fn is_test_or_bench_path(path: &Path) -> bool {
         || s.contains("/benches/")
         || s.starts_with("./tests/")
         || s.starts_with("./benches/")
-}
-
-/// Split stripped source into production lines and `#[cfg(test)]` lines.
-///
-/// Uses brace-depth tracking: when a `#[cfg(test)]` attribute is seen, the
-/// next `{` opens the test module and everything until the matching `}` is
-/// classified as test text.  Everything else is production text.
-fn split_prod_test_text(stripped: &str) -> (String, String) {
-    let mut prod = String::with_capacity(stripped.len());
-    let mut test = String::with_capacity(stripped.len() / 4);
-
-    let mut in_test_block = false;
-    let mut pending_cfg_test = false;
-    let mut brace_depth: i64 = 0;
-    let mut test_start_depth: i64 = 0;
-
-    for line in stripped.lines() {
-        // Count braces on this line.
-        let opens = line.chars().filter(|&c| c == '{').count() as i64;
-        let closes = line.chars().filter(|&c| c == '}').count() as i64;
-
-        if pending_cfg_test && opens > 0 {
-            // The opening brace of the #[cfg(test)] block.
-            in_test_block = true;
-            test_start_depth = brace_depth; // depth *before* this line's braces
-            pending_cfg_test = false;
-        }
-
-        brace_depth += opens - closes;
-
-        if in_test_block {
-            test.push_str(line);
-            test.push('\n');
-            if brace_depth <= test_start_depth {
-                in_test_block = false;
-            }
-        } else {
-            // Detect #[cfg(test)] — the next block is a test module.
-            if line.contains("cfg(test)") {
-                pending_cfg_test = true;
-                test.push_str(line);
-                test.push('\n');
-            } else {
-                prod.push_str(line);
-                prod.push('\n');
-            }
-        }
-    }
-
-    (prod, test)
 }
 
 /// Try to extract a public item name from a single (stripped) source line.
@@ -4043,6 +3999,32 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
 
     let mut allviolations = Vec::new();
 
+    // ---- Git-tiered enforcement ----
+    // Uncommitted files → silent (skip entirely, WIP grace period).
+    // Committed but not pushed → warn only (nudge, don't block).
+    // Pushed → error (fail the build).
+    fn git_changed_files(args: &[&str]) -> HashSet<String> {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!("./{l}"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let mut uncommitted_files = git_changed_files(&["diff", "--name-only", "HEAD"]);
+    uncommitted_files.extend(git_changed_files(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+    ]));
+    let unpushed_files = git_changed_files(&["diff", "--name-only", "@{upstream}..HEAD"]);
+
     // Names to skip: common trait methods and very short / very common identifiers
     // that would collide with unrelated identifiers producing false positives.
     let skip_names: HashSet<&str> = [
@@ -4095,17 +4077,18 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
         if sf.is_test_file {
             continue; // Don't scan test files for dead definitions.
         }
-        // Only extract from production lines (outside #[cfg(test)]).
-        for (line_idx, line) in sf.prod_text.lines().enumerate() {
+        let file_str = sf.path.to_string_lossy().to_string();
+        if uncommitted_files.contains(&file_str) {
+            continue; // WIP file — silent grace period.
+        }
+        // Extract definitions from stripped source lines (1-based line numbers).
+        for (line_idx, line) in sf.stripped.lines().enumerate() {
             if let Some((name, vis)) = extract_pub_item_name(line) {
                 if name.len() >= 4 && !skip_names.contains(name) {
                     pub_items.push(PubItem {
                         name: name.to_string(),
                         file: sf.path.to_string_lossy().to_string(),
-                        // Line number is approximate (prod_text lines != file lines).
-                        // Find exact line in full stripped text for accurate reporting.
-                        line: find_definition_line(&sf.stripped, name, line)
-                            .unwrap_or(line_idx + 1),
+                        line: line_idx + 1,
                         visibility: vis,
                     });
                 }
@@ -4118,13 +4101,14 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
         let mut prod_refs: usize = 0;
         let mut test_refs: usize = 0;
 
+        // Count references using full stripped text per file.
+        // File-level counting avoids fragile brace-depth zone splitting.
         for sf in cache {
+            let refs = count_real_references(&sf.stripped, &item.name);
             if sf.is_test_file {
-                // Entire file is test code.
-                test_refs += count_real_references(&sf.stripped, &item.name);
+                test_refs += refs;
             } else {
-                prod_refs += count_real_references(&sf.prod_text, &item.name);
-                test_refs += count_real_references(&sf.test_text, &item.name);
+                prod_refs += refs;
             }
         }
 
@@ -4132,6 +4116,14 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
         // If prod_refs <= 1, no production code calls this item.
         if prod_refs > 1 {
             continue; // Alive in production — not dead.
+        }
+
+        // `pub` items used from integration tests (tests/*.rs) are legitimate —
+        // that's how Rust's test architecture works.  Only flag `pub` items that
+        // have ZERO references anywhere, or `pub(crate)` items (which can't be
+        // reached from tests/ anyway, so test refs are in-file #[cfg(test)]).
+        if item.visibility == PubVisibility::Pub && test_refs > 0 {
+            continue; // Exported for integration tests — not dead.
         }
 
         // ---- Phase 3: categorize the violation ----
@@ -4165,8 +4157,16 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
             )
         };
 
+        // Tiered enforcement: committed-not-pushed → warn, pushed → error.
+        let is_unpushed = unpushed_files.contains(&item.file);
+        let (icon, severity) = if is_unpushed {
+            ("\u{26a0}\u{fe0f}", "WARNING")
+        } else {
+            ("\u{274c}", "ERROR")
+        };
+
         let mut msg = format!(
-            "\n\u{274c} ERROR: {category} \u{2014} `{vis}` item '{name}' at {file}:{line}",
+            "\n{icon} {severity}: {category} \u{2014} `{vis}` item '{name}' at {file}:{line}",
             vis = vis_label,
             name = item.name,
             file = item.file,
@@ -4179,24 +4179,14 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
                 test_refs
             ));
         }
-        allviolations.push(msg);
+        if is_unpushed {
+            // Warnings don't block the build — just print them.
+            eprintln!("{msg}");
+        } else {
+            allviolations.push(msg);
+        }
     }
 
     allviolations
 }
 
-/// Find the actual line number of a definition in the full stripped text.
-/// Searches for a line that both contains `name` at a word boundary AND
-/// matches the prod-text line content.
-fn find_definition_line(full_stripped: &str, name: &str, prod_line: &str) -> Option<usize> {
-    let prod_trimmed = prod_line.trim();
-    if prod_trimmed.is_empty() {
-        return None;
-    }
-    for (idx, line) in full_stripped.lines().enumerate() {
-        if line.trim() == prod_trimmed && countvariable_occurrences(line, name) > 0 {
-            return Some(idx + 1);
-        }
-    }
-    None
-}

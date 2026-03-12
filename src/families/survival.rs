@@ -679,37 +679,6 @@ impl WorkingModelSurvival {
         1e-10 * scale
     }
 
-    pub fn structural_time_initial_coefficient_floor(
-        &self,
-        derivative_target_floor: f64,
-    ) -> Option<f64> {
-        if !self.structurally_monotonic || self.structural_time_columns == 0 {
-            return None;
-        }
-        let derivative_target_floor = derivative_target_floor.max(self.derivative_guard());
-        let mut min_uniform_time_coef = 0.0_f64;
-        let p = self.coefficient_dim();
-        let mut row = vec![0.0_f64; p];
-
-        for i in 0..self.nrows() {
-            if self.sampleweight[i] <= 0.0 {
-                continue;
-            }
-            self.fill_derivative_row(i, &mut row);
-            let row_sum = row[0..self.structural_time_columns]
-                .iter()
-                .copied()
-                .sum::<f64>();
-            if row_sum <= 1e-12 {
-                continue;
-            }
-            let rhs = (derivative_target_floor - self.offset_derivative_exit[i]).max(0.0);
-            min_uniform_time_coef = min_uniform_time_coef.max(rhs / row_sum);
-        }
-
-        Some(min_uniform_time_coef)
-    }
-
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
         let p = self.coefficient_dim();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
