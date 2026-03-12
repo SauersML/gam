@@ -2187,6 +2187,9 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut cycles_done = 0usize;
 
     let is_dynamic = family.block_geometry_is_dynamic();
+    // Preallocate eta backup buffer to avoid O(n) clone per block per cycle.
+    let n_obs = states.iter().map(|s| s.eta.len()).max().unwrap_or(0);
+    let mut eta_backup = Array1::<f64>::zeros(n_obs);
     for cycle in 0..inner_max_cycles {
         let mut max_beta_step = 0.0_f64;
 
@@ -2257,7 +2260,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
             // Damped update: require non-increasing penalized objective under dynamic geometry.
             // Precompute X * delta once so line-search eta updates are O(n) not O(np).
-            let eta_old = states[b].eta.clone();
+            // Swap eta into backup buffer instead of cloning to avoid O(n) allocation.
+            std::mem::swap(&mut states[b].eta, &mut eta_backup);
             let x_delta = if !is_dynamic {
                 Some(spec.design.matrixvectormultiply(&delta))
             } else {
@@ -2273,7 +2277,9 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 // Use precomputed X*delta when geometry is static and beta wasn't modified.
                 if let Some(ref xd) = x_delta {
                     if states[b].beta == trial_beta_raw {
-                        states[b].eta = &eta_old + &xd.mapv(|v| alpha * v);
+                        // In-place: eta = eta_backup + alpha * xd (zero allocations).
+                        states[b].eta.assign(&eta_backup);
+                        states[b].eta.scaled_add(alpha, xd);
                     } else {
                         refresh_single_block_eta(family, specs, &mut states, b)?;
                     }
@@ -2294,7 +2300,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
             if !accepted {
                 states[b].beta = beta_old.clone();
-                states[b].eta = eta_old.clone();
+                states[b].eta.assign(&eta_backup);
                 if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
                     let descent_dir = gradient - &s_lambda.dot(&beta_old);
                     let dir_norm = descent_dir.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
@@ -2318,7 +2324,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
                             states[b].beta = trial_beta;
                             if let Some(ref xd) = x_descent {
                                 if states[b].beta == trial_beta_raw {
-                                    states[b].eta = &eta_old + &xd.mapv(|v| alpha * v);
+                                    states[b].eta.assign(&eta_backup);
+                                    states[b].eta.scaled_add(alpha, xd);
                                 } else {
                                     refresh_single_block_eta(family, specs, &mut states, b)?;
                                 }
@@ -2344,14 +2351,14 @@ fn inner_blockwise_fit<F: CustomFamily>(
                                 break;
                             }
                             states[b].beta = beta_old.clone();
-                            states[b].eta = eta_old.clone();
+                            states[b].eta.assign(&eta_backup);
                         }
                     }
                 }
             }
             if !accepted {
                 states[b].beta = beta_old;
-                states[b].eta = eta_old;
+                states[b].eta.assign(&eta_backup);
             }
         }
 
