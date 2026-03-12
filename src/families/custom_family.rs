@@ -6614,4 +6614,550 @@ mod tests {
             "expected covariance root cause in fit error, got: {err}"
         );
     }
+
+    //
+    // Root-cause tests for "exact-newton eigendecomposition failed: NoConvergence"
+    //
+    // Bug: ExactNewtonBlockUpdater::compute_update_step calls FaerEigh::eigh()
+    // to determine the minimum eigenvalue for ridging, but this eigendecomposition
+    // itself fails when the Hessian contains NaN/Inf (e.g. from overflow in the
+    // log_sigma block when exp(eta) overflows).  Unlike stable_logdet_with_ridge_policy
+    // which has a 4-tier fallback chain (eigh -> SVD -> ridged Cholesky -> diagonal),
+    // compute_update_step has NO fallback and propagates the error, killing the fit.
+    //
+    // The tests below prove necessity and sufficiency:
+    //   - NECESSITY: NaN/Inf in the Hessian causes the eigendecomposition to fail,
+    //     which is the sole cause of the "eigendecomposition failed" crash.
+    //   - SUFFICIENCY: The same family with finite Hessians succeeds; the same
+    //     pathological matrix succeeds through stable_logdet_with_ridge_policy.
+    //
+
+    /// A QuadraticReml family whose log_sigma block returns a Hessian containing
+    /// NaN, simulating what happens when exp(eta_sigma) overflows during
+    /// location-scale fitting.
+    #[derive(Clone)]
+    struct TwoBlockNaNHessianFamily;
+
+    impl CustomFamily for TwoBlockNaNHessianFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n0 = block_states[0].eta.len();
+            let p1 = block_states[1].beta.len();
+            // Block 0 (mu): well-behaved diagonal working set.
+            // Block 1 (log_sigma): ExactNewton with NaN in the Hessian,
+            // simulating overflow from extreme coefficients.
+            let mut hessian = Array2::<f64>::eye(p1);
+            hessian[[0, 0]] = f64::NAN; // overflow poison
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.5 * block_states[0].eta.iter().map(|&v| v * v).sum::<f64>(),
+                blockworking_sets: vec![
+                    BlockWorkingSet::Diagonal {
+                        working_response: Array1::zeros(n0),
+                        working_weights: Array1::ones(n0),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(p1),
+                        hessian: SymmetricMatrix::Dense(hessian),
+                    },
+                ],
+            })
+        }
+    }
+
+    /// Same two-block layout but with finite Hessians — the control group.
+    #[derive(Clone)]
+    struct TwoBlockFiniteHessianFamily;
+
+    impl CustomFamily for TwoBlockFiniteHessianFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n0 = block_states[0].eta.len();
+            let p1 = block_states[1].beta.len();
+            let beta1 = &block_states[1].beta;
+            let resid1: f64 = beta1.iter().map(|&b| b * b).sum();
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.5 * block_states[0].eta.iter().map(|&v| v * v).sum::<f64>()
+                    - 0.5 * resid1,
+                blockworking_sets: vec![
+                    BlockWorkingSet::Diagonal {
+                        working_response: Array1::zeros(n0),
+                        working_weights: Array1::ones(n0),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: -beta1.clone(),
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                    },
+                ],
+            })
+        }
+    }
+
+    /// Same NaN-Hessian family but with PseudoLaplace objective, which takes
+    /// the strict-SPD path and skips the eigendecomposition in compute_update_step.
+    #[derive(Clone)]
+    struct TwoBlockNaNHessianPseudoLaplaceFamily;
+
+    impl CustomFamily for TwoBlockNaNHessianPseudoLaplaceFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            TwoBlockNaNHessianFamily.evaluate(block_states)
+        }
+
+        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+            ExactNewtonOuterObjective::PseudoLaplace
+        }
+    }
+
+    fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
+        vec![
+            ParameterBlockSpec {
+                name: "mu".to_string(),
+                design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(array![0.0]),
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: DesignMatrix::Dense(Array2::from_elem((n, 2), 1.0)),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(array![0.0, 0.0]),
+            },
+        ]
+    }
+
+    #[test]
+    fn exact_newton_nan_hessian_causes_eigendecomposition_failure_in_inner_fit() {
+        // NECESSITY: A NaN Hessian in the log_sigma block causes the inner fit
+        // to fail at the eigendecomposition step.  This reproduces the exact
+        // error message seen in production: "exact-newton eigendecomposition
+        // failed: Self-adjoint eigendecomposition failed: NoConvergence".
+        let specs = make_two_block_specs(4);
+        let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let err = inner_blockwise_fit(
+            &TwoBlockNaNHessianFamily,
+            &specs,
+            &per_block_log_lambdas,
+            &options,
+            None,
+        )
+        .expect_err("inner fit should fail when log_sigma Hessian contains NaN");
+        assert!(
+            err.contains("exact-newton eigendecomposition failed"),
+            "expected eigendecomposition error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn exact_newton_finite_hessian_succeeds_where_nan_hessian_fails() {
+        // SUFFICIENCY (control): The identical two-block structure with a
+        // finite Hessian succeeds, proving that NaN in the Hessian is the
+        // specific trigger — not the block layout, penalty structure, or
+        // solver configuration.
+        let specs = make_two_block_specs(4);
+        let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = inner_blockwise_fit(
+            &TwoBlockFiniteHessianFamily,
+            &specs,
+            &per_block_log_lambdas,
+            &options,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "inner fit should succeed with finite Hessian: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn stable_logdet_survives_nan_matrix_but_compute_update_step_does_not() {
+        // NECESSITY + SUFFICIENCY contrast: the same pathological matrix
+        // succeeds through stable_logdet_with_ridge_policy (which has
+        // fallbacks) but fails through the block-update eigendecomposition
+        // path (which has none).
+        let mut mat = Array2::<f64>::eye(3);
+        mat[[0, 0]] = f64::NAN;
+
+        // stable_logdet_with_ridge_policy returns a finite result via its
+        // fallback chain (SVD -> ridged Cholesky -> diagonal approximation).
+        let logdet = stable_logdet_with_ridge_policy(
+            &mat,
+            1e-8,
+            RidgePolicy::explicit_stabilization_pospart(),
+        );
+        assert!(
+            logdet.is_ok(),
+            "stable_logdet should survive NaN via fallback chain: {:?}",
+            logdet.err()
+        );
+
+        // But FaerEigh::eigh (used in compute_update_step) has no fallback.
+        use crate::faer_ndarray::FaerEigh;
+        let eigh_result = FaerEigh::eigh(&mat, faer::Side::Lower);
+        assert!(
+            eigh_result.is_err(),
+            "FaerEigh::eigh should fail on NaN matrix (no fallback chain)"
+        );
+    }
+
+    #[test]
+    fn pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash() {
+        // SUFFICIENCY: The PseudoLaplace path takes strict_solve_spd instead
+        // of eigendecomposition-based ridging.  It will still fail (the Hessian
+        // is NaN so the solve produces garbage), but the failure is NOT the
+        // eigendecomposition NoConvergence error — it's a different error
+        // downstream.  This proves the eigendecomposition call is the unique
+        // failure point for QuadraticReml families.
+        let specs = make_two_block_specs(4);
+        let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = inner_blockwise_fit(
+            &TwoBlockNaNHessianPseudoLaplaceFamily,
+            &specs,
+            &per_block_log_lambdas,
+            &options,
+            None,
+        );
+        // The PseudoLaplace path may fail for other reasons (NaN in solve),
+        // but it must NOT fail with the eigendecomposition error.
+        match result {
+            Ok(_) => {} // Acceptable — strict_solve_spd might produce NaN
+            // betas which don't trigger a hard error.
+            Err(ref msg) => {
+                assert!(
+                    !msg.contains("exact-newton eigendecomposition failed"),
+                    "PseudoLaplace path should NOT hit eigendecomposition; \
+                     got eigendecomposition error anyway: {msg}"
+                );
+            }
+        }
+    }
+
+    // ---------- eta_backup mem::swap shape-mismatch tests ----------
+    //
+    // Root cause: inner_blockwise_fit (line ~2241) allocates a single
+    // `eta_backup` buffer to `max(eta.len())` across blocks.  It then
+    // uses `mem::swap` to exchange each block's eta with this buffer.
+    // When blocks have DIFFERENT eta lengths (e.g. survival time block
+    // = 3n, threshold/log-sigma = n), the swap after the first large
+    // block leaves eta_backup at the smaller length.  The subsequent
+    // `states[b].eta.assign(&eta_backup)` tries to write a short
+    // array into a long slot, triggering an ndarray broadcast panic:
+    //   "could not broadcast array from shape: [n] to: [3n]"
+
+    /// Minimal two-block family where block 0 has design nrows=3n and
+    /// block 1 has design nrows=n.  Both use ExactNewton.  Block 0's
+    /// gradient is nonzero so the Newton step exceeds tol and triggers
+    /// the line-search path (which contains the faulty mem::swap).
+    #[derive(Clone)]
+    struct HeterogeneousEtaLengthFamily {
+        n: usize,
+    }
+
+    impl CustomFamily for HeterogeneousEtaLengthFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = self.n;
+            let eta0 = &block_states[0].eta;
+            let eta1 = &block_states[1].eta;
+            assert_eq!(eta0.len(), 3 * n, "block 0 eta must be 3n");
+            assert_eq!(eta1.len(), n, "block 1 eta must be n");
+            let p0 = block_states[0].beta.len();
+            let p1 = block_states[1].beta.len();
+            // Simple quadratic log-likelihood so optimum is at beta=0.
+            let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+            // Nonzero gradient drives a real step in both blocks.
+            let grad0 = &(-&block_states[0].beta) + &Array1::from_elem(p0, 0.1);
+            let grad1 = &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1);
+            Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad0,
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad1,
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                    },
+                ],
+            })
+        }
+    }
+
+    fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> {
+        let p0 = 2;
+        let p1 = 2;
+        vec![
+            ParameterBlockSpec {
+                name: "big_block".to_string(),
+                // 3n rows — mimics survival time block stacking
+                design: DesignMatrix::Dense(Array2::from_elem((3 * n, p0), 1.0)),
+                offset: Array1::zeros(3 * n),
+                penalties: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(Array1::from_elem(p0, 1.0)),
+            },
+            ParameterBlockSpec {
+                name: "small_block".to_string(),
+                // n rows — mimics threshold/log-sigma block
+                design: DesignMatrix::Dense(Array2::from_elem((n, p1), 1.0)),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(Array1::from_elem(p1, 1.0)),
+            },
+        ]
+    }
+
+    /// NECESSITY: blocks with identical eta lengths do NOT trigger the
+    /// panic — the bug requires heterogeneous eta lengths across blocks.
+    #[test]
+    fn uniform_eta_lengths_do_not_panic() {
+        let n = 10;
+        struct UniformEtaFamily;
+        impl CustomFamily for UniformEtaFamily {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                let p0 = block_states[0].beta.len();
+                let p1 = block_states[1].beta.len();
+                let eta0 = &block_states[0].eta;
+                let eta1 = &block_states[1].eta;
+                let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+                Ok(FamilyEvaluation {
+                    log_likelihood: ll,
+                    blockworking_sets: vec![
+                        BlockWorkingSet::ExactNewton {
+                            gradient: &(-&block_states[0].beta) + &Array1::from_elem(p0, 0.1),
+                            hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                        },
+                        BlockWorkingSet::ExactNewton {
+                            gradient: &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1),
+                            hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                        },
+                    ],
+                })
+            }
+        }
+        // Both blocks have n rows — no shape mismatch possible.
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "block_a".to_string(),
+                design: DesignMatrix::Dense(Array2::from_elem((n, 2), 1.0)),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(Array1::from_elem(2, 1.0)),
+            },
+            ParameterBlockSpec {
+                name: "block_b".to_string(),
+                design: DesignMatrix::Dense(Array2::from_elem((n, 2), 1.0)),
+                offset: Array1::zeros(n),
+                penalties: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(Array1::from_elem(2, 1.0)),
+            },
+        ];
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 3,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        // Must NOT panic — uniform eta lengths keep eta_backup
+        // compatible with every block's eta after mem::swap.
+        let result = inner_blockwise_fit(&UniformEtaFamily, &specs, &per_block, &options, None);
+        assert!(
+            result.is_ok(),
+            "uniform eta lengths should not panic: {result:?}"
+        );
+    }
+
+    /// SUFFICIENCY: heterogeneous eta lengths (3n vs n) must NOT prevent
+    /// the inner fit from completing.  Currently panics with
+    /// "could not broadcast array from shape: [n] to: [3n]" due to the
+    /// eta_backup mem::swap bug.
+    #[test]
+    fn heterogeneous_eta_lengths_inner_fit_completes() {
+        let n = 10;
+        let family = HeterogeneousEtaLengthFamily { n };
+        let specs = make_heterogeneous_eta_specs(n);
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 3,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+        assert!(result.is_ok(), "inner fit should complete: {result:?}");
+    }
+
+    /// SUFFICIENCY (single-cycle): even one inner cycle must complete
+    /// without panic when blocks have heterogeneous eta lengths.
+    #[test]
+    fn heterogeneous_eta_single_cycle_completes() {
+        let n = 10;
+        let family = HeterogeneousEtaLengthFamily { n };
+        let specs = make_heterogeneous_eta_specs(n);
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+        assert!(
+            result.is_ok(),
+            "single-cycle inner fit should complete: {result:?}"
+        );
+    }
+
+    /// NECESSITY: when ALL blocks have step <= tol (already converged),
+    /// the line-search path is skipped for every block and the swap
+    /// never executes — so no panic even with heterogeneous eta lengths.
+    /// This proves that reaching the swap is necessary to trigger the bug.
+    #[test]
+    fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
+        let n = 10;
+        struct AllConvergedFamily {
+            n: usize,
+        }
+        impl CustomFamily for AllConvergedFamily {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                let n = self.n;
+                let eta0 = &block_states[0].eta;
+                let eta1 = &block_states[1].eta;
+                assert_eq!(eta0.len(), 3 * n);
+                assert_eq!(eta1.len(), n);
+                let p0 = block_states[0].beta.len();
+                let p1 = block_states[1].beta.len();
+                let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+                Ok(FamilyEvaluation {
+                    log_likelihood: ll,
+                    blockworking_sets: vec![
+                        BlockWorkingSet::ExactNewton {
+                            gradient: Array1::zeros(p0),
+                            hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                        },
+                        BlockWorkingSet::ExactNewton {
+                            gradient: Array1::zeros(p1),
+                            hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                        },
+                    ],
+                })
+            }
+        }
+        let mut specs = make_heterogeneous_eta_specs(n);
+        specs[0].initial_beta = Some(Array1::zeros(2));
+        specs[1].initial_beta = Some(Array1::zeros(2));
+        let family = AllConvergedFamily { n };
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        // All blocks converged → step=0 → `continue` before swap →
+        // eta_backup never participates → no broadcast panic.
+        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+        assert!(
+            result.is_ok(),
+            "should not panic when all blocks are converged: {result:?}"
+        );
+    }
+
+    /// SUFFICIENCY: even when only the SECOND (smaller) block takes a
+    /// step, the fit must complete.  Currently panics because the
+    /// oversized eta_backup buffer (3n) gets swapped into block 1's
+    /// eta slot (n), then assign fails.
+    #[test]
+    fn heterogeneous_eta_completes_when_only_small_block_steps() {
+        let n = 10;
+        struct OnlySmallBlockStepsFamily {
+            n: usize,
+        }
+        impl CustomFamily for OnlySmallBlockStepsFamily {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                let n = self.n;
+                let eta0 = &block_states[0].eta;
+                let eta1 = &block_states[1].eta;
+                assert_eq!(eta0.len(), 3 * n);
+                assert_eq!(eta1.len(), n);
+                let p0 = block_states[0].beta.len();
+                let p1 = block_states[1].beta.len();
+                let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+                Ok(FamilyEvaluation {
+                    log_likelihood: ll,
+                    blockworking_sets: vec![
+                        BlockWorkingSet::ExactNewton {
+                            // Block 0: converged, step=0
+                            gradient: Array1::zeros(p0),
+                            hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                        },
+                        BlockWorkingSet::ExactNewton {
+                            // Block 1: nontrivial step
+                            gradient: &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1),
+                            hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                        },
+                    ],
+                })
+            }
+        }
+        let mut specs = make_heterogeneous_eta_specs(n);
+        specs[0].initial_beta = Some(Array1::zeros(2)); // block 0 at optimum
+        let family = OnlySmallBlockStepsFamily { n };
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+        assert!(
+            result.is_ok(),
+            "fit should complete when only small block steps: {result:?}"
+        );
+    }
 }
