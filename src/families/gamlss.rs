@@ -4751,40 +4751,89 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
 
-        for i in 0..n {
-            let eta_ls_i = eta_log_sigma[i];
-            let two_eta = 2.0 * eta_ls_i;
-            let sigma_i = eta_ls_i.exp().max(1e-12);
-            let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
-            let r = self.y[i] - etamu[i];
-            let weight_i = self.weights[i];
-            // ll = -0.5 * (r²/s² + ln(2π) + 2·eta_ls) — avoids ln(s²) call.
-            ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+        if let (
+            Some(y_s),
+            Some(w_s),
+            Some(mu_s),
+            Some(ls_s),
+            Some(zmu_s),
+            Some(wmu_s),
+            Some(zls_s),
+            Some(wls_s),
+        ) = (
+            self.y.as_slice_memory_order(),
+            self.weights.as_slice_memory_order(),
+            etamu.as_slice_memory_order(),
+            eta_log_sigma.as_slice_memory_order(),
+            zmu.as_slice_memory_order_mut(),
+            wmu.as_slice_memory_order_mut(),
+            z_ls.as_slice_memory_order_mut(),
+            w_ls.as_slice_memory_order_mut(),
+        ) {
+            for i in 0..n {
+                let eta_ls_i = ls_s[i];
+                let two_eta = 2.0 * eta_ls_i;
+                let sigma_i = eta_ls_i.exp().max(1e-12);
+                let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
+                let r = y_s[i] - mu_s[i];
+                let weight_i = w_s[i];
+                ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
 
-            // mu block (identity): canonical WLS
-            if weight_i == 0.0 {
-                wmu[i] = 0.0;
-                zmu[i] = etamu[i];
-            } else {
-                wmu[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
-                zmu[i] = etamu[i] + r;
+                if weight_i == 0.0 {
+                    wmu_s[i] = 0.0;
+                    zmu_s[i] = mu_s[i];
+                } else {
+                    wmu_s[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
+                    zmu_s[i] = mu_s[i] + r;
+                }
+
+                let dlogsigma_du = if sigma_i <= 1e-10 {
+                    sigma_i * 1e10
+                } else {
+                    1.0
+                };
+                let info_u =
+                    floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
+                if info_u == 0.0 {
+                    wls_s[i] = 0.0;
+                    zls_s[i] = eta_ls_i;
+                } else {
+                    wls_s[i] = info_u;
+                    let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
+                    zls_s[i] = eta_ls_i + score_ls / info_u;
+                }
             }
-
-            // d_sigma/sigma = 1 except on the tiny-sigma floor branch.
-            let dlogsigma_du = if sigma_i <= 1e-10 {
-                sigma_i * 1e10
-            } else {
-                1.0
-            };
-            let info_u =
-                floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
-            if info_u == 0.0 {
-                w_ls[i] = 0.0;
-                z_ls[i] = eta_ls_i;
-            } else {
-                w_ls[i] = info_u;
-                let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
-                z_ls[i] = eta_ls_i + score_ls / info_u;
+        } else {
+            for i in 0..n {
+                let eta_ls_i = eta_log_sigma[i];
+                let two_eta = 2.0 * eta_ls_i;
+                let sigma_i = eta_ls_i.exp().max(1e-12);
+                let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
+                let r = self.y[i] - etamu[i];
+                let weight_i = self.weights[i];
+                ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+                if weight_i == 0.0 {
+                    wmu[i] = 0.0;
+                    zmu[i] = etamu[i];
+                } else {
+                    wmu[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
+                    zmu[i] = etamu[i] + r;
+                }
+                let dlogsigma_du = if sigma_i <= 1e-10 {
+                    sigma_i * 1e10
+                } else {
+                    1.0
+                };
+                let info_u =
+                    floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
+                if info_u == 0.0 {
+                    w_ls[i] = 0.0;
+                    z_ls[i] = eta_ls_i;
+                } else {
+                    w_ls[i] = info_u;
+                    let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
+                    z_ls[i] = eta_ls_i + score_ls / info_u;
+                }
             }
         }
 
@@ -4821,11 +4870,25 @@ impl CustomFamily for GaussianLocationScaleFamily {
         // This avoids exp() + ln() per observation.
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
-        for i in 0..n {
-            let two_eta = 2.0 * eta_log_sigma[i];
-            let inv_s2 = (-two_eta).exp().min(1e24);
-            let r = self.y[i] - etamu[i];
-            ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+        if let (Some(y_s), Some(w_s), Some(mu_s), Some(ls_s)) = (
+            self.y.as_slice_memory_order(),
+            self.weights.as_slice_memory_order(),
+            etamu.as_slice_memory_order(),
+            eta_log_sigma.as_slice_memory_order(),
+        ) {
+            for i in 0..n {
+                let two_eta = 2.0 * ls_s[i];
+                let inv_s2 = (-two_eta).exp().min(1e24);
+                let r = y_s[i] - mu_s[i];
+                ll += w_s[i] * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+            }
+        } else {
+            for i in 0..n {
+                let two_eta = 2.0 * eta_log_sigma[i];
+                let inv_s2 = (-two_eta).exp().min(1e24);
+                let r = self.y[i] - etamu[i];
+                ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+            }
         }
         Ok(ll)
     }
@@ -13761,8 +13824,8 @@ mod tests {
         let weights = Array1::ones(n);
 
         let design = cosine_basis(n, p);
-        let penalty = crate::basis::create_difference_penalty_matrix(p, 2, None)
-            .expect("difference penalty");
+        let penalty =
+            crate::basis::create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
 
         let spec = BinomialLocationScaleSpec {
             y,
@@ -13811,8 +13874,8 @@ mod tests {
         let weights = Array1::ones(n);
 
         let design = cosine_basis(n, p);
-        let penalty = crate::basis::create_difference_penalty_matrix(p, 2, None)
-            .expect("difference penalty");
+        let penalty =
+            crate::basis::create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
 
         let spec = BinomialLocationScaleSpec {
             y,
