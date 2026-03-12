@@ -1012,11 +1012,7 @@ fn refresh_all_block_etas<F: CustomFamily>(
     states: &mut [ParameterBlockState],
 ) -> Result<(), String> {
     for b in 0..specs.len() {
-        let spec = &specs[b];
-        let beta = states[b].beta.clone();
-        states[b].eta = with_block_geometry(family, states, spec, b, |x, off| {
-            Ok(x.matrixvectormultiply(&beta) + off)
-        })?;
+        refresh_single_block_eta(family, specs, states, b)?;
     }
     Ok(())
 }
@@ -2362,7 +2358,12 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
         }
 
-        refresh_all_block_etas(family, specs, &mut states)?;
+        // For non-dynamic families, incremental eta updates within the block loop
+        // maintain correct etas. Only refresh from scratch for dynamic-geometry families
+        // where block interactions may require recomputation.
+        if is_dynamic {
+            refresh_all_block_etas(family, specs, &mut states)?;
+        }
         cached_eval = family.evaluate(&states)?;
         current_penalty = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
         let objective = -cached_eval.log_likelihood + current_penalty;
