@@ -76,7 +76,6 @@ use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -5703,19 +5702,50 @@ fn run_generate_standard_or_flexible(
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
+    use gam::probability::standard_normal_quantile;
+
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     let report_total_steps = if args.data.is_some() { 5 } else { 3 };
     progress.start_workflow("Report", report_total_steps);
     progress.set_stage("report", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let family = model.likelihood();
     progress.advance_workflow(1);
 
-    let data_ctx = if let Some(data_path) = args.data.as_ref() {
+    let beta_se = fit
+        .beta_standard_errors_corrected()
+        .or(fit.beta_standard_errors());
+
+    let coefficients: Vec<report::CoefficientRow> = fit
+        .beta
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, b)| report::CoefficientRow {
+            index: i,
+            estimate: b,
+            std_error: beta_se.and_then(|s| s.get(i).copied()),
+        })
+        .collect();
+
+    let edf_blocks: Vec<(usize, f64)> =
+        fit.edf_by_block().iter().copied().enumerate().collect();
+
+    let mut notes = Vec::new();
+    let mut diagnostics = None;
+    let mut smooth_plots = Vec::new();
+    let mut continuous_order = Vec::new();
+    let mut alo_data = None;
+    let mut n_obs = None;
+    let mut r_squared = None;
+
+    if let Some(data_path) = args.data.as_ref() {
         progress.set_stage("report", "loading report dataset");
         let schema = model.require_data_schema()?;
         let ds = load_datasetwith_schema(data_path, schema)?;
         progress.advance_workflow(2);
+
         let col_map: HashMap<String, usize> = ds
             .headers
             .iter()
@@ -5724,8 +5754,8 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
             .collect();
         let training_headers = model.training_headers.as_ref();
         let parsed = parse_formula(&model.formula)?;
-        let y_col = col_map.get(&parsed.response).copied();
-        if let Some(y_col) = y_col {
+
+        if let Some(y_col) = col_map.get(&parsed.response).copied() {
             if matches!(
                 model.predict_model_class(),
                 PredictModelClass::Standard | PredictModelClass::BinomialLocationScale
@@ -5741,54 +5771,173 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
                 progress.advance_workflow(3);
 
-                let family = model.likelihood();
                 let offset = Array1::<f64>::zeros(ds.values.nrows());
                 let pred =
                     predict_gam(design.design.view(), fit.beta.view(), offset.view(), family)
                         .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
                 let y = ds.values.column(y_col).to_owned();
+                n_obs = Some(y.len());
+
+                // R-squared for Gaussian
+                if matches!(family, LikelihoodFamily::GaussianIdentity) {
+                    let y_mean = y.mean().unwrap_or(0.0);
+                    let ss_tot: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
+                    let ss_res: f64 = y.iter().zip(pred.mean.iter()).map(|(&yi, &pi)| (yi - pi).powi(2)).sum();
+                    if ss_tot > 1e-15 {
+                        r_squared = Some(1.0 - ss_res / ss_tot);
+                    }
+                }
+
+                // Continuous smoothness order
                 let reportweights = Array1::<f64>::ones(ds.values.nrows());
                 let summary = build_model_summary(
-                    &design,
-                    &spec,
-                    &fit,
-                    family,
-                    y.view(),
-                    reportweights.view(),
+                    &design, &spec, &fit, family, y.view(), reportweights.view(),
                 );
-                let design_smooth_terms: Vec<(String, std::ops::Range<usize>)> = design
-                    .smooth
-                    .terms
-                    .iter()
-                    .map(|t| (t.name.clone(), t.coeff_range.clone()))
-                    .collect();
-                Some(report::ReportDataContext::new(
-                    y,
-                    pred.mean.to_owned(),
-                    summary,
-                    // Safety: spec lives long enough — we own it in this scope.
-                    // We leak a ref via unsafe to avoid lifetime gymnastics with the
-                    // builder, since build_report_input consumes it immediately.
-                    unsafe { &*(&spec as *const _) },
-                    design.design.to_owned(),
-                    ds.values.to_owned(),
-                    design_smooth_terms,
-                ))
-            } else {
-                None
+                for st in &summary.smooth_terms {
+                    if let Some(ord) = st.continuous_order.as_ref() {
+                        let status = match ord.status {
+                            ContinuousSmoothnessOrderStatus::Ok => "Ok",
+                            ContinuousSmoothnessOrderStatus::NonMaternRegime => "Non-Matern",
+                            ContinuousSmoothnessOrderStatus::FirstOrderLimit => "1st-Order Limit",
+                            ContinuousSmoothnessOrderStatus::IntrinsicLimit => "Intrinsic Limit",
+                            ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => "Undef",
+                        };
+                        let fin = |v: Option<f64>| v.filter(|x| x.is_finite());
+                        continuous_order.push(report::ContinuousOrderRow {
+                            name: st.name.clone(),
+                            lambda0: ord.lambda0,
+                            lambda1: ord.lambda1,
+                            lambda2: ord.lambda2,
+                            r_ratio: fin(ord.r_ratio),
+                            nu: fin(ord.nu),
+                            kappa2: fin(ord.kappa2),
+                            status: status.to_string(),
+                        });
+                    }
+                }
+
+                // Residual QQ data
+                let residuals: Vec<f64> = y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
+                let mut residuals_sorted = residuals.clone();
+                residuals_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = residuals_sorted.len().max(1);
+                let theoretical_quantiles = (0..n)
+                    .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Calibration for binary responses
+                let calibration = if is_binary_response(y.view()) {
+                    let mut bin_pred = [0.0f64; 10];
+                    let mut bin_obs = [0.0f64; 10];
+                    let mut counts = [0usize; 10];
+                    for i in 0..y.len() {
+                        let p = pred.mean[i].clamp(0.0, 1.0);
+                        let b = ((p * 10.0).floor() as usize).min(9);
+                        bin_pred[b] += p;
+                        bin_obs[b] += y[i];
+                        counts[b] += 1;
+                    }
+                    let mut mp = Vec::new();
+                    let mut or = Vec::new();
+                    for b in 0..10 {
+                        if counts[b] > 0 {
+                            mp.push(bin_pred[b] / counts[b] as f64);
+                            or.push((bin_obs[b] / counts[b] as f64).clamp(0.0, 1.0));
+                        }
+                    }
+                    Some(report::CalibrationData { mean_predicted: mp, observed_rate: or })
+                } else {
+                    None
+                };
+
+                diagnostics = Some(report::DiagnosticsInput {
+                    residuals_sorted,
+                    theoretical_quantiles,
+                    y_observed: y.to_vec(),
+                    y_predicted: pred.mean.to_vec(),
+                    calibration,
+                });
+
+                // ALO diagnostics
+                if let Some(link) = model
+                    .resolved_inverse_link()
+                    .ok()
+                    .and_then(|r| r.map(|lk| lk.link_function()))
+                {
+                    match compute_alo_diagnostics_from_fit(&fit, y.view(), link) {
+                        Ok(alo) => {
+                            alo_data = Some(report::AloData {
+                                rows: (0..alo.leverage.len())
+                                    .map(|i| report::AloRow {
+                                        index: i,
+                                        leverage: alo.leverage[i],
+                                        eta_tilde: alo.eta_tilde[i],
+                                        se_sandwich: alo.se_sandwich[i],
+                                    })
+                                    .collect(),
+                            });
+                        }
+                        Err(e) => notes.push(format!("ALO diagnostics unavailable: {e}")),
+                    }
+                }
+
+                // Smooth term partial-effect plots
+                for st in &spec.smooth_terms {
+                    if let Some(col) = smooth_term_primary_column(st) {
+                        if col < ds.values.ncols() {
+                            if let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name) {
+                                let x_col = ds.values.column(col);
+                                let contrib = design
+                                    .design
+                                    .slice(s![.., dt.coeff_range.clone()])
+                                    .dot(&fit.beta.slice(s![dt.coeff_range.clone()]));
+                                let mut pairs: Vec<(f64, f64)> = x_col
+                                    .iter()
+                                    .copied()
+                                    .zip(contrib.iter().copied())
+                                    .collect();
+                                pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                smooth_plots.push(report::SmoothPlotData {
+                                    name: st.name.clone(),
+                                    x: pairs.iter().map(|p| p.0).collect(),
+                                    y: pairs.iter().map(|p| p.1).collect(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
-        } else {
-            None
         }
     } else {
+        notes.push(
+            "No data provided \u{2014} diagnostics are omitted. \
+             Pass training data as the second positional argument."
+                .to_string(),
+        );
         progress.advance_workflow(2);
-        None
-    };
+    }
 
     progress.set_stage("report", "generating html");
-    let input = report::build_report_input(&model, &fit, &args.model, data_ctx)?;
-    let out_path = args.out.as_deref();
-    let out = report::write_report(&input, out_path, &args.model)?;
+    let input = report::ReportInput {
+        model_path: args.model.display().to_string(),
+        family_name: pretty_familyname(family).to_string(),
+        model_class: format!("{:?}", model.predict_model_class()),
+        formula: model.formula.clone(),
+        n_obs,
+        deviance: fit.deviance,
+        reml_score: fit.reml_score,
+        iterations: fit.iterations,
+        edf_total: fit.edf_total().unwrap_or(0.0),
+        r_squared,
+        coefficients,
+        edf_blocks,
+        continuous_order,
+        diagnostics,
+        smooth_plots,
+        alo: alo_data,
+        notes,
+    };
+    let out = report::write_report(&input, args.out.as_deref(), &args.model)?;
 
     progress.advance_workflow(report_total_steps);
     progress.finish_progress("report complete");
@@ -5802,33 +5951,6 @@ fn choose_formula(args: &FitArgs) -> Result<String, String> {
         return Err("FORMULA cannot be empty".to_string());
     }
     Ok(v.to_string())
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn js_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-}
-
-fn html_id(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
