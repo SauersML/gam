@@ -145,12 +145,10 @@ impl PenaltyBlocks {
             if block.lambda == 0.0 {
                 continue;
             }
-            let r = block.range.clone();
-            for (i_local, i) in r.clone().enumerate() {
-                for (j_local, j) in r.clone().enumerate() {
-                    h[[i, j]] += block.lambda * block.matrix[[i_local, j_local]];
-                }
-            }
+            let start = block.range.start;
+            let end = block.range.end;
+            h.slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(block.lambda, &block.matrix);
         }
     }
 }
@@ -250,6 +248,72 @@ enum SurvivalDesign {
     },
 }
 
+impl SurvivalDesign {
+    fn p_total(&self) -> usize {
+        match self {
+            Self::Flat { x_exit, .. } => x_exit.ncols(),
+            Self::TimeCovariateShared { time_exit, covariates, .. } => {
+                time_exit.ncols() + covariates.ncols()
+            }
+        }
+    }
+
+    fn design_dot(&self, time_mat: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Flat { .. } => time_mat.dot(beta),
+            Self::TimeCovariateShared { covariates, .. } => {
+                let p_time = time_mat.ncols();
+                let mut out = time_mat.dot(&beta.slice(ndarray::s![..p_time]));
+                if covariates.ncols() > 0 {
+                    out += &covariates.dot(&beta.slice(ndarray::s![p_time..]));
+                }
+                out
+            }
+        }
+    }
+
+    fn fill_row(&self, time_mat: &Array2<f64>, i: usize, out: &mut [f64]) {
+        match self {
+            Self::Flat { .. } => {
+                for (dst, &src) in out.iter_mut().zip(time_mat.row(i).iter()) {
+                    *dst = src;
+                }
+            }
+            Self::TimeCovariateShared { covariates, .. } => {
+                let p_time = time_mat.ncols();
+                for j in 0..p_time {
+                    out[j] = time_mat[[i, j]];
+                }
+                for j in 0..covariates.ncols() {
+                    out[p_time + j] = covariates[[i, j]];
+                }
+            }
+        }
+    }
+
+    fn transpose_vector_multiply(
+        &self,
+        time_mat: &Array2<f64>,
+        vector: &Array1<f64>,
+        include_covariates: bool,
+    ) -> Array1<f64> {
+        match self {
+            Self::Flat { .. } => fast_atv(time_mat, vector),
+            Self::TimeCovariateShared { covariates, .. } => {
+                let p_time = time_mat.ncols();
+                let mut out = Array1::<f64>::zeros(p_time + covariates.ncols());
+                out.slice_mut(ndarray::s![..p_time])
+                    .assign(&fast_atv(time_mat, vector));
+                if include_covariates && covariates.ncols() > 0 {
+                    out.slice_mut(ndarray::s![p_time..])
+                        .assign(&fast_atv(covariates, vector));
+                }
+                out
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
@@ -294,14 +358,7 @@ impl WorkingModelSurvival {
     }
 
     fn coefficient_dim(&self) -> usize {
-        match &self.design {
-            SurvivalDesign::Flat { x_exit, .. } => x_exit.ncols(),
-            SurvivalDesign::TimeCovariateShared {
-                time_exit,
-                covariates,
-                ..
-            } => time_exit.ncols() + covariates.ncols(),
-        }
+        self.design.p_total()
     }
 
     fn nrows(&self) -> usize {
@@ -309,39 +366,19 @@ impl WorkingModelSurvival {
     }
 
     fn entry_dot(&self, beta: &Array1<f64>) -> Array1<f64> {
-        match &self.design {
-            SurvivalDesign::Flat { x_entry, .. } => x_entry.dot(beta),
-            SurvivalDesign::TimeCovariateShared {
-                time_entry,
-                covariates,
-                ..
-            } => {
-                let p_time = time_entry.ncols();
-                let mut out = time_entry.dot(&beta.slice(ndarray::s![..p_time]));
-                if covariates.ncols() > 0 {
-                    out += &covariates.dot(&beta.slice(ndarray::s![p_time..]));
-                }
-                out
-            }
-        }
+        let time_mat = match &self.design {
+            SurvivalDesign::Flat { x_entry, .. } => x_entry,
+            SurvivalDesign::TimeCovariateShared { time_entry, .. } => time_entry,
+        };
+        self.design.design_dot(time_mat, beta)
     }
 
     fn exit_dot(&self, beta: &Array1<f64>) -> Array1<f64> {
-        match &self.design {
-            SurvivalDesign::Flat { x_exit, .. } => x_exit.dot(beta),
-            SurvivalDesign::TimeCovariateShared {
-                time_exit,
-                covariates,
-                ..
-            } => {
-                let p_time = time_exit.ncols();
-                let mut out = time_exit.dot(&beta.slice(ndarray::s![..p_time]));
-                if covariates.ncols() > 0 {
-                    out += &covariates.dot(&beta.slice(ndarray::s![p_time..]));
-                }
-                out
-            }
-        }
+        let time_mat = match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => x_exit,
+            SurvivalDesign::TimeCovariateShared { time_exit, .. } => time_exit,
+        };
+        self.design.design_dot(time_mat, beta)
     }
 
     fn derivative_dot(&self, beta: &Array1<f64>) -> Array1<f64> {
@@ -354,49 +391,19 @@ impl WorkingModelSurvival {
     }
 
     fn fill_entry_row(&self, i: usize, out: &mut [f64]) {
-        match &self.design {
-            SurvivalDesign::Flat { x_entry, .. } => {
-                for (dst, &src) in out.iter_mut().zip(x_entry.row(i).iter()) {
-                    *dst = src;
-                }
-            }
-            SurvivalDesign::TimeCovariateShared {
-                time_entry,
-                covariates,
-                ..
-            } => {
-                let p_time = time_entry.ncols();
-                for j in 0..p_time {
-                    out[j] = time_entry[[i, j]];
-                }
-                for j in 0..covariates.ncols() {
-                    out[p_time + j] = covariates[[i, j]];
-                }
-            }
-        }
+        let time_mat = match &self.design {
+            SurvivalDesign::Flat { x_entry, .. } => x_entry,
+            SurvivalDesign::TimeCovariateShared { time_entry, .. } => time_entry,
+        };
+        self.design.fill_row(time_mat, i, out);
     }
 
     fn fill_exit_row(&self, i: usize, out: &mut [f64]) {
-        match &self.design {
-            SurvivalDesign::Flat { x_exit, .. } => {
-                for (dst, &src) in out.iter_mut().zip(x_exit.row(i).iter()) {
-                    *dst = src;
-                }
-            }
-            SurvivalDesign::TimeCovariateShared {
-                time_exit,
-                covariates,
-                ..
-            } => {
-                let p_time = time_exit.ncols();
-                for j in 0..p_time {
-                    out[j] = time_exit[[i, j]];
-                }
-                for j in 0..covariates.ncols() {
-                    out[p_time + j] = covariates[[i, j]];
-                }
-            }
-        }
+        let time_mat = match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => x_exit,
+            SurvivalDesign::TimeCovariateShared { time_exit, .. } => time_exit,
+        };
+        self.design.fill_row(time_mat, i, out);
     }
 
     fn fill_derivative_row(&self, i: usize, out: &mut [f64]) {
@@ -421,40 +428,19 @@ impl WorkingModelSurvival {
     }
 
     fn derivative_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        match &self.design {
-            SurvivalDesign::Flat { x_derivative, .. } => fast_atv(x_derivative, vector),
-            SurvivalDesign::TimeCovariateShared {
-                time_derivative,
-                covariates,
-                ..
-            } => {
-                let mut out = Array1::<f64>::zeros(time_derivative.ncols() + covariates.ncols());
-                out.slice_mut(ndarray::s![..time_derivative.ncols()])
-                    .assign(&fast_atv(time_derivative, vector));
-                out
-            }
-        }
+        let time_mat = match &self.design {
+            SurvivalDesign::Flat { x_derivative, .. } => x_derivative,
+            SurvivalDesign::TimeCovariateShared { time_derivative, .. } => time_derivative,
+        };
+        self.design.transpose_vector_multiply(time_mat, vector, false)
     }
 
     fn exit_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        match &self.design {
-            SurvivalDesign::Flat { x_exit, .. } => fast_atv(x_exit, vector),
-            SurvivalDesign::TimeCovariateShared {
-                time_exit,
-                covariates,
-                ..
-            } => {
-                let p_time = time_exit.ncols();
-                let mut out = Array1::<f64>::zeros(p_time + covariates.ncols());
-                out.slice_mut(ndarray::s![..p_time])
-                    .assign(&fast_atv(time_exit, vector));
-                if covariates.ncols() > 0 {
-                    out.slice_mut(ndarray::s![p_time..])
-                        .assign(&fast_atv(covariates, vector));
-                }
-                out
-            }
-        }
+        let time_mat = match &self.design {
+            SurvivalDesign::Flat { x_exit, .. } => x_exit,
+            SurvivalDesign::TimeCovariateShared { time_exit, .. } => time_exit,
+        };
+        self.design.transpose_vector_multiply(time_mat, vector, true)
     }
 
     fn derivative_xt_diag_x(&self, weights: &Array1<f64>) -> Array2<f64> {
@@ -604,7 +590,7 @@ impl WorkingModelSurvival {
     }
 
     fn spd_logdet(hessian: &Array2<f64>) -> Result<f64, EstimationError> {
-        if let Ok(chol) = hessian.clone().cholesky(Side::Lower) {
+        if let Ok(chol) = hessian.cholesky(Side::Lower) {
             let l = chol.lower_triangular();
             return Ok(2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>());
         }
@@ -1128,7 +1114,6 @@ impl WorkingModelSurvival {
             eta: LinearPredictor::new(eta_exit),
             gradient: totalgrad,
             hessian: crate::linalg::matrix::SymmetricMatrix::Dense(h),
-            sparsehessian: None,
             deviance,
             penalty_term: penalty_dev + ridge_penalty,
             firth: crate::pirls::FirthDiagnostics::Inactive,
@@ -1162,13 +1147,11 @@ impl WorkingModelSurvival {
             if block.lambda == 0.0 {
                 continue;
             }
-            let r = block.range.clone();
-            let scale = block.lambda;
-            for (i_local, i) in r.clone().enumerate() {
-                for (j_local, j) in r.clone().enumerate() {
-                    s_total[[i, j]] += scale * block.matrix[[i_local, j_local]];
-                }
-            }
+            let start = block.range.start;
+            let end = block.range.end;
+            s_total
+                .slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(block.lambda, &block.matrix);
         }
         let (s_eval, _) = s_total
             .eigh(Side::Lower)
@@ -1299,13 +1282,11 @@ impl WorkingModelSurvival {
             if block.lambda == 0.0 {
                 continue;
             }
-            let r = block.range.clone();
-            let scale = block.lambda;
-            for (i_local, i) in r.clone().enumerate() {
-                for (j_local, j) in r.clone().enumerate() {
-                    s_total[[i, j]] += scale * block.matrix[[i_local, j_local]];
-                }
-            }
+            let start = block.range.start;
+            let end = block.range.end;
+            s_total
+                .slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(block.lambda, &block.matrix);
         }
 
         // Pseudo-logdet and pseudoinverse for S:
@@ -1315,31 +1296,30 @@ impl WorkingModelSurvival {
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
         let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
         let s_tol = (max_s_eval * 1e-12).max(1e-14);
-        let mut s_pinv = Array2::<f64>::zeros((p, p));
+        // Build S^+ = U_+ diag(1/ev_j) U_+^T via scaled columns of U.
+        let mut u_scaled = s_evec.clone();
         for j in 0..p {
             let ev = s_eval[j];
             if ev > s_tol {
-                let inv_ev = 1.0 / ev;
-                // Build S^+ = U_+ diag(1/ev_j) U_+^T in-place by rank-1 updates.
-                for r in 0..p {
-                    let ur = s_evec[(r, j)];
-                    for c in 0..p {
-                        s_pinv[[r, c]] += inv_ev * ur * s_evec[(c, j)];
-                    }
-                }
+                let inv_ev_sqrt = (1.0 / ev).sqrt();
+                u_scaled.column_mut(j).mapv_inplace(|v| v * inv_ev_sqrt);
+            } else {
+                u_scaled.column_mut(j).fill(0.0);
             }
         }
+        let s_pinv = u_scaled.dot(&u_scaled.t());
 
         let mut grad = Array1::<f64>::zeros(k_count);
         for (k, block) in self.penalties.blocks.iter().enumerate() {
             let lambda = block.lambda;
-            let r = block.range.clone();
+            let start = block.range.start;
+            let end = block.range.end;
 
-            let b_block = beta.slice(ndarray::s![r.clone()]).to_owned();
+            let b_block = beta.slice(ndarray::s![start..end]).to_owned();
             let a_k_beta_block = block.matrix.dot(&b_block).mapv(|v| lambda * v);
             let mut a_k_beta = Array1::<f64>::zeros(p);
             a_k_beta
-                .slice_mut(ndarray::s![r.clone()])
+                .slice_mut(ndarray::s![start..end])
                 .assign(&a_k_beta_block);
 
             // Implicit inner derivative:
@@ -1347,12 +1327,11 @@ impl WorkingModelSurvival {
             let u_k = -solvevec(&a_k_beta);
 
             // trace(H^{-1} A_k) on block support from precomputed H^{-1}.
-            let mut trace_hinv_ak = 0.0_f64;
-            for (i_local, i) in r.clone().enumerate() {
-                for (j_local, j) in r.clone().enumerate() {
-                    trace_hinv_ak += h_inv[[i, j]] * (lambda * block.matrix[[j_local, i_local]]);
-                }
-            }
+            // tr(H_inv_block * A_k^T) = element-wise sum of H_inv_block .* A_k^T
+            let h_inv_block = h_inv.slice(ndarray::s![start..end, start..end]);
+            let trace_hinv_ak = lambda
+                * (&h_inv_block * &block.matrix.t())
+                    .sum();
 
             // Exact directional derivative B = dH_nll/d beta [u_k].
             // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).
@@ -1451,21 +1430,12 @@ impl WorkingModelSurvival {
                 }
             }
 
-            let mut tracethird = 0.0_f64;
-            for r_idx in 0..p {
-                for c_idx in 0..p {
-                    tracethird += h_inv[[r_idx, c_idx]] * b_dir[[c_idx, r_idx]];
-                }
-            }
+            let tracethird = (&h_inv * &b_dir.t()).sum();
             let t_k = trace_hinv_ak + tracethird;
 
-            let mut p_k = 0.0_f64;
-            for (i_local, i) in r.clone().enumerate() {
-                for (j_local, j) in r.clone().enumerate() {
-                    // p_k = tr(S^+ A_k) restricted to this block.
-                    p_k += s_pinv[[i, j]] * (lambda * block.matrix[[j_local, i_local]]);
-                }
-            }
+            // p_k = tr(S^+ A_k) restricted to this block.
+            let s_pinv_block = s_pinv.slice(ndarray::s![start..end, start..end]);
+            let p_k = lambda * (&s_pinv_block * &block.matrix.t()).sum();
 
             // Final exact component:
             // 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} dH/drho_k) - 0.5 * tr(S^+ A_k),

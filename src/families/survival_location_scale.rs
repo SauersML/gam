@@ -10,26 +10,13 @@ use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdfthird_derivative_for_inverse_link,
 };
+use crate::families::sigma_link::{exp_sigma_derivs_up_to_third, exp_sigma_derivs_up_to_third_scalar};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
 
 const MIN_PROB: f64 = 1e-12;
-
-#[inline]
-fn exp_sigma_derivs_up_to_third(
-    eta: ndarray::ArrayView1<'_, f64>,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
-    let sigma = eta.mapv(f64::exp);
-    (sigma.clone(), sigma.clone(), sigma.clone(), sigma)
-}
-
-#[inline]
-fn exp_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
-    let sigma = eta.exp();
-    (sigma, sigma, sigma, sigma)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualDistribution {

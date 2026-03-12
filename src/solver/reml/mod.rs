@@ -1,7 +1,7 @@
 use self::cache::AtomicFlagGuard;
 use self::strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
 use super::*;
-use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt};
+use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
     assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
@@ -36,7 +36,7 @@ mod tests {
     use super::{
         DirectionalHyperParam, EvalShared, FirthDenseOperator, LinkFunction, RemlConfig, RemlState,
     };
-    use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_atb};
+    use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
     use crate::linalg::sparse_exact::{
         SparsePenaltyBlock, dense_to_sparse_symmetric_upper, factorize_sparse_spd,
     };

@@ -620,14 +620,17 @@ impl<'a> RemlState<'a> {
             //   H B_k = -A_k beta
             // into rhs_bk so all B_k can be solved together.
             let r_k = &rs_transformed[k];
-            let s_k = r_k.t().dot(r_k);
+            let mut s_k = fast_ata(r_k);
             let r_beta = r_k.dot(beta);
-            let s_k_beta = r_k.t().dot(&r_beta);
-            let a_k = s_k.mapv(|v| lambdas[k] * v);
-            let a_kb = s_k_beta.mapv(|v| lambdas[k] * v);
+            let s_k_beta = fast_atv(r_k, &r_beta);
+            let lam_k = lambdas[k];
+            let a_kb = s_k_beta.mapv(|v| lam_k * v);
             q_diag[k] = beta.dot(&a_kb);
-            rhs_bk.column_mut(k).assign(&a_kb.mapv(|v| -v));
-            a_k_mats.push(a_k);
+            rhs_bk
+                .column_mut(k)
+                .zip_mut_with(&a_kb, |dst, &src| *dst = -src);
+            s_k.mapv_inplace(|v| lam_k * v);
+            a_k_mats.push(s_k);
             a_k_beta.push(a_kb);
         }
 
@@ -647,27 +650,8 @@ impl<'a> RemlState<'a> {
                 .collect::<Vec<_>>()
         });
 
-        let mut h_k = Vec::with_capacity(k_count);
-        let mut weighted_xtdx = Array2::<f64>::zeros(x_dense.raw_dim());
-        for k in 0..k_count {
-            // u_k = X B_k is the eta-space sensitivity for rho_k.
-            // The first Hessian derivative is
-            //   H_k = A_k + X' diag(c ⊙ u_k) X.
-            let mut diag = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                diag[i] = c[i] * u_mat[[i, k]];
-            }
-            let mut hk = a_k_mats[k].clone();
-            hk += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx);
-            if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_dirs.as_ref()) {
-                // Firth path:
-                //   H_k <- H_k - D H_φ[B_k].
-                // This is the exact substitution in
-                //   H_k = A_k + D(X'WX)[B_k] - D(H_φ)[B_k].
-                hk -= &Self::firth_hphi_direction(op, &dirs[k]);
-            }
-            h_k.push(hk);
-        }
+        // Pre-compute c ⊙ u_k for each penalty term k.
+        // These are reused for both H_k assembly and second-derivative traces.
         let s_cols: Vec<Array1<f64>> = (0..k_count)
             .map(|k| {
                 let mut s = Array1::<f64>::zeros(n);
@@ -677,6 +661,24 @@ impl<'a> RemlState<'a> {
                 s
             })
             .collect();
+
+        let mut h_k = Vec::with_capacity(k_count);
+        let mut weighted_xtdx = Array2::<f64>::zeros(x_dense.raw_dim());
+        for k in 0..k_count {
+            // u_k = X B_k is the eta-space sensitivity for rho_k.
+            // The first Hessian derivative is
+            //   H_k = A_k + X' diag(c ⊙ u_k) X.
+            let mut hk = a_k_mats[k].clone();
+            hk += &Self::xt_diag_x_dense_into(x_dense, &s_cols[k], &mut weighted_xtdx);
+            if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_dirs.as_ref()) {
+                // Firth path:
+                //   H_k <- H_k - D H_φ[B_k].
+                // This is the exact substitution in
+                //   H_k = A_k + D(X'WX)[B_k] - D(H_φ)[B_k].
+                hk -= &Self::firth_hphi_direction(op, &dirs[k]);
+            }
+            h_k.push(hk);
+        }
 
         // Exact-only trace backend for Hessian assembly.
         //
