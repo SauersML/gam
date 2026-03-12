@@ -1398,6 +1398,7 @@ pub fn fit_gaussian_location_scale(
         weights,
         mu_design: Some(muspec.design.clone()),
         log_sigma_design: Some(log_sigmaspec.design.clone()),
+        cached_row_scalars: std::cell::RefCell::new(None),
     };
     let blocks = vec![muspec, log_sigmaspec];
     Ok(fit_custom_family(&family, &blocks, options)?)
@@ -2206,6 +2207,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
             log_sigma_design: Some(DesignMatrix::Dense(preparednoise_design)),
+            cached_row_scalars: std::cell::RefCell::new(None),
         }
     }
 
@@ -3508,6 +3510,9 @@ pub struct GaussianLocationScaleFamily {
     pub weights: Array1<f64>,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+    /// Cached per-observation row scalars keyed by (eta_mu[0], eta_ls[0]) fingerprint.
+    /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
+    cached_row_scalars: std::cell::RefCell<Option<(f64, f64, GaussianJointRowScalars)>>,
 }
 
 struct GaussianLocationScaleJointPsiDirection {
@@ -3519,6 +3524,7 @@ struct GaussianLocationScaleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
+#[derive(Clone)]
 struct GaussianJointRowScalars {
     w: Array1<f64>,
     m: Array1<f64>,
@@ -3983,6 +3989,30 @@ impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
 
+    /// Get or compute the per-observation row scalars, caching the result.
+    /// Uses a (eta_mu[0], eta_ls[0]) fingerprint to detect when etas change.
+    fn get_or_compute_row_scalars(
+        &self,
+        etamu: &Array1<f64>,
+        eta_ls: &Array1<f64>,
+    ) -> Result<GaussianJointRowScalars, String> {
+        let key = (
+            etamu.get(0).copied().unwrap_or(f64::NAN),
+            eta_ls.get(0).copied().unwrap_or(f64::NAN),
+        );
+        {
+            let cache = self.cached_row_scalars.borrow();
+            if let Some((k0, k1, ref scalars)) = *cache {
+                if k0 == key.0 && k1 == key.1 {
+                    return Ok(scalars.clone());
+                }
+            }
+        }
+        let scalars = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        *self.cached_row_scalars.borrow_mut() = Some((key.0, key.1, scalars.clone()));
+        Ok(scalars)
+    }
+
     pub fn parameternames() -> &'static [&'static str] {
         &["mu", "log_sigma"]
     }
@@ -4183,7 +4213,7 @@ impl GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         Ok(Some(gaussian_joint_hessian_from_coeffs(
             xmu,
             x_ls,
@@ -4223,11 +4253,9 @@ impl GaussianLocationScaleFamily {
                 total
             ));
         }
-        let umu = d_beta_flat.slice(s![0..pmu]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pmu..pmu + p_ls]).to_owned();
-        let ximu = xmu.dot(&umu);
-        let xi_ls = x_ls.dot(&u_ls);
-        let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let ximu = xmu.dot(&d_beta_flat.slice(s![0..pmu]));
+        let xi_ls = x_ls.dot(&d_beta_flat.slice(s![pmu..pmu + p_ls]));
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         let (dhmumu, dhmu_ls, dh_ls_ls) =
             gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
 
@@ -4268,15 +4296,11 @@ impl GaussianLocationScaleFamily {
                 total
             ));
         }
-        let umu = d_beta_u_flat.slice(s![0..pmu]).to_owned();
-        let u_ls = d_beta_u_flat.slice(s![pmu..pmu + p_ls]).to_owned();
-        let vmu = d_betav_flat.slice(s![0..pmu]).to_owned();
-        let v_ls = d_betav_flat.slice(s![pmu..pmu + p_ls]).to_owned();
-        let ximu_u = xmu.dot(&umu);
-        let xi_ls_u = x_ls.dot(&u_ls);
-        let ximuv = xmu.dot(&vmu);
-        let xi_lsv = x_ls.dot(&v_ls);
-        let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let ximu_u = xmu.dot(&d_beta_u_flat.slice(s![0..pmu]));
+        let xi_ls_u = x_ls.dot(&d_beta_u_flat.slice(s![pmu..pmu + p_ls]));
+        let ximuv = xmu.dot(&d_betav_flat.slice(s![0..pmu]));
+        let xi_lsv = x_ls.dot(&d_betav_flat.slice(s![pmu..pmu + p_ls]));
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         let (d2hmumu, d2hmu_ls, d2h_ls_ls) =
             gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
 
@@ -4474,7 +4498,7 @@ impl GaussianLocationScaleFamily {
         // objects to the full fixed-beta V_a / g_a / H_a by adding S_a.
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         let weights_a = gaussian_joint_psi_firstweights(&rows, &dir_a.zmu_psi, &dir_a.z_ls_psi);
         let objective_psi = weights_a.objective_psirow.sum();
         let score_psi = gaussian_pack_joint_score(
@@ -4558,7 +4582,7 @@ impl GaussianLocationScaleFamily {
         // design motion X_{.,a}, X_{.,b}, X_{.,ab}. Generic code adds S_ab.
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         let weights_i = gaussian_joint_psi_firstweights(&rows, &dir_i.zmu_psi, &dir_i.z_ls_psi);
         let weights_j = gaussian_joint_psi_firstweights(&rows, &dir_j.zmu_psi, &dir_j.z_ls_psi);
         let secondweights = gaussian_joint_psisecondweights(
@@ -4636,8 +4660,8 @@ impl GaussianLocationScaleFamily {
                 total
             ));
         }
-        let umu = d_beta_flat.slice(s![0..pmu]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pmu..pmu + p_ls]).to_owned();
+        let umu = d_beta_flat.slice(s![0..pmu]);
+        let u_ls = d_beta_flat.slice(s![pmu..pmu + p_ls]);
         let ximu = xmu.dot(&umu);
         let xi_ls = x_ls.dot(&u_ls);
         let uzamu = dir_a.xmu_psi.dot(&umu);
@@ -4683,7 +4707,7 @@ impl GaussianLocationScaleFamily {
         //
         // Generic code then combines this with S(theta)-motion and the profile
         // mode responses to form ddot H_{ij}.
-        let rows = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         let mixedweights = gaussian_joint_psi_mixed_driftweights(
             &rows,
             &ximu,
@@ -5887,10 +5911,8 @@ impl BinomialLocationScaleFamily {
                 pt + pls
             ));
         }
-        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pt..pt + pls]).to_owned();
-        let d_eta_t = x_t.dot(&u_t);
-        let d_eta_ls = x_ls.dot(&u_ls);
+        let d_eta_t = x_t.dot(&d_beta_flat.slice(s![0..pt]));
+        let d_eta_ls = x_ls.dot(&d_beta_flat.slice(s![pt..pt + pls]));
         let core = binomial_location_scale_core(
             &self.y,
             &self.weights,
@@ -6014,14 +6036,10 @@ impl BinomialLocationScaleFamily {
                 total
             ));
         }
-        let u_t = d_beta_u_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_u_flat.slice(s![pt..total]).to_owned();
-        let v_t = d_betav_flat.slice(s![0..pt]).to_owned();
-        let v_ls = d_betav_flat.slice(s![pt..total]).to_owned();
-        let d_eta_t_u = x_t.dot(&u_t);
-        let d_eta_ls_u = x_ls.dot(&u_ls);
-        let d_eta_tv = x_t.dot(&v_t);
-        let d_eta_lsv = x_ls.dot(&v_ls);
+        let d_eta_t_u = x_t.dot(&d_beta_u_flat.slice(s![0..pt]));
+        let d_eta_ls_u = x_ls.dot(&d_beta_u_flat.slice(s![pt..total]));
+        let d_eta_tv = x_t.dot(&d_betav_flat.slice(s![0..pt]));
+        let d_eta_lsv = x_ls.dot(&d_betav_flat.slice(s![pt..total]));
         let core = binomial_location_scale_core(
             &self.y,
             &self.weights,
@@ -6792,10 +6810,8 @@ impl BinomialLocationScaleFamily {
                 total
             ));
         }
-        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pt..pt + pls]).to_owned();
-        let xi_t = x_t.dot(&u_t);
-        let xi_ls = x_ls.dot(&u_ls);
+        let xi_t = x_t.dot(&d_beta_flat.slice(s![0..pt]));
+        let xi_ls = x_ls.dot(&d_beta_flat.slice(s![pt..pt + pls]));
 
         // Mixed contraction T_a[u] = D_beta H_{psi_a}[u].
         //
@@ -10689,6 +10705,7 @@ mod tests {
             weights: weights.clone(),
             mu_design: None,
             log_sigma_design: None,
+            cached_row_scalars: std::cell::RefCell::new(None),
         };
         let gaussian_eval = gaussian
             .evaluate(&[
@@ -10834,6 +10851,7 @@ mod tests {
             weights: Array1::from_vec(vec![1.0]),
             mu_design: None,
             log_sigma_design: None,
+            cached_row_scalars: std::cell::RefCell::new(None),
         };
         let states = vec![
             ParameterBlockState {
@@ -10865,6 +10883,7 @@ mod tests {
             weights: Array1::from_vec(vec![1.0]),
             mu_design: None,
             log_sigma_design: None,
+            cached_row_scalars: std::cell::RefCell::new(None),
         };
         let etamu = Array1::from_vec(vec![0.1]);
         let eta_ls = Array1::from_vec(vec![0.4]);
