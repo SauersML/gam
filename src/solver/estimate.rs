@@ -713,7 +713,7 @@ fn compute_smoothing_correction(
 
     // Step 3: Invert Hessian to get V_rho.
     // Add a small ridge before factorization to regularize weakly identified ρ directions.
-    let ridge = add_relative_diag_ridge(&mut hessian_rho, 1e-8, 1e-8);
+    let _ridge = add_relative_diag_ridge(&mut hessian_rho, 1e-8, 1e-8);
 
     let v_rho = match hessian_rho.cholesky(faer::Side::Lower) {
         Ok(chol) => {

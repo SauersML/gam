@@ -848,8 +848,8 @@ impl FirthDenseOperator {
         let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
 
         let dw = &self.w1 * deta;
-        let dot_i = Self::weighted_cross(&x_tau_reduced, &self.x_reduced, &self.w)
-            + Self::weighted_cross(&self.x_reduced, &x_tau_reduced, &self.w)
+        let dot_i = RemlState::weighted_cross(&x_tau_reduced, &self.x_reduced, &self.w)
+            + RemlState::weighted_cross(&self.x_reduced, &x_tau_reduced, &self.w)
             + crate::faer_ndarray::fast_xt_diag_x(&self.x_reduced, &dw);
 
         let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
