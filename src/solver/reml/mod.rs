@@ -36,7 +36,7 @@ mod tests {
     use super::{
         DirectionalHyperParam, EvalShared, FirthDenseOperator, LinkFunction, RemlConfig, RemlState,
     };
-    use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
+    use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_atb};
     use crate::linalg::sparse_exact::{
         SparsePenaltyBlock, dense_to_sparse_symmetric_upper, factorize_sparse_spd,
     };
