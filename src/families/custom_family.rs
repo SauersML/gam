@@ -1783,13 +1783,6 @@ fn trace_product_block(
     t
 }
 
-fn trace_jinv_a_jinv_b(j_inv: &Array2<f64>, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-    // tr(J^{-1} A J^{-1} B) computed without forming explicit Kronecker products.
-    let tmp = j_inv.dot(a);
-    let tmp = tmp.dot(j_inv);
-    trace_product(&tmp, b)
-}
-
 fn leverage_quadratic_forms(x: &DesignMatrix, h_inv: &Array2<f64>) -> Array1<f64> {
     let x_dense_arc = x.to_dense_arc();
     let x_dense = x_dense_arc.as_ref();
@@ -2789,6 +2782,21 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             at += spec.penalties.len();
         }
         if need_hessian {
+            // Precompute h_inv @ j_terms[k] for all k: tr(H^{-1} A H^{-1} B)
+            // becomes trace_product(C_A, C_B) at O(p²) instead of 2×O(p³).
+            let hinv_jterms: Vec<Array2<f64>> = if include_logdet_h {
+                j_terms.iter().map(|jt| h_inv.dot(jt)).collect()
+            } else {
+                Vec::new()
+            };
+            let spinv_aterms: Vec<Array2<f64>> = if include_logdet_s {
+                let sp = s_pinv_joint.as_ref().ok_or_else(|| {
+                    "missing joint S^+ for REML Hessian".to_string()
+                })?;
+                a_terms.iter().map(|at| sp.dot(at)).collect()
+            } else {
+                Vec::new()
+            };
             let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
             let mut hess_available = true;
             for k in 0..rho.len() {
@@ -2830,7 +2838,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                     let mut v_kl = a_beta_terms[k].dot(&u_terms[l])
                         + 0.5 * delta_kl * beta_flat.dot(&a_beta_terms[k]);
                     if include_logdet_h || include_logdet_s {
-                        let tr_prod = trace_jinv_a_jinv_b(&h_inv, &j_terms[l], &j_terms[k]);
+                        // Use precomputed h_inv @ j_terms products: O(p²) trace
+                        // instead of 2×O(p³) matmul per pair.
+                        let tr_prod = trace_product(&hinv_jterms[l], &hinv_jterms[k]);
                         // Second-order sensitivity:
                         //   J u_{k,l} = -(J_l u_k + A_k u_l + delta_{k,l} A_k beta).
                         let rhs_kl = -(a_terms[k].dot(&u_terms[l])
@@ -2884,20 +2894,15 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                             0.0
                         };
                         let tr_p = if include_logdet_s {
-                            0.5 * trace_jinv_a_jinv_b(
-                                s_pinv_joint.as_ref().ok_or_else(|| {
-                                    "missing joint S^+ for REML Hessian".to_string()
-                                })?,
-                                &a_terms[l],
-                                &a_terms[k],
-                            ) - 0.5
-                                * delta_kl
-                                * trace_product(
-                                    s_pinv_joint.as_ref().ok_or_else(|| {
-                                        "missing joint S^+ for REML Hessian".to_string()
-                                    })?,
-                                    &a_terms[k],
-                                )
+                            0.5 * trace_product(&spinv_aterms[l], &spinv_aterms[k])
+                                - 0.5
+                                    * delta_kl
+                                    * trace_product(
+                                        s_pinv_joint.as_ref().ok_or_else(|| {
+                                            "missing joint S^+ for REML Hessian".to_string()
+                                        })?,
+                                        &a_terms[k],
+                                    )
                         } else {
                             0.0
                         };
@@ -3133,6 +3138,20 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             at += spec.penalties.len();
         }
         if need_hessian {
+            // Precompute h_inv @ j_terms[k] and s_pinv @ a_terms[k] for O(p²) traces.
+            let hinv_jterms: Vec<Array2<f64>> = if include_logdet_h {
+                j_terms.iter().map(|jt| h_inv.dot(jt)).collect()
+            } else {
+                Vec::new()
+            };
+            let spinv_aterms: Vec<Array2<f64>> = if include_logdet_s {
+                let sp = s_pinv_joint.as_ref().ok_or_else(|| {
+                    "missing joint S^+ for surrogate REML Hessian".to_string()
+                })?;
+                a_terms.iter().map(|at| sp.dot(at)).collect()
+            } else {
+                Vec::new()
+            };
             let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
             let mut hess_available = true;
             for k in 0..rho.len() {
@@ -3141,7 +3160,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                     let mut v_kl = a_beta_terms[k].dot(&u_terms[l])
                         + 0.5 * delta_kl * beta_flat.dot(&a_beta_terms[k]);
                     if include_logdet_h || include_logdet_s {
-                        let tr_prod = trace_jinv_a_jinv_b(&h_inv, &j_terms[l], &j_terms[k]);
+                        let tr_prod = trace_product(&hinv_jterms[l], &hinv_jterms[k]);
                         let rhs_kl = -(a_terms[k].dot(&u_terms[l])
                             + j_terms[l].dot(&u_terms[k])
                             + delta_kl * a_beta_terms[k].clone());
@@ -3191,20 +3210,16 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                             0.0
                         };
                         let tr_p = if include_logdet_s {
-                            0.5 * trace_jinv_a_jinv_b(
-                                s_pinv_joint.as_ref().ok_or_else(|| {
-                                    "missing joint S^+ for surrogate REML Hessian".to_string()
-                                })?,
-                                &a_terms[l],
-                                &a_terms[k],
-                            ) - 0.5
-                                * delta_kl
-                                * trace_product(
-                                    s_pinv_joint.as_ref().ok_or_else(|| {
-                                        "missing joint S^+ for surrogate REML Hessian".to_string()
-                                    })?,
-                                    &a_terms[k],
-                                )
+                            0.5 * trace_product(&spinv_aterms[l], &spinv_aterms[k])
+                                - 0.5
+                                    * delta_kl
+                                    * trace_product(
+                                        s_pinv_joint.as_ref().ok_or_else(|| {
+                                            "missing joint S^+ for surrogate REML Hessian"
+                                                .to_string()
+                                        })?,
+                                        &a_terms[k],
+                                    )
                         } else {
                             0.0
                         };
@@ -3912,6 +3927,21 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
     } else {
         None
     };
+    // Precompute h_inv @ dot_h_i_terms[k] and s_pinv @ s_i_terms[k]
+    // so the Hessian double loop uses O(p²) traces instead of 2×O(p³).
+    let hinv_dot_h_i: Vec<Array2<f64>> = if need_hessian && include_logdet_h {
+        dot_h_i_terms.iter().map(|dh| h_inv.dot(dh)).collect()
+    } else {
+        Vec::new()
+    };
+    let spinv_s_i: Vec<Array2<f64>> = if need_hessian && include_logdet_s {
+        let sp = s_pinv_joint.as_ref().ok_or_else(|| {
+            "missing joint S^+ for [rho, psi] Hessian precomputation".to_string()
+        })?;
+        s_i_terms.iter().map(|si| sp.dot(si)).collect()
+    } else {
+        Vec::new()
+    };
     if let Some(hess) = outer_hessian.as_mut() {
         for i in 0..theta_dim {
             for j in i..theta_dim {
@@ -4040,7 +4070,7 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
                 let profile_term = v_ij + g_i_terms[i].dot(&beta_i_terms[j]);
                 let log_h_term = if include_logdet_h {
                     0.5 * (trace_product(&h_inv, &ddot_h_ij)
-                        - trace_jinv_a_jinv_b(&h_inv, &dot_h_i_terms[j], &dot_h_i_terms[i]))
+                        - trace_product(&hinv_dot_h_i[j], &hinv_dot_h_i[i]))
                 } else {
                     0.0
                 };
@@ -4051,13 +4081,7 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
                             .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
                         &s_ij,
                     ) + 0.5
-                        * trace_jinv_a_jinv_b(
-                            s_pinv_joint.as_ref().ok_or_else(|| {
-                                "missing joint S^+ for second derivative".to_string()
-                            })?,
-                            &s_i_terms[j],
-                            &s_i_terms[i],
-                        )
+                        * trace_product(&spinv_s_i[j], &spinv_s_i[i])
                 } else {
                     0.0
                 };
