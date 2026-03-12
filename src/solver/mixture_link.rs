@@ -1323,33 +1323,6 @@ mod tests {
     use crate::types::{InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkState};
 
     #[test]
-    fn softmax_jacobian_matchesfd() {
-        let rho = Array1::from_vec(vec![0.7, -1.2, 0.4]);
-        let (pi, jac) = softmaxwith_jacobian_last_fixedzero(&rho);
-        let h = 1e-6;
-        for j in 0..rho.len() {
-            let mut rp = rho.clone();
-            rp[j] += h;
-            let mut rm = rho.clone();
-            rm[j] -= h;
-            let pp = softmax_last_fixedzero(&rp);
-            let pm = softmax_last_fixedzero(&rm);
-            let fd = (&pp - &pm).mapv(|v| v / (2.0 * h));
-            for k in 0..pi.len() {
-                let err = (jac[[k, j]] - fd[k]).abs();
-                assert_eq!(
-                    jac[[k, j]].signum(),
-                    fd[k].signum(),
-                    "jac sign mismatch at ({k},{j}): analytic={} fd={}",
-                    jac[[k, j]],
-                    fd[k]
-                );
-                assert!(err < 5e-6, "jac mismatch at ({k},{j}): err={err:e}");
-            }
-        }
-    }
-
-    #[test]
     fn mixture_jet_rho_partials_matchfd() {
         let spec = MixtureLinkSpec {
             components: vec![

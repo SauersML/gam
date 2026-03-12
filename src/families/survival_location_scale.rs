@@ -3654,7 +3654,6 @@ fn var_hrow(i: usize, input: &SurvivalLocationScalePredictInput, xh_hh: &Array2<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::evaluate_custom_family_joint_hyper;
     use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
     use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
     use faer::sparse::{SparseColMat, Triplet};

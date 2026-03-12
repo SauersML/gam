@@ -5215,7 +5215,7 @@ pub fn fit_custom_family<F: CustomFamily>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
+    use crate::families::gamlss::BinomialLocationScaleWiggleFamily;
     use crate::matrix::DesignMatrix;
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
