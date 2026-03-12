@@ -1921,6 +1921,7 @@ fn strict_psd_positive_part_inverse_and_logdet(
     Ok((pinv, logdet))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn strict_solve_spdwith_semidefinite_option(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -1955,42 +1956,6 @@ fn strict_logdet_spd_with_semidefinite_option(
     strict_logdet_spd(matrix)
 }
 
-fn solve_dense_symmetric_indefinite(
-    matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-    context: &str,
-) -> Result<Array1<f64>, String> {
-    if matrix.nrows() != matrix.ncols() || rhs.len() != matrix.nrows() {
-        return Err(format!("{context}: dimension mismatch"));
-    }
-    let matrixview = FaerArrayView::new(matrix);
-    let solver = FaerLblt::new(matrixview.as_ref(), Side::Lower);
-    let mut rhs_mat = FaerMat::zeros(rhs.len(), 1);
-    for i in 0..rhs.len() {
-        rhs_mat[(i, 0)] = rhs[i];
-    }
-    solver.solve_in_place(rhs_mat.as_mut());
-    let mut out = Array1::<f64>::zeros(rhs.len());
-    for i in 0..rhs.len() {
-        out[i] = rhs_mat[(i, 0)];
-    }
-    if !out.iter().all(|v| v.is_finite()) {
-        out = pinv_positive_part(matrix, 1e-12)
-            .map(|pinv| pinv.dot(rhs))
-            .unwrap_or_else(|_| {
-                let mut diag = Array1::<f64>::zeros(rhs.len());
-                for i in 0..rhs.len() {
-                    let di = matrix[[i, i]].abs().max(1e-12);
-                    diag[i] = rhs[i] / di;
-                }
-                diag
-            });
-        if !out.iter().all(|v| v.is_finite()) {
-            return Err(format!("{context}: solve produced non-finite values"));
-        }
-    }
-    Ok(out)
-}
 
 fn pinv_positive_part_with_floor(
     matrix: &Array2<f64>,
@@ -2661,6 +2626,44 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             strict_spd,
             allow_semidefinite,
         )?;
+        // Precompute J_mode inverse once (handles tangent basis projection).
+        // All mode sensitivity solves u_k = J^{-1} rhs_k then become matvecs.
+        let j_mode_inv = if need_hessian || include_logdet_h || include_logdet_s {
+            let j_inv_raw = if strict_spd || extra_logdet_ridge == 0.0 {
+                // j_for_traces == j_joint, reuse h_inv
+                std::borrow::Cow::Borrowed(&h_inv)
+            } else {
+                std::borrow::Cow::Owned(logdet_trace_inverse_with_ridge_policy(
+                    &j_joint,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                    strict_spd,
+                    allow_semidefinite,
+                )?)
+            };
+            match joint_tangent_basis.as_ref() {
+                Some(basis) => {
+                    // Project: u = B (B^T J B)^{-1} B^T rhs
+                    // => effective inverse = B (B^T J B)^{-1} B^T
+                    let btjb = basis.t().dot(&j_joint).dot(basis);
+                    let btjb_inv = if strict_spd {
+                        strict_inverse_spdwith_semidefinite_option(&btjb, allow_semidefinite)?
+                    } else {
+                        logdet_trace_inverse_with_ridge_policy(
+                            &btjb,
+                            options.ridge_floor,
+                            options.ridge_policy,
+                            strict_spd,
+                            allow_semidefinite,
+                        )?
+                    };
+                    Some(basis.dot(&btjb_inv).dot(&basis.t()))
+                }
+                None => Some(j_inv_raw.into_owned()),
+            }
+        } else {
+            None
+        };
         let mut at = 0usize;
         let mut a_terms: Vec<Array2<f64>> = Vec::new();
         let mut a_beta_terms: Vec<Array1<f64>> = Vec::new();
@@ -2688,15 +2691,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 let keep_second_order = need_hessian || include_logdet_h || include_logdet_s;
                 let u_k = if keep_second_order {
                     let rhs_k = -&a_k_beta;
-                    solve_mode_sensitivity(
-                        &j_joint,
-                        &rhs_k,
-                        joint_tangent_basis.as_ref(),
-                        strict_spd,
-                        allow_semidefinite,
-                        options,
-                        "joint mode sensitivity system for REML gradient",
-                    )?
+                    j_mode_inv.as_ref().unwrap().dot(&rhs_k)
                 } else {
                     Array1::<f64>::zeros(total)
                 };
@@ -2826,15 +2821,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                         let rhs_kl = -(a_terms[k].dot(&u_terms[l])
                             + j_terms[l].dot(&u_terms[k])
                             + delta_kl * a_beta_terms[k].clone());
-                        let u_kl = solve_mode_sensitivity(
-                            &j_joint,
-                            &rhs_kl,
-                            joint_tangent_basis.as_ref(),
-                            strict_spd,
-                            allow_semidefinite,
-                            options,
-                            "joint second-order mode sensitivity system for REML Hessian",
-                        )?;
+                        let u_kl = j_mode_inv.as_ref().unwrap().dot(&rhs_kl);
                         let dh_u_kl = match family
                             .exact_newton_joint_hessian_directional_derivative_with_specs(
                                 &synced_joint_states,
@@ -3031,6 +3018,24 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         let objective = -inner.log_likelihood + inner.penalty_value + 0.5 * logdet_h_total
             - 0.5 * logdet_s_total;
 
+        // Precompute J_mode inverse once for all mode sensitivity solves.
+        let j_mode_inv = if need_hessian || include_logdet_h || include_logdet_s {
+            Some(if strict_spd || extra_logdet_ridge == 0.0 {
+                // j_for_traces == j_joint, reuse h_inv
+                h_inv.clone()
+            } else {
+                logdet_trace_inverse_with_ridge_policy(
+                    &j_joint,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                    strict_spd,
+                    allow_semidefinite,
+                )?
+            })
+        } else {
+            None
+        };
+
         let mut at = 0usize;
         let mut a_terms: Vec<Array2<f64>> = Vec::new();
         let mut a_beta_terms: Vec<Array1<f64>> = Vec::new();
@@ -3053,15 +3058,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
                 let keep_second_order = need_hessian || include_logdet_h || include_logdet_s;
                 let u_k = if keep_second_order {
-                    solve_mode_sensitivity(
-                        &j_joint,
-                        &(-&a_k_beta),
-                        None,
-                        strict_spd,
-                        allow_semidefinite,
-                        options,
-                        "joint mode sensitivity system for surrogate REML gradient",
-                    )?
+                    j_mode_inv.as_ref().unwrap().dot(&(-&a_k_beta))
                 } else {
                     Array1::<f64>::zeros(total)
                 };
@@ -3133,15 +3130,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                         let rhs_kl = -(a_terms[k].dot(&u_terms[l])
                             + j_terms[l].dot(&u_terms[k])
                             + delta_kl * a_beta_terms[k].clone());
-                        let u_kl = solve_mode_sensitivity(
-                            &j_joint,
-                            &rhs_kl,
-                            None,
-                            strict_spd,
-                            allow_semidefinite,
-                            options,
-                            "joint second-order mode sensitivity system for surrogate REML Hessian",
-                        )?;
+                        let u_kl = j_mode_inv.as_ref().unwrap().dot(&rhs_kl);
                         let dh_u_kl = match family
                             .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
                                 &inner.block_states,
@@ -3339,6 +3328,24 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             None
         };
 
+        // Precompute h_mode inverse once for all per-block mode sensitivity solves.
+        let h_mode_inv = if include_logdet_h {
+            Some(if strict_spd || !options.ridge_policy.include_penalty_logdet {
+                // h_for_logdet == h_mode, reuse h_inv
+                h_inv.clone()
+            } else {
+                logdet_trace_inverse_with_ridge_policy(
+                    &h_mode,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                    strict_spd,
+                    allow_semidefinite,
+                )?
+            })
+        } else {
+            None
+        };
+
         let beta = &inner.block_states[b].beta;
         for (k, s_k) in spec.penalties.iter().enumerate() {
             let a_k = s_k.mapv(|v| lambdas[k] * v);
@@ -3399,20 +3406,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 // matrix for trace evaluation, but that ridge is not part of the
                 // stationarity surface and must not enter the sensitivity solve.
                 let rhs = -&a_k_beta;
-                let u_k = if strict_spd {
-                    strict_solve_spdwith_semidefinite_option(&h_mode, &rhs, allow_semidefinite)?
-                } else {
-                    solve_spd_systemwith_policy(
-                        &h_mode,
-                        &rhs,
-                        options.ridge_floor,
-                        options.ridge_policy,
-                    )
-                    .or_else(|_| {
-                        pinv_positive_part(&h_mode, options.ridge_floor)
-                            .map(|h_pinv| h_pinv.dot(&rhs))
-                    })?
-                };
+                let u_k = h_mode_inv.as_ref().unwrap().dot(&rhs);
                 let u_norm = u_k.dot(&u_k).sqrt();
                 let g_hbeta = if !include_logdet_h || u_norm <= 1e-14 {
                     0.0
@@ -3774,6 +3768,38 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
         strict_spd,
         allow_semidefinite,
     )?;
+    // Precompute h_mode inverse once for all mode sensitivity solves.
+    let h_mode_inv = {
+        let h_inv_raw = if strict_spd || extra_logdet_ridge == 0.0 {
+            std::borrow::Cow::Borrowed(&h_inv)
+        } else {
+            std::borrow::Cow::Owned(logdet_trace_inverse_with_ridge_policy(
+                &h_mode,
+                options.ridge_floor,
+                options.ridge_policy,
+                strict_spd,
+                allow_semidefinite,
+            )?)
+        };
+        match joint_tangent_basis.as_ref() {
+            Some(basis) => {
+                let btjb = basis.t().dot(&h_mode).dot(basis);
+                let btjb_inv = if strict_spd {
+                    strict_inverse_spdwith_semidefinite_option(&btjb, allow_semidefinite)?
+                } else {
+                    logdet_trace_inverse_with_ridge_policy(
+                        &btjb,
+                        options.ridge_floor,
+                        options.ridge_policy,
+                        strict_spd,
+                        allow_semidefinite,
+                    )?
+                };
+                basis.dot(&btjb_inv).dot(&basis.t())
+            }
+            None => h_inv_raw.into_owned(),
+        }
+    };
 
     let mut v_i_terms: Vec<f64> = Vec::with_capacity(theta_dim);
     let mut g_i_terms: Vec<Array1<f64>> = Vec::with_capacity(theta_dim);
@@ -3830,15 +3856,7 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
         } else {
             0.0
         };
-        let beta_i = solve_mode_sensitivity(
-            &h_mode,
-            &(-&g_i),
-            joint_tangent_basis.as_ref(),
-            strict_spd,
-            allow_semidefinite,
-            options,
-            "joint mode sensitivity system for full [rho, psi] outer calculus",
-        )?;
+        let beta_i = h_mode_inv.dot(&(-&g_i));
         let d_h_beta_i = if beta_i.dot(&beta_i).sqrt() > 1e-14 {
             symmetrized_square_matrix(
                 family
@@ -3925,15 +3943,7 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
                     + &h_i_terms[i].dot(&beta_i_terms[j])
                     + &h_i_terms[j].dot(&beta_i_terms[i])
                     + &d_h_beta_i_terms[i].dot(&beta_i_terms[j]);
-                let beta_ij = solve_mode_sensitivity(
-                    &h_mode,
-                    &(-beta_ij_rhs),
-                    joint_tangent_basis.as_ref(),
-                    strict_spd,
-                    allow_semidefinite,
-                    options,
-                    "joint second-order mode sensitivity system for full [rho, psi] outer calculus",
-                )?;
+                let beta_ij = h_mode_inv.dot(&(-&beta_ij_rhs));
                 let mut ddot_h_ij = h_ij.clone();
                 match &coords[i] {
                     JointHyperCoord::Psi { .. } => {
@@ -4734,44 +4744,6 @@ fn joint_post_update_tangent_basis<F: CustomFamily>(
         col_at += width;
     }
     Ok(Some(basis))
-}
-
-fn solve_mode_sensitivity(
-    lhs: &Array2<f64>,
-    rhs: &Array1<f64>,
-    tangent_basis: Option<&Array2<f64>>,
-    strict_spd: bool,
-    allow_semidefinite: bool,
-    _: &BlockwiseFitOptions,
-    context: &str,
-) -> Result<Array1<f64>, String> {
-    let solve_dense = |matrix: &Array2<f64>, vector: &Array1<f64>| -> Result<Array1<f64>, String> {
-        if strict_spd {
-            strict_solve_spdwith_semidefinite_option(matrix, vector, allow_semidefinite)
-        } else {
-            solve_dense_symmetric_indefinite(matrix, vector, context)
-        }
-    };
-
-    match tangent_basis {
-        Some(basis) => {
-            if basis.nrows() != lhs.nrows() {
-                return Err(format!(
-                    "{context} tangent basis row mismatch: got {}, expected {}",
-                    basis.nrows(),
-                    lhs.nrows()
-                ));
-            }
-            if basis.ncols() == 0 {
-                return Ok(Array1::zeros(lhs.nrows()));
-            }
-            let lhs_reduced = basis.t().dot(lhs).dot(basis);
-            let rhs_reduced = basis.t().dot(rhs);
-            let sol_reduced = solve_dense(&lhs_reduced, &rhs_reduced)?;
-            Ok(basis.dot(&sol_reduced))
-        }
-        None => solve_dense(lhs, rhs),
-    }
 }
 
 fn penalizedobjective_at_beta<F: CustomFamily>(

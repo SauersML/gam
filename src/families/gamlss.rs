@@ -10,7 +10,7 @@ use crate::custom_family::{
     CustomFamilyBlockPsiDerivative, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec,
     ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
-use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
+use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
@@ -3835,12 +3835,19 @@ fn gaussian_joint_hessian_from_coeffs(
     hmu_ls_coeff: &Array1<f64>,
     h_ls_ls_coeff: &Array1<f64>,
 ) -> Result<Array2<f64>, String> {
-    let hmumu = xt_diag_x_dense(xmu, hmumu_coeff)?;
-    let hmu_ls = xt_diag_y_dense(xmu, hmu_ls_coeff, x_ls)?;
-    let h_ls_ls = xt_diag_x_dense(x_ls, h_ls_ls_coeff)?;
-    Ok(gaussian_pack_joint_symmetrichessian(
-        &hmumu, &hmu_ls, &h_ls_ls,
-    ))
+    if xmu.nrows() != hmumu_coeff.len()
+        || xmu.nrows() != hmu_ls_coeff.len()
+        || xmu.nrows() != h_ls_ls_coeff.len()
+        || x_ls.nrows() != xmu.nrows()
+    {
+        return Err(format!(
+            "gaussian_joint_hessian_from_coeffs dimension mismatch: xmu {}x{}, x_ls {}x{}, coeffs {}/{}/{}",
+            xmu.nrows(), xmu.ncols(), x_ls.nrows(), x_ls.ncols(),
+            hmumu_coeff.len(), hmu_ls_coeff.len(), h_ls_ls_coeff.len()
+        ));
+    }
+    // Fused single-pass: reads X_mu and X_ls once instead of twice each.
+    Ok(fast_joint_hessian_2x2(xmu, x_ls, hmumu_coeff, hmu_ls_coeff, h_ls_ls_coeff))
 }
 
 fn gaussian_joint_psihessian_fromweights(
