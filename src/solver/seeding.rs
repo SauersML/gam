@@ -15,6 +15,11 @@ pub struct SeedConfig {
     pub screening_budget: usize,
     pub screen_max_inner_iterations: usize,
     pub risk_profile: SeedRiskProfile,
+    /// Number of trailing dimensions that are auxiliary parameters (e.g. SAS
+    /// epsilon + log_delta) rather than log-smoothing parameters.  Auxiliary
+    /// dimensions are pinned to their heuristic initial values in every seed
+    /// instead of being swept through the smoothing-parameter seeding grid.
+    pub num_auxiliary_trailing: usize,
 }
 
 impl Default for SeedConfig {
@@ -25,6 +30,7 @@ impl Default for SeedConfig {
             screening_budget: 4,
             screen_max_inner_iterations: 5,
             risk_profile: SeedRiskProfile::GeneralizedLinear,
+            num_auxiliary_trailing: 0,
         }
     }
 }
@@ -256,10 +262,37 @@ pub fn generate_rho_candidates(
     }
 
     // Prefer a full heuristic vector (length == k) as the primary anchor.
+    // Auxiliary trailing dimensions (e.g. SAS params) are already in the
+    // correct parameter space — do NOT apply rho_from_lambda to them.
+    let num_aux = config.num_auxiliary_trailing.min(num_penalties);
+    let num_smoothing = num_penalties - num_aux;
+    let aux_initial: Vec<f64> = if num_aux > 0 {
+        heuristic_lambdas
+            .filter(|h| h.len() == num_penalties)
+            .map(|h| {
+                h[num_smoothing..]
+                    .iter()
+                    .copied()
+                    .map(|v| clamp_to_bounds(v, bounds))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![0.0; num_aux])
+    } else {
+        Vec::new()
+    };
     let heuristic_rhovec: Option<Array1<f64>> = heuristic_lambdas.and_then(|vals| {
         if vals.len() == num_penalties {
             Some(Array1::from_iter(
-                vals.iter().copied().map(|v| rho_from_lambda(v, bounds)),
+                vals[..num_smoothing]
+                    .iter()
+                    .copied()
+                    .map(|v| rho_from_lambda(v, bounds))
+                    .chain(
+                        vals[num_smoothing..]
+                            .iter()
+                            .copied()
+                            .map(|v| clamp_to_bounds(v, bounds)),
+                    ),
             ))
         } else {
             None
@@ -428,6 +461,28 @@ pub fn generate_rho_candidates(
         }
     }
 
+    // Pin auxiliary trailing dimensions to their initial values in every seed.
+    // Auxiliary params (e.g. SAS epsilon, log_delta) live in a different
+    // parameter space than log-smoothing rho and must not be swept by the
+    // smoothing seeding grid.  After pinning we re-dedup because seeds that
+    // differed only in the (now-overwritten) auxiliary dimensions collapse.
+    if num_aux > 0 {
+        for seed in &mut seeds {
+            for (i, &v) in aux_initial.iter().enumerate() {
+                seed[num_smoothing + i] = v;
+            }
+        }
+        let mut deduped = Vec::new();
+        let mut seen2: HashSet<Vec<u64>> = HashSet::new();
+        for seed in seeds {
+            let key: Vec<u64> = seed.iter().map(|&v| v.to_bits()).collect();
+            if seen2.insert(key) {
+                deduped.push(seed);
+            }
+        }
+        seeds = deduped;
+    }
+
     if seeds.len() > max_seeds {
         seeds.truncate(max_seeds);
     }
@@ -532,5 +587,58 @@ mod tests {
             .iter()
             .any(|s| s.len() == 3 && (s[2] - (-12.0)).abs() < 1e-12);
         assert!(has_floor);
+    }
+
+    #[test]
+    fn auxiliary_trailing_dims_pinned_to_initial_values() {
+        // Simulate SAS optimization: 2 smoothing dims + 2 auxiliary dims
+        // (epsilon=0, log_delta=0).  The heuristic vector has lambda values
+        // for smoothing and raw initial values for auxiliary.
+        let cfg = SeedConfig {
+            num_auxiliary_trailing: 2,
+            risk_profile: SeedRiskProfile::GeneralizedLinear,
+            ..SeedConfig::default()
+        };
+        let heur = [1.0, 10.0, 0.0, 0.0]; // lambdas + SAS initials
+        let seeds = generate_rho_candidates(4, Some(&heur), &cfg);
+        assert!(!seeds.is_empty());
+        // EVERY seed must have the auxiliary dims pinned to 0.0.
+        for (idx, seed) in seeds.iter().enumerate() {
+            assert_eq!(seed.len(), 4);
+            assert!(
+                (seed[2] - 0.0).abs() < 1e-12 && (seed[3] - 0.0).abs() < 1e-12,
+                "seed {} has auxiliary dims [{}, {}], expected [0, 0]",
+                idx,
+                seed[2],
+                seed[3],
+            );
+        }
+        // The smoothing dims should NOT all be zero (some seeds should vary them).
+        let has_nonzero_smoothing = seeds
+            .iter()
+            .any(|s| s[0].abs() > 1e-12 || s[1].abs() > 1e-12);
+        assert!(has_nonzero_smoothing);
+    }
+
+    #[test]
+    fn auxiliary_dims_dedup_collapses_identical_seeds() {
+        // With auxiliary pinning, seeds that differed only in aux dims
+        // should collapse to a single seed.
+        let cfg = SeedConfig {
+            num_auxiliary_trailing: 1,
+            max_seeds: 32,
+            risk_profile: SeedRiskProfile::GeneralizedLinear,
+            ..SeedConfig::default()
+        };
+        let seeds_with_aux = generate_rho_candidates(3, None, &cfg);
+        let cfg_no_aux = SeedConfig {
+            num_auxiliary_trailing: 0,
+            max_seeds: 32,
+            risk_profile: SeedRiskProfile::GeneralizedLinear,
+            ..SeedConfig::default()
+        };
+        let seeds_without_aux = generate_rho_candidates(3, None, &cfg_no_aux);
+        // Aux pinning causes many seeds to collapse, so fewer unique seeds.
+        assert!(seeds_with_aux.len() <= seeds_without_aux.len());
     }
 }

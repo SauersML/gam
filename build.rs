@@ -4189,4 +4189,3 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
 
     allviolations
 }
-

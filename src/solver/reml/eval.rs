@@ -2213,10 +2213,7 @@ impl<'a> RemlState<'a> {
                         // T_j = Σ_i c_i x_{ij}³
                         let c_arr = Array1::from_vec(cvec.to_vec());
                         let third_deriv = self
-                            .third_derivative_projection_from_design(
-                                x_transformed_eval,
-                                &c_arr,
-                            )?;
+                            .third_derivative_projection_from_design(x_transformed_eval, &c_arr)?;
 
                         // s³ and TK value for gating
                         let s_cubed: Array1<f64> = h_inv_diag.mapv(|s| s * s * s);
@@ -2235,10 +2232,8 @@ impl<'a> RemlState<'a> {
 
                             // ---- Term B precomputation ----
                             // g_i = Σ_j s³_j x_{ij}³  (row-wise cubed multiply)
-                            let g_vec = Self::cubed_forward_multiply_rows(
-                                x_transformed_eval,
-                                &s_cubed,
-                            )?;
+                            let g_vec =
+                                Self::cubed_forward_multiply_rows(x_transformed_eval, &s_cubed)?;
 
                             // f = X'(d ⊙ g) = M' s³  (the per-coefficient sensitivity)
                             let d_arr = &pirls_result.solve_d_array;
@@ -2251,8 +2246,7 @@ impl<'a> RemlState<'a> {
                                     0.0
                                 }
                             });
-                            let f_vec =
-                                x_transformed_eval.transpose_vector_multiply(&dg);
+                            let f_vec = x_transformed_eval.transpose_vector_multiply(&dg);
 
                             // ---- Term A precomputation ----
                             // G = W' diag(s² ⊙ T) W  (r×r)
@@ -2263,9 +2257,7 @@ impl<'a> RemlState<'a> {
                                     for b in a..rank {
                                         let mut acc = 0.0;
                                         for j in 0..p_eff {
-                                            acc += w_weight[j]
-                                                * w_pos[[j, a]]
-                                                * w_pos[[j, b]];
+                                            acc += w_weight[j] * w_pos[[j, a]] * w_pos[[j, b]];
                                         }
                                         g[[a, b]] = acc;
                                         g[[b, a]] = acc;
@@ -2279,10 +2271,7 @@ impl<'a> RemlState<'a> {
                             let m_mat = wg.dot(&w_pos.t());
 
                             // h_G_i = x_i' M x_i (G-weighted leverage, no floor)
-                            let h_g = Self::quadratic_form_diag_signed(
-                                x_transformed_eval,
-                                &m_mat,
-                            )?;
+                            let h_g = Self::quadratic_form_diag_signed(x_transformed_eval, &m_mat)?;
 
                             // r_G = (XW)'(c ⊙ h_G) = W' X'(c ⊙ h_G)
                             let c_hg = Array1::from_shape_fn(nobs, |i| {
@@ -2294,8 +2283,7 @@ impl<'a> RemlState<'a> {
                                     0.0
                                 }
                             });
-                            let xt_chg = x_transformed_eval
-                                .transpose_vector_multiply(&c_hg);
+                            let xt_chg = x_transformed_eval.transpose_vector_multiply(&c_hg);
                             let r_g = w_pos.t().dot(&xt_chg); // r-vector
 
                             // g_k = W' (S_k β̂) for each k (r × k_count)
@@ -2319,8 +2307,7 @@ impl<'a> RemlState<'a> {
                                     .zip(pkpk.iter())
                                     .map(|(&gv, &pv)| gv * pv)
                                     .sum();
-                                let term_a =
-                                    -(lambdas[k] / 2.0) * (tr_g_pkpk - r_g.dot(&g_k));
+                                let term_a = -(lambdas[k] / 2.0) * (tr_g_pkpk - r_g.dot(&g_k));
 
                                 tk_grad[k] = term_a + term_b;
                             }
@@ -2340,11 +2327,8 @@ impl<'a> RemlState<'a> {
                             }
 
                             if log::log_enabled!(log::Level::Debug) {
-                                let tk_grad_norm: f64 = tk_grad
-                                    .iter()
-                                    .map(|v| v * v)
-                                    .sum::<f64>()
-                                    .sqrt();
+                                let tk_grad_norm: f64 =
+                                    tk_grad.iter().map(|v| v * v).sum::<f64>().sqrt();
                                 log::debug!(
                                     "[REML] TK gradient correction: |TK|={:.3e}, ||∇TK||={:.3e}",
                                     tk_value.abs(),

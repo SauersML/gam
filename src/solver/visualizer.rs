@@ -713,7 +713,6 @@ impl VisualizerSession {
         self.redraw(true);
     }
 
-
     pub fn push_diagnostic(&mut self, message: &str) {
         self.model.diagnostics_lines.push(message.to_string());
         if self.model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {

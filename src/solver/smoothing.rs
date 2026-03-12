@@ -354,6 +354,7 @@ where
     let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let mut fd_check_done = false;
     let objective = CachedFirstOrderObjective::new(|rho: &Array1<f64>| {
         reset_context(context);
         let (cost, grad_rho) = match evalcostgrad_rho(context, rho) {
@@ -366,6 +367,49 @@ where
                 ));
             }
         };
+        // Finite-difference gradient check (only once per seed, controlled by env var)
+        if !fd_check_done && smoothing_debug_enabled() && rho.len() <= 12 {
+            fd_check_done = true;
+            let eps = 1e-4;
+            let mut fd_grad = Array1::<f64>::zeros(rho.len());
+            let mut max_mismatch = 0.0_f64;
+            for k in 0..rho.len() {
+                let mut rho_plus = rho.clone();
+                rho_plus[k] += eps;
+                reset_context(context);
+                let cost_plus = match evalcostgrad_rho(context, &rho_plus) {
+                    Ok((c, _)) if c.is_finite() => c,
+                    _ => f64::NAN,
+                };
+                let mut rho_minus = rho.clone();
+                rho_minus[k] -= eps;
+                reset_context(context);
+                let cost_minus = match evalcostgrad_rho(context, &rho_minus) {
+                    Ok((c, _)) if c.is_finite() => c,
+                    _ => f64::NAN,
+                };
+                fd_grad[k] = (cost_plus - cost_minus) / (2.0 * eps);
+                let scale = grad_rho[k].abs().max(fd_grad[k].abs()).max(1e-8);
+                max_mismatch = max_mismatch.max((grad_rho[k] - fd_grad[k]).abs() / scale);
+            }
+            eprintln!(
+                "[fd-gradient-check] rho={:?} cost={:.6} analytic_grad={:?} fd_grad={:?} max_rel_mismatch={:.3e}",
+                rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>(),
+                cost,
+                grad_rho
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>(),
+                fd_grad
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>(),
+                max_mismatch
+            );
+            // Re-evaluate at the original rho to reset state
+            reset_context(context);
+            let _ = evalcostgrad_rho(context, rho);
+        }
         last_eval = Some((rho.clone(), cost, grad_rho.clone()));
         Ok((cost, grad_rho))
     });
@@ -677,6 +721,7 @@ where
     let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let mut fd_check_done = false;
     let objective = CachedFirstOrderObjective::new(|rho: &Array1<f64>| {
         let (cost, grad_rho) = match evalcostgrad_rho(rho) {
             Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
@@ -688,6 +733,40 @@ where
                 ));
             }
         };
+        // Finite-difference gradient check (parallel path)
+        if !fd_check_done && smoothing_debug_enabled() && rho.len() <= 12 {
+            fd_check_done = true;
+            let eps = 1e-4;
+            let mut fd_grad = Array1::<f64>::zeros(rho.len());
+            for k in 0..rho.len() {
+                let mut rho_plus = rho.clone();
+                rho_plus[k] += eps;
+                let cost_plus = match evalcostgrad_rho(&rho_plus) {
+                    Ok((c, _)) if c.is_finite() => c,
+                    _ => f64::NAN,
+                };
+                let mut rho_minus = rho.clone();
+                rho_minus[k] -= eps;
+                let cost_minus = match evalcostgrad_rho(&rho_minus) {
+                    Ok((c, _)) if c.is_finite() => c,
+                    _ => f64::NAN,
+                };
+                fd_grad[k] = (cost_plus - cost_minus) / (2.0 * eps);
+            }
+            eprintln!(
+                "[fd-gradient-check] rho={:?} cost={:.6} analytic={:?} fd={:?}",
+                rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>(),
+                cost,
+                grad_rho
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>(),
+                fd_grad
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>(),
+            );
+        }
         last_eval = Some((rho.clone(), cost, grad_rho.clone()));
         Ok((cost, grad_rho))
     });

@@ -1532,6 +1532,7 @@ where
             } else {
                 SeedRiskProfile::GeneralizedLinear
             },
+            num_auxiliary_trailing: 0,
         },
     };
     let outer_eval_idx = AtomicUsize::new(0usize);
@@ -1634,6 +1635,7 @@ where
         let mut smoothing_options_mix = smoothing_options.clone();
         smoothing_options_mix.fdhessian_max_dim = 0;
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
+        smoothing_options_mix.seed_config.num_auxiliary_trailing = aux_dim_outer;
         let mut rho_buf = Array1::<f64>::zeros(k);
         let mut mix_rho_buf = if use_mixture {
             Some(Array1::<f64>::zeros(mixture_dim))
@@ -1869,6 +1871,77 @@ where
                     )?;
                     let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
                     let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
+
+                    // ---- TK gradient correction for auxiliary link params ----
+                    // The LAML cost includes a Tierney-Kadane skewness correction
+                    //   TK = -(1/6) Σ_m s_m³ T_m.
+                    // The gradient -∂TK/∂θ_j contributes:
+                    //   Term A: -(1/2)(dW_total_j' h_G)
+                    //   Term B: +(1/6)(f' dβ/dθ_j)
+                    // where h_G_i = diag(X M X')_i, M = WGW',
+                    //       G = W' diag(s²⊙T) W,  W = h_posw,
+                    //       f = X'(d⊙g), g_i = Σ_m s³_m x_{im}³.
+                    let tk_infra: Option<(Array1<f64>, Array1<f64>)> = {
+                        let c_arr = &pirls_mix.solve_c_array;
+                        let d_arr = &pirls_mix.solve_d_array;
+                        let rank = h_posw.ncols();
+                        let p_eff = h_posw.nrows();
+                        if !c_arr.is_empty() && rank > 0 && p_eff > 0 {
+                            let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+                            for m in 0..p_eff {
+                                for a in 0..rank {
+                                    h_inv_diag[m] += h_posw[[m, a]].powi(2);
+                                }
+                            }
+                            let c_clean = Array1::from_shape_fn(c_arr.len(), |i| {
+                                if c_arr[i].is_finite() { c_arr[i] } else { 0.0 }
+                            });
+                            let third_deriv = reml_state
+                                .third_derivative_projection_from_design(x_t, &c_clean)?;
+                            let s_cubed = h_inv_diag.mapv(|s| s * s * s);
+                            let tk_value: f64 = s_cubed
+                                .iter()
+                                .zip(third_deriv.iter())
+                                .map(|(&s3, &t)| s3 * t)
+                                .sum::<f64>()
+                                * (-1.0 / 6.0);
+                            if tk_value.abs() > 1e-12 {
+                                let s_squared = h_inv_diag.mapv(|s| s * s);
+                                let w_weight = &s_squared * &third_deriv;
+                                let mut g_mat = ndarray::Array2::<f64>::zeros((rank, rank));
+                                for a in 0..rank {
+                                    for b in a..rank {
+                                        let mut acc = 0.0;
+                                        for m in 0..p_eff {
+                                            acc += w_weight[m] * h_posw[[m, a]] * h_posw[[m, b]];
+                                        }
+                                        g_mat[[a, b]] = acc;
+                                        g_mat[[b, a]] = acc;
+                                    }
+                                }
+                                let wg = h_posw.dot(&g_mat);
+                                let m_mat = wg.dot(&h_posw.t());
+                                let h_g = RemlState::quadratic_form_diag_signed(x_t, &m_mat)?;
+                                let g_vec = RemlState::cubed_forward_multiply_rows(x_t, &s_cubed)?;
+                                let dg = Array1::from_shape_fn(nobs, |i| {
+                                    let di = if i < d_arr.len() { d_arr[i] } else { 0.0 };
+                                    let gi = g_vec[i];
+                                    if di.is_finite() && gi.is_finite() {
+                                        di * gi
+                                    } else {
+                                        0.0
+                                    }
+                                });
+                                let f_vec = x_t.transpose_vector_multiply(&dg);
+                                Some((h_g, f_vec))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
                     for j in 0..aux_dim {
                         let rhs_j = x_t.transpose_vector_multiply(&du_by_j_buf[j]);
                         let dbeta_j = solver
@@ -1885,12 +1958,22 @@ where
                             })?;
                         let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
                         let mut trace_term = 0.0_f64;
+                        let mut tk_dw_dot_hg = 0.0_f64;
                         for i in 0..nobs {
                             let dw_total = dw_explicit_by_j_buf[j][i]
                                 + pirls_mix.solve_c_array[i] * eta_dot_j[i];
                             trace_term += leverage_buf[i] * dw_total;
+                            if let Some((ref h_g, _)) = tk_infra {
+                                tk_dw_dot_hg += dw_total * h_g[i];
+                            }
                         }
                         grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
+                        if let Some((_, ref f_vec)) = tk_infra {
+                            let tk_correction = -0.5 * tk_dw_dot_hg + f_vec.dot(&dbeta_j) / 6.0;
+                            if tk_correction.is_finite() {
+                                grad[k + j] += tk_correction;
+                            }
+                        }
                     }
                     if use_sas && !use_beta_logistic {
                         let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
@@ -2175,10 +2258,7 @@ where
             c
         };
         let third_deriv = if let Ok(td) =
-            reml_state.third_derivative_projection_from_design(
-                &pirls_res.x_transformed,
-                &c_arr,
-            )
+            reml_state.third_derivative_projection_from_design(&pirls_res.x_transformed, &c_arr)
         {
             td
         } else {
@@ -2218,12 +2298,6 @@ where
             // Hessian (stabilized, transformed)
             let hessian_view = pirls_res.stabilizedhessian_transformed.view();
 
-            // Penalty roots (transformed)
-            let penalty_roots_cloned: Vec<Array2<f64>> = pirls_res
-                .reparam_result
-                .rs_transformed
-                .clone();
-
             let rho_view = final_rho.view();
 
             let is_logit = matches!(cfg.link_function(), LinkFunction::Logit);
@@ -2234,7 +2308,7 @@ where
                 weights: w_view,
                 mode: mode_view,
                 hessian: hessian_view,
-                penalty_roots: penalty_roots_cloned,
+                penalty_roots: pirls_res.reparam_result.rs_transformed.clone(),
                 rho_mode: rho_view,
                 is_logit,
                 trigger_skewness: max_skewness,
@@ -4262,6 +4336,68 @@ where
     )?;
     let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
     let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
+
+    // ---- TK gradient correction for auxiliary link params ----
+    let tk_infra: Option<(Array1<f64>, Array1<f64>)> = {
+        let c_arr = &pirls_mix.solve_c_array;
+        let d_arr = &pirls_mix.solve_d_array;
+        let rank = h_posw.ncols();
+        let p_eff = h_posw.nrows();
+        if !c_arr.is_empty() && rank > 0 && p_eff > 0 {
+            let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+            for m in 0..p_eff {
+                for a in 0..rank {
+                    h_inv_diag[m] += h_posw[[m, a]].powi(2);
+                }
+            }
+            let c_clean = Array1::from_shape_fn(c_arr.len(), |i| {
+                if c_arr[i].is_finite() { c_arr[i] } else { 0.0 }
+            });
+            let third_deriv = reml_state.third_derivative_projection_from_design(x_t, &c_clean)?;
+            let s_cubed = h_inv_diag.mapv(|s| s * s * s);
+            let tk_value: f64 = s_cubed
+                .iter()
+                .zip(third_deriv.iter())
+                .map(|(&s3, &t)| s3 * t)
+                .sum::<f64>()
+                * (-1.0 / 6.0);
+            if tk_value.abs() > 1e-12 {
+                let s_squared = h_inv_diag.mapv(|s| s * s);
+                let w_weight = &s_squared * &third_deriv;
+                let mut g_mat = ndarray::Array2::<f64>::zeros((rank, rank));
+                for a in 0..rank {
+                    for b in a..rank {
+                        let mut acc = 0.0;
+                        for m in 0..p_eff {
+                            acc += w_weight[m] * h_posw[[m, a]] * h_posw[[m, b]];
+                        }
+                        g_mat[[a, b]] = acc;
+                        g_mat[[b, a]] = acc;
+                    }
+                }
+                let wg = h_posw.dot(&g_mat);
+                let m_mat = wg.dot(&h_posw.t());
+                let h_g = RemlState::quadratic_form_diag_signed(x_t, &m_mat)?;
+                let g_vec = RemlState::cubed_forward_multiply_rows(x_t, &s_cubed)?;
+                let dg = Array1::from_shape_fn(nobs, |i| {
+                    let di = if i < d_arr.len() { d_arr[i] } else { 0.0 };
+                    let gi = g_vec[i];
+                    if di.is_finite() && gi.is_finite() {
+                        di * gi
+                    } else {
+                        0.0
+                    }
+                });
+                let f_vec = x_t.transpose_vector_multiply(&dg);
+                Some((h_g, f_vec))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     for j in 0..aux_dim {
         let rhs_j = x_t.transpose_vector_multiply(&du_by_j[j]);
         // The mathematically correct implicit solve for d beta / d psi_j is
@@ -4302,11 +4438,21 @@ where
             })?;
         let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
         let mut trace_term = 0.0_f64;
+        let mut tk_dw_dot_hg = 0.0_f64;
         for i in 0..nobs {
             let dw_total = dw_explicit_by_j[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
             trace_term += leverage[i] * dw_total;
+            if let Some((ref h_g, _)) = tk_infra {
+                tk_dw_dot_hg += dw_total * h_g[i];
+            }
         }
         grad[k + j] = -direct_ll[j] + 0.5 * trace_term;
+        if let Some((_, ref f_vec)) = tk_infra {
+            let tk_correction = -0.5 * tk_dw_dot_hg + f_vec.dot(&dbeta_j) / 6.0;
+            if tk_correction.is_finite() {
+                grad[k + j] += tk_correction;
+            }
+        }
     }
     if use_sas && !use_beta_logistic {
         let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);

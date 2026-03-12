@@ -1,5 +1,5 @@
 use self::cache::AtomicFlagGuard;
-use self::strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
+use self::reml_strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
 use super::*;
 use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
 use crate::linalg::sparse_exact::{
@@ -21,10 +21,9 @@ mod eval;
 mod firth;
 mod geometry;
 mod hyper;
+mod reml_strategy;
 mod runtime;
-mod strategy;
 mod trace;
-pub mod unified;
 
 enum FaerFactor {
     Llt(FaerLlt<f64>),

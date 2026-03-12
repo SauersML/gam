@@ -6,7 +6,7 @@ use crate::linalg::utils::{
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 
 impl<'a> RemlState<'a> {
-    pub(super) fn third_derivative_projection_from_design(
+    pub(crate) fn third_derivative_projection_from_design(
         &self,
         design: &DesignMatrix,
         d_vec: &Array1<f64>,
@@ -44,7 +44,7 @@ impl<'a> RemlState<'a> {
 
     /// Row-wise cubed-weighted forward multiply: g_i = Σ_j w_j x_{ij}³.
     /// Transpose of `third_derivative_projection_from_design` (which computes column sums).
-    pub(super) fn cubed_forward_multiply_rows(
+    pub(crate) fn cubed_forward_multiply_rows(
         design: &DesignMatrix,
         w: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -75,9 +75,7 @@ impl<'a> RemlState<'a> {
             Ok(out)
         } else {
             let x_dense = design.as_dense().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "design should be dense or sparse".to_string(),
-                )
+                EstimationError::InvalidInput("design should be dense or sparse".to_string())
             })?;
             let mut out = Array1::<f64>::zeros(n);
             for i in 0..n {
@@ -96,7 +94,7 @@ impl<'a> RemlState<'a> {
     /// M is a p×p dense symmetric matrix. Unlike `DesignMatrix::quadratic_form_diag`,
     /// this does NOT clamp negative values to zero, which is required for the
     /// Tierney-Kadane gradient where the weight vector can be negative.
-    pub(super) fn quadratic_form_diag_signed(
+    pub(crate) fn quadratic_form_diag_signed(
         design: &DesignMatrix,
         m_mat: &Array2<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -140,9 +138,7 @@ impl<'a> RemlState<'a> {
             Ok(out)
         } else {
             let x_dense = design.as_dense().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "design should be dense or sparse".to_string(),
-                )
+                EstimationError::InvalidInput("design should be dense or sparse".to_string())
             })?;
             let xm = fast_ab(x_dense, m_mat);
             let mut out = Array1::<f64>::zeros(n);
@@ -1692,26 +1688,29 @@ impl<'a> RemlState<'a> {
                 }
                 let phi = dp_c / denom;
 
-                // log |H| = log |X'X + S_λ + ridge I| using the single effective
-                // Hessian shared with the gradient. Ridge is already baked into h_eff.
-                //
-                // This is the same stabilized H used in compute_gradient;
-                // otherwise the chain-rule pieces and determinant pieces are taken on
-                // different objective surfaces and the optimizer sees inconsistent derivatives.
-                let h_for_det = h_eff.clone();
-
-                let chol = h_for_det.cholesky(Side::Lower).map_err(|_| {
-                    let min_eig = h_eff
-                        .clone()
+                // log |H|_+ via eigenvalue-thresholded decomposition from the
+                // eval bundle.  The gradient computes tr(H_+^{-1} A_k) using
+                // the same positive-part factor (h_pos_factorw), so using the
+                // matching log-determinant here keeps cost and gradient on the
+                // same spectral truncation surface.  The previous Cholesky-based
+                // log|H| included ALL eigenvalues (even near-zero ones below the
+                // gradient's threshold), causing a cost/gradient mismatch that
+                // made BFGS stall on multi-penalty problems.
+                let log_det_h = if free_basis_opt.is_some() {
+                    // Constrained path: recompute from projected h_eff
+                    let (eigvals, _) = h_eff
                         .eigh(Side::Lower)
-                        .ok()
-                        .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                        .unwrap_or(f64::NAN);
-                    EstimationError::HessianNotPositiveDefinite {
-                        min_eigenvalue: min_eig,
-                    }
-                })?;
-                let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
+                        .map_err(EstimationError::EigendecompositionFailed)?;
+                    let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
+                    let threshold = (max_eig * 1e-10).max(1e-14);
+                    eigvals
+                        .iter()
+                        .filter(|&&v| v > threshold)
+                        .map(|&v| v.ln())
+                        .sum()
+                } else {
+                    bundle.h_total_log_det
+                };
 
                 // log |S_λ + ridge I|_+ (pseudo-determinant) to match the
                 // stabilized penalty used by PIRLS.
@@ -2076,5 +2075,71 @@ impl<'a> RemlState<'a> {
         };
         let analytic = self.compute_gradient_with_bundle(p, &bundle)?;
         Ok(analytic)
+    }
+
+    /// Evaluate the unified REML/LAML objective, gradient, and optional Hessian
+    /// in a single call through the unified evaluator.
+    ///
+    /// This is the migration bridge: it obtains the PIRLS bundle (as before),
+    /// converts it to an `InnerSolution`, and calls the single `reml_laml_evaluate`
+    /// function. Cost and gradient are guaranteed to share intermediates because
+    /// they are computed in the same function scope.
+    pub fn evaluate_via_unified(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{
+            pirls_result_to_inner_solution, reml_laml_evaluate, PirlsConversionConfig,
+        };
+
+        // Obtain the converged PIRLS result (cached if available).
+        let bundle = match self.obtain_eval_bundle(rho) {
+            Ok(bundle) => bundle,
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                self.cache_manager.invalidate_eval_bundle();
+                log::warn!(
+                    "P-IRLS flagged ill-conditioning; returning +inf cost to retreat."
+                );
+                return Ok(super::unified::RemlLamlResult {
+                    cost: f64::INFINITY,
+                    gradient: None,
+                    hessian: None,
+                });
+            }
+            Err(e) => {
+                self.cache_manager.invalidate_eval_bundle();
+                return Err(e);
+            }
+        };
+
+        let pirls_result = bundle.pirls_result.as_ref();
+
+        // Determine if Gaussian identity (profiled scale) or GLM (fixed phi).
+        let is_gaussian_identity = self.config.is_gaussian_identity;
+        let n_observations = self.config.n;
+
+        // TK correction from the current bundle (if applicable).
+        let tk_correction = if self.config.use_tierney_kadane {
+            bundle.tk_correction.unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let config = PirlsConversionConfig {
+            n_observations,
+            is_gaussian_identity,
+            fixed_dispersion: self.config.dispersion.unwrap_or(1.0),
+            tk_correction,
+            tk_gradient: None,
+            nullspace_dims: self.config.nullspace_dims.clone(),
+            penalty_logdet_ridge: bundle.ridge_passport.delta,
+        };
+
+        let inner_solution = pirls_result_to_inner_solution(pirls_result, &config)
+            .map_err(|e| EstimationError::InvalidInput(e))?;
+
+        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, None)
+            .map_err(|e| EstimationError::InvalidInput(e))
     }
 }

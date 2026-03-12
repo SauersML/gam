@@ -107,10 +107,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// such that Hₖ = Aₖ + correction.
     ///
     /// Returns `None` for Gaussian (c=d=0, no correction needed).
-    fn hessian_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-    ) -> Option<Array2<f64>>;
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>>;
 
     /// Compute the second-order correction to H_{k,l} for the outer Hessian.
     ///
@@ -159,10 +156,7 @@ pub struct SinglePredictorGlmDerivatives {
 }
 
 impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
-    fn hessian_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
         // Cₖ = Xᵀ diag(c ⊙ X vₖ) X
         // where vₖ is the mode response H⁻¹(Aₖβ̂).
         // Note: vₖ here is already −dβ̂/dρₖ (the sign convention from the solve).
@@ -288,9 +282,7 @@ pub enum DispersionHandling {
     /// the profiled scale derivative.
     ProfiledGaussian,
     /// Non-Gaussian LAML: dispersion is fixed (typically φ=1 for binomial).
-    Fixed {
-        phi: f64,
-    },
+    Fixed { phi: f64 },
 }
 
 /// The unified inner solution produced by any inner solver.
@@ -510,12 +502,8 @@ pub fn reml_laml_evaluate(
         // For non-Gaussian: 0.5 × β̂ᵀAₖβ̂ (direct from LAML formula).
         let d_k = lambdas[idx] * solution.beta.dot(&s_k_beta);
         let penalty_term = match &solution.dispersion {
-            DispersionHandling::ProfiledGaussian => {
-                dp_cgrad * (d_k / (2.0 * profiled_scale))
-            }
-            DispersionHandling::Fixed { .. } => {
-                0.5 * d_k
-            }
+            DispersionHandling::ProfiledGaussian => dp_cgrad * (d_k / (2.0 * profiled_scale)),
+            DispersionHandling::Fixed { .. } => 0.5 * d_k,
         };
 
         // Term 2: ½ tr(H⁻¹ Hₖ).
@@ -601,11 +589,9 @@ fn compute_outer_hessian(
     let k = rho.len();
     let mut hess = Array2::zeros((k, k));
 
-    let det2 = solution
-        .penalty_logdet
-        .second
-        .as_ref()
-        .ok_or_else(|| "Outer Hessian requested but penalty second derivatives not provided".to_string())?;
+    let det2 = solution.penalty_logdet.second.as_ref().ok_or_else(|| {
+        "Outer Hessian requested but penalty second derivatives not provided".to_string()
+    })?;
 
     // Precompute vₖ = H⁻¹(Aₖβ̂) and Aₖβ̂ for all k.
     let mut a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
@@ -629,7 +615,10 @@ fn compute_outer_hessian(
         a_k *= lambdas[idx];
 
         if solution.deriv_provider.has_corrections() {
-            if let Some(correction) = solution.deriv_provider.hessian_derivative_correction(&v_ks[idx]) {
+            if let Some(correction) = solution
+                .deriv_provider
+                .hessian_derivative_correction(&v_ks[idx])
+            {
                 a_k += &correction;
             }
         }
@@ -662,9 +651,14 @@ fn compute_outer_hessian(
                 // H_{kk} = Aₖ + (second-derivative correction if non-Gaussian)
                 let base = hop.trace_hinv_product(&h_k_matrices[kk]);
                 if solution.deriv_provider.has_corrections() {
-                    if let Some(correction) = solution.deriv_provider.hessian_second_derivative_correction(
-                        &v_ks[kk], &v_ks[ll], &Array1::zeros(solution.beta.len()),
-                    ) {
+                    if let Some(correction) = solution
+                        .deriv_provider
+                        .hessian_second_derivative_correction(
+                            &v_ks[kk],
+                            &v_ks[ll],
+                            &Array1::zeros(solution.beta.len()),
+                        )
+                    {
                         base + hop.trace_hinv_product(&correction)
                     } else {
                         base
@@ -680,9 +674,10 @@ fn compute_outer_hessian(
                     rhs += &h_k_matrices[ll].dot(&v_ks[kk]);
                     let u_kl = hop.solve(&rhs);
 
-                    if let Some(correction) = solution.deriv_provider.hessian_second_derivative_correction(
-                        &v_ks[kk], &v_ks[ll], &u_kl,
-                    ) {
+                    if let Some(correction) = solution
+                        .deriv_provider
+                        .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)
+                    {
                         hop.trace_hinv_product(&correction)
                     } else {
                         0.0
@@ -744,7 +739,11 @@ impl DenseSpectralOperator {
 
         let n = h.nrows();
         if n != h.ncols() {
-            return Err(format!("HessianOperator: expected square matrix, got {}×{}", n, h.ncols()));
+            return Err(format!(
+                "HessianOperator: expected square matrix, got {}×{}",
+                n,
+                h.ncols()
+            ));
         }
 
         let (eigenvalues, eigenvectors) = h
@@ -752,7 +751,10 @@ impl DenseSpectralOperator {
             .map_err(|e| format!("Eigendecomposition failed: {e}"))?;
 
         // Threshold: machine epsilon × dimension × max eigenvalue
-        let max_ev = eigenvalues.iter().copied().fold(0.0_f64, |a: f64, b: f64| a.max(b.abs()));
+        let max_ev = eigenvalues
+            .iter()
+            .copied()
+            .fold(0.0_f64, |a: f64, b: f64| a.max(b.abs()));
         let tol = (n.max(1) as f64) * f64::EPSILON * max_ev.max(1.0);
 
         let active_mask: Vec<bool> = eigenvalues.iter().map(|&v| v > tol).collect();
@@ -883,7 +885,7 @@ impl HessianOperator for SparseCholeskyOperator {
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         // For sparse: tr(H⁻¹ A) = tr(L⁻ᵀ L⁻¹ A) using the selected inverse.
         // Delegate to the sparse trace infrastructure.
-        // For now, fall back to solving columns of A and computing the trace.
+        // Current implementation solves each column of A and accumulates the trace.
         let mut trace = 0.0;
         for j in 0..a.ncols() {
             let col = a.column(j).to_owned();
@@ -1021,7 +1023,7 @@ pub fn pirls_result_to_inner_solution(
         tk_correction: config.tk_correction,
         tk_gradient: config.tk_gradient.clone(),
         firth_logdet,
-        firth_gradient: None, // Firth gradient handled separately for now.
+        firth_gradient: None, // Firth gradient is provided by the outer Firth path.
         n_observations: config.n_observations,
         nullspace_dim,
         dispersion,
@@ -1085,6 +1087,216 @@ pub fn blockwise_result_to_inner_solution(
             phi: config.fixed_dispersion,
         },
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Block-coupled derivative provider (GAMLSS, survival, link wiggles)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Derivative provider for block-coupled families.
+///
+/// For GAMLSS, survival, and joint link wiggle models, the working Hessian
+/// couples multiple parameter blocks. The third-derivative correction is:
+///   D_β H_L[−vₖ] — the directional derivative of the joint likelihood
+///   Hessian in the mode response direction.
+///
+/// This struct holds the precomputed joint likelihood Hessian derivatives
+/// and design matrices needed to form these corrections.
+pub struct BlockCoupledDerivativeProvider {
+    /// The joint design matrix J (or its blocks) for computing H_L derivatives.
+    /// For a single-predictor + link wiggle: J = [diag(g')X | B_wiggle].
+    pub joint_design: Array2<f64>,
+    /// Third derivatives of the negative log-likelihood w.r.t. η for each block.
+    /// These are the ∂³(-ℓ)/∂ηᵢ³ values used in the directional derivative.
+    pub third_deriv_weights: Array1<f64>,
+    /// Fourth derivatives (for second-order Hessian corrections).
+    pub fourth_deriv_weights: Option<Array1<f64>>,
+}
+
+impl HessianDerivativeProvider for BlockCoupledDerivativeProvider {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        // D_β H_L[vₖ] = Jᵀ diag(c ⊙ J vₖ) J
+        // where c is the third-derivative weight vector.
+        let j = &self.joint_design;
+        let j_v = j.dot(v_k);
+
+        let n = j.nrows();
+        let p = j.ncols();
+        let mut c_jv = j_v;
+        Zip::from(&mut c_jv)
+            .and(&self.third_deriv_weights)
+            .for_each(|jv_i, &c_i| *jv_i *= c_i);
+
+        // Jᵀ diag(c_jv) J
+        let mut result = Array2::zeros((p, p));
+        for i in 0..n {
+            let w = c_jv[i];
+            if w.abs() > 0.0 {
+                let ji = j.row(i);
+                for a in 0..p {
+                    let wa = w * ji[a];
+                    for b in a..p {
+                        let val = wa * ji[b];
+                        result[[a, b]] += val;
+                        if a != b {
+                            result[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(result)
+    }
+
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        let j = &self.joint_design;
+        let j_vk = j.dot(v_k);
+        let j_vl = j.dot(v_l);
+        let j_ukl = j.dot(u_kl);
+
+        let n = j.nrows();
+        let p = j.ncols();
+        let mut weights = Array1::zeros(n);
+
+        // c ⊙ J u_{kl}
+        Zip::from(&mut weights)
+            .and(&self.third_deriv_weights)
+            .and(&j_ukl)
+            .for_each(|w, &c, &ju| *w = c * ju);
+
+        // + d ⊙ (J vₖ) ⊙ (J vₗ)
+        if let Some(ref d) = self.fourth_deriv_weights {
+            Zip::from(&mut weights)
+                .and(d)
+                .and(&j_vk)
+                .and(&j_vl)
+                .for_each(|w, &d_i, &jvk, &jvl| *w += d_i * jvk * jvl);
+        }
+
+        // Jᵀ diag(weights) J
+        let mut result = Array2::zeros((p, p));
+        for i in 0..n {
+            let wi = weights[i];
+            if wi.abs() > 0.0 {
+                let ji = j.row(i);
+                for a in 0..p {
+                    let wa = wi * ji[a];
+                    for b in a..p {
+                        let val = wa * ji[b];
+                        result[[a, b]] += val;
+                        if a != b {
+                            result[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(result)
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Joint link wiggle conversion
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Configuration for converting a JointModelState result into an InnerSolution.
+pub struct JointConversionConfig {
+    /// Number of observations.
+    pub n_observations: usize,
+    /// Whether this is a Gaussian identity-link model (profiled scale).
+    pub is_gaussian: bool,
+    /// Dispersion parameter for non-Gaussian families.
+    pub fixed_dispersion: f64,
+    /// Full joint penalized Hessian H = J'WJ + S(λ).
+    pub joint_hessian: Array2<f64>,
+    /// Concatenated coefficients [β_base; β_link].
+    pub joint_beta: Array1<f64>,
+    /// Penalty roots for each smoothing parameter (in the joint basis).
+    pub penalty_roots: Vec<Array2<f64>>,
+    /// Penalty logdet derivatives.
+    pub penalty_logdet: PenaltyLogdetDerivs,
+    /// Nullspace dimension (unpenalized coefficients).
+    pub nullspace_dim: f64,
+    /// Ridge passport.
+    pub ridge_passport: RidgePassport,
+    /// Log-likelihood at the mode.
+    pub log_likelihood: f64,
+    /// Penalty quadratic form.
+    pub penalty_quadratic: f64,
+    /// Family-specific derivative provider.
+    pub deriv_provider: Box<dyn HessianDerivativeProvider>,
+}
+
+/// Convert a joint link-wiggle model result into an InnerSolution.
+pub fn joint_result_to_inner_solution(
+    config: JointConversionConfig,
+) -> Result<InnerSolution, String> {
+    let hessian_op = Box::new(
+        DenseSpectralOperator::from_symmetric(&config.joint_hessian)
+            .map_err(|e| format!("Failed to build HessianOperator from joint Hessian: {e}"))?,
+    );
+
+    let dispersion = if config.is_gaussian {
+        DispersionHandling::ProfiledGaussian
+    } else {
+        DispersionHandling::Fixed {
+            phi: config.fixed_dispersion,
+        }
+    };
+
+    Ok(InnerSolution {
+        log_likelihood: config.log_likelihood,
+        penalty_quadratic: config.penalty_quadratic,
+        ridge_passport: config.ridge_passport,
+        hessian_op,
+        beta: config.joint_beta,
+        penalty_roots: config.penalty_roots,
+        penalty_logdet: config.penalty_logdet,
+        deriv_provider: config.deriv_provider,
+        tk_correction: 0.0,
+        tk_gradient: None,
+        firth_logdet: 0.0,
+        firth_gradient: None,
+        n_observations: config.n_observations,
+        nullspace_dim: config.nullspace_dim,
+        dispersion,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RemlState bridge: evaluate_via_unified
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Configuration for converting a RemlState evaluation bundle into an InnerSolution.
+///
+/// This bridges the existing PIRLS-based RemlState machinery to the unified
+/// evaluator, providing a migration path where the unified evaluator can be
+/// called alongside (or instead of) the legacy compute_cost/compute_gradient.
+pub struct RemlBundleConversionConfig {
+    /// Number of observations.
+    pub n_observations: usize,
+    /// Whether this is Gaussian identity-link (profiled scale).
+    pub is_gaussian_identity: bool,
+    /// Dispersion parameter for non-Gaussian (typically 1.0).
+    pub fixed_dispersion: f64,
+    /// Tierney-Kadane correction.
+    pub tk_correction: f64,
+    /// TK gradient.
+    pub tk_gradient: Option<Array1<f64>>,
 }
 
 #[cfg(test)]
@@ -1217,23 +1429,11 @@ mod tests {
         let n = 50; // 50 observations
 
         // Fixed X'X (data-dependent, rho-independent)
-        let xtx = array![
-            [10.0, 2.0, 1.0],
-            [2.0, 8.0, 0.5],
-            [1.0, 0.5, 6.0],
-        ];
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0],];
 
         // Two penalty matrices (one per smoothing parameter)
-        let s1 = array![
-            [1.0, 0.2, 0.0],
-            [0.2, 1.0, 0.0],
-            [0.0, 0.0, 0.0],
-        ];
-        let s2 = array![
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ];
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0],];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0],];
 
         let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
 
@@ -1250,20 +1450,12 @@ mod tests {
 
         // Penalty roots (Cholesky-like square roots of Sₖ).
         // For testing, use eigendecomposition: Sₖ = Rₖᵀ Rₖ.
-        let r1 = array![
-            [1.0, 0.2, 0.0],
-            [0.0, 0.9798, 0.0],
-            [0.0, 0.0, 0.0],
-        ];
-        let r2 = array![
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ];
+        let r1 = array![[1.0, 0.2, 0.0], [0.0, 0.9798, 0.0], [0.0, 0.0, 0.0],];
+        let r2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0],];
 
         // Penalty quadratic: Σ λₖ β'Sₖβ
-        let penalty_quad = lambdas[0] * beta.dot(&s1.dot(&beta))
-            + lambdas[1] * beta.dot(&s2.dot(&beta));
+        let penalty_quad =
+            lambdas[0] * beta.dot(&s1.dot(&beta)) + lambdas[1] * beta.dot(&s2.dot(&beta));
 
         // RSS: ||y - Xβ||² (simulated)
         let deviance = 10.0; // fixed for this test
@@ -1275,11 +1467,7 @@ mod tests {
         s_total.scaled_add(lambdas[1], &s2);
         let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
         let tol = 1e-10;
-        let log_det_s: f64 = s_eigs
-            .iter()
-            .filter(|&&v| v > tol)
-            .map(|&v| v.ln())
-            .sum();
+        let log_det_s: f64 = s_eigs.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum();
         let penalty_rank = s_eigs.iter().filter(|&&v| v > tol).count();
 
         // Penalty logdet first derivatives (numerical for correctness).
@@ -1359,8 +1547,7 @@ mod tests {
         let rho = vec![1.0, -0.5];
         let solution = build_gaussian_test_solution(&rho);
 
-        let result =
-            reml_laml_evaluate(&solution, &rho, EvalMode::ValueAndGradient, None).unwrap();
+        let result = reml_laml_evaluate(&solution, &rho, EvalMode::ValueAndGradient, None).unwrap();
         let analytic_grad = result.gradient.unwrap();
 
         // Finite-difference gradient
@@ -1370,18 +1557,16 @@ mod tests {
             let mut rho_plus = rho.clone();
             rho_plus[k] += eps;
             let sol_plus = build_gaussian_test_solution(&rho_plus);
-            let cost_plus =
-                reml_laml_evaluate(&sol_plus, &rho_plus, EvalMode::ValueOnly, None)
-                    .unwrap()
-                    .cost;
+            let cost_plus = reml_laml_evaluate(&sol_plus, &rho_plus, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
 
             let mut rho_minus = rho.clone();
             rho_minus[k] -= eps;
             let sol_minus = build_gaussian_test_solution(&rho_minus);
-            let cost_minus =
-                reml_laml_evaluate(&sol_minus, &rho_minus, EvalMode::ValueOnly, None)
-                    .unwrap()
-                    .cost;
+            let cost_minus = reml_laml_evaluate(&sol_minus, &rho_minus, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
 
             fd_grad[k] = (cost_plus - cost_minus) / (2.0 * eps);
         }

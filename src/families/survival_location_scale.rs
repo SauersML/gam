@@ -2866,7 +2866,54 @@ pub fn fit_survival_location_scale(
     }
 
     let anchorrow = select_anchorrow(&spec.age_entry, spec.time_anchor)?;
-    let time_prepared = prepare_identified_time_block(&spec.time_block, anchorrow)?;
+    let mut time_prepared = prepare_identified_time_block(&spec.time_block, anchorrow)?;
+
+    // When initial_beta is None and derivative offsets are near-zero (linear
+    // baseline), the solver would start with d_raw = X_deriv * 0 + 0 = 0 for
+    // all rows.  The log(g) term in the likelihood then produces derivatives
+    // scaled as 1/softness (~1e6) and 1/softness² (~1e12), creating an
+    // extremely ill-conditioned Newton system that can produce NaN betas.
+    //
+    // Fix: compute a least-squares initial beta so that d_raw starts at a
+    // reasonable positive value (~1/exit_time), avoiding the degenerate zero
+    // initialization entirely.
+    if time_prepared.initial_beta.is_none() {
+        let deriv_offset_max = spec
+            .time_block
+            .derivative_offset_exit
+            .iter()
+            .fold(0.0_f64, |a, &v| a.max(v.abs()));
+        if deriv_offset_max < 1e-8 {
+            let x = &time_prepared.design_derivative_exit;
+            let p = x.ncols();
+            if p > 0 && n > 0 {
+                // Target: d_raw[i] ≈ 1 / age_exit[i] (natural hazard-rate scale).
+                let mut target = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    target[i] = 1.0 / spec.age_exit[i].max(1e-9);
+                }
+                // Solve (X^T X + eps I)^{-1} X^T target via normal equations.
+                let xtx = x.t().dot(x);
+                let xty = x.t().dot(&target);
+                let eps = 1e-6 * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
+                let mut lhs = xtx;
+                for i in 0..p {
+                    lhs[[i, i]] += eps;
+                }
+                // Small dense solve via Cholesky.
+                use crate::faer_ndarray::FaerCholesky;
+                if let Ok(chol) = lhs.cholesky(faer::Side::Lower) {
+                    let beta_init = chol.solvevec(&xty);
+                    // Verify the initial beta gives finite, positive d_raw.
+                    let d_raw_init = x.dot(&beta_init);
+                    if d_raw_init.iter().all(|v| v.is_finite() && *v > 0.0) {
+                        time_prepared.initial_beta = Some(beta_init);
+                    }
+                }
+            }
+        }
+    }
+
     let time_stacked_design = stack_time_design(&TimeBlockInput {
         design_entry: time_prepared.design_entry.clone(),
         design_exit: time_prepared.design_exit.clone(),
