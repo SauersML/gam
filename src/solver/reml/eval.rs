@@ -2164,6 +2164,195 @@ impl<'a> RemlState<'a> {
                             gradview[k_idx] = gk;
                         }
                     }
+
+                    // ---- Tierney-Kadane LAML gradient correction ----
+                    //
+                    // The LAML objective includes a TK skewness correction:
+                    //   TK(ρ) = -(1/6) Σ_j s_j³ T_j
+                    // where s_j = (H⁻¹)_{jj} and T_j = Σ_i c_i x_{ij}³.
+                    //
+                    // The cost gradient must include -∂TK/∂ρ_k for consistency
+                    // with the objective. Without this, BFGS sees an objective
+                    // that includes TK but a gradient that ignores it.
+                    //
+                    // Derivation (product rule on s_j³ T_j):
+                    //
+                    //   ∂TK/∂ρ_k = (1/2) Σ_j s²_j T_j (H⁻¹ H_k H⁻¹)_{jj}   [term A]
+                    //             + (λ_k/6) Σ_j s³_j (M v_k)_j                  [term B]
+                    //
+                    // where:
+                    //   H_k = dH/dρ_k (total derivative, includes third-deriv term),
+                    //   M_{jm} = Σ_i d_i x_{ij}³ x_{im}  (fourth-derivative tensor),
+                    //   v_k = H⁻¹(S_k β̂),  d_i = d²W_i/dη_i² (fourth-deriv array).
+                    //
+                    // Term A rewrites via the H_+^† factor W:
+                    //   Σ_j w_j (WF_kW')_{jj} = tr(G F_k)
+                    //   where G = W' diag(w) W, w = s²⊙T, F_k = W'H_kW.
+                    //   Using H_k = λ_k S_k + X'diag(c⊙u_k)X with u_k = -λ_k X v_k:
+                    //     tr(G F_k) = λ_k[tr(G P_k'P_k) - r_G' g_k]
+                    //   where P_k=R_kW, g_k=W'(S_kβ̂), h_G_i=z_i'Gz_i,
+                    //   r_G = (XW)'(c⊙h_G).
+                    //
+                    // Term B rewrites via precomputation:
+                    //   Σ_j s³_j (M v_k)_j = [X'(d⊙g)]' v_k =: f' v_k
+                    //   where g_i = Σ_j s³_j x_{ij}³.
+                    //
+                    // Cost gradient contribution: -∂TK/∂ρ_k.
+                    if w_pos.ncols() > 0 && w_pos.nrows() > 0 && k_count > 0 {
+                        let p_eff = w_pos.nrows();
+                        let rank = w_pos.ncols();
+
+                        // s_j = (H⁻¹)_{jj} ≈ (WW')_{jj}
+                        let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+                        for j in 0..p_eff {
+                            for a in 0..rank {
+                                h_inv_diag[j] += w_pos[[j, a]].powi(2);
+                            }
+                        }
+
+                        // T_j = Σ_i c_i x_{ij}³
+                        let c_arr = Array1::from_vec(cvec.to_vec());
+                        let third_deriv = self
+                            .third_derivative_projection_from_design(
+                                x_transformed_eval,
+                                &c_arr,
+                            )?;
+
+                        // s³ and TK value for gating
+                        let s_cubed: Array1<f64> = h_inv_diag.mapv(|s| s * s * s);
+                        let tk_value: f64 = s_cubed
+                            .iter()
+                            .zip(third_deriv.iter())
+                            .map(|(&s3, &t)| s3 * t)
+                            .sum::<f64>()
+                            * (-1.0 / 6.0);
+
+                        // Only add TK gradient when the correction is non-trivial.
+                        // This gates the O(np² + nr²) cost for biobank-scale models
+                        // where the posterior is nearly Gaussian and TK ≈ 0.
+                        if tk_value.abs() > 1e-12 {
+                            let s_squared: Array1<f64> = h_inv_diag.mapv(|s| s * s);
+
+                            // ---- Term B precomputation ----
+                            // g_i = Σ_j s³_j x_{ij}³  (row-wise cubed multiply)
+                            let g_vec = Self::cubed_forward_multiply_rows(
+                                x_transformed_eval,
+                                &s_cubed,
+                            )?;
+
+                            // f = X'(d ⊙ g) = M' s³  (the per-coefficient sensitivity)
+                            let d_arr = &pirls_result.solve_d_array;
+                            let dg = Array1::from_shape_fn(nobs, |i| {
+                                let di = if i < d_arr.len() { d_arr[i] } else { 0.0 };
+                                let gi = g_vec[i];
+                                if di.is_finite() && gi.is_finite() {
+                                    di * gi
+                                } else {
+                                    0.0
+                                }
+                            });
+                            let f_vec =
+                                x_transformed_eval.transpose_vector_multiply(&dg);
+
+                            // ---- Term A precomputation ----
+                            // G = W' diag(s² ⊙ T) W  (r×r)
+                            let w_weight = &s_squared * &third_deriv;
+                            let g_mat = {
+                                let mut g = Array2::<f64>::zeros((rank, rank));
+                                for a in 0..rank {
+                                    for b in a..rank {
+                                        let mut acc = 0.0;
+                                        for j in 0..p_eff {
+                                            acc += w_weight[j]
+                                                * w_pos[[j, a]]
+                                                * w_pos[[j, b]];
+                                        }
+                                        g[[a, b]] = acc;
+                                        g[[b, a]] = acc;
+                                    }
+                                }
+                                g
+                            };
+
+                            // M = WGW' (p×p)
+                            let wg = w_pos.dot(&g_mat);
+                            let m_mat = wg.dot(&w_pos.t());
+
+                            // h_G_i = x_i' M x_i (G-weighted leverage, no floor)
+                            let h_g = Self::quadratic_form_diag_signed(
+                                x_transformed_eval,
+                                &m_mat,
+                            )?;
+
+                            // r_G = (XW)'(c ⊙ h_G) = W' X'(c ⊙ h_G)
+                            let c_hg = Array1::from_shape_fn(nobs, |i| {
+                                let ci = if i < cvec.len() { cvec[i] } else { 0.0 };
+                                let hgi = h_g[i];
+                                if ci.is_finite() && hgi.is_finite() {
+                                    ci * hgi
+                                } else {
+                                    0.0
+                                }
+                            });
+                            let xt_chg = x_transformed_eval
+                                .transpose_vector_multiply(&c_hg);
+                            let r_g = w_pos.t().dot(&xt_chg); // r-vector
+
+                            // g_k = W' (S_k β̂) for each k (r × k_count)
+                            let wt_sk_beta = w_pos.t().dot(&s_k_beta_mat);
+
+                            // ---- Per-k TK gradient ----
+                            let mut tk_grad = Array1::<f64>::zeros(k_count);
+                            for k in 0..k_count {
+                                let v_k = v_all.column(k);
+                                let g_k = wt_sk_beta.column(k);
+
+                                // Term B: -(λ_k/6) f' v_k
+                                let term_b = -(lambdas[k] / 6.0) * f_vec.dot(&v_k);
+
+                                // Term A: -(λ_k/2) [tr(G P_k'P_k) - r_G' g_k]
+                                let r_k = &rs_transformed[k];
+                                let rkw = r_k.dot(w_pos);
+                                let pkpk = rkw.t().dot(&rkw); // r×r
+                                let tr_g_pkpk: f64 = g_mat
+                                    .iter()
+                                    .zip(pkpk.iter())
+                                    .map(|(&gv, &pv)| gv * pv)
+                                    .sum();
+                                let term_a =
+                                    -(lambdas[k] / 2.0) * (tr_g_pkpk - r_g.dot(&g_k));
+
+                                tk_grad[k] = term_a + term_b;
+                            }
+
+                            // Guard against non-finite values
+                            for val in tk_grad.iter_mut() {
+                                if !val.is_finite() {
+                                    *val = 0.0;
+                                }
+                            }
+
+                            {
+                                let mut gradview = workspace.costgradientview(len);
+                                for k in 0..k_count {
+                                    gradview[k] += tk_grad[k];
+                                }
+                            }
+
+                            if log::log_enabled!(log::Level::Debug) {
+                                let tk_grad_norm: f64 = tk_grad
+                                    .iter()
+                                    .map(|v| v * v)
+                                    .sum::<f64>()
+                                    .sqrt();
+                                log::debug!(
+                                    "[REML] TK gradient correction: |TK|={:.3e}, ||∇TK||={:.3e}",
+                                    tk_value.abs(),
+                                    tk_grad_norm,
+                                );
+                            }
+                        }
+                    }
                 }
             }
 

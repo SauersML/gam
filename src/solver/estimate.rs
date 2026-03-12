@@ -2137,6 +2137,213 @@ where
         0.0
     };
 
+    // ---- Skewness diagnostic & automatic joint (β, ρ) HMC fallback ----
+    //
+    // For non-Gaussian models, check if the Laplace approximation to the
+    // marginal likelihood is reliable. If the posterior has high skewness,
+    // LAML picks the wrong λ. We detect this and automatically fall back
+    // to joint (β, ρ) NUTS sampling which bypasses Laplace entirely.
+    let (final_rho, pirls_res) = if !matches!(cfg.link_function(), LinkFunction::Identity)
+        && !pirls_res.solve_c_array.is_empty()
+    {
+        // Compute per-coefficient skewness diagnostic
+        let h_eff = &pirls_res.stabilizedhessian_transformed;
+        let p_eff = h_eff.ncols();
+        let h_inv_diag = if p_eff > 0 {
+            if let Ok(chol) = h_eff.cholesky(Side::Lower) {
+                let mut diag = Array1::<f64>::zeros(p_eff);
+                for j in 0..p_eff {
+                    let mut e_j = Array1::<f64>::zeros(p_eff);
+                    e_j[j] = 1.0;
+                    diag[j] = chol.solvevec(&e_j)[j];
+                }
+                diag
+            } else {
+                Array1::<f64>::zeros(p_eff)
+            }
+        } else {
+            Array1::<f64>::zeros(0)
+        };
+
+        let c_arr = {
+            let mut c = Array1::from_vec(pirls_res.solve_c_array.clone());
+            for val in c.iter_mut() {
+                if !val.is_finite() {
+                    *val = 0.0;
+                }
+            }
+            c
+        };
+        let third_deriv = if let Ok(td) =
+            reml_state.third_derivative_projection_from_design(
+                &pirls_res.x_transformed,
+                &c_arr,
+            )
+        {
+            td
+        } else {
+            Array1::<f64>::zeros(p_eff)
+        };
+
+        let (max_skewness, skewness_vec) =
+            crate::hmc::laplace_skewness_diagnostic(&h_inv_diag, &third_deriv);
+
+        if max_skewness > crate::hmc::SKEWNESS_HMC_THRESHOLD {
+            log::warn!(
+                "[REML] High posterior skewness detected (max |s_j| = {:.3}). \
+                 Falling back to joint (β, ρ) HMC to refine smoothing parameters.",
+                max_skewness,
+            );
+
+            // Log which coefficients are skewed
+            let n_skewed = skewness_vec.iter().filter(|s| s.abs() > 0.3).count();
+            log::info!(
+                "[Joint HMC] {}/{} coefficients have |skewness| > 0.3",
+                n_skewed,
+                p_eff,
+            );
+
+            // Build inputs for joint HMC.
+            // We need the design matrix in dense form for HMC.
+            let x_dense = pirls_res.x_transformed.to_dense_arc();
+            let x_view = x_dense.view();
+
+            // Weights and response from PIRLS
+            let y_view = y_o.view();
+            let w_view = w_o.view();
+
+            // Beta mode (transformed)
+            let mode_view = pirls_res.beta_transformed.view();
+
+            // Hessian (stabilized, transformed)
+            let hessian_view = pirls_res.stabilizedhessian_transformed.view();
+
+            // Penalty roots (transformed)
+            let penalty_roots_cloned: Vec<Array2<f64>> = pirls_res
+                .reparam_result
+                .rs_transformed
+                .clone();
+
+            let rho_view = final_rho.view();
+
+            let is_logit = matches!(cfg.link_function(), LinkFunction::Logit);
+
+            let hmc_inputs = crate::hmc::JointBetaRhoInputs {
+                x: x_view,
+                y: y_view,
+                weights: w_view,
+                mode: mode_view,
+                hessian: hessian_view,
+                penalty_roots: penalty_roots_cloned,
+                rho_mode: rho_view,
+                is_logit,
+                trigger_skewness: max_skewness,
+            };
+
+            // Adaptive config: scale samples with dimension
+            let total_dim = p_eff + final_rho.len();
+            let hmc_config = crate::hmc::NutsConfig {
+                n_samples: (400 + 50 * total_dim).min(4000),
+                nwarmup: (400 + 50 * total_dim).min(4000),
+                n_chains: 2,
+                target_accept: 0.8,
+                seed: 31_415,
+            };
+
+            match crate::hmc::run_joint_beta_rho_sampling(&hmc_inputs, &hmc_config) {
+                Ok(result) if result.converged => {
+                    log::info!(
+                        "[Joint HMC] Converged (R-hat={:.3}, ESS={:.1}). \
+                         Updating smoothing parameters from posterior mean.",
+                        result.rhat,
+                        result.ess,
+                    );
+
+                    // Use posterior mean ρ as the new smoothing parameters
+                    let new_rho = result.rho_mean;
+
+                    // Re-run final PIRLS at the HMC-informed ρ
+                    match pirls::fit_model_for_fixed_rho(
+                        LogSmoothingParamsView::new(new_rho.view()),
+                        pirls::PirlsProblem {
+                            x: reml_state.x(),
+                            offset: offset_o.view(),
+                            y: y_o.view(),
+                            priorweights: w_o.view(),
+                            covariate_se: None,
+                        },
+                        pirls::PenaltyConfig {
+                            rs_original: &rs_list,
+                            balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
+                            reparam_invariant: None,
+                            p,
+                            coefficient_lower_bounds: None,
+                            linear_constraints_original: fit_linear_constraints.as_ref(),
+                        },
+                        &pirls::PirlsConfig {
+                            link_kind: if let Some(state) = final_mixture_state.clone() {
+                                InverseLink::Mixture(state)
+                            } else if let Some(state) = final_sas_state.clone() {
+                                if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
+                                    InverseLink::BetaLogistic(state)
+                                } else {
+                                    InverseLink::Sas(state)
+                                }
+                            } else {
+                                cfg.link_kind.clone()
+                            },
+                            ..cfg.as_pirls_config()
+                        },
+                        None,
+                    ) {
+                        Ok((new_pirls_res, _)) => (new_rho, new_pirls_res),
+                        Err(e) => {
+                            log::warn!(
+                                "[Joint HMC] Re-PIRLS at posterior ρ failed ({:?}); \
+                                 keeping LAML estimates.",
+                                e,
+                            );
+                            (final_rho, pirls_res)
+                        }
+                    }
+                }
+                Ok(result) => {
+                    log::warn!(
+                        "[Joint HMC] Did not converge (R-hat={:.3}, ESS={:.1}); \
+                         keeping LAML estimates.",
+                        result.rhat,
+                        result.ess,
+                    );
+                    (final_rho, pirls_res)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[Joint HMC] Sampling failed ({}); keeping LAML estimates.",
+                        e,
+                    );
+                    (final_rho, pirls_res)
+                }
+            }
+        } else {
+            if max_skewness > 0.1 {
+                log::info!(
+                    "[REML] Posterior skewness moderate (max |s_j| = {:.3}); \
+                     TK correction sufficient.",
+                    max_skewness,
+                );
+            }
+            (final_rho, pirls_res)
+        }
+    } else {
+        (final_rho, pirls_res)
+    };
+
+    // Recompute beta in case pirls_res was updated by joint HMC
+    let beta_orig_internal = pirls_res
+        .reparam_result
+        .qs
+        .dot(pirls_res.beta_transformed.as_ref());
+
     let lambdas = final_rho.mapv(f64::exp);
     let p_dim = pirls_res.beta_transformed.len();
     let mut edf_by_block = vec![0.0; k];
