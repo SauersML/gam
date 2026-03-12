@@ -6834,7 +6834,7 @@ pub fn select_thin_plate_knots(
 }
 
 #[inline(always)]
-fn thin_plate_kernel_m2_from_dist2(dist2: f64, dimension: usize) -> Result<f64, BasisError> {
+fn thin_plate_kernel_from_dist2(dist2: f64, dimension: usize) -> Result<f64, BasisError> {
     if !dist2.is_finite() || dist2 < 0.0 {
         return Err(BasisError::InvalidInput(
             "thin-plate kernel distance must be finite and non-negative".to_string(),
@@ -6844,19 +6844,22 @@ fn thin_plate_kernel_m2_from_dist2(dist2: f64, dimension: usize) -> Result<f64, 
         return Ok(0.0);
     }
     match dimension {
-        // For the m=2 thin-plate spline, the radial kernel is the biharmonic
-        // fundamental solution modulo low-order polynomials:
+        // For d≤3, the minimum penalty order m=2 (biharmonic) suffices.
+        // Hand-optimized closed forms avoid the overhead of the general evaluator.
         //   d=1:  r^3
         //   d=2:  r^2 log(r)
         //   d=3: -r
-        // The d=3 sign is essential for conditional positive definiteness
-        // after projecting out the polynomial side constraints.
         1 => Ok(dist2 * dist2.sqrt()),
         2 => Ok(0.5 * dist2 * dist2.ln()),
         3 => Ok(-dist2.sqrt()),
-        _ => Err(BasisError::InvalidInput(format!(
-            "thin-plate spline (m=2) currently supports dimensions 1..=3, got {dimension}"
-        ))),
+        _ => {
+            // General case: choose the smallest penalty order m with 2m > d,
+            // i.e. m = floor(d/2) + 1, and evaluate via the Duchon polyharmonic
+            // kernel which handles arbitrary (m, d) combinations.
+            let m = dimension / 2 + 1;
+            let r = dist2.sqrt();
+            Ok(duchon_polyharmonic_block(r, m, dimension))
+        }
     }
 }
 
@@ -6928,7 +6931,7 @@ pub fn create_thin_plate_spline_basiswithworkspace(
                     let delta = data[[i, c]] - knots[[j, c]];
                     dist2 += delta * delta;
                 }
-                row[j] = thin_plate_kernel_m2_from_dist2(dist2, d)?;
+                row[j] = thin_plate_kernel_from_dist2(dist2, d)?;
             }
             Ok(())
         });
@@ -6946,7 +6949,7 @@ pub fn create_thin_plate_spline_basiswithworkspace(
                 let delta = knots[[i, c]] - knots[[j, c]];
                 dist2 += delta * delta;
             }
-            let kij = thin_plate_kernel_m2_from_dist2(dist2, d)?;
+            let kij = thin_plate_kernel_from_dist2(dist2, d)?;
             omega[[i, j]] = kij;
             omega[[j, i]] = kij;
         }
@@ -8810,22 +8813,32 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_plate_kernel_m2_matches_dimensionspecific_forms() {
+    fn test_thin_plate_kernel_matches_dimensionspecific_forms() {
         let dist2 = 4.0;
-        assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(dist2, 1).unwrap(), 8.0);
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(dist2, 1).unwrap(), 8.0);
         assert_abs_diff_eq!(
-            thin_plate_kernel_m2_from_dist2(dist2, 2).unwrap(),
+            thin_plate_kernel_from_dist2(dist2, 2).unwrap(),
             0.5 * dist2 * dist2.ln(),
             epsilon = 1e-12
         );
-        assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(dist2, 3).unwrap(), -2.0);
-        assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(0.0, 3).unwrap(), 0.0);
-        match thin_plate_kernel_m2_from_dist2(dist2, 4) {
-            Err(BasisError::InvalidInput(msg)) => {
-                assert!(msg.contains("supports dimensions 1..=3"));
-            }
-            other => panic!("expected invalid dimension error, got {other:?}"),
-        }
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(dist2, 3).unwrap(), -2.0);
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(0.0, 3).unwrap(), 0.0);
+
+        // d=4: general kernel with m=3, power = 2*3-4 = 2, d even & m>=d/2
+        let val4 = thin_plate_kernel_from_dist2(dist2, 4).unwrap();
+        assert!(val4.is_finite(), "d=4 kernel should be finite, got {val4}");
+        assert_ne!(val4, 0.0, "d=4 kernel at dist2=4 should be nonzero");
+
+        // d=5: m=3, power = 2*3-5 = 1 (odd) → c * r^1
+        let val5 = thin_plate_kernel_from_dist2(dist2, 5).unwrap();
+        assert!(val5.is_finite(), "d=5 kernel should be finite, got {val5}");
+
+        // d=19: m=10, power = 1 → c * r
+        let val19 = thin_plate_kernel_from_dist2(dist2, 19).unwrap();
+        assert!(val19.is_finite(), "d=19 kernel should be finite, got {val19}");
+
+        // Zero distance always returns zero
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(0.0, 7).unwrap(), 0.0);
     }
 
     #[test]

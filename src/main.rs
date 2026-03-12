@@ -121,12 +121,6 @@ fn classify_invalid_tpsspec(lower: &str) -> Option<String> {
     if !lower.contains("thin-plate spline") {
         return None;
     }
-    if lower.contains("supports dimensions 1..=3") {
-        return Some(
-            "Unsupported thin-plate model specification. Joint thin-plate smooths in this CLI currently support only 1 to 3 covariate dimensions; reduce the joint smooth dimension or choose a different basis."
-                .to_string(),
-        );
-    }
     if lower.contains("requires at least d+1 knots") {
         return Some(
             "Invalid thin-plate model specification. Increase the number of centers/knots for this joint smooth or reduce its covariate dimension."
@@ -8065,13 +8059,6 @@ fn build_smooth_basis(
             })
         }
         "tps" | "thinplate" | "thin-plate" => {
-            if cols.len() > 3 {
-                return Err(format!(
-                    "thinplate/tps smooth '{}' uses {} variables, but this CLI currently supports only 1 to 3 dimensions for joint thin-plate smooths. Reduce the joint smooth dimension or choose a different basis.",
-                    vars.join(", "),
-                    cols.len()
-                ));
-            }
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
@@ -10426,13 +10413,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_cli_errorspecializes_thin_plate_dimension_error() {
+    fn classify_cli_errorspecializes_thin_plate_knot_count_error() {
         let err = classify_cli_error(
-            "failed to build term collection design: Invalid input: thin-plate spline (m=2) currently supports dimensions 1..=3, got 6"
+            "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (7), got 3"
                 .to_string(),
         );
         let advice = err.advice().expect("thin-plate advice");
-        assert!(advice.contains("Unsupported thin-plate model specification"));
+        assert!(advice.contains("Increase the number of centers/knots"));
         assert!(!advice.contains("Shape mismatch detected"));
     }
 
@@ -10914,8 +10901,19 @@ mod tests {
     }
 
     #[test]
-    fn build_termspec_rejects_joint_thinplate_above_three_dimensions() {
-        let parsed = parse_formula("y ~ thinplate(pc1, pc2, pc3, pc4)").expect("formula");
+    fn build_termspec_accepts_joint_thinplate_above_three_dimensions() {
+        // TPS supports arbitrary dimensions via the general polyharmonic kernel
+        // with auto-selected penalty order m = floor(d/2) + 1.
+        let parsed =
+            parse_formula("y ~ thinplate(pc1, pc2, pc3, pc4, centers=6)").expect("formula");
+        let n = 20;
+        let mut rng = 42u64;
+        let mut vals = Array2::<f64>::zeros((n, 4));
+        for v in vals.iter_mut() {
+            // simple LCG for deterministic pseudo-random data
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = (rng >> 33) as f64 / (1u64 << 31) as f64;
+        }
         let ds = Dataset {
             headers: vec![
                 "pc1".to_string(),
@@ -10923,11 +10921,7 @@ mod tests {
                 "pc3".to_string(),
                 "pc4".to_string(),
             ],
-            values: array![
-                [0.1, 0.2, 0.3, 0.4],
-                [0.2, 0.3, 0.4, 0.5],
-                [0.3, 0.4, 0.5, 0.6],
-            ],
+            values: vals,
             schema: DataSchema {
                 columns: vec![
                     SchemaColumn {
@@ -10966,10 +10960,9 @@ mod tests {
             ("pc4".to_string(), 3usize),
         ]);
         let mut inference_notes = Vec::<String>::new();
-        let err = super::build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
-            .expect_err("expected thin-plate dimension validation failure");
-        assert!(err.contains("currently supports only 1 to 3 dimensions"));
-        assert!(err.contains("pc1, pc2, pc3, pc4"));
+        let spec = super::build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+            .expect("4-d TPS should be accepted");
+        assert_eq!(spec.smooth_terms.len(), 1, "should have one smooth term");
     }
 
     #[test]

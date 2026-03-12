@@ -2146,12 +2146,7 @@ impl<'a> RemlState<'a> {
                             if !tracethird.is_finite() {
                                 tracethird = 0.0;
                             }
-                            // Auto-correct third-derivative contribution in numerically
-                            // brittle regimes: cap its magnitude relative to the primary
-                            // trace term so one noisy contraction cannot dominate the
-                            // hyper-gradient.
-                            let cap = (trace_h_inv_s_k.abs() + 1.0) * 10.0;
-                            tracethird = tracethird.clamp(-cap, cap);
+
                             let trace_term = trace_h_inv_s_k - tracethird;
                             let log_det_hgrad_term = 0.5 * lambdas[k_idx] * trace_term;
                             let corrected_log_det_h = log_det_hgrad_term;
