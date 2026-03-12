@@ -11659,8 +11659,14 @@ mod tests {
             .sum::<f64>()
             .sqrt();
 
-        assert!(design_err < 5e-3, "Matérn public second-derivative design mismatch: {design_err}");
-        assert!(penalty_err < 5e-3, "Matérn public second-derivative penalty mismatch: {penalty_err}");
+        assert!(
+            design_err < 5e-3,
+            "Matérn public second-derivative design mismatch: {design_err}"
+        );
+        assert!(
+            penalty_err < 5e-3,
+            "Matérn public second-derivative penalty mismatch: {penalty_err}"
+        );
     }
 
     #[test]
@@ -11686,8 +11692,8 @@ mod tests {
         spec_plus.length_scale = Some(ls_plus);
         spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis_log_kappa_derivative(data.view(), &spec_plus).expect("plus");
-        let minus = build_duchon_basis_log_kappa_derivative(data.view(), &spec_minus)
-            .expect("minus");
+        let minus =
+            build_duchon_basis_log_kappa_derivative(data.view(), &spec_minus).expect("minus");
 
         let fd_design = (&plus.design_derivative - &minus.design_derivative) / (2.0 * eps);
         let fd_penalty =
@@ -11704,8 +11710,14 @@ mod tests {
             .sum::<f64>()
             .sqrt();
 
-        assert!(design_err < 5e-3, "Duchon public second-derivative design mismatch: {design_err}");
-        assert!(penalty_err < 5e-3, "Duchon public second-derivative penalty mismatch: {penalty_err}");
+        assert!(
+            design_err < 5e-3,
+            "Duchon public second-derivative design mismatch: {design_err}"
+        );
+        assert!(
+            penalty_err < 5e-3,
+            "Duchon public second-derivative penalty mismatch: {penalty_err}"
+        );
     }
 
     #[test]
