@@ -2022,6 +2022,476 @@ pub fn run_nuts_sampling_flattened_family(
 }
 
 // ============================================================================
+// Joint (β, ρ) HMC for Skewed Posteriors
+// ============================================================================
+//
+// When the Laplace approximation to the marginal likelihood is unreliable
+// (high posterior skewness), we bypass LAML entirely and sample from the
+// joint posterior p(β, ρ | y) ∝ p(y|β) p(β|ρ) p(ρ).
+//
+// The joint log-posterior is:
+//   log p(β, ρ | y) = ℓ(y|β) - 0.5 β'S(ρ)β + 0.5 log|S(ρ)|_+ + log p(ρ) + const
+//
+// Gradients:
+//   ∇_β: ∇_β ℓ - S(ρ) β
+//   ∂/∂ρ_k: -0.5 λ_k β'S_k β + 0.5 tr(S_+⁻¹ A_k) + ∂log p(ρ)/∂ρ_k
+//
+// This completely avoids the Laplace approximation — no log|H| term needed.
+// The sampler explores the full posterior including smoothing parameters.
+
+/// Skewness diagnostic for the Laplace approximation.
+///
+/// Computes per-coefficient posterior skewness s_j = (H⁻¹)_{jj}^{3/2} · T_j
+/// where T_j = Σ_i c_i x_{ij}³ is the third-derivative projection.
+///
+/// Returns (max_abs_skewness, per_coefficient_skewness).
+pub fn laplace_skewness_diagnostic(
+    h_inv_diag: &Array1<f64>,
+    third_deriv: &Array1<f64>,
+) -> (f64, Array1<f64>) {
+    let p = h_inv_diag.len().min(third_deriv.len());
+    let mut skewness = Array1::<f64>::zeros(p);
+    let mut max_abs = 0.0_f64;
+    for j in 0..p {
+        let s = h_inv_diag[j];
+        let s_j = s.sqrt() * s * third_deriv[j]; // s^{3/2} * T_j
+        skewness[j] = if s_j.is_finite() { s_j } else { 0.0 };
+        max_abs = max_abs.max(skewness[j].abs());
+    }
+    (max_abs, skewness)
+}
+
+/// Threshold for triggering joint (β, ρ) HMC.
+/// When max|skewness_j| exceeds this, the Laplace approximation is unreliable
+/// and NUTS on the joint space is used to refine smoothing parameters.
+pub const SKEWNESS_HMC_THRESHOLD: f64 = 0.5;
+
+/// Result of joint (β, ρ) sampling.
+#[derive(Clone, Debug)]
+pub struct JointBetaRhoResult {
+    /// Coefficient samples: shape (n_total_samples, n_beta)
+    pub beta_samples: Array2<f64>,
+    /// Log-smoothing parameter samples: shape (n_total_samples, n_rho)
+    pub rho_samples: Array2<f64>,
+    /// Posterior mean of β
+    pub beta_mean: Array1<f64>,
+    /// Posterior mean of ρ
+    pub rho_mean: Array1<f64>,
+    /// R-hat diagnostic
+    pub rhat: f64,
+    /// Effective sample size
+    pub ess: f64,
+    /// Whether sampling converged
+    pub converged: bool,
+    /// Max skewness that triggered this sampling
+    pub trigger_skewness: f64,
+}
+
+/// Joint (β, ρ) posterior target for NUTS.
+///
+/// Samples from p(β, ρ | y) ∝ p(y|β) p(β|ρ) p(ρ) directly,
+/// completely bypassing the Laplace approximation.
+///
+/// The parameter vector is [z_β; ρ] where z_β = L⁻¹(β - μ) is the
+/// whitened β and ρ is the raw log-smoothing parameters.
+struct JointBetaRhoPosterior {
+    data: SharedData,
+    /// L where LL' = H⁻¹ (whitening for β block)
+    chol: Array2<f64>,
+    /// L' for chain rule
+    chol_t: Array2<f64>,
+    /// Logit or Gaussian
+    is_logit: bool,
+    /// Dimension of β
+    n_beta: usize,
+    /// Dimension of ρ
+    n_rho: usize,
+    /// Penalty root matrices R_k where S_k = R_k' R_k (in transformed basis)
+    penalty_roots: Vec<Array2<f64>>,
+    /// Prior std dev on ρ (weakly informative Gaussian)
+    rho_prior_sd: f64,
+    /// LAML-converged ρ (used as centering for ρ prior)
+    rho_mode: Array1<f64>,
+}
+
+impl JointBetaRhoPosterior {
+    fn new(
+        x: ArrayView2<f64>,
+        y: ArrayView1<f64>,
+        weights: ArrayView1<f64>,
+        mode: ArrayView1<f64>,
+        hessian: ArrayView2<f64>,
+        penalty_roots: Vec<Array2<f64>>,
+        rho_mode: ArrayView1<f64>,
+        is_logit: bool,
+    ) -> Result<Self, String> {
+        let n_samples = x.nrows();
+        let n_beta = x.ncols();
+        let n_rho = penalty_roots.len();
+
+        if rho_mode.len() != n_rho {
+            return Err(format!(
+                "rho_mode length {} != penalty_roots count {}",
+                rho_mode.len(),
+                n_rho
+            ));
+        }
+
+        // Cholesky of H for β-whitening (same as NutsPosterior)
+        let hessian_owned = hessian.to_owned();
+        let chol_factor = hessian_owned
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("Joint HMC: Hessian Cholesky failed: {:?}", e))?;
+        let l_h = chol_factor.lower_triangular();
+        let chol = solve_upper_triangular_transpose(&l_h, n_beta);
+        let chol_t = chol.t().to_owned();
+
+        // Build combined penalty at the LAML mode (for SharedData)
+        let lambdas_mode: Array1<f64> = rho_mode.mapv(f64::exp);
+        let mut s_combined = Array2::<f64>::zeros((n_beta, n_beta));
+        for (k, r_k) in penalty_roots.iter().enumerate() {
+            let s_k = r_k.t().dot(r_k);
+            s_combined.scaled_add(lambdas_mode[k], &s_k);
+        }
+
+        let data = SharedData {
+            x: Arc::new(x.to_owned()),
+            y: Arc::new(y.to_owned()),
+            weights: Arc::new(weights.to_owned()),
+            penalty: Arc::new(s_combined),
+            mode: Arc::new(mode.to_owned()),
+            n_samples,
+            dim: n_beta,
+        };
+
+        // Weakly informative prior on ρ: N(rho_mode, 3²)
+        // This is broad enough to let the data speak but prevents
+        // runaway smoothing parameters.
+        let rho_prior_sd = 3.0;
+
+        Ok(Self {
+            data,
+            chol,
+            chol_t,
+            is_logit,
+            n_beta,
+            n_rho,
+            penalty_roots,
+            nullspace_dims,
+            rho_prior_sd,
+            rho_mode: rho_mode.to_owned(),
+        })
+    }
+
+    /// Compute the joint log-posterior and gradient.
+    ///
+    /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho)]
+    fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>) {
+        let n_beta = self.n_beta;
+        let n_rho = self.n_rho;
+
+        // Split parameter vector
+        let z = params.slice(ndarray::s![..n_beta]).to_owned();
+        let rho = params.slice(ndarray::s![n_beta..]).to_owned();
+        let lambdas: Array1<f64> = rho.mapv(f64::exp);
+
+        // Un-whiten: β = μ + L z
+        let beta = self.data.mode.as_ref() + &self.chol.dot(&z);
+
+        // η = X β
+        let eta = self.data.x.dot(&beta);
+
+        // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
+        let (ll, grad_ll_beta) = if self.is_logit {
+            let n = self.data.n_samples;
+            let mut ll = 0.0;
+            let mut residual = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let eta_i = eta[i];
+                let y_i = self.data.y[i];
+                let w_i = self.data.weights[i];
+                ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
+                let mu = NutsPosterior::sigmoid_stable(eta_i);
+                residual[i] = w_i * (y_i - mu);
+            }
+            let grad_ll = fast_atv(&self.data.x, &residual);
+            (ll, grad_ll)
+        } else {
+            let n = self.data.n_samples;
+            let mut ll = 0.0;
+            let mut weighted_residual = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let residual = self.data.y[i] - eta[i];
+                let w_i = self.data.weights[i];
+                ll -= 0.5 * w_i * residual * residual;
+                weighted_residual[i] = w_i * residual;
+            }
+            let grad_ll = fast_atv(&self.data.x, &weighted_residual);
+            (ll, grad_ll)
+        };
+
+        // ---- Penalty: -0.5 β'S(ρ)β ----
+        // S(ρ) = Σ_k λ_k S_k = Σ_k λ_k R_k'R_k
+        let mut penalty_val = 0.0;
+        let mut s_beta = Array1::<f64>::zeros(n_beta);
+        let mut grad_rho = Array1::<f64>::zeros(n_rho);
+
+        for (k, r_k) in self.penalty_roots.iter().enumerate() {
+            let r_beta = r_k.dot(&beta);
+            let quad_k = r_beta.dot(&r_beta); // β'S_k β
+            penalty_val += 0.5 * lambdas[k] * quad_k;
+
+            // Accumulate S(ρ)β for β-gradient
+            let s_k_beta = r_k.t().dot(&r_beta);
+            s_beta.scaled_add(lambdas[k], &s_k_beta);
+
+            // ρ_k gradient from penalty: -0.5 λ_k β'S_k β
+            grad_rho[k] = -0.5 * lambdas[k] * quad_k;
+        }
+
+        // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|_+ ----
+        // Compute via eigendecomposition of S(ρ).
+        let mut s_rho = Array2::<f64>::zeros((n_beta, n_beta));
+        for (k, r_k) in self.penalty_roots.iter().enumerate() {
+            let s_k = r_k.t().dot(r_k);
+            s_rho.scaled_add(lambdas[k], &s_k);
+        }
+        let (log_det_s, s_inv_opt) = {
+            match s_rho.eigh(Side::Lower) {
+                Ok((evals, evecs)) => {
+                    let floor = 1e-10;
+                    let lds: f64 = evals.iter().filter(|&&v| v > floor).map(|&v| v.ln()).sum();
+                    // S_+⁻¹ for gradient: only invert on kept subspace
+                    let mut s_inv = Array2::<f64>::zeros((n_beta, n_beta));
+                    for i in 0..evals.len() {
+                        if evals[i] > floor {
+                            let u = evecs.column(i);
+                            // s_inv += (1/evals[i]) * u u'
+                            for a in 0..n_beta {
+                                for b in 0..n_beta {
+                                    s_inv[[a, b]] += u[a] * u[b] / evals[i];
+                                }
+                            }
+                        }
+                    }
+                    (lds, Some(s_inv))
+                }
+                Err(_) => (0.0, None),
+            }
+        };
+
+        // ρ_k gradient from log|S|_+: +0.5 tr(S_+⁻¹ A_k)
+        // where A_k = λ_k S_k.
+        if let Some(ref s_inv) = s_inv_opt {
+            for (k, r_k) in self.penalty_roots.iter().enumerate() {
+                // tr(S_+⁻¹ λ_k S_k) = λ_k tr(S_+⁻¹ R_k'R_k) = λ_k ||R_k S_inv_half||²
+                // But we just compute tr(S_inv @ A_k) directly.
+                let s_k = r_k.t().dot(r_k);
+                let tr_val: f64 = s_inv
+                    .iter()
+                    .zip(s_k.iter())
+                    .map(|(&si, &sk)| si * sk)
+                    .sum();
+                grad_rho[k] += 0.5 * lambdas[k] * tr_val;
+            }
+        }
+
+        // ---- Prior on ρ: N(rho_mode, σ²I) ----
+        let mut rho_prior = 0.0;
+        let inv_var = 1.0 / (self.rho_prior_sd * self.rho_prior_sd);
+        for k in 0..n_rho {
+            let d = rho[k] - self.rho_mode[k];
+            rho_prior -= 0.5 * inv_var * d * d;
+            grad_rho[k] -= inv_var * d;
+        }
+
+        // ---- Assemble ----
+        let logp = ll - penalty_val + 0.5 * log_det_s + rho_prior;
+
+        // β-gradient in original space: ∇_β ℓ - S(ρ)β
+        let grad_beta = &grad_ll_beta - &s_beta;
+
+        // Chain rule to whitened space: ∇_z = L' ∇_β
+        let grad_z = self.chol_t.dot(&grad_beta);
+
+        // Combined gradient: [∇_z; ∇_ρ]
+        let mut grad = Array1::<f64>::zeros(n_beta + n_rho);
+        grad.slice_mut(ndarray::s![..n_beta]).assign(&grad_z);
+        grad.slice_mut(ndarray::s![n_beta..]).assign(&grad_rho);
+
+        (logp, grad)
+    }
+}
+
+impl HamiltonianTarget<Array1<f64>> for JointBetaRhoPosterior {
+    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        let (logp, g) = self.compute_joint_logp_and_grad(position);
+        grad.assign(&g);
+        logp
+    }
+}
+
+/// Inputs for joint (β, ρ) sampling.
+pub struct JointBetaRhoInputs<'a> {
+    pub x: ArrayView2<'a, f64>,
+    pub y: ArrayView1<'a, f64>,
+    pub weights: ArrayView1<'a, f64>,
+    pub mode: ArrayView1<'a, f64>,
+    pub hessian: ArrayView2<'a, f64>,
+    pub penalty_roots: Vec<Array2<f64>>,
+    pub rho_mode: ArrayView1<'a, f64>,
+    pub is_logit: bool,
+    /// Max posterior skewness that triggered this sampling
+    pub trigger_skewness: f64,
+}
+
+/// Run joint (β, ρ) NUTS sampling.
+///
+/// This is the automatic fallback when the Laplace approximation has high
+/// skewness. It samples from the true joint posterior, completely bypassing
+/// the Laplace approximation for smoothing parameter selection.
+pub fn run_joint_beta_rho_sampling(
+    inputs: &JointBetaRhoInputs<'_>,
+    config: &NutsConfig,
+) -> Result<JointBetaRhoResult, String> {
+    let n_beta = inputs.mode.len();
+    let n_rho = inputs.penalty_roots.len();
+    let total_dim = n_beta + n_rho;
+
+    log::info!(
+        "[Joint HMC] Sampling (β, ρ) jointly: {} β-params + {} ρ-params = {} total (triggered by skewness {:.3})",
+        n_beta, n_rho, total_dim, inputs.trigger_skewness,
+    );
+
+    let target = JointBetaRhoPosterior::new(
+        inputs.x,
+        inputs.y,
+        inputs.weights,
+        inputs.mode,
+        inputs.hessian,
+        inputs.penalty_roots.clone(),
+        inputs.rho_mode,
+        inputs.is_logit,
+    )?;
+
+    let chol = target.chol.clone();
+    let mode_arr = target.data.mode.clone();
+    let rho_mode = target.rho_mode.clone();
+
+    // Initialize chains: z_β at 0 (= mode), ρ at rho_mode
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
+        .map(|_| {
+            let mut pos = Array1::<f64>::zeros(total_dim);
+            // Small jitter for β (whitened space)
+            for j in 0..n_beta {
+                pos[j] = sample_standard_normal(&mut rng) * 0.1;
+            }
+            // Small jitter for ρ around mode
+            for k in 0..n_rho {
+                pos[n_beta + k] = rho_mode[k] + sample_standard_normal(&mut rng) * 0.2;
+            }
+            pos
+        })
+        .collect();
+
+    // Use diagonal mass matrix for the mixed (β, ρ) space.
+    // The ρ components may have very different scale from β components,
+    // and diagonal adaptation handles this.
+    let mass_cfg = {
+        let nwarmup = config.nwarmup;
+        if nwarmup < 80 {
+            NUTSMassMatrixConfig::disabled()
+        } else {
+            let start_buffer = (nwarmup / 8).clamp(30, 180);
+            let end_buffer = (nwarmup / 6).clamp(30, 180);
+            let initial_window = (nwarmup / 10).clamp(25, 140);
+            NUTSMassMatrixConfig {
+                adaptation: MassMatrixAdaptation::Diagonal,
+                start_buffer,
+                end_buffer,
+                initial_window,
+                regularize: 0.1,
+                jitter: 1e-6,
+                dense_max_dim: 75,
+            }
+        }
+    };
+
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
+        target,
+        initial_positions,
+        config.target_accept,
+        mass_cfg,
+    );
+
+    let (samples_array, run_stats) = sampler
+        .run_progress(config.n_samples, config.nwarmup)
+        .map_err(|e| format!("Joint (β,ρ) NUTS sampling failed: {e}"))?;
+    log::info!("[Joint HMC] Sampling complete: {}", run_stats);
+
+    // Unpack samples
+    let shape = samples_array.shape();
+    let n_chains = shape[0];
+    let n_samples_out = shape[1];
+    let total_samples = n_chains * n_samples_out;
+
+    let mut beta_samples = Array2::<f64>::zeros((total_samples, n_beta));
+    let mut rho_samples = Array2::<f64>::zeros((total_samples, n_rho));
+
+    for chain in 0..n_chains {
+        for sample_i in 0..n_samples_out {
+            let sample_idx = chain * n_samples_out + sample_i;
+            let zview = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+
+            // Un-whiten β: β = μ + L z
+            let z_beta = zview.slice(ndarray::s![..n_beta]).to_owned();
+            let beta = mode_arr.as_ref() + &chol.dot(&z_beta);
+            beta_samples.row_mut(sample_idx).assign(&beta);
+
+            // ρ is stored directly
+            let rho_slice = zview.slice(ndarray::s![n_beta..]);
+            rho_samples.row_mut(sample_idx).assign(&rho_slice);
+        }
+    }
+
+    let beta_mean = beta_samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(n_beta));
+    let rho_mean = rho_samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(n_rho));
+
+    let (rhat, ess) = if n_chains >= 2 && n_samples_out >= 4 {
+        (
+            f64::from(run_stats.rhat.mean),
+            f64::from(run_stats.ess.mean),
+        )
+    } else {
+        (1.0, (total_samples as f64) * 0.5)
+    };
+
+    let converged = rhat < 1.1 && ess > 50.0;
+    if !converged {
+        log::warn!(
+            "[Joint HMC] Convergence warning: R-hat={:.3}, ESS={:.1}",
+            rhat, ess,
+        );
+    }
+
+    Ok(JointBetaRhoResult {
+        beta_samples,
+        rho_samples,
+        beta_mean,
+        rho_mean,
+        rhat,
+        ess,
+        converged,
+        trigger_skewness: inputs.trigger_skewness,
+    })
+}
+
+// ============================================================================
 // Survival Model HMC Support
 // ============================================================================
 

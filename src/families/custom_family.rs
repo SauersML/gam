@@ -2073,11 +2073,30 @@ fn pinv_positive_part_with_floor(
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
-    let (evals, _) = FaerEigh::eigh(matrix, Side::Lower)
-        .map_err(|e| format!("eigh failed in positive-part pseudoinverse: {e}"))?;
-    let max_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tol = (max_eval * 1e-12).max(ridge_floor.max(1e-14));
-    pinv_positive_part_with_floor(matrix, tol)
+    // SVD-based pseudoinverse: unconditionally convergent, unlike eigh which
+    // can fail on pathological matrices from degenerate GAMLSS Hessians.
+    let (u_opt, singular, vt_opt) = matrix
+        .svd(true, true)
+        .map_err(|e| format!("SVD failed in positive-part pseudoinverse: {e}"))?;
+    let u = u_opt.ok_or("SVD did not produce left singular vectors")?;
+    let vt = vt_opt.ok_or("SVD did not produce right singular vectors")?;
+    let max_sv = singular.iter().fold(0.0_f64, |a, &b| a.max(b));
+    let tol = (max_sv * 1e-12).max(ridge_floor.max(1e-14));
+    let p = matrix.nrows();
+    let mut pinv = Array2::<f64>::zeros((p, p));
+    for k in 0..p.min(singular.len()) {
+        let sv = singular[k];
+        if sv > tol {
+            let inv_sv = 1.0 / sv;
+            for i in 0..p {
+                let vik = vt[(k, i)]; // V^T row k = V column k
+                for j in 0..p {
+                    pinv[[i, j]] += inv_sv * vik * u[(j, k)];
+                }
+            }
+        }
+    }
+    Ok(pinv)
 }
 
 fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(family: &F) -> bool {
