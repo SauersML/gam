@@ -472,7 +472,7 @@ impl RemlConfig {
     }
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;

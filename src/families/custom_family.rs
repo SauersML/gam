@@ -90,6 +90,19 @@ pub trait CustomFamily {
     /// Evaluate log-likelihood and per-block working quantities at current block predictors.
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String>;
 
+    /// Compute only the log-likelihood without building working sets.
+    ///
+    /// This is used in backtracking line searches where only the objective value
+    /// is needed, avoiding the O(n × blocks) cost of assembling IRLS working
+    /// weights and responses that will be immediately discarded.
+    ///
+    /// The default implementation falls back to `evaluate()` and discards the
+    /// working sets.  Families with expensive working-set assembly should
+    /// override this for a significant speedup.
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        self.evaluate(block_states).map(|e| e.log_likelihood)
+    }
+
     /// Selects the outer objective semantics for exact-Newton families.
     ///
     /// `QuadraticReml` is the classical blockwise REML/LAML surface:
@@ -1106,17 +1119,15 @@ struct BlockUpdateResult {
 }
 
 #[inline]
-fn floor_positiveworkingweight(rawweight: f64, minweight: f64) -> f64 {
-    if rawweight <= 0.0 {
-        0.0
-    } else {
-        rawweight.max(minweight)
-    }
-}
-
-#[inline]
 fn floor_positiveworking_weights(working_weights: &Array1<f64>, minweight: f64) -> Array1<f64> {
-    working_weights.mapv(|wi| floor_positiveworkingweight(wi, minweight))
+    let n = working_weights.len();
+    let mut out = Array1::<f64>::uninit(n);
+    for i in 0..n {
+        let wi = working_weights[i];
+        out[i].write(if wi <= 0.0 { 0.0 } else { wi.max(minweight) });
+    }
+    // SAFETY: all elements written in the loop above.
+    unsafe { out.assume_init() }
 }
 
 trait ParameterBlockUpdater {
@@ -1749,6 +1760,26 @@ fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     t
 }
 
+/// Compute tr(A * B) when B is block-diagonal — only the sub-block [start..end, start..end]
+/// is non-zero. This is O(block^2) instead of O(total^2).
+fn trace_product_block(
+    a: &Array2<f64>,
+    b_block: &Array2<f64>,
+    start: usize,
+    end: usize,
+) -> f64 {
+    let block_size = end - start;
+    debug_assert_eq!(b_block.nrows(), block_size);
+    debug_assert_eq!(b_block.ncols(), block_size);
+    let mut t = 0.0;
+    for i in 0..block_size {
+        for j in 0..block_size {
+            t += a[[start + i, start + j]] * b_block[[j, i]];
+        }
+    }
+    t
+}
+
 fn trace_jinv_a_jinv_b(j_inv: &Array2<f64>, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     // tr(J^{-1} A J^{-1} B) computed without forming explicit Kronecker products.
     let tmp = j_inv.dot(a);
@@ -2183,33 +2214,54 @@ fn inner_blockwise_fit<F: CustomFamily>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    let initial_eval = family.evaluate(&states)?;
+    let mut cached_eval = family.evaluate(&states)?;
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-    let mut lastobjective = -initial_eval.log_likelihood + current_penalty;
+    let mut lastobjective = -cached_eval.log_likelihood + current_penalty;
     let mut converged = false;
     let mut cycles_done = 0usize;
 
+    let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
         let mut max_beta_step = 0.0_f64;
 
         let mut objective_cycle_prev = lastobjective;
+        // Reuse cached evaluation from end of previous cycle (or initial eval).
+        // For non-dynamic families this avoids a redundant evaluate per cycle.
+        // Dynamic families re-evaluate per block to capture geometry changes.
+        let mut cycle_eval = if is_dynamic {
+            family.evaluate(&states)?
+        } else {
+            std::mem::replace(
+                &mut cached_eval,
+                FamilyEvaluation {
+                    log_likelihood: 0.0,
+                    blockworking_sets: Vec::new(),
+                },
+            )
+        };
+        if cycle_eval.blockworking_sets.len() != specs.len() {
+            return Err(format!(
+                "family returned {} block working sets, expected {}",
+                cycle_eval.blockworking_sets.len(),
+                specs.len()
+            ));
+        }
         for b in 0..specs.len() {
-            // Keep all blocks synchronized with any dynamic geometry.
-            if family.block_geometry_is_dynamic() {
+            if is_dynamic {
                 refresh_all_block_etas(family, specs, &mut states)?;
-            }
-            let eval = family.evaluate(&states)?;
-            if eval.blockworking_sets.len() != specs.len() {
-                return Err(format!(
-                    "family returned {} block working sets, expected {}",
-                    eval.blockworking_sets.len(),
-                    specs.len()
-                ));
+                cycle_eval = family.evaluate(&states)?;
+                if cycle_eval.blockworking_sets.len() != specs.len() {
+                    return Err(format!(
+                        "family returned {} block working sets, expected {}",
+                        cycle_eval.blockworking_sets.len(),
+                        specs.len()
+                    ));
+                }
             }
 
             let spec = &specs[b];
-            let work = &eval.blockworking_sets[b];
+            let work = &cycle_eval.blockworking_sets[b];
             let linear_constraints = family.block_linear_constraints(&states, b, spec)?;
             let s_lambda = &s_lambdas[b];
             let updater = work.updater();
@@ -2239,18 +2291,35 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
 
             // Damped update: require non-increasing penalized objective under dynamic geometry.
+            // Precompute X * delta once so line-search eta updates are O(n) not O(np).
+            let eta_old = states[b].eta.clone();
+            let x_delta = if !is_dynamic {
+                Some(spec.design.matrixvectormultiply(&delta))
+            } else {
+                None
+            };
             let mut accepted = false;
             for bt in 0..8 {
                 let alpha = 0.5f64.powi(bt);
                 let trial_beta_raw = &beta_old + &delta.mapv(|v| alpha * v);
-                let trial_beta = family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
+                let trial_beta =
+                    family.post_update_block_beta(&states, b, spec, trial_beta_raw.clone())?;
                 states[b].beta = trial_beta;
-                refresh_single_block_eta(family, specs, &mut states, b)?;
-                let trial_eval = family.evaluate(&states)?;
+                // Use precomputed X*delta when geometry is static and beta wasn't modified.
+                if let Some(ref xd) = x_delta {
+                    if states[b].beta == trial_beta_raw {
+                        states[b].eta = &eta_old + &xd.mapv(|v| alpha * v);
+                    } else {
+                        refresh_single_block_eta(family, specs, &mut states, b)?;
+                    }
+                } else {
+                    refresh_single_block_eta(family, specs, &mut states, b)?;
+                }
+                let trial_ll = family.log_likelihood_only(&states)?;
                 let trial_block_penalty =
                     block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
                 let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
-                let trialobjective = -trial_eval.log_likelihood + trial_penalty;
+                let trialobjective = -trial_ll + trial_penalty;
                 if trialobjective.is_finite() && trialobjective <= objective_cycle_prev + 1e-10 {
                     objective_cycle_prev = trialobjective;
                     current_penalty = trial_penalty;
@@ -2260,19 +2329,38 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
             if !accepted {
                 states[b].beta = beta_old.clone();
-                refresh_single_block_eta(family, specs, &mut states, b)?;
+                states[b].eta = eta_old.clone();
                 if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
                     let descent_dir = gradient - &s_lambda.dot(&beta_old);
                     let dir_norm = descent_dir.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
                     if dir_norm > inner_tol {
+                        // Precompute X * descent_dir once for incremental eta updates.
+                        let x_descent = if !is_dynamic {
+                            Some(spec.design.matrixvectormultiply(&descent_dir))
+                        } else {
+                            None
+                        };
                         for bt in 0..12 {
                             let alpha = 0.5f64.powi(bt);
-                            let trial_beta_raw = &beta_old + &descent_dir.mapv(|v| alpha * v);
-                            let trial_beta =
-                                family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
+                            let trial_beta_raw =
+                                &beta_old + &descent_dir.mapv(|v| alpha * v);
+                            let trial_beta = family.post_update_block_beta(
+                                &states,
+                                b,
+                                spec,
+                                trial_beta_raw.clone(),
+                            )?;
                             states[b].beta = trial_beta;
-                            refresh_single_block_eta(family, specs, &mut states, b)?;
-                            let trial_eval = family.evaluate(&states)?;
+                            if let Some(ref xd) = x_descent {
+                                if states[b].beta == trial_beta_raw {
+                                    states[b].eta = &eta_old + &xd.mapv(|v| alpha * v);
+                                } else {
+                                    refresh_single_block_eta(family, specs, &mut states, b)?;
+                                }
+                            } else {
+                                refresh_single_block_eta(family, specs, &mut states, b)?;
+                            }
+                            let trial_ll = family.log_likelihood_only(&states)?;
                             let trial_block_penalty = block_quadratic_penalty(
                                 &states[b].beta,
                                 s_lambda,
@@ -2281,7 +2369,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                             );
                             let trial_penalty =
                                 current_penalty - old_block_penalty + trial_block_penalty;
-                            let trialobjective = -trial_eval.log_likelihood + trial_penalty;
+                            let trialobjective = -trial_ll + trial_penalty;
                             if trialobjective.is_finite()
                                 && trialobjective <= objective_cycle_prev + 1e-10
                             {
@@ -2291,21 +2379,21 @@ fn inner_blockwise_fit<F: CustomFamily>(
                                 break;
                             }
                             states[b].beta = beta_old.clone();
-                            refresh_single_block_eta(family, specs, &mut states, b)?;
+                            states[b].eta = eta_old.clone();
                         }
                     }
                 }
             }
             if !accepted {
                 states[b].beta = beta_old;
-                refresh_single_block_eta(family, specs, &mut states, b)?;
+                states[b].eta = eta_old;
             }
         }
 
         refresh_all_block_etas(family, specs, &mut states)?;
-        let eval = family.evaluate(&states)?;
+        cached_eval = family.evaluate(&states)?;
         current_penalty = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-        let objective = -eval.log_likelihood + current_penalty;
+        let objective = -cached_eval.log_likelihood + current_penalty;
         let objective_change = (objective - lastobjective).abs();
         lastobjective = objective;
         cycles_done = cycle + 1;
@@ -2313,7 +2401,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
         let objective_tol = inner_tol * (1.0 + objective.abs());
         let exact_joint_stationarity_ok = if has_joint_exacthessian {
             exact_newton_joint_stationarity_inf_norm(
-                &eval,
+                &cached_eval,
                 &states,
                 &s_lambdas,
                 ridge,
@@ -2333,7 +2421,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
         }
     }
 
-    let final_eval = family.evaluate(&states)?;
+    // Reuse cached evaluation from the last cycle's end (or the initial eval if 0 cycles ran).
     let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
 
     let (block_logdet_h, block_logdet_s) =
@@ -2342,7 +2430,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
     Ok(BlockwiseInnerResult {
         block_states: states,
         active_sets: cached_active_sets,
-        log_likelihood: final_eval.log_likelihood,
+        log_likelihood: cached_eval.log_likelihood,
         penalty_value,
         cycles: cycles_done,
         converged,
@@ -2584,11 +2672,15 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
             let lambdas = per_block[b].mapv(f64::exp);
             for (k, s_k) in spec.penalties.iter().enumerate() {
-                let mut a_k = Array2::<f64>::zeros((total, total));
                 let local = s_k.mapv(|v| lambdas[k] * v);
+                // Exploit block-diagonal structure: A_k is zero except in [start..end, start..end].
+                let mut a_k_beta = Array1::<f64>::zeros(total);
+                a_k_beta
+                    .slice_mut(ndarray::s![start..end])
+                    .assign(&local.dot(&beta_block));
+                let mut a_k = Array2::<f64>::zeros((total, total));
                 a_k.slice_mut(ndarray::s![start..end, start..end])
                     .assign(&local);
-                let a_k_beta = a_k.dot(&beta_flat);
                 // Penalty-quadratic derivative:
                 //   d/drho_k [0.5 * beta^T P beta] = 0.5 * beta^T A_k beta
                 // at the inner mode (envelope theorem), with A_k = dP/drho_k.
@@ -2610,11 +2702,13 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 };
                 let g = if include_logdet_h || include_logdet_s {
                     let g_logs = if include_logdet_s {
-                        0.5 * trace_product(
+                        0.5 * trace_product_block(
                             s_pinv_joint
                                 .as_ref()
                                 .ok_or_else(|| "missing joint S^+ for REML gradient".to_string())?,
-                            &a_k,
+                            &local,
+                            start,
+                            end,
                         )
                     } else {
                         0.0
@@ -2948,11 +3042,14 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
             let lambdas = per_block[b].mapv(f64::exp);
             for (k, s_k) in spec.penalties.iter().enumerate() {
-                let mut a_k = Array2::<f64>::zeros((total, total));
                 let local = s_k.mapv(|v| lambdas[k] * v);
+                let mut a_k_beta = Array1::<f64>::zeros(total);
+                a_k_beta
+                    .slice_mut(ndarray::s![start..end])
+                    .assign(&local.dot(&beta_block));
+                let mut a_k = Array2::<f64>::zeros((total, total));
                 a_k.slice_mut(ndarray::s![start..end, start..end])
                     .assign(&local);
-                let a_k_beta = a_k.dot(&beta_flat);
                 let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
                 let keep_second_order = need_hessian || include_logdet_h || include_logdet_s;
                 let u_k = if keep_second_order {
@@ -2970,11 +3067,13 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 };
                 let g = if include_logdet_h || include_logdet_s {
                     let g_logs = if include_logdet_s {
-                        0.5 * trace_product(
+                        0.5 * trace_product_block(
                             s_pinv_joint.as_ref().ok_or_else(|| {
                                 "missing joint S^+ for surrogate REML gradient".to_string()
                             })?,
-                            &a_k,
+                            &local,
+                            start,
+                            end,
                         )
                     } else {
                         0.0

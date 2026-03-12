@@ -1412,14 +1412,19 @@ impl<'a> RemlState<'a> {
 
         let lambdas = p.mapv(f64::exp);
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let mut h_eff_eval = bundle.h_eff.as_ref().clone();
-        let mut h_total_eval = bundle.h_total.as_ref().clone();
-        let mut e_eval = pirls_result.reparam_result.e_transformed.clone();
-        if let Some(z) = free_basis_opt.as_ref() {
-            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
-            e_eval = pirls_result.reparam_result.e_transformed.dot(z);
-        }
+        let (h_eff_eval, h_total_eval, e_eval) = if let Some(z) = free_basis_opt.as_ref() {
+            (
+                Self::projectwith_basis(bundle.h_eff.as_ref(), z),
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                pirls_result.reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_eff.as_ref().clone(),
+                bundle.h_total.as_ref().clone(),
+                pirls_result.reparam_result.e_transformed.clone(),
+            )
+        };
         let h_eff = &h_eff_eval;
 
         // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.

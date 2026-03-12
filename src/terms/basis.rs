@@ -3852,7 +3852,56 @@ fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, Bas
     }
 }
 
-#[inline(always)]
+/// Precomputed coefficient for `duchon_polyharmonic_block` that depends only on
+/// `m` and `k_dim`, not on `r`.  Avoids repeated gamma_lanczos calls in the
+/// hot kernel evaluation loop (called n × k times per basis build).
+struct PolyharmonicBlockCoeff {
+    c: f64,
+    power: f64,
+    is_log_case: bool,
+}
+
+impl PolyharmonicBlockCoeff {
+    fn new(m: usize, k_dim: usize) -> Self {
+        let k_half = 0.5 * k_dim as f64;
+        let power = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
+        if k_dim % 2 == 0 && m >= (k_dim / 2) {
+            let c = duchon_polyharmonic_log_sign(m, k_dim)
+                / (2.0_f64.powi((2 * m - 1) as i32)
+                    * std::f64::consts::PI.powf(k_half)
+                    * gamma_lanczos(m as f64)
+                    * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+            Self {
+                c,
+                power,
+                is_log_case: true,
+            }
+        } else {
+            let c = gamma_lanczos(k_half - m as f64)
+                / (4.0_f64.powi(m as i32)
+                    * std::f64::consts::PI.powf(k_half)
+                    * gamma_lanczos(m as f64));
+            Self {
+                c,
+                power,
+                is_log_case: false,
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn eval(&self, r: f64) -> f64 {
+        if r <= 0.0 {
+            return 0.0;
+        }
+        if self.is_log_case {
+            self.c * r.powf(self.power) * r.max(1e-300).ln()
+        } else {
+            self.c * r.powf(self.power)
+        }
+    }
+}
+
 fn duchon_polyharmonic_block(r: f64, m: usize, k_dim: usize) -> f64 {
     if r <= 0.0 {
         return 0.0;
@@ -6357,16 +6406,14 @@ pub fn create_duchon_spline_basiswithworkspace(
     let s_order = power;
     let d = centers.ncols();
     let k = centers.nrows();
-    let coeffs = if length_scale.is_none() {
-        None
-    } else if p_order == 1 && s_order == 4 && d == 10 {
-        None
-    } else {
+    let coeffs = if let Some(ls) = length_scale {
         Some(duchon_partial_fraction_coeffs(
             p_order,
             s_order,
-            1.0 / length_scale.unwrap().max(1e-300),
+            1.0 / ls.max(1e-300),
         ))
+    } else {
+        None
     };
     let center_center_r = compute_center_center_distances(centers);
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
@@ -6450,16 +6497,14 @@ fn build_duchon_basis_designwithworkspace(
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    let coeffs = if length_scale.is_none() {
-        None
-    } else if p_order == 1 && s_order == 4 && d == 10 {
-        None
-    } else {
+    let coeffs = if let Some(ls) = length_scale {
         Some(duchon_partial_fraction_coeffs(
             p_order,
             s_order,
-            1.0 / length_scale.unwrap().max(1e-300),
+            1.0 / ls.max(1e-300),
         ))
+    } else {
+        None
     };
 
     // When 2(p+s) > d the RKHS admits classical pointwise evaluation and the
@@ -6504,34 +6549,62 @@ fn build_duchon_basis_designwithworkspace(
     let poly_cols = poly_block.ncols();
     let total_cols = kernel_cols + poly_cols;
 
+    // Pre-compute polyharmonic coefficient for the pure Duchon case (no length_scale).
+    // This avoids 2 gamma_lanczos calls per kernel evaluation (n × k total).
+    let pure_poly_coeff = if length_scale.is_none() {
+        Some(PolyharmonicBlockCoeff::new(
+            pure_duchon_block_order(p_order, s_order),
+            d,
+        ))
+    } else {
+        None
+    };
+
     let mut basis = Array2::<f64>::zeros((n, total_cols));
+    // Process rows in chunks to amortize thread-local allocation across many rows.
+    let chunk_size = 256.min(n);
     let basis_result: Result<(), BasisError> = basis
-        .axis_iter_mut(Axis(0))
+        .axis_chunks_iter_mut(Axis(0), chunk_size)
         .into_par_iter()
         .enumerate()
-        .try_for_each(|(i, mut row)| {
+        .try_for_each(|(ci, mut chunk)| {
             let mut kernel_row = vec![0.0; k];
-            for j in 0..k {
-                let mut dist2 = 0.0;
-                for axis in 0..d {
-                    let delta = data[[i, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                kernel_row[j] = duchon_matern_kernel_general_from_distance(
-                    dist2.sqrt(),
-                    length_scale,
-                    p_order,
-                    s_order,
-                    d,
-                    coeffs.as_ref(),
-                )?;
-            }
-            for col in 0..kernel_cols {
-                let mut acc = 0.0;
+            let chunk_start = ci * chunk_size;
+            for local_i in 0..chunk.nrows() {
+                let i = chunk_start + local_i;
                 for j in 0..k {
-                    acc += kernel_row[j] * z[[j, col]];
+                    let mut dist2 = 0.0;
+                    for axis in 0..d {
+                        let delta = data[[i, axis]] - centers[[j, axis]];
+                        dist2 += delta * delta;
+                    }
+                    let r = dist2.sqrt();
+                    kernel_row[j] = if let Some(ref ppc) = pure_poly_coeff {
+                        // Pure Duchon: use precomputed coefficient, skip gamma calls.
+                        if r == 0.0 && p_order > 0 {
+                            0.0
+                        } else {
+                            ppc.eval(r)
+                        }
+                    } else {
+                        duchon_matern_kernel_general_from_distance(
+                            r,
+                            length_scale,
+                            p_order,
+                            s_order,
+                            d,
+                            coeffs.as_ref(),
+                        )?
+                    };
                 }
-                row[col] = acc;
+                let mut row = chunk.row_mut(local_i);
+                for col in 0..kernel_cols {
+                    let mut acc = 0.0;
+                    for j in 0..k {
+                        acc += kernel_row[j] * z[[j, col]];
+                    }
+                    row[col] = acc;
+                }
             }
             Ok(())
         });

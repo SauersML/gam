@@ -637,20 +637,24 @@ impl<'a> RemlState<'a> {
         let x_eval = x_eval_owned
             .as_ref()
             .unwrap_or_else(|| x_eval_dense.as_ref());
-        let mut h_eff_eval = bundle.h_eff.as_ref().clone();
-        let mut h_total_eval = bundle.h_total.as_ref().clone();
         let x_tau_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
-
-        if let Some(z) = free_basis_opt.as_ref() {
+        let (h_eff_eval, h_total_eval) = if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             rs_eval = reparam_result
                 .rs_transformed
                 .iter()
                 .map(|r| r.dot(z))
                 .collect();
-            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
-        }
+            (
+                Self::projectwith_basis(bundle.h_eff.as_ref(), z),
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+            )
+        } else {
+            (
+                bundle.h_eff.as_ref().clone(),
+                bundle.h_total.as_ref().clone(),
+            )
+        };
         let p_dim = beta_eval.len();
         if p_dim == 0 {
             return Ok(out);
@@ -1035,13 +1039,18 @@ impl<'a> RemlState<'a> {
         let x_eval = x_eval_owned
             .as_ref()
             .unwrap_or_else(|| x_eval_dense.as_ref());
-        let mut h_eff_eval = bundle.h_eff.as_ref().clone();
-        let mut h_total_eval = bundle.h_total.as_ref().clone();
-        if let Some(z) = free_basis_opt.as_ref() {
+        let (h_eff_eval, h_total_eval) = if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
-            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
-        }
+            (
+                Self::projectwith_basis(bundle.h_eff.as_ref(), z),
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+            )
+        } else {
+            (
+                bundle.h_eff.as_ref().clone(),
+                bundle.h_total.as_ref().clone(),
+            )
+        };
         let transform_x_tau = |dir: &DirectionalHyperParam| -> Array2<f64> {
             dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())
                 .expect("valid transformed X_tau in exact tau/tau path")
