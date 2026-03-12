@@ -1208,4 +1208,196 @@ mod tests {
         assert_eq!(grad.len(), 1);
         assert!(grad[0].is_finite());
     }
+
+    /// Helper: build an InnerSolution for a Gaussian model at a given rho.
+    /// The Hessian H = X'X + Σ λₖ Sₖ depends on rho through the penalty,
+    /// so we must rebuild InnerSolution for each rho evaluation.
+    fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution {
+        let p = 3; // 3 coefficients
+        let n = 50; // 50 observations
+
+        // Fixed X'X (data-dependent, rho-independent)
+        let xtx = array![
+            [10.0, 2.0, 1.0],
+            [2.0, 8.0, 0.5],
+            [1.0, 0.5, 6.0],
+        ];
+
+        // Two penalty matrices (one per smoothing parameter)
+        let s1 = array![
+            [1.0, 0.2, 0.0],
+            [0.2, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let s2 = array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+
+        // Build H = X'X + λ₁S₁ + λ₂S₂
+        let mut h = xtx.clone();
+        h.scaled_add(lambdas[0], &s1);
+        h.scaled_add(lambdas[1], &s2);
+
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        // Solve for β̂ = H⁻¹ X'y (simulate with a fixed X'y)
+        let xty = array![5.0, 3.0, 2.0];
+        let beta = op.solve(&xty);
+
+        // Penalty roots (Cholesky-like square roots of Sₖ).
+        // For testing, use eigendecomposition: Sₖ = Rₖᵀ Rₖ.
+        let r1 = array![
+            [1.0, 0.2, 0.0],
+            [0.0, 0.9798, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let r2 = array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+
+        // Penalty quadratic: Σ λₖ β'Sₖβ
+        let penalty_quad = lambdas[0] * beta.dot(&s1.dot(&beta))
+            + lambdas[1] * beta.dot(&s2.dot(&beta));
+
+        // RSS: ||y - Xβ||² (simulated)
+        let deviance = 10.0; // fixed for this test
+        let log_likelihood = -0.5 * deviance;
+
+        // Penalty logdet: log|Σ λₖ Sₖ|₊
+        let mut s_total = Array2::zeros((p, p));
+        s_total.scaled_add(lambdas[0], &s1);
+        s_total.scaled_add(lambdas[1], &s2);
+        let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
+        let tol = 1e-10;
+        let log_det_s: f64 = s_eigs
+            .iter()
+            .filter(|&&v| v > tol)
+            .map(|&v| v.ln())
+            .sum();
+        let penalty_rank = s_eigs.iter().filter(|&&v| v > tol).count();
+
+        // Penalty logdet first derivatives (numerical for correctness).
+        let mut det1 = Array1::zeros(rho.len());
+        let eps = 1e-7;
+        for k in 0..rho.len() {
+            let mut rho_plus = rho.to_vec();
+            rho_plus[k] += eps;
+            let lambdas_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
+            let mut s_plus = Array2::zeros((p, p));
+            s_plus.scaled_add(lambdas_plus[0], &s1);
+            s_plus.scaled_add(lambdas_plus[1], &s2);
+            let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
+            let log_det_s_plus: f64 = s_eigs_plus
+                .iter()
+                .filter(|&&v| v > tol)
+                .map(|&v| v.ln())
+                .sum();
+
+            let mut rho_minus = rho.to_vec();
+            rho_minus[k] -= eps;
+            let lambdas_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
+            let mut s_minus = Array2::zeros((p, p));
+            s_minus.scaled_add(lambdas_minus[0], &s1);
+            s_minus.scaled_add(lambdas_minus[1], &s2);
+            let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
+            let log_det_s_minus: f64 = s_eigs_minus
+                .iter()
+                .filter(|&&v| v > tol)
+                .map(|&v| v.ln())
+                .sum();
+
+            det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
+        }
+
+        InnerSolution {
+            log_likelihood,
+            penalty_quadratic: penalty_quad,
+            ridge_passport: RidgePassport {
+                delta: 0.0,
+                matrix_form: crate::types::RidgeMatrixForm::ScaledIdentity,
+                policy: crate::types::RidgePolicy {
+                    rho_independent: true,
+                    include_quadratic_penalty: false,
+                    include_penalty_logdet: false,
+                    include_laplacehessian: false,
+                    determinant_mode: crate::types::RidgeDeterminantMode::Auto,
+                },
+            },
+            hessian_op: Box::new(op),
+            beta,
+            penalty_roots: vec![r1, r2],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: log_det_s,
+                first: det1,
+                second: None,
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth_logdet: 0.0,
+            firth_gradient: None,
+            n_observations: n,
+            nullspace_dim: (p - penalty_rank) as f64,
+            dispersion: DispersionHandling::ProfiledGaussian,
+        }
+    }
+
+    /// The structural test: finite-difference gradient matches analytic gradient.
+    ///
+    /// Because the unified evaluator computes cost and gradient from the same
+    /// intermediates in the same function, drift is impossible. This test
+    /// verifies that the mathematical formulas are correct (which FD catches),
+    /// and serves as a regression gate.
+    #[test]
+    fn test_gaussian_reml_fd_vs_analytic_gradient() {
+        let rho = vec![1.0, -0.5];
+        let solution = build_gaussian_test_solution(&rho);
+
+        let result =
+            reml_laml_evaluate(&solution, &rho, EvalMode::ValueAndGradient, None).unwrap();
+        let analytic_grad = result.gradient.unwrap();
+
+        // Finite-difference gradient
+        let eps = 1e-5;
+        let mut fd_grad = Array1::zeros(rho.len());
+        for k in 0..rho.len() {
+            let mut rho_plus = rho.clone();
+            rho_plus[k] += eps;
+            let sol_plus = build_gaussian_test_solution(&rho_plus);
+            let cost_plus =
+                reml_laml_evaluate(&sol_plus, &rho_plus, EvalMode::ValueOnly, None)
+                    .unwrap()
+                    .cost;
+
+            let mut rho_minus = rho.clone();
+            rho_minus[k] -= eps;
+            let sol_minus = build_gaussian_test_solution(&rho_minus);
+            let cost_minus =
+                reml_laml_evaluate(&sol_minus, &rho_minus, EvalMode::ValueOnly, None)
+                    .unwrap()
+                    .cost;
+
+            fd_grad[k] = (cost_plus - cost_minus) / (2.0 * eps);
+        }
+
+        // Check agreement
+        for k in 0..rho.len() {
+            let abs_err = (analytic_grad[k] - fd_grad[k]).abs();
+            let rel_err = abs_err / (1.0 + analytic_grad[k].abs());
+            assert!(
+                rel_err < 1e-4,
+                "Gradient mismatch at k={}: analytic={:.8e}, fd={:.8e}, rel_err={:.3e}",
+                k,
+                analytic_grad[k],
+                fd_grad[k],
+                rel_err,
+            );
+        }
+    }
 }
