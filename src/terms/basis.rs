@@ -3179,7 +3179,7 @@ fn duchon_kernel_radial_triplet(
 
     let Some(length_scale) = length_scale else {
         let block_order = pure_duchon_block_order(p_order, s_order);
-        let (_, mut first, second) = duchon_polyharmonic_block_triplet(r, block_order, k_dim)?;
+        let (_, mut first, second) = polyharmonic_kernel_triplet(r, block_order, k_dim)?;
         if r == 0.0 {
             first = 0.0;
         }
@@ -3206,7 +3206,7 @@ fn duchon_kernel_radial_triplet(
         if *coeff == 0.0 {
             continue;
         }
-        let (_, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+        let (_, dm, d2m) = polyharmonic_kernel_triplet(r_eval, m, k_dim)?;
         first += coeff * dm;
         second += coeff * d2m;
     }
@@ -3852,7 +3852,7 @@ fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, Bas
     }
 }
 
-/// Precomputed coefficient for `duchon_polyharmonic_block` that depends only on
+/// Precomputed coefficient for `polyharmonic_kernel` that depends only on
 /// `m` and `k_dim`, not on `r`.  Avoids repeated gamma_lanczos calls in the
 /// hot kernel evaluation loop (called n × k times per basis build).
 struct PolyharmonicBlockCoeff {
@@ -3866,7 +3866,7 @@ impl PolyharmonicBlockCoeff {
         let k_half = 0.5 * k_dim as f64;
         let power = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
         if k_dim % 2 == 0 && m >= (k_dim / 2) {
-            let c = duchon_polyharmonic_log_sign(m, k_dim)
+            let c = polyharmonic_log_sign(m, k_dim)
                 / (2.0_f64.powi((2 * m - 1) as i32)
                     * std::f64::consts::PI.powf(k_half)
                     * gamma_lanczos(m as f64)
@@ -3902,7 +3902,7 @@ impl PolyharmonicBlockCoeff {
     }
 }
 
-fn duchon_polyharmonic_block(r: f64, m: usize, k_dim: usize) -> f64 {
+fn polyharmonic_kernel(r: f64, m: usize, k_dim: usize) -> f64 {
     if r <= 0.0 {
         return 0.0;
     }
@@ -3911,7 +3911,7 @@ fn duchon_polyharmonic_block(r: f64, m: usize, k_dim: usize) -> f64 {
     let power_f = power_i as f64;
     // Log case: k even and m >= k/2 (gamma pole in generic power form).
     if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = duchon_polyharmonic_log_sign(m, k_dim)
+        let c = polyharmonic_log_sign(m, k_dim)
             / (2.0_f64.powi((2 * m - 1) as i32)
                 * std::f64::consts::PI.powf(k_half)
                 * gamma_lanczos(m as f64)
@@ -3924,7 +3924,7 @@ fn duchon_polyharmonic_block(r: f64, m: usize, k_dim: usize) -> f64 {
 }
 
 #[inline(always)]
-fn duchon_polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
+fn polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
     assert!(k_dim % 2 == 0);
     (-1.0_f64).powi(m as i32 - (k_dim as i32 / 2) + 1)
 }
@@ -4024,7 +4024,7 @@ fn duchon_matern_block_triplet(
 }
 
 #[inline(always)]
-fn duchon_polyharmonic_block_triplet(
+fn polyharmonic_kernel_triplet(
     r: f64,
     m: usize,
     k_dim: usize,
@@ -4059,7 +4059,7 @@ fn duchon_polyharmonic_block_triplet(
     let log_r = r_safe.ln();
 
     if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = duchon_polyharmonic_log_sign(m, k_dim)
+        let c = polyharmonic_log_sign(m, k_dim)
             / (2.0_f64.powi((2 * m - 1) as i32)
                 * std::f64::consts::PI.powf(k_half)
                 * gamma_lanczos(m as f64)
@@ -4146,7 +4146,7 @@ fn duchon_matern_kernel_general_from_distance(
         return Ok(0.0);
     }
     let Some(length_scale) = length_scale else {
-        return Ok(duchon_polyharmonic_block(
+        return Ok(polyharmonic_kernel(
             r,
             pure_duchon_block_order(p_order, s_order),
             k_dim,
@@ -4171,7 +4171,7 @@ fn duchon_matern_kernel_general_from_distance(
         if *coeff == 0.0 {
             continue;
         }
-        val += coeff * duchon_polyharmonic_block(r, m, k_dim);
+        val += coeff * polyharmonic_kernel(r, m, k_dim);
     }
     for (n, coeff) in coeffs_ref.b.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
@@ -5644,7 +5644,7 @@ fn duchon_polyharmonic_q_l_r_triplets(
     let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
     let rr = r.max(1e-300);
     if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = duchon_polyharmonic_log_sign(m, k_dim)
+        let c = polyharmonic_log_sign(m, k_dim)
             / (2.0_f64.powi((2 * m - 1) as i32)
                 * std::f64::consts::PI.powf(k_half)
                 * gamma_lanczos(m as f64)
@@ -5736,7 +5736,7 @@ fn duchon_polyharmonicsecond_collision_psi_triplet(
     let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
     let e = alpha - 2.0;
     if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = duchon_polyharmonic_log_sign(m, k_dim)
+        let c = polyharmonic_log_sign(m, k_dim)
             / (2.0_f64.powi((2 * m - 1) as i32)
                 * std::f64::consts::PI.powf(k_half)
                 * gamma_lanczos(m as f64)
@@ -5978,7 +5978,7 @@ fn duchon_radial_jets(
         if *coeff == 0.0 {
             continue;
         }
-        let (_, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+        let (_, dm, d2m) = polyharmonic_kernel_triplet(r_eval, m, k_dim)?;
         let ((q0, q1, q2), (l0, l1, l2)) = duchon_polyharmonic_q_l_r_triplets(r_eval, m, k_dim);
         out.phi_r += coeff * dm;
         out.phi_rr += coeff * d2m;
@@ -6858,7 +6858,7 @@ fn thin_plate_kernel_from_dist2(dist2: f64, dimension: usize) -> Result<f64, Bas
             // kernel which handles arbitrary (m, d) combinations.
             let m = dimension / 2 + 1;
             let r = dist2.sqrt();
-            Ok(duchon_polyharmonic_block(r, m, dimension))
+            Ok(polyharmonic_kernel(r, m, dimension))
         }
     }
 }
@@ -8835,7 +8835,10 @@ mod tests {
 
         // d=19: m=10, power = 1 → c * r
         let val19 = thin_plate_kernel_from_dist2(dist2, 19).unwrap();
-        assert!(val19.is_finite(), "d=19 kernel should be finite, got {val19}");
+        assert!(
+            val19.is_finite(),
+            "d=19 kernel should be finite, got {val19}"
+        );
 
         // Zero distance always returns zero
         assert_abs_diff_eq!(thin_plate_kernel_from_dist2(0.0, 7).unwrap(), 0.0);
@@ -11144,20 +11147,20 @@ mod tests {
         // In 2D the legacy (-1)^m sign happens to agree with the correct formula.
         let m_2d = 2usize;
         let d_2d = 2usize;
-        let c_2d = duchon_polyharmonic_log_sign(m_2d, d_2d)
+        let c_2d = polyharmonic_log_sign(m_2d, d_2d)
             / (2.0_f64.powi((2 * m_2d - 1) as i32)
                 * std::f64::consts::PI.powf(0.5 * d_2d as f64)
                 * gamma_lanczos(m_2d as f64)
                 * gamma_lanczos((m_2d - d_2d / 2 + 1) as f64));
         let expected_2d = c_2d * r.powi((2 * m_2d - d_2d) as i32) * r.ln();
-        let got_2d = duchon_polyharmonic_block(r, m_2d, d_2d);
+        let got_2d = polyharmonic_kernel(r, m_2d, d_2d);
         assert!((got_2d - expected_2d).abs() < 1e-12);
 
         // In 4D the correct log-branch sign differs from (-1)^m and must be positive for m=3.
         let m_4d = 3usize;
         let d_4d = 4usize;
         let legacy_sign = (-1.0_f64).powi(m_4d as i32);
-        let fixed_sign = duchon_polyharmonic_log_sign(m_4d, d_4d);
+        let fixed_sign = polyharmonic_log_sign(m_4d, d_4d);
         assert_eq!(legacy_sign, -1.0);
         assert_eq!(fixed_sign, 1.0);
 
@@ -11167,7 +11170,7 @@ mod tests {
                 * gamma_lanczos(m_4d as f64)
                 * gamma_lanczos((m_4d - d_4d / 2 + 1) as f64));
         let expected_4d = c_4d * r.powi((2 * m_4d - d_4d) as i32) * r.ln();
-        let got_4d = duchon_polyharmonic_block(r, m_4d, d_4d);
+        let got_4d = polyharmonic_kernel(r, m_4d, d_4d);
         assert!((got_4d - expected_4d).abs() < 1e-12);
         assert!(got_4d > 0.0);
     }
