@@ -15,8 +15,8 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    GlmLikelihoodFamily, InverseLink, LinkFunction,
-    MixtureLinkState, RidgePassport, RidgePolicy, SasLinkState,
+    GlmLikelihoodFamily, InverseLink, LinkFunction, MixtureLinkState, RidgePassport, RidgePolicy,
+    SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -6522,8 +6522,8 @@ mod root_cause_tests {
             for i in 0..n {
                 let t1 = (i as f64 / (n - 1) as f64) * 6.0 - 3.0;
                 // Second covariate derived from seed for variety
-                let t2 = ((i as u64).wrapping_mul(seed).wrapping_add(13) % 100) as f64 / 100.0
-                    - 0.5;
+                let t2 =
+                    ((i as u64).wrapping_mul(seed).wrapping_add(13) % 100) as f64 / 100.0 - 0.5;
                 x_data[[i, 0]] = 1.0;
                 x_data[[i, 1]] = t1;
                 x_data[[i, 2]] = t2;

@@ -37,8 +37,8 @@ use gam::gamlss::{
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
-    FamilyNutsInputs, GlmFlatInputs, JointSplineArtifacts, NutsConfig,
-    run_joint_nuts_sampling, run_nuts_sampling_flattened_family,
+    FamilyNutsInputs, GlmFlatInputs, JointSplineArtifacts, NutsConfig, run_joint_nuts_sampling,
+    run_nuts_sampling_flattened_family,
 };
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
@@ -5468,11 +5468,9 @@ fn run_sample_standard(
 
         // Build the joint penalized Hessian by augmenting the base Hessian
         // with the link penalty block.
-        let base_hessian = fit
-            .penalized_hessian()
-            .ok_or_else(|| {
-                "fit result is missing inference Hessian; refit with inference enabled".to_string()
-            })?;
+        let base_hessian = fit.penalized_hessian().ok_or_else(|| {
+            "fit result is missing inference Hessian; refit with inference enabled".to_string()
+        })?;
         let p_base = base_hessian.nrows();
         let p_link = penalty_link.nrows();
         let dim = p_base + p_link;
@@ -9152,7 +9150,21 @@ fn build_model_summary(
             Array1::from_elem(y.len(), p)
         }
         LikelihoodFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
-        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => todo!(),
+        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
+            let mean = y
+                .iter()
+                .zip(weights.iter())
+                .map(|(&yy, &ww)| yy * ww)
+                .sum::<f64>()
+                / wsum;
+            let baseline = if family == LikelihoodFamily::PoissonLog {
+                mean.max(0.0)
+            } else {
+                mean.max(1e-12)
+            };
+            Array1::from_elem(y.len(), baseline)
+        }
     };
     let null_dev = gam::pirls::calculate_deviance(y, &nullmu, link, weights);
     let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
@@ -9477,7 +9489,32 @@ fn response_sd_from_eta_for_family(
                 v
             }
             LikelihoodFamily::GaussianIdentity => 0.0,
-            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => todo!(),
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+                let sigma2 = eta_se[i] * eta_se[i];
+                if !sigma2.is_finite() || sigma2 <= 0.0 {
+                    0.0
+                } else {
+                    let expm1_sigma2 = sigma2.exp_m1();
+                    if !expm1_sigma2.is_finite() || expm1_sigma2 <= 0.0 {
+                        0.0
+                    } else {
+                        let log_var = 2.0 * eta[i] + sigma2 + expm1_sigma2.ln();
+                        if !log_var.is_finite() {
+                            f64::MAX
+                        } else {
+                            let max_log = f64::MAX.ln();
+                            let min_log = f64::MIN_POSITIVE.ln();
+                            if log_var >= max_log {
+                                f64::MAX
+                            } else if log_var <= min_log {
+                                0.0
+                            } else {
+                                log_var.exp()
+                            }
+                        }
+                    }
+                }
+            }
         };
         var.max(0.0).sqrt()
     })))

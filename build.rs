@@ -3815,7 +3815,10 @@ fn build_stripped_file_cache() -> Vec<StrippedFile> {
 /// Returns `true` for files under `tests/`, `benches/`, or test helper crates.
 fn is_test_or_bench_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
-    s.contains("/tests/") || s.contains("/benches/") || s.starts_with("./tests/") || s.starts_with("./benches/")
+    s.contains("/tests/")
+        || s.contains("/benches/")
+        || s.starts_with("./tests/")
+        || s.starts_with("./benches/")
 }
 
 /// Split stripped source into production lines and `#[cfg(test)]` lines.
@@ -4027,13 +4030,36 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
     // that would collide with unrelated identifiers producing false positives.
     let skip_names: HashSet<&str> = [
         // Trait methods
-        "new", "default", "from", "into", "fmt", "clone", "drop",
-        "eq", "ne", "cmp", "partial_cmp", "hash",
-        "deref", "deref_mut", "index", "index_mut",
-        "next", "size_hint", "try_from", "try_into",
-        "serialize", "deserialize", "matched", "main",
+        "new",
+        "default",
+        "from",
+        "into",
+        "fmt",
+        "clone",
+        "drop",
+        "eq",
+        "ne",
+        "cmp",
+        "partial_cmp",
+        "hash",
+        "deref",
+        "deref_mut",
+        "index",
+        "index_mut",
+        "next",
+        "size_hint",
+        "try_from",
+        "try_into",
+        "serialize",
+        "deserialize",
+        "matched",
+        "main",
         // Too short / too common — high collision risk
-        "run", "get", "set", "add", "len",
+        "run",
+        "get",
+        "set",
+        "add",
+        "len",
     ]
     .iter()
     .copied()
@@ -4061,7 +4087,8 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
                         file: sf.path.to_string_lossy().to_string(),
                         // Line number is approximate (prod_text lines != file lines).
                         // Find exact line in full stripped text for accurate reporting.
-                        line: find_definition_line(&sf.stripped, name, line).unwrap_or(line_idx + 1),
+                        line: find_definition_line(&sf.stripped, name, line)
+                            .unwrap_or(line_idx + 1),
                         visibility: vis,
                     });
                 }

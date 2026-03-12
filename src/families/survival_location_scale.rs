@@ -47,7 +47,9 @@ impl ResidualDistributionOps for ResidualDistribution {
                 if z == f64::NEG_INFINITY {
                     return 0.0;
                 }
-                if z > 700.0 { return 1.0; }
+                if z > 700.0 {
+                    return 1.0;
+                }
                 let ez = z.exp();
                 1.0 - (-ez).exp()
             }
@@ -92,7 +94,9 @@ impl ResidualDistributionOps for ResidualDistribution {
                     return 0.0;
                 }
                 let log_f = z - z.exp();
-                if log_f < -745.0 { return 0.0; }
+                if log_f < -745.0 {
+                    return 0.0;
+                }
                 let f = log_f.exp();
                 let ez = z.clamp(-700.0, 700.0).exp();
                 f * (1.0 - ez)
@@ -116,7 +120,9 @@ impl ResidualDistributionOps for ResidualDistribution {
                     return 0.0;
                 }
                 let log_f = z - z.exp();
-                if log_f < -745.0 { return 0.0; }
+                if log_f < -745.0 {
+                    return 0.0;
+                }
                 let f = log_f.exp();
                 let ez = z.clamp(-700.0, 700.0).exp();
                 f * (1.0 - 3.0 * ez + ez * ez)
@@ -140,7 +146,9 @@ impl ResidualDistributionOps for ResidualDistribution {
                     return 0.0;
                 }
                 let log_f = z - z.exp();
-                if log_f < -745.0 { return 0.0; }
+                if log_f < -745.0 {
+                    return 0.0;
+                }
                 let f = log_f.exp();
                 let ez = z.clamp(-700.0, 700.0).exp();
                 f * (1.0 - 7.0 * ez + 6.0 * ez * ez - ez * ez * ez)

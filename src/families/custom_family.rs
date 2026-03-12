@@ -1311,7 +1311,11 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                         // min_eval becomes NaN, triggering ridging.
                         // (f64::min silently drops NaN — that was the old bug.)
                         let min_eval = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                            if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else {
+                                a.min(b)
+                            }
                         });
                         if !min_eval.is_finite() || min_eval <= floor {
                             Some(floor - min_eval.min(0.0).max(-1e12))
@@ -2363,7 +2367,11 @@ fn inner_blockwise_fit<F: CustomFamily>(
             // (a coefficient change of 20 means exp(eta) changes by ~5e8)
             // but prevents catastrophic jumps to eta > 700.
             const MAX_NEWTON_STEP: f64 = 20.0;
-            let step_inf = raw_delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            let step_inf = raw_delta
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(0.0_f64, f64::max);
             let delta = if step_inf > MAX_NEWTON_STEP {
                 &raw_delta * (MAX_NEWTON_STEP / step_inf)
             } else {
@@ -5430,7 +5438,11 @@ pub fn fit_custom_family<F: CustomFamily>(
                 } else {
                     0.0
                 };
-                let reml_term = if reml_term.is_finite() { reml_term } else { 0.0 };
+                let reml_term = if reml_term.is_finite() {
+                    reml_term
+                } else {
+                    0.0
+                };
                 return Ok(BlockwiseFitResult {
                     block_states: inner.block_states,
                     log_likelihood: inner.log_likelihood,
@@ -6941,7 +6953,11 @@ mod tests {
             Ok((evals, _)) => {
                 // NaN-propagating fold (matches the production code):
                 let new_min = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                    if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else {
+                        a.min(b)
+                    }
                 });
                 assert!(
                     !new_min.is_finite(),

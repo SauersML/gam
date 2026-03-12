@@ -114,5 +114,3 @@ pub fn working_model_from_time_covariateshared(
         spec,
     )
 }
-
-

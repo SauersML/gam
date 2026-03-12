@@ -31,7 +31,6 @@ impl GenerativeSpec {
     pub fn nobs(&self) -> usize {
         self.mean.len()
     }
-
 }
 
 /// Build a generative specification for built-in GAM families from eta/mean.
