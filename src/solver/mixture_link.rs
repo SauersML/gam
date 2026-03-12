@@ -837,6 +837,14 @@ pub fn inverse_link_jet_for_family(
                 sas_link_state,
             )
         }
+        LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+            "PoissonLog inverse-link jet is not defined in mixture-link dispatcher; use fit_poisson_log outputs directly"
+                .to_string(),
+        )),
+        LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+            "GammaLog inverse-link jet is not defined in mixture-link dispatcher; use fit_gamma_log outputs directly"
+                .to_string(),
+        )),
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "RoystonParmar inverse-link jet is not defined in mixture-link dispatcher".to_string(),
         )),

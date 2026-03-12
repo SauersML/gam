@@ -4430,6 +4430,16 @@ fn evaluate_standard_familyobservations(
                         + lmu * d3mu_deta3);
                 log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
             }
+            LikelihoodFamily::PoissonLog => {
+                return Err(EstimationError::InvalidInput(
+                    "bounded linear terms are not supported for PoissonLog fits".to_string(),
+                ));
+            }
+            LikelihoodFamily::GammaLog => {
+                return Err(EstimationError::InvalidInput(
+                    "bounded linear terms are not supported for GammaLog fits".to_string(),
+                ));
+            }
             LikelihoodFamily::RoystonParmar => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for survival model fits".to_string(),

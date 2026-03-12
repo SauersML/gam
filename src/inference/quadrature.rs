@@ -2196,6 +2196,14 @@ pub fn integrated_family_moments_jetwith_state(
         LikelihoodFamily::BinomialMixture => Err(EstimationError::InvalidInput(
             "Integrated moments dispatcher does not support binomial mixture links yet".to_string(),
         )),
+        LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+            "Integrated moments dispatcher does not support PoissonLog; use fit_poisson_log outputs directly"
+                .to_string(),
+        )),
+        LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+            "Integrated moments dispatcher does not support GammaLog; use fit_gamma_log outputs directly"
+                .to_string(),
+        )),
     }
 }
 

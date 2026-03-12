@@ -2010,6 +2010,14 @@ pub fn run_nuts_sampling_flattened_family(
             "Survival flattened inputs are only valid for LikelihoodFamily::RoystonParmar"
                 .to_string(),
         ),
+        (LikelihoodFamily::PoissonLog, FamilyNutsInputs::Glm(_)) => Err(
+            "PoissonLog NUTS is not supported; use fit_poisson_log for blockwise Poisson models"
+                .to_string(),
+        ),
+        (LikelihoodFamily::GammaLog, FamilyNutsInputs::Glm(_)) => Err(
+            "GammaLog NUTS is not supported; use fit_gamma_log for blockwise Gamma models"
+                .to_string(),
+        ),
     }
 }
 

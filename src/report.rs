@@ -94,7 +94,8 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     let json = |v: &[f64]| serde_json::to_string(v).map_err(|e| e.to_string());
 
     let mut scripts = Vec::new();
-    let plot_cfg = "responsive:true,displaylogo:false,modeBarButtonsToRemove:['lasso2d','select2d']";
+    let plot_cfg =
+        "responsive:true,displaylogo:false,modeBarButtonsToRemove:['lasso2d','select2d']";
     let plot_style = |title: &str, xtitle: &str, ytitle: &str| {
         format!(
             "{{margin:{{t:44,b:48,l:56,r:24}},\
@@ -128,8 +129,16 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
         ));
 
         // Residuals vs fitted
-        let fit_min = diag.y_predicted.iter().copied().fold(f64::INFINITY, f64::min);
-        let fit_max = diag.y_predicted.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let fit_min = diag
+            .y_predicted
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let fit_max = diag
+            .y_predicted
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         scripts.push(format!(
             "Plotly.newPlot('resid_fitted',\
              [{{x:{fitted},y:{resid},mode:'markers',type:'scattergl',{marker}}}],\
@@ -146,8 +155,18 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
         ));
 
         // Observed vs Predicted
-        let range_min = diag.y_observed.iter().chain(diag.y_predicted.iter()).copied().fold(f64::INFINITY, f64::min);
-        let range_max = diag.y_observed.iter().chain(diag.y_predicted.iter()).copied().fold(f64::NEG_INFINITY, f64::max);
+        let range_min = diag
+            .y_observed
+            .iter()
+            .chain(diag.y_predicted.iter())
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let range_max = diag
+            .y_observed
+            .iter()
+            .chain(diag.y_predicted.iter())
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         scripts.push(format!(
             "Plotly.newPlot('obs_pred',\
              [{{x:{pred},y:{obs},mode:'markers',type:'scattergl',{marker}}},\
@@ -178,9 +197,13 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
         let resid_std = {
             let n = residuals.len() as f64;
             let mean = residuals.iter().sum::<f64>() / n.max(1.0);
-            let var = residuals.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
+            let var =
+                residuals.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
             let sd = var.sqrt().max(1e-15);
-            residuals.iter().map(|r| (r / sd).abs().sqrt()).collect::<Vec<_>>()
+            residuals
+                .iter()
+                .map(|r| (r / sd).abs().sqrt())
+                .collect::<Vec<_>>()
         };
         scripts.push(format!(
             "Plotly.newPlot('scale_loc',\
@@ -189,7 +212,11 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
             fitted = json(&diag.y_predicted)?,
             sqrt_abs = json(&resid_std)?,
             marker = marker,
-            layout = plot_style("Scale-Location", "Fitted Value", "&radic;|Standardized Residual|"),
+            layout = plot_style(
+                "Scale-Location",
+                "Fitted Value",
+                "&radic;|Standardized Residual|"
+            ),
             cfg = plot_cfg,
         ));
 
@@ -239,7 +266,12 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     } else {
         format!(
             "<div class=\"alert\">{}</div>",
-            input.notes.iter().map(|n| esc(n)).collect::<Vec<_>>().join("<br/>")
+            input
+                .notes
+                .iter()
+                .map(|n| esc(n))
+                .collect::<Vec<_>>()
+                .join("<br/>")
         )
     };
 
@@ -302,7 +334,9 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     let edf_rows = input
         .edf_blocks
         .iter()
-        .map(|(i, edf)| format!("<tr><td class=\"mono\">{i}</td><td class=\"num\">{edf:.4}</td></tr>"))
+        .map(|(i, edf)| {
+            format!("<tr><td class=\"mono\">{i}</td><td class=\"num\">{edf:.4}</td></tr>")
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -310,16 +344,30 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     let continuous_section = if input.continuous_order.is_empty() {
         String::new()
     } else {
-        let rows = input.continuous_order.iter().map(|c| {
-            let f = |v: Option<f64>| v.map(|x| format!("{x:.4e}")).unwrap_or_else(|| "\u{2014}".to_string());
-            format!(
-                "<tr><td>{}</td><td class=\"num\">{:.4e}</td><td class=\"num\">{:.4e}</td>\
+        let rows = input
+            .continuous_order
+            .iter()
+            .map(|c| {
+                let f = |v: Option<f64>| {
+                    v.map(|x| format!("{x:.4e}"))
+                        .unwrap_or_else(|| "\u{2014}".to_string())
+                };
+                format!(
+                    "<tr><td>{}</td><td class=\"num\">{:.4e}</td><td class=\"num\">{:.4e}</td>\
                  <td class=\"num\">{:.4e}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
                  <td class=\"num\">{}</td><td class=\"status\">{}</td></tr>",
-                esc(&c.name), c.lambda0, c.lambda1, c.lambda2,
-                f(c.r_ratio), f(c.nu), f(c.kappa2), esc(&c.status),
-            )
-        }).collect::<Vec<_>>().join("\n");
+                    esc(&c.name),
+                    c.lambda0,
+                    c.lambda1,
+                    c.lambda2,
+                    f(c.r_ratio),
+                    f(c.nu),
+                    f(c.kappa2),
+                    esc(&c.status),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
             "<section class=\"card\" id=\"sec-cont-order\">\n\
              <h2>Continuous Smoothness Order</h2>\n\
@@ -332,8 +380,16 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
 
     // Diagnostics plots grid
     let diagnostics_section = if input.diagnostics.is_some() {
-        let has_cal = input.diagnostics.as_ref().and_then(|d| d.calibration.as_ref()).is_some();
-        let cal_div = if has_cal { "<div id=\"cal_plot\" class=\"plot\"></div>" } else { "" };
+        let has_cal = input
+            .diagnostics
+            .as_ref()
+            .and_then(|d| d.calibration.as_ref())
+            .is_some();
+        let cal_div = if has_cal {
+            "<div id=\"cal_plot\" class=\"plot\"></div>"
+        } else {
+            ""
+        };
         format!(
             "<section class=\"card\" id=\"sec-diagnostics\">\n\
              <h2>Diagnostics</h2>\n\
@@ -354,9 +410,17 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     let smooth_section = if input.smooth_plots.is_empty() {
         String::new()
     } else {
-        let divs = input.smooth_plots.iter()
-            .map(|sp| format!("<div id=\"smooth_{}\" class=\"plot\"></div>", to_html_id(&sp.name)))
-            .collect::<Vec<_>>().join("\n");
+        let divs = input
+            .smooth_plots
+            .iter()
+            .map(|sp| {
+                format!(
+                    "<div id=\"smooth_{}\" class=\"plot\"></div>",
+                    to_html_id(&sp.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
             "<section class=\"card\" id=\"sec-smooth\">\n\
              <h2>Smooth Terms</h2>\n\
@@ -368,15 +432,22 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     let alo_section = if let Some(alo) = &input.alo {
         let max_show = 100;
         let n_show = alo.rows.len().min(max_show);
-        let rows = alo.rows[..n_show].iter().map(|r| {
-            format!(
-                "<tr><td class=\"mono\">{}</td><td class=\"num\">{:.6e}</td>\
+        let rows = alo.rows[..n_show]
+            .iter()
+            .map(|r| {
+                format!(
+                    "<tr><td class=\"mono\">{}</td><td class=\"num\">{:.6e}</td>\
                  <td class=\"num\">{:.6e}</td><td class=\"num\">{:.6e}</td></tr>",
-                r.index, r.leverage, r.eta_tilde, r.se_sandwich
-            )
-        }).collect::<Vec<_>>().join("\n");
+                    r.index, r.leverage, r.eta_tilde, r.se_sandwich
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let truncation_note = if alo.rows.len() > max_show {
-            format!("<p class=\"muted\">Showing first {n_show} of {} rows</p>", alo.rows.len())
+            format!(
+                "<p class=\"muted\">Showing first {n_show} of {} rows</p>",
+                alo.rows.len()
+            )
         } else {
             String::new()
         };
@@ -410,7 +481,8 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     if input.alo.is_some() {
         nav_items.push(("sec-alo", "ALO"));
     }
-    let nav_links = nav_items.iter()
+    let nav_links = nav_items
+        .iter()
         .map(|(id, label)| format!("<a href=\"#{id}\">{label}</a>"))
         .collect::<Vec<_>>()
         .join("");
@@ -615,7 +687,13 @@ fn js_escape(s: &str) -> String {
 
 fn to_html_id(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
