@@ -1199,9 +1199,31 @@ trait PenalizedGeometry {
 }
 
 #[derive(Clone)]
+enum DerivativeMatrixStorage {
+    Dense(Array2<f64>),
+    Embedded(EmbeddedDerivativeMatrix),
+}
+
+#[derive(Clone)]
+struct EmbeddedDerivativeMatrix {
+    local: Array2<f64>,
+    global_range: Range<usize>,
+    total_dim: usize,
+}
+
+impl EmbeddedDerivativeMatrix {
+    fn new(local: Array2<f64>, global_range: Range<usize>, total_dim: usize) -> Self {
+        Self {
+            local,
+            global_range,
+            total_dim,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct HyperDesignDerivative {
-    dense: Option<Array2<f64>>,
-    embedded: Option<(Array2<f64>, Range<usize>, usize)>,
+    storage: DerivativeMatrixStorage,
 }
 
 impl HyperDesignDerivative {
@@ -1211,107 +1233,95 @@ impl HyperDesignDerivative {
         total_cols: usize,
     ) -> Self {
         Self {
-            dense: None,
-            embedded: Some((local, global_range, total_cols)),
+            storage: DerivativeMatrixStorage::Embedded(EmbeddedDerivativeMatrix::new(
+                local,
+                global_range,
+                total_cols,
+            )),
         }
     }
 
     pub(crate) fn nrows(&self) -> usize {
-        self.embedded.as_ref().map_or_else(
-            || self.dense.as_ref().map_or(0, Array2::nrows),
-            |(local, _, _)| local.nrows(),
-        )
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.nrows(),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded.local.nrows(),
+        }
     }
 
     pub(crate) fn ncols(&self) -> usize {
-        self.embedded.as_ref().map_or_else(
-            || self.dense.as_ref().map_or(0, Array2::ncols),
-            |(_, _, total_cols)| *total_cols,
-        )
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.ncols(),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded.total_dim,
+        }
     }
 
     pub(crate) fn materialize(&self) -> Array2<f64> {
-        if let Some(dense) = self.dense.as_ref() {
-            return dense.clone();
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.clone(),
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                let mut dense = Array2::<f64>::zeros((embedded.local.nrows(), embedded.total_dim));
+                dense
+                    .slice_mut(s![.., embedded.global_range.clone()])
+                    .assign(&embedded.local);
+                dense
+            }
         }
-        let (local, global_range, total_cols) = self
-            .embedded
-            .as_ref()
-            .expect("HyperDesignDerivative must be dense or embedded");
-        let mut dense = Array2::<f64>::zeros((local.nrows(), *total_cols));
-        dense.slice_mut(s![.., global_range.clone()]).assign(local);
-        dense
     }
 
     pub(crate) fn any_nonzero(&self) -> bool {
-        if let Some((local, _, _)) = self.embedded.as_ref() {
-            local.iter().any(|v| *v != 0.0)
-        } else {
-            self.dense
-                .as_ref()
-                .is_some_and(|dense| dense.iter().any(|v| *v != 0.0))
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.iter().any(|v| *v != 0.0),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded.local.iter().any(|v| *v != 0.0),
         }
     }
 
     pub(crate) fn t_dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
-            let mut out = Array1::<f64>::zeros(*total_cols);
-            out.slice_mut(s![global_range.clone()])
-                .assign(&local.t().dot(rhs));
-            out
-        } else {
-            self.dense
-                .as_ref()
-                .expect("dense HyperDesignDerivative missing matrix")
-                .t()
-                .dot(rhs)
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.t().dot(rhs),
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                let mut out = Array1::<f64>::zeros(embedded.total_dim);
+                out.slice_mut(s![embedded.global_range.clone()])
+                    .assign(&embedded.local.t().dot(rhs));
+                out
+            }
         }
     }
 
     pub(crate) fn dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        if let Some((local, global_range, _)) = self.embedded.as_ref() {
-            local.dot(&rhs.slice(s![global_range.clone(), ..]))
-        } else {
-            self.dense
-                .as_ref()
-                .expect("dense HyperDesignDerivative missing matrix")
-                .dot(rhs)
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded
+                .local
+                .dot(&rhs.slice(s![embedded.global_range.clone(), ..])),
         }
     }
 
     pub(crate) fn t_dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
-            let mut out = Array2::<f64>::zeros((*total_cols, rhs.ncols()));
-            out.slice_mut(s![global_range.clone(), ..])
-                .assign(&local.t().dot(rhs));
-            out
-        } else {
-            self.dense
-                .as_ref()
-                .expect("dense HyperDesignDerivative missing matrix")
-                .t()
-                .dot(rhs)
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.t().dot(rhs),
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                let mut out = Array2::<f64>::zeros((embedded.total_dim, rhs.ncols()));
+                out.slice_mut(s![embedded.global_range.clone(), ..])
+                    .assign(&embedded.local.t().dot(rhs));
+                out
+            }
         }
     }
 
     pub(crate) fn transpose_row_block(&self, rows: Range<usize>) -> Array2<f64> {
-        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
-            let start = rows.start.min(local.nrows());
-            let end = rows.end.min(local.nrows());
-            let block_cols = end.saturating_sub(start);
-            let mut out = Array2::<f64>::zeros((*total_cols, block_cols));
-            if block_cols > 0 {
-                out.slice_mut(s![global_range.clone(), ..])
-                    .assign(&local.slice(s![start..end, ..]).t());
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.slice(s![rows, ..]).t().to_owned(),
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                let start = rows.start.min(embedded.local.nrows());
+                let end = rows.end.min(embedded.local.nrows());
+                let block_cols = end.saturating_sub(start);
+                let mut out = Array2::<f64>::zeros((embedded.total_dim, block_cols));
+                if block_cols > 0 {
+                    out.slice_mut(s![embedded.global_range.clone(), ..])
+                        .assign(&embedded.local.slice(s![start..end, ..]).t());
+                }
+                out
             }
-            out
-        } else {
-            self.dense
-                .as_ref()
-                .expect("dense HyperDesignDerivative missing matrix")
-                .slice(s![rows, ..])
-                .t()
-                .to_owned()
         }
     }
 
@@ -1320,12 +1330,8 @@ impl HyperDesignDerivative {
         target: &mut Array2<f64>,
         amp: f64,
     ) -> Result<(), EstimationError> {
-        match self.embedded.as_ref() {
-            None => {
-                let dense = self
-                    .dense
-                    .as_ref()
-                    .expect("dense HyperDesignDerivative missing matrix");
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => {
                 if target.raw_dim() != dense.raw_dim() {
                     return Err(EstimationError::InvalidInput(format!(
                         "dense hyper design derivative shape mismatch: target={}x{}, matrix={}x{}",
@@ -1337,19 +1343,20 @@ impl HyperDesignDerivative {
                 }
                 target.scaled_add(amp, dense);
             }
-            Some((local, global_range, total_cols)) => {
-                if target.nrows() != local.nrows() || target.ncols() != *total_cols {
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if target.nrows() != embedded.local.nrows() || target.ncols() != embedded.total_dim
+                {
                     return Err(EstimationError::InvalidInput(format!(
                         "embedded hyper design derivative shape mismatch: target={}x{}, expected {}x{}",
                         target.nrows(),
                         target.ncols(),
-                        local.nrows(),
-                        total_cols
+                        embedded.local.nrows(),
+                        embedded.total_dim
                     )));
                 }
                 target
-                    .slice_mut(s![.., global_range.clone()])
-                    .scaled_add(amp, local);
+                    .slice_mut(s![.., embedded.global_range.clone()])
+                    .scaled_add(amp, &embedded.local);
             }
         }
         Ok(())
@@ -1360,40 +1367,37 @@ impl HyperDesignDerivative {
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError> {
-        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
-            if *total_cols != qs.nrows() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "embedded design derivative width mismatch: total_cols={}, qs rows={}",
-                    total_cols,
-                    qs.nrows()
-                )));
+        match &self.storage {
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if embedded.total_dim != qs.nrows() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded design derivative width mismatch: total_cols={}, qs rows={}",
+                        embedded.total_dim,
+                        qs.nrows()
+                    )));
+                }
+                let qs_local = qs.slice(s![embedded.global_range.clone(), ..]);
+                let mut transformed = embedded.local.dot(&qs_local);
+                if let Some(z) = free_basis_opt {
+                    transformed = transformed.dot(z);
+                }
+                Ok(transformed)
             }
-            let qs_local = qs.slice(s![global_range.clone(), ..]);
-            let mut transformed = local.dot(&qs_local);
-            if let Some(z) = free_basis_opt {
-                transformed = transformed.dot(z);
+            DerivativeMatrixStorage::Dense(dense) => {
+                Ok(crate::matrix::DenseRightProductView::new(dense)
+                    .with_factor(qs)
+                    .with_optional_factor(free_basis_opt)
+                    .materialize())
             }
-            Ok(transformed)
-        } else {
-            Ok(crate::matrix::DenseRightProductView::new(
-                self.dense
-                    .as_ref()
-                    .expect("dense HyperDesignDerivative missing matrix"),
-            )
-            .with_factor(qs)
-            .with_optional_factor(free_basis_opt)
-            .materialize())
         }
     }
 
     pub(crate) fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        if let Some((local, global_range, _)) = self.embedded.as_ref() {
-            local.dot(&rhs.slice(s![global_range.clone()]))
-        } else {
-            self.dense
-                .as_ref()
-                .expect("dense HyperDesignDerivative missing matrix")
-                .dot(rhs)
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded
+                .local
+                .dot(&rhs.slice(s![embedded.global_range.clone()])),
         }
     }
 }
@@ -1401,16 +1405,14 @@ impl HyperDesignDerivative {
 impl From<Array2<f64>> for HyperDesignDerivative {
     fn from(value: Array2<f64>) -> Self {
         Self {
-            dense: Some(value),
-            embedded: None,
+            storage: DerivativeMatrixStorage::Dense(value),
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct HyperPenaltyDerivative {
-    dense: Option<Array2<f64>>,
-    embedded: Option<(Array2<f64>, Range<usize>, usize)>,
+    storage: DerivativeMatrixStorage,
 }
 
 impl HyperPenaltyDerivative {
@@ -1420,16 +1422,19 @@ impl HyperPenaltyDerivative {
         total_dim: usize,
     ) -> Self {
         Self {
-            dense: None,
-            embedded: Some((local, global_range, total_dim)),
+            storage: DerivativeMatrixStorage::Embedded(EmbeddedDerivativeMatrix::new(
+                local,
+                global_range,
+                total_dim,
+            )),
         }
     }
 
     pub(crate) fn nrows(&self) -> usize {
-        self.embedded.as_ref().map_or_else(
-            || self.dense.as_ref().map_or(0, Array2::nrows),
-            |(_, _, total_dim)| *total_dim,
-        )
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense.nrows(),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded.total_dim,
+        }
     }
 
     pub(crate) fn ncols(&self) -> usize {
@@ -1448,30 +1453,29 @@ impl HyperPenaltyDerivative {
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError> {
-        if let Some((local, global_range, total_dim)) = self.embedded.as_ref() {
-            if *total_dim != qs.nrows() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "embedded penalty derivative width mismatch: total_dim={}, qs rows={}",
-                    total_dim,
-                    qs.nrows()
-                )));
+        match &self.storage {
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if embedded.total_dim != qs.nrows() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded penalty derivative width mismatch: total_dim={}, qs rows={}",
+                        embedded.total_dim,
+                        qs.nrows()
+                    )));
+                }
+                let qs_local = qs.slice(s![embedded.global_range.clone(), ..]);
+                let mut transformed = qs_local.t().dot(&embedded.local).dot(&qs_local);
+                if let Some(z) = free_basis_opt {
+                    transformed = z.t().dot(&transformed).dot(z);
+                }
+                Ok(transformed)
             }
-            let qs_local = qs.slice(s![global_range.clone(), ..]);
-            let mut transformed = qs_local.t().dot(local).dot(&qs_local);
-            if let Some(z) = free_basis_opt {
-                transformed = z.t().dot(&transformed).dot(z);
+            DerivativeMatrixStorage::Dense(dense) => {
+                let mut transformed = qs.t().dot(dense).dot(qs);
+                if let Some(z) = free_basis_opt {
+                    transformed = z.t().dot(&transformed).dot(z);
+                }
+                Ok(transformed)
             }
-            Ok(transformed)
-        } else {
-            let dense = self
-                .dense
-                .as_ref()
-                .expect("dense HyperPenaltyDerivative missing matrix");
-            let mut transformed = qs.t().dot(dense).dot(qs);
-            if let Some(z) = free_basis_opt {
-                transformed = z.t().dot(&transformed).dot(z);
-            }
-            Ok(transformed)
         }
     }
 
@@ -1480,12 +1484,8 @@ impl HyperPenaltyDerivative {
         target: &mut Array2<f64>,
         amp: f64,
     ) -> Result<(), EstimationError> {
-        match self.embedded.as_ref() {
-            None => {
-                let dense = self
-                    .dense
-                    .as_ref()
-                    .expect("dense HyperPenaltyDerivative missing matrix");
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => {
                 if target.raw_dim() != dense.raw_dim() {
                     return Err(EstimationError::InvalidInput(format!(
                         "dense hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
@@ -1497,19 +1497,22 @@ impl HyperPenaltyDerivative {
                 }
                 target.scaled_add(amp, dense);
             }
-            Some((local, global_range, total_dim)) => {
-                if target.nrows() != *total_dim || target.ncols() != *total_dim {
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if target.nrows() != embedded.total_dim || target.ncols() != embedded.total_dim {
                     return Err(EstimationError::InvalidInput(format!(
                         "embedded hyper penalty derivative shape mismatch: target={}x{}, expected {}x{}",
                         target.nrows(),
                         target.ncols(),
-                        total_dim,
-                        total_dim
+                        embedded.total_dim,
+                        embedded.total_dim
                     )));
                 }
                 target
-                    .slice_mut(s![global_range.clone(), global_range.clone()])
-                    .scaled_add(amp, local);
+                    .slice_mut(s![
+                        embedded.global_range.clone(),
+                        embedded.global_range.clone()
+                    ])
+                    .scaled_add(amp, &embedded.local);
             }
         }
         Ok(())
@@ -1519,8 +1522,7 @@ impl HyperPenaltyDerivative {
 impl From<Array2<f64>> for HyperPenaltyDerivative {
     fn from(value: Array2<f64>) -> Self {
         Self {
-            dense: Some(value),
-            embedded: None,
+            storage: DerivativeMatrixStorage::Dense(value),
         }
     }
 }
