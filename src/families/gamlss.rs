@@ -30,8 +30,7 @@ use crate::smooth::{
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
-use crate::solver::pirls::WorkingLikelihood;
-use crate::types::{GlmLikelihoodFamily, InverseLink, LinkFunction};
+use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
@@ -81,12 +80,6 @@ fn gaussian_log_sigma_irlsinfo_directional_derivative(
     if dw.is_finite() { dw } else { 0.0 }
 }
 
-#[inline]
-fn hard_clamped_etarow(eta: f64, min_eta: f64, max_eta: f64) -> (f64, bool) {
-    let eta_used = eta.clamp(min_eta, max_eta);
-    let clamp_active = eta != eta_used;
-    (eta_used, clamp_active)
-}
 
 #[derive(Clone, Copy)]
 struct GamlssLambdaLayout {
@@ -471,45 +464,6 @@ fn validate_binomial_location_scalewiggle_termspec(
         ));
     }
     Ok(())
-}
-
-/// Shared single-block GLM evaluation adapter backed by the engine-level
-/// `WorkingLikelihood` implementation used by PIRLS.
-fn evaluate_single_block_glm(
-    family: GlmLikelihoodFamily,
-    y: &Array1<f64>,
-    weights: &Array1<f64>,
-    eta: &Array1<f64>,
-) -> Result<FamilyEvaluation, String> {
-    let n = y.len();
-    if eta.len() != n || weights.len() != n {
-        return Err("single-block GLM input size mismatch".to_string());
-    }
-    let mut mu = Array1::<f64>::zeros(n);
-    let mut z = Array1::<f64>::zeros(n);
-    let mut w = Array1::<f64>::zeros(n);
-    family
-        .irls_update(
-            y.view(),
-            eta,
-            weights.view(),
-            &mut mu,
-            &mut w,
-            &mut z,
-            None,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-    let ll = family
-        .log_likelihood(y.view(), eta, &mu, weights.view())
-        .map_err(|e| e.to_string())?;
-    Ok(FamilyEvaluation {
-        log_likelihood: ll,
-        blockworking_sets: vec![BlockWorkingSet::Diagonal {
-            working_response: z,
-            working_weights: w,
-        }],
-    })
 }
 
 fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64>, String> {
@@ -1134,13 +1088,6 @@ pub struct GaussianLocationScaleSpec {
 }
 
 #[derive(Clone)]
-pub struct BinomialLogitSpec {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub eta_block: ParameterBlockInput,
-}
-
-#[derive(Clone)]
 pub struct BinomialMeanWiggleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -1322,24 +1269,6 @@ pub fn fit_gaussian_location_scale(
         cached_row_scalars: std::cell::RefCell::new(None),
     };
     let blocks = vec![muspec, log_sigmaspec];
-    Ok(fit_custom_family(&family, &blocks, options)?)
-}
-
-pub fn fit_binomial_logit(
-    spec: BinomialLogitSpec,
-    options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
-    let n = spec.y.len();
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, "fit_binomial_logit")?;
-    validate_binomial_response(&spec.y, "fit_binomial_logit")?;
-    validate_blockrows("eta", n, &spec.eta_block)?;
-
-    let family = BinomialLogitFamily {
-        y: spec.y,
-        weights: spec.weights,
-    };
-    let blocks = vec![spec.eta_block.intospec("eta")?];
     Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
@@ -4971,33 +4900,6 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
     }
 }
 
-/// Built-in binomial logit family (single parameter block).
-#[derive(Clone)]
-pub struct BinomialLogitFamily {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-}
-
-impl BinomialLogitFamily {
-    pub const BLOCK_ETA: usize = 0;
-
-    pub fn parameternames() -> &'static [&'static str] {
-        &["eta"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::Logit]
-    }
-
-    pub fn metadata() -> FamilyMetadata {
-        FamilyMetadata {
-            name: "binomial_logit",
-            parameternames: Self::parameternames(),
-            parameter_links: Self::parameter_links(),
-        }
-    }
-}
-
 fn expect_single_block<'a>(
     block_states: &'a [ParameterBlockState],
     family_name: &str,
@@ -5009,37 +4911,6 @@ fn expect_single_block<'a>(
         ));
     }
     Ok(&block_states[0])
-}
-
-impl CustomFamily for BinomialLogitFamily {
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        let eta = &expect_single_block(block_states, "BinomialLogitFamily")?.eta;
-        let n = self.y.len();
-        if eta.len() != n || self.weights.len() != n {
-            return Err("BinomialLogitFamily input size mismatch".to_string());
-        }
-        evaluate_single_block_glm(
-            GlmLikelihoodFamily::BinomialLogit,
-            &self.y,
-            &self.weights,
-            eta,
-        )
-    }
-}
-
-impl CustomFamilyGenerative for BinomialLogitFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        let mean = expect_single_block(block_states, "BinomialLogitFamily")?
-            .eta
-            .mapv(|e| 1.0 / (1.0 + (-e.clamp(-30.0, 30.0)).exp()));
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Bernoulli,
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -5297,14 +5168,14 @@ impl CustomFamily for PoissonLogFamily {
                     "PoissonLogFamily requires non-negative finite y; found y[{i}]={yi}"
                 ));
             }
-            let (e, clamp_active) = hard_clamped_etarow(eta[i], -30.0, 30.0);
+            let e = eta[i];
             let m = e.exp().max(1e-12);
             mu[i] = m;
             // Drop log(y!) constant in objective.
             ll += self.weights[i] * (yi * e - m);
             let dmu = m.max(MIN_DERIV);
             let var = m.max(MIN_PROB);
-            if self.weights[i] == 0.0 || clamp_active {
+            if self.weights[i] == 0.0 {
                 w[i] = 0.0;
                 z[i] = eta[i];
             } else {
@@ -5389,14 +5260,14 @@ impl CustomFamily for GammaLogFamily {
                     "GammaLogFamily requires positive finite y; found y[{i}]={yi}"
                 ));
             }
-            let (e, clamp_active) = hard_clamped_etarow(eta[i], -30.0, 30.0);
+            let e = eta[i];
             let m = e.exp().max(1e-12);
             mu[i] = m;
             // Gamma(shape=k, scale=mu/k), dropping constants independent of eta.
             ll += self.weights[i] * (-self.shape * (yi / m + m.ln()));
             let dmu = m.max(MIN_DERIV);
             let var = (m * m / self.shape).max(MIN_PROB);
-            if self.weights[i] == 0.0 || clamp_active {
+            if self.weights[i] == 0.0 {
                 w[i] = 0.0;
                 z[i] = eta[i];
             } else {
@@ -13740,8 +13611,9 @@ mod tests {
             }
             Err(err) => {
                 // An error here also confirms the instability
+                let msg = format!("{err}");
                 assert!(
-                    err.contains("non-finite") || err.contains("NaN"),
+                    msg.contains("non-finite") || msg.contains("NaN"),
                     "unexpected Hessian error: {err}"
                 );
             }
@@ -13795,5 +13667,92 @@ mod tests {
             wiggle_family.known_link_wiggle().is_some(),
             "BinomialLocationScaleWiggleFamily SHOULD have stabilization"
         );
+    }
+
+    #[test]
+    fn poisson_extreme_eta_produces_nonfinite_without_clamp() {
+        use crate::families::custom_family::{CustomFamily, ParameterBlockState};
+        let poisson = PoissonLogFamily {
+            y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
+            weights: Array1::from_vec(vec![1.0, 1.0, 1.0]),
+        };
+        let extreme_eta = Array1::from_vec(vec![0.5, 709.0, -0.3]);
+        let eval_result = poisson.evaluate(&[ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: extreme_eta,
+        }]);
+        match eval_result {
+            Ok(eval) => {
+                match &eval.blockworking_sets[0] {
+                    crate::families::custom_family::BlockWorkingSet::Diagonal {
+                        working_response,
+                        working_weights,
+                    } => {
+                        let all_finite = working_response.iter().all(|v| v.is_finite())
+                            && working_weights.iter().all(|v| v.is_finite())
+                            && eval.log_likelihood.is_finite();
+                        assert!(
+                            all_finite,
+                            "Poisson evaluate should produce finite outputs for all eta, \
+                             but got non-finite values: ll={}, z={:?}, w={:?}",
+                            eval.log_likelihood, working_response, working_weights
+                        );
+                    }
+                    _ => panic!("expected Diagonal block"),
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_extreme_log_sigma_triggers_eigendecomposition_crash() {
+        use crate::families::custom_family::BlockwiseFitOptions;
+        let n = 20;
+        let y = Array1::from_shape_fn(n, |i| (i as f64) * 0.5 + 0.1);
+        let weights = Array1::ones(n);
+        let mu_design = Array2::from_shape_fn((n, 2), |(_, j)| if j == 0 { 1.0 } else { 0.5 });
+        let ls_design = Array2::from_shape_fn((n, 2), |(_, j)| if j == 0 { 1.0 } else { 0.1 });
+        let spec = GaussianLocationScaleSpec {
+            y,
+            weights,
+            mu_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(mu_design),
+                penalties: vec![],
+                initial_log_lambdas: None,
+                initial_beta: Some(array![0.0, 1.0]),
+            },
+            log_sigma_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(ls_design),
+                penalties: vec![],
+                initial_log_lambdas: None,
+                initial_beta: Some(array![500.0, 0.0]),
+            },
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 3,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = fit_gaussian_location_scale(spec, &options);
+        match result {
+            Ok(fit) => {
+                let all_finite = fit.block_results.iter().all(|br| {
+                    br.beta.iter().all(|v| v.is_finite())
+                });
+                assert!(
+                    all_finite,
+                    "fit succeeded but produced non-finite coefficients"
+                );
+            }
+            Err(ref e) => {
+                let msg = format!("{e}");
+                assert!(
+                    !msg.contains("eigendecomposition failed"),
+                    "the fit crashed with the eigendecomposition bug: {msg}"
+                );
+            }
+        }
     }
 }

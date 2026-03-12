@@ -25,9 +25,6 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 // These helpers prevent diagnostic spam while ensuring important messages are seen.
 // Pattern: show first occurrence, then every Nth occurrence, with count indicator.
 
-/// Print interval for rate-limited diagnostics
-pub const DIAG_PRINT_INTERVAL: usize = 50;
-
 /// Rate-limited diagnostic counters for gradient calculations
 pub static GRAD_DIAG_BETA_COLLAPSE_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static GRAD_DIAG_DELTA_ZERO_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -39,13 +36,6 @@ pub static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
 pub static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub const MIN_EIG_DIAG_EVERY: usize = 200;
 pub const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
-
-/// Returns (should_print, count) - prints on first occurrence, then every DIAG_PRINT_INTERVAL
-pub fn should_emitgrad_diag(counter: &AtomicUsize) -> (bool, usize) {
-    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let should_print = count == 1 || count.is_multiple_of(DIAG_PRINT_INTERVAL);
-    (should_print, count)
-}
 
 /// Rate-limited check for Hessian minimum eigenvalue diagnostics.
 /// Returns true if this eigenvalue warrants a diagnostic message.
@@ -297,14 +287,6 @@ impl GradientDiagnosticReport {
         }
     }
 
-    /// Log the full diagnostic report to stderr
-    pub fn log_to_stderr(&self) {
-        if self.has_issues() {
-            eprintln!("\n=== GRADIENT DIAGNOSTIC REPORT ===");
-            eprintln!("{}", self.summary());
-            eprintln!("==================================\n");
-        }
-    }
 }
 
 // =============================================================================

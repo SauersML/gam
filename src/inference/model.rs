@@ -409,22 +409,6 @@ impl FittedModel {
         matches!(self.predict_model_class(), PredictModelClass::Survival)
     }
 
-    #[inline]
-    pub fn is_location_scale_model(&self) -> bool {
-        matches!(
-            self.predict_model_class(),
-            PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale
-        )
-    }
-
-    #[inline]
-    pub fn is_binomial_location_scale_model(&self) -> bool {
-        matches!(
-            self.predict_model_class(),
-            PredictModelClass::BinomialLocationScale
-        )
-    }
-
     pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, String> {
         let payload = self.payload();
         let raw = match &payload.family_state {

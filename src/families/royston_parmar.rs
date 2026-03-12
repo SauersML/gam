@@ -2,8 +2,7 @@ use crate::survival::{
     MonotonicityPenalty, PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs,
     SurvivalSpec, SurvivalTimeCovarInputs, WorkingModelSurvival,
 };
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// Flattened engine inputs for Royston-Parmar likelihood evaluation.
 pub struct RoystonParmarInputs<'a> {
@@ -114,22 +113,6 @@ pub fn working_model_from_time_covariateshared(
         monotonicity,
         spec,
     )
-}
-
-/// Compute expected Hessian directly from flattened inputs.
-pub fn expectedhessian_from_flattened(
-    penalties: PenaltyBlocks,
-    monotonicity: MonotonicityPenalty,
-    spec: SurvivalSpec,
-    beta: ArrayView1<'_, f64>,
-    inputs: RoystonParmarInputs<'_>,
-) -> Result<Array2<f64>, crate::estimate::EstimationError> {
-    let model = working_model_from_flattened(penalties, monotonicity, spec, inputs)
-        .map_err(|e| crate::estimate::EstimationError::InvalidSpecification(e.to_string()))?;
-    let state = model
-        .update_state(&beta.to_owned())
-        .map_err(|e| crate::estimate::EstimationError::InvalidSpecification(e.to_string()))?;
-    Ok(state.hessian.to_dense())
 }
 
 /// Options for survival smoothing-parameter optimization over `rho = log(lambda)`.
@@ -326,96 +309,3 @@ where
     })
 }
 
-/// Explicit finite-difference fallback for callers that only expose an
-/// objective value `V(rho)` and not an exact rho-gradient.
-pub fn optimize_survival_lambdaswithmultistartfd<F>(
-    num_penalties: usize,
-    heuristic_lambdas: Option<&[f64]>,
-    objective: F,
-    options: &SurvivalLambdaOptimizerOptions,
-) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
-where
-    F: Fn(&Array1<f64>) -> Result<f64, crate::estimate::EstimationError> + Sync,
-{
-    let eval_count = AtomicUsize::new(0usize);
-    let warned_rho_extreme = AtomicBool::new(false);
-    let warned_nonfinitevalue = AtomicBool::new(false);
-    let reml_start = std::time::Instant::now();
-    let wrappedobjective = |rho: &Array1<f64>| {
-        let eval_idx = eval_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if eval_idx % 5 == 1 {
-            log::debug!(
-                "[REML/fd] eval {:>3} | rho=[{}] | {:.1}s",
-                eval_idx,
-                rho.iter()
-                    .map(|r| format!("{:.2}", r))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                reml_start.elapsed().as_secs_f64(),
-            );
-        }
-        if !warned_rho_extreme.load(Ordering::Relaxed)
-            && rho.iter().any(|r| r.abs() > 12.0)
-            && !warned_rho_extreme.swap(true, Ordering::Relaxed)
-        {
-            log::warn!(
-                "[REML/fd] exploring extreme rho region at eval {} (max|rho|={:.3e})",
-                eval_idx,
-                rho.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-            );
-        }
-        let value = objective(rho)?;
-        if !warned_nonfinitevalue.load(Ordering::Relaxed)
-            && !value.is_finite()
-            && !warned_nonfinitevalue.swap(true, Ordering::Relaxed)
-        {
-            log::warn!("[REML/fd] non-finite objective value at eval {}", eval_idx);
-        }
-        Ok(value)
-    };
-
-    // Explicit fallback path for callers that only provide V(rho).
-    // Gradient is approximated numerically in estimate.rs.
-    let core_opts = crate::estimate::SmoothingBfgsOptions {
-        max_iter: options.max_iter,
-        tol: options.tol,
-        finite_diff_step: options.finite_diff_step,
-        fdhessian_max_dim: usize::MAX,
-        optimizer_kind: crate::estimate::SmoothingOptimizerKind::Bfgs,
-        seed_config: options.seed_config,
-    };
-    let result = crate::estimate::optimize_log_smoothingwithmultistart_parallelfd(
-        num_penalties,
-        heuristic_lambdas,
-        wrappedobjective,
-        &core_opts,
-    )?;
-    warn_survival_lambda_optimization_health("fd", &result, options);
-    let lambdas = result.rho.mapv(f64::exp);
-    Ok(SurvivalLambdaOptimizerResult {
-        rho: result.rho,
-        lambdas,
-        final_value: result.final_value,
-        iterations: result.iterations,
-        finalgrad_norm: result.finalgrad_norm,
-        stationary: result.stationary,
-    })
-}
-
-/// Backward-compatible alias for explicit-gradient survival optimization.
-pub fn optimize_survival_lambdaswithmultistartwithgradient<F>(
-    num_penalties: usize,
-    heuristic_lambdas: Option<&[f64]>,
-    objectivewithgradient: F,
-    options: &SurvivalLambdaOptimizerOptions,
-) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
-where
-    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
-{
-    optimize_survival_lambdaswithmultistart(
-        num_penalties,
-        heuristic_lambdas,
-        objectivewithgradient,
-        options,
-    )
-}

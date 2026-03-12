@@ -578,47 +578,6 @@ pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     result
 }
 
-/// Frobenius norm of a dense matrix.
-pub fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
-    matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
-}
-
-/// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
-pub fn rowwise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    let n_samples = a.nrows();
-    assert_eq!(
-        n_samples,
-        b.nrows(),
-        "Matrices must have same number of rows"
-    );
-
-    let a_cols = a.ncols();
-    let b_cols = b.ncols();
-
-    if n_samples == 0 || a_cols == 0 || b_cols == 0 {
-        return Array2::zeros((n_samples, a_cols * b_cols));
-    }
-
-    let mut result = Array2::zeros((n_samples, a_cols * b_cols));
-    result
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(r, mut row)| {
-            let ar = a.row(r);
-            let br = b.row(r);
-            let mut k = 0;
-            for i in 0..a_cols {
-                let ai = ar[i];
-                for j in 0..b_cols {
-                    row[k] = ai * br[j];
-                    k += 1;
-                }
-            }
-        });
-    result
-}
-
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
 #[derive(Clone)]
 pub struct ReparamResult {
@@ -769,38 +728,6 @@ pub fn compute_penalty_square_roots(
     }
 
     Ok(rs_list)
-}
-
-/// Helper to construct the summed, weighted penalty matrix S_lambda.
-/// This version works with full-sized p × p penalty matrices from s_list.
-pub fn construct_s_lambda(
-    lambdas: &Array1<f64>,
-    s_list: &[Array2<f64>],
-    p: usize,
-) -> Result<Array2<f64>, EstimationError> {
-    let mut s_lambda = Array2::zeros((p, p));
-
-    if s_list.is_empty() {
-        return Ok(s_lambda);
-    }
-
-    // Validation: lambdas length must match number of penalty matrices
-    if lambdas.len() != s_list.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",
-            s_list.len(),
-            s_list.len(),
-            lambdas.len()
-        )));
-    }
-
-    // Simple weighted sum since all matrices are now p × p
-    for (i, s_k) in s_list.iter().enumerate() {
-        // Add weighted penalty matrix
-        s_lambda.scaled_add(lambdas[i], s_k);
-    }
-
-    Ok(s_lambda)
 }
 
 /// Lambda-independent reparameterization invariants derived from penalty structure.
