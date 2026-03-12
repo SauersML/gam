@@ -23,7 +23,7 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
-use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -2177,7 +2177,6 @@ impl JointBetaRhoPosterior {
             n_beta,
             n_rho,
             penalty_roots,
-            nullspace_dims,
             rho_prior_sd,
             rho_mode: rho_mode.to_owned(),
         })
@@ -2287,11 +2286,7 @@ impl JointBetaRhoPosterior {
                 // tr(S_+⁻¹ λ_k S_k) = λ_k tr(S_+⁻¹ R_k'R_k) = λ_k ||R_k S_inv_half||²
                 // But we just compute tr(S_inv @ A_k) directly.
                 let s_k = r_k.t().dot(r_k);
-                let tr_val: f64 = s_inv
-                    .iter()
-                    .zip(s_k.iter())
-                    .map(|(&si, &sk)| si * sk)
-                    .sum();
+                let tr_val: f64 = s_inv.iter().zip(s_k.iter()).map(|(&si, &sk)| si * sk).sum();
                 grad_rho[k] += 0.5 * lambdas[k] * tr_val;
             }
         }
@@ -2360,7 +2355,10 @@ pub fn run_joint_beta_rho_sampling(
 
     log::info!(
         "[Joint HMC] Sampling (β, ρ) jointly: {} β-params + {} ρ-params = {} total (triggered by skewness {:.3})",
-        n_beta, n_rho, total_dim, inputs.trigger_skewness,
+        n_beta,
+        n_rho,
+        total_dim,
+        inputs.trigger_skewness,
     );
 
     let target = JointBetaRhoPosterior::new(
@@ -2475,7 +2473,8 @@ pub fn run_joint_beta_rho_sampling(
     if !converged {
         log::warn!(
             "[Joint HMC] Convergence warning: R-hat={:.3}, ESS={:.1}",
-            rhat, ess,
+            rhat,
+            ess,
         );
     }
 

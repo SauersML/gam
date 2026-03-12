@@ -524,7 +524,6 @@ fn compose_qs_from_split(q_pen: &Mat<f64>, q_null: &Mat<f64>, p: usize) -> Mat<f
     qs
 }
 
-
 /// Computes the Kronecker product A ⊗ B for penalty matrix construction.
 /// This is used to create tensor product penalties that enforce smoothness
 /// in multiple dimensions for interaction terms.

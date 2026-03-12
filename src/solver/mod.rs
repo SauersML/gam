@@ -5,4 +5,5 @@ pub mod opt_objective;
 pub mod pirls;
 pub mod seeding;
 pub mod smoothing;
+pub mod strategy;
 pub mod visualizer;

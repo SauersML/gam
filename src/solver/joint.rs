@@ -3020,6 +3020,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         },
         screen_max_inner_iterations: 5,
         risk_profile: seed_risk_profile_for_joint_link(link),
+        num_auxiliary_trailing: 0,
     };
     let seed_candidates =
         generate_rho_candidates(n_base + 1, heuristic_lambdas.as_deref(), &seed_config);
