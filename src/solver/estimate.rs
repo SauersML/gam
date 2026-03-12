@@ -1299,9 +1299,7 @@ where
                     // (e.g. FD perturbations) converge in far fewer inner iterations.
                     let cost = reml_state.compute_cost(rho)?;
                     let grad = reml_state.compute_gradient(rho)?;
-                    let hessian = reml_state
-                        .compute_lamlhessian_consistent(rho)
-                        .ok();
+                    let hessian = reml_state.compute_lamlhessian_consistent(rho).ok();
                     Ok((cost, grad, hessian))
                 },
                 &pure_smoothing_options,

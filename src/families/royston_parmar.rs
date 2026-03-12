@@ -281,17 +281,11 @@ where
         );
         if !warned_nonfinitevalue && !value.is_finite() {
             warned_nonfinitevalue = true;
-            log::warn!(
-                "[REML] non-finite objective value at eval {}",
-                eval_count
-            );
+            log::warn!("[REML] non-finite objective value at eval {}", eval_count);
         }
         if !warned_nonfinitegrad && grad.iter().any(|g| !g.is_finite()) {
             warned_nonfinitegrad = true;
-            log::warn!(
-                "[REML] non-finite rho-gradient at eval {}",
-                eval_count
-            );
+            log::warn!("[REML] non-finite rho-gradient at eval {}", eval_count);
         }
         Ok((value, grad))
     };
@@ -375,10 +369,7 @@ where
             && !value.is_finite()
             && !warned_nonfinitevalue.swap(true, Ordering::Relaxed)
         {
-            log::warn!(
-                "[REML/fd] non-finite objective value at eval {}",
-                eval_idx
-            );
+            log::warn!("[REML/fd] non-finite objective value at eval {}", eval_idx);
         }
         Ok(value)
     };

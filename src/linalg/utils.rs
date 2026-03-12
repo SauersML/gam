@@ -141,13 +141,7 @@ impl<'a> StableSolver<'a> {
             let mut invview = array2_to_matmut(&mut inv);
             factor.solve_in_place(invview.as_mut());
             if inv.iter().all(|v| v.is_finite()) {
-                for i in 0..p {
-                    for j in (i + 1)..p {
-                        let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
-                        inv[[i, j]] = avg;
-                        inv[[j, i]] = avg;
-                    }
-                }
+                enforce_symmetry(&mut inv);
                 return Some(inv);
             }
         }

@@ -1396,13 +1396,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         };
-        for i in 0..n_rho {
-            for j in (i + 1)..n_rho {
-                let avg = 0.5 * (hessian_rho[[i, j]] + hessian_rho[[j, i]]);
-                hessian_rho[[i, j]] = avg;
-                hessian_rho[[j, i]] = avg;
-            }
-        }
+        enforce_symmetry(&mut hessian_rho);
         let ridge = 1e-8
             * hessian_rho
                 .diag()
