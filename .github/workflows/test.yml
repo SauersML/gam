@@ -25,16 +25,17 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.93.0
           components: rustfmt
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -45,16 +46,17 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.93.0
           components: clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Lint
-        run: cargo +nightly clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -65,8 +67,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -75,7 +79,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +nightly test --all-features -- --nocapture 2>&1 | tee /tmp/cargo-test.log
+          cargo test --all-features -- --nocapture 2>&1 | tee /tmp/cargo-test.log
 
           # Treat runtime optimizer/model-path degradations as hard failures even when tests return 0.
           forbidden='P-IRLS INNER LOOP FAILED|Perfect or quasi-perfect separation detected|all candidate seeds failed|no stationary candidate found|BFGS fallback failed|Newton failed \(|falling back to BFGS|Line search stopped early|marking as non-stationary|non-stationary solution|range penalty block contains non-finite entries'
