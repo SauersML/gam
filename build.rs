@@ -1139,11 +1139,8 @@ fn split_top_level_components(pattern: &str) -> Vec<&str> {
     for (idx, ch) in pattern.char_indices() {
         match ch {
             '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ')' | ']' | '}' => {}
             ',' if depth == 0 => {
                 components.push(pattern[start..idx].trim());
                 start = idx + 1;

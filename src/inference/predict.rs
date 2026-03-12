@@ -1,5 +1,6 @@
 use crate::estimate::{EstimationError, FitResult, FittedLinkState};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
+use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
@@ -178,19 +179,10 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if x.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam dimension mismatch: X has {} columns but beta has length {}",
-            x.ncols(),
-            beta.len()
-        )));
-    }
-    if x.nrows() != offset.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam dimension mismatch: X has {} rows but offset has length {}",
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) =
+        predict_gam_dimension_mismatch_message(x.nrows(), x.ncols(), beta.len(), offset.len())
+    {
+        return Err(EstimationError::InvalidInput(message));
     }
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(

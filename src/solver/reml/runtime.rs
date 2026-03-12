@@ -1,6 +1,8 @@
 use super::*;
 use crate::faer_ndarray::FaerLblt;
-use crate::linalg::utils::StableSolver;
+use crate::linalg::utils::{
+    StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
+};
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 
 impl<'a> RemlState<'a> {
@@ -959,7 +961,7 @@ impl<'a> RemlState<'a> {
             // The hphi block below is therefore the curvature of that
             // identifiable-subspace Jeffreys penalty, represented in the
             // current transformed basis.
-            let mut weighted_xtdx = Array2::<f64>::zeros(firth_op.x_dense.raw_dim());
+            let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
             let diag_term = Self::xt_diag_x_dense_into(
                 &firth_op.x_dense,
                 &(&firth_op.w2 * &firth_op.h_diag),
@@ -1377,22 +1379,7 @@ impl<'a> RemlState<'a> {
                     "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
                 );
                 // Diagnostics: which rho are at bounds
-                let at_lower: Vec<usize> = p
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| {
-                        if v <= -RHO_BOUND + 1e-8 {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let at_upper: Vec<usize> = p
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
-                    .collect();
+                let (at_lower, at_upper) = boundary_hit_indices(p.view(), RHO_BOUND, 1e-8);
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
                     log::debug!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
@@ -1406,22 +1393,7 @@ impl<'a> RemlState<'a> {
                 self.cache_manager.invalidate_eval_bundle();
                 // Other errors still bubble up
                 // Provide bounds diagnostics here too
-                let at_lower: Vec<usize> = p
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| {
-                        if v <= -RHO_BOUND + 1e-8 {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let at_upper: Vec<usize> = p
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
-                    .collect();
+                let (at_lower, at_upper) = boundary_hit_indices(p.view(), RHO_BOUND, 1e-8);
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
                     log::debug!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
@@ -1719,16 +1691,9 @@ impl<'a> RemlState<'a> {
                     let p_eff = h_eff.ncols() as f64;
                     let edf = self.edf_from_h_and_e(&e_eval, lambdas.view(), h_eff)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
-                    let stab_cond = pirls_result
-                        .penalized_hessian_transformed
-                        .eigh(Side::Lower)
-                        .ok()
-                        .map(|(evals, _)| {
-                            let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            max / min.max(1e-12)
-                        })
-                        .unwrap_or(f64::NAN);
+                    let stab_cond = symmetric_spectrum_condition_number(
+                        &pirls_result.penalized_hessian_transformed,
+                    );
                     (edf, trace_h_inv_s_lambda, stab_cond)
                 } else {
                     (f64::NAN, f64::NAN, f64::NAN)
@@ -1751,15 +1716,7 @@ impl<'a> RemlState<'a> {
                             h_raw.scaled_add(lambda, s_k);
                         }
                     }
-                    let raw = h_raw
-                        .eigh(Side::Lower)
-                        .ok()
-                        .map(|(evals, _)| {
-                            let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            max / min.max(1e-12)
-                        })
-                        .unwrap_or(f64::NAN);
+                    let raw = symmetric_spectrum_condition_number(&h_raw);
                     *self.arena.raw_cond_snapshot.write().unwrap() = raw;
                     raw
                 } else {

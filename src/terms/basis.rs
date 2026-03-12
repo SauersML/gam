@@ -6453,8 +6453,7 @@ fn build_duchon_basis_designwithworkspace(
         }
     }
 
-    let (data_center_r, center_center_r) =
-        spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block

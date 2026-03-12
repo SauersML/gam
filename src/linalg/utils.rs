@@ -256,7 +256,9 @@ pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
         .eigh(Side::Lower)
         .ok()
         .map(|(evals, _)| {
-            let min = evals.iter().fold(f64::INFINITY, |acc, &value| acc.min(value));
+            let min = evals
+                .iter()
+                .fold(f64::INFINITY, |acc, &value| acc.min(value));
             let max = evals
                 .iter()
                 .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));

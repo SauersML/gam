@@ -727,26 +727,11 @@ pub(crate) fn compute_smoothing_correction(
     }
 
     // Symmetrize the Hessian
-    for i in 0..n_rho {
-        for j in (i + 1)..n_rho {
-            let avg = 0.5 * (hessian_rho[[i, j]] + hessian_rho[[j, i]]);
-            hessian_rho[[i, j]] = avg;
-            hessian_rho[[j, i]] = avg;
-        }
-    }
+    enforce_symmetry(&mut hessian_rho);
 
     // Step 3: Invert Hessian to get V_ρ
     // Add small ridge for numerical stability
-    let ridge = 1e-8
-        * hessian_rho
-            .diag()
-            .iter()
-            .map(|&v| v.abs())
-            .fold(0.0, f64::max)
-            .max(1e-8);
-    for i in 0..n_rho {
-        hessian_rho[[i, i]] += ridge;
-    }
+    let ridge = add_relative_diag_ridge(&mut hessian_rho, 1e-8, 1e-8);
 
     let v_rho = match hessian_rho.cholesky(Side::Lower) {
         Ok(chol) => {
@@ -1270,14 +1255,8 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
 
     use crate::construction::compute_penalty_square_roots;
@@ -1725,19 +1704,10 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if x.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam dimension mismatch: X has {} columns but beta has length {}",
-            x.ncols(),
-            beta.len()
-        )));
-    }
-    if x.nrows() != offset.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam dimension mismatch: X has {} rows but offset has length {}",
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) =
+        predict_gam_dimension_mismatch_message(x.nrows(), x.ncols(), beta.len(), offset.len())
+    {
+        return Err(EstimationError::InvalidInput(message));
     }
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
@@ -2243,14 +2213,8 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
 
     let p = x.ncols();
@@ -2297,14 +2261,8 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
 
     let p = x.ncols();
@@ -3754,22 +3712,7 @@ pub mod internal {
                         "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
                     );
                     // Diagnostics: which rho are at bounds
-                    let at_lower: Vec<usize> = p
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, &v)| {
-                            if v <= -RHO_BOUND + 1e-8 {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let at_upper: Vec<usize> = p
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
-                        .collect();
+                    let (at_lower, at_upper) = boundary_hit_indices(p.view(), RHO_BOUND, 1e-8);
                     eprintln!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
                         at_lower, at_upper
@@ -3780,22 +3723,7 @@ pub mod internal {
                     self.current_eval_bundle.write().unwrap().take();
                     // Other errors still bubble up
                     // Provide bounds diagnostics here too
-                    let at_lower: Vec<usize> = p
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, &v)| {
-                            if v <= -RHO_BOUND + 1e-8 {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let at_upper: Vec<usize> = p
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
-                        .collect();
+                    let (at_lower, at_upper) = boundary_hit_indices(p.view(), RHO_BOUND, 1e-8);
                     eprintln!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
                         at_lower, at_upper
@@ -4039,16 +3967,9 @@ pub mod internal {
                         let p_eff = pirls_result.beta_transformed.len() as f64;
                         let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
                         let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
-                        let stab_cond = pirls_result
-                            .penalized_hessian_transformed
-                            .eigh(Side::Lower)
-                            .ok()
-                            .map(|(evals, _)| {
-                                let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                                let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                                max / min.max(1e-12)
-                            })
-                            .unwrap_or(f64::NAN);
+                        let stab_cond = symmetric_spectrum_condition_number(
+                            &pirls_result.penalized_hessian_transformed,
+                        );
                         (edf, trace_h_inv_s_lambda, stab_cond)
                     } else {
                         (f64::NAN, f64::NAN, f64::NAN)
@@ -4068,15 +3989,7 @@ pub mod internal {
                                 h_raw.scaled_add(lambda, s_k);
                             }
                         }
-                        let raw = h_raw
-                            .eigh(Side::Lower)
-                            .ok()
-                            .map(|(evals, _)| {
-                                let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                                let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                                max / min.max(1e-12)
-                            })
-                            .unwrap_or(f64::NAN);
+                        let raw = symmetric_spectrum_condition_number(&h_raw);
                         *self.raw_cond_snapshot.write().unwrap() = raw;
                         raw
                     } else {
@@ -4221,24 +4134,8 @@ pub mod internal {
                     }
                     // Diagnostics: report which rho are at bounds
                     if !rho.is_empty() {
-                        let at_lower: Vec<usize> = rho
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, &v)| {
-                                if v <= -RHO_BOUND + 1e-8 {
-                                    Some(i)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        let at_upper: Vec<usize> = rho
-                            .iter()
-                            .enumerate()
-                            .filter_map(
-                                |(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None },
-                            )
-                            .collect();
+                        let (at_lower, at_upper) =
+                            boundary_hit_indices(rho.view(), RHO_BOUND, 1e-8);
                         if verbose_opt {
                             eprintln!("  -> Rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
                         }
@@ -4737,12 +4634,9 @@ pub mod internal {
                                     let mut w_k =
                                         faer::Mat::<f64>::zeros(rank_k, truncated_count_gauss);
                                     let r_k_faer = FaerArrayView::new(r_k);
-                                    let u_mul_rows =
-                                        r_k.ncols().min(u_truncated_gauss.nrows());
-                                    let r_k_sub =
-                                        r_k_faer.as_ref().subcols(0, u_mul_rows);
-                                    let u_mul_sub =
-                                        u_view.as_ref().subrows(0, u_mul_rows);
+                                    let u_mul_rows = r_k.ncols().min(u_truncated_gauss.nrows());
+                                    let r_k_sub = r_k_faer.as_ref().subcols(0, u_mul_rows);
+                                    let u_mul_sub = u_view.as_ref().subrows(0, u_mul_rows);
                                     matmul(
                                         w_k.as_mut(),
                                         Accum::Replace,

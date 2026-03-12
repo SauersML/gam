@@ -664,7 +664,7 @@ impl<'a> RemlState<'a> {
             .collect();
 
         let mut h_k = Vec::with_capacity(k_count);
-        let mut weighted_xtdx = Array2::<f64>::zeros(x_dense.raw_dim());
+        let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
         for k in 0..k_count {
             // u_k = X B_k is the eta-space sensitivity for rho_k.
             // The first Hessian derivative is

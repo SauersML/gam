@@ -34,12 +34,7 @@ impl<'a> RemlState<'a> {
         let rkw = fast_ab(r_k, w_pos);
         let mut t_k = fast_ata(&rkw);
         t_k.mapv_inplace(|v| v * lambda_k);
-
-        let mut zweighted = z_mat.clone();
-        ndarray::Zip::from(zweighted.rows_mut())
-            .and(cweighted_u_k.view())
-            .for_each(|mut row, weight| row *= *weight);
-        t_k += &fast_atb(z_mat, &zweighted);
+        t_k += &crate::faer_ndarray::fast_xt_diag_x(z_mat, cweighted_u_k);
         t_k
     }
 

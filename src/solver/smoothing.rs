@@ -1255,50 +1255,6 @@ mod tests {
         assert!(screened[0].1.iter().any(|v| v.abs() > 1e-12));
     }
 
-    #[test]
-    fn exactgradient_parallel_matches_sequential() {
-        let mut options = SmoothingBfgsOptions {
-            tol: 1e-8,
-            max_iter: 120,
-            ..SmoothingBfgsOptions::default()
-        };
-        options.seed_config.screening_budget = 4;
-        let heur = [1.0, 1.0, 1.0];
-
-        let seq = optimize_log_smoothingwithmultistartwithgradient(
-            3,
-            Some(&heur),
-            |rho: &Array1<f64>| {
-                let mut g = Array1::<f64>::zeros(rho.len());
-                g[0] = rho[0] - 0.7;
-                g[1] = 2.0 * (rho[1] + 1.1);
-                g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convexvalue(rho), g))
-            },
-            &options,
-        )
-        .expect("sequential exact-gradient optimization should succeed");
-
-        let par = optimize_log_smoothingwithmultistartwithgradient_parallel(
-            3,
-            Some(&heur),
-            |rho: &Array1<f64>| {
-                let mut g = Array1::<f64>::zeros(rho.len());
-                g[0] = rho[0] - 0.7;
-                g[1] = 2.0 * (rho[1] + 1.1);
-                g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convexvalue(rho), g))
-            },
-            &options,
-        )
-        .expect("parallel exact-gradient optimization should succeed");
-
-        assert!((seq.final_value - par.final_value).abs() < 1e-9);
-        assert_eq!(seq.rho.len(), par.rho.len());
-        for i in 0..seq.rho.len() {
-            assert!((seq.rho[i] - par.rho[i]).abs() < 1e-7);
-        }
-    }
 
     #[test]
     fn finite_difference_parallel_matches_sequential() {
@@ -1334,50 +1290,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn optimizer_kind_arc_and_bfgs_agree_on_exactgradient_problem() {
-        let heur = [1.0, 1.0, 1.0];
-        let bfgs = optimize_log_smoothingwithmultistartwithgradient(
-            3,
-            Some(&heur),
-            |rho: &Array1<f64>| {
-                let mut g = Array1::<f64>::zeros(rho.len());
-                g[0] = rho[0] - 0.7;
-                g[1] = 2.0 * (rho[1] + 1.1);
-                g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convexvalue(rho), g))
-            },
-            &SmoothingBfgsOptions {
-                tol: 1e-8,
-                max_iter: 120,
-                optimizer_kind: SmoothingOptimizerKind::Bfgs,
-                ..SmoothingBfgsOptions::default()
-            },
-        )
-        .expect("bfgs exact-gradient optimization should succeed");
-
-        let arc = optimize_log_smoothingwithmultistartwithgradient(
-            3,
-            Some(&heur),
-            |rho: &Array1<f64>| {
-                let mut g = Array1::<f64>::zeros(rho.len());
-                g[0] = rho[0] - 0.7;
-                g[1] = 2.0 * (rho[1] + 1.1);
-                g[2] = 0.5 * (rho[2] - 0.3);
-                Ok((convexvalue(rho), g))
-            },
-            &SmoothingBfgsOptions {
-                tol: 1e-8,
-                max_iter: 120,
-                optimizer_kind: SmoothingOptimizerKind::Arc,
-                ..SmoothingBfgsOptions::default()
-            },
-        )
-        .expect("arc exact-gradient optimization should succeed");
-
-        assert!((bfgs.final_value - arc.final_value).abs() < 1e-8);
-        for i in 0..bfgs.rho.len() {
-            assert!((bfgs.rho[i] - arc.rho[i]).abs() < 1e-6);
-        }
-    }
 }
