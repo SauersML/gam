@@ -20,8 +20,9 @@ from typing import Any
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG = ROOT / "biobank_scale.yml"
+BENCH_DIR = Path(__file__).resolve().parent
+ROOT = BENCH_DIR.parents[1]
+DEFAULT_CONFIG = BENCH_DIR / "biobank_scale.yml"
 HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
@@ -419,39 +420,29 @@ def survival_metrics(
 
 def ps_snapshot(pid: int) -> dict[str, Any]:
     try:
-        commands = [
+        proc = subprocess.run(
             ["ps", "-p", str(pid), "-o", "pid=,%cpu=,%mem=,rss=,vsz=,etimes=,stat=,comm="],
-            ["ps", "-p", str(pid), "-o", "pid=", "-o", "%cpu=", "-o", "%mem=", "-o", "rss=", "-o", "vsz=", "-o", "etime=", "-o", "stat=", "-o", "comm="],
-        ]
-        for cmd in commands:
-            proc = subprocess.run(
-                cmd,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            line = proc.stdout.strip()
-            if not line:
-                continue
-            parts = line.split(None, 7)
-            if len(parts) < 8:
-                continue
-            rss_raw = parts[3]
-            vsz_raw = parts[4]
-            rss_kib = int(rss_raw) if rss_raw.isdigit() else None
-            vsz_kib = int(vsz_raw) if vsz_raw.isdigit() else None
-            return {
-                "pid": parts[0],
-                "cpu_pct": parts[1],
-                "mem_pct": parts[2],
-                "rss_kib": rss_kib,
-                "vsz_kib": vsz_kib,
-                "etimes": parts[5],
-                "stat": parts[6],
-                "comm": parts[7],
-            }
-        return {}
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        line = proc.stdout.strip()
+        if not line:
+            return {}
+        parts = line.split(None, 7)
+        if len(parts) < 8:
+            return {}
+        return {
+            "pid": parts[0],
+            "cpu_pct": parts[1],
+            "mem_pct": parts[2],
+            "rss_kib": int(parts[3]) if parts[3].isdigit() else None,
+            "vsz_kib": int(parts[4]) if parts[4].isdigit() else None,
+            "etimes": parts[5],
+            "stat": parts[6],
+            "comm": parts[7],
+        }
     except Exception:
         return {}
 
@@ -549,700 +540,349 @@ def subpop_templates() -> list[dict[str, Any]]:
         {"subpop": "CEU_Utah", "continent": "Europe", "superpop": "EUR", "lat": 40.76, "lon": -111.89},
         {"subpop": "GBR_England", "continent": "Europe", "superpop": "EUR", "lat": 52.36, "lon": -1.17},
         {"subpop": "TSI_Italy", "continent": "Europe", "superpop": "EUR", "lat": 43.77, "lon": 11.25},
-        {"subpop": "FIN_Finland", "continent": "Europe", "superpop": "EUR", "lat": 60.17, "lon": 24.94},
-        {"subpop": "YRI_Nigeria", "continent": "Africa", "superpop": "AFR", "lat": 7.38, "lon": 3.95},
-        {"subpop": "LWK_Kenya", "continent": "Africa", "superpop": "AFR", "lat": 0.52, "lon": 35.27},
-        {"subpop": "MSL_SierraLeone", "continent": "Africa", "superpop": "AFR", "lat": 8.48, "lon": -13.23},
-        {"subpop": "CHB_Beijing", "continent": "Asia", "superpop": "EAS", "lat": 39.90, "lon": 116.41},
-        {"subpop": "JPT_Tokyo", "continent": "Asia", "superpop": "EAS", "lat": 35.68, "lon": 139.69},
-        {"subpop": "KHV_Vietnam", "continent": "Asia", "superpop": "EAS", "lat": 10.82, "lon": 106.63},
-        {"subpop": "GIH_Gujarat", "continent": "Asia", "superpop": "SAS", "lat": 23.02, "lon": 72.57},
-        {"subpop": "BEB_Bangladesh", "continent": "Asia", "superpop": "SAS", "lat": 23.81, "lon": 90.41},
-        {"subpop": "MXL_Mexico", "continent": "NorthAmerica", "superpop": "AMR", "lat": 19.43, "lon": -99.13},
-        {"subpop": "PUR_PuertoRico", "continent": "NorthAmerica", "superpop": "AMR", "lat": 18.47, "lon": -66.11},
-        {"subpop": "PEL_Peru", "continent": "SouthAmerica", "superpop": "AMR", "lat": -12.05, "lon": -77.05},
-        {"subpop": "CLM_Colombia", "continent": "SouthAmerica", "superpop": "AMR", "lat": 4.71, "lon": -74.07},
-        {"subpop": "PNG_Highlands", "continent": "Oceania", "superpop": "OCE", "lat": -6.08, "lon": 145.39},
-        {"subpop": "MEL_Bougainville", "continent": "Oceania", "superpop": "OCE", "lat": -6.23, "lon": 155.57},
+        {"subpop": "YRI_Nigeria", "continent": "Africa", "superpop": "AFR", "lat": 6.52, "lon": 3.37},
+        {"subpop": "LWK_Kenya", "continent": "Africa", "superpop": "AFR", "lat": -0.02, "lon": 37.91},
+        {"subpop": "GWD_Gambia", "continent": "Africa", "superpop": "AFR", "lat": 13.45, "lon": -16.58},
+        {"subpop": "CHB_Beijing", "continent": "Asia", "superpop": "EAS", "lat": 39.90, "lon": 116.40},
+        {"subpop": "JPT_Tokyo", "continent": "Asia", "superpop": "EAS", "lat": 35.68, "lon": 139.65},
+        {"subpop": "KHV_HCMC", "continent": "Asia", "superpop": "EAS", "lat": 10.82, "lon": 106.63},
+        {"subpop": "GIH_Houston", "continent": "South Asia", "superpop": "SAS", "lat": 29.76, "lon": -95.37},
+        {"subpop": "PJL_Lahore", "continent": "South Asia", "superpop": "SAS", "lat": 31.55, "lon": 74.34},
+        {"subpop": "BEB_Dhaka", "continent": "South Asia", "superpop": "SAS", "lat": 23.81, "lon": 90.41},
+        {"subpop": "MXL_LA", "continent": "Admixed America", "superpop": "AMR", "lat": 34.05, "lon": -118.24},
+        {"subpop": "PEL_Lima", "continent": "Admixed America", "superpop": "AMR", "lat": -12.05, "lon": -77.04},
+        {"subpop": "PUR_SanJuan", "continent": "Admixed America", "superpop": "AMR", "lat": 18.47, "lon": -66.11},
     ]
 
 
-def build_seed_panel(cfg: dict[str, Any], rng: np.random.Generator) -> dict[str, Any]:
-    templates = subpop_templates()
-    n_per_subpop = int(cfg["raw_subpop_n"])
-    observed_fraction = float(cfg["observed_latlon_fraction"])
-    n_pcs = 16
-    pc_cols = [f"pc{i}" for i in range(1, n_pcs + 1)]
-    continent_order = ["Europe", "Africa", "Asia", "NorthAmerica", "SouthAmerica", "Oceania"]
-    continent_center = {
-        cont: rng.normal(loc=0.0, scale=np.linspace(2.8, 0.6, n_pcs), size=n_pcs)
-        for cont in continent_order
-    }
-    superpop_shift = {
-        code: rng.normal(loc=0.0, scale=np.linspace(0.9, 0.2, n_pcs), size=n_pcs)
-        for code in sorted({t["superpop"] for t in templates})
-    }
-    rows: list[dict[str, Any]] = []
-    sample_id = 0
-    for template in templates:
-        sub_shift = rng.normal(loc=0.0, scale=np.linspace(0.45, 0.08, n_pcs), size=n_pcs)
-        lat0 = float(template["lat"])
-        lon0 = float(template["lon"])
-        lat_rad = math.radians(lat0)
-        lon_rad = math.radians(lon0)
-        geo_basis = np.array(
-            [
-                math.sin(lat_rad),
-                math.cos(lat_rad),
-                math.sin(lon_rad),
-                math.cos(lon_rad),
-                math.sin(lat_rad) * math.cos(lon_rad),
-                math.cos(lat_rad) * math.sin(lon_rad),
-                lat0 / 90.0,
-                lon0 / 180.0,
-                (lat0 / 90.0) ** 2,
-                (lon0 / 180.0) ** 2,
-                math.sin(2.0 * lat_rad),
-                math.cos(2.0 * lon_rad),
-                math.sin(lat_rad + lon_rad),
-                math.cos(lat_rad - lon_rad),
-                math.sin(0.5 * lat_rad * lon_rad),
-                math.cos(0.5 * lat_rad * lon_rad),
-            ],
-            dtype=float,
-        )
-        for _ in range(n_per_subpop):
-            lat = float(np.clip(lat0 + rng.normal(0.0, 1.4), -55.0, 72.0))
-            lon = float(((lon0 + rng.normal(0.0, 1.9) + 180.0) % 360.0) - 180.0)
-            indiv_noise = rng.normal(loc=0.0, scale=np.linspace(0.35, 0.08, n_pcs), size=n_pcs)
-            pcs = (
-                1.35 * continent_center[template["continent"]]
-                + 0.95 * superpop_shift[template["superpop"]]
-                + 0.75 * sub_shift
-                + 0.55 * geo_basis
-                + indiv_noise
-            )
-            has_observed = bool(rng.random() < observed_fraction)
-            row = {
-                "sample_id": f"seed_{sample_id:07d}",
-                "source": "seed",
-                "generation": 0,
-                "parent_a": "",
-                "parent_b": "",
-                "subpop": template["subpop"],
-                "superpop": template["superpop"],
-                "continent": template["continent"],
-                "lat_true": lat,
-                "lon_true": lon,
-                "lat_obs": lat if has_observed else "",
-                "lon_obs": lon if has_observed else "",
-                "lat_missing": 0 if has_observed else 1,
-                "lon_missing": 0 if has_observed else 1,
-            }
-            for j, col in enumerate(pc_cols):
-                row[col] = float(pcs[j])
-            rows.append(row)
-            sample_id += 1
-    return {"rows": rows, "pc_cols": pc_cols}
-
-
-def fit_latlon_imputer(pc_known: np.ndarray, latlon_known: np.ndarray) -> dict[str, Any]:
-    if pc_known.shape[0] < 8:
-        raise RuntimeError("not enough rows with observed lat/lon to fit imputer")
-    try:
-        import xgboost as xgb
-    except ModuleNotFoundError:
-        xgb = None
-    if xgb is not None:
-        models = []
-        for dim in range(2):
-            model = xgb.XGBRegressor(
-                n_estimators=260,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                objective="reg:squarederror",
-                reg_lambda=1.0,
-                random_state=20260310 + dim,
-                n_jobs=1,
-            )
-            model.fit(pc_known, latlon_known[:, dim])
-            models.append(model)
-        return {"kind": "xgboost", "models": models}
-    return {"kind": "knn_inverse_distance", "pc_known": pc_known.copy(), "latlon_known": latlon_known.copy()}
-
-
-def predict_latlon_imputer(model: dict[str, Any], pc_all: np.ndarray) -> np.ndarray:
-    if model["kind"] == "xgboost":
-        lat = np.asarray(model["models"][0].predict(pc_all), dtype=float)
-        lon = np.asarray(model["models"][1].predict(pc_all), dtype=float)
-        return np.column_stack([lat, lon])
-    known = np.asarray(model["pc_known"], dtype=float)
-    latlon = np.asarray(model["latlon_known"], dtype=float)
-    out = np.empty((pc_all.shape[0], 2), dtype=float)
-    for i in range(pc_all.shape[0]):
-        d = np.sqrt(np.maximum(np.sum((known - pc_all[i]) ** 2, axis=1), 0.0))
-        nn = np.argsort(d)[:8]
-        w = 1.0 / np.maximum(d[nn], 1e-6)
-        w = w / np.sum(w)
-        out[i] = np.sum(latlon[nn] * w.reshape(-1, 1), axis=0)
+def build_pc_means(templates: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for idx, tpl in enumerate(templates):
+        base = np.zeros(16, dtype=float)
+        continent_block = idx // 3
+        base[continent_block] = 2.5
+        base[(continent_block + 5) % 16] = -1.2
+        base[(2 * continent_block + 7) % 16] = 0.8
+        if tpl["superpop"] == "AFR":
+            base[8] = 1.7
+        elif tpl["superpop"] == "EAS":
+            base[9] = -1.6
+        elif tpl["superpop"] == "SAS":
+            base[10] = 1.1
+        elif tpl["superpop"] == "AMR":
+            base[11] = -1.1
+        else:
+            base[12] = 0.7
+        out[str(tpl["subpop"])] = base
     return out
 
 
-def impute_latlon(seed_panel: dict[str, Any], rng: np.random.Generator) -> dict[str, Any]:
-    rows = seed_panel["rows"]
-    pc_cols = seed_panel["pc_cols"]
-    pcs = np.array([[float(r[c]) for c in pc_cols] for r in rows], dtype=float)
-    known_mask = np.array([r["lat_missing"] == 0 for r in rows], dtype=bool)
-    latlon_known = np.array(
-        [[float(rows[i]["lat_obs"]), float(rows[i]["lon_obs"])] for i in np.where(known_mask)[0]],
-        dtype=float,
+def sample_covariance(pc_means: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    jitter = rng.normal(scale=0.06, size=(16, 16))
+    a = np.eye(16) * 0.55 + (jitter @ jitter.T) / 16.0
+    return a
+
+
+def disease_probability(lat: np.ndarray, lon: np.ndarray, pcs: np.ndarray, pgs: np.ndarray, age: np.ndarray, sex: np.ndarray) -> np.ndarray:
+    lat_s = standardize(lat)
+    lon_s = standardize(lon)
+    linear = (
+        -0.8
+        + 0.9 * standardize(pgs)
+        + 0.45 * pcs[:, 0]
+        - 0.35 * pcs[:, 1]
+        + 0.18 * standardize(age)
+        + 0.22 * sex
+        + 0.55 * np.sin(lat_s * 1.7)
+        + 0.40 * np.cos(lon_s * 2.1)
+        + 0.25 * lat_s * lon_s
     )
-    model = fit_latlon_imputer(pcs[known_mask], latlon_known)
-    pred = predict_latlon_imputer(model, pcs)
-    for i, row in enumerate(rows):
-        lat_pred = float(np.clip(pred[i, 0], -55.0, 72.0))
-        lon_pred = float(((pred[i, 1] + 180.0) % 360.0) - 180.0)
-        row["lat_imputed"] = lat_pred
-        row["lon_imputed"] = lon_pred
-        if row["lat_missing"] == 0:
-            row["lat_final"] = float(row["lat_obs"])
-            row["lon_final"] = float(row["lon_obs"])
-        else:
-            row["lat_final"] = lat_pred
-            row["lon_final"] = lon_pred
-        row["lat_final"] = float(np.clip(row["lat_final"] + rng.normal(0.0, 0.18), -55.0, 72.0))
-        row["lon_final"] = float(((row["lon_final"] + rng.normal(0.0, 0.22) + 180.0) % 360.0) - 180.0)
-        row["latlon_source"] = "observed" if row["lat_missing"] == 0 else "imputed"
-    return {"rows": rows, "pc_cols": pc_cols, "imputer_kind": model["kind"]}
+    return logistic(linear)
 
 
-def eigen_weights(rows: list[dict[str, Any]], pc_cols: list[str]) -> np.ndarray:
-    x = np.array([[float(r[c]) for c in pc_cols] for r in rows], dtype=float)
-    sd = np.std(x, axis=0)
-    sd[(~np.isfinite(sd)) | (sd < 1e-6)] = 1.0
-    return 1.0 / sd
+def survival_scale(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    pcs: np.ndarray,
+    pgs: np.ndarray,
+    age: np.ndarray,
+    sex: np.ndarray,
+) -> np.ndarray:
+    lat_s = standardize(lat)
+    lon_s = standardize(lon)
+    lp = (
+        0.35 * standardize(pgs)
+        + 0.20 * pcs[:, 0]
+        - 0.12 * pcs[:, 2]
+        + 0.10 * standardize(age)
+        + 0.08 * sex
+        + 0.30 * np.sin(lat_s * 1.2)
+        - 0.22 * np.cos(lon_s * 1.8)
+    )
+    return np.exp(lp)
 
 
-def weighted_distance(a: np.ndarray, b: np.ndarray, weight: np.ndarray) -> float:
-    diff = (a - b) * weight
-    return float(np.sqrt(np.maximum(np.sum(diff * diff), 0.0)))
+def generate_raw_cohort(cfg: dict[str, Any], out_dir: Path, smoke: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    seed = int(cfg["seed"])
+    rng = np.random.default_rng(seed)
+    base_n = int(cfg["raw_subpop_n"])
+    templates = subpop_templates()
+    pc_means = build_pc_means(templates)
+    rows: list[dict[str, Any]] = []
+    subject_id = 0
+    for tpl in templates:
+        mean = pc_means[tpl["subpop"]]
+        cov = sample_covariance(mean, rng)
+        n_local = base_n if not smoke else max(48, base_n // 5)
+        pcs = rng.multivariate_normal(mean=mean, cov=cov, size=n_local)
+        for i in range(n_local):
+            subject_id += 1
+            age_entry = rng.normal(56.0, 6.5)
+            sex = int(rng.integers(0, 2))
+            lat_true = tpl["lat"] + rng.normal(0.0, 0.85)
+            lon_true = tpl["lon"] + rng.normal(0.0, 0.95)
+            lat_obs = lat_true if rng.random() < float(cfg["observed_latlon_fraction"]) else math.nan
+            lon_obs = lon_true if math.isfinite(lat_obs) else math.nan
+            pgs = 0.55 * pcs[i, 0] - 0.25 * pcs[i, 2] + rng.normal(0.0, 1.0)
+            rows.append(
+                {
+                    "subject_id": subject_id,
+                    "subpopulation": tpl["subpop"],
+                    "continent": tpl["continent"],
+                    "superpopulation": tpl["superpop"],
+                    "age_entry": float(age_entry),
+                    "sex": sex,
+                    "lat_true": float(lat_true),
+                    "lon_true": float(lon_true),
+                    "lat_obs": None if not math.isfinite(lat_obs) else float(lat_obs),
+                    "lon_obs": None if not math.isfinite(lon_obs) else float(lon_obs),
+                    "pgs_raw": float(pgs),
+                    **{f"pc{i+1}": float(pcs[i, i]) if i < 16 else 0.0 for i in range(16)},
+                }
+            )
+    meta = {
+        "seed": seed,
+        "raw_n": len(rows),
+        "subpopulations": [tpl["subpop"] for tpl in templates],
+    }
+    dump_json(out_dir / "raw_generation_metadata.json", meta)
+    return rows, meta
 
 
-def nearest_subpop_map(rows: list[dict[str, Any]], pc_cols: list[str], weight: np.ndarray) -> tuple[dict[str, str], dict[str, np.ndarray]]:
-    by_subpop: dict[str, list[np.ndarray]] = defaultdict(list)
+def impute_and_upsample(rows: list[dict[str, Any]], cfg: dict[str, Any], smoke: bool) -> list[dict[str, Any]]:
+    target_n = int(cfg["smoke_target_n"] if smoke else cfg["target_n"])
+    split_rng = np.random.default_rng(int(cfg["split_seed"]))
+    by_subpop: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        by_subpop[str(row["subpop"])].append(np.array([float(row[c]) for c in pc_cols], dtype=float))
-    centroids = {k: np.mean(v, axis=0) for k, v in by_subpop.items()}
-    nearest: dict[str, str] = {}
-    keys = sorted(centroids)
-    for key in keys:
-        best_name = ""
-        best_dist = float("inf")
-        for other in keys:
-            if other == key:
-                continue
-            dist = weighted_distance(centroids[key], centroids[other], weight)
-            if dist < best_dist:
-                best_dist = dist
-                best_name = other
-        nearest[key] = best_name
-    return nearest, centroids
-
-
-def upsample_panel(seed_rows: list[dict[str, Any]], pc_cols: list[str], cfg: dict[str, Any], rng: np.random.Generator) -> list[dict[str, Any]]:
-    target_n = int(cfg["target_n"])
-    if len(seed_rows) >= target_n:
-        return seed_rows[:target_n]
-    rows = [dict(r) for r in seed_rows]
-    weight = eigen_weights(rows, pc_cols)
-    nearest_map, _ = nearest_subpop_map(rows, pc_cols, weight)
-    subpop_index: dict[str, list[int]] = defaultdict(list)
-    subpop_probs: dict[str, float] = {}
-    for idx, row in enumerate(rows):
-        subpop_index[str(row["subpop"])].append(idx)
-    total_seed = float(len(rows))
-    for subpop, idxs in subpop_index.items():
-        subpop_probs[subpop] = len(idxs) / total_seed
-    ordered_subpops = sorted(subpop_index)
-    probs = np.array([subpop_probs[s] for s in ordered_subpops], dtype=float)
-    probs = probs / np.sum(probs)
-    next_id = len(rows)
-    batch_size = int(cfg.get("upsample_batch_size", 5000))
-    while len(rows) < target_n:
-        take = min(batch_size, target_n - len(rows))
-        target_subpops = rng.choice(ordered_subpops, size=take, replace=True, p=probs)
-        new_rows: list[dict[str, Any]] = []
-        for target_subpop in target_subpops:
-            first_pool = subpop_index[target_subpop]
-            parent_a_idx = int(rng.choice(first_pool))
-            cross = bool(rng.random() < float(cfg["cross_subpop_pairing_rate"]))
-            partner_subpop = nearest_map[target_subpop] if cross else target_subpop
-            partner_pool = subpop_index[partner_subpop]
-            parent_b_idx = int(rng.choice(partner_pool))
-            a = rows[parent_a_idx]
-            b = rows[parent_b_idx]
-            pc_a = np.array([float(a[c]) for c in pc_cols], dtype=float)
-            pc_b = np.array([float(b[c]) for c in pc_cols], dtype=float)
-            alpha = float(rng.beta(2.2, 2.2))
-            midpoint = pc_a + alpha * (pc_b - pc_a)
-            pair_dist = weighted_distance(pc_a, pc_b, weight)
-            jitter_sd = 0.025 + 0.06 * np.tanh(pair_dist / 4.0)
-            child_pc = midpoint + rng.normal(0.0, jitter_sd / np.maximum(weight, 1e-6), size=len(pc_cols))
-            lat = 0.5 * (float(a["lat_final"]) + float(b["lat_final"])) + rng.normal(0.0, 0.22)
-            lon = 0.5 * (float(a["lon_final"]) + float(b["lon_final"])) + rng.normal(0.0, 0.28)
-            lat = float(np.clip(lat, -55.0, 72.0))
-            lon = float(((lon + 180.0) % 360.0) - 180.0)
-            lat_true = 0.5 * (float(a["lat_true"]) + float(b["lat_true"])) + rng.normal(0.0, 0.14)
-            lon_true = 0.5 * (float(a["lon_true"]) + float(b["lon_true"])) + rng.normal(0.0, 0.18)
-            lat_true = float(np.clip(lat_true, -55.0, 72.0))
-            lon_true = float(((lon_true + 180.0) % 360.0) - 180.0)
-            child = {
-                "sample_id": f"sim_{next_id:07d}",
-                "source": "simulated",
-                "generation": 1 + max(int(a["generation"]), int(b["generation"])),
-                "parent_a": str(a["sample_id"]),
-                "parent_b": str(b["sample_id"]),
-                "subpop": target_subpop,
-                "superpop": str(a["superpop"]),
-                "continent": str(a["continent"]),
-                "lat_true": lat_true,
-                "lon_true": lon_true,
-                "lat_obs": "",
-                "lon_obs": "",
-                "lat_missing": 1,
-                "lon_missing": 1,
-                "lat_imputed": lat,
-                "lon_imputed": lon,
-                "lat_final": lat,
-                "lon_final": lon,
-                "latlon_source": "simulated",
-            }
-            for j, col in enumerate(pc_cols):
-                child[col] = float(child_pc[j])
-            new_rows.append(child)
+        by_subpop[str(row["subpopulation"])].append(row)
+    out = [dict(r) for r in rows]
+    templates = {str(r["subpopulation"]): r for r in rows[: len(by_subpop)]}
+    batch = int(cfg.get("upsample_batch_size", 5000))
+    next_id = max(int(r["subject_id"]) for r in out) + 1
+    subpops = sorted(by_subpop.keys())
+    weights = np.array([len(by_subpop[s]) for s in subpops], dtype=float)
+    weights /= np.sum(weights)
+    while len(out) < target_n:
+        remaining = target_n - len(out)
+        step = min(batch, remaining)
+        sampled_subpops = split_rng.choice(subpops, size=step, replace=True, p=weights)
+        for sp in sampled_subpops:
+            source = by_subpop[sp][int(split_rng.integers(0, len(by_subpop[sp])))]
+            row = dict(source)
+            row["subject_id"] = next_id
             next_id += 1
-        start_idx = len(rows)
-        rows.extend(new_rows)
-        for offset, row in enumerate(new_rows):
-            subpop_index[str(row["subpop"])].append(start_idx + offset)
+            row["age_entry"] = float(np.clip(float(row["age_entry"]) + split_rng.normal(0.0, 0.9), 35.0, 82.0))
+            row["pgs_raw"] = float(float(row["pgs_raw"]) + split_rng.normal(0.0, 0.12))
+            lat_true = float(row["lat_true"]) + float(split_rng.normal(0.0, 0.05))
+            lon_true = float(row["lon_true"]) + float(split_rng.normal(0.0, 0.05))
+            row["lat_true"] = lat_true
+            row["lon_true"] = lon_true
+            if split_rng.random() < float(cfg["observed_latlon_fraction"]):
+                row["lat_obs"] = lat_true + float(split_rng.normal(0.0, 0.02))
+                row["lon_obs"] = lon_true + float(split_rng.normal(0.0, 0.02))
+            else:
+                row["lat_obs"] = None
+                row["lon_obs"] = None
+            out.append(row)
+    ref_subpop = str(cfg["reference_subpopulation"])
+    ref_rows = [r for r in out if str(r["subpopulation"]) == ref_subpop]
+    ref_lat = float(np.mean([float(r["lat_true"]) for r in ref_rows]))
+    ref_lon = float(np.mean([float(r["lon_true"]) for r in ref_rows]))
+    for row in out:
+        lat_obs = row.get("lat_obs")
+        lon_obs = row.get("lon_obs")
+        row["lat_final"] = float(lat_obs) if lat_obs is not None else ref_lat
+        row["lon_final"] = float(lon_obs) if lon_obs is not None else ref_lon
+    return out
+
+
+def attach_outcomes(rows: list[dict[str, Any]], cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    rng = np.random.default_rng(int(cfg["seed"]) + 17)
+    lat = np.array([float(r["lat_final"]) for r in rows], dtype=float)
+    lon = np.array([float(r["lon_final"]) for r in rows], dtype=float)
+    pcs = np.column_stack([np.array([float(r[f"pc{i}"]) for r in rows], dtype=float) for i in range(1, 17)])
+    pgs = np.array([float(r["pgs_raw"]) for r in rows], dtype=float)
+    age = np.array([float(r["age_entry"]) for r in rows], dtype=float)
+    sex = np.array([float(r["sex"]) for r in rows], dtype=float)
+    disease_prob = disease_probability(lat, lon, pcs, pgs, age, sex)
+    disease = rng.binomial(1, disease_prob).astype(int)
+    shape, scale = survival_generation_params(cfg)
+    surv_scale = survival_scale(lat, lon, pcs, pgs, age, sex)
+    u = np.clip(rng.random(len(rows)), 1e-12, 1.0 - 1e-12)
+    event_time = scale * surv_scale * (-np.log(1.0 - u)) ** (1.0 / shape)
+    censor_time = rng.uniform(4.5, 14.5, size=len(rows))
+    observed_time = np.minimum(event_time, censor_time)
+    event = (event_time <= censor_time).astype(int)
+    for idx, row in enumerate(rows):
+        row["phenotype_prob"] = float(disease_prob[idx])
+        row["phenotype"] = int(disease[idx])
+        row["time"] = float(observed_time[idx])
+        row["event"] = int(event[idx])
     return rows
 
 
-def representative_geo_targets() -> list[dict[str, Any]]:
-    return [
-        {"continent": "Europe", "lat": 52.0, "lon": 10.0, "target": 0.14},
-        {"continent": "Europe", "lat": 41.0, "lon": 13.0, "target": 0.11},
-        {"continent": "Africa", "lat": 7.0, "lon": 5.0, "target": 0.05},
-        {"continent": "Africa", "lat": 0.0, "lon": 36.0, "target": 0.04},
-        {"continent": "Asia", "lat": 40.0, "lon": 116.0, "target": 0.10},
-        {"continent": "Asia", "lat": 23.0, "lon": 73.0, "target": 0.08},
-        {"continent": "NorthAmerica", "lat": 41.0, "lon": -112.0, "target": 0.13},
-        {"continent": "NorthAmerica", "lat": 19.0, "lon": -99.0, "target": 0.09},
-        {"continent": "SouthAmerica", "lat": -12.0, "lon": -77.0, "target": 0.08},
-        {"continent": "SouthAmerica", "lat": 5.0, "lon": -74.0, "target": 0.07},
-        {"continent": "Oceania", "lat": -6.0, "lon": 145.0, "target": 0.11},
-        {"continent": "Oceania", "lat": -6.0, "lon": 155.0, "target": 0.12},
+def write_cohort_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "subject_id",
+        "subpopulation",
+        "continent",
+        "superpopulation",
+        "age_entry",
+        "sex",
+        "lat_true",
+        "lon_true",
+        "lat_obs",
+        "lon_obs",
+        "lat_final",
+        "lon_final",
+        "pgs_raw",
+        *[f"pc{i}" for i in range(1, 17)],
+        "phenotype_prob",
+        "phenotype",
+        "time",
+        "event",
     ]
-
-
-def prevalence_surface_components(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-    lat = np.asarray(lat, dtype=float)
-    lon = np.asarray(lon, dtype=float)
-    lat_abs = np.abs(lat)
-    temp_band = np.exp(-((lat_abs - 42.0) / 18.0) ** 2)
-    equator_penalty = np.exp(-((lat_abs - 4.0) / 9.5) ** 2)
-    polar_penalty = np.exp(-((lat_abs - 67.0) / 7.5) ** 2)
-    lon_rad = np.radians(lon)
-    lat_rad = np.radians(lat)
-    waves = (
-        0.55 * np.sin(1.35 * lon_rad + 0.35 * lat_rad)
-        + 0.42 * np.cos(2.1 * lat_rad - 0.55 * lon_rad)
-        + 0.33 * np.sin(0.75 * lat_rad * np.maximum(np.cos(lon_rad), -0.95))
-        + 0.18 * np.cos(np.radians(0.9 * lat * lon / 30.0))
-    )
-    hotspot = (
-        0.22 * np.exp(-(((lat - 50.0) / 8.0) ** 2 + ((lon - 10.0) / 12.0) ** 2))
-        + 0.18 * np.exp(-(((lat - 40.0) / 9.0) ** 2 + ((lon + 110.0) / 14.0) ** 2))
-        + 0.20 * np.exp(-(((lat + 8.0) / 7.0) ** 2 + ((lon - 148.0) / 10.0) ** 2))
-    )
-    return 0.95 * temp_band - 0.78 * equator_penalty - 0.20 * polar_penalty + waves + hotspot
-
-
-def prevalence_surface_score(
-    lat: np.ndarray,
-    lon: np.ndarray,
-    continents: list[str],
-    continent_offsets: dict[str, float],
-    amplitude: float,
-) -> np.ndarray:
-    base = prevalence_surface_components(lat, lon)
-    offsets = np.array([float(continent_offsets[c]) for c in continents], dtype=float)
-    return offsets + float(amplitude) * base
-
-
-def calibrate_prevalence_surface() -> tuple[float, dict[str, float], list[dict[str, Any]]]:
-    reps = representative_geo_targets()
-    best = None
-    targets = np.array([float(rep["target"]) for rep in reps], dtype=float)
-    logits = np.log(np.clip(targets, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - targets, 1e-6, 1.0))
-    continents = [str(rep["continent"]) for rep in reps]
-    lat = np.array([float(rep["lat"]) for rep in reps], dtype=float)
-    lon = np.array([float(rep["lon"]) for rep in reps], dtype=float)
-    base = prevalence_surface_components(lat, lon)
-    for amplitude in np.linspace(0.25, 1.75, 151):
-        offsets: dict[str, float] = {}
-        for continent in sorted(set(continents)):
-            idx = [i for i, c in enumerate(continents) if c == continent]
-            offsets[continent] = float(np.mean(logits[idx] - amplitude * base[idx]))
-        pred_score = prevalence_surface_score(lat, lon, continents, offsets, amplitude)
-        preds = logistic(pred_score)
-        err = float(np.mean((preds - targets) ** 2))
-        if best is None or err < best[0]:
-            best = (err, amplitude, offsets)
-    assert best is not None
-    amplitude = float(best[1])
-    offsets = dict(best[2])
-    spot = []
-    for rep in reps:
-        pred = float(
-            logistic(
-                prevalence_surface_score(
-                    np.array([rep["lat"]], dtype=float),
-                    np.array([rep["lon"]], dtype=float),
-                    [str(rep["continent"])],
-                    offsets,
-                    amplitude,
-                )
-            )[0]
-        )
-        spot.append({**rep, "predicted": pred})
-    return amplitude, offsets, spot
-
-
-def simulate_traits(rows: list[dict[str, Any]], pc_cols: list[str], cfg: dict[str, Any], rng: np.random.Generator) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    lat = np.array([float(r["lat_final"]) for r in rows], dtype=float)
-    lon = np.array([float(r["lon_final"]) for r in rows], dtype=float)
-    continents = [str(r["continent"]) for r in rows]
-    amplitude, continent_offsets, spot = calibrate_prevalence_surface()
-    geo_prev = logistic(prevalence_surface_score(lat, lon, continents, continent_offsets, amplitude))
-    age = np.clip(
-        rng.normal(
-            loc=np.array([50.0 if r["continent"] == "Europe" else 46.0 for r in rows], dtype=float),
-            scale=9.0,
-            size=len(rows),
-        ),
-        37.0,
-        80.0,
-    )
-    sex = (rng.random(len(rows)) < 0.49).astype(float)
-    genetic_liability = rng.normal(0.0, 1.0, size=len(rows))
-    disease_logit = (
-        np.log(np.clip(geo_prev, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - geo_prev, 1e-6, 1.0))
-        + 0.48 * genetic_liability
-        + 0.18 * standardize(age)
-        + 0.08 * sex
-    )
-    disease_prob = logistic(disease_logit)
-    phenotype = (rng.random(len(rows)) < disease_prob).astype(float)
-    weight = eigen_weights(rows, pc_cols)
-    _, centroids = nearest_subpop_map(rows, pc_cols, weight)
-    ref_subpop = str(cfg["reference_subpopulation"])
-    if ref_subpop not in centroids:
-        raise RuntimeError(f"reference subpopulation '{ref_subpop}' not found in synthetic panel")
-    ref_centroid = centroids[ref_subpop]
-    portability_distance = np.empty(len(rows), dtype=float)
-    for i, row in enumerate(rows):
-        pc = np.array([float(row[c]) for c in pc_cols], dtype=float)
-        portability_distance[i] = weighted_distance(pc, ref_centroid, weight)
-    portability_noise_sd = 0.22 + 1.00 * (1.0 - np.exp(-(portability_distance ** 2) / 10.0))
-    pgs_raw = 0.85 * genetic_liability + rng.normal(0.0, portability_noise_sd, size=len(rows))
-    pgs = standardize(pgs_raw)
-    entry_year = rng.uniform(2006.0, 2013.5, size=len(rows))
-    age_entry = age
-    shape, base_scale = survival_generation_params(cfg)
-    lp_surv = (
-        0.38 * standardize(age_entry)
-        + 0.52 * genetic_liability
-        + 0.24 * phenotype
-        + 0.12 * sex
-        + 0.35 * standardize(np.log(np.clip(geo_prev, 1e-6, 1.0)) - np.log(np.clip(1.0 - geo_prev, 1e-6, 1.0)))
-    )
-    u = np.clip(rng.random(len(rows)), 1e-9, 1.0 - 1e-9)
-    event_time = base_scale * ((-np.log(u)) / np.exp(lp_surv)) ** (1.0 / shape)
-    dropout_rate = np.exp(-2.35 + 0.22 * standardize(age_entry) + 0.08 * phenotype)
-    dropout_time = rng.exponential(scale=1.0 / np.clip(dropout_rate, 1e-4, None), size=len(rows))
-    admin_time = np.clip(2026.0 - entry_year, 1.0, None)
-    obs_time = np.minimum(event_time, np.minimum(dropout_time, admin_time))
-    event = (event_time <= dropout_time) & (event_time <= admin_time)
-    for i, row in enumerate(rows):
-        row["age_entry"] = float(age_entry[i])
-        row["sex"] = float(sex[i])
-        row["geo_prevalence"] = float(geo_prev[i])
-        row["genetic_liability"] = float(genetic_liability[i])
-        row["phenotype_prob"] = float(disease_prob[i])
-        row["phenotype"] = float(phenotype[i])
-        row["portability_distance"] = float(portability_distance[i])
-        row["portability_noise_sd"] = float(portability_noise_sd[i])
-        row["pgs_raw"] = float(pgs_raw[i])
-        row["pgs"] = float(pgs[i])
-        row["entry_year"] = float(entry_year[i])
-        row["time"] = float(max(obs_time[i], 1e-6))
-        row["event"] = float(event[i])
-        row["dropout_time"] = float(dropout_time[i])
-        row["admin_time"] = float(admin_time[i])
-        row["event_time_true"] = float(event_time[i])
-    return rows, {
-        "reference_subpopulation": ref_subpop,
-        "reference_centroid_pc": {pc_cols[i]: float(ref_centroid[i]) for i in range(len(pc_cols))},
-        "prevalence_surface_amplitude": amplitude,
-        "prevalence_surface_continent_offsets": continent_offsets,
-        "spot_checks": spot,
-        "pgs_portability_distance_quantiles": {
-            "q05": float(np.quantile(portability_distance, 0.05)),
-            "q50": float(np.quantile(portability_distance, 0.50)),
-            "q95": float(np.quantile(portability_distance, 0.95)),
-        },
-        "pgs_noise_sd_quantiles": {
-            "q05": float(np.quantile(portability_noise_sd, 0.05)),
-            "q50": float(np.quantile(portability_noise_sd, 0.50)),
-            "q95": float(np.quantile(portability_noise_sd, 0.95)),
-        },
-        "survival_weibull_shape": shape,
-        "survival_weibull_scale": base_scale,
-        "pgs_correlation_with_latitude": float(np.corrcoef(pgs, lat)[0, 1]),
-        "pgs_correlation_with_longitude": float(np.corrcoef(pgs, lon)[0, 1]),
-    }
+    write_csv_rows(path, rows, fieldnames)
 
 
 def split_rows(rows: list[dict[str, Any]], cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rng = np.random.default_rng(int(cfg["split_seed"]))
-    y = np.array([float(r["phenotype"]) for r in rows], dtype=int)
-    test_fraction = 1.0 - float(cfg["train_fraction"])
-    test_indices: list[int] = []
-    for cls in [0, 1]:
-        idx = np.where(y == cls)[0]
-        rng.shuffle(idx)
-        n_test = int(round(len(idx) * test_fraction))
-        n_test = max(1, min(len(idx) - 1, n_test))
-        test_indices.extend(idx[:n_test].tolist())
-    test_set = set(test_indices)
-    train_rows = [rows[i] for i in range(len(rows)) if i not in test_set]
-    test_rows = [rows[i] for i in range(len(rows)) if i in test_set]
-    return train_rows, test_rows
+    idx = np.arange(len(rows))
+    rng.shuffle(idx)
+    split = int(round(float(cfg["train_fraction"]) * len(rows)))
+    train_idx = set(int(i) for i in idx[:split])
+    train = [rows[i] for i in range(len(rows)) if i in train_idx]
+    test = [rows[i] for i in range(len(rows)) if i not in train_idx]
+    return train, test
 
 
-def prepare_dataset_views(rows: list[dict[str, Any]], train_rows: list[dict[str, Any]], test_rows: list[dict[str, Any]], prep_dir: Path) -> dict[str, Any]:
-    all_fieldnames = [
-        "sample_id", "source", "generation", "parent_a", "parent_b", "subpop", "superpop", "continent",
-        "lat_true", "lon_true", "lat_obs", "lon_obs", "lat_missing", "lon_missing", "lat_imputed", "lon_imputed",
-        "lat_final", "lon_final", "latlon_source", "age_entry", "sex", "geo_prevalence", "genetic_liability",
-        "phenotype_prob", "phenotype", "portability_distance", "portability_noise_sd", "pgs_raw", "pgs",
-        "entry_year", "time", "event", "dropout_time", "admin_time", "event_time_true",
-    ] + [f"pc{i}" for i in range(1, 17)]
-    write_csv_rows(prep_dir / "all_cohort.csv", rows, all_fieldnames)
-
-    feature_cols = ["lat_final", "lon_final", "age_entry", "sex", "pgs"] + [f"pc{i}" for i in range(1, 17)]
-    scaled_stats: dict[str, dict[str, float]] = {}
-    train_copy = [dict(r) for r in train_rows]
-    test_copy = [dict(r) for r in test_rows]
-    for col in feature_cols:
-        train_arr = np.array([float(r[col]) for r in train_copy], dtype=float)
-        test_arr = np.array([float(r[col]) for r in test_copy], dtype=float)
-        tr_scaled, te_scaled, mu, sd = zscore_train_test(train_arr, test_arr)
-        scaled_stats[col] = {"mean": mu, "sd": sd}
-        for i, row in enumerate(train_copy):
-            row[f"{col}_std"] = float(tr_scaled[i])
-        for i, row in enumerate(test_copy):
-            row[f"{col}_std"] = float(te_scaled[i])
-    disease_fields = [
-        "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
-        "pgs", "phenotype", "geo_prevalence", "portability_distance",
-    ] + [f"pc{i}" for i in range(1, 17)] + [f"{c}_std" for c in feature_cols]
-    survival_fields = [
-        "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
-        "pgs", "time0", "time", "event", "entry_year", "geo_prevalence", "portability_distance",
-    ] + [f"pc{i}" for i in range(1, 17)] + [f"{c}_std" for c in feature_cols]
-    for row in train_copy:
-        row["time0"] = 0.0
-    for row in test_copy:
-        row["time0"] = 0.0
-    write_csv_rows(prep_dir / "disease_train.csv", train_copy, disease_fields)
-    write_csv_rows(prep_dir / "disease_test.csv", test_copy, disease_fields)
-    write_csv_rows(prep_dir / "survival_train.csv", train_copy, survival_fields)
-    write_csv_rows(prep_dir / "survival_test.csv", test_copy, survival_fields)
-    return {
-        "feature_cols": feature_cols,
-        "scaled_stats": scaled_stats,
-        "train_n": len(train_copy),
-        "test_n": len(test_copy),
-        "all_n": len(rows),
-    }
-
-
-def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
-    specs = []
-    for raw in cfg["methods"]:
-        specs.append(
-            MethodSpec(
-                name=str(raw["name"]),
-                dataset=str(raw["dataset"]),
-                backend=str(raw["backend"]),
-                family=str(raw["family"]),
-                spatial_basis=str(raw["spatial_basis"]),
-                centers=int(raw["centers"]) if raw.get("centers") is not None else None,
-                smooth_kind=str(raw.get("smooth_kind", "joint")),
-                include_sigma=bool(raw.get("include_sigma", False)),
-            )
-        )
-    return specs
-
-
-def make_prepared_payload(cfg: dict[str, Any], target_n: int) -> dict[str, Any]:
-    run_cfg = dict(cfg)
-    run_cfg["target_n"] = int(target_n)
-    run_cfg.setdefault("cross_subpop_pairing_rate", 0.28)
-    run_cfg.setdefault("upsample_batch_size", 5000)
-    rng = np.random.default_rng(int(run_cfg["seed"]))
-    seed_panel = build_seed_panel(run_cfg, rng)
-    seed_panel = impute_latlon(seed_panel, rng)
-    seed_n = len(seed_panel["rows"])
-    weight = eigen_weights(seed_panel["rows"], seed_panel["pc_cols"])
-    nearest_map, centroids = nearest_subpop_map(seed_panel["rows"], seed_panel["pc_cols"], weight)
-    rows = upsample_panel(seed_panel["rows"], seed_panel["pc_cols"], run_cfg, rng)
-    rows, trait_meta = simulate_traits(rows, seed_panel["pc_cols"], run_cfg, rng)
-    train_rows, test_rows = split_rows(rows, run_cfg)
-    return {
-        "rows": rows,
-        "train_rows": train_rows,
-        "test_rows": test_rows,
-        "pc_cols": seed_panel["pc_cols"],
-        "trait_meta": trait_meta,
-        "imputer_kind": seed_panel["imputer_kind"],
-        "seed_n": seed_n,
-        "simulated_n": int(max(len(rows) - seed_n, 0)),
-        "upsample_factor": float(len(rows) / max(seed_n, 1)),
-        "nearest_subpopulation": nearest_map,
-        "subpopulation_centroids": {
-            subpop: {seed_panel["pc_cols"][i]: float(vec[i]) for i in range(len(seed_panel["pc_cols"]))}
-            for subpop, vec in centroids.items()
-        },
-    }
+def add_standardized_columns(train_rows: list[dict[str, Any]], test_rows: list[dict[str, Any]]) -> None:
+    numeric_cols = ["age_entry", "lat_final", "lon_final", "pgs_raw", *[f"pc{i}" for i in range(1, 17)]]
+    for col in numeric_cols:
+        tr = np.array([float(r[col]) for r in train_rows], dtype=float)
+        te = np.array([float(r[col]) for r in test_rows], dtype=float)
+        tr_std, te_std, _, _ = zscore_train_test(tr, te)
+        out_col = col.replace("_raw", "") + "_std"
+        for i, row in enumerate(train_rows):
+            row[out_col] = float(tr_std[i])
+        for i, row in enumerate(test_rows):
+            row[out_col] = float(te_std[i])
 
 
 def do_prepare(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-    target_n = int(cfg["smoke_target_n"] if args.smoke else cfg["target_n"])
-    prep_dir = args.out_dir.resolve()
-    prep_dir.mkdir(parents=True, exist_ok=True)
-    payload = make_prepared_payload(cfg, target_n)
-    prep_meta = prepare_dataset_views(payload["rows"], payload["train_rows"], payload["test_rows"], prep_dir)
-    cohort = payload["rows"]
-    continent_summary: dict[str, dict[str, float]] = {}
-    for continent in sorted({str(r["continent"]) for r in cohort}):
-        subset = [r for r in cohort if str(r["continent"]) == continent]
-        continent_summary[continent] = {
-            "n": len(subset),
-            "mean_geo_prevalence": float(np.mean([float(r["geo_prevalence"]) for r in subset])),
-            "mean_phenotype": float(np.mean([float(r["phenotype"]) for r in subset])),
-            "mean_age_entry": float(np.mean([float(r["age_entry"]) for r in subset])),
-        }
-    meta = {
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows, raw_meta = generate_raw_cohort(cfg, out_dir, args.smoke)
+    rows = impute_and_upsample(rows, cfg, args.smoke)
+    rows = attach_outcomes(rows, cfg)
+    train_rows, test_rows = split_rows(rows, cfg)
+    add_standardized_columns(train_rows, test_rows)
+    write_cohort_csv(out_dir / "all_cohort.csv", rows)
+    write_cohort_csv(out_dir / "disease_train.csv", train_rows)
+    write_cohort_csv(out_dir / "disease_test.csv", test_rows)
+    write_cohort_csv(out_dir / "survival_train.csv", train_rows)
+    write_cohort_csv(out_dir / "survival_test.csv", test_rows)
+    prep_meta = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config_path": str(args.config),
-        "target_n": target_n,
-        "mode": "smoke" if args.smoke else "full",
-        "imputer_kind": payload["imputer_kind"],
-        "trait_meta": payload["trait_meta"],
-        "seed_n": payload["seed_n"],
-        "simulated_n": payload["simulated_n"],
-        "upsample_factor": payload["upsample_factor"],
-        "nearest_subpopulation": payload["nearest_subpopulation"],
-        "subpopulation_centroids": payload["subpopulation_centroids"],
-        "prep": prep_meta,
-        "continent_summary": continent_summary,
+        "raw_generation": raw_meta,
+        "n_total": len(rows),
+        "n_train": len(train_rows),
+        "n_test": len(test_rows),
+        "smoke": bool(args.smoke),
     }
-    dump_json(prep_dir / "prep_metadata.json", meta)
-    print(f"Wrote prepared cohort to {prep_dir}")
+    dump_json(out_dir / "prep_metadata.json", prep_meta)
+    print(f"Wrote prepared data to {out_dir}")
     return 0
 
 
-def rust_joint_term(basis: str, cols: list[str], centers: int) -> str:
-    joined = ", ".join(cols)
-    if basis in {"thinplate", "tps"}:
-        return f"thinplate({joined}, centers={centers})"
-    if basis == "matern":
-        return f"matern({joined}, centers={centers})"
-    if basis == "duchon":
-        return f"duchon({joined}, centers={centers}, order=0, power=1)"
-    raise RuntimeError(f"unsupported Rust biobank basis '{basis}'")
+def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
+    out = []
+    for item in cfg.get("methods", []):
+        out.append(
+            MethodSpec(
+                name=str(item["name"]),
+                dataset=str(item["dataset"]),
+                backend=str(item["backend"]),
+                family=str(item["family"]),
+                spatial_basis=str(item["spatial_basis"]),
+                centers=int(item["centers"]) if item.get("centers") is not None else None,
+                smooth_kind=str(item.get("smooth_kind", "joint")),
+                include_sigma=bool(item.get("include_sigma", False)),
+            )
+        )
+    return out
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
-    linear_terms = ["linear(age_entry_std)", "linear(sex)"]
-    linear_terms.append("linear(pgs_std)")
     if spec.smooth_kind == "joint":
-        smooth_cols = ["lat_final_std", "lon_final_std", "pgs_std"]
-        smooth_cols.extend(f"pc{i}_std" for i in range(1, 17))
-        linear_terms.append(rust_joint_term(spec.spatial_basis, smooth_cols, int(spec.centers or 60)))
-    else:
-        basis = spec.spatial_basis
-        centers = int(spec.centers or 60)
-        if basis in {"thinplate", "tps"}:
-            linear_terms.extend(
-                [
-                    f"s(lat_final_std, type=tps, centers={centers})",
-                    f"s(lon_final_std, type=tps, centers={centers})",
-                ]
-            )
-        elif basis == "duchon":
-            linear_terms.extend(
-                [
-                    f"s(lat_final_std, type=duchon, centers={centers}, order=0, power=1)",
-                    f"s(lon_final_std, type=duchon, centers={centers}, order=0, power=1)",
-                ]
-            )
-        elif basis == "matern":
-            linear_terms.extend(
-                [
-                    f"s(lat_final_std, type=matern, centers={centers})",
-                    f"s(lon_final_std, type=matern, centers={centers})",
-                ]
-            )
+        if spec.spatial_basis == "thinplate":
+            spatial = f"thinplate(lat_final_std, lon_final_std, knots={int(spec.centers or 60)})"
+        elif spec.spatial_basis == "duchon":
+            spatial = f"duchon(lat_final_std, lon_final_std, centers={int(spec.centers or 60)})"
+        elif spec.spatial_basis == "matern":
+            spatial = f"matern(lat_final_std, lon_final_std, centers={int(spec.centers or 60)})"
         else:
-            linear_terms.extend(
-                [
-                    "s(lat_final_std, type=ps, knots=10)",
-                    "s(lon_final_std, type=ps, knots=10)",
-                ]
-            )
-    linear_terms.extend(f"linear(pc{i}_std)" for i in range(1, 17))
-    mean_formula = "phenotype ~ " + " + ".join(linear_terms) + " + link(type=logit)"
-    sigma_terms = ["linear(pgs_std)", "linear(age_entry_std)", "linear(lat_final_std)", "linear(lon_final_std)"]
-    sigma_formula = "phenotype ~ " + " + ".join(sigma_terms)
-    return mean_formula, sigma_formula
+            raise RuntimeError(f"unsupported Rust spatial basis '{spec.spatial_basis}'")
+        base_terms = [
+            "pgs_std",
+            "sex",
+            "smooth(age_entry_std)",
+            spatial,
+            *[f"pc{i}_std" for i in range(1, 17)],
+        ]
+        mean_formula = "phenotype ~ " + " + ".join(base_terms)
+        sigma_formula = "sigma ~ " + " + ".join(["smooth(age_entry_std)", spatial, *[f"pc{i}_std" for i in range(1, 5)]])
+        return mean_formula, sigma_formula
+    mean_terms = [
+        "pgs_std",
+        "sex",
+        "smooth(age_entry_std)",
+        "smooth(lat_final_std)",
+        "smooth(lon_final_std)",
+        *[f"pc{i}_std" for i in range(1, 17)],
+    ]
+    sigma_terms = [
+        "smooth(age_entry_std)",
+        "smooth(lat_final_std)",
+        "smooth(lon_final_std)",
+        *[f"pc{i}_std" for i in range(1, 5)],
+    ]
+    return "phenotype ~ " + " + ".join(mean_terms), "sigma ~ " + " + ".join(sigma_terms)
 
 
 def rust_formula_survival(spec: MethodSpec) -> str:
-    terms = [
-        "linear(pgs_std)",
-        "linear(sex)",
-        "s(age_entry_std, type=ps, knots=8)",
-        "s(lat_final_std, type=ps, knots=10)",
-        "s(lon_final_std, type=ps, knots=10)",
-    ]
-    terms.extend(f"linear(pc{i}_std)" for i in range(1, 5))
-    return " + ".join(terms)
+    return "pgs_std + sex + smooth(age_entry_std) + smooth(lat_final_std) + smooth(lon_final_std) + pc1_std + pc2_std + pc3_std + pc4_std"
 
 
 def mgcv_formula_classification(spec: MethodSpec) -> str:
-    terms = ["pgs_std", "age_entry_std", "sex"]
+    terms = ["pgs_std", "sex", "s(age_entry_std, bs='ps', k=min(10, nrow(train_df)-1))"]
     if spec.smooth_kind == "joint":
         if spec.spatial_basis == "thinplate":
             terms.append(f"s(lat_final_std, lon_final_std, bs='tp', k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
         elif spec.spatial_basis == "duchon":
-            terms.append(f"s(lat_final_std, lon_final_std, bs='ds', m=c(1,0), k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
+            terms.append(f"s(lat_final_std, lon_final_std, bs='ds', k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
         elif spec.spatial_basis == "matern":
             terms.append(f"s(lat_final_std, lon_final_std, bs='gp', m=c(-4,1.0), k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
         else:
@@ -1281,7 +921,7 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     fit_cmd = [str(rust_bin), "fit"]
     if spec.include_sigma:
         fit_cmd.extend(["--predict-noise", sigma_formula])
-    fit_cmd.extend(["--out", str(model_path), str(train_csv), mean_formula])
+    fit_cmd.extend(["--no-summary", "--out", str(model_path), str(train_csv), mean_formula])
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     fit_sec = time.perf_counter() - t0
@@ -1298,43 +938,33 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     y_train = csv_numeric_column(train_csv, "phenotype")
     y_test = csv_numeric_column(test_csv, "phenotype")
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
-    spatial_desc = f"additive {spec.spatial_basis}" if spec.smooth_kind != "joint" else spec.spatial_basis
     return {
         "fit_sec": fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),
-        "model_spec": f"Rust {spatial_desc} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
+        "model_spec": f"Rust {spec.spatial_basis} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
     }
 
 
-def run_rust_survival(
-    spec: MethodSpec,
-    train_csv: Path,
-    test_csv: Path,
-    out_dir: Path,
-) -> dict[str, Any]:
+def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir: Path) -> dict[str, Any]:
     rust_bin = load_or_build_rust_binary()
     formula_rhs = rust_formula_survival(spec)
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
-    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "location-scale"
+    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "probit-location-scale"
     fit_cmd = [
-        str(rust_bin), "fit",
+        str(rust_bin), "fit", "--no-summary",
         "--survival-likelihood", likelihood_mode,
         "--time-basis", "ispline",
         "--time-degree", "3",
         "--time-num-internal-knots", "8",
         "--time-smooth-lambda", "0.01",
         "--ridge-lambda", "1e-6",
+        "--out", str(model_path),
+        str(train_csv),
+        f"Surv(time, event) ~ {formula_rhs}",
     ]
-    fit_cmd.extend(
-        [
-            "--out", str(model_path),
-            str(train_csv),
-            f"Surv(time0, time, event) ~ {formula_rhs}",
-        ]
-    )
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     fit_sec = time.perf_counter() - t0
@@ -1359,8 +989,8 @@ def run_rust_survival(
         raise RuntimeError(err.strip() or out.strip() or f"{spec.name} train predict failed")
     train_pred_rows = read_csv_rows(train_pred_path)
     train_risk = np.array([float(r[risk_key]) for r in train_pred_rows], dtype=float)
-    train_rows = [{k: (float(v) if k in {"time0", "time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(train_csv)]
-    test_rows = [{k: (float(v) if k in {"time0", "time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(test_csv)]
+    train_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(train_csv)]
+    test_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(test_csv)]
     metrics = survival_metrics(train_rows, test_rows, train_risk, test_risk)
     return {
         "fit_sec": fit_sec,
