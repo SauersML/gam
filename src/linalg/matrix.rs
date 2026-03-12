@@ -1731,7 +1731,6 @@ mod tests {
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, Axis, array};
-    use std::time::Instant;
 
     fn exact_weighted_penalized_solve(
         design: &Array2<f64>,
@@ -1990,10 +1989,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "microbenchmark for local performance validation"]
-    fn compute_xtwy_dense_allocationfree_microbenchmark() {
-        let n = 20_000usize;
-        let p = 192usize;
+    fn compute_xtwy_dense_allocationfree_matches_matvec() {
+        let n = 2_000usize;
+        let p = 64usize;
         let mut x = Array2::<f64>::zeros((n, p));
         let mut y = Array1::<f64>::zeros(n);
         let mut w = Array1::<f64>::zeros(n);
@@ -2005,39 +2003,18 @@ mod tests {
             }
         }
 
-        let warmup_old = {
+        let reference = {
             let wy = Array1::from_shape_fn(n, |i| y[i] * w[i].max(0.0));
             dense_transpose_matvec(&x, &wy)
         };
-        let warmup_new = dense_transpose_weighted_response(&x, &w, &y, None);
+        let fused = dense_transpose_weighted_response(&x, &w, &y, None);
         for j in 0..p {
-            assert!((warmup_old[j] - warmup_new[j]).abs() < 1e-10);
+            assert!(
+                (reference[j] - fused[j]).abs() < 1e-10,
+                "mismatch at column {j}: ref={} fused={}",
+                reference[j],
+                fused[j]
+            );
         }
-
-        let iters = 120usize;
-        let start_old = Instant::now();
-        let mut acc_old = 0.0_f64;
-        for _ in 0..iters {
-            let wy = Array1::from_shape_fn(n, |i| y[i] * w[i].max(0.0));
-            let out = dense_transpose_matvec(&x, &wy);
-            acc_old += out[0];
-        }
-        let old_elapsed = start_old.elapsed();
-
-        let start_new = Instant::now();
-        let mut acc_new = 0.0_f64;
-        for _ in 0..iters {
-            let out = dense_transpose_weighted_response(&x, &w, &y, None);
-            acc_new += out[0];
-        }
-        let new_elapsed = start_new.elapsed();
-
-        assert!((acc_old - acc_new).abs() < 1e-8);
-        println!(
-            "compute_xtwy microbenchmark: old={:?}, new={:?}, speedup={:.2}x",
-            old_elapsed,
-            new_elapsed,
-            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64()
-        );
     }
 }
