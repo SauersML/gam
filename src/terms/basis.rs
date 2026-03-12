@@ -11141,7 +11141,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn test_log_kappa_scaling_identities_match_autodiff() {
         let psi0 = -0.23;
@@ -11323,7 +11322,6 @@ mod tests {
         assert!(phi_r.abs() < 1e-12);
         assert!((phi_rr - phi_rr_collision).abs() < 1e-12);
     }
-
 
     #[test]
     fn test_duchon_general_p0_case_builds() {
