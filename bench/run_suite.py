@@ -114,6 +114,12 @@ _LEAN_PROFILE_EXCLUDED_CONTENDERS = {
     "python_lifelines_lognormal_aft",
     "python_xgboost_aft",
 }
+_GLOBALLY_DISABLED_CONTENDERS = {
+    "rust_gamlss",
+    "rust_gamlss_flexible",
+    "rust_gamlss_survival",
+    "r_gamlss",
+}
 _SYNTHETIC_PC_PANEL_SEED = 20260329
 _SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP = 40
 _SYNTHETIC_PC_PANEL: pd.DataFrame | None = None
@@ -2812,7 +2818,7 @@ def _validate_result_metadata(results: list[dict]) -> None:
             )
 
 
-def _rust_fit_mapping(scenario_name):
+def _scenario_fit_mapping(scenario_name):
     geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
     papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
     subpop_cfg = _geo_subpop16_scenario_cfg(scenario_name)
@@ -3058,8 +3064,8 @@ def _rust_fit_mapping(scenario_name):
     }.get(scenario_name)
 
 
-def _effective_rust_fit_mapping(scenario_name: str, override: dict | None = None):
-    cfg = _rust_fit_mapping(scenario_name)
+def _effective_scenario_fit_mapping(scenario_name: str, override: dict | None = None):
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None
     if not override:
@@ -3113,7 +3119,7 @@ def _mgcv_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int
 
 
 def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None = None):
-    cfg = _effective_rust_fit_mapping(scenario_name, cfg_override)
+    cfg = _effective_scenario_fit_mapping(scenario_name, cfg_override)
     if cfg is None:
         raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
@@ -3176,7 +3182,7 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
 
 
 def _mgcv_formula_for_scenario(scenario_name, ds):
-    cfg = _rust_fit_mapping(scenario_name)
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No shared smooth mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
@@ -3240,7 +3246,7 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
 
 
 def _survival_formula_mapping(scenario_name: str) -> dict:
-    cfg = _rust_fit_mapping(scenario_name)
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No survival formula mapping configured for scenario '{scenario_name}'")
     basis = _canonical_smooth_basis(cfg.get("smooth_basis", "ps"))
@@ -3324,7 +3330,7 @@ def _default_rust_formula_link_for_family(family: str) -> str:
 
 
 def _is_matern_rust_scenario(s_cfg) -> bool:
-    cfg = _rust_fit_mapping(s_cfg["name"])
+    cfg = _scenario_fit_mapping(s_cfg["name"])
     if cfg is None:
         return False
     return _canonical_smooth_basis(cfg.get("smooth_basis", "ps")) == "matern"
@@ -3691,7 +3697,7 @@ def run_rust_scenario_cv(
     ood_rows = []
     continuous_rows = []
     adaptive_rows = []
-    rust_cfg = _effective_rust_fit_mapping(scenario_name, rust_cfg_override) or {}
+    rust_cfg = _effective_scenario_fit_mapping(scenario_name, rust_cfg_override) or {}
     smooth_cols = list(rust_cfg.get("smooth_cols") or ([rust_cfg["smooth_col"]] if "smooth_col" in rust_cfg else []))
     linear_cols = list(rust_cfg.get("linear_cols", []))
     # Use a workspace-local temp root to reduce /tmp lifecycle flakiness in CI.
@@ -4099,7 +4105,7 @@ def _run_rust_gamlss_scenario_cv_variant(
 ):
     scenario_name = scenario["name"]
     # Run for any scenario with a valid formula mapping (not just geo scenarios).
-    if _rust_fit_mapping(scenario_name) is None:
+    if _scenario_fit_mapping(scenario_name) is None:
         return None
 
     if ds is None:
@@ -4517,14 +4523,14 @@ def run_rust_gamlss_survival_cv(
 
 
 def _is_gamlss_benchmark_scenario(scenario_name: str) -> bool:
-    cfg = _rust_fit_mapping(scenario_name)
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return False
     return not _requires_joint_spatial_term(cfg)
 
 
 def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
-    cfg = _rust_fit_mapping(scenario_name)
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None
     if ds["family"] not in ("binomial", "gaussian"):
@@ -4554,7 +4560,7 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
 def _scenario_knot_count(scenario_name: str | None, default: int = 8) -> int:
     if not scenario_name:
         return int(default)
-    cfg = _rust_fit_mapping(scenario_name)
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return int(default)
     return max(4, int(cfg.get("knots", default)))
@@ -4907,7 +4913,7 @@ def run_external_mgcv_cv(scenario, *, ds: dict | None = None, folds: list[Fold] 
         folds = folds_for_dataset(ds)
     contender_name = "r_survival_coxph" if ds["family"] == "survival" else "r_mgcv"
     mgcv_formula = None
-    rust_cfg = _rust_fit_mapping(scenario["name"])
+    rust_cfg = _scenario_fit_mapping(scenario["name"])
     use_select = bool((rust_cfg or {}).get("double_penalty", True))
     if ds["family"] != "survival":
         mgcv_formula = _mgcv_formula_for_scenario(scenario["name"], ds)
@@ -5264,7 +5270,7 @@ def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list
     if folds is None:
         folds = folds_for_dataset(ds)
     mu_formula = _mgcv_formula_for_scenario(scenario["name"], ds)
-    rust_cfg = _rust_fit_mapping(scenario["name"])
+    rust_cfg = _scenario_fit_mapping(scenario["name"])
     use_select = bool((rust_cfg or {}).get("double_penalty", True))
 
     # For gaulss, cap the mu formula k values too so the combined mu + sigma
@@ -5516,7 +5522,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 
 
 def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
-    cfg = _rust_fit_mapping(scenario_name)
+    cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None, None
     if ds["family"] != "gaussian":
@@ -7324,7 +7330,7 @@ def _assert_basis_parity_for_scenario(s_cfg, *, ds: dict | None = None):
     if ds is None:
         ds = dataset_for_scenario(s_cfg)
     scenario_name = s_cfg["name"]
-    rust_cfg = _rust_fit_mapping(scenario_name)
+    rust_cfg = _scenario_fit_mapping(scenario_name)
     if rust_cfg is None:
         return
     basis = _canonical_smooth_basis(rust_cfg.get("smooth_basis", "ps"))
@@ -7347,6 +7353,8 @@ def _extra_excluded_contenders_for_profile() -> set[str]:
 
 
 def _is_contender_enabled(s_cfg, contender: str) -> bool:
+    if contender in _GLOBALLY_DISABLED_CONTENDERS:
+        return False
     excluded = set(s_cfg.get("exclude_contenders", []))
     excluded.update(_extra_excluded_contenders_for_profile())
     return contender not in excluded
@@ -7581,41 +7589,6 @@ def main():
             )
             if rust_sas_row is not None:
                 results.append(rust_sas_row)
-            rust_gamlss_row = run_rust_gamlss_scenario_cv(
-                s_cfg,
-                ds=ds,
-                folds=folds,
-                shared_fold_artifacts=shared_fold_artifacts,
-            )
-            if rust_gamlss_row is not None:
-                results.append(rust_gamlss_row)
-                if ds["family"] == "binomial" and _is_contender_enabled(
-                    s_cfg, "rust_gamlss_flexible"
-                ):
-                    results.append(
-                        run_rust_gamlss_scenario_cv(
-                            s_cfg,
-                            contender_name="rust_gamlss_flexible",
-                            binomial_cli_family=_flexible_link_name("probit"),
-                            ds=ds,
-                            folds=folds,
-                            shared_fold_artifacts=shared_fold_artifacts,
-                        )
-                    )
-            rust_gamlss_surv_row = (
-                run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
-                if _is_contender_enabled(s_cfg, "rust_gamlss_survival")
-                else None
-            )
-            if rust_gamlss_surv_row is not None:
-                results.append(rust_gamlss_surv_row)
-            r_gamlss_row = (
-                run_external_r_gamlss_cv(s_cfg, ds=ds, folds=folds)
-                if _is_contender_enabled(s_cfg, "r_gamlss")
-                else None
-            )
-            if r_gamlss_row is not None:
-                results.append(r_gamlss_row)
             if _is_contender_enabled(s_cfg, "r_mgcv"):
                 results.append(run_external_mgcv_cv(s_cfg, ds=ds, folds=folds))
             mgcv_gaulss_row = (
@@ -7710,7 +7683,9 @@ def main():
     for s_cfg in scenarios:
         s_name = s_cfg["name"]
         ds = dataset_for_scenario(s_cfg)
-        required_contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
+        required_contender = None if ds["family"] == "survival" else "rust_gam"
+        if required_contender is None:
+            continue
         has_required_ok = any(
             r.get("scenario_name") == s_name
             and r.get("contender") == required_contender

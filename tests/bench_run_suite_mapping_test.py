@@ -6,13 +6,13 @@ from types import SimpleNamespace
 from pathlib import Path
 
 
-_RUN_SUITE_PATH = Path("/Users/user/gam/bench/run_suite.py")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_RUN_SUITE_PATH = _REPO_ROOT / "bench" / "run_suite.py"
 _SPEC = importlib.util.spec_from_file_location("bench_run_suite", _RUN_SUITE_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load benchmark runner from {_RUN_SUITE_PATH}")
 _RUN_SUITE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_RUN_SUITE)
-_REPO_ROOT = Path("/Users/user/gam")
 _GITIGNORE_PATH = _REPO_ROOT / ".gitignore"
 _BENCH_DATASET_DIR = _REPO_ROOT / "bench" / "datasets"
 _REQUIRED_BENCHMARK_DATASETS = {
@@ -190,7 +190,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertEqual(ignored_required, [])
 
     def assert_joint_mapping(self, scenario_name: str, expected_dim: int, expected_knots: int) -> None:
-        cfg = _RUN_SUITE._rust_fit_mapping(scenario_name)
+        cfg = _RUN_SUITE._scenario_fit_mapping(scenario_name)
         self.assertIsNotNone(cfg, scenario_name)
         self.assertEqual(cfg["smooth_basis"], "thinplate")
         self.assertEqual(len(cfg["smooth_cols"]), expected_dim)
@@ -223,7 +223,7 @@ class RunSuiteMappingTests(unittest.TestCase):
 
     def test_legacy_geo_disease_tp_scenarios_use_fixed_joint_embedding(self) -> None:
         for scenario_name in ("geo_disease_tp", "geo_disease_shrinkage"):
-            cfg = _RUN_SUITE._rust_fit_mapping(scenario_name)
+            cfg = _RUN_SUITE._scenario_fit_mapping(scenario_name)
             self.assertEqual(cfg["smooth_basis"], "thinplate")
             self.assertEqual(cfg["smooth_cols"], ["pc1", "pc2", "pc3"])
             self.assertEqual(cfg["knots"], 12)
@@ -452,7 +452,7 @@ class RunSuiteMappingTests(unittest.TestCase):
             _RUN_SUITE.zip_figure_dir = orig_zip
 
         self.assertNotIn(("rust_gam", "rust_gam"), seen)
-        self.assertIn(("survival", "rust_gamlss_survival"), seen)
+        self.assertNotIn(("survival", "rust_gamlss_survival"), seen)
 
     def test_main_skips_flexible_variants_for_gaussian_scenarios(self) -> None:
         seen_rust = []
@@ -533,7 +533,7 @@ class RunSuiteMappingTests(unittest.TestCase):
 
         self.assertIn("rust_gam", seen_rust)
         self.assertNotIn("rust_gam_flexible", seen_rust)
-        self.assertIn("rust_gamlss", seen_gamlss)
+        self.assertNotIn("rust_gamlss", seen_gamlss)
         self.assertNotIn("rust_gamlss_flexible", seen_gamlss)
 
     def test_main_skips_flexible_variants_for_survival_scenarios(self) -> None:
@@ -609,7 +609,7 @@ class RunSuiteMappingTests(unittest.TestCase):
             _RUN_SUITE.generate_scenario_figures = orig_figures
             _RUN_SUITE.zip_figure_dir = orig_zip
 
-        self.assertEqual(seen_survival, ["rust_gamlss_survival"])
+        self.assertEqual(seen_survival, [])
 
 
 if __name__ == "__main__":
