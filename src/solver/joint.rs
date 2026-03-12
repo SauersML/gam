@@ -3709,7 +3709,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_joint_analytic_gradient_supports_integrated_logitweights() {
         let n = 120;
