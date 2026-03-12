@@ -871,14 +871,19 @@ impl SurvivalLocationScaleFamily {
 
         let guard = self.derivative_guard;
         let soft = self.derivative_softness.max(0.0);
-        let g = state.d_raw;
-        let (log_g_safe, d_log_g, d2_log_g, d3_log_g) =
-            Self::clamped_logwith_derivatives(g + soft, 1e-12);
-        if !g.is_finite() {
-            return Err(format!(
-                "survival location-scale non-finite d_eta/dt at row {row}: {g}"
-            ));
-        }
+        let (g, log_g_safe, d_log_g, d2_log_g, d3_log_g) = if state.d_raw.is_finite() {
+            let g_val = state.d_raw;
+            let (log_g, d1, d2, d3) = Self::clamped_logwith_derivatives(g_val + soft, 1e-12);
+            (g_val, log_g, d1, d2, d3)
+        } else {
+            // Keep the likelihood/derivative surface finite when line-search
+            // probes an invalid time-derivative state. Treat this as an active
+            // floor branch: finite objective contribution with zero local
+            // derivative curvature in d_eta/dt.
+            let g_floor = 0.0;
+            let log_g = soft.max(1e-12).ln();
+            (g_floor, log_g, 0.0, 0.0, 0.0)
+        };
         if guard > 0.0 && g <= guard {
             return Err(format!(
                 "survival location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} <= guard={:.3e}",
@@ -5354,5 +5359,331 @@ mod tests {
             assert!(pm.survival_prob[0].is_finite());
             assert!(pm.survival_prob[0] > 0.0 && pm.survival_prob[0] < 1.0);
         }
+    }
+
+    /// Full-path reproducer: runs fit_survival_location_scale with zero
+    /// derivative offsets, mimicking the heart_failure_survival scenario
+    /// where the linear baseline produces d_raw=0 at initialization.
+    #[test]
+    fn heart_failure_full_fit_zero_deriv_offset() {
+        // 20 rows with realistic-ish I-spline-like structure.
+        let n = 20;
+        let p_time = 8; // 8 time basis columns
+
+        // Entry times all near zero (left-truncation at 0) — like __entry=0.
+        let age_entry = Array1::from_elem(n, 1e-9_f64);
+        // Exit times spread out like real survival data.
+        let mut age_exit = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            age_exit[i] = 4.0 + (i as f64) * 14.0; // 4 to 270
+        }
+
+        // Events: ~1/3 event rate.
+        let mut event_target = Array1::<f64>::zeros(n);
+        for i in [0, 3, 5, 8, 12, 17] {
+            event_target[i] = 1.0;
+        }
+        let weights = Array1::ones(n);
+
+        // Build I-spline-like time designs.
+        // Entry design is all zeros (I-spline = 0 below knot range).
+        let design_entry = Array2::<f64>::zeros((n, p_time));
+
+        // Exit design: monotonically increasing I-spline-like columns.
+        let mut design_exit = Array2::<f64>::zeros((n, p_time));
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64); // 0 to 1
+            for j in 0..p_time {
+                let center = (j as f64 + 0.5) / (p_time as f64);
+                // Smooth sigmoid-like I-spline approximation.
+                let x = 8.0 * (t - center);
+                design_exit[[i, j]] = 1.0 / (1.0 + (-x).exp());
+            }
+        }
+
+        // Derivative design: derivative of I-spline columns.
+        let mut design_derivative_exit = Array2::<f64>::zeros((n, p_time));
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            for j in 0..p_time {
+                let center = (j as f64 + 0.5) / (p_time as f64);
+                let x = 8.0 * (t - center);
+                let sigmoid = 1.0 / (1.0 + (-x).exp());
+                // Derivative of sigmoid * chain_rule (1/t).
+                let deriv = 8.0 * sigmoid * (1.0 - sigmoid);
+                let chain = 1.0 / age_exit[i];
+                design_derivative_exit[[i, j]] = deriv * chain;
+            }
+        }
+
+        // Zero derivative offsets (linear baseline → (0,0)).
+        let derivative_offset_exit = Array1::<f64>::zeros(n);
+        let offset_entry = Array1::<f64>::zeros(n);
+        let offset_exit = Array1::<f64>::zeros(n);
+
+        // Simple difference penalty.
+        let mut penalty = Array2::<f64>::zeros((p_time, p_time));
+        for i in 0..(p_time - 1) {
+            penalty[[i, i]] += 1.0;
+            penalty[[i, i + 1]] -= 1.0;
+            penalty[[i + 1, i]] -= 1.0;
+            penalty[[i + 1, i + 1]] += 1.0;
+        }
+
+        let spec = SurvivalLocationScaleSpec {
+            age_entry,
+            age_exit,
+            event_target,
+            weights,
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard: 0.0,
+            derivative_softness: 1e-6,
+            time_anchor: None,
+            max_iter: 400,
+            tol: 1e-6,
+            time_block: TimeBlockInput {
+                design_entry,
+                design_exit,
+                design_derivative_exit,
+                offset_entry,
+                offset_exit,
+                derivative_offset_exit,
+                penalties: vec![penalty.clone()],
+                initial_log_lambdas: Some(array![0.0]),
+                initial_beta: None,
+            },
+            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::Dense(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::Dense(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            linkwiggle_block: None,
+        };
+
+        match fit_survival_location_scale(spec) {
+            Ok(result) => {
+                eprintln!(
+                    "fit succeeded: log_likelihood={:.6e}",
+                    result.log_likelihood
+                );
+                eprintln!("beta_time: {:?}", result.beta_time);
+                eprintln!("beta_threshold: {:?}", result.beta_threshold);
+                eprintln!("beta_log_sigma: {:?}", result.beta_log_sigma);
+            }
+            Err(e) => {
+                panic!("fit_survival_location_scale failed: {e}");
+            }
+        }
+    }
+
+    /// Reproducer for heart_failure_survival NaN crash.
+    ///
+    /// Mimics the real scenario: zero derivative offsets (linear baseline),
+    /// zero initial beta, probit link (Gaussian residual distribution),
+    /// multiple event/non-event rows.
+    #[test]
+    fn heart_failure_zero_offset_nan_small() {
+        // 6 rows: 3 events, 3 non-events.  Single time column for simplicity.
+        let n = 6;
+        // I-spline-like designs: entry is all zero (left truncation at t=0),
+        // exit has non-trivial values, derivative is the B-spline derivative.
+        let x_entry = Array2::<f64>::zeros((n, 2));
+        let x_exit = array![
+            [0.1, 0.05],
+            [0.3, 0.15],
+            [0.5, 0.35],
+            [0.7, 0.55],
+            [0.9, 0.80],
+            [1.0, 0.95],
+        ];
+        let x_deriv = array![
+            [0.2, 0.1],
+            [0.3, 0.2],
+            [0.3, 0.3],
+            [0.3, 0.3],
+            [0.2, 0.3],
+            [0.1, 0.2],
+        ];
+        // Zero derivative offsets (linear baseline)
+        let offset_deriv = Array1::<f64>::zeros(n);
+
+        let family = SurvivalLocationScaleFamily {
+            n,
+            y: array![1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            w: Array1::ones(n),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard: 0.0,
+            derivative_softness: 1e-6,
+            x_time_entry: x_entry,
+            x_time_exit: x_exit.clone(),
+            x_time_deriv: x_deriv.clone(),
+            offset_time_deriv: offset_deriv.clone(),
+            x_threshold: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_threshold_entry: None,
+            x_log_sigma: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_log_sigma_entry: None,
+            x_link_wiggle: None,
+        };
+
+        // Build initial states with beta=0 → d_raw = 0 for all rows.
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(2),
+                eta: Array1::zeros(3 * n), // [h0; h1; d_raw] all zero
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(n),
+            },
+        ];
+
+        // Step 1: Verify initial evaluate succeeds with d_raw=0.
+        let eval = family
+            .evaluate(&states)
+            .expect("initial evaluate with d_raw=0 should succeed");
+        eprintln!("initial log-likelihood: {:.6e}", eval.log_likelihood);
+
+        // Step 2: Extract time block gradient and Hessian.
+        let (grad, hess) = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                (gradient.clone(), hessian.to_dense())
+            }
+            _ => panic!("expected exact-newton for time block"),
+        };
+        eprintln!("time block gradient: {:?}", grad);
+        eprintln!(
+            "time block Hessian diagonal: {:?}",
+            (0..hess.nrows()).map(|i| hess[[i, i]]).collect::<Vec<_>>()
+        );
+        eprintln!("time block Hessian:\n{:.6e}", hess);
+
+        // Step 3: Simulate Newton step (H + ridge*I) * delta = grad - S*beta.
+        // With beta=0 and no penalty: (H + ridge*I) * delta = grad.
+        let ridge = 1e-6_f64;
+        let p = 2;
+        let mut lhs = hess.clone();
+        for i in 0..p {
+            lhs[[i, i]] += ridge;
+        }
+        // Solve via direct inversion (2x2).
+        let det = lhs[[0, 0]] * lhs[[1, 1]] - lhs[[0, 1]] * lhs[[1, 0]];
+        eprintln!("LHS determinant: {:.6e}", det);
+        let delta = if det.abs() > 1e-30 {
+            let inv00 = lhs[[1, 1]] / det;
+            let inv01 = -lhs[[0, 1]] / det;
+            let inv10 = -lhs[[1, 0]] / det;
+            let inv11 = lhs[[0, 0]] / det;
+            array![
+                inv00 * grad[0] + inv01 * grad[1],
+                inv10 * grad[0] + inv11 * grad[1]
+            ]
+        } else {
+            eprintln!("SINGULAR: det={:.6e}", det);
+            Array1::zeros(p)
+        };
+        eprintln!("Newton delta: {:?}", delta);
+        assert!(
+            delta.iter().all(|v| v.is_finite()),
+            "Newton delta has non-finite entries: {:?}",
+            delta
+        );
+
+        // Step 4: Compute new d_raw after the step.
+        let new_d_raw = x_deriv.dot(&delta) + &offset_deriv;
+        eprintln!("new d_raw after Newton step: {:?}", new_d_raw);
+        for (i, &v) in new_d_raw.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "d_raw[{i}] is non-finite ({v}) after Newton step with delta={:?}",
+                delta
+            );
+        }
+
+        // Step 5: Verify evaluate succeeds with the new state.
+        let new_eta_time = {
+            let mut eta = Array1::<f64>::zeros(3 * n);
+            // h0 = x_entry * delta (all zero since x_entry is zero)
+            // h1 = x_exit * delta
+            let h1 = x_exit.dot(&delta);
+            eta.slice_mut(ndarray::s![n..2 * n]).assign(&h1);
+            // d_raw = x_deriv * delta + offset_deriv
+            eta.slice_mut(ndarray::s![2 * n..3 * n]).assign(&new_d_raw);
+            eta
+        };
+        let new_states = vec![
+            ParameterBlockState {
+                beta: delta.clone(),
+                eta: new_eta_time,
+            },
+            states[1].clone(),
+            states[2].clone(),
+        ];
+        match family.evaluate(&new_states) {
+            Ok(eval2) => eprintln!("post-step log-likelihood: {:.6e}", eval2.log_likelihood),
+            Err(e) => {
+                eprintln!("post-step evaluate FAILED: {e}");
+                eprintln!("delta was: {:?}", delta);
+                eprintln!("new d_raw was: {:?}", new_d_raw);
+                panic!("evaluate failed after Newton step: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_survival_location_scale_soft_clamps_non_finite_d_eta_dt() {
+        let n = 2;
+        let family = SurvivalLocationScaleFamily {
+            n,
+            y: array![1.0, 0.0],
+            w: Array1::ones(n),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard: 0.0,
+            derivative_softness: 1e-6,
+            x_time_entry: Array2::zeros((n, 1)),
+            x_time_exit: Array2::ones((n, 1)),
+            x_time_deriv: Array2::ones((n, 1)),
+            offset_time_deriv: Array1::zeros(n),
+            x_threshold: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_threshold_entry: None,
+            x_log_sigma: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_log_sigma_entry: None,
+            x_link_wiggle: None,
+        };
+
+        let mut eta_time = Array1::<f64>::zeros(3 * n);
+        eta_time[2 * n] = f64::NAN;
+        eta_time[2 * n + 1] = 0.25;
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: eta_time,
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(n),
+            },
+        ];
+
+        let eval = family
+            .evaluate(&states)
+            .expect("non-finite d_eta/dt should be soft-clamped, not fatal");
+        assert!(eval.log_likelihood.is_finite());
     }
 }

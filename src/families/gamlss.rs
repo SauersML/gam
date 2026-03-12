@@ -42,7 +42,7 @@ const BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT: f64 = 0.0;
 
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
-    if rawweight <= 0.0 {
+    if !rawweight.is_finite() || rawweight <= 0.0 {
         0.0
     } else {
         rawweight.max(minweight)
@@ -5160,6 +5160,7 @@ impl CustomFamily for PoissonLogFamily {
         let mut ll = 0.0;
         let mut z = Array1::<f64>::zeros(n);
         let mut w = Array1::<f64>::zeros(n);
+        const ETA_HARD_CLAMP: f64 = 30.0;
 
         for i in 0..n {
             let yi = self.y[i];
@@ -5168,14 +5169,16 @@ impl CustomFamily for PoissonLogFamily {
                     "PoissonLogFamily requires non-negative finite y; found y[{i}]={yi}"
                 ));
             }
-            let e = eta[i];
+            let e_raw = eta[i];
+            let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
+            let active_clamp = e != e_raw;
             let m = safe_exp(e).max(1e-12);
             mu[i] = m;
             // Drop log(y!) constant in objective.
             ll += self.weights[i] * (yi * e - m);
             let dmu = m.max(MIN_DERIV);
             let var = m.max(MIN_PROB);
-            if self.weights[i] == 0.0 {
+            if self.weights[i] == 0.0 || active_clamp {
                 w[i] = 0.0;
                 z[i] = eta[i];
             } else {
@@ -5252,6 +5255,7 @@ impl CustomFamily for GammaLogFamily {
         let mut ll = 0.0;
         let mut z = Array1::<f64>::zeros(n);
         let mut w = Array1::<f64>::zeros(n);
+        const ETA_HARD_CLAMP: f64 = 30.0;
 
         for i in 0..n {
             let yi = self.y[i];
@@ -5260,14 +5264,16 @@ impl CustomFamily for GammaLogFamily {
                     "GammaLogFamily requires positive finite y; found y[{i}]={yi}"
                 ));
             }
-            let e = eta[i];
+            let e_raw = eta[i];
+            let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
+            let active_clamp = e != e_raw;
             let m = safe_exp(e).max(1e-12);
             mu[i] = m;
             // Gamma(shape=k, scale=mu/k), dropping constants independent of eta.
             ll += self.weights[i] * (-self.shape * (yi / m + m.ln()));
             let dmu = m.max(MIN_DERIV);
             let var = (m * m / self.shape).max(MIN_PROB);
-            if self.weights[i] == 0.0 {
+            if self.weights[i] == 0.0 || active_clamp {
                 w[i] = 0.0;
                 z[i] = eta[i];
             } else {
