@@ -2,7 +2,7 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_matmut,
-    array2_to_matmut, fast_ab, fast_atv,
+    array2_to_matmut, fast_ab, fast_atv, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
@@ -723,6 +723,8 @@ pub struct PirlsWorkspace {
     pub weighted_x_chunk: Array2<f64>,
     // Reusable p×p buffer for Hessian assembly (avoids per-iteration allocation).
     pub hessian_buf: Array2<f64>,
+    // Reusable n-length buffer for X*β matvec (avoids per-iteration allocation in update).
+    pub matvec_buf: Array1<f64>,
 }
 
 impl PirlsWorkspace {
@@ -763,6 +765,7 @@ impl PirlsWorkspace {
             weighted_xvalues: Vec::new(),
             weighted_x_chunk: Array2::zeros((0, 0).f()),
             hessian_buf: Array2::zeros((0, 0).f()),
+            matvec_buf: Array1::zeros(n),
         }
     }
 
@@ -1233,6 +1236,24 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
+    /// Compute X_transformed * β into a pre-allocated buffer, avoiding
+    /// per-iteration allocation in the dense case.
+    fn transformed_matvec_into(&self, beta: &Coefficients, out: &mut Array1<f64>) {
+        match &self.coordinate_design {
+            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
+                if let Some(dense) = x_transformed.as_dense() {
+                    fast_av_into(dense, beta.as_ref(), out);
+                    return;
+                }
+                out.assign(&x_transformed.matrixvectormultiply(beta));
+            }
+            _ => {
+                // Sparse-native and implicit paths: fall back to allocating version.
+                out.assign(&self.transformed_matvec(beta));
+            }
+        }
+    }
+
     fn transformed_transpose_matvec(&self, vec: &Array1<f64>) -> Array1<f64> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::OriginalSparseNative => {
@@ -1354,11 +1375,16 @@ impl<'a> GamWorkingModel<'a> {
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
-        if self.workspace.eta_buf.len() != self.offset.len() {
-            self.workspace.eta_buf = Array1::zeros(self.offset.len());
+        let n = self.offset.len();
+        if self.workspace.eta_buf.len() != n {
+            self.workspace.eta_buf = Array1::zeros(n);
         }
+        if self.workspace.matvec_buf.len() != n {
+            self.workspace.matvec_buf = Array1::zeros(n);
+        }
+        self.transformed_matvec_into(beta, &mut self.workspace.matvec_buf);
         self.workspace.eta_buf.assign(&self.offset);
-        self.workspace.eta_buf += &self.transformed_matvec(beta);
+        self.workspace.eta_buf += &self.workspace.matvec_buf;
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.

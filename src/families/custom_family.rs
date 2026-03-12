@@ -6763,16 +6763,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_newton_nan_hessian_silently_bypasses_ridging_check() {
-        // BUG DEMONSTRATION: A NaN Hessian in the log_sigma block should
-        // cause the inner fit to fail or at least trigger ridging. Instead,
-        // eigh returns NaN eigenvalues, f64::min ignores NaN, and min_eval
-        // appears healthy — the NaN matrix passes through unridged.
+    fn exact_newton_nan_hessian_should_fail_but_silently_passes() {
+        // RED TEST: A NaN Hessian in the log_sigma block SHOULD cause the
+        // inner fit to return an error (non-finite Hessian is invalid input).
+        // Currently this test FAILS because the bug lets NaN pass through:
+        //   - eigh returns NaN eigenvalues (not Err)
+        //   - f64::min ignores NaN, so min_eval appears healthy
+        //   - no ridge is added, NaN propagates silently
         //
-        // The inner fit "succeeds" with NaN-contaminated betas, which is
-        // WRONG: the code should detect and handle non-finite Hessians.
-        // On production CI (different platform/SIMD), the same NaN pattern
-        // instead triggers eigh NoConvergence, which also has no fallback.
+        // When the fix is applied, this test will turn GREEN.
         let specs = make_two_block_specs(4);
         let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
         let options = BlockwiseFitOptions {
@@ -6788,12 +6787,10 @@ mod tests {
             &options,
             None,
         );
-        // This SHOULD fail (NaN Hessian is invalid), but currently doesn't
-        // because the ridging check silently ignores NaN eigenvalues.
-        // When the fix is applied, change this to expect_err.
         assert!(
-            result.is_ok(),
-            "BUG: inner fit should detect NaN Hessian but currently doesn't"
+            result.is_err(),
+            "NaN Hessian should cause inner_blockwise_fit to return Err, \
+             but it silently succeeded (bug: NaN eigenvalues bypass ridging check)"
         );
     }
 
@@ -6826,38 +6823,53 @@ mod tests {
     }
 
     #[test]
-    fn nan_hessian_eigh_min_eval_ignores_nan_bypassing_ridge() {
-        // CORE BUG MECHANISM: When the Hessian has NaN, eigh returns NaN
-        // eigenvalues. But f64::min ignores NaN, so min_eval computed by
-        // compute_update_step appears healthy. The ridging check passes
-        // even though the matrix is pathological.
+    fn nan_hessian_has_no_safe_path_through_compute_update_step() {
+        // RED TEST: compute_update_step has NO safe handling for NaN Hessians.
+        // There are two platform-dependent failure modes, both buggy:
         //
-        // This is the same logic as custom_family.rs:1313:
-        //   let min_eval = evals.iter().fold(f64::INFINITY, |m, &v| m.min(v));
-        //   if min_eval <= floor { add ridge }
+        //   Mode A (some platforms): eigh returns Err(NoConvergence).
+        //     compute_update_step propagates this as a hard error with
+        //     NO fallback chain. This is the production crash.
+        //
+        //   Mode B (macOS/other): eigh returns Ok(NaN eigenvalues).
+        //     f64::min ignores NaN, so min_eval appears healthy.
+        //     No ridge is added; NaN propagates silently.
+        //
+        // CORRECT BEHAVIOR: compute_update_step should detect NaN in the
+        // Hessian and either add a ridge or fall back gracefully (like
+        // stable_logdet_with_ridge_policy does).
+        //
+        // This test asserts that stable_logdet_with_ridge_policy DOES
+        // handle the same NaN matrix, proving the fallback chain works —
+        // but compute_update_step lacks it.
         let mut mat = Array2::<f64>::eye(3);
         mat[[1, 0]] = f64::NAN;
         mat[[0, 1]] = f64::NAN;
 
         use crate::faer_ndarray::FaerEigh;
-        let (evals, _) = FaerEigh::eigh(&mat, faer::Side::Lower)
-            .expect("eigh returns Ok with NaN eigenvalues, not Err");
-        assert!(
-            evals.iter().any(|v| v.is_nan()),
-            "eigh should produce NaN eigenvalues for NaN input: {evals:?}"
-        );
+        let eigh_result = FaerEigh::eigh(&mat, faer::Side::Lower);
 
-        // f64::min ignores NaN — min_eval is the finite eigenvalue
-        let min_eval = evals.iter().fold(f64::INFINITY, |m, &v| m.min(v));
-        let floor = effective_solverridge(1e-8);
-        assert!(
-            min_eval > floor,
-            "BUG: min_eval ({min_eval}) appears above floor ({floor}) \
-             because f64::min ignores NaN eigenvalues — no ridge added"
-        );
+        match &eigh_result {
+            Err(_) => {
+                // Mode A: eigh itself fails. compute_update_step has no
+                // fallback and would propagate this error. BUG.
+            }
+            Ok((evals, _)) => {
+                // Mode B: eigh returns NaN eigenvalues.
+                // compute_update_step uses f64::min which ignores NaN:
+                let min_eval = evals.iter().fold(f64::INFINITY, |m, &v| m.min(v));
+                let floor = effective_solverridge(1e-8);
+                // BUG: min_eval appears healthy despite NaN eigenvalues
+                assert!(
+                    !min_eval.is_nan() && min_eval > floor,
+                    "Expected f64::min to silently ignore NaN (the bug), \
+                     but it didn't: min_eval={min_eval}"
+                );
+            }
+        }
 
         // Meanwhile, stable_logdet_with_ridge_policy handles the same
-        // matrix gracefully via its fallback chain:
+        // pathological matrix gracefully — proving the fix exists:
         let logdet = stable_logdet_with_ridge_policy(
             &mat,
             1e-8,
@@ -6865,7 +6877,8 @@ mod tests {
         );
         assert!(
             logdet.is_ok(),
-            "stable_logdet survives NaN via fallbacks: {:?}",
+            "stable_logdet survives NaN via its 4-tier fallback chain, \
+             but compute_update_step has no such fallback: {:?}",
             logdet.err()
         );
     }

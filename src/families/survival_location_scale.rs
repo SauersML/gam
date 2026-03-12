@@ -1953,18 +1953,23 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let (grad_ls, hess_ls) = if let Some(x_ls_entry) = self.x_log_sigma_entry.as_ref() {
             let sigma_e = sigma_entry.as_ref().unwrap();
             // For exp link: σ' = σ = exp(η_ls)
-            let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
+            let exit_qd =
+                compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
             let ds_entry = eta_ls_entry.mapv(f64::exp);
-            let entry_qd = compute_q_chain_derivs(&eta_t_entry, sigma_e, &ds_entry, &ds_entry, &ds_entry);
-            let (ge, he) = chain_rule_weights(&d1_q1, &d2_q1, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
-            let (gn, hn) = chain_rule_weights(&d1_q0, &d2_q0, &entry_qd.dq_ls, Some(&entry_qd.d2q_ls));
+            let entry_qd =
+                compute_q_chain_derivs(&eta_t_entry, sigma_e, &ds_entry, &ds_entry, &ds_entry);
+            let (ge, he) =
+                chain_rule_weights(&d1_q1, &d2_q1, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
+            let (gn, hn) =
+                chain_rule_weights(&d1_q0, &d2_q0, &entry_qd.dq_ls, Some(&entry_qd.d2q_ls));
             let grad = self.x_log_sigma.transpose_vector_multiply(&ge)
                 + x_ls_entry.transpose_vector_multiply(&gn);
             let hess = xt_diag_x_symmetric(&self.x_log_sigma, &he)?
                 .add(&xt_diag_x_symmetric(x_ls_entry, &hn)?)?;
             (grad, hess)
         } else {
-            let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
+            let exit_qd =
+                compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
             let (g, h) = chain_rule_weights(&d1_q, &d2_q, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
             let grad = self.x_log_sigma.transpose_vector_multiply(&g);
             let hess = xt_diag_x_symmetric(&self.x_log_sigma, &h)?;
@@ -2091,16 +2096,36 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     let dq_t_entry = sigma_e.mapv(|s| -1.0 / s.max(1e-12));
                     let d_eta_exit = self.x_threshold.matrixvectormultiply(d_beta);
                     let d_eta_entry = x_t_entry.matrixvectormultiply(d_beta);
-                    let dh_exit = directional_hessian_weights(&d1_q1, &d2_q1, &d3_q1, &dq_t_exit, None, None, &d_eta_exit);
-                    let dh_entry = directional_hessian_weights(&d1_q0, &d2_q0, &d3_q0, &dq_t_entry, None, None, &d_eta_entry);
+                    let dh_exit = directional_hessian_weights(
+                        &d1_q1,
+                        &d2_q1,
+                        &d3_q1,
+                        &dq_t_exit,
+                        None,
+                        None,
+                        &d_eta_exit,
+                    );
+                    let dh_entry = directional_hessian_weights(
+                        &d1_q0,
+                        &d2_q0,
+                        &d3_q0,
+                        &dq_t_entry,
+                        None,
+                        None,
+                        &d_eta_entry,
+                    );
                     let d_h = xt_diag_x_symmetric(&self.x_threshold, &dh_exit)?
                         .add(&xt_diag_x_symmetric(x_t_entry, &dh_entry)?)?;
                     Ok(Some(d_h.to_dense()))
                 } else {
                     let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
                     let d_eta_t = self.x_threshold.matrixvectormultiply(d_beta);
-                    let dh = directional_hessian_weights(&d1_q, &d2_q, &d3_q, &dq_t, None, None, &d_eta_t);
-                    Ok(Some(xt_diag_x_symmetric(&self.x_threshold, &dh)?.to_dense()))
+                    let dh = directional_hessian_weights(
+                        &d1_q, &d2_q, &d3_q, &dq_t, None, None, &d_eta_t,
+                    );
+                    Ok(Some(
+                        xt_diag_x_symmetric(&self.x_threshold, &dh)?.to_dense(),
+                    ))
                 }
             }
             Self::BLOCK_LOG_SIGMA => {
@@ -2115,19 +2140,51 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     let sigma_e = sigma_entry_vec.as_ref().unwrap();
                     // For exp link: σ' = σ'' = σ''' = σ
                     let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
-                    let entry_qd = compute_q_chain_derivs(&eta_t_entry.to_owned(), sigma_e, sigma_e, sigma_e, sigma_e);
+                    let entry_qd = compute_q_chain_derivs(
+                        &eta_t_entry.to_owned(),
+                        sigma_e,
+                        sigma_e,
+                        sigma_e,
+                        sigma_e,
+                    );
                     let d_eta_exit = self.x_log_sigma.matrixvectormultiply(d_beta);
                     let d_eta_entry = x_ls_entry.matrixvectormultiply(d_beta);
-                    let dh_exit = directional_hessian_weights(&d1_q1, &d2_q1, &d3_q1, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls), Some(&exit_qd.d3q_ls), &d_eta_exit);
-                    let dh_entry = directional_hessian_weights(&d1_q0, &d2_q0, &d3_q0, &entry_qd.dq_ls, Some(&entry_qd.d2q_ls), Some(&entry_qd.d3q_ls), &d_eta_entry);
+                    let dh_exit = directional_hessian_weights(
+                        &d1_q1,
+                        &d2_q1,
+                        &d3_q1,
+                        &exit_qd.dq_ls,
+                        Some(&exit_qd.d2q_ls),
+                        Some(&exit_qd.d3q_ls),
+                        &d_eta_exit,
+                    );
+                    let dh_entry = directional_hessian_weights(
+                        &d1_q0,
+                        &d2_q0,
+                        &d3_q0,
+                        &entry_qd.dq_ls,
+                        Some(&entry_qd.d2q_ls),
+                        Some(&entry_qd.d3q_ls),
+                        &d_eta_entry,
+                    );
                     let d_h = xt_diag_x_symmetric(&self.x_log_sigma, &dh_exit)?
                         .add(&xt_diag_x_symmetric(x_ls_entry, &dh_entry)?)?;
                     Ok(Some(d_h.to_dense()))
                 } else {
                     let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
                     let d_eta_ls = self.x_log_sigma.matrixvectormultiply(d_beta);
-                    let dh = directional_hessian_weights(&d1_q, &d2_q, &d3_q, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls), Some(&exit_qd.d3q_ls), &d_eta_ls);
-                    Ok(Some(xt_diag_x_symmetric(&self.x_log_sigma, &dh)?.to_dense()))
+                    let dh = directional_hessian_weights(
+                        &d1_q,
+                        &d2_q,
+                        &d3_q,
+                        &exit_qd.dq_ls,
+                        Some(&exit_qd.d2q_ls),
+                        Some(&exit_qd.d3q_ls),
+                        &d_eta_ls,
+                    );
+                    Ok(Some(
+                        xt_diag_x_symmetric(&self.x_log_sigma, &dh)?.to_dense(),
+                    ))
                 }
             }
             Self::BLOCK_LINK_WIGGLE => {
@@ -5330,7 +5387,7 @@ mod tests {
             Array2::from_shape_fn((n, p_time), |(i, j)| {
                 let t = times[i];
                 if j == 0 {
-                    0.0  // constant term → zero derivative (enables Inf*0=NaN)
+                    0.0 // constant term → zero derivative (enables Inf*0=NaN)
                 } else {
                     let log_t = t.ln();
                     let freq = j as f64 * std::f64::consts::PI / 4.0;
@@ -5410,7 +5467,9 @@ mod tests {
             ),
             Err(err) => {
                 assert!(
-                    err.contains("non-finite") || err.contains("NaN") || err.contains("outer smoothing optimization failed"),
+                    err.contains("non-finite")
+                        || err.contains("NaN")
+                        || err.contains("outer smoothing optimization failed"),
                     "expected non-finite/NaN outer REML error, got: {err}"
                 );
             }
@@ -5525,9 +5584,7 @@ mod tests {
                     "fitted loglik should be finite"
                 );
             }
-            Err(err) => panic!(
-                "expected survival REML to succeed when n >> p, but got: {err}"
-            ),
+            Err(err) => panic!("expected survival REML to succeed when n >> p, but got: {err}"),
         }
     }
 }

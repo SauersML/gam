@@ -4357,13 +4357,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let mut fitted_inverse_link = survival_inverse_link.clone();
         // Optimize link parameters via BFGS for parametric inverse-link families.
         let optimize_link_bfgs = |init: Array1<f64>,
-                                   name: &str,
-                                   mut objective: Box<
+                                  name: &str,
+                                  mut objective: Box<
             dyn FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
         >,
-                                   recover: Box<
-            dyn Fn(&Array1<f64>) -> Option<InverseLink>,
-        >|
+                                  recover: Box<dyn Fn(&Array1<f64>) -> Option<InverseLink>>|
          -> Option<InverseLink> {
             let dim = init.len();
             let mut opt = SmoothingBfgsOptions {
@@ -4396,7 +4394,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     }
                 }
                 Err(err) => {
-                    eprintln!("[survival link opt] {name} optimization failed; using initial params: {err}");
+                    eprintln!(
+                        "[survival link opt] {name} optimization failed; using initial params: {err}"
+                    );
                     None
                 }
             }
@@ -4412,9 +4412,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         initial_log_delta: theta[1],
                     })
                     .map_err(EstimationError::InvalidInput)?;
-                    Ok(fit_survival_location_scale(buildspec(InverseLink::Sas(state), None))
-                        .map_err(EstimationError::InvalidInput)?
-                        .penalizedobjective)
+                    Ok(
+                        fit_survival_location_scale(buildspec(InverseLink::Sas(state), None))
+                            .map_err(EstimationError::InvalidInput)?
+                            .penalizedobjective,
+                    )
                 }),
                 Box::new(|rho| {
                     state_from_sasspec(SasLinkSpec {
@@ -4439,14 +4441,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         initial_log_delta: theta[1],
                     })
                     .map_err(EstimationError::InvalidInput)?;
-                    Ok(
-                        fit_survival_location_scale(buildspec(
-                            InverseLink::BetaLogistic(state),
-                            None,
-                        ))
-                        .map_err(EstimationError::InvalidInput)?
-                        .penalizedobjective,
-                    )
+                    Ok(fit_survival_location_scale(buildspec(
+                        InverseLink::BetaLogistic(state),
+                        None,
+                    ))
+                    .map_err(EstimationError::InvalidInput)?
+                    .penalizedobjective)
                 }),
                 Box::new(|rho| {
                     state_from_beta_logisticspec(SasLinkSpec {
@@ -4476,12 +4476,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     })
                     .map_err(EstimationError::InvalidInput)?;
                     Ok(
-                        fit_survival_location_scale(buildspec(
-                            InverseLink::Mixture(state),
-                            None,
-                        ))
-                        .map_err(EstimationError::InvalidInput)?
-                        .penalizedobjective,
+                        fit_survival_location_scale(buildspec(InverseLink::Mixture(state), None))
+                            .map_err(EstimationError::InvalidInput)?
+                            .penalizedobjective,
                     )
                 }),
                 Box::new(move |rho| {
@@ -4995,6 +4992,72 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         nuts.samples.nrows(),
         nuts.samples.ncols()
     );
+
+    // Print posterior coefficient summary with 95% credible intervals.
+    let n_coeffs = nuts.samples.ncols();
+    println!();
+    println!(
+        "  {:<10} {:>12} {:>12} {:>12} {:>12}",
+        "coeff", "post_mean", "post_std", "ci_2.5%", "ci_97.5%"
+    );
+    println!("  {}", "-".repeat(62));
+    for j in 0..n_coeffs {
+        // Use posterior_mean_of to compute per-coefficient posterior mean from
+        // the MCMC draws (functional API over the sample matrix).
+        let pm = nuts.posterior_mean_of(|row| row[j]);
+        let (lo, hi) = nuts.posterior_interval_of(|row| row[j], 2.5, 97.5);
+        println!(
+            "  {:<10} {:>12.6} {:>12.6} {:>12.6} {:>12.6}",
+            format!("beta_{j}"),
+            pm,
+            nuts.posterior_std[j],
+            lo,
+            hi,
+        );
+    }
+    println!();
+    println!(
+        "  convergence: rhat={:.4}  ess={:.1}  converged={}",
+        nuts.rhat, nuts.ess, nuts.converged
+    );
+
+    // Write per-coefficient posterior summary (mean, std, 95% CI) to CSV.
+    let summary_path = out.with_extension("summary.csv");
+    {
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(true)
+            .from_path(&summary_path)
+            .map_err(|e| {
+                format!(
+                    "failed to create summary csv '{}': {e}",
+                    summary_path.display()
+                )
+            })?;
+        wtr.write_record([
+            "coeff",
+            "posterior_mean",
+            "posterior_std",
+            "ci_2.5",
+            "ci_97.5",
+        ])
+        .map_err(|e| format!("failed to write summary csv header: {e}"))?;
+        for j in 0..n_coeffs {
+            let pm = nuts.posterior_mean_of(|row| row[j]);
+            let (lo, hi) = nuts.posterior_interval_of(|row| row[j], 2.5, 97.5);
+            wtr.write_record(&[
+                format!("beta_{j}"),
+                format!("{pm:.8}"),
+                format!("{:.8}", nuts.posterior_std[j]),
+                format!("{lo:.8}"),
+                format!("{hi:.8}"),
+            ])
+            .map_err(|e| format!("failed to write summary row: {e}"))?;
+        }
+        wtr.flush()
+            .map_err(|e| format!("failed to flush summary csv: {e}"))?;
+    }
+    println!("wrote posterior summary: {}", summary_path.display());
+
     Ok(())
 }
 

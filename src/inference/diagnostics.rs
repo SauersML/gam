@@ -192,32 +192,6 @@ impl fmt::Display for EnvelopeAudit {
     }
 }
 
-/// Result of component-wise finite difference check
-#[derive(Clone, Debug)]
-pub struct ComponentFdResult {
-    /// Component name (e.g., "D_p", "log|H|", "log|S|")
-    pub component: String,
-    /// Analytic gradient value for this component
-    pub analytic: f64,
-    /// Finite difference approximation
-    pub numeric: f64,
-    /// Relative error
-    pub rel_error: f64,
-    /// Whether this component has a significant mismatch
-    pub has_mismatch: bool,
-}
-
-impl fmt::Display for ComponentFdResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let status = if self.has_mismatch { "MISMATCH" } else { "OK" };
-        write!(
-            f,
-            "[{}] {}: analytic={:+.4e}, numeric={:+.4e}, rel_error={:.2e}",
-            status, self.component, self.analytic, self.numeric, self.rel_error
-        )
-    }
-}
-
 /// Result of spectral bleed trace diagnostic
 #[derive(Clone, Debug)]
 pub struct SpectralBleedResult {
@@ -268,8 +242,6 @@ impl fmt::Display for DualRidgeResult {
 pub struct GradientDiagnosticReport {
     /// Envelope theorem audit results
     pub envelopeaudit: Option<EnvelopeAudit>,
-    /// Component-wise FD results for each penalty dimension
-    pub componentfd: Vec<Vec<ComponentFdResult>>,
     /// Spectral bleed results for each penalty
     pub spectral_bleed: Vec<SpectralBleedResult>,
     /// Dual-ridge consistency result
@@ -291,10 +263,9 @@ impl GradientDiagnosticReport {
     /// Check if any diagnostics detected issues
     pub fn has_issues(&self) -> bool {
         let envelope_issue = self.envelopeaudit.as_ref().is_some_and(|a| a.isviolated);
-        let component_issue = self.componentfd.iter().flatten().any(|c| c.has_mismatch);
         let bleed_issue = self.spectral_bleed.iter().any(|s| s.has_bleed);
         let ridge_issue = self.dualridge.as_ref().is_some_and(|r| r.has_mismatch);
-        envelope_issue || component_issue || bleed_issue || ridge_issue
+        envelope_issue || bleed_issue || ridge_issue
     }
 
     /// Generate a summary string of all issues found
@@ -305,14 +276,6 @@ impl GradientDiagnosticReport {
             && audit.isviolated
         {
             lines.push(format!("[DIAG] {}", audit));
-        }
-
-        for (k, components) in self.componentfd.iter().enumerate() {
-            for comp in components {
-                if comp.has_mismatch {
-                    lines.push(format!("[DIAG] ρ[{}] {}", k, comp));
-                }
-            }
         }
 
         for bleed in &self.spectral_bleed {
@@ -410,97 +373,6 @@ pub fn compute_envelopeaudit(
         isviolated,
         message,
     }
-}
-
-// =============================================================================
-// Strategy 2: Component-wise Finite Difference
-// =============================================================================
-
-/// Result of evaluating each cost component at a given rho
-#[derive(Clone, Debug)]
-pub struct CostComponents {
-    /// Penalized deviance: D_p = -2*loglik + β'S_λ β
-    pub penalized_deviance: f64,
-    /// Log-determinant of Hessian: log|H|
-    pub log_det_h: f64,
-    /// Log-determinant of penalty (pseudo): log|S_λ|_+
-    pub log_det_s: f64,
-    /// Total LAML cost
-    pub total: f64,
-    /// Optional Firth log-det contribution
-    pub firth_log_det: Option<f64>,
-}
-
-/// Compute component-wise gradient comparison between analytic and FD.
-///
-/// This breaks down the LAML objective into:
-/// 1. Penalized deviance term: D_p/(2φ) → gradient includes dD_p/dρ_k
-/// 2. Hessian log-det term: 0.5 log|H| → gradient includes 0.5 tr(H⁻¹ dH/dρ_k)
-/// 3. Penalty log-det term: -0.5 log|S_λ|_+ → gradient includes -0.5 det1[k]
-///
-/// By checking each component separately, we can isolate which term is wrong.
-pub fn compute_componentfd(
-    components_plus: &CostComponents,
-    components_minus: &CostComponents,
-    analytic_dpgrad: f64,
-    analytic_loghgrad: f64,
-    analytic_logsgrad: f64,
-    h: f64,
-    rel_threshold: f64,
-) -> Vec<ComponentFdResult> {
-    let mut results = Vec::with_capacity(4);
-
-    // D_p component
-    let numeric_dp =
-        (components_plus.penalized_deviance - components_minus.penalized_deviance) / (2.0 * h);
-    let dp_denom = analytic_dpgrad.abs().max(numeric_dp.abs()).max(1e-8);
-    let dp_rel = (analytic_dpgrad - numeric_dp).abs() / dp_denom;
-    results.push(ComponentFdResult {
-        component: "D_p (penalized deviance)".to_string(),
-        analytic: analytic_dpgrad,
-        numeric: numeric_dp,
-        rel_error: dp_rel,
-        has_mismatch: dp_rel > rel_threshold,
-    });
-
-    // log|H| component
-    let numeric_logh = (components_plus.log_det_h - components_minus.log_det_h) / (2.0 * h);
-    let logh_denom = analytic_loghgrad.abs().max(numeric_logh.abs()).max(1e-8);
-    let logh_rel = (analytic_loghgrad - numeric_logh).abs() / logh_denom;
-    results.push(ComponentFdResult {
-        component: "log|H| (Hessian)".to_string(),
-        analytic: analytic_loghgrad,
-        numeric: numeric_logh,
-        rel_error: logh_rel,
-        has_mismatch: logh_rel > rel_threshold,
-    });
-
-    // log|S| component
-    let numeric_logs = (components_plus.log_det_s - components_minus.log_det_s) / (2.0 * h);
-    let logs_denom = analytic_logsgrad.abs().max(numeric_logs.abs()).max(1e-8);
-    let logs_rel = (analytic_logsgrad - numeric_logs).abs() / logs_denom;
-    results.push(ComponentFdResult {
-        component: "log|S|_+ (penalty)".to_string(),
-        analytic: analytic_logsgrad,
-        numeric: numeric_logs,
-        rel_error: logs_rel,
-        has_mismatch: logs_rel > rel_threshold,
-    });
-
-    // Total
-    let analytic_total = analytic_dpgrad + analytic_loghgrad + analytic_logsgrad;
-    let numeric_total = (components_plus.total - components_minus.total) / (2.0 * h);
-    let total_denom = analytic_total.abs().max(numeric_total.abs()).max(1e-8);
-    let total_rel = (analytic_total - numeric_total).abs() / total_denom;
-    results.push(ComponentFdResult {
-        component: "Total LAML".to_string(),
-        analytic: analytic_total,
-        numeric: numeric_total,
-        rel_error: total_rel,
-        has_mismatch: total_rel > rel_threshold,
-    });
-
-    results
 }
 
 // =============================================================================
@@ -718,27 +590,6 @@ pub fn compute_dualridge_check(
 ///
 /// If (grad(ρ+ε) + grad(ρ))/2 ≈ FD_slope but grad(ρ) alone doesn't, there's a
 /// bias term that doesn't cancel—often a sign of missing terms in the derivative.
-pub fn gradient_perturbation_consistency(
-    grad_at_rho: &Array1<f64>,
-    grad_at_rho_plus: &Array1<f64>,
-    fd_slope: &Array1<f64>,
-    rel_threshold: f64,
-) -> (bool, f64, f64) {
-    // Average gradient
-    let avggrad = (grad_at_rho + grad_at_rho_plus).mapv(|v| v / 2.0);
-
-    // Check if average matches FD better than the gradient at rho
-    let diff_avg = &avggrad - fd_slope;
-    let diff_rho = grad_at_rho - fd_slope;
-
-    let rel_error_avg = diff_avg.dot(&diff_avg).sqrt() / fd_slope.dot(fd_slope).sqrt().max(1e-8);
-    let rel_error_rho = diff_rho.dot(&diff_rho).sqrt() / fd_slope.dot(fd_slope).sqrt().max(1e-8);
-
-    let has_bias = rel_error_avg < rel_error_rho * 0.5 && rel_error_rho > rel_threshold;
-
-    (has_bias, rel_error_avg, rel_error_rho)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
