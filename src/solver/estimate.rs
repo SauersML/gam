@@ -1568,23 +1568,75 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        let pure_smoothing_options = smoothing_options.clone();
-        let outer_result =
-            crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient_andhessian(
-                k,
-                heuristic_lambdas,
-                |rho: &Array1<f64>| {
-                    outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                    // Do NOT clear warm start: the PIRLS cache auto-updates beta after each
-                    // successful solve. Keeping the warm start lets nearby rho evaluations
-                    // (e.g. FD perturbations) converge in far fewer inner iterations.
-                    let cost = reml_state.compute_cost(rho)?;
-                    let grad = reml_state.compute_gradient(rho)?;
-                    let hessian = reml_state.compute_lamlhessian_consistent(rho).ok();
-                    Ok((cost, grad, hessian))
-                },
-                &pure_smoothing_options,
-            )?;
+        use crate::solver::strategy::{
+            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+        };
+
+        let outer_config = OuterConfig {
+            tolerance: smoothing_options.tol,
+            max_iter: smoothing_options.max_iter,
+            fd_step: smoothing_options.finite_diff_step,
+            seed_config: smoothing_options.seed_config.clone(),
+            rho_bound: crate::estimate::RHO_BOUND,
+            heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
+            initial_rho: None,
+        };
+
+        let mut obj = ClosureObjective {
+            state: &mut reml_state,
+            cap: OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: Derivative::Analytic,
+                n_params: k,
+            },
+            cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+                use self::reml::unified::EvalMode;
+                let result = state.evaluate_via_unified(rho, EvalMode::ValueOnly)?;
+                Ok(result.cost)
+            },
+            eval_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+                outer_eval_idx.fetch_add(1, Ordering::Relaxed);
+                // Unified REML/LAML evaluator: cost and gradient are computed
+                // from the SAME HessianOperator in a single function call,
+                // guaranteeing spectral consistency between cost and gradient.
+                use self::reml::unified::EvalMode;
+                let result = state.evaluate_via_unified(
+                    rho,
+                    EvalMode::ValueAndGradient,
+                )?;
+                let cost = result.cost;
+                let grad = result.gradient.ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "unified evaluator returned no gradient".to_string(),
+                    )
+                })?;
+                // Hessian: use existing specialized strategies (sparse exact,
+                // analytic fallback) which have their own complex logic. The
+                // unified evaluator handles cost+gradient coherency; the Hessian
+                // is a separate concern with different accuracy trade-offs.
+                let hessian = state.compute_lamlhessian_consistent(rho).ok();
+                Ok(OuterEval {
+                    cost,
+                    gradient: grad,
+                    hessian: match hessian {
+                        Some(h) => HessianResult::Analytic(h),
+                        None => HessianResult::Unavailable,
+                    },
+                })
+            },
+            reset_fn: |state: &mut &mut self::reml::RemlState<'_>| {
+                // No-op: PIRLS cache auto-manages warm start.
+                // State is accessed to satisfy the borrow checker.
+                let _ = state.x();
+            },
+        };
+
+        let strategy_result = crate::solver::strategy::run_outer(
+            &mut obj,
+            &outer_config,
+            "standard REML",
+        )?;
+        let outer_result = strategy_result.into_smoothing_result();
         (
             outer_result.rho.clone(),
             cfg.link_kind.mixture_state().cloned(),

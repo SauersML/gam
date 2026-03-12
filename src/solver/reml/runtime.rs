@@ -2116,28 +2116,23 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
 
         // Determine if Gaussian identity (profiled scale) or GLM (fixed phi).
-        let is_gaussian_identity = self.config.is_gaussian_identity;
-        let n_observations = self.config.n;
+        let is_gaussian_identity =
+            matches!(self.config.link_function(), LinkFunction::Identity);
+        let n_observations = self.y.len();
 
-        // TK correction from the current bundle (if applicable).
-        let tk_correction = if self.config.use_tierney_kadane {
-            bundle.tk_correction.unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
-        let config = PirlsConversionConfig {
+        let conversion_config = PirlsConversionConfig {
             n_observations,
             is_gaussian_identity,
-            fixed_dispersion: self.config.dispersion.unwrap_or(1.0),
-            tk_correction,
+            fixed_dispersion: 1.0,
+            tk_correction: 0.0,
             tk_gradient: None,
-            nullspace_dims: self.config.nullspace_dims.clone(),
+            nullspace_dims: self.nullspace_dims.clone(),
             penalty_logdet_ridge: bundle.ridge_passport.delta,
         };
 
-        let inner_solution = pirls_result_to_inner_solution(pirls_result, &config)
-            .map_err(|e| EstimationError::InvalidInput(e))?;
+        let inner_solution =
+            pirls_result_to_inner_solution(pirls_result, &conversion_config)
+                .map_err(|e| EstimationError::InvalidInput(e))?;
 
         reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, None)
             .map_err(|e| EstimationError::InvalidInput(e))

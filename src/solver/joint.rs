@@ -33,16 +33,15 @@ use crate::faer_ndarray::{
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
-use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
-use crate::solver::opt_objective::CachedSecondOrderObjective;
+use crate::seeding::{SeedConfig, SeedRiskProfile};
+use crate::solver::strategy::{
+    ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+};
 use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
-};
 
 // NOTE on z standardization:
 // We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
@@ -1511,14 +1510,24 @@ impl<'a> JointRemlState<'a> {
         self.eval.cached_beta_base = state.beta_base.clone();
         self.eval.cached_beta_link = state.beta_link.clone();
 
-        // Compute LAML = deviance + log|H_pen| - log|S_λ|
-        let (laml, edf) = Self::compute_laml_at_convergence(
+        // Unified REML/LAML evaluator: build InnerSolution and compute cost
+        // through the single formula that guarantees cost/gradient coherency.
+        use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
+        let (inner_solution, edf) = Self::build_inner_solution_at_convergence(
             state,
+            rho.as_slice().unwrap(),
             &lambda_base,
             lambda_link,
             self.core.base_reparam_invariant.as_ref(),
             &self.core.base_rs_list,
-        );
+        )?;
+        let unified_result = reml_laml_evaluate(
+            &inner_solution,
+            rho.as_slice().unwrap(),
+            EvalMode::ValueOnly,
+            None,
+        ).map_err(|e| EstimationError::InvalidInput(e))?;
+        let laml = -unified_result.cost; // unified returns cost to minimize; LAML is negated
 
         // Cache for gradient
         self.eval.cached_laml = Some(laml);
@@ -1839,6 +1848,310 @@ impl<'a> JointRemlState<'a> {
         );
 
         (laml, edf)
+    }
+
+    /// Build an InnerSolution from the converged joint state for the unified
+    /// REML/LAML evaluator. This replaces compute_laml_at_convergence for cost
+    /// and compute_gradient_analytic for gradient — both are now computed by
+    /// the single reml_laml_evaluate function.
+    fn build_inner_solution_at_convergence(
+        state: &JointModelState,
+        rho: &[f64],
+        lambda_base: &Array1<f64>,
+        lambda_link: f64,
+        base_reparam_invariant: Option<&ReparamInvariant>,
+        base_rs_list: &[Array2<f64>],
+    ) -> Result<
+        (
+            crate::estimate::reml::unified::InnerSolution,
+            Option<f64>,
+        ),
+        EstimationError,
+    > {
+        use crate::faer_ndarray::FaerEigh;
+        use crate::estimate::reml::unified::{
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives,
+            BlockCoupledDerivativeProvider, InnerSolution, PenaltyLogdetDerivs,
+        };
+        use crate::types::{RidgePassport, RidgePolicy, RidgeMatrixForm, RidgeDeterminantMode};
+        use faer::Side;
+
+        let n = state.nobs();
+        let u = state.base_linear_predictor();
+        let bwiggle = state.build_link_basis_from_state(&u);
+        let eta = state.compute_eta_full(&u, &bwiggle);
+
+        // Compute mu/weights at convergence (same as compute_laml_at_convergence).
+        let mut mu = Array1::<f64>::zeros(n);
+        let mut weights = Array1::<f64>::zeros(n);
+        let mut third_deriv_weights = Array1::<f64>::zeros(n);
+        let is_gaussian = matches!(state.link, LinkFunction::Identity);
+
+        match state.link {
+            LinkFunction::Identity => {
+                for i in 0..n {
+                    mu[i] = eta[i];
+                    weights[i] = state.weights[i];
+                }
+            }
+            _ => {
+                const MIN_WEIGHT: f64 = 1e-12;
+                const MIN_DMU: f64 = 1e-6;
+                let family = match state.link {
+                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+                    LinkFunction::Identity => unreachable!(),
+                };
+                let strategy = strategy_for_family(family, None);
+                for i in 0..n {
+                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
+                    let moments = strategy
+                        .integrated_moments(&state.quadctx, eta[i], se_i)
+                        .expect("binomial family moments must be available");
+                    let dmu = moments.d1.abs().max(MIN_DMU);
+                    mu[i] = moments.mean;
+                    let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
+                    weights[i] = state.weights[i] * w;
+                    // Third derivative for GLM gradient correction.
+                    // For binomial logit: d³(-ℓ)/dη³ = μ(1-μ)(1-2μ)
+                    if matches!(state.link, LinkFunction::Logit) {
+                        let p = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                        third_deriv_weights[i] = state.weights[i] * p * (1.0 - p) * (1.0 - 2.0 * p);
+                    }
+                }
+            }
+        }
+        let deviance = state.compute_deviance(&mu);
+
+        // Build joint Hessian H = J'WJ + S_λ.
+        let p_base = state.x_base.ncols();
+        let p_link = bwiggle.ncols();
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let p_total = coef_layout.p_total();
+
+        let (g_prime, _, _) = compute_link_derivative_terms_from_state(state, &u);
+        let j_mat = state.build_joint_jacobian(&bwiggle, &g_prime);
+        let penalty_full = state.build_joint_penalty(lambda_base, lambda_link, p_link);
+        let link_penalty = state.build_link_penalty();
+
+        let mut jweighted = j_mat.clone();
+        let sqrtw = weights.mapv(|wi| wi.max(0.0).sqrt());
+        ndarray::Zip::from(jweighted.rows_mut())
+            .and(sqrtw.view())
+            .for_each(|mut row, wi| row *= *wi);
+        let mut h_full = crate::faer_ndarray::fast_ata(&jweighted);
+        if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
+            h_full += &penalty_full;
+        }
+
+        // Build HessianOperator from joint Hessian.
+        let hessian_op = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_full)
+                .map_err(|e| EstimationError::InvalidInput(
+                    format!("Joint HessianOperator failed: {e}"),
+                ))?,
+        );
+
+        // Penalty logdet via reparameterization (base) + eigendecomposition (link).
+        let base_reparam = if let Some(invariant) = base_reparam_invariant {
+            stable_reparameterizationwith_invariant_engine(
+                base_rs_list,
+                &lambda_base.to_vec(),
+                EngineDims::new(state.layout_base.p, base_rs_list.len()),
+                invariant,
+            )
+        } else {
+            stable_reparameterization_engine(
+                base_rs_list,
+                &lambda_base.to_vec(),
+                EngineDims::new(state.layout_base.p, base_rs_list.len()),
+            )
+        }
+        .map_err(|e| EstimationError::InvalidInput(format!("Reparam failed: {e}")))?;
+
+        let base_rank = base_reparam.e_transformed.nrows();
+        let base_log_det_s = Self::fixed_subspace_logdet_for_penalty(
+            &base_reparam.s_transformed,
+            base_rank,
+            state.ridge_base_used,
+        )?;
+
+        let (link_log_det_s, link_rank) = if p_link > 0 {
+            let rank = Self::structural_rank_from_penalty(&link_penalty)?;
+            let s_link_lambda = link_penalty.mapv(|v| v * lambda_link);
+            let log_det = Self::fixed_subspace_logdet_for_penalty(
+                &s_link_lambda,
+                rank,
+                state.ridge_link_used,
+            )?;
+            (log_det, rank)
+        } else {
+            (0.0, 0)
+        };
+
+        let log_det_s = base_log_det_s + link_log_det_s;
+        let mp = (p_base - base_rank) as f64 + (p_link - link_rank) as f64;
+
+        // Penalty logdet first derivatives.
+        // Base derivatives from reparameterization; link derivative computed directly.
+        let k = rho.len();
+        let n_base_penalties = lambda_base.len();
+        let mut det1 = Array1::zeros(k);
+        for idx in 0..n_base_penalties.min(k) {
+            det1[idx] = base_reparam.det1[idx];
+        }
+        // Link penalty derivative: d/dρ_link log|λ_link S_link|₊ = link_rank
+        // (because log|λ S|₊ = rank * log(λ) + log|S|₊, and d/dρ = rank * dλ/dρ / λ = rank)
+        if k > n_base_penalties {
+            det1[n_base_penalties] = link_rank as f64;
+        }
+
+        // Penalty quadratic + ridge (same as compute_laml_at_convergence).
+        let mut penalty_quadratic = 0.0;
+        for (idx, s_k) in state.s_base.iter().enumerate() {
+            let lk = lambda_base.get(idx).cloned().unwrap_or(0.0);
+            if lk > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
+                let sb = s_k.dot(&state.beta_base);
+                penalty_quadratic += lk * state.beta_base.dot(&sb);
+            }
+        }
+        if p_link > 0 && link_penalty.nrows() == p_link && state.beta_link.len() == p_link {
+            let sb = link_penalty.dot(&state.beta_link);
+            penalty_quadratic += lambda_link * state.beta_link.dot(&sb);
+        }
+        if state.ridge_base_used > 0.0 {
+            penalty_quadratic += state.ridge_base_used * state.beta_base.dot(&state.beta_base);
+        }
+        if p_link > 0 && state.beta_link.len() == p_link && state.ridge_link_used > 0.0 {
+            penalty_quadratic += state.ridge_link_used * state.beta_link.dot(&state.beta_link);
+        }
+
+        // Build penalty roots in the JOINT basis.
+        // Each base penalty Sₖ lives in [0..p_base, 0..p_base] of the joint space.
+        // The link penalty lives in [p_base..p_total, p_base..p_total].
+        let mut penalty_roots: Vec<Array2<f64>> = Vec::with_capacity(k);
+        for rs in base_rs_list.iter() {
+            // Embed base penalty root into joint space: [R_k | 0]
+            let rank_k = rs.nrows();
+            let mut joint_root = Array2::zeros((rank_k, p_total));
+            joint_root
+                .slice_mut(ndarray::s![.., ..p_base])
+                .assign(rs);
+            penalty_roots.push(joint_root);
+        }
+        // Link penalty root (if present).
+        if p_link > 0 && k > n_base_penalties {
+            // Simple Cholesky-like root of link penalty.
+            match link_penalty.eigh(Side::Lower) {
+                Ok((eigs, vecs)) => {
+                    let tol = 1e-12;
+                    let mut rank_entries = Vec::new();
+                    for j in 0..eigs.len() {
+                        if eigs[j] > tol {
+                            rank_entries.push(j);
+                        }
+                    }
+                    let rank_k = rank_entries.len();
+                    let mut link_root = Array2::zeros((rank_k, p_total));
+                    for (row, &j) in rank_entries.iter().enumerate() {
+                        let scale = eigs[j].sqrt();
+                        for col in 0..p_link {
+                            link_root[[row, p_base + col]] = scale * vecs[[col, j]];
+                        }
+                    }
+                    penalty_roots.push(link_root);
+                }
+                Err(_) => {
+                    // Fallback: identity-like root
+                    let mut link_root = Array2::zeros((p_link, p_total));
+                    for j in 0..p_link {
+                        link_root[[j, p_base + j]] = 1.0;
+                    }
+                    penalty_roots.push(link_root);
+                }
+            }
+        }
+
+        // Concatenated beta.
+        let mut beta = Array1::zeros(p_total);
+        beta.slice_mut(ndarray::s![..p_base])
+            .assign(&state.beta_base);
+        if p_link > 0 {
+            beta.slice_mut(ndarray::s![p_base..p_total])
+                .assign(&state.beta_link);
+        }
+
+        // Log-likelihood: for GLM, ll = -0.5 * deviance. For Gaussian, same.
+        let log_likelihood = -0.5 * deviance;
+
+        // Derivative provider.
+        let deriv_provider: Box<dyn crate::estimate::reml::unified::HessianDerivativeProvider> =
+            if is_gaussian {
+                Box::new(GaussianDerivatives)
+            } else {
+                Box::new(BlockCoupledDerivativeProvider {
+                    joint_design: j_mat,
+                    third_deriv_weights,
+                    fourth_deriv_weights: None,
+                })
+            };
+
+        // Ridge passport.
+        let ridge_delta = state.ridge_base_used.max(state.ridge_link_used);
+        let ridge_passport = RidgePassport {
+            delta: ridge_delta,
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            policy: RidgePolicy {
+                rho_independent: true,
+                include_quadratic_penalty: ridge_delta > 0.0,
+                include_penalty_logdet: false,
+                include_laplacehessian: false,
+                determinant_mode: RidgeDeterminantMode::Auto,
+            },
+        };
+
+        let dispersion = if is_gaussian {
+            DispersionHandling::ProfiledGaussian
+        } else {
+            DispersionHandling::Fixed { phi: 1.0 }
+        };
+
+        let inner_solution = InnerSolution {
+            log_likelihood,
+            penalty_quadratic,
+            ridge_passport,
+            hessian_op,
+            beta,
+            penalty_roots,
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: log_det_s,
+                first: det1,
+                second: None,
+            },
+            deriv_provider,
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth_logdet: 0.0,
+            firth_gradient: None,
+            n_observations: n,
+            nullspace_dim: mp,
+            dispersion,
+        };
+
+        // Compute EDF for diagnostics.
+        let edf = Self::compute_joint_edf(
+            state,
+            &bwiggle,
+            &g_prime,
+            &weights,
+            lambda_base,
+            lambda_link,
+        );
+
+        Ok((inner_solution, edf))
     }
 
     fn compute_joint_edf(
@@ -3008,118 +3321,96 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             .map(|knots| baseline_lambda_seed(knots, state.degree, 2))
     };
     let heuristic_lambdas = heuristic_lambda.map(|lambda| vec![lambda; n_base + 1]);
-    let seed_config = SeedConfig {
-        bounds: (-12.0, 12.0),
-        max_seeds: if n_base < 4 { 12 } else { 16 },
-        screening_budget: if n_base < 2 {
-            2
-        } else if n_base < 6 {
-            3
-        } else {
-            4
-        },
-        screen_max_inner_iterations: 5,
-        risk_profile: seed_risk_profile_for_joint_link(link),
-        num_auxiliary_trailing: 0,
-    };
-    let seed_candidates =
-        generate_rho_candidates(n_base + 1, heuristic_lambdas.as_deref(), &seed_config);
-    // Bounded ρ optimization.
-    const RHO_BOUND: f64 = 30.0;
-
-    let mut candidate_plans: Vec<(String, Array1<f64>)> = if seed_candidates.is_empty() {
-        vec![("fallback-symmetric".to_string(), Array1::zeros(n_base + 1))]
-    } else {
-        seed_candidates
-            .into_iter()
-            .enumerate()
-            .map(|(i, rho)| (format!("seed_{i}"), rho))
-            .collect()
-    };
-
-    let mut successful_runs: Vec<(String, Array1<f64>, f64)> = Vec::new();
-    let mut last_error: Option<EstimationError> = None;
-    let total_candidates = candidate_plans.len();
-    let mut candidate_idx = 0usize;
+    let n_params = n_base + 1;
     let snapshot = JointRemlSnapshot::new(&reml_state);
-    reml_state
-        .visualizer
-        .start_workflow("Candidates", total_candidates.max(1));
-
-    for (label, rho) in candidate_plans.drain(..) {
-        candidate_idx += 1;
-        reml_state
-            .visualizer
-            .set_stage("joint", &format!("candidate {label}"));
-        reml_state.visualizer.advance_workflow(candidate_idx);
-
-        snapshot.restore(&mut reml_state);
-        let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
-        let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
-        let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-        let objective = CachedSecondOrderObjective::new(
-            |rho: &Array1<f64>| {
-                let (cost, grad) = match (
-                    reml_state.compute_cost(rho),
-                    reml_state.compute_gradient(rho),
-                ) {
-                    (Ok(cost), Ok(grad))
-                        if cost.is_finite() && grad.iter().all(|v| v.is_finite()) =>
-                    {
-                        (cost, grad)
-                    }
-                    _ => {
-                        return Err(ObjectiveEvalError::recoverable(
-                            "joint outer objective/gradient evaluation failed",
-                        ));
-                    }
-                };
-                last_eval = Some((rho.clone(), cost, grad.clone()));
-                Ok((cost, grad, None))
+    let outer_config = OuterConfig {
+        tolerance: config.reml_tol,
+        max_iter: config.max_reml_iter,
+        fd_step: 1e-4,
+        seed_config: SeedConfig {
+            bounds: (-12.0, 12.0),
+            max_seeds: if n_base < 4 { 12 } else { 16 },
+            screening_budget: if n_base < 2 {
+                2
+            } else if n_base < 6 {
+                3
+            } else {
+                4
             },
-            1e-4,
-        );
-        let mut solver = NewtonTrustRegion::new(rho, objective)
-            .with_bounds(Bounds::new(lower, upper, 1e-6).expect("joint rho bounds must be valid"))
-            .with_tolerance(Tolerance::new(config.reml_tol).expect("joint tolerance must be valid"))
-            .with_max_iterations(
-                MaxIterations::new(config.max_reml_iter)
-                    .expect("joint max iterations must be valid"),
-            );
+            screen_max_inner_iterations: 5,
+            risk_profile: seed_risk_profile_for_joint_link(link),
+            num_auxiliary_trailing: 0,
+        },
+        rho_bound: 30.0,
+        heuristic_lambdas: heuristic_lambdas,
+        initial_rho: None,
+    };
 
-        let solution = match solver.run() {
-            Ok(solution) => solution,
-            Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(e) => {
-                last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                    "trust-region solve failed for joint model: {e:?}"
-                )));
-                continue;
+    let mut obj = ClosureObjective {
+        state: reml_state,
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params,
+        },
+        cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
+            state.compute_cost(rho)
+        },
+        eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
+            // Unified REML/LAML: cost and gradient from the SAME InnerSolution.
+            // compute_cost runs the inner solver and caches the converged state.
+            // Then we rebuild the InnerSolution to get the gradient.
+            let cost = state.compute_cost(rho)?;
+
+            // Build InnerSolution for the gradient.
+            use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
+            let jstate = &state.core.state;
+            let penalty_layout = JointPenaltyLayout::for_state(jstate);
+            let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
+            let (inner_sol, ..) = JointRemlState::build_inner_solution_at_convergence(
+                jstate,
+                rho.as_slice().unwrap(),
+                &lambda_base,
+                lambda_link,
+                state.core.base_reparam_invariant.as_ref(),
+                &state.core.base_rs_list,
+            )?;
+            let result = reml_laml_evaluate(
+                &inner_sol,
+                rho.as_slice().unwrap(),
+                EvalMode::ValueAndGradient,
+                None,
+            ).map_err(|e| EstimationError::InvalidInput(e))?;
+            let grad = result.gradient.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "unified evaluator returned no gradient".to_string(),
+                )
+            })?;
+
+            Ok(OuterEval {
+                cost,
+                gradient: grad,
+                hessian: HessianResult::Unavailable,
+            })
+        },
+        reset_fn: {
+            let snap = snapshot;
+            move |state: &mut JointRemlState<'_>| {
+                snap.restore(state);
             }
-        };
-        let final_value = solution.final_value;
-        successful_runs.push((label, solution.final_point.clone(), final_value));
-    }
+        },
+    };
 
-    let (_, best_rho, _) =
-        match successful_runs
-            .into_iter()
-            .min_by(|a, b| match a.2.partial_cmp(&b.2) {
-                Some(order) => order,
-                None => std::cmp::Ordering::Equal,
-            }) {
-            Some(best) => best,
-            None => {
-                return Err(last_error.unwrap_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(
-                        "All joint REML candidate runs failed.".to_string(),
-                    )
-                }));
-            }
-        };
+    let result = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "joint flexible link",
+    )?;
 
-    let _ = reml_state.compute_cost(&best_rho)?;
-    Ok(reml_state.into_result(include_base_covariance))
+    // Extract state from the objective wrapper to finalize.
+    let ClosureObjective { mut state, .. } = obj;
+    state.compute_cost(&result.rho)?;
+    Ok(state.into_result(include_base_covariance))
 }
 
 /// Prediction result from joint model

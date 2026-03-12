@@ -5,15 +5,11 @@ use crate::linalg::utils::{
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2, s};
-use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
-};
 use thiserror::Error;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
@@ -2617,18 +2613,20 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     //       + 0.5*tr(J_trace^{-1}(A_k + D H[u_k]))
     //       - 0.5*tr(P_trace,+^{-1} A_k),
     // with A_k=dS_lambda/drho_k and u_k=d beta^/drho_k.
-    let objective = -inner.log_likelihood
-        + inner.penalty_value
-        + if include_logdet_h {
-            0.5 * inner.block_logdet_h
-        } else {
-            0.0
+    //
+    // Unified REML/LAML cost: uses the same formula as all other paths.
+    // The objective is computed from the inner result's pre-computed logdet
+    // values. For families with include_logdet_h = false, the objective
+    // reduces to MaxPenalizedLikelihood (no logdet terms).
+    let objective = {
+        let base_cost = -inner.log_likelihood + inner.penalty_value;
+        match (include_logdet_h, include_logdet_s) {
+            (true, true) => base_cost + 0.5 * inner.block_logdet_h - 0.5 * inner.block_logdet_s,
+            (true, false) => base_cost + 0.5 * inner.block_logdet_h,
+            (false, true) => base_cost - 0.5 * inner.block_logdet_s,
+            (false, false) => base_cost,
         }
-        - if include_logdet_s {
-            0.5 * inner.block_logdet_s
-        } else {
-            0.0
-        };
+    };
     let mut grad = Array1::<f64>::zeros(rho.len());
     let mut outer_hessian: Option<Array2<f64>> = None;
 
@@ -5292,219 +5290,262 @@ pub fn fit_custom_family<F: CustomFamily>(
         });
     }
 
-    let warm_cache = std::sync::Mutex::new(None::<ConstrainedWarmStart>);
-    let last_outer_error = std::sync::Mutex::new(None::<String>);
-    let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
-    let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let objective = CachedSecondOrderObjective::new(
-        |x: &Array1<f64>| {
-            let cached = warm_cache.lock().ok().and_then(|g| g.clone());
-            let warm_start = if include_exact_newton_logdet_h(family) {
+    use crate::estimate::EstimationError;
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+    };
+
+    // Mutable bookkeeping for the outer optimization loop. These fields were
+    // previously behind Mutex (required by Fn closures in
+    // CachedSecondOrderObjective) but ClosureObjective uses FnMut, so plain
+    // fields suffice.
+    struct CustomOuterState {
+        warm_cache: Option<ConstrainedWarmStart>,
+        last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)>,
+        last_error: Option<String>,
+    }
+
+    let has_exact_hess = include_exact_newton_logdet_h(family);
+    let n_rho = rho0.len();
+
+    let outer_max_iter = if has_exact_hess {
+        options.outer_max_iter.min(3).max(1)
+    } else {
+        options.outer_max_iter
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: options.outer_tol,
+        max_iter: outer_max_iter,
+        fd_step: 1e-4,
+        seed_config: crate::seeding::SeedConfig::default(),
+        rho_bound: 30.0,
+        heuristic_lambdas: None,
+        initial_rho: Some(rho0.clone()),
+    };
+
+    let hessian_deriv = if has_exact_hess {
+        Derivative::Analytic
+    } else {
+        Derivative::Unavailable
+    };
+
+    let mut obj = ClosureObjective {
+        state: CustomOuterState {
+            warm_cache: None,
+            last_eval: None,
+            last_error: None,
+        },
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: hessian_deriv,
+            n_params: n_rho,
+        },
+        cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
+            let warm_ref = if has_exact_hess {
+                None
+            } else {
+                outer.warm_cache.as_ref()
+            };
+            match outerobjectivegradienthessian(
+                family, specs, options, &penalty_counts, rho, warm_ref, false,
+            ) {
+                Ok((cost, _, _, warm)) => {
+                    outer.warm_cache = Some(warm);
+                    Ok(cost)
+                }
+                Err(e) => Err(EstimationError::RemlOptimizationFailed(e)),
+            }
+        },
+        eval_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
+            let cached = outer.warm_cache.clone();
+            let warm_ref = if has_exact_hess {
                 None
             } else {
                 cached.as_ref()
             };
-            let (obj, grad, hess_opt) = match outerobjectivegradienthessian(
-                family,
-                specs,
-                options,
-                &penalty_counts,
-                x,
-                warm_start,
-                true,
+            let (cost, grad, hess_opt) = match outerobjectivegradienthessian(
+                family, specs, options, &penalty_counts, rho, warm_ref, true,
             ) {
-                Ok((obj, grad, hess_opt, warm))
-                    if obj.is_finite()
+                Ok((cost, grad, hess_opt, warm))
+                    if cost.is_finite()
                         && grad.iter().all(|v| v.is_finite())
                         && hess_opt
                             .as_ref()
                             .map(|h| h.iter().all(|v| v.is_finite()))
                             .unwrap_or(true) =>
                 {
-                    if let Ok(mut guard) = warm_cache.lock() {
-                        let seed_ok = cached
-                            .as_ref()
-                            .map(|c| {
-                                c.rho.len() == x.len()
-                                    && c.rho
-                                        .iter()
-                                        .zip(x.iter())
-                                        .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                            })
-                            .unwrap_or(true);
-                        if seed_ok {
-                            *guard = Some(warm);
-                        } else {
-                            *guard = None;
-                        }
+                    // Warm-start proximity check: discard warm cache if rho
+                    // jumped too far from the cached point.
+                    let seed_ok = cached
+                        .as_ref()
+                        .map(|c| {
+                            c.rho.len() == rho.len()
+                                && c.rho
+                                    .iter()
+                                    .zip(rho.iter())
+                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                        })
+                        .unwrap_or(true);
+                    if seed_ok {
+                        outer.warm_cache = Some(warm);
+                    } else {
+                        outer.warm_cache = None;
                     }
-                    if let Ok(mut guard) = last_outer_error.lock() {
-                        *guard = None;
-                    }
-                    (obj, grad, hess_opt)
+                    outer.last_error = None;
+                    (cost, grad, hess_opt)
                 }
                 Ok((_, _, _, _)) => {
-                    if let Ok(mut guard) = last_outer_error.lock() {
-                        *guard = Some(
-                            "custom-family outer objective/derivatives became non-finite"
-                                .to_string(),
-                        );
+                    outer.last_error = Some(
+                        "custom-family outer objective/derivatives became non-finite".to_string(),
+                    );
+                    // For exact-Newton families, reuse the last good eval to
+                    // give the optimizer a safe fallback value.
+                    if has_exact_hess {
+                        if let Some((ref xp, cp, ref gp, ref hp)) = outer.last_eval {
+                            if xp.len() == rho.len() {
+                                let hess = match hp {
+                                    Some(h) => HessianResult::Analytic(h.clone()),
+                                    None => HessianResult::Unavailable,
+                                };
+                                return Ok(OuterEval {
+                                    cost: cp,
+                                    gradient: gp.clone(),
+                                    hessian: hess,
+                                });
+                            }
+                        }
                     }
-                    if include_exact_newton_logdet_h(family)
-                        && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
-                        && x_prev.len() == x.len()
-                    {
-                        return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
-                    }
-                    return Err(ObjectiveEvalError::recoverable(
-                        "custom-family outer objective/derivatives became non-finite",
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "custom-family outer objective/derivatives became non-finite".to_string(),
                     ));
                 }
                 Err(e) => {
-                    if let Ok(mut guard) = last_outer_error.lock() {
-                        *guard = Some(e);
+                    outer.last_error = Some(e.clone());
+                    if has_exact_hess {
+                        if let Some((ref xp, cp, ref gp, ref hp)) = outer.last_eval {
+                            if xp.len() == rho.len() {
+                                let hess = match hp {
+                                    Some(h) => HessianResult::Analytic(h.clone()),
+                                    None => HessianResult::Unavailable,
+                                };
+                                return Ok(OuterEval {
+                                    cost: cp,
+                                    gradient: gp.clone(),
+                                    hessian: hess,
+                                });
+                            }
+                        }
                     }
-                    if include_exact_newton_logdet_h(family)
-                        && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
-                        && x_prev.len() == x.len()
-                    {
-                        return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
-                    }
-                    return Err(ObjectiveEvalError::recoverable(
-                        "custom-family outer objective/gradient evaluation failed",
-                    ));
+                    return Err(EstimationError::RemlOptimizationFailed(e));
                 }
             };
-            last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
-            Ok((obj, grad, hess_opt))
+            outer.last_eval = Some((rho.clone(), cost, grad.clone(), hess_opt.clone()));
+            let hessian = match hess_opt {
+                Some(h) => HessianResult::Analytic(h),
+                None => HessianResult::Unavailable,
+            };
+            Ok(OuterEval {
+                cost,
+                gradient: grad,
+                hessian,
+            })
         },
-        1e-4,
+        reset_fn: |outer: &mut CustomOuterState| {
+            outer.warm_cache = None;
+            outer.last_eval = None;
+            outer.last_error = None;
+        },
+    };
+
+    let outer_result = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "custom family",
     );
-    let outer_max_iter = if include_exact_newton_logdet_h(family) {
-        options.outer_max_iter.min(3).max(1)
-    } else {
-        options.outer_max_iter
-    };
-    let mut solver = NewtonTrustRegion::new(rho0.clone(), objective)
-        .with_bounds(
-            Bounds::new(lower, upper, 1e-6).expect("custom-family rho bounds must be valid"),
-        )
-        .with_tolerance(
-            Tolerance::new(options.outer_tol).expect("custom-family tolerance must be valid"),
-        )
-        .with_max_iterations(
-            MaxIterations::new(outer_max_iter).expect("custom-family max iterations must be valid"),
-        );
-    let last_eval_error = || {
-        last_outer_error
-            .lock()
-            .ok()
-            .and_then(|g| (*g).clone())
-            .map(|e| format!(" last objective error: {e}"))
-            .unwrap_or_default()
-    };
-    let sol = match solver.run() {
-        Ok(sol) => Some(sol),
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-            if last_solution.final_value.is_finite()
-                && last_solution.final_gradient_norm.is_finite()
-            {
-                log::warn!(
-                    "Outer smoothing hit max iterations; using best-so-far solution (iter={}, f={:.6e}, ||g||={:.3e}).",
-                    last_solution.iterations,
-                    last_solution.final_value,
-                    last_solution.final_gradient_norm
-                );
-                Some(*last_solution)
-            } else {
-                log::warn!(
-                    "Outer smoothing hit max iterations with non-finite state; \
-                     falling back to inner fit at initial smoothing parameters.{details}",
-                    details = last_eval_error()
-                );
-                None
-            }
-        }
+
+    let last_error_detail = obj
+        .state
+        .last_error
+        .as_ref()
+        .map(|e| format!(" last objective error: {e}"))
+        .unwrap_or_default();
+
+    // Determine rho_star: either from the optimizer or fall back to rho0.
+    let (rho_star, outer_iters, outer_grad_norm) = match outer_result {
+        Ok(result) => (result.rho, result.iterations, result.final_grad_norm),
         Err(e) => {
             log::warn!(
-                "Outer smoothing optimization failed ({e:?}); \
-                 falling back to inner fit at initial smoothing parameters.{details}",
-                details = last_eval_error()
+                "Outer smoothing optimization failed ({e}); \
+                 falling back to inner fit at initial smoothing parameters.{last_error_detail}"
             );
-            None
+            let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
+            match inner_blockwise_fit(family, specs, &per_block, options, None) {
+                Ok(mut inner) => {
+                    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+                    let covariance_conditional = compute_joint_covariance_required(
+                        family,
+                        specs,
+                        &inner.block_states,
+                        &per_block,
+                        options,
+                    )?;
+                    let reml_term = if include_exact_newton_logdet_h(family) {
+                        0.5 * inner.block_logdet_h
+                    } else {
+                        0.0
+                    } - if include_exact_newton_logdet_s(family, options) {
+                        0.5 * inner.block_logdet_s
+                    } else {
+                        0.0
+                    };
+                    let reml_term = if reml_term.is_finite() {
+                        reml_term
+                    } else {
+                        0.0
+                    };
+                    return Ok(BlockwiseFitResult {
+                        block_states: inner.block_states,
+                        log_likelihood: inner.log_likelihood,
+                        log_lambdas: rho0.clone(),
+                        lambdas: rho0.mapv(f64::exp),
+                        covariance_conditional,
+                        penalizedobjective: finite_penalizedobjective(
+                            inner.log_likelihood,
+                            inner.penalty_value,
+                            reml_term,
+                        ),
+                        outer_iterations: 0,
+                        outer_final_gradient_norm: 0.0,
+                        inner_cycles: inner.cycles,
+                        converged: inner.converged,
+                    });
+                }
+                Err(inner_err) => {
+                    return Err(format!(
+                        "outer smoothing optimization failed and fallback inner fit \
+                         at rho0 also failed: {inner_err}.{last_error_detail}"
+                    )
+                    .into());
+                }
+            }
         }
     };
 
-    if sol.is_none() {
-        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
-        match inner_blockwise_fit(family, specs, &per_block, options, None) {
-            Ok(mut inner) => {
-                refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-                let covariance_conditional = compute_joint_covariance_required(
-                    family,
-                    specs,
-                    &inner.block_states,
-                    &per_block,
-                    options,
-                )?;
-                let reml_term = if include_exact_newton_logdet_h(family) {
-                    0.5 * inner.block_logdet_h
-                } else {
-                    0.0
-                } - if include_exact_newton_logdet_s(family, options) {
-                    0.5 * inner.block_logdet_s
-                } else {
-                    0.0
-                };
-                let reml_term = if reml_term.is_finite() {
-                    reml_term
-                } else {
-                    0.0
-                };
-                return Ok(BlockwiseFitResult {
-                    block_states: inner.block_states,
-                    log_likelihood: inner.log_likelihood,
-                    log_lambdas: rho0.clone(),
-                    lambdas: rho0.mapv(f64::exp),
-                    covariance_conditional,
-                    penalizedobjective: finite_penalizedobjective(
-                        inner.log_likelihood,
-                        inner.penalty_value,
-                        reml_term,
-                    ),
-                    outer_iterations: 0,
-                    outer_final_gradient_norm: 0.0,
-                    inner_cycles: inner.cycles,
-                    converged: inner.converged,
-                });
-            }
-            Err(inner_err) => {
-                return Err(format!(
-                    "outer smoothing optimization failed and fallback inner fit \
-                     at rho0 also failed: {inner_err}.{details}",
-                    details = last_eval_error()
-                )
-                .into());
-            }
-        }
-    }
-
-    let sol = sol.unwrap();
-    let rho_star = sol.final_point;
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
-    let final_seed = warm_cache.lock().ok().and_then(|g| g.clone());
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
-        .map_err(|e| {
-            format!(
-                "outer smoothing optimization failed during final inner refit: {e}.{details}",
-                details = last_eval_error()
-            )
-        })?;
+    let final_seed = obj.state.warm_cache.clone();
+    let mut inner =
+        inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
+            .map_err(|e| {
+                format!(
+                    "outer smoothing optimization failed during final inner refit: \
+                     {e}.{last_error_detail}"
+                )
+            })?;
     refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
         format!(
-            "outer smoothing optimization failed during final eta refresh: {e}.{details}",
-            details = last_eval_error()
+            "outer smoothing optimization failed during final eta refresh: \
+             {e}.{last_error_detail}"
         )
     })?;
     let covariance_conditional =
@@ -5529,8 +5570,12 @@ pub fn fit_custom_family<F: CustomFamily>(
                 0.0
             },
         ),
-        outer_iterations: sol.iterations,
-        outer_final_gradient_norm: sol.final_gradient_norm,
+        outer_iterations: outer_iters,
+        outer_final_gradient_norm: if outer_grad_norm.is_finite() {
+            outer_grad_norm
+        } else {
+            0.0
+        },
         inner_cycles: inner.cycles,
         converged: inner.converged,
     })

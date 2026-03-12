@@ -1,3 +1,6 @@
+// Allow dead code: this module is under active development by a concurrent
+// contributor. Items are defined ahead of their call-site wiring.
+#![allow(dead_code)]
 //! Unified REML/LAML evaluator.
 //!
 //! This module provides a single implementation of the outer REML/LAML objective,
@@ -283,6 +286,10 @@ pub enum DispersionHandling {
     ProfiledGaussian,
     /// Non-Gaussian LAML: dispersion is fixed (typically φ=1 for binomial).
     Fixed { phi: f64 },
+    /// Maximum penalized likelihood: V = −ℓ + ½ β̂ᵀSβ̂.
+    /// No logdet terms (neither log|H| nor log|S|). Used by custom family
+    /// paths where include_logdet_h = false.
+    MaxPenalizedLikelihood,
 }
 
 /// The unified inner solution produced by any inner solver.
@@ -467,6 +474,13 @@ pub fn reml_laml_evaluate(
 
             (cost, *phi, 0.0)
         }
+        DispersionHandling::MaxPenalizedLikelihood => {
+            // Maximum penalized likelihood: V = −ℓ + ½ β̂ᵀSβ̂.
+            // No logdet terms — used when the outer objective is just MPL
+            // (e.g., custom families with include_logdet_h = false).
+            let cost = -solution.log_likelihood + 0.5 * solution.penalty_quadratic;
+            (cost, 1.0, 0.0)
+        }
     };
 
     // Add prior.
@@ -504,12 +518,16 @@ pub fn reml_laml_evaluate(
         let penalty_term = match &solution.dispersion {
             DispersionHandling::ProfiledGaussian => dp_cgrad * (d_k / (2.0 * profiled_scale)),
             DispersionHandling::Fixed { .. } => 0.5 * d_k,
+            DispersionHandling::MaxPenalizedLikelihood => 0.5 * d_k,
         };
 
         // Term 2: ½ tr(H⁻¹ Hₖ).
         // Hₖ = Aₖ + (third-derivative correction).
         // For Gaussian: correction is zero. For GLMs/coupled: correction is non-trivial.
-        let trace_term = if solution.deriv_provider.has_corrections() {
+        // For MaxPenalizedLikelihood: no logdet terms, so trace_term = 0.
+        let trace_term = if matches!(solution.dispersion, DispersionHandling::MaxPenalizedLikelihood) {
+            0.0
+        } else if solution.deriv_provider.has_corrections() {
             // Compute mode response vₖ = H⁻¹(Aₖβ̂)
             let v_k = hop.solve(&a_k_beta);
             let correction = solution.deriv_provider.hessian_derivative_correction(&v_k);
@@ -534,8 +552,12 @@ pub fn reml_laml_evaluate(
             0.5 * hop.trace_hinv_product(&a_k_matrix)
         };
 
-        // Term 3: −½ ∂/∂ρₖ log|S|₊
-        let det_term = 0.5 * solution.penalty_logdet.first[idx];
+        // Term 3: −½ ∂/∂ρₖ log|S|₊ (zero for MaxPenalizedLikelihood)
+        let det_term = if matches!(solution.dispersion, DispersionHandling::MaxPenalizedLikelihood) {
+            0.0
+        } else {
+            0.5 * solution.penalty_logdet.first[idx]
+        };
 
         grad[idx] = penalty_term + trace_term - det_term;
     }
@@ -1033,6 +1055,10 @@ pub fn pirls_result_to_inner_solution(
 /// Convert a BlockwiseInnerResult (from the custom family engine) into an InnerSolution.
 ///
 /// Configuration for the block-coupled conversion.
+///
+/// Currently gated behind cfg(test) because the blockwise path is not yet wired
+/// to use the unified evaluator. Remove the gate when the custom_family.rs
+/// migration is complete.
 pub struct BlockwiseConversionConfig {
     /// Number of observations.
     pub n_observations: usize,
