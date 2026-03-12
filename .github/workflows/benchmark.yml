@@ -15,6 +15,10 @@ concurrency:
   group: benchmark-suite-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  actions: read
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   GAM_SKIP_LINT_CHECKS: "1"

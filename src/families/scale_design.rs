@@ -40,45 +40,6 @@ fn weighted_centered_ss(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Resu
         .sum())
 }
 
-/// Solve the weighted least-squares projection `argmin_c || W^{1/2}(y - X c) ||^2`
-/// using column-pivoted QR on `W^{1/2} X`.
-///
-/// Column-pivoted QR is a direct method (no iterative convergence issues)
-/// that handles rank-deficiency naturally through pivoting, gracefully
-/// dealing with collinear columns (e.g. saturated I-spline columns that
-/// duplicate the intercept) without failing.
-fn solveweighted_projection_dense(
-    design: &Array2<f64>,
-    target: &Array1<f64>,
-    weights: &Array1<f64>,
-) -> Result<Array1<f64>, String> {
-    let (n, p) = design.dim();
-    if target.len() != n || weights.len() != n {
-        return Err("weighted projection dimension mismatch".to_string());
-    }
-    // Form W^{1/2} X and W^{1/2} y, then solve via column-pivoted QR.
-    // This is a direct method (no convergence issues) and handles
-    // rank-deficiency naturally through the pivoting.
-    let mut wx = Array2::<f64>::zeros((n, p));
-    let mut wy = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let sw = weights[i].sqrt();
-        wy[i] = sw * target[i];
-        for j in 0..p {
-            wx[[i, j]] = sw * design[[i, j]];
-        }
-    }
-    let wx_faer = FaerArrayView::new(&wx);
-    let qr = wx_faer.as_ref().col_piv_qr();
-    // solve_lstsq_in_place solves the least-squares problem for the n×p
-    // overdetermined system; the p-length solution is written into the first
-    // p entries of the n-length rhs vector.
-    let mut rhs = wy;
-    let mut rhs_mat = crate::faer_ndarray::array1_to_col_matmut(&mut rhs);
-    qr.solve_lstsq_in_place(rhs_mat.as_mut());
-    Ok(rhs.slice(ndarray::s![..p]).to_owned())
-}
-
 pub fn infer_non_intercept_start(design: &Array2<f64>, weights: &Array1<f64>) -> usize {
     let mut end = 0;
     for j in 0..design.ncols() {
@@ -188,36 +149,7 @@ pub fn apply_scale_deviation_transform(
 mod tests {
     use super::*;
 
-    /// Regression test: solveweighted_projection_dense must handle overdetermined
-    /// systems (n >> p) without panicking. The old code used `qr.solve_in_place()`
-    /// which asserts nrows == ncols (square). The fix uses `solve_lstsq_in_place()`.
-    #[test]
-    fn overdetermined_weighted_projection_does_not_panic() {
-        // n=500, p=5: strongly overdetermined, like biobank-scale GAMLSS
-        let n = 500;
-        let p = 5;
-        let design = Array2::<f64>::ones((n, p));
-        // Make columns distinguishable
-        let mut design = design;
-        for j in 0..p {
-            for i in 0..n {
-                design[[i, j]] = ((i + j * 7) as f64).sin();
-            }
-        }
-        let target = Array1::<f64>::from_vec((0..n).map(|i| (i as f64) * 0.01).collect());
-        let weights = Array1::<f64>::ones(n);
-
-        // This panicked with solve_in_place; should succeed with solve_lstsq_in_place
-        let result = solveweighted_projection_dense(&design, &target, &weights);
-        assert!(
-            result.is_ok(),
-            "overdetermined solve failed: {:?}",
-            result.err()
-        );
-        assert_eq!(result.unwrap().len(), p);
-    }
-
-    /// Verify the full build_scale_deviation_transform pipeline for n >> p.
+    /// Verify the real scale-deviation pipeline for an overdetermined system.
     #[test]
     fn scale_deviation_transform_overdetermined() {
         let n = 1000;
@@ -238,7 +170,14 @@ mod tests {
         noise.column_mut(0).fill(1.0);
         let weights = Array1::<f64>::ones(n);
 
-        let transform = build_scale_deviation_transform(&primary, &noise, &weights, 1);
-        assert!(transform.is_ok(), "transform failed: {:?}", transform.err());
+        let transform = build_scale_deviation_transform(&primary, &noise, &weights, 1)
+            .expect("transform should succeed for overdetermined inputs");
+        let transformed = apply_scale_deviation_transform(&primary, &noise, &transform)
+            .expect("apply should succeed for overdetermined inputs");
+
+        assert_eq!(transform.projection_coef.dim(), (p_primary, p_noise));
+        assert_eq!(transformed.dim(), (n, p_noise));
+        assert!(transformed.iter().all(|v| v.is_finite()));
+        assert!(transformed.column(0).iter().all(|&v| v == 1.0));
     }
 }

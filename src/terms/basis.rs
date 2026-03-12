@@ -1691,6 +1691,15 @@ pub struct DuchonSplineBasis {
     pub nullspace_order: DuchonNullspaceOrder,
 }
 
+#[derive(Debug, Clone)]
+struct DuchonBasisDesign {
+    basis: Array2<f64>,
+    num_kernel_basis: usize,
+    num_polynomial_basis: usize,
+    dimension: usize,
+    nullspace_order: DuchonNullspaceOrder,
+}
+
 /// Which knot strategy to use for 1D B-spline bases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BSplineKnotSpec {
@@ -4572,8 +4581,7 @@ pub fn create_matern_spline_basiswithworkspace(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
-    let (data_center_r, center_center_r) =
-        spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -6096,6 +6104,7 @@ fn duchonphi_rr_collision_psi_triplet(
 
 fn build_duchon_design_psi_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
@@ -6111,14 +6120,13 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     // 2. project the kernel block with the same nullspace constraint used by the basis
     // 3. append polynomial columns; their psi derivatives are zero because p and s are fixed
     // 4. apply any frozen identifiability transform
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
     let kappa = 1.0 / length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel =
-        kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
-    let (data_center_r, _) = spatial_distance_matrices(data, centers.view(), &mut workspace.cache)?;
+        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
+    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
     let n = data.nrows();
     let k = centers.nrows();
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
@@ -6177,23 +6185,24 @@ pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let base = build_duchon_basiswithworkspace(data, spec, workspace)?;
-    let identifiability_transform = match &base.metadata {
+    let (centers, identifiability_transform) = match &base.metadata {
         BasisMetadata::Duchon {
+            centers,
             identifiability_transform,
             ..
-        } => identifiability_transform.as_ref(),
-        _ => None,
+        } => (centers.view(), identifiability_transform.as_ref()),
+        _ => unreachable!("Duchon basis metadata expected"),
     };
     let (design_derivative, _) = build_duchon_design_psi_derivativeswithworkspace(
         data,
+        centers,
         spec,
         identifiability_transform,
         workspace,
     )?;
     let (all_penalty_deriv, _) = build_duchon_operator_penalty_psi_derivatives(
-        centers.view(),
+        centers,
         spec,
         identifiability_transform,
         workspace,
@@ -6219,23 +6228,24 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let base = build_duchon_basiswithworkspace(data, spec, workspace)?;
-    let identifiability_transform = match &base.metadata {
+    let (centers, identifiability_transform) = match &base.metadata {
         BasisMetadata::Duchon {
+            centers,
             identifiability_transform,
             ..
-        } => identifiability_transform.as_ref(),
-        _ => None,
+        } => (centers.view(), identifiability_transform.as_ref()),
+        _ => unreachable!("Duchon basis metadata expected"),
     };
     let (_, designsecond_derivative) = build_duchon_design_psi_derivativeswithworkspace(
         data,
+        centers,
         spec,
         identifiability_transform,
         workspace,
     )?;
     let (_, all_penaltysecond_deriv) = build_duchon_operator_penalty_psi_derivatives(
-        centers.view(),
+        centers,
         spec,
         identifiability_transform,
         workspace,
@@ -6288,6 +6298,77 @@ pub fn create_duchon_spline_basiswithworkspace(
     nullspace_order: DuchonNullspaceOrder,
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonSplineBasis, BasisError> {
+    let design = build_duchon_basis_designwithworkspace(
+        data,
+        centers,
+        length_scale,
+        power,
+        nullspace_order,
+        workspace,
+    )?;
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let s_order = power;
+    let d = centers.ncols();
+    let k = centers.nrows();
+    let coeffs = if length_scale.is_none() {
+        None
+    } else if p_order == 1 && s_order == 4 && d == 10 {
+        None
+    } else {
+        Some(duchon_partial_fraction_coeffs(
+            p_order,
+            s_order,
+            1.0 / length_scale.unwrap().max(1e-300),
+        ))
+    };
+    let (_, center_center_r) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    let mut center_kernel = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let kij = duchon_matern_kernel_general_from_distance(
+                center_center_r[[i, j]],
+                length_scale,
+                p_order,
+                s_order,
+                d,
+                coeffs.as_ref(),
+            )?;
+            center_kernel[[i, j]] = kij;
+            center_kernel[[j, i]] = kij;
+        }
+    }
+    let omega_constrained = {
+        let zt_k = fast_atb(&z, &center_kernel);
+        fast_ab(&zt_k, &z)
+    };
+    let total_cols = design.basis.ncols();
+    let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_kernel
+        .slice_mut(s![0..design.num_kernel_basis, 0..design.num_kernel_basis])
+        .assign(&omega_constrained);
+    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_kernel)?
+        .map(|block| block.sym_penalty)
+        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
+    Ok(DuchonSplineBasis {
+        basis: design.basis,
+        penalty_kernel,
+        penalty_ridge,
+        num_kernel_basis: design.num_kernel_basis,
+        num_polynomial_basis: design.num_polynomial_basis,
+        dimension: design.dimension,
+        nullspace_order: design.nullspace_order,
+    })
+}
+
+fn build_duchon_basis_designwithworkspace(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    workspace: &mut BasisWorkspace,
+) -> Result<DuchonBasisDesign, BasisError> {
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
@@ -6395,31 +6476,7 @@ pub fn create_duchon_spline_basiswithworkspace(
         });
     kernel_result?;
 
-    let mut center_kernel = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let kij = duchon_matern_kernel_general_from_distance(
-                center_center_r[[i, j]],
-                length_scale,
-                p_order,
-                s_order,
-                d,
-                coeffs.as_ref(),
-            )?;
-            center_kernel[[i, j]] = kij;
-            center_kernel[[j, i]] = kij;
-        }
-    }
-
     let kernel_constrained = fast_ab(&kernel_block, &z);
-    // Constrained Gram penalty block: S_free = Z^T K_CC Z.
-    // This is the standard Duchon/thin-plate constrained coefficient penalty.
-    // Constrained (conditionally PD) penalty:
-    //   alpha = Z gamma,  Q^T alpha = 0  =>  gamma^T (Z^T K_CC Z) gamma.
-    let omega_constrained = {
-        let zt_k = fast_atb(&z, &center_kernel);
-        fast_ab(&zt_k, &z)
-    };
     let kernel_cols = kernel_constrained.ncols();
     let poly_cols = poly_block.ncols();
     let total_cols = kernel_cols + poly_cols;
@@ -6432,18 +6489,8 @@ pub fn create_duchon_spline_basiswithworkspace(
         basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
     }
 
-    let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
-    penalty_kernel
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&omega_constrained);
-    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_kernel)?
-        .map(|block| block.sym_penalty)
-        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
-
-    Ok(DuchonSplineBasis {
+    Ok(DuchonBasisDesign {
         basis,
-        penalty_kernel,
-        penalty_ridge,
         num_kernel_basis: kernel_cols,
         num_polynomial_basis: poly_cols,
         dimension: d,
@@ -6466,7 +6513,7 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let d = create_duchon_spline_basiswithworkspace(
+    let d = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
         spec.length_scale,

@@ -9826,104 +9826,6 @@ mod tests {
         }
     }
 
-    fn fit_structural_survival_eta_for_unit_test(
-        age_entry: &Array1<f64>,
-        age_exit: &Array1<f64>,
-        event_target: &Array1<u8>,
-        knots: Array1<f64>,
-    ) -> (Array1<f64>, Array1<f64>, f64) {
-        let time_build = build_survival_time_basis(
-            age_entry,
-            age_exit,
-            SurvivalTimeBasisConfig::ISpline {
-                degree: 2,
-                knots,
-                keep_cols: Vec::new(),
-                smooth_lambda: 5e-1,
-            },
-            None,
-        )
-        .expect("build structural survival time basis");
-        let p_time = time_build.x_exit_time.ncols();
-        let penalties = gam::survival::PenaltyBlocks::new(
-            time_build
-                .penalties
-                .iter()
-                .filter(|s| s.nrows() == p_time && s.ncols() == p_time)
-                .map(|s| gam::survival::PenaltyBlock {
-                    matrix: s.clone(),
-                    lambda: 5e-1,
-                    range: 0..p_time,
-                })
-                .collect(),
-        );
-        let event_competing = Array1::zeros(age_entry.len());
-        let weights = Array1::ones(age_entry.len());
-        let eta_offset_entry = Array1::zeros(age_entry.len());
-        let eta_offset_exit = Array1::zeros(age_entry.len());
-        let derivative_offset_exit = Array1::zeros(age_entry.len());
-        let mut model = gam::families::royston_parmar::working_model_from_flattened(
-            penalties,
-            gam::survival::MonotonicityPenalty { tolerance: 0.0 },
-            gam::survival::SurvivalSpec::Net,
-            gam::families::royston_parmar::RoystonParmarInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                weights: weights.view(),
-                x_entry: time_build.x_entry_time.view(),
-                x_exit: time_build.x_exit_time.view(),
-                x_derivative: time_build.x_derivative_time.view(),
-                eta_offset_entry: Some(eta_offset_entry.view()),
-                eta_offset_exit: Some(eta_offset_exit.view()),
-                derivative_offset_exit: Some(derivative_offset_exit.view()),
-            },
-        )
-        .expect("construct structural survival model");
-        model
-            .set_structural_monotonicity(true, p_time)
-            .expect("enable structural monotonicity");
-        let mut beta0 = Array1::<f64>::zeros(p_time);
-        beta0.fill(0.1);
-        let mut constrained_model = model;
-        // I-spline basis is monotone by construction — use coefficient lower
-        // bounds (non-negativity) instead of per-observation derivative constraints.
-        let lb = Array1::from_elem(p_time, 0.0_f64);
-        let summary = gam::pirls::runworking_model_pirls(
-            &mut constrained_model,
-            gam::types::Coefficients::new(beta0),
-            &gam::pirls::WorkingModelPirlsOptions {
-                max_iterations: 400,
-                convergence_tolerance: 1e-6,
-                max_step_halving: 40,
-                min_step_size: 1e-12,
-                firth_bias_reduction: false,
-                coefficient_lower_bounds: Some(lb),
-                linear_constraints: None,
-            },
-            |_| {},
-        )
-        .expect("fit structural survival model");
-        assert!(
-            matches!(
-                summary.status,
-                gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum
-            ),
-            "unexpected PIRLS status: {:?} after {} iterations, grad_norm={:.3e}",
-            summary.status,
-            summary.iterations,
-            summary.lastgradient_norm
-        );
-        let beta = summary.beta.as_ref().to_owned();
-        let eta = time_build.x_exit_time.dot(&beta);
-        let surv = survival_probability_from_eta(eta.view());
-        let state = constrained_model
-            .update_state(&beta)
-            .expect("evaluate fitted structural survival state");
-        (eta, surv, state.deviance)
-    }
-
     fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
         let mut rdr = csv::Reader::from_path(path).expect("open prediction csv");
         let rows = rdr
@@ -11837,38 +11739,6 @@ mod tests {
         assert!((derivative - expected_derivative).abs() <= 1e-12);
     }
 
-    fn base_survival_args_for_link_tests() -> SurvivalArgs {
-        SurvivalArgs {
-            data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
-            exit: "exit".to_string(),
-            event: "event".to_string(),
-            formula: "1".to_string(),
-            survival_likelihood: "location-scale".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            link: Some("logit".to_string()),
-            mixture_rho: None,
-            sas_init: None,
-            beta_logistic_init: None,
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "linear".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            out: None,
-        }
-    }
-
     #[test]
     fn parse_link_choice_accepts_flexible_beta_logistic() {
         let choice =
@@ -11902,7 +11772,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_accepts_sas_init() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("sas".to_string());
         args.sas_init = Some("0.15,-0.70".to_string());
         let link = parse_survival_inverse_link(&args).expect("sas survival link");
@@ -11917,7 +11815,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_beta_logistic_init_for_sas() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("sas".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
         let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
@@ -11926,7 +11852,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_sas_init_for_logit() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("logit".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
         let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
@@ -11935,7 +11889,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_accepts_beta_logistic_init() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("beta-logistic".to_string());
         args.beta_logistic_init = Some("0.25,0.80".to_string());
         let link = parse_survival_inverse_link(&args).expect("beta-logistic survival link");
@@ -11950,7 +11932,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_sas_init_for_beta_logistic() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("beta-logistic".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
         let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
@@ -11959,7 +11969,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_beta_logistic_init_for_logit() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("logit".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
         let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
@@ -12033,7 +12071,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_accepts_flexible_standard_links() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("flexible(logit)".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible survival link");
         assert!(matches!(link, InverseLink::Standard(LinkFunction::Logit)));
@@ -12041,7 +12107,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_accepts_flexible_blended_links() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("flexible(blended(logit,probit))".to_string());
         args.mixture_rho = Some("0.2".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible blended survival link");
@@ -12059,7 +12153,35 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_reports_survival_specific_supported_links() {
-        let mut args = base_survival_args_for_link_tests();
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("logit".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            out: None,
+        };
         args.link = Some("bogus".to_string());
         let err =
             parse_survival_inverse_link(&args).expect_err("expected unsupported survival link");
@@ -12217,12 +12339,105 @@ mod tests {
 
     #[test]
     fn structural_survival_fit_is_time_unit_invariant() {
+        let fit_structural_survival_eta =
+            |age_entry: &Array1<f64>, age_exit: &Array1<f64>, event_target: &Array1<u8>, knots| {
+                let time_build = build_survival_time_basis(
+                    age_entry,
+                    age_exit,
+                    SurvivalTimeBasisConfig::ISpline {
+                        degree: 2,
+                        knots,
+                        keep_cols: Vec::new(),
+                        smooth_lambda: 5e-1,
+                    },
+                    None,
+                )
+                .expect("build structural survival time basis");
+                let p_time = time_build.x_exit_time.ncols();
+                let penalties = gam::survival::PenaltyBlocks::new(
+                    time_build
+                        .penalties
+                        .iter()
+                        .filter(|s| s.nrows() == p_time && s.ncols() == p_time)
+                        .map(|s| gam::survival::PenaltyBlock {
+                            matrix: s.clone(),
+                            lambda: 5e-1,
+                            range: 0..p_time,
+                        })
+                        .collect(),
+                );
+                let event_competing = Array1::zeros(age_entry.len());
+                let weights = Array1::ones(age_entry.len());
+                let eta_offset_entry = Array1::zeros(age_entry.len());
+                let eta_offset_exit = Array1::zeros(age_entry.len());
+                let derivative_offset_exit = Array1::zeros(age_entry.len());
+                let mut model = gam::families::royston_parmar::working_model_from_flattened(
+                    penalties,
+                    gam::survival::MonotonicityPenalty { tolerance: 0.0 },
+                    gam::survival::SurvivalSpec::Net,
+                    gam::families::royston_parmar::RoystonParmarInputs {
+                        age_entry: age_entry.view(),
+                        age_exit: age_exit.view(),
+                        event_target: event_target.view(),
+                        event_competing: event_competing.view(),
+                        weights: weights.view(),
+                        x_entry: time_build.x_entry_time.view(),
+                        x_exit: time_build.x_exit_time.view(),
+                        x_derivative: time_build.x_derivative_time.view(),
+                        eta_offset_entry: Some(eta_offset_entry.view()),
+                        eta_offset_exit: Some(eta_offset_exit.view()),
+                        derivative_offset_exit: Some(derivative_offset_exit.view()),
+                    },
+                )
+                .expect("construct structural survival model");
+                model
+                    .set_structural_monotonicity(true, p_time)
+                    .expect("enable structural monotonicity");
+                let mut beta0 = Array1::<f64>::zeros(p_time);
+                beta0.fill(0.1);
+                let mut constrained_model = model;
+                let lb = Array1::from_elem(p_time, 0.0_f64);
+                let summary = gam::pirls::runworking_model_pirls(
+                    &mut constrained_model,
+                    gam::types::Coefficients::new(beta0),
+                    &gam::pirls::WorkingModelPirlsOptions {
+                        max_iterations: 400,
+                        convergence_tolerance: 1e-6,
+                        max_step_halving: 40,
+                        min_step_size: 1e-12,
+                        firth_bias_reduction: false,
+                        coefficient_lower_bounds: Some(lb),
+                        linear_constraints: None,
+                    },
+                    |_| {},
+                )
+                .expect("fit structural survival model");
+                assert!(
+                    matches!(
+                        summary.status,
+                        gam::pirls::PirlsStatus::Converged
+                            | gam::pirls::PirlsStatus::StalledAtValidMinimum
+                    ),
+                    "unexpected PIRLS status: {:?} after {} iterations, grad_norm={:.3e}",
+                    summary.status,
+                    summary.iterations,
+                    summary.lastgradient_norm
+                );
+                let beta = summary.beta.as_ref().to_owned();
+                let eta = time_build.x_exit_time.dot(&beta);
+                let surv = survival_probability_from_eta(eta.view());
+                let state = constrained_model
+                    .update_state(&beta)
+                    .expect("evaluate fitted structural survival state");
+                (eta, surv, state.deviance)
+            };
+
         let age_entry_days = Array1::from_vec(vec![10.0, 20.0, 40.0, 80.0, 120.0, 160.0]);
         let age_exit_days = Array1::from_vec(vec![15.0, 35.0, 60.0, 100.0, 150.0, 220.0]);
         let event_target = Array1::from_vec(vec![1u8, 0u8, 1u8, 0u8, 1u8, 1u8]);
         let knots_days = Array1::from_vec(vec![2.0, 2.0, 2.0, 2.0, 4.0, 5.5, 5.5, 5.5, 5.5]);
 
-        let (eta_days, surv_days, deviance_days) = fit_structural_survival_eta_for_unit_test(
+        let (eta_days, surv_days, deviance_days) = fit_structural_survival_eta(
             &age_entry_days,
             &age_exit_days,
             &event_target,
@@ -12233,7 +12448,7 @@ mod tests {
         let age_entry_years = age_entry_days.mapv(|v| v / time_scale);
         let age_exit_years = age_exit_days.mapv(|v| v / time_scale);
         let knots_years = knots_days.mapv(|v| v - time_scale.ln());
-        let (eta_years, surv_years, deviance_years) = fit_structural_survival_eta_for_unit_test(
+        let (eta_years, surv_years, deviance_years) = fit_structural_survival_eta(
             &age_entry_years,
             &age_exit_years,
             &event_target,

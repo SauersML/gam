@@ -62,6 +62,11 @@ use crate::diagnostics::{
     GRAD_DIAG_LOGH_CLAMPED_COUNT, approx_f64, format_compact_series, format_cond, format_range,
     quantize_value, quantize_vec, should_emit_grad_diag, should_emit_h_min_eig_diag,
 };
+use crate::linalg::utils::{
+    add_relative_diag_ridge, boundary_hit_indices, enforce_symmetry,
+    predict_gam_dimension_mismatch_message, row_mismatch_message,
+    symmetric_spectrum_condition_number,
+};
 
 // Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
 // instead of weight deflation. See update_glm_vectors_integrated in pirls.rs.

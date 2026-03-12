@@ -204,7 +204,6 @@ fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
     repetition_count > 1 && repetition_count.is_power_of_two()
 }
 
-const SPARSE_NATIVE_MIN_P: usize = 256;
 const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.10;
 
 #[derive(Clone, Debug)]
@@ -2079,9 +2078,6 @@ fn estimate_sparse_native_decision(
         );
     };
     let nnz_x = x_sparse.val().len();
-    if p < SPARSE_NATIVE_MIN_P {
-        return dense_reject("p_below_threshold", nnz_x);
-    }
     match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
         Ok(stats) => {
             let decision = SparsePirlsDecision {
@@ -6220,6 +6216,23 @@ mod tests {
         assert_eq!(decision.nnz_xtwx_symbolic, Some(300));
         assert_eq!(decision.nnz_h_est, Some(300));
         assert!(decision.density_h_est.expect("density") < 0.01);
+    }
+
+    #[test]
+    fn sparse_native_decision_allows_moderate_sparse_designs_below_old_width_gate() {
+        let triplets: Vec<_> = (0..64).map(|i| Triplet::new(i, i, 1.0)).collect();
+        let x = SparseColMat::try_new_from_triplets(64, 64, &triplets)
+            .expect("sparse identity should build");
+        let x = DesignMatrix::from(x);
+        let s = Array2::from_diag(&Array1::ones(64));
+        let mut workspace = PirlsWorkspace::new(64, 64, 0, 0);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
+        assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
+        assert_eq!(decision.reason, "sparse_native_eligible");
+        assert_eq!(decision.nnz_x, 64);
+        assert_eq!(decision.nnz_xtwx_symbolic, Some(64));
+        assert_eq!(decision.nnz_h_est, Some(64));
+        assert!(decision.density_h_est.expect("density") < 0.05);
     }
 
     #[test]
