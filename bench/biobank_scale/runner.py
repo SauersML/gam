@@ -761,6 +761,12 @@ def write_cohort_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "phenotype",
         "time",
         "event",
+        "lat_final_std",
+        "lon_final_std",
+        "age_entry_std",
+        "sex_std",
+        "pgs_std",
+        *[f"pc{i}_std" for i in range(1, 17)],
     ]
     write_csv_rows(path, rows, fieldnames)
 
@@ -921,7 +927,7 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     fit_cmd = [str(rust_bin), "fit"]
     if spec.include_sigma:
         fit_cmd.extend(["--predict-noise", sigma_formula])
-    fit_cmd.extend(["--no-summary", "--out", str(model_path), str(train_csv), mean_formula])
+    fit_cmd.extend(["--out", str(model_path), str(train_csv), mean_formula])
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     fit_sec = time.perf_counter() - t0
@@ -954,7 +960,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     pred_path = out_dir / f"{spec.name}.pred.csv"
     likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "probit-location-scale"
     fit_cmd = [
-        str(rust_bin), "fit", "--no-summary",
+        str(rust_bin), "fit",
         "--survival-likelihood", likelihood_mode,
         "--time-basis", "ispline",
         "--time-degree", "3",
