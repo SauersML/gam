@@ -2584,6 +2584,67 @@ mod tests {
         );
     }
 
+    fn modelwith_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
+        let mut model = base.clone();
+        assert_eq!(model.penalties.blocks.len(), rho.len());
+        for (k, block) in model.penalties.blocks.iter_mut().enumerate() {
+            block.lambda = rho[k].exp();
+        }
+        model
+    }
+
+    fn solve_inner_mode(model: &WorkingModelSurvival, beta_init: &Array1<f64>) -> Array1<f64> {
+        let mut model_local = model.clone();
+        let opts = crate::pirls::WorkingModelPirlsOptions {
+            max_iterations: 200,
+            convergence_tolerance: 1e-10,
+            max_step_halving: 40,
+            min_step_size: 1e-12,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: model_local.monotonicity_linear_constraints(),
+        };
+        let out = crate::pirls::runworking_model_pirls(
+            &mut model_local,
+            crate::types::Coefficients::new(beta_init.clone()),
+            &opts,
+            |info| {
+                let _ = info;
+            },
+        )
+        .expect("survival constrained PIRLS inner mode");
+        out.beta.0
+    }
+
+    fn lamlobjective_at_rho(
+        base: &WorkingModelSurvival,
+        rho: &Array1<f64>,
+        beta_init: &Array1<f64>,
+    ) -> (f64, Array1<f64>, Array1<f64>) {
+        let model = modelwith_rho(base, rho);
+        let beta_hat = solve_inner_mode(&model, beta_init);
+        let state = model
+            .update_state(&beta_hat)
+            .expect("state at inner mode for outer objective");
+        let (obj, grad) = model
+            .lamlobjective_and_rhogradient(&beta_hat, &state)
+            .expect("analytic laml objective/gradient");
+        (obj, grad, beta_hat)
+    }
+
+    #[test]
+    fn wip_outer_helper_signatures_stay_linked() {
+        let _model_fn =
+            modelwith_rho as fn(&WorkingModelSurvival, &Array1<f64>) -> WorkingModelSurvival;
+        let _mode_fn = solve_inner_mode as fn(&WorkingModelSurvival, &Array1<f64>) -> Array1<f64>;
+        let _laml_fn = lamlobjective_at_rho
+            as fn(
+                &WorkingModelSurvival,
+                &Array1<f64>,
+                &Array1<f64>,
+            ) -> (f64, Array1<f64>, Array1<f64>);
+    }
+
     #[test]
     fn update_state_rejects_negative_exit_derivative_for_censoredrows() {
         let age_entry = array![1.0_f64];
