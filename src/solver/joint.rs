@@ -1224,8 +1224,19 @@ pub(crate) fn fit_joint_model<'a>(
     layout_base: EngineDims,
     link: LinkFunction,
     config: &JointModelConfig,
+    include_base_covariance: bool,
 ) -> Result<JointModelResult, EstimationError> {
-    fit_joint_modelwith_reml(y, weights, x_base, s_base, layout_base, link, config, None)
+    fit_joint_modelwith_reml(
+        y,
+        weights,
+        x_base,
+        s_base,
+        layout_base,
+        link,
+        config,
+        None,
+        include_base_covariance,
+    )
 }
 
 /// Engine-facing joint model entrypoint without domain `EngineDims`.
@@ -1237,6 +1248,7 @@ pub fn fit_joint_model_engine<'a>(
     link: LinkFunction,
     geometry: JointLinkGeometry,
     mut config: JointModelConfig,
+    include_base_covariance: bool,
 ) -> Result<JointModelResult, EstimationError> {
     if matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic) {
         return Err(EstimationError::InvalidSpecification(
@@ -1251,7 +1263,16 @@ pub fn fit_joint_model_engine<'a>(
     }
     config.n_link_knots = geometry.n_link_knots;
     let layout = EngineDims::new(x_base.ncols(), s_base.len());
-    fit_joint_model(y, weights, x_base, s_base, layout, link, &config)
+    fit_joint_model(
+        y,
+        weights,
+        x_base,
+        s_base,
+        layout,
+        link,
+        &config,
+        include_base_covariance,
+    )
 }
 
 /// State for REML optimization of the joint model
@@ -2897,7 +2918,7 @@ impl<'a> JointRemlState<'a> {
     }
 
     /// Extract final result after optimization
-    pub fn into_result(mut self) -> JointModelResult {
+    pub fn into_result(mut self, include_base_covariance: bool) -> JointModelResult {
         let cached_edf = self.eval.cached_edf;
         let cached_iters = self.eval.last_backfit_iterations;
         let cached_converged = self.eval.last_converged;
@@ -2916,72 +2937,76 @@ impl<'a> JointRemlState<'a> {
         // Compute base-coefficient covariance: (X' W_eff X + S_λ + δI)^{-1}
         // where W_eff = w_glm * g_prime^2, accounting for the chain rule through
         // the link wiggle.
-        let beta_base_covariance = (|| -> Option<Array2<f64>> {
-            use crate::faer_ndarray::FaerCholesky;
-            use faer::Side;
+        let beta_base_covariance = include_base_covariance
+            .then(|| {
+                (|| -> Option<Array2<f64>> {
+                    use crate::faer_ndarray::FaerCholesky;
+                    use faer::Side;
 
-            let n = state.nobs();
-            let p = state.x_base.ncols();
-            if p == 0 {
-                return None;
-            }
-
-            // Compute GLM working weights at converged eta
-            let mut mu = Array1::<f64>::zeros(n);
-            let mut w_glm = Array1::<f64>::zeros(n);
-            let mut z_glm = Array1::<f64>::zeros(n);
-            crate::pirls::update_glmvectors(
-                state.y,
-                &eta,
-                &InverseLink::Standard(state.link.clone()),
-                state.weights,
-                &mut mu,
-                &mut w_glm,
-                &mut z_glm,
-                None,
-            )
-            .ok()?;
-
-            // Compute link derivative g'(u) = 1 + B'(u) · θ
-            let g_prime = compute_link_derivative_from_state(state, &u, &bwiggle);
-
-            // Effective weights: w_eff_i = w_glm_i * g'(u_i)^2
-            let w_eff = &w_glm * &(&g_prime * &g_prime);
-
-            let mut h = fast_xt_diag_x(&state.x_base, &w_eff);
-
-            // Add penalty: S_λ = Σ λ_k S_k
-            let penalty_layout = JointPenaltyLayout::for_state(state);
-            let (lambda_base, _) = penalty_layout.lambdas(&rho);
-            for (idx, s_k) in state.s_base.iter().enumerate() {
-                let lam = lambda_base.get(idx).cloned().unwrap_or(0.0);
-                if s_k.nrows() == p && s_k.ncols() == p && lam > 0.0 {
-                    h.scaled_add(lam, s_k);
-                }
-            }
-
-            // Add ridge stabilization matching what was used in the fit
-            if state.ridge_base_used > 0.0 {
-                for i in 0..p {
-                    h[[i, i]] += state.ridge_base_used;
-                }
-            }
-
-            // Invert via Cholesky
-            match h.cholesky(Side::Lower) {
-                Ok(chol) => {
-                    let eye = Array2::<f64>::eye(p);
-                    let cov = chol.solve_mat(&eye);
-                    // Verify all finite
-                    if cov.iter().all(|v: &f64| v.is_finite()) {
-                        Some(cov)
-                    } else {
-                        None
+                    let n = state.nobs();
+                    let p = state.x_base.ncols();
+                    if p == 0 {
+                        return None;
                     }
-                }
-                Err(_) => None,
-            }
-        })();
+
+                    // Compute GLM working weights at converged eta
+                    let mut mu = Array1::<f64>::zeros(n);
+                    let mut w_glm = Array1::<f64>::zeros(n);
+                    let mut z_glm = Array1::<f64>::zeros(n);
+                    crate::pirls::update_glmvectors(
+                        state.y,
+                        &eta,
+                        &InverseLink::Standard(state.link.clone()),
+                        state.weights,
+                        &mut mu,
+                        &mut w_glm,
+                        &mut z_glm,
+                        None,
+                    )
+                    .ok()?;
+
+                    // Compute link derivative g'(u) = 1 + B'(u) · θ
+                    let g_prime = compute_link_derivative_from_state(state, &u, &bwiggle);
+
+                    // Effective weights: w_eff_i = w_glm_i * g'(u_i)^2
+                    let w_eff = &w_glm * &(&g_prime * &g_prime);
+
+                    let mut h = fast_xt_diag_x(&state.x_base, &w_eff);
+
+                    // Add penalty: S_λ = Σ λ_k S_k
+                    let penalty_layout = JointPenaltyLayout::for_state(state);
+                    let (lambda_base, _) = penalty_layout.lambdas(&rho);
+                    for (idx, s_k) in state.s_base.iter().enumerate() {
+                        let lam = lambda_base.get(idx).cloned().unwrap_or(0.0);
+                        if s_k.nrows() == p && s_k.ncols() == p && lam > 0.0 {
+                            h.scaled_add(lam, s_k);
+                        }
+                    }
+
+                    // Add ridge stabilization matching what was used in the fit
+                    if state.ridge_base_used > 0.0 {
+                        for i in 0..p {
+                            h[[i, i]] += state.ridge_base_used;
+                        }
+                    }
+
+                    // Invert via Cholesky
+                    match h.cholesky(Side::Lower) {
+                        Ok(chol) => {
+                            let mut cov = Array2::<f64>::eye(p);
+                            chol.solve_mat_in_place(&mut cov);
+                            // Verify all finite
+                            if cov.iter().all(|v: &f64| v.is_finite()) {
+                                Some(cov)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                })()
+            })
+            .flatten();
 
         let state = self.core.state;
         JointModelResult {
@@ -3021,6 +3046,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
     link: LinkFunction,
     config: &JointModelConfig,
     covariate_se: Option<Array1<f64>>,
+    include_base_covariance: bool,
 ) -> Result<JointModelResult, EstimationError> {
     if matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic) {
         return Err(EstimationError::InvalidSpecification(
@@ -3170,7 +3196,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         };
 
     let _ = reml_state.compute_cost(&best_rho)?;
-    Ok(reml_state.into_result())
+    Ok(reml_state.into_result(include_base_covariance))
 }
 
 /// Prediction result from joint model
@@ -3804,7 +3830,7 @@ mod tests {
             .state
             .compute_eta_full(&u, &reml_state.core.state.build_link_basis_from_state(&u));
         let expected = reml_state.core.state.recompute_deviance_from_eta(&eta_full);
-        let result = reml_state.into_result();
+        let result = reml_state.into_result(true);
         assert!(
             (result.deviance - expected).abs() <= 1e-10,
             "integrated final deviance drifted: got {}, expected {}",

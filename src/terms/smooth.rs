@@ -5002,13 +5002,7 @@ impl SpatialAdaptiveExactFamily {
 
 impl CustomFamily for SpatialAdaptiveExactFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "spatial adaptive exact family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let beta = &block_states[0].beta;
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
         let eval = self.exact_evaluation(beta)?;
         let mut gradient = fast_atv(&self.design, &eval.obs.score);
         gradient -= &eval.total_penaltygradient();
@@ -5035,13 +5029,8 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "spatial adaptive exact family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let eval = self.exact_evaluation(&block_states[0].beta)?;
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
+        let eval = self.exact_evaluation(beta)?;
         Ok(Some(eval.totalobjectivehessian(&self.design)?))
     }
 
@@ -5051,11 +5040,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         block_idx: usize,
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_idx != 0 {
-            return Err(format!(
-                "spatial adaptive exact family expects block_idx 0, got {block_idx}"
-            ));
-        }
+        expect_block_idx_zero(block_idx, "spatial adaptive exact family", "")?;
         self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta)
     }
 
@@ -5064,13 +5049,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "spatial adaptive exact family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let beta = &block_states[0].beta;
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
         if d_beta_flat.len() != beta.len() {
             return Err(format!(
                 "spatial adaptive exact family direction length mismatch: got {}, expected {}",
@@ -5090,11 +5069,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         block_idx: usize,
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        if block_idx != 0 {
-            return Err(format!(
-                "spatial adaptive exact family expects block_idx 0, got {block_idx}"
-            ));
-        }
+        expect_block_idx_zero(block_idx, "spatial adaptive exact family", "")?;
         Ok(self.linear_constraints.clone())
     }
 
@@ -5151,6 +5126,28 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
             hessian_psi: betahessian_explicit,
         }))
     }
+}
+
+fn expect_single_block_state<'a>(
+    block_states: &'a [ParameterBlockState],
+    family_name: &str,
+) -> Result<&'a ParameterBlockState, String> {
+    if block_states.len() != 1 {
+        return Err(format!(
+            "{family_name} expects 1 block, got {}",
+            block_states.len()
+        ));
+    }
+    Ok(&block_states[0])
+}
+
+fn expect_block_idx_zero(block_idx: usize, family_name: &str, context: &str) -> Result<(), String> {
+    if block_idx != 0 {
+        return Err(format!(
+            "{family_name} expects block_idx 0{context}, got {block_idx}"
+        ));
+    }
+    Ok(())
 }
 
 impl BoundedLinearFamily {
@@ -5289,13 +5286,7 @@ impl BoundedLinearFamily {
 
 impl CustomFamily for BoundedLinearFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "bounded linear family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let latent_beta = &block_states[0].beta;
+        let latent_beta = &expect_single_block_state(block_states, "bounded linear family")?.beta;
         let (obs, hessian, gradient, prior_loglik) = self.evaluation_from_latent(latent_beta)?;
         Ok(FamilyEvaluation {
             log_likelihood: obs.log_likelihood + prior_loglik,
@@ -5310,13 +5301,8 @@ impl CustomFamily for BoundedLinearFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "bounded linear family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let (_, hessian, _, _) = self.evaluation_from_latent(&block_states[0].beta)?;
+        let latent_beta = &expect_single_block_state(block_states, "bounded linear family")?.beta;
+        let (_, hessian, _, _) = self.evaluation_from_latent(latent_beta)?;
         Ok(Some(hessian))
     }
 
@@ -5326,11 +5312,7 @@ impl CustomFamily for BoundedLinearFamily {
         block_idx: usize,
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_idx != 0 {
-            return Err(format!(
-                "bounded linear family expects block_idx 0, got {block_idx}"
-            ));
-        }
+        expect_block_idx_zero(block_idx, "bounded linear family", "")?;
         self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta)
     }
 
@@ -5339,13 +5321,7 @@ impl CustomFamily for BoundedLinearFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "bounded linear family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let latent_beta = &block_states[0].beta;
+        let latent_beta = &expect_single_block_state(block_states, "bounded linear family")?.beta;
         if d_beta_flat.len() != latent_beta.len() {
             return Err(format!(
                 "bounded linear family directional derivative length mismatch: got {}, expected {}",
@@ -5411,13 +5387,9 @@ impl CustomFamily for BoundedLinearFamily {
                 self.offset.clone(),
             ));
         }
-        if block_states.len() != 1 {
-            return Err(format!(
-                "bounded linear family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let offset = self.nonlinear_offset_from_latent(&block_states[0].beta);
+        let offset = self.nonlinear_offset_from_latent(
+            &expect_single_block_state(block_states, "bounded linear family")?.beta,
+        );
         let x = if spec.design.ncols() == self.designzeroed.ncols() {
             self.designzeroed.clone()
         } else {
@@ -5437,17 +5409,12 @@ impl CustomFamily for BoundedLinearFamily {
         spec: &ParameterBlockSpec,
         d_beta: &Array1<f64>,
     ) -> Result<Option<BlockGeometryDirectionalDerivative>, String> {
-        if block_idx != 0 {
-            return Err(format!(
-                "bounded linear family expects block_idx 0 for geometry derivative, got {block_idx}"
-            ));
-        }
-        if block_states.len() != 1 {
-            return Err(format!(
-                "bounded linear family expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
+        expect_block_idx_zero(
+            block_idx,
+            "bounded linear family",
+            " for geometry derivative",
+        )?;
+        let _ = expect_single_block_state(block_states, "bounded linear family")?;
         if d_beta.len() != spec.design.ncols() {
             return Err(format!(
                 "bounded linear family geometry derivative direction mismatch: got {}, expected {}",

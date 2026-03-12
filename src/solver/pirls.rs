@@ -1805,7 +1805,8 @@ fn compute_firth_hat_and_half_logdet_sparse(
     for i in 0..p {
         identity[[i, i]] = 1.0;
     }
-    let h_inv_arr = chol.solve_mat(&identity);
+    chol.solve_mat_in_place(&mut identity);
+    let h_inv_arr = identity;
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     let xview = x_design_csr.as_ref();

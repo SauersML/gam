@@ -3891,6 +3891,115 @@ impl GaussianLocationScaleFamily {
         Ok(None)
     }
 
+    fn exact_newton_joint_hessian_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_from_designs(block_states, &xmu, &x_ls)
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+            block_states,
+            &xmu,
+            &x_ls,
+            d_beta_flat,
+        )
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+            block_states,
+            &xmu,
+            &x_ls,
+            d_beta_u_flat,
+            d_betav_flat,
+        )
+    }
+
+    fn exact_newton_joint_psi_terms_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_terms_from_designs(
+            block_states,
+            specs,
+            derivative_blocks,
+            psi_index,
+            &xmu,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psisecond_order_terms_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psisecond_order_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            &xmu,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psihessian_directional_derivative_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &xmu,
+            &x_ls,
+        )
+    }
+
     fn exact_newton_joint_hessian_from_designs(
         &self,
         block_states: &[ParameterBlockState],
@@ -4514,10 +4623,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_from_designs(block_states, &xmu, &x_ls)
+        self.exact_newton_joint_hessian_for_specs(block_states, None)
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -4525,13 +4631,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_directional_derivative_for_specs(
             block_states,
-            &xmu,
-            &x_ls,
+            None,
             d_beta_flat,
         )
     }
@@ -4542,13 +4644,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_second_directional_derivative_for_specs(
             block_states,
-            &xmu,
-            &x_ls,
+            None,
             d_beta_u_flat,
             d_betav_flat,
         )
@@ -4629,10 +4727,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_from_designs(block_states, &xmu, &x_ls)
+        self.exact_newton_joint_hessian_for_specs(block_states, Some(specs))
     }
 
     fn exact_newton_joint_hessian_directional_derivative_with_specs(
@@ -4641,13 +4736,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_directional_derivative_for_specs(
             block_states,
-            &xmu,
-            &x_ls,
+            Some(specs),
             d_beta_flat,
         )
     }
@@ -4659,13 +4750,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_second_directional_derivative_for_specs(
             block_states,
-            &xmu,
-            &x_ls,
+            Some(specs),
             d_beta_u_flat,
             d_betav_flat,
         )
@@ -4678,16 +4765,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psi_terms_from_designs(
+        self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
             derivative_blocks,
             psi_index,
-            &xmu,
-            &x_ls,
         )
     }
 
@@ -4699,16 +4781,12 @@ impl CustomFamily for GaussianLocationScaleFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psisecond_order_terms_from_designs(
+        self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_i,
             psi_j,
-            &xmu,
-            &x_ls,
         )
     }
 
@@ -4720,16 +4798,12 @@ impl CustomFamily for GaussianLocationScaleFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psihessian_directional_derivative_from_designs(
+        self.exact_newton_joint_psihessian_directional_derivative_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_index,
             d_beta_flat,
-            &xmu,
-            &x_ls,
         )
     }
 }
@@ -4781,15 +4855,22 @@ impl BinomialLogitFamily {
     }
 }
 
+fn expect_single_block<'a>(
+    block_states: &'a [ParameterBlockState],
+    family_name: &str,
+) -> Result<&'a ParameterBlockState, String> {
+    if block_states.len() != 1 {
+        return Err(format!(
+            "{family_name} expects 1 block, got {}",
+            block_states.len()
+        ));
+    }
+    Ok(&block_states[0])
+}
+
 impl CustomFamily for BinomialLogitFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "BinomialLogitFamily expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let eta = &expect_single_block(block_states, "BinomialLogitFamily")?.eta;
         let n = self.y.len();
         if eta.len() != n || self.weights.len() != n {
             return Err("BinomialLogitFamily input size mismatch".to_string());
@@ -4808,13 +4889,7 @@ impl CustomFamilyGenerative for BinomialLogitFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "BinomialLogitFamily expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let mean = block_states[Self::BLOCK_ETA]
+        let mean = expect_single_block(block_states, "BinomialLogitFamily")?
             .eta
             .mapv(|e| 1.0 / (1.0 + (-e.clamp(-30.0, 30.0)).exp()));
         Ok(GenerativeSpec {
@@ -5061,13 +5136,7 @@ impl PoissonLogFamily {
 
 impl CustomFamily for PoissonLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "PoissonLogFamily expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
         let n = self.y.len();
         if eta.len() != n || self.weights.len() != n {
             return Err("PoissonLogFamily input size mismatch".to_string());
@@ -5116,13 +5185,7 @@ impl CustomFamilyGenerative for PoissonLogFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "PoissonLogFamily expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let mean = block_states[Self::BLOCK_ETA]
+        let mean = expect_single_block(block_states, "PoissonLogFamily")?
             .eta
             .mapv(|e| e.clamp(-30.0, 30.0).exp().max(1e-12));
         Ok(GenerativeSpec {
@@ -5162,13 +5225,7 @@ impl GammaLogFamily {
 
 impl CustomFamily for GammaLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "GammaLogFamily expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
         let n = self.y.len();
         if eta.len() != n || self.weights.len() != n {
             return Err("GammaLogFamily input size mismatch".to_string());
@@ -5220,13 +5277,7 @@ impl CustomFamilyGenerative for GammaLogFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        if block_states.len() != 1 {
-            return Err(format!(
-                "GammaLogFamily expects 1 block, got {}",
-                block_states.len()
-            ));
-        }
-        let mean = block_states[Self::BLOCK_ETA]
+        let mean = expect_single_block(block_states, "GammaLogFamily")?
             .eta
             .mapv(|e| e.clamp(-30.0, 30.0).exp().max(1e-12));
         Ok(GenerativeSpec {
@@ -5349,6 +5400,53 @@ impl BinomialLocationScaleFamily {
             return self.dense_block_designs_fromspecs(specs).map(Some);
         }
         Ok(None)
+    }
+
+    fn exact_newton_joint_hessian_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_flat,
+        )
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_u_flat,
+            d_betav_flat,
+        )
     }
 
     fn exact_newton_joint_hessian_from_designs(
@@ -6802,16 +6900,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psi_terms_from_designs(
+        self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
             derivative_blocks,
             psi_index,
-            &x_t,
-            &x_ls,
         )
     }
 
@@ -6823,16 +6916,12 @@ impl CustomFamily for BinomialLocationScaleFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psisecond_order_terms_from_designs(
+        self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_i,
             psi_j,
-            &x_t,
-            &x_ls,
         )
     }
 
@@ -6844,16 +6933,12 @@ impl CustomFamily for BinomialLocationScaleFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psihessian_directional_derivative_from_designs(
+        self.exact_newton_joint_psihessian_directional_derivative_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_index,
             d_beta_flat,
-            &x_t,
-            &x_ls,
         )
     }
 
@@ -6909,10 +6994,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)
+        self.exact_newton_joint_hessian_for_specs(block_states, None)
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -6920,13 +7002,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_directional_derivative_for_specs(
             block_states,
-            &x_t,
-            &x_ls,
+            None,
             d_beta_flat,
         )
     }
@@ -6937,13 +7015,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_second_directional_derivative_for_specs(
             block_states,
-            &x_t,
-            &x_ls,
+            None,
             d_beta_u_flat,
             d_betav_flat,
         )
@@ -6954,10 +7028,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)
+        self.exact_newton_joint_hessian_for_specs(block_states, Some(specs))
     }
 
     fn exact_newton_joint_hessian_directional_derivative_with_specs(
@@ -6966,13 +7037,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_directional_derivative_for_specs(
             block_states,
-            &x_t,
-            &x_ls,
+            Some(specs),
             d_beta_flat,
         )
     }
@@ -6984,13 +7051,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+        self.exact_newton_joint_hessian_second_directional_derivative_for_specs(
             block_states,
-            &x_t,
-            &x_ls,
+            Some(specs),
             d_beta_u_flat,
             d_betav_flat,
         )
@@ -7312,6 +7375,85 @@ impl BinomialLocationScaleWiggleFamily {
             return self.dense_block_designs_fromspecs(specs).map(Some);
         }
         self.dense_block_designs().map(Some)
+    }
+
+    fn shadow_with_exact_joint_designs(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Self>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            y: self.y.clone(),
+            weights: self.weights.clone(),
+            link_kind: self.link_kind.clone(),
+            threshold_design: Some(DesignMatrix::Dense(x_t)),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
+            wiggle_knots: self.wiggle_knots.clone(),
+            wiggle_degree: self.wiggle_degree,
+        }))
+    }
+
+    fn exact_newton_joint_psi_terms_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            &x_t,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psisecond_order_terms_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psisecond_order_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            &x_t,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psihessian_directional_derivative_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &x_t,
+            &x_ls,
+        )
     }
 
     fn exact_newton_joint_psi_direction(
@@ -9908,17 +10050,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+        let Some(shadow) = self.shadow_with_exact_joint_designs(specs)? else {
             return Ok(None);
-        };
-        let shadow = Self {
-            y: self.y.clone(),
-            weights: self.weights.clone(),
-            link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(x_t)),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
-            wiggle_knots: self.wiggle_knots.clone(),
-            wiggle_degree: self.wiggle_degree,
         };
         shadow.exact_newton_joint_hessian(block_states)
     }
@@ -9929,17 +10062,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+        let Some(shadow) = self.shadow_with_exact_joint_designs(specs)? else {
             return Ok(None);
-        };
-        let shadow = Self {
-            y: self.y.clone(),
-            weights: self.weights.clone(),
-            link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(x_t)),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
-            wiggle_knots: self.wiggle_knots.clone(),
-            wiggle_degree: self.wiggle_degree,
         };
         shadow.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
     }
@@ -9951,17 +10075,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+        let Some(shadow) = self.shadow_with_exact_joint_designs(specs)? else {
             return Ok(None);
-        };
-        let shadow = Self {
-            y: self.y.clone(),
-            weights: self.weights.clone(),
-            link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(x_t)),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
-            wiggle_knots: self.wiggle_knots.clone(),
-            wiggle_degree: self.wiggle_degree,
         };
         shadow.exact_newton_joint_hessiansecond_directional_derivative(
             block_states,
@@ -9991,15 +10106,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         // drifts dot H_i, ddot H_ij. Keeping this contract explicit is what
         // makes the wiggle family's full [rho, psi] Hessian real rather than a
         // gradient-only or block-local surrogate.
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psi_terms_from_designs(
+        self.exact_newton_joint_psi_terms_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_index,
-            &x_t,
-            &x_ls,
         )
     }
 
@@ -10011,16 +10122,12 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psisecond_order_terms_from_designs(
+        self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_i,
             psi_j,
-            &x_t,
-            &x_ls,
         )
     }
 
@@ -10032,16 +10139,12 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_psihessian_directional_derivative_from_designs(
+        self.exact_newton_joint_psihessian_directional_derivative_for_specs(
             block_states,
+            specs,
             derivative_blocks,
             psi_index,
             d_beta_flat,
-            &x_t,
-            &x_ls,
         )
     }
 

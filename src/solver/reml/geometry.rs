@@ -421,7 +421,7 @@ impl<'a> RemlState<'a> {
     pub(super) fn sparse_exactweighted_cross_trace_xtau(
         &self,
         factor: &SparseExactFactor,
-        x_tau: &Array2<f64>,
+        x_tau: &HyperDesignDerivative,
         weights_diag: &Array1<f64>,
     ) -> Result<f64, EstimationError> {
         let n = x_tau.nrows();
@@ -445,7 +445,7 @@ impl<'a> RemlState<'a> {
         let mut start = 0usize;
         while start < n {
             let end = (start + batch).min(n);
-            let rhs = x_tau.slice(s![start..end, ..]).t().to_owned();
+            let rhs = x_tau.transpose_row_block(start..end);
             let solved = solve_sparse_spdmulti(factor, &rhs)?;
             for local_col in 0..(end - start) {
                 let row = start + local_col;
@@ -507,7 +507,7 @@ impl<'a> RemlState<'a> {
         let x_tau_beta = hyper_dir.x_tau_original.dot(&beta);
         let s_tau_total = hyper_dir.penalty_total_at(rho, p)?;
         let weighted_x_tau_beta = &pirls_result.solveweights * &x_tau_beta;
-        let mut g_psi = hyper_dir.x_tau_original.t().dot(&u)
+        let mut g_psi = hyper_dir.x_tau_original.t_dot(&u)
             - self.x().transpose_vector_multiply(&weighted_x_tau_beta)
             - s_tau_total.dot(&beta);
 
@@ -526,8 +526,8 @@ impl<'a> RemlState<'a> {
                     .map_err(EstimationError::InvalidInput)?;
                 Self::build_firth_dense_operator(x_dense_arc.as_ref(), &pirls_result.final_eta)?
             };
-            let need_tau_kernel = hyper_dir.x_tau_original.iter().any(|v| *v != 0.0);
-            let tau_bundle = Self::firth_exact_tau_kernel(
+            let need_tau_kernel = hyper_dir.x_tau_original.any_nonzero();
+            let tau_bundle = Self::firth_exact_tau_kernel_compact(
                 &op,
                 &hyper_dir.x_tau_original,
                 &beta,
@@ -621,7 +621,7 @@ impl<'a> RemlState<'a> {
                         p_dim,
                         None,
                         |basis_block: &Array2<f64>| {
-                            Ok(Self::firth_hphi_trace_apply_combined(
+                            Ok(Self::firth_hphi_trace_apply_combined_compact(
                                 op,
                                 &firth_dir,
                                 tau_x,

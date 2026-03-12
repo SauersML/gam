@@ -2158,7 +2158,7 @@ where
     let (cfg, _) = resolved_external_config(opts)?;
     let has_design_drift = hyper_dirs
         .iter()
-        .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
+        .any(|dir| dir.x_tau_original.any_nonzero());
     ensure_exact_directional_hyper_supported(
         cfg.link_function(),
         cfg.firth_bias_reduction,
