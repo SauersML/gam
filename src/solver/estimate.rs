@@ -1244,6 +1244,12 @@ fn resolve_external_family(
             Ok((LinkFunction::BetaLogistic, false))
         }
         crate::types::LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
+        crate::types::LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+            "optimize_external_design does not support PoissonLog; use fit_poisson_log".to_string(),
+        )),
+        crate::types::LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+            "optimize_external_design does not support GammaLog; use fit_gamma_log".to_string(),
+        )),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -2751,6 +2757,12 @@ impl FitResult {
                     "BinomialMixture requires fitted mixture link parameters".to_string(),
                 )),
             },
+            crate::types::LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+                "fitted_link_state is not defined for PoissonLog".to_string(),
+            )),
+            crate::types::LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+                "fitted_link_state is not defined for GammaLog".to_string(),
+            )),
             crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "fitted_link_state is not defined for RoystonParmar".to_string(),
             )),
