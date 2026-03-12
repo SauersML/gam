@@ -1,6 +1,6 @@
 use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, fast_atv};
+use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
@@ -524,27 +524,6 @@ fn compose_qs_from_split(q_pen: &Mat<f64>, q_null: &Mat<f64>, p: usize) -> Mat<f
     qs
 }
 
-/// Computes weighted column means for functional ANOVA decomposition.
-/// Returns the weighted means that would be subtracted by center_columns_in_place.
-fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
-    let denom = w.sum();
-    if denom <= 0.0 {
-        return Array1::zeros(x.ncols());
-    }
-    // Vectorized: means = (X^T w) / sum(w)
-    fast_atv(x, w) / denom
-}
-
-/// Centers the columns of a matrix using weighted means.
-/// This enforces intercept orthogonality (sum-to-zero) for the columns it is applied to.
-pub fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
-    let means = weighted_column_means(x, w);
-    // Subtract means from each column
-    for j in 0..x.ncols() {
-        let m = means[j];
-        x.column_mut(j).mapv_inplace(|v| v - m);
-    }
-}
 
 /// Computes the Kronecker product A ⊗ B for penalty matrix construction.
 /// This is used to create tensor product penalties that enforce smoothness
@@ -992,9 +971,9 @@ pub fn stable_reparameterizationwith_invariant(
         });
     }
 
-    let mut q_pen = array_to_faer(&invariant.split.q_pen);
+    let q_pen = array_to_faer(&invariant.split.q_pen);
     let q_null = array_to_faer(&invariant.split.q_null);
-    let mut rs_transformed: Vec<Mat<f64>> = invariant
+    let rs_transformed: Vec<Mat<f64>> = invariant
         .rs_transformed_base
         .iter()
         .map(array_to_faer)
@@ -1003,6 +982,7 @@ pub fn stable_reparameterizationwith_invariant(
     let penalized_rank = invariant.split.rank();
 
     let mut range_eigenvalues_sorted: Vec<f64> = Vec::new();
+    let mut range_rotation = Mat::<f64>::zeros(penalized_rank, penalized_rank);
     if penalized_rank > 0 {
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
         for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
@@ -1028,49 +1008,20 @@ pub fn stable_reparameterizationwith_invariant(
             .map(|&idx| range_eigenvalues[idx])
             .collect();
 
-        let mut range_rotation = Mat::<f64>::zeros(penalized_rank, penalized_rank);
+        // Build range_rotation = U (sorted eigenvectors) for E and S⁺
+        // construction only.  DO NOT apply to q_pen or rs_transformed —
+        // keeping Q_s lambda-independent prevents BFGS coordinate-system
+        // drift when multiple penalties interact (the eigenvectors of
+        // Σ λ_k S_k rotate with λ, breaking the quasi-Newton Hessian
+        // approximation at eigenvalue crossings).
         for (col_idx, &idx) in range_order.iter().enumerate() {
             for row in 0..penalized_rank {
                 range_rotation[(row, col_idx)] = range_eigenvectors[(row, idx)];
             }
         }
-
-        let mut qs_range = Mat::<f64>::zeros(p, penalized_rank);
-        matmul(
-            qs_range.as_mut(),
-            Accum::Replace,
-            q_pen.as_ref(),
-            range_rotation.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-        q_pen = qs_range;
-
-        for rs in rs_transformed.iter_mut() {
-            if rs.ncols() >= penalized_rank {
-                let rows = rs.nrows();
-                let mut rs_subset = Mat::<f64>::zeros(rows, penalized_rank);
-                for i in 0..rows {
-                    for j in 0..penalized_rank {
-                        rs_subset[(i, j)] = rs[(i, j)];
-                    }
-                }
-                let mut updated = Mat::<f64>::zeros(rows, penalized_rank);
-                matmul(
-                    updated.as_mut(),
-                    Accum::Replace,
-                    rs_subset.as_ref(),
-                    range_rotation.as_ref(),
-                    1.0,
-                    Par::Seq,
-                );
-                for i in 0..rows {
-                    for j in 0..penalized_rank {
-                        rs[(i, j)] = updated[(i, j)];
-                    }
-                }
-            }
-        }
+        // q_pen and rs_transformed stay in the lambda-independent
+        // invariant basis.  E and S⁺ below are expressed in this same
+        // basis using U from the eigendecomposition.
     }
 
     let mut s_k_transformed_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
@@ -1123,14 +1074,19 @@ pub fn stable_reparameterizationwith_invariant(
         Par::Seq,
     );
 
-    // E is represented in TRANSFORMED coordinates (beta_t). In this frame,
-    // penalized directions are the first `structural_rank` coordinates, so E is
-    // a diagonal block with sqrt(eigenvalue) entries and zeros elsewhere.
+    // E is represented in TRANSFORMED coordinates (beta_t).  Because the
+    // penalized subspace is NOT rotated by the lambda-dependent eigenvectors
+    // (to keep Q_s stable across BFGS iterations), E is no longer diagonal.
+    // Instead E = diag(√d) · U' embedded in structural_rank × p, so that
+    // E'E = U diag(d) U' = Σ λ_k S_k in the invariant penalized basis.
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
     for row_idx in 0..structural_rank {
         let safe_eigenval = range_eigs_sorted[row_idx].max(eigenvalue_floor);
         let sqrt_eigenval = safe_eigenval.sqrt();
-        e_transformed_mat[(row_idx, row_idx)] = sqrt_eigenval;
+        // E[row, j] = sqrt(d_row) * U'[row, j] = sqrt(d_row) * U[j, row]
+        for j in 0..penalized_rank {
+            e_transformed_mat[(row_idx, j)] = sqrt_eigenval * range_rotation[(j, row_idx)];
+        }
     }
 
     // Positive-part pseudo-logdet on fixed structural rank.
@@ -1142,22 +1098,33 @@ pub fn stable_reparameterizationwith_invariant(
 
     let mut det1vec = vec![0.0; lambdas.len()];
 
-    // Build S⁺ in TRANSFORMED coordinates:
-    // diag(1/eig_i) on penalized coordinates, zero on null-space coordinates.
+    // Build S⁺ = U diag(1/d) U' in the invariant penalized basis.
+    // Because we no longer rotate into the eigenbasis, S⁺ is a general
+    // (symmetric) matrix on the penalized block rather than diagonal.
     let mut s_plus = Mat::<f64>::zeros(p, p);
-    for (eig_idx, &eigenval) in range_eigs_sorted.iter().take(structural_rank).enumerate() {
-        if eigenval > eigenvalue_floor {
-            s_plus[(eig_idx, eig_idx)] = 1.0 / eigenval;
+    for l in 0..structural_rank {
+        let eigenval = range_eigs_sorted[l];
+        let inv_d = if eigenval > eigenvalue_floor {
+            1.0 / eigenval
+        } else {
+            0.0
+        };
+        // S⁺[i,j] += (1/d_l) * U[i,l] * U[j,l]
+        for i in 0..penalized_rank {
+            for j in 0..penalized_rank {
+                s_plus[(i, j)] += inv_d * range_rotation[(i, l)] * range_rotation[(j, l)];
+            }
         }
     }
 
     for (k, lambda) in lambdas.iter().enumerate() {
         let s_k = &s_k_transformed_cache[k];
+        // tr(S⁺ S_k) via element-wise contraction on the penalized block.
         let mut trace = 0.0_f64;
-        for i in 0..structural_rank {
-            // Since S⁺ is diagonal in transformed coordinates, tr(S⁺ S_k)
-            // reduces to weighted diagonal entries on penalized coordinates.
-            trace += s_plus[(i, i)] * s_k[(i, i)];
+        for i in 0..penalized_rank {
+            for j in 0..penalized_rank {
+                trace += s_plus[(i, j)] * s_k[(j, i)];
+            }
         }
         det1vec[k] = *lambda * trace;
     }
