@@ -24,6 +24,7 @@ mod hyper;
 mod runtime;
 mod strategy;
 mod trace;
+pub mod unified;
 
 enum FaerFactor {
     Llt(FaerLlt<f64>),
