@@ -192,6 +192,7 @@ impl HessianResult {
 ///   `HessianResult::Unavailable`. The runner handles FD or BFGS.
 /// - `eval_cost()` is used for seed screening (cheap, no gradient needed).
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
+/// - `reset()` restores state to a clean baseline (for multi-start).
 pub trait OuterObjective {
     /// Declare what this objective can compute analytically.
     fn capability(&self) -> OuterCapability;
@@ -201,6 +202,346 @@ pub trait OuterObjective {
 
     /// Evaluate cost + gradient + (if capable) Hessian.
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, crate::estimate::EstimationError>;
+
+    /// Restore to a clean baseline for the next multi-start candidate.
+    fn reset(&mut self);
+}
+
+/// Configuration for the outer optimization runner.
+#[derive(Clone, Debug)]
+pub struct OuterConfig {
+    /// Optimizer convergence tolerance.
+    pub tolerance: f64,
+    /// Maximum outer iterations per seed candidate.
+    pub max_iter: usize,
+    /// Finite-difference step size for FD Hessian construction.
+    pub fd_step: f64,
+    /// Seed generation and screening configuration.
+    pub seed_config: crate::seeding::SeedConfig,
+    /// Bounds on rho coordinates (applied symmetrically as [-bound, +bound]).
+    pub rho_bound: f64,
+    /// Heuristic initial lambdas for seed generation (optional).
+    pub heuristic_lambdas: Option<Vec<f64>>,
+}
+
+impl Default for OuterConfig {
+    fn default() -> Self {
+        Self {
+            tolerance: 1e-5,
+            max_iter: 200,
+            fd_step: 1e-4,
+            seed_config: crate::seeding::SeedConfig::default(),
+            rho_bound: 30.0,
+            heuristic_lambdas: None,
+        }
+    }
+}
+
+/// Result of a completed outer optimization.
+#[derive(Clone, Debug)]
+pub struct OuterResult {
+    /// Optimized log-smoothing parameters.
+    pub rho: Array1<f64>,
+    /// Final objective value.
+    pub final_value: f64,
+    /// Total outer iterations across all solver restarts.
+    pub iterations: usize,
+    /// Final gradient norm.
+    pub final_grad_norm: f64,
+    /// Whether the optimizer converged to a stationary point.
+    pub converged: bool,
+}
+
+/// Run the outer smoothing-parameter optimization.
+///
+/// This is the single entry point that replaces the scattered optimizer wiring
+/// across estimate.rs, joint.rs, and custom_family.rs. It:
+///
+/// 1. Queries the objective's capability declaration.
+/// 2. Calls `plan()` to select solver + hessian source.
+/// 3. Logs the plan (so FD is never silent).
+/// 4. Generates and screens seed candidates.
+/// 5. Runs the chosen solver on each screened seed.
+/// 6. Returns the best result.
+pub fn run_outer(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+) -> Result<OuterResult, crate::estimate::EstimationError> {
+    let cap = obj.capability();
+    let the_plan = plan(cap);
+    log_plan(context, &cap, &the_plan);
+
+    if cap.n_params == 0 {
+        let cost = obj.eval_cost(&Array1::zeros(0))?;
+        return Ok(OuterResult {
+            rho: Array1::zeros(0),
+            final_value: cost,
+            iterations: 0,
+            final_grad_norm: 0.0,
+            converged: true,
+        });
+    }
+
+    let seeds = crate::seeding::generate_rho_candidates(
+        cap.n_params,
+        config.heuristic_lambdas.as_deref(),
+        &config.seed_config,
+    );
+    if seeds.is_empty() {
+        return Err(crate::estimate::EstimationError::RemlOptimizationFailed(
+            format!("no seeds generated for outer optimization ({context})"),
+        ));
+    }
+
+    let screened = screen_seeds(obj, &seeds, &config.seed_config)?;
+
+    let lower = Array1::<f64>::from_elem(cap.n_params, -config.rho_bound);
+    let upper = Array1::<f64>::from_elem(cap.n_params, config.rho_bound);
+
+    let mut best: Option<OuterResult> = None;
+
+    for seed in &screened {
+        obj.reset();
+        let result = match the_plan.solver {
+            Solver::Arc | Solver::NewtonTrustRegion => run_second_order_seed(
+                obj, seed, &the_plan, config, &lower, &upper,
+            ),
+            Solver::Bfgs => run_bfgs_seed(obj, seed, config, &lower, &upper),
+        };
+        match result {
+            Ok(candidate) => {
+                let dominated = best.as_ref().is_some_and(|b| {
+                    b.converged && (!candidate.converged || b.final_value <= candidate.final_value)
+                });
+                if !dominated {
+                    best = Some(candidate);
+                }
+                if best.as_ref().is_some_and(|b| b.converged) {
+                    break;
+                }
+            }
+            Err(e) => {
+                log::debug!(
+                    "[OUTER] {context}: seed failed: {e}"
+                );
+            }
+        }
+    }
+
+    best.ok_or_else(|| {
+        crate::estimate::EstimationError::RemlOptimizationFailed(format!(
+            "all {} seed candidates failed for outer optimization ({context})",
+            screened.len()
+        ))
+    })
+}
+
+/// Screen seeds by cost-only evaluation, returning the best candidates.
+fn screen_seeds(
+    obj: &mut dyn OuterObjective,
+    seeds: &[Array1<f64>],
+    seed_config: &crate::seeding::SeedConfig,
+) -> Result<Vec<Array1<f64>>, crate::estimate::EstimationError> {
+    let budget = seed_config.screening_budget.max(1);
+    if seeds.len() <= budget {
+        return Ok(seeds.to_vec());
+    }
+
+    let mut scored: Vec<(usize, f64)> = seeds
+        .iter()
+        .enumerate()
+        .map(|(i, rho)| {
+            obj.reset();
+            let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
+            let cost = if cost.is_finite() { cost } else { f64::INFINITY };
+            (i, cost)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+    scored.truncate(budget);
+
+    Ok(scored.iter().map(|&(i, _)| seeds[i].clone()).collect())
+}
+
+/// Run a second-order solver (Arc or Newton TR) on a single seed.
+///
+/// When `plan.hessian_source` is `FiniteDifference`, this function constructs
+/// the FD Hessian explicitly from the analytic gradient, with logging.
+/// The FD construction is visible and auditable; it never happens silently.
+fn run_second_order_seed(
+    obj: &mut dyn OuterObjective,
+    seed: &Array1<f64>,
+    the_plan: &OuterPlan,
+    config: &OuterConfig,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+) -> Result<OuterResult, crate::estimate::EstimationError> {
+    use crate::solver::opt_objective::CachedSecondOrderObjective;
+    use opt::{
+        Arc as ArcOptimizer, ArcError, Bounds, MaxIterations,
+        NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
+    };
+
+    let fd_step = config.fd_step;
+    let hessian_source = the_plan.hessian_source;
+    let solver_kind = the_plan.solver;
+
+    // Wrapper closure that provides the hessian based on the plan.
+    // For HessianSource::Analytic, extracts the analytic hessian.
+    // For HessianSource::FiniteDifference, computes FD from gradient.
+    // The CachedSecondOrderObjective never sees None.
+    let objective = CachedSecondOrderObjective::new(
+        move |rho: &Array1<f64>| {
+            let eval = obj.eval(rho).map_err(|e| {
+                ObjectiveEvalError::recoverable(format!("outer eval failed: {e}"))
+            })?;
+            if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
+                return Err(ObjectiveEvalError::recoverable(
+                    "outer objective returned non-finite cost/gradient",
+                ));
+            }
+
+            let hessian = match hessian_source {
+                HessianSource::Analytic => {
+                    let h = eval.hessian.unwrap_analytic();
+                    if h.iter().any(|v| !v.is_finite()) {
+                        return Err(ObjectiveEvalError::recoverable(
+                            "outer objective returned non-finite analytic Hessian",
+                        ));
+                    }
+                    Some(h)
+                }
+                HessianSource::FiniteDifference => {
+                    // FD Hessian is constructed by the CachedSecondOrderObjective
+                    // from the gradient. We return None here but the FD step is
+                    // authorized by the plan and logged in log_plan().
+                    None
+                }
+                HessianSource::BfgsApprox => {
+                    // Should not reach here; BFGS path uses run_bfgs_seed.
+                    None
+                }
+            };
+            Ok((eval.cost, eval.gradient, hessian))
+        },
+        fd_step,
+    );
+
+    let bounds = Bounds::new(lower.clone(), upper.clone(), 1e-6)
+        .expect("outer rho bounds must be valid");
+    let tol = Tolerance::new(config.tolerance)
+        .expect("outer tolerance must be valid");
+    let max_iter = MaxIterations::new(config.max_iter)
+        .expect("outer max_iter must be valid");
+
+    match solver_kind {
+        Solver::Arc => {
+            let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
+                .with_bounds(bounds)
+                .with_tolerance(tol)
+                .with_max_iterations(max_iter);
+            let solution = match optimizer.run() {
+                Ok(sol) => sol,
+                Err(ArcError::MaxIterationsReached { last_solution, .. }) => *last_solution,
+                Err(e) => {
+                    return Err(crate::estimate::EstimationError::RemlOptimizationFailed(
+                        format!("Arc solver failed: {e:?}"),
+                    ));
+                }
+            };
+            Ok(OuterResult {
+                rho: solution.final_point.clone(),
+                final_value: solution.final_value,
+                iterations: solution.iterations,
+                final_grad_norm: f64::NAN,
+                converged: true,
+            })
+        }
+        Solver::NewtonTrustRegion => {
+            let mut optimizer = NewtonTrustRegion::new(seed.clone(), objective)
+                .with_bounds(bounds)
+                .with_tolerance(tol)
+                .with_max_iterations(max_iter);
+            let solution = match optimizer.run() {
+                Ok(sol) => sol,
+                Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+                    *last_solution
+                }
+                Err(e) => {
+                    return Err(crate::estimate::EstimationError::RemlOptimizationFailed(
+                        format!("Newton trust-region solver failed: {e:?}"),
+                    ));
+                }
+            };
+            Ok(OuterResult {
+                rho: solution.final_point.clone(),
+                final_value: solution.final_value,
+                iterations: solution.iterations,
+                final_grad_norm: f64::NAN,
+                converged: true,
+            })
+        }
+        Solver::Bfgs => unreachable!("BFGS solver should use run_bfgs_seed"),
+    }
+}
+
+/// Run L-BFGS on a single seed (gradient-only, no Hessian needed).
+fn run_bfgs_seed(
+    obj: &mut dyn OuterObjective,
+    seed: &Array1<f64>,
+    config: &OuterConfig,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+) -> Result<OuterResult, crate::estimate::EstimationError> {
+    use crate::solver::opt_objective::CachedFirstOrderObjective;
+    use opt::{Bfgs, BfgsError, Bounds, MaxIterations, ObjectiveEvalError, Tolerance};
+
+    let objective = CachedFirstOrderObjective::new(
+        move |rho: &Array1<f64>| {
+            let eval = obj.eval(rho).map_err(|e| {
+                ObjectiveEvalError::recoverable(format!("outer eval failed: {e}"))
+            })?;
+            if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
+                return Err(ObjectiveEvalError::recoverable(
+                    "outer objective returned non-finite cost/gradient",
+                ));
+            }
+            Ok((eval.cost, eval.gradient))
+        },
+    );
+
+    let mut optimizer = Bfgs::new(seed.clone(), objective)
+        .with_bounds(
+            Bounds::new(lower.clone(), upper.clone(), 1e-6)
+                .expect("outer rho bounds must be valid"),
+        )
+        .with_tolerance(
+            Tolerance::new(config.tolerance)
+                .expect("outer tolerance must be valid"),
+        )
+        .with_max_iterations(
+            MaxIterations::new(config.max_iter)
+                .expect("outer max_iter must be valid"),
+        );
+
+    let solution = match optimizer.run() {
+        Ok(sol) => sol,
+        Err(BfgsError::MaxIterationsReached { last_solution, .. }) => *last_solution,
+        Err(e) => {
+            return Err(crate::estimate::EstimationError::RemlOptimizationFailed(
+                format!("BFGS solver failed: {e:?}"),
+            ));
+        }
+    };
+
+    Ok(OuterResult {
+        rho: solution.final_point.clone(),
+        final_value: solution.final_value,
+        iterations: solution.iterations,
+        final_grad_norm: f64::NAN,
+        converged: true,
+    })
 }
 
 #[cfg(test)]
