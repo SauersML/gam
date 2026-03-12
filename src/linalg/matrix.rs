@@ -15,7 +15,7 @@ const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_SPARSE_TO_DENSE_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_SPARSE_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 pub use crate::linalg::utils::PcgSolveInfo;
 
@@ -179,6 +179,29 @@ fn dense_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
 #[inline]
 fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
     fast_atv(matrix, vector)
+}
+
+#[inline]
+fn dense_transpose_weighted_response(
+    matrix: &Array2<f64>,
+    weights: &Array1<f64>,
+    y: &Array1<f64>,
+    row_scale: Option<&Array1<f64>>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(matrix.ncols());
+    for i in 0..matrix.nrows() {
+        let mut scaled = y[i] * weights[i].max(0.0);
+        if let Some(scale) = row_scale {
+            scaled *= scale[i];
+        }
+        if scaled == 0.0 {
+            continue;
+        }
+        for j in 0..matrix.ncols() {
+            out[j] += matrix[[i, j]] * scaled;
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -829,7 +852,9 @@ impl LinearOperator for DesignMatrix {
                     out += &pen.dot(vector);
                 }
                 if ridge > 0.0 {
-                    out += &vector.mapv(|x| ridge * x);
+                    for j in 0..p {
+                        out[j] += ridge * vector[j];
+                    }
                 }
                 out
             }
@@ -875,7 +900,9 @@ impl LinearOperator for DesignMatrix {
                     out += &pen.dot(vector);
                 }
                 if ridge > 0.0 {
-                    out += &vector.mapv(|x| ridge * x);
+                    for j in 0..out.len() {
+                        out[j] += ridge * vector[j];
+                    }
                 }
                 out
             }
@@ -1035,10 +1062,7 @@ impl LinearOperator for DesignMatrix {
             ));
         }
         match self {
-            Self::Dense(_) => {
-                let wy = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
-                Ok(self.matvec_trans(&wy))
-            }
+            Self::Dense(x) => Ok(dense_transpose_weighted_response(x, weights, y, None)),
             Self::Sparse(xs) => {
                 let csr = xs
                     .as_ref()
@@ -1183,8 +1207,15 @@ impl LinearOperator for DenseRightProductView<'_> {
                 self.nrows()
             ));
         }
-        let weighted_y = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
-        Ok(self.apply_transpose(&weighted_y))
+        let weighted_xty = dense_transpose_weighted_response(self.base, weights, y, None);
+        let mut out = weighted_xty;
+        if let Some(factor) = self.first {
+            out = fast_atv(factor, &out);
+        }
+        if let Some(factor) = self.second {
+            out = fast_atv(factor, &out);
+        }
+        Ok(out)
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
@@ -1242,9 +1273,12 @@ impl LinearOperator for DenseRowScaledView<'_> {
                 self.nrows()
             ));
         }
-        let combined =
-            Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0) * self.scale[i]);
-        Ok(dense_transpose_matvec(self.matrix, &combined))
+        Ok(dense_transpose_weighted_response(
+            self.matrix,
+            weights,
+            y,
+            Some(self.scale),
+        ))
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
@@ -1327,11 +1361,11 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
                 self.nrows()
             ));
         }
-        let mut wy = y.clone();
-        for i in 0..wy.len() {
-            wy[i] *= weights[i].max(0.0);
-        }
-        Ok(self.apply_transpose(&wy))
+        let local = dense_transpose_weighted_response(self.local, weights, y, None);
+        let mut out = Array1::<f64>::zeros(self.total_cols);
+        out.slice_mut(ndarray::s![self.global_range.clone()])
+            .assign(&local);
+        Ok(out)
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
@@ -1689,11 +1723,15 @@ impl From<&DesignMatrix> for DesignMatrix {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesignMatrix, SparseDesignMatrix, dense_matvec, dense_transpose_matvec};
+    use super::{
+        DesignMatrix, SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
+        dense_transpose_weighted_response,
+    };
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, Axis, array};
+    use std::time::Instant;
 
     fn exact_weighted_penalized_solve(
         design: &Array2<f64>,
@@ -1949,5 +1987,57 @@ mod tests {
                 exact[i]
             );
         }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark for local performance validation"]
+    fn compute_xtwy_dense_allocationfree_microbenchmark() {
+        let n = 20_000usize;
+        let p = 192usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        let mut w = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            y[i] = ((i % 17) as f64 - 8.0) * 0.1;
+            w[i] = 0.25 + ((i % 11) as f64) * 0.05;
+            for j in 0..p {
+                x[[i, j]] = (((i * 13 + j * 7) % 97) as f64) / 97.0;
+            }
+        }
+
+        let warmup_old = {
+            let wy = Array1::from_shape_fn(n, |i| y[i] * w[i].max(0.0));
+            dense_transpose_matvec(&x, &wy)
+        };
+        let warmup_new = dense_transpose_weighted_response(&x, &w, &y, None);
+        for j in 0..p {
+            assert!((warmup_old[j] - warmup_new[j]).abs() < 1e-10);
+        }
+
+        let iters = 120usize;
+        let start_old = Instant::now();
+        let mut acc_old = 0.0_f64;
+        for _ in 0..iters {
+            let wy = Array1::from_shape_fn(n, |i| y[i] * w[i].max(0.0));
+            let out = dense_transpose_matvec(&x, &wy);
+            acc_old += out[0];
+        }
+        let old_elapsed = start_old.elapsed();
+
+        let start_new = Instant::now();
+        let mut acc_new = 0.0_f64;
+        for _ in 0..iters {
+            let out = dense_transpose_weighted_response(&x, &w, &y, None);
+            acc_new += out[0];
+        }
+        let new_elapsed = start_new.elapsed();
+
+        assert!((acc_old - acc_new).abs() < 1e-8);
+        println!(
+            "compute_xtwy microbenchmark: old={:?}, new={:?}, speedup={:.2}x",
+            old_elapsed,
+            new_elapsed,
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64()
+        );
     }
 }
