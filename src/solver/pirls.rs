@@ -918,11 +918,12 @@ impl PirlsWorkspace {
         cache.compute_dense(&cscview, weights)
     }
 
-    pub(crate) fn sparse_penalized_system_stats(
+    /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
+    fn ensure_sparse_penalty_cache(
         &mut self,
         x: &SparseColMat<usize, f64>,
         s_lambda: &Array2<f64>,
-    ) -> Result<SparsePenalizedSystemStats, EstimationError> {
+    ) -> Result<(), EstimationError> {
         let penalty_pattern = SparsePenaltyPattern::from_dense_upper(s_lambda, 1e-12);
         let rebuild = match self.sparse_penalized_system_cache.as_ref() {
             Some(cache) => !cache.matches(x, &penalty_pattern),
@@ -932,10 +933,16 @@ impl PirlsWorkspace {
             self.sparse_penalized_system_cache =
                 Some(SparsePenalizedSystemCache::new(x, penalty_pattern)?);
         }
-        let cache = self.sparse_penalized_system_cache.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput("missing sparse penalized cache".to_string())
-        })?;
-        Ok(cache.stats())
+        Ok(())
+    }
+
+    pub(crate) fn sparse_penalized_system_stats(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        s_lambda: &Array2<f64>,
+    ) -> Result<SparsePenalizedSystemStats, EstimationError> {
+        self.ensure_sparse_penalty_cache(x, s_lambda)?;
+        Ok(self.sparse_penalized_system_cache.as_ref().unwrap().stats())
     }
 
     // Phase 2 hook: numeric sparse penalized-system assembly in original coordinates.
@@ -946,19 +953,11 @@ impl PirlsWorkspace {
         s_lambda: &Array2<f64>,
         ridge: f64,
     ) -> Result<SparseColMat<usize, f64>, EstimationError> {
-        let penalty_pattern = SparsePenaltyPattern::from_dense_upper(s_lambda, 1e-12);
-        let rebuild = match self.sparse_penalized_system_cache.as_ref() {
-            Some(cache) => !cache.matches(x, &penalty_pattern),
-            None => true,
-        };
-        if rebuild {
-            self.sparse_penalized_system_cache =
-                Some(SparsePenalizedSystemCache::new(x, penalty_pattern)?);
-        }
-        let cache = self.sparse_penalized_system_cache.as_mut().ok_or_else(|| {
-            EstimationError::InvalidInput("missing sparse penalized cache".to_string())
-        })?;
-        cache.assemble_upper(x, weights, ridge)
+        self.ensure_sparse_penalty_cache(x, s_lambda)?;
+        self.sparse_penalized_system_cache
+            .as_mut()
+            .unwrap()
+            .assemble_upper(x, weights, ridge)
     }
 }
 

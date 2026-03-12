@@ -80,6 +80,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod report;
+
 type CliResult<T> = Result<T, CliError>;
 
 #[derive(Debug, Error)]
@@ -1409,32 +1411,10 @@ fn run_fitwith_predict_noise(
             Some(&binomial_noise_transform),
             None,
         );
-        match &location_scale_link_kind {
-            InverseLink::Sas(state) => {
-                model.family_state = FittedFamily::LocationScale {
-                    likelihood: LikelihoodFamily::BinomialSas,
-                    base_link: Some(InverseLink::Sas(*state)),
-                };
-            }
-            InverseLink::BetaLogistic(state) => {
-                model.family_state = FittedFamily::LocationScale {
-                    likelihood: LikelihoodFamily::BinomialBetaLogistic,
-                    base_link: Some(InverseLink::BetaLogistic(*state)),
-                };
-            }
-            InverseLink::Mixture(state) => {
-                model.family_state = FittedFamily::LocationScale {
-                    likelihood: LikelihoodFamily::BinomialMixture,
-                    base_link: Some(InverseLink::Mixture(state.clone())),
-                };
-            }
-            InverseLink::Standard(link_fn) => {
-                model.family_state = FittedFamily::LocationScale {
-                    likelihood: inverse_link_to_binomial_family(&InverseLink::Standard(*link_fn)),
-                    base_link: Some(InverseLink::Standard(*link_fn)),
-                };
-            }
-        }
+        model.family_state = FittedFamily::LocationScale {
+            likelihood: inverse_link_to_binomial_family(&location_scale_link_kind),
+            base_link: Some(location_scale_link_kind.clone()),
+        };
         if let Some((knots, degree, betawiggle)) = wiggle_meta {
             model.probitwiggle_knots = Some(knots.to_vec());
             model.probitwiggle_degree = Some(degree);
@@ -4375,24 +4355,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
 
         let mut fitted_inverse_link = survival_inverse_link.clone();
-        if let InverseLink::Sas(state0) = fitted_inverse_link.clone() {
-            let mut objective = |theta: &Array1<f64>| -> Result<f64, EstimationError> {
-                if theta.len() != 2 {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "SAS theta length mismatch: expected 2, got {}",
-                        theta.len()
-                    )));
-                }
-                let state = state_from_sasspec(SasLinkSpec {
-                    initial_epsilon: theta[0],
-                    initial_log_delta: theta[1],
-                })
-                .map_err(EstimationError::InvalidInput)?;
-                let fit = fit_survival_location_scale(buildspec(InverseLink::Sas(state), None))
-                    .map_err(EstimationError::InvalidInput)?;
-                Ok(fit.penalizedobjective)
-            };
-            let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
+        // Optimize link parameters via BFGS for parametric inverse-link families.
+        let optimize_link_bfgs = |init: Array1<f64>,
+                                   name: &str,
+                                   mut objective: Box<
+            dyn FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
+        >,
+                                   recover: Box<
+            dyn Fn(&Array1<f64>) -> Option<InverseLink>,
+        >|
+         -> Option<InverseLink> {
+            let dim = init.len();
             let mut opt = SmoothingBfgsOptions {
                 max_iter: 30,
                 tol: 1e-4,
@@ -4403,89 +4376,88 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opt.seed_config.screening_budget = 3;
             opt.seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
             match optimize_log_smoothingwithmultistart(
-                2,
+                dim,
                 init.as_slice().map(|s| s as &[f64]),
-                &mut objective,
+                &mut *objective,
                 &opt,
             ) {
                 Ok(opt_res) => {
-                    if let Ok(opt_state) = state_from_sasspec(SasLinkSpec {
-                        initial_epsilon: opt_res.rho[0],
-                        initial_log_delta: opt_res.rho[1],
-                    }) {
+                    if let Some(link) = recover(&opt_res.rho) {
                         eprintln!(
-                            "[survival link opt] optimized SAS params: eps={:.6e} log_delta={:.6e} iters={} stationary={} finalobj={:.6e}",
-                            opt_res.rho[0],
-                            opt_res.rho[1],
+                            "[survival link opt] optimized {name} params: dim={} iters={} stationary={} finalobj={:.6e}",
+                            opt_res.rho.len(),
                             opt_res.iterations,
                             opt_res.stationary,
                             opt_res.final_value
                         );
-                        fitted_inverse_link = InverseLink::Sas(opt_state);
+                        Some(link)
+                    } else {
+                        None
                     }
                 }
                 Err(err) => {
-                    eprintln!(
-                        "[survival link opt] SAS optimization failed; using initial params: {err}"
-                    );
+                    eprintln!("[survival link opt] {name} optimization failed; using initial params: {err}");
+                    None
                 }
+            }
+        };
+        if let InverseLink::Sas(state0) = fitted_inverse_link.clone() {
+            let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
+            if let Some(link) = optimize_link_bfgs(
+                init,
+                "SAS",
+                Box::new(|theta: &Array1<f64>| {
+                    let state = state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: theta[0],
+                        initial_log_delta: theta[1],
+                    })
+                    .map_err(EstimationError::InvalidInput)?;
+                    Ok(fit_survival_location_scale(buildspec(InverseLink::Sas(state), None))
+                        .map_err(EstimationError::InvalidInput)?
+                        .penalizedobjective)
+                }),
+                Box::new(|rho| {
+                    state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: rho[0],
+                        initial_log_delta: rho[1],
+                    })
+                    .ok()
+                    .map(InverseLink::Sas)
+                }),
+            ) {
+                fitted_inverse_link = link;
             }
         }
         if let InverseLink::BetaLogistic(state0) = fitted_inverse_link.clone() {
-            let mut objective = |theta: &Array1<f64>| -> Result<f64, EstimationError> {
-                if theta.len() != 2 {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "Beta-Logistic theta length mismatch: expected 2, got {}",
-                        theta.len()
-                    )));
-                }
-                let state = state_from_beta_logisticspec(SasLinkSpec {
-                    initial_epsilon: theta[0],
-                    initial_log_delta: theta[1],
-                })
-                .map_err(EstimationError::InvalidInput)?;
-                let fit =
-                    fit_survival_location_scale(buildspec(InverseLink::BetaLogistic(state), None))
-                        .map_err(EstimationError::InvalidInput)?;
-                Ok(fit.penalizedobjective)
-            };
             let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-            let mut opt = SmoothingBfgsOptions {
-                max_iter: 30,
-                tol: 1e-4,
-                finite_diff_step: 1e-3,
-                ..SmoothingBfgsOptions::default()
-            };
-            opt.seed_config.max_seeds = 8;
-            opt.seed_config.screening_budget = 3;
-            opt.seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
-            match optimize_log_smoothingwithmultistart(
-                2,
-                init.as_slice().map(|s| s as &[f64]),
-                &mut objective,
-                &opt,
+            if let Some(link) = optimize_link_bfgs(
+                init,
+                "BetaLogistic",
+                Box::new(|theta: &Array1<f64>| {
+                    let state = state_from_beta_logisticspec(SasLinkSpec {
+                        initial_epsilon: theta[0],
+                        initial_log_delta: theta[1],
+                    })
+                    .map_err(EstimationError::InvalidInput)?;
+                    Ok(
+                        fit_survival_location_scale(buildspec(
+                            InverseLink::BetaLogistic(state),
+                            None,
+                        ))
+                        .map_err(EstimationError::InvalidInput)?
+                        .penalizedobjective,
+                    )
+                }),
+                Box::new(|rho| {
+                    state_from_beta_logisticspec(SasLinkSpec {
+                        initial_epsilon: rho[0],
+                        initial_log_delta: rho[1],
+                    })
+                    .ok()
+                    .map(InverseLink::BetaLogistic)
+                }),
             ) {
-                Ok(opt_res) => {
-                    if let Ok(opt_state) = state_from_beta_logisticspec(SasLinkSpec {
-                        initial_epsilon: opt_res.rho[0],
-                        initial_log_delta: opt_res.rho[1],
-                    }) {
-                        eprintln!(
-                            "[survival link opt] optimized Beta-Logistic params: eps={:.6e} delta={:.6e} iters={} stationary={} finalobj={:.6e}",
-                            opt_res.rho[0],
-                            opt_res.rho[1],
-                            opt_res.iterations,
-                            opt_res.stationary,
-                            opt_res.final_value
-                        );
-                        fitted_inverse_link = InverseLink::BetaLogistic(opt_state);
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[survival link opt] Beta-Logistic optimization failed; using initial params: {err}"
-                    );
-                }
+                fitted_inverse_link = link;
             }
         }
         if let InverseLink::Mixture(state0) = fitted_inverse_link.clone()
@@ -4493,52 +4465,35 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         {
             let components = state0.components.clone();
             let init = state0.rho.clone();
-            let mut objective = |rho: &Array1<f64>| -> Result<f64, EstimationError> {
-                let state = state_fromspec(&MixtureLinkSpec {
-                    components: components.clone(),
-                    initial_rho: rho.clone(),
-                })
-                .map_err(EstimationError::InvalidInput)?;
-                let fit = fit_survival_location_scale(buildspec(InverseLink::Mixture(state), None))
-                    .map_err(EstimationError::InvalidInput)?;
-                Ok(fit.penalizedobjective)
-            };
-            let mut opt = SmoothingBfgsOptions {
-                max_iter: 30,
-                tol: 1e-4,
-                finite_diff_step: 1e-3,
-                ..SmoothingBfgsOptions::default()
-            };
-            // Survival objective is expensive and noisy; lighter multi-start is enough.
-            opt.seed_config.max_seeds = 8;
-            opt.seed_config.screening_budget = 3;
-            opt.seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
-            match optimize_log_smoothingwithmultistart(
-                state0.rho.len(),
-                init.as_slice().map(|s| s as &[f64]),
-                &mut objective,
-                &opt,
-            ) {
-                Ok(opt_res) => {
-                    if let Ok(opt_state) = state_fromspec(&MixtureLinkSpec {
+            let components2 = components.clone();
+            if let Some(link) = optimize_link_bfgs(
+                init,
+                "mixture",
+                Box::new(move |rho: &Array1<f64>| {
+                    let state = state_fromspec(&MixtureLinkSpec {
                         components: components.clone(),
-                        initial_rho: opt_res.rho.clone(),
-                    }) {
-                        eprintln!(
-                            "[survival link opt] optimized mixture rho: dim={} iters={} stationary={} finalobj={:.6e}",
-                            opt_res.rho.len(),
-                            opt_res.iterations,
-                            opt_res.stationary,
-                            opt_res.final_value
-                        );
-                        fitted_inverse_link = InverseLink::Mixture(opt_state);
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[survival link opt] mixture rho optimization failed; using initial rho: {err}"
-                    );
-                }
+                        initial_rho: rho.clone(),
+                    })
+                    .map_err(EstimationError::InvalidInput)?;
+                    Ok(
+                        fit_survival_location_scale(buildspec(
+                            InverseLink::Mixture(state),
+                            None,
+                        ))
+                        .map_err(EstimationError::InvalidInput)?
+                        .penalizedobjective,
+                    )
+                }),
+                Box::new(move |rho| {
+                    state_fromspec(&MixtureLinkSpec {
+                        components: components2.clone(),
+                        initial_rho: rho.to_owned(),
+                    })
+                    .ok()
+                    .map(InverseLink::Mixture)
+                }),
+            ) {
+                fitted_inverse_link = link;
             }
         }
         let mut wiggle_knots: Option<Array1<f64>> = None;
@@ -5693,67 +5648,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     progress.advance_workflow(1);
 
-    let out = args.out.unwrap_or_else(|| {
-        let stem = args
-            .model
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model");
-        PathBuf::from(format!("{stem}.report.html"))
-    });
-
-    let mut summaryrows = Vec::<String>::new();
-    summaryrows.push(format!(
-        "<tr><th>Family</th><td>{}</td></tr>",
-        html_escape(&pretty_familyname(model.likelihood()))
-    ));
-    summaryrows.push(format!(
-        "<tr><th>Model kind</th><td>{:?}</td></tr>",
-        model.predict_model_class()
-    ));
-    summaryrows.push(format!(
-        "<tr><th>Deviance</th><td>{:.6e}</td></tr>",
-        fit.deviance
-    ));
-    summaryrows.push(format!(
-        "<tr><th>REML/LAML</th><td>{:.6e}</td></tr>",
-        fit.reml_score
-    ));
-    summaryrows.push(format!(
-        "<tr><th>Iterations</th><td>{}</td></tr>",
-        fit.iterations
-    ));
-    summaryrows.push(format!(
-        "<tr><th>EDF total</th><td>{:.4}</td></tr>",
-        fit.edf_total().unwrap_or(0.0)
-    ));
-
-    let beta_se = fit
-        .beta_standard_errors_corrected()
-        .or(fit.beta_standard_errors());
-    let mut coefrows = Vec::<String>::new();
-    for (i, b) in fit.beta.iter().copied().enumerate() {
-        let se = beta_se.and_then(|s| s.get(i).copied());
-        coefrows.push(format!(
-            "<tr><td>{}</td><td>{:.6e}</td><td>{}</td></tr>",
-            i,
-            b,
-            se.map(|v| format!("{v:.6e}"))
-                .unwrap_or_else(|| "NA".to_string())
-        ));
-    }
-
-    let mut edfrows = Vec::<String>::new();
-    for (i, edf) in fit.edf_by_block().iter().copied().enumerate() {
-        edfrows.push(format!("<tr><td>{}</td><td>{:.6}</td></tr>", i, edf));
-    }
-
-    let mut plot_scripts = Vec::<String>::new();
-    let mut diag_notes = Vec::<String>::new();
-    let mut alorows = String::new();
-    let mut continuousrows = String::new();
-
-    if let Some(data_path) = args.data.as_ref() {
+    let data_ctx = if let Some(data_path) = args.data.as_ref() {
         progress.set_stage("report", "loading report dataset");
         let schema = model.require_data_schema()?;
         let ds = load_datasetwith_schema(data_path, schema)?;
@@ -5766,7 +5661,8 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
             .collect();
         let training_headers = model.training_headers.as_ref();
         let parsed = parse_formula(&model.formula)?;
-        if let Some(y_col) = col_map.get(&parsed.response).copied() {
+        let y_col = col_map.get(&parsed.response).copied();
+        if let Some(y_col) = y_col {
             if matches!(
                 model.predict_model_class(),
                 PredictModelClass::Standard | PredictModelClass::BinomialLocationScale
@@ -5797,245 +5693,40 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     y.view(),
                     reportweights.view(),
                 );
-                for st in &summary.smooth_terms {
-                    if let Some(ord) = st.continuous_order.as_ref() {
-                        let status = match ord.status {
-                            ContinuousSmoothnessOrderStatus::Ok => "Ok",
-                            ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
-                            ContinuousSmoothnessOrderStatus::FirstOrderLimit => "FirstOrderLimit",
-                            ContinuousSmoothnessOrderStatus::IntrinsicLimit => "IntrinsicLimit",
-                            ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => {
-                                "UndefinedZeroLambda"
-                            }
-                        };
-                        let r_txt = ord
-                            .r_ratio
-                            .filter(|v| v.is_finite())
-                            .map(|v| format!("{v:.6e}"))
-                            .unwrap_or_else(|| "NA".to_string());
-                        let nu_txt = ord
-                            .nu
-                            .filter(|v| v.is_finite())
-                            .map(|v| format!("{v:.6e}"))
-                            .unwrap_or_else(|| "NA".to_string());
-                        let kappa_txt = ord
-                            .kappa2
-                            .filter(|v| v.is_finite())
-                            .map(|v| format!("{v:.6e}"))
-                            .unwrap_or_else(|| "NA".to_string());
-                        continuousrows.push_str(&format!(
-                            "<tr><td>{}</td><td>{:.6e}</td><td>{:.6e}</td><td>{:.6e}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                            html_escape(&st.name),
-                            ord.lambda0,
-                            ord.lambda1,
-                            ord.lambda2,
-                            r_txt,
-                            nu_txt,
-                            kappa_txt,
-                            status
-                        ));
-                    }
-                }
-                let residuals = &y - &pred.mean;
-                let mut residuals_sorted = residuals.to_vec();
-                residuals_sorted
-                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let n = residuals_sorted.len().max(1);
-                let theo = (0..n)
-                    .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                plot_scripts.push(format!(
-                    "Plotly.newPlot('qq_plot',[{{x:{},y:{},mode:'markers',name:'QQ'}}],{{title:'Residual QQ Plot',xaxis:{{title:'Normal quantile'}},yaxis:{{title:'Residual'}}}});",
-                    serde_json::to_string(&theo).map_err(|e| e.to_string())?,
-                    serde_json::to_string(&residuals_sorted).map_err(|e| e.to_string())?,
-                ));
-
-                plot_scripts.push(format!(
-                    "Plotly.newPlot('fit_plot',[{{x:{},y:{},mode:'markers',name:'Observed'}},{{x:{},y:{},mode:'markers',name:'Predicted'}}],{{title:'Observed vs Predicted',xaxis:{{title:'Row'}},yaxis:{{title:'Value'}}}});",
-                    serde_json::to_string(&(0..y.len()).collect::<Vec<_>>()).map_err(|e| e.to_string())?,
-                    serde_json::to_string(&y.to_vec()).map_err(|e| e.to_string())?,
-                    serde_json::to_string(&(0..pred.mean.len()).collect::<Vec<_>>()).map_err(|e| e.to_string())?,
-                    serde_json::to_string(&pred.mean.to_vec()).map_err(|e| e.to_string())?,
-                ));
-
-                if is_binary_response(y.view()) {
-                    let mut bins: Vec<(usize, f64, f64)> = (0..10).map(|b| (b, 0.0, 0.0)).collect();
-                    let mut counts = [0usize; 10];
-                    for i in 0..y.len() {
-                        let p = pred.mean[i].clamp(0.0, 1.0);
-                        let b = ((p * 10.0).floor() as usize).min(9);
-                        bins[b].1 += p;
-                        bins[b].2 += y[i];
-                        counts[b] += 1;
-                    }
-                    let mut x = Vec::<f64>::new();
-                    let mut yobs = Vec::<f64>::new();
-                    for b in 0..10 {
-                        if counts[b] == 0 {
-                            continue;
-                        }
-                        x.push(bins[b].1 / counts[b] as f64);
-                        yobs.push((bins[b].2 / counts[b] as f64).clamp(0.0, 1.0));
-                    }
-                    plot_scripts.push(format!(
-                        "Plotly.newPlot('cal_plot',[{{x:{},y:{},mode:'markers+lines',name:'Calibration'}},{{x:[0,1],y:[0,1],mode:'lines',name:'Ideal'}}],{{title:'Calibration (deciles)',xaxis:{{title:'Mean predicted'}},yaxis:{{title:'Observed rate'}}}});",
-                        serde_json::to_string(&x).map_err(|e| e.to_string())?,
-                        serde_json::to_string(&yobs).map_err(|e| e.to_string())?,
-                    ));
-                }
-
-                if let Ok(link) = model
-                    .resolved_inverse_link()?
-                    .map(|lk| lk.link_function())
-                    .ok_or_else(|| "missing link".to_string())
-                {
-                    match compute_alo_diagnostics_from_fit(&fit, y.view(), link) {
-                        Ok(alo) => {
-                            for i in 0..alo.leverage.len() {
-                                alorows.push_str(&format!(
-                                    "<tr><td>{}</td><td>{:.6e}</td><td>{:.6e}</td><td>{:.6e}</td></tr>",
-                                    i, alo.leverage[i], alo.eta_tilde[i], alo.se_sandwich[i]
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            diag_notes.push(format!("ALO diagnostics unavailable: {e}"));
-                        }
-                    }
-                }
-
-                for st in &spec.smooth_terms {
-                    if let Some(col) = smooth_term_primary_column(st)
-                        && col < ds.values.ncols()
-                    {
-                        let x = ds.values.column(col).to_owned();
-                        if let Some(design_term) =
-                            design.smooth.terms.iter().find(|t| t.name == st.name)
-                        {
-                            let contrib = design
-                                .design
-                                .slice(s![.., design_term.coeff_range.clone()])
-                                .dot(&fit.beta.slice(s![design_term.coeff_range.clone()]));
-                            let mut pairs = x
-                                .iter()
-                                .copied()
-                                .zip(contrib.iter().copied())
-                                .collect::<Vec<_>>();
-                            pairs.sort_by(|a, b| {
-                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let xs = pairs.iter().map(|p| p.0).collect::<Vec<_>>();
-                            let ys = pairs.iter().map(|p| p.1).collect::<Vec<_>>();
-                            let div_id = format!("smooth_{}", html_id(&st.name));
-                            plot_scripts.push(format!(
-                                "Plotly.newPlot('{}',[{{x:{},y:{},mode:'lines',name:'{}'}}],{{title:'Smooth term: {}',xaxis:{{title:'x'}},yaxis:{{title:'Contribution'}}}});",
-                                div_id,
-                                serde_json::to_string(&xs).map_err(|e| e.to_string())?,
-                                serde_json::to_string(&ys).map_err(|e| e.to_string())?,
-                                js_escape(&st.name),
-                                js_escape(&st.name)
-                            ));
-                        }
-                    }
-                }
+                let design_smooth_terms: Vec<(String, std::ops::Range<usize>)> = design
+                    .smooth
+                    .terms
+                    .iter()
+                    .map(|t| (t.name.clone(), t.coeff_range.clone()))
+                    .collect();
+                Some(report::ReportDataContext::new(
+                    y,
+                    pred.mean.to_owned(),
+                    summary,
+                    // Safety: spec lives long enough — we own it in this scope.
+                    // We leak a ref via unsafe to avoid lifetime gymnastics with the
+                    // builder, since build_report_input consumes it immediately.
+                    unsafe { &*(&spec as *const _) },
+                    design.design.to_owned(),
+                    ds.values.to_owned(),
+                    design_smooth_terms,
+                ))
+            } else {
+                None
             }
+        } else {
+            None
         }
     } else {
-        diag_notes.push("No data provided: residual QQ, calibration, and ALO sections are omitted. Pass training/new data as second positional argument.".to_string());
         progress.advance_workflow(2);
-    }
-
-    let smooth_divs = if let Some(spec) = model.resolved_termspec.as_ref() {
-        spec.smooth_terms
-            .iter()
-            .map(|st| {
-                format!(
-                    "<h3>{}</h3><div id=\"smooth_{}\" class=\"plot\"></div>",
-                    html_escape(&st.name),
-                    html_id(&st.name)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        String::new()
+        None
     };
 
-    let html = format!(
-        r#"<!doctype html>
-<html><head>
-<meta charset="utf-8"/>
-<title>GAM Report</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-<style>
-body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 24px; }}
-h1,h2,h3 {{ margin: 0 0 10px 0; }}
-table {{ border-collapse: collapse; width: 100%; margin-bottom: 16px; }}
-th, td {{ border: 1px solid #ddd; padding: 6px 8px; font-size: 13px; text-align: left; }}
-th {{ background: #f6f8fa; }}
-.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-.plot {{ width: 100%; height: 320px; border: 1px solid #eee; }}
-.notes {{ background:#fffbe6; border:1px solid #ffe58f; padding:10px; margin-bottom:12px; }}
-</style></head>
-<body>
-<h1>GAM Report</h1>
-<p><b>Model:</b> {model_path}</p>
-{notes}
-<h2>Model Summary</h2>
-<table>{summaryrows}</table>
-<h2>Coefficient Table</h2>
-<table><tr><th>Index</th><th>Estimate</th><th>Std. Error</th></tr>{coefrows}</table>
-	<h2>EDF by Penalty Block</h2>
-	<table><tr><th>Block</th><th>EDF</th></tr>{edfrows}</table>
-	<h2>Continuous Smoothness Order</h2>
-	<table><tr><th>Term</th><th>lambda0</th><th>lambda1</th><th>lambda2</th><th>R</th><th>nu</th><th>kappa^2</th><th>Status</th></tr>{continuousrows}</table>
-	<h2>Diagnostics</h2>
-<div class="grid">
-  <div id="qq_plot" class="plot"></div>
-  <div id="fit_plot" class="plot"></div>
-  <div id="cal_plot" class="plot"></div>
-</div>
-<h2>ALO Leverage Table</h2>
-<table><tr><th>Row</th><th>Leverage</th><th>eta_tilde</th><th>SE sandwich</th></tr>{alorows}</table>
-<h2>Smooth Term Plots</h2>
-{smooth_divs}
-<script>{scripts}</script>
-</body></html>"#,
-        model_path = html_escape(&args.model.display().to_string()),
-        notes = if diag_notes.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "<div class=\"notes\">{}</div>",
-                diag_notes
-                    .iter()
-                    .map(|n| html_escape(n))
-                    .collect::<Vec<_>>()
-                    .join("<br/>")
-            )
-        },
-        summaryrows = summaryrows.join(""),
-        coefrows = coefrows.join(""),
-        edfrows = edfrows.join(""),
-        continuousrows = if continuousrows.is_empty() {
-            "<tr><td colspan=\"8\">Unavailable (requires smooth terms with exactly 3 active penalties and report data input)</td></tr>".to_string()
-        } else {
-            continuousrows
-        },
-        alorows = if alorows.is_empty() {
-            "<tr><td colspan=\"4\">Unavailable</td></tr>".to_string()
-        } else {
-            alorows
-        },
-        smooth_divs = smooth_divs,
-        scripts = plot_scripts.join("\n"),
-    );
+    progress.set_stage("report", "generating html");
+    let input = report::build_report_input(&model, &fit, &args.model, data_ctx)?;
+    let out_path = args.out.as_deref();
+    let out = report::write_report(&input, out_path, &args.model)?;
 
-    progress.advance_workflow(report_total_steps.saturating_sub(1));
-    progress.set_stage("report", "writing html report");
-    fs::write(&out, html)
-        .map_err(|e| format!("failed to write report '{}': {e}", out.display()))?;
     progress.advance_workflow(report_total_steps);
     progress.finish_progress("report complete");
     println!("wrote report: {}", out.display());
