@@ -32,17 +32,6 @@ impl GenerativeSpec {
         self.mean.len()
     }
 
-    /// Pointwise conditional variance implied by the observation model.
-    pub fn conditionalvariance(&self) -> Array1<f64> {
-        match &self.noise {
-            NoiseModel::Gaussian { sigma } => sigma.mapv(|s| s * s),
-            NoiseModel::Poisson => self.mean.mapv(|m| m.max(0.0)),
-            NoiseModel::Gamma { shape } => {
-                self.mean.mapv(|m| ((m * m) / shape.max(1e-12)).max(0.0))
-            }
-            NoiseModel::Bernoulli => self.mean.mapv(|m| (m * (1.0 - m)).max(0.0)),
-        }
-    }
 }
 
 /// Build a generative specification for built-in GAM families from eta/mean.

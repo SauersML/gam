@@ -1544,13 +1544,6 @@ impl DesignMatrix {
         }
     }
 
-    pub fn try_to_dense(&self, context: &str) -> Result<Array2<f64>, String> {
-        match self {
-            Self::Dense(matrix) => Ok(matrix.clone()),
-            Self::Sparse(matrix) => Ok(matrix.try_to_dense_arc(context)?.as_ref().clone()),
-        }
-    }
-
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Dense(matrix) => Arc::new(matrix.clone()),

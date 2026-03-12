@@ -454,16 +454,6 @@ impl<'a> JointModelState<'a> {
         self.link.clone()
     }
 
-    /// Get number of base penalties
-    pub fn n_base_penalties(&self) -> usize {
-        self.s_base.len()
-    }
-
-    /// Get number of link penalties  
-    pub fn n_link_penalties(&self) -> usize {
-        1 // Single penalty for link wiggle
-    }
-
     /// Initialize the geometric constraint transform from the knot vector.
     ///
     /// This computes Z and S_c using Greville abscissae, which depend only on
@@ -3385,15 +3375,6 @@ fn compute_link_derivative_terms_from_state(
     }
 
     (g_prime, gsecond, b_prime_u)
-}
-
-/// Public version for use in HMC Hessian computation
-pub fn compute_link_derivative_from_result_public(
-    result: &JointModelResult,
-    eta_base: &Array1<f64>,
-    bwiggle: &Array2<f64>,
-) -> Array1<f64> {
-    compute_link_derivative_from_result(result, eta_base, bwiggle)
 }
 
 fn compute_link_derivative_from_result(

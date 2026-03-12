@@ -1,4 +1,4 @@
-use ndarray::{Array1, ArrayView1};
+use ndarray::Array1;
 #[cfg(test)]
 use std::fs;
 #[cfg(test)]
@@ -32,20 +32,27 @@ fn canonicalzero(v: f64) -> f64 {
     if v.abs() < 1e-15 { 0.0 } else { v }
 }
 
+/// Overflow-safe exponential. Clamps the argument to the representable
+/// range of f64::exp, preventing Inf/NaN from propagating into
+/// downstream Hessian and gradient computations.  The clamp boundaries
+/// are just inside the IEEE 754 overflow/underflow thresholds
+/// (exp(709.78) ≈ 1.8e308, exp(−745.13) ≈ 5e−324) so this guard
+/// only activates when the mathematical result would be
+/// indistinguishable from +Inf or 0 in f64 arithmetic.
+#[inline]
+pub fn safe_exp(eta: f64) -> f64 {
+    eta.clamp(-700.0, 700.0).exp()
+}
+
 #[inline]
 pub fn exp_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
-    let sigma = eta.exp();
+    let sigma = safe_exp(eta);
     SigmaJet1 { sigma, d1: sigma }
 }
 
 #[inline]
 pub fn exp_sigma_from_eta_scalar(eta: f64) -> f64 {
-    eta.exp()
-}
-
-pub fn exp_sigma_and_deriv_from_eta(eta: ArrayView1<'_, f64>) -> (Array1<f64>, Array1<f64>) {
-    let sigma = eta.mapv(f64::exp);
-    (sigma.clone(), sigma)
+    safe_exp(eta)
 }
 
 #[inline]
@@ -57,7 +64,7 @@ pub fn exp_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
 
 #[inline]
 pub fn exp_sigma_jet3_scalar(eta: f64) -> SigmaJet3 {
-    let sigma = eta.exp();
+    let sigma = safe_exp(eta);
     SigmaJet3 {
         sigma,
         d1: canonicalzero(sigma),
@@ -77,7 +84,7 @@ pub fn exp_sigma_derivs_up_to_third(
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
     // For the exp link, all derivatives are identical: sigma = sigma' = sigma'' = sigma'''.
     // Share the single allocation via Arc and clone cheaply where the caller needs ownership.
-    let sigma = eta.mapv(f64::exp);
+    let sigma = eta.mapv(safe_exp);
     let d1 = sigma.clone();
     let d2 = sigma.clone();
     let d3 = sigma.clone();
@@ -86,7 +93,7 @@ pub fn exp_sigma_derivs_up_to_third(
 
 #[inline]
 pub fn exp_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
-    let sigma = eta.exp();
+    let sigma = safe_exp(eta);
     SigmaJet4 {
         sigma,
         d1: canonicalzero(sigma),
@@ -112,7 +119,7 @@ pub fn exp_sigma_derivs_up_to_fourth(
     Array1<f64>,
     Array1<f64>,
 ) {
-    let sigma = eta.mapv(f64::exp);
+    let sigma = eta.mapv(safe_exp);
     (
         sigma.clone(),
         sigma.clone(),
@@ -258,5 +265,19 @@ mod tests {
     #[should_panic(expected = "sigma must be positive")]
     fn exp_sigma_inverse_rejects_non_positive_sigma() {
         let _ = exp_sigma_eta_for_sigma_scalar(0.0);
+    }
+
+    #[test]
+    fn safe_exp_returns_finite_at_overflow_boundary() {
+        assert!(safe_exp(0.0).is_finite());
+        assert!(safe_exp(700.0).is_finite());
+        assert!(safe_exp(-700.0).is_finite());
+        assert!(safe_exp(1000.0).is_finite());
+        assert!(safe_exp(-1000.0).is_finite());
+        assert!(safe_exp(f64::MAX).is_finite());
+        assert!(safe_exp(f64::MIN).is_finite());
+        // Verify it still matches exp() in the normal range
+        assert!((safe_exp(1.0) - 1.0_f64.exp()).abs() < 1e-15);
+        assert!((safe_exp(-5.0) - (-5.0_f64).exp()).abs() < 1e-15);
     }
 }

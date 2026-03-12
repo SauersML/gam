@@ -119,7 +119,9 @@ impl LikelihoodFamily {
     #[inline]
     pub fn link_function(self) -> LinkFunction {
         match self {
-            Self::GaussianIdentity | Self::RoystonParmar | Self::PoissonLog | Self::GammaLog => LinkFunction::Identity,
+            Self::GaussianIdentity | Self::RoystonParmar | Self::PoissonLog | Self::GammaLog => {
+                LinkFunction::Identity
+            }
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
             Self::BinomialCLogLog => LinkFunction::CLogLog,
@@ -319,15 +321,6 @@ impl RidgePassport {
             delta,
             matrix_form: RidgeMatrixForm::ScaledIdentity,
             policy,
-        }
-    }
-
-    #[inline]
-    pub fn quadratic_penalty_ridge(self) -> f64 {
-        if self.policy.include_quadratic_penalty {
-            self.delta
-        } else {
-            0.0
         }
     }
 

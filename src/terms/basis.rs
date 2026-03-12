@@ -1417,70 +1417,6 @@ fn eval_kinds_from_orders(orders: &[usize]) -> Result<Vec<BasisEvalKind>, BasisE
         .collect()
 }
 
-fn create_bspline_basis_ndwith_knots_internal(
-    data: &[ArrayView1<'_, f64>],
-    knot_vectors: &[ArrayView1<'_, f64>],
-    degrees: &[usize],
-    eval_kinds: &[BasisEvalKind],
-) -> Result<(Arc<Array2<f64>>, Vec<Array1<f64>>), BasisError> {
-    validatemulti_dim_inputs(data, knot_vectors, degrees, eval_kinds)?;
-    let knotvecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
-    let knotviews: Vec<ArrayView1<'_, f64>> = knotvecs.iter().map(|v| v.view()).collect();
-
-    let basis_matrix = generate_basis_nd_dense(data, &knotviews, degrees, eval_kinds)?;
-    Ok((Arc::new(basis_matrix), knotvecs))
-}
-
-/// Creates a multi-dimensional tensor-product B-spline basis using pre-computed knot vectors.
-pub fn create_bspline_basis_ndwith_knots(
-    data: &[ArrayView1<'_, f64>],
-    knot_vectors: &[ArrayView1<'_, f64>],
-    degrees: &[usize],
-) -> Result<(Arc<Array2<f64>>, Vec<Array1<f64>>), BasisError> {
-    let eval_kinds = vec![BasisEvalKind::Basis; degrees.len()];
-    create_bspline_basis_ndwith_knots_internal(data, knot_vectors, degrees, &eval_kinds)
-}
-
-/// Creates a multi-dimensional tensor-product B-spline basis using pre-computed knot vectors,
-/// allowing per-dimension derivative orders (0, 1, 2).
-pub fn create_bspline_basis_ndwith_knots_derivative(
-    data: &[ArrayView1<'_, f64>],
-    knot_vectors: &[ArrayView1<'_, f64>],
-    degrees: &[usize],
-    derivative_orders: &[usize],
-) -> Result<(Arc<Array2<f64>>, Vec<Array1<f64>>), BasisError> {
-    let eval_kinds = eval_kinds_from_orders(derivative_orders)?;
-    create_bspline_basis_ndwith_knots_internal(data, knot_vectors, degrees, &eval_kinds)
-}
-
-/// Creates a sparse multi-dimensional tensor-product B-spline basis using pre-computed knot vectors.
-pub fn create_bspline_basis_nd_sparsewith_knots(
-    data: &[ArrayView1<'_, f64>],
-    knot_vectors: &[ArrayView1<'_, f64>],
-    degrees: &[usize],
-) -> Result<(SparseColMat<usize, f64>, Vec<Array1<f64>>), BasisError> {
-    let eval_kinds = vec![BasisEvalKind::Basis; degrees.len()];
-    let knotvecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
-    let knotviews: Vec<ArrayView1<'_, f64>> = knotvecs.iter().map(|v| v.view()).collect();
-    let sparse = generate_basis_nd_sparse(data, &knotviews, degrees, &eval_kinds)?;
-    Ok((sparse, knotvecs))
-}
-
-/// Creates a sparse multi-dimensional tensor-product B-spline basis using pre-computed knot vectors,
-/// allowing per-dimension derivative orders (0, 1, 2).
-pub fn create_bspline_basis_nd_sparsewith_knots_derivative(
-    data: &[ArrayView1<'_, f64>],
-    knot_vectors: &[ArrayView1<'_, f64>],
-    degrees: &[usize],
-    derivative_orders: &[usize],
-) -> Result<(SparseColMat<usize, f64>, Vec<Array1<f64>>), BasisError> {
-    let eval_kinds = eval_kinds_from_orders(derivative_orders)?;
-    let knotvecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
-    let knotviews: Vec<ArrayView1<'_, f64>> = knotvecs.iter().map(|v| v.view()).collect();
-    let sparse = generate_basis_nd_sparse(data, &knotviews, degrees, &eval_kinds)?;
-    Ok((sparse, knotvecs))
-}
-
 /// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
 /// The penalty is of the form `S = D' * D`, penalizing the squared `order`-th
 /// differences of the spline coefficients. This is the core of P-splines.
@@ -1654,18 +1590,6 @@ pub enum MaternNu {
     FiveHalves,
     SevenHalves,
     NineHalves,
-}
-
-impl MaternNu {
-    /// Recommend the lowest-order half-integer Matérn that stays compatible with
-    /// the canonical mass/tension/stiffness collocation penalties.
-    pub fn recommended_for_dimension(dimension: usize) -> Self {
-        if dimension <= 1 {
-            Self::Half
-        } else {
-            Self::ThreeHalves
-        }
-    }
 }
 
 /// Matérn radial basis and penalties.
@@ -7321,67 +7245,6 @@ pub fn compute_geometric_constraint_transform(
     };
 
     Ok((z, s_constrained))
-}
-
-/// Decomposes a penalty matrix S into its null-space and whitened range-space components.
-/// This is used for functional ANOVA decomposition in GAMs to separate unpenalized
-/// and penalized subspaces of a basis.
-///
-/// # Arguments
-/// * `s_1d`: The 1D penalty matrix (typically a difference penalty matrix)
-///
-/// # Returns
-/// A tuple of transformation matrices: (Z_null, Z_rangewhiten) where:
-/// - `Z_null`: Orthogonal basis for the null space (unpenalized functions)
-/// - `Z_rangewhiten`: Whitened basis for the range space (penalized functions)
-///   In these coordinates, the penalty becomes an identity matrix.
-pub fn null_rangewhiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let (evals, evecs) = s_1d.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
-
-    // Calculate a relative tolerance based on the maximum eigenvalue
-    // This is more robust than using a fixed absolute tolerance
-    let max_eig = evals.iter().fold(0.0f64, |maxval, &val| maxval.max(val));
-    let relative_tol = if max_eig > 0.0 {
-        max_eig * 1e-12
-    } else {
-        1e-12
-    };
-
-    let mut idx_n = Vec::new();
-    let mut idx_r = Vec::new();
-    for (i, &d) in evals.iter().enumerate() {
-        if d > relative_tol {
-            idx_r.push(i);
-        } else {
-            idx_n.push(i);
-        }
-    }
-
-    // Build basis for the null space (unpenalized part)
-    let z_null = select_columns(&evecs, &idx_n);
-
-    // Build whitened basis for the range space (penalized part)
-    let mut d_inv_sqrt = Array2::<f64>::zeros((idx_r.len(), idx_r.len()));
-    for (j, &i) in idx_r.iter().enumerate() {
-        // Use max(evals[i], 0.0) to ensure we don't try to take sqrt of a negative number
-        d_inv_sqrt[[j, j]] = 1.0 / (evals[i].max(0.0)).sqrt();
-    }
-    let z_rangewhiten = fast_ab(&select_columns(&evecs, &idx_r), &d_inv_sqrt);
-
-    Ok((z_null, z_rangewhiten))
-}
-
-/// This is needed because ndarray doesn't have a direct way to select non-contiguous columns.
-fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
-    let nrows = matrix.nrows();
-    let ncols = indices.len();
-    let mut result = Array2::zeros((nrows, ncols));
-
-    for (j, &col_idx) in indices.iter().enumerate() {
-        result.column_mut(j).assign(&matrix.column(col_idx));
-    }
-
-    result
 }
 
 /// Internal module for implementation details not exposed in the public API.

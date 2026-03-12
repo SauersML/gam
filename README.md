@@ -46,7 +46,7 @@ gam <command> --help
 
 | Command | Required args | Key options | Default output behavior |
 | --- | --- | --- | --- |
-| `gam fit` | `<DATA> <FORMULA>` | `--out`, `--predict-noise`, `--survival-likelihood` | No artifact written unless `--out` is provided |
+| `gam fit` | `<DATA> <FORMULA>` | `--out`, `--predict-noise`, `--survival-likelihood`, `--firth`, `--adaptive-regularization` | No artifact written unless `--out` is provided |
 | `gam predict` | `<MODEL> <NEW_DATA>` | `--out` (required), `--uncertainty`, `--mode`, `--covariance-mode` | Writes the CSV passed via `--out` |
 | `gam report` | `<MODEL> [DATA] [OUT]` | positional `[OUT]` | Writes `<model_stem>.report.html` when `[OUT]` omitted |
 | `gam diagnose` | `<MODEL> <DATA>` | `--alo` | Prints terminal diagnostics table |
@@ -135,7 +135,7 @@ Important smooth options and semantics:
   - `knots=<internal_knots>` or `k=<basis_dim>` (mutually exclusive)
   - `penalty_order` default `2`
 - Thin plate (`type=tps|thinplate|thin-plate`):
-  - Supports 1 to 3 dimensions in joint smooths
+  - Supports arbitrary joint covariate dimensions (subject to basis/knots feasibility)
   - `centers` or `k`
 - Matérn (`type=matern`):
   - `centers` or `k`
@@ -227,6 +227,15 @@ Survival-specific behavior:
   Current support: binomial mean-only non-flexible links, binomial mean-only `flexible(...)`, binomial location-scale, and survival `location-scale`.
 - Flexible links are binomial-focused and have restrictions by mode (for example in survival, flexible links require `--survival-likelihood=location-scale`).
 
+### Notable fit CLI options
+
+- Spatial smooth adaptive regularization is enabled by default; disable with `--adaptive-regularization false`.
+- Survival options in `gam fit` include:
+  - `--survival-time-anchor`
+  - `--baseline-target`, `--baseline-scale`, `--baseline-shape`, `--baseline-rate`, `--baseline-makeham`
+  - `--time-basis`, `--time-degree`, `--time-num-internal-knots`, `--time-smooth-lambda`
+  - `--threshold-time-k`, `--threshold-time-degree`, `--sigma-time-k`, `--sigma-time-degree`
+
 ## Model I/O and Defaults
 
 - `gam fit ... --out model.json` writes a model.
@@ -277,9 +286,10 @@ gam report model.json data.csv out.html
 ```
 
 - Produces a standalone HTML report.
-- Includes model summary, coefficient table, EDF blocks, and diagnostic plots.
+- Includes model summary cards, coefficient table, EDF blocks, and smooth-effect plots.
 - With data input, includes residual/fit diagnostics and ALO table where available.
 - Without data input, data-dependent diagnostics are omitted with notes.
+- Diagnostics section includes normal QQ, residual-vs-fitted, observed-vs-predicted, residual distribution, and scale-location plots (plus calibration for binary outcomes).
 
 ## Diagnose Behavior
 

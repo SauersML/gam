@@ -1277,19 +1277,6 @@ pub fn stable_reparameterizationwith_invariant_engine(
     stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, invariant)
 }
 
-/// Result of the stable penalized least squares solve
-#[derive(Clone)]
-pub struct StablePLSResult {
-    /// Solution vector beta
-    pub beta: Array1<f64>,
-    /// Final penalized Hessian matrix
-    pub penalized_hessian: Array2<f64>,
-    /// Effective degrees of freedom
-    pub edf: f64,
-    /// Scale parameter estimate
-    pub scale: f64,
-}
-
 /// Calculate the 2-norm condition number of a matrix.
 ///
 /// For symmetric matrices (the dominant case for GAM Hessians/penalties),
