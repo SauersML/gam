@@ -1,4 +1,3 @@
-#![deny(warnings)]
 #![deny(unused_variables)]
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};

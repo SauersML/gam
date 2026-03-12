@@ -3842,12 +3842,23 @@ fn gaussian_joint_hessian_from_coeffs(
     {
         return Err(format!(
             "gaussian_joint_hessian_from_coeffs dimension mismatch: xmu {}x{}, x_ls {}x{}, coeffs {}/{}/{}",
-            xmu.nrows(), xmu.ncols(), x_ls.nrows(), x_ls.ncols(),
-            hmumu_coeff.len(), hmu_ls_coeff.len(), h_ls_ls_coeff.len()
+            xmu.nrows(),
+            xmu.ncols(),
+            x_ls.nrows(),
+            x_ls.ncols(),
+            hmumu_coeff.len(),
+            hmu_ls_coeff.len(),
+            h_ls_ls_coeff.len()
         ));
     }
     // Fused single-pass: reads X_mu and X_ls once instead of twice each.
-    Ok(fast_joint_hessian_2x2(xmu, x_ls, hmumu_coeff, hmu_ls_coeff, h_ls_ls_coeff))
+    Ok(fast_joint_hessian_2x2(
+        xmu,
+        x_ls,
+        hmumu_coeff,
+        hmu_ls_coeff,
+        h_ls_ls_coeff,
+    ))
 }
 
 fn gaussian_joint_psihessian_fromweights(

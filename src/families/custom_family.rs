@@ -1753,24 +1753,21 @@ fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> Rid
 }
 
 fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-    let (r, c) = a.dim();
+    // tr(A B) = sum_ij A_ij B_ji.
+    // Row-sum approach: for each row i of A and column i of B (= row i of B^T),
+    // compute the dot product. This keeps A row-contiguous and B column access
+    // is sequential when B is row-major (B column i = B^T row i).
+    let n = a.nrows();
     let mut t = 0.0;
-    for i in 0..r {
-        for j in 0..c {
-            t += a[[i, j]] * b[[j, i]];
-        }
+    for i in 0..n {
+        t += a.row(i).dot(&b.column(i));
     }
     t
 }
 
 /// Compute tr(A * B) when B is block-diagonal — only the sub-block [start..end, start..end]
 /// is non-zero. This is O(block^2) instead of O(total^2).
-fn trace_product_block(
-    a: &Array2<f64>,
-    b_block: &Array2<f64>,
-    start: usize,
-    end: usize,
-) -> f64 {
+fn trace_product_block(a: &Array2<f64>, b_block: &Array2<f64>, start: usize, end: usize) -> f64 {
     let block_size = end - start;
     debug_assert_eq!(b_block.nrows(), block_size);
     debug_assert_eq!(b_block.ncols(), block_size);
@@ -1951,7 +1948,6 @@ fn strict_logdet_spd_with_semidefinite_option(
     }
     strict_logdet_spd(matrix)
 }
-
 
 fn pinv_positive_part_with_floor(
     matrix: &Array2<f64>,
@@ -2264,15 +2260,18 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 None
             };
             let mut accepted = false;
+            // Reuse trial_beta_buf to avoid allocation per backtracking trial.
+            let mut trial_beta_buf = beta_old.clone();
             for bt in 0..8 {
                 let alpha = 0.5f64.powi(bt);
-                let trial_beta_raw = &beta_old + &delta.mapv(|v| alpha * v);
+                trial_beta_buf.assign(&beta_old);
+                trial_beta_buf.scaled_add(alpha, &delta);
                 let trial_beta =
-                    family.post_update_block_beta(&states, b, spec, trial_beta_raw.clone())?;
+                    family.post_update_block_beta(&states, b, spec, trial_beta_buf.clone())?;
                 states[b].beta = trial_beta;
                 // Use precomputed X*delta when geometry is static and beta wasn't modified.
                 if let Some(ref xd) = x_delta {
-                    if states[b].beta == trial_beta_raw {
+                    if states[b].beta == trial_beta_buf {
                         // In-place: eta = eta_backup + alpha * xd (zero allocations).
                         states[b].eta.assign(&eta_backup);
                         states[b].eta.scaled_add(alpha, xd);
@@ -2295,7 +2294,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 }
             }
             if !accepted {
-                states[b].beta = beta_old.clone();
+                states[b].beta.assign(&beta_old);
                 states[b].eta.assign(&eta_backup);
                 if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
                     let descent_dir = gradient - &s_lambda.dot(&beta_old);
@@ -2309,17 +2308,17 @@ fn inner_blockwise_fit<F: CustomFamily>(
                         };
                         for bt in 0..12 {
                             let alpha = 0.5f64.powi(bt);
-                            let trial_beta_raw =
-                                &beta_old + &descent_dir.mapv(|v| alpha * v);
+                            trial_beta_buf.assign(&beta_old);
+                            trial_beta_buf.scaled_add(alpha, &descent_dir);
                             let trial_beta = family.post_update_block_beta(
                                 &states,
                                 b,
                                 spec,
-                                trial_beta_raw.clone(),
+                                trial_beta_buf.clone(),
                             )?;
                             states[b].beta = trial_beta;
                             if let Some(ref xd) = x_descent {
-                                if states[b].beta == trial_beta_raw {
+                                if states[b].beta == trial_beta_buf {
                                     states[b].eta.assign(&eta_backup);
                                     states[b].eta.scaled_add(alpha, xd);
                                 } else {
@@ -2346,14 +2345,14 @@ fn inner_blockwise_fit<F: CustomFamily>(
                                 accepted = true;
                                 break;
                             }
-                            states[b].beta = beta_old.clone();
+                            states[b].beta.assign(&beta_old);
                             states[b].eta.assign(&eta_backup);
                         }
                     }
                 }
             }
             if !accepted {
-                states[b].beta = beta_old;
+                states[b].beta.assign(&beta_old);
                 states[b].eta.assign(&eta_backup);
             }
         }
@@ -2790,9 +2789,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 Vec::new()
             };
             let spinv_aterms: Vec<Array2<f64>> = if include_logdet_s {
-                let sp = s_pinv_joint.as_ref().ok_or_else(|| {
-                    "missing joint S^+ for REML Hessian".to_string()
-                })?;
+                let sp = s_pinv_joint
+                    .as_ref()
+                    .ok_or_else(|| "missing joint S^+ for REML Hessian".to_string())?;
                 a_terms.iter().map(|at| sp.dot(at)).collect()
             } else {
                 Vec::new()
@@ -3145,9 +3144,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 Vec::new()
             };
             let spinv_aterms: Vec<Array2<f64>> = if include_logdet_s {
-                let sp = s_pinv_joint.as_ref().ok_or_else(|| {
-                    "missing joint S^+ for surrogate REML Hessian".to_string()
-                })?;
+                let sp = s_pinv_joint
+                    .as_ref()
+                    .ok_or_else(|| "missing joint S^+ for surrogate REML Hessian".to_string())?;
                 a_terms.iter().map(|at| sp.dot(at)).collect()
             } else {
                 Vec::new()
@@ -3360,18 +3359,20 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
 
         // Precompute h_mode inverse once for all per-block mode sensitivity solves.
         let h_mode_inv = if include_logdet_h {
-            Some(if strict_spd || !options.ridge_policy.include_penalty_logdet {
-                // h_for_logdet == h_mode, reuse h_inv
-                h_inv.clone()
-            } else {
-                logdet_trace_inverse_with_ridge_policy(
-                    &h_mode,
-                    options.ridge_floor,
-                    options.ridge_policy,
-                    strict_spd,
-                    allow_semidefinite,
-                )?
-            })
+            Some(
+                if strict_spd || !options.ridge_policy.include_penalty_logdet {
+                    // h_for_logdet == h_mode, reuse h_inv
+                    h_inv.clone()
+                } else {
+                    logdet_trace_inverse_with_ridge_policy(
+                        &h_mode,
+                        options.ridge_floor,
+                        options.ridge_policy,
+                        strict_spd,
+                        allow_semidefinite,
+                    )?
+                },
+            )
         } else {
             None
         };
@@ -3935,9 +3936,9 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
         Vec::new()
     };
     let spinv_s_i: Vec<Array2<f64>> = if need_hessian && include_logdet_s {
-        let sp = s_pinv_joint.as_ref().ok_or_else(|| {
-            "missing joint S^+ for [rho, psi] Hessian precomputation".to_string()
-        })?;
+        let sp = s_pinv_joint
+            .as_ref()
+            .ok_or_else(|| "missing joint S^+ for [rho, psi] Hessian precomputation".to_string())?;
         s_i_terms.iter().map(|si| sp.dot(si)).collect()
     } else {
         Vec::new()
@@ -4080,8 +4081,7 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
                             .as_ref()
                             .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
                         &s_ij,
-                    ) + 0.5
-                        * trace_product(&spinv_s_i[j], &spinv_s_i[i])
+                    ) + 0.5 * trace_product(&spinv_s_i[j], &spinv_s_i[i])
                 } else {
                     0.0
                 };
