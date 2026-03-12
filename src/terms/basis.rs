@@ -4581,7 +4581,8 @@ pub fn create_matern_spline_basiswithworkspace(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
-    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+    let (data_center_r, center_center_r) =
+        spatial_distance_matrices(data, centers, &mut workspace.cache)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block

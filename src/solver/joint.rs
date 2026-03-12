@@ -2917,7 +2917,7 @@ impl<'a> JointRemlState<'a> {
         // where W_eff = w_glm * g_prime^2, accounting for the chain rule through
         // the link wiggle.
         let beta_base_covariance = (|| -> Option<Array2<f64>> {
-            use crate::faer_ndarray::{FaerCholesky, fast_ata};
+            use crate::faer_ndarray::FaerCholesky;
             use faer::Side;
 
             let n = state.nobs();
