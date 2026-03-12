@@ -337,16 +337,6 @@ impl RidgePassport {
         }
     }
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JointLinkModel {
-    pub knot_range: (f64, f64),
-    pub knot_vector: Array1<f64>,
-    pub link_transform: ndarray::Array2<f64>,
-    pub beta_link: Array1<f64>,
-    pub degree: usize,
-}
-
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Coefficients(pub Array1<f64>);

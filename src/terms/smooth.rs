@@ -343,18 +343,6 @@ pub struct AdaptiveRegularizationDiagnostics {
     pub maps: Vec<AdaptiveSpatialMap>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FittedPenaltyBlockReport {
-    pub global_index: usize,
-    pub termname: Option<String>,
-    pub source: PenaltySource,
-    pub effective_rank: usize,
-    pub nullspace_dim: usize,
-    pub normalization_scale: f64,
-    pub lambda: Option<f64>,
-    pub edf: Option<f64>,
-}
-
 #[derive(Debug, Clone)]
 struct LinearColumnConditioning {
     col_idx: usize,
@@ -2127,30 +2115,6 @@ pub fn build_term_collection_design(
         random_effect_levels,
         smooth,
     })
-}
-
-pub fn fitted_penalty_block_report(
-    design: &TermCollectionDesign,
-    fit: &FitResult,
-) -> Vec<FittedPenaltyBlockReport> {
-    design
-        .penaltyinfo
-        .iter()
-        .map(|info| FittedPenaltyBlockReport {
-            global_index: info.global_index,
-            termname: info.termname.clone(),
-            source: info.penalty.source.clone(),
-            effective_rank: info.penalty.effective_rank,
-            nullspace_dim: info.penalty.nullspace_dim_hint,
-            normalization_scale: info.penalty.normalization_scale,
-            lambda: fit.lambdas.get(info.global_index).copied(),
-            edf: fit.edf_by_block().get(info.global_index).copied(),
-        })
-        .collect()
-}
-
-pub fn dropped_penalty_block_report(design: &TermCollectionDesign) -> Vec<DroppedPenaltyBlockInfo> {
-    design.dropped_penaltyinfo.clone()
 }
 
 fn apply_spatial_orthogonality_to_parametric(
