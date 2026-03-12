@@ -1382,9 +1382,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if self.workspace.matvec_buf.len() != n {
             self.workspace.matvec_buf = Array1::zeros(n);
         }
-        self.transformed_matvec_into(beta, &mut self.workspace.matvec_buf);
+        let mut matvec_tmp = std::mem::take(&mut self.workspace.matvec_buf);
+        self.transformed_matvec_into(beta, &mut matvec_tmp);
         self.workspace.eta_buf.assign(&self.offset);
-        self.workspace.eta_buf += &self.workspace.matvec_buf;
+        self.workspace.eta_buf += &matvec_tmp;
+        self.workspace.matvec_buf = matvec_tmp;
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.
@@ -4586,6 +4588,12 @@ fn resolve_pirls_family(
         LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
         LikelihoodFamily::BinomialBetaLogistic => Ok((LinkFunction::BetaLogistic, false)),
         LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
+        LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+            "run_pirls does not support PoissonLog; use fit_poisson_log".to_string(),
+        )),
+        LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+            "run_pirls does not support GammaLog; use fit_gamma_log".to_string(),
+        )),
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "run_pirls does not support RoystonParmar; use survival-specific working models"
                 .to_string(),

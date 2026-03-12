@@ -110,6 +110,8 @@ pub enum LikelihoodFamily {
     BinomialSas,
     BinomialBetaLogistic,
     BinomialMixture,
+    PoissonLog,
+    GammaLog,
     RoystonParmar,
 }
 
@@ -117,7 +119,7 @@ impl LikelihoodFamily {
     #[inline]
     pub fn link_function(self) -> LinkFunction {
         match self {
-            Self::GaussianIdentity | Self::RoystonParmar => LinkFunction::Identity,
+            Self::GaussianIdentity | Self::RoystonParmar | Self::PoissonLog | Self::GammaLog => LinkFunction::Identity,
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
             Self::BinomialCLogLog => LinkFunction::CLogLog,
@@ -136,6 +138,8 @@ impl LikelihoodFamily {
             Self::BinomialSas => "binomial-sas",
             Self::BinomialBetaLogistic => "binomial-beta-logistic",
             Self::BinomialMixture => "binomial-blended-inverse-link",
+            Self::PoissonLog => "poisson-log",
+            Self::GammaLog => "gamma-log",
             Self::RoystonParmar => "royston-parmar",
         }
     }
@@ -150,6 +154,8 @@ impl LikelihoodFamily {
             Self::BinomialSas => "Binomial SAS",
             Self::BinomialBetaLogistic => "Binomial Beta-Logistic",
             Self::BinomialMixture => "Binomial Blended Inverse-Link",
+            Self::PoissonLog => "Poisson Log",
+            Self::GammaLog => "Gamma Log",
             Self::RoystonParmar => "Royston Parmar",
         }
     }
@@ -199,6 +205,12 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::BinomialSas => Ok(Self::BinomialSas),
             LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
             LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
+            LikelihoodFamily::PoissonLog => {
+                Err("PoissonLog uses blockwise custom family fitting and is not a GLM likelihood")
+            }
+            LikelihoodFamily::GammaLog => {
+                Err("GammaLog uses blockwise custom family fitting and is not a GLM likelihood")
+            }
             LikelihoodFamily::RoystonParmar => {
                 Err("RoystonParmar is survival-specific and not a GLM likelihood")
             }

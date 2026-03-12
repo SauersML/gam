@@ -30,7 +30,7 @@ pub use families::gamlss::{
     BinomialLocationScaleFamily, BinomialLocationScaleSpec, BinomialLocationScaleTermSpec,
     BinomialLocationScaleWiggleFamily, BinomialLocationScaleWiggleSpec,
     BinomialLocationScaleWiggleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
-    BinomialLocationScaleWorkflowResult, BinomialLogitFamily, BinomialLogitSpec,
+    BinomialLocationScaleWorkflowResult,
     BinomialMeanWiggleFamily, BinomialMeanWiggleSpec, BlockwiseTermFitResult,
     BlockwiseTermWiggleFitResult, FamilyMetadata, GammaLogFamily, GammaLogSpec,
     GaussianLocationScaleFamily, GaussianLocationScaleSpec, GaussianLocationScaleTermSpec,
@@ -39,7 +39,7 @@ pub use families::gamlss::{
     fit_binomial_location_scale, fit_binomial_location_scale_terms,
     fit_binomial_location_scale_termsworkflow, fit_binomial_location_scalewiggle,
     fit_binomial_location_scalewiggle_terms, fit_binomial_location_scalewiggle_terms_auto,
-    fit_binomial_logit, fit_binomial_mean_wiggle, fit_gamma_log, fit_gaussian_location_scale,
+    fit_binomial_mean_wiggle, fit_gamma_log, fit_gaussian_location_scale,
     fit_gaussian_location_scale_terms, fit_poisson_log, initializewiggle_knots_from_seed,
 };
 pub use families::strategy::{
