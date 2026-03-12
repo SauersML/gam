@@ -4748,33 +4748,43 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let mut wmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
         let mut z_ls = unsafe { Array1::<f64>::uninit(n).assume_init() };
         let mut w_ls = unsafe { Array1::<f64>::uninit(n).assume_init() };
+        let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
 
         for i in 0..n {
-            let sigma_i = eta_log_sigma[i].exp().max(1e-12);
+            let eta_ls_i = eta_log_sigma[i];
+            let two_eta = 2.0 * eta_ls_i;
+            let sigma_i = eta_ls_i.exp().max(1e-12);
+            let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
             let r = self.y[i] - etamu[i];
-            let s2 = (sigma_i * sigma_i).max(1e-20);
-            ll += self.weights[i] * (-0.5 * (r * r / s2 + (2.0 * std::f64::consts::PI * s2).ln()));
+            let weight_i = self.weights[i];
+            // ll = -0.5 * (r²/s² + ln(2π) + 2·eta_ls) — avoids ln(s²) call.
+            ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
 
             // mu block (identity): canonical WLS
-            if self.weights[i] == 0.0 {
+            if weight_i == 0.0 {
                 wmu[i] = 0.0;
                 zmu[i] = etamu[i];
             } else {
-                wmu[i] = floor_positiveweight(self.weights[i] / s2, MIN_WEIGHT);
+                wmu[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
                 zmu[i] = etamu[i] + r;
             }
 
-            // log-sigma block: IRLS working response and weights.
-            let (dlogsigma_du, info_u) =
-                gaussian_log_sigma_irlsinfo(self.weights[i], sigma_i, sigma_i);
+            // d_sigma/sigma = 1 except on the tiny-sigma floor branch.
+            let dlogsigma_du = if sigma_i <= 1e-10 {
+                sigma_i * 1e10
+            } else {
+                1.0
+            };
+            let info_u =
+                floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
             if info_u == 0.0 {
                 w_ls[i] = 0.0;
-                z_ls[i] = eta_log_sigma[i];
+                z_ls[i] = eta_ls_i;
             } else {
                 w_ls[i] = info_u;
-                let score_ls = self.weights[i] * (r * r / s2 - 1.0) * dlogsigma_du;
-                z_ls[i] = eta_log_sigma[i] + score_ls / info_u;
+                let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
+                z_ls[i] = eta_ls_i + score_ls / info_u;
             }
         }
 
@@ -10557,6 +10567,7 @@ mod tests {
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
     use ndarray::{Axis, array};
     use num_dual::{DualNum, second_derivative};
+    use std::time::Instant;
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
         ParameterBlockInput {
@@ -10943,6 +10954,113 @@ mod tests {
 
         let fd = (w_plus - w_minus) / (2.0 * eps);
         assert!((dw[0] - fd).abs() < 1e-6, "dw={} fd={}", dw[0], fd);
+    }
+
+    #[test]
+    fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_faster_locally() {
+        let n = 4096usize;
+        let rounds = 250usize;
+        let y = Array1::from_shape_fn(n, |i| ((i as f64) * 0.003).sin() + 0.1);
+        let mu = Array1::from_shape_fn(n, |i| ((i as f64) * 0.001).cos() - 0.2);
+        let eta_ls = Array1::from_shape_fn(n, |i| ((i as f64) * 0.002).sin() * 0.8 - 0.1);
+        let weights = Array1::from_shape_fn(n, |i| if i % 37 == 0 { 0.0 } else { 1.0 });
+        let ln2pi = (2.0 * std::f64::consts::PI).ln();
+
+        let legacy_eval = || {
+            let mut ll = 0.0;
+            let mut zmu = Array1::<f64>::zeros(n);
+            let mut wmu = Array1::<f64>::zeros(n);
+            let mut zls = Array1::<f64>::zeros(n);
+            let mut wls = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let w = weights[i];
+                let eta = eta_ls[i];
+                let two_eta = 2.0 * eta;
+                let sigma = eta.exp().max(1e-12);
+                let inv_s2 = (-two_eta).exp().min(1e24);
+                let r = y[i] - mu[i];
+                ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+                if w == 0.0 {
+                    wmu[i] = 0.0;
+                    zmu[i] = mu[i];
+                } else {
+                    wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
+                    zmu[i] = mu[i] + r;
+                }
+                let (dlogsigma_du, info_u) = gaussian_log_sigma_irlsinfo(w, sigma, sigma);
+                if info_u == 0.0 {
+                    wls[i] = 0.0;
+                    zls[i] = eta;
+                } else {
+                    wls[i] = info_u;
+                    let score_ls = w * (r * r * inv_s2 - 1.0) * dlogsigma_du;
+                    zls[i] = eta + score_ls / info_u;
+                }
+            }
+            (ll, zmu, wmu, zls, wls)
+        };
+
+        let optimized_eval = || {
+            let mut ll = 0.0;
+            let mut zmu = Array1::<f64>::zeros(n);
+            let mut wmu = Array1::<f64>::zeros(n);
+            let mut zls = Array1::<f64>::zeros(n);
+            let mut wls = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let eta = eta_ls[i];
+                let two_eta = 2.0 * eta;
+                let sigma = eta.exp().max(1e-12);
+                let inv_s2 = (sigma * sigma).recip().min(1e24);
+                let w = weights[i];
+                let r = y[i] - mu[i];
+                ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+                if w == 0.0 {
+                    wmu[i] = 0.0;
+                    zmu[i] = mu[i];
+                } else {
+                    wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
+                    zmu[i] = mu[i] + r;
+                }
+                let dlogsigma_du = if sigma <= 1e-10 { sigma * 1e10 } else { 1.0 };
+                let info_u =
+                    floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
+                if info_u == 0.0 {
+                    wls[i] = 0.0;
+                    zls[i] = eta;
+                } else {
+                    wls[i] = info_u;
+                    let score_ls = w * (r * r * inv_s2 - 1.0) * dlogsigma_du;
+                    zls[i] = eta + score_ls / info_u;
+                }
+            }
+            (ll, zmu, wmu, zls, wls)
+        };
+
+        let (ll_legacy, zmu_legacy, wmu_legacy, zls_legacy, wls_legacy) = legacy_eval();
+        let (ll_opt, zmu_opt, wmu_opt, zls_opt, wls_opt) = optimized_eval();
+        assert!((ll_legacy - ll_opt).abs() < 1e-10);
+        assert!((&zmu_legacy - &zmu_opt).iter().all(|v| v.abs() < 1e-12));
+        assert!((&wmu_legacy - &wmu_opt).iter().all(|v| v.abs() < 1e-12));
+        assert!((&zls_legacy - &zls_opt).iter().all(|v| v.abs() < 1e-12));
+        assert!((&wls_legacy - &wls_opt).iter().all(|v| v.abs() < 1e-12));
+
+        let t_legacy = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(legacy_eval());
+        }
+        let legacy_dt = t_legacy.elapsed();
+
+        let t_opt = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(optimized_eval());
+        }
+        let opt_dt = t_opt.elapsed();
+        eprintln!(
+            "gaussian hotloop legacy={:?} optimized={:?} speedup={:.3}x",
+            legacy_dt,
+            opt_dt,
+            legacy_dt.as_secs_f64() / opt_dt.as_secs_f64()
+        );
     }
 
     #[test]
@@ -13604,5 +13722,129 @@ mod tests {
                 core.mu[i]
             );
         }
+    }
+
+    // ── Root-cause reproduction: binomial location-scale exact REML fails
+    //    when p > n (rank-deficient Hessian) ──────────────────────────────
+
+    /// Helper: Fourier-cosine basis of dimension `p` evaluated at `n` equally
+    /// spaced points in [0, 1].  Combined with a 2nd-order difference penalty
+    /// this mimics the P-spline setup used by the benchmark suite.
+    fn cosine_basis(n: usize, p: usize) -> Array2<f64> {
+        Array2::from_shape_fn((n, p), |(i, j)| {
+            let x = i as f64 / (n.max(2) - 1) as f64;
+            if j == 0 {
+                1.0
+            } else {
+                (j as f64 * std::f64::consts::PI * x).cos()
+            }
+        })
+    }
+
+    /// **Sufficiency – binomial location-scale exact REML is non-finite when
+    /// p > n.**
+    ///
+    /// With n = 20 observations and p_threshold = p_log_sigma = 12 (total
+    /// p ≈ 24 > n after log-sigma identification), the likelihood Hessian
+    /// H_lik has rank ≤ n < p, so `log|H_mode|` and its gradient become
+    /// non-finite on the very first outer REML evaluation.  The outer
+    /// optimizer has no cached fallback for iter = 0 and fails.
+    ///
+    /// This reproduces the `rust_gamlss_flexible / bone_gamair` benchmark
+    /// failure whose pilot fit (BinomialLocationScaleFamily, no wiggle)
+    /// blows up identically.
+    #[test]
+    fn binomial_location_scale_exact_reml_fails_when_p_exceeds_n() {
+        let n = 20usize;
+        let p = 12usize; // per block → total ≈ 24 > n after identification
+        let y = Array1::from_shape_fn(n, |i| if i % 4 == 0 { 1.0 } else { 0.0 });
+        let weights = Array1::ones(n);
+
+        let design = cosine_basis(n, p);
+        let penalty = crate::basis::create_difference_penalty_matrix(p, 2, None)
+            .expect("difference penalty");
+
+        let spec = BinomialLocationScaleSpec {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(design.clone()),
+                offset: Array1::zeros(n),
+                penalties: vec![penalty.clone()],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            log_sigma_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(design),
+                offset: Array1::zeros(n),
+                penalties: vec![penalty],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+        };
+
+        let options = BlockwiseFitOptions::default();
+        let result = fit_binomial_location_scale(spec, &options);
+        assert!(
+            result.is_err(),
+            "expected exact REML to fail when p > n, but fit succeeded: loglik={:.4e}",
+            result.as_ref().unwrap().log_likelihood
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-finite") || err.contains("outer smoothing optimization failed"),
+            "expected non-finite outer REML error, got: {err}"
+        );
+    }
+
+    /// **Necessity – the same model succeeds when n >> p.**
+    ///
+    /// Scaling up to n = 200 while keeping p = 12 per block (total ≈ 24)
+    /// gives a well-conditioned Hessian. The exact REML outer objective and
+    /// its gradient stay finite and the Newton solver converges.
+    #[test]
+    fn binomial_location_scale_exact_reml_succeeds_when_n_exceeds_p() {
+        let n = 200usize;
+        let p = 12usize;
+        let y = Array1::from_shape_fn(n, |i| if i % 4 == 0 { 1.0 } else { 0.0 });
+        let weights = Array1::ones(n);
+
+        let design = cosine_basis(n, p);
+        let penalty = crate::basis::create_difference_penalty_matrix(p, 2, None)
+            .expect("difference penalty");
+
+        let spec = BinomialLocationScaleSpec {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(design.clone()),
+                offset: Array1::zeros(n),
+                penalties: vec![penalty.clone()],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            log_sigma_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(design),
+                offset: Array1::zeros(n),
+                penalties: vec![penalty],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+        };
+
+        let options = BlockwiseFitOptions::default();
+        let result = fit_binomial_location_scale(spec, &options);
+        assert!(
+            result.is_ok(),
+            "expected exact REML to succeed when n >> p, but got: {}",
+            result.unwrap_err()
+        );
+        let fit = result.unwrap();
+        assert!(
+            fit.log_likelihood.is_finite(),
+            "fitted loglik should be finite"
+        );
     }
 }

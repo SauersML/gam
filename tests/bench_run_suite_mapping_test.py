@@ -452,7 +452,7 @@ class RunSuiteMappingTests(unittest.TestCase):
             _RUN_SUITE.zip_figure_dir = orig_zip
 
         self.assertNotIn(("rust_gam", "rust_gam"), seen)
-        self.assertNotIn(("survival", "rust_gamlss_survival"), seen)
+        self.assertIn(("survival", "rust_gamlss_survival"), seen)
 
     def test_main_skips_flexible_variants_for_gaussian_scenarios(self) -> None:
         seen_rust = []
@@ -533,7 +533,7 @@ class RunSuiteMappingTests(unittest.TestCase):
 
         self.assertIn("rust_gam", seen_rust)
         self.assertNotIn("rust_gam_flexible", seen_rust)
-        self.assertNotIn("rust_gamlss", seen_gamlss)
+        self.assertIn("rust_gamlss", seen_gamlss)
         self.assertNotIn("rust_gamlss_flexible", seen_gamlss)
 
     def test_main_skips_flexible_variants_for_survival_scenarios(self) -> None:
@@ -609,7 +609,7 @@ class RunSuiteMappingTests(unittest.TestCase):
             _RUN_SUITE.generate_scenario_figures = orig_figures
             _RUN_SUITE.zip_figure_dir = orig_zip
 
-        self.assertEqual(seen_survival, [])
+        self.assertEqual(seen_survival, ["rust_gamlss_survival"])
 
 
 if __name__ == "__main__":

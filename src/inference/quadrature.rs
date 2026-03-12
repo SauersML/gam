@@ -923,10 +923,16 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
         ));
     }
     if sigma <= LOGIT_SIGMA_DEGENERATE {
+        let x_clamped = mu.clamp(-700.0, 700.0);
         let mean = sigmoid(mu);
+        let dmean_dmu = if x_clamped == mu {
+            mean * (1.0 - mean)
+        } else {
+            0.0
+        };
         return Ok(IntegratedMeanDerivative {
             mean,
-            dmean_dmu: mean * (1.0 - mean),
+            dmean_dmu,
             mode: IntegratedExpectationMode::ExactClosedForm,
         });
     }
@@ -1045,6 +1051,7 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // exp(-exp(mu)) so the PIRLS derivative uses the same approximation order
     // as the mean.
     let z = mu.clamp(-30.0, 30.0);
+    let clamp_active = z != mu;
     let s2 = sigma * sigma;
     let s4 = s2 * s2;
     let ex = z.exp();
@@ -1061,7 +1068,11 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
     IntegratedMeanDerivative {
         mean: f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4,
-        dmean_dmu: (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0),
+        dmean_dmu: if clamp_active {
+            0.0
+        } else {
+            (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0)
+        },
         mode: IntegratedExpectationMode::ControlledAsymptotic,
     }
 }
@@ -1837,11 +1848,16 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     // best evaluator chosen for each regime.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
         let z = mu.clamp(-30.0, 30.0);
+        let clamp_active = z != mu;
         let ez = z.exp();
         let surv = (-ez).exp();
         return IntegratedMeanDerivative {
             mean: 1.0 - surv,
-            dmean_dmu: (ez * surv).max(0.0),
+            dmean_dmu: if clamp_active {
+                0.0
+            } else {
+                (ez * surv).max(0.0)
+            },
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
@@ -2319,12 +2335,17 @@ where
 fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
     if sigma <= 1e-10 {
         let z = mu.clamp(-30.0, 30.0);
+        let clamp_active = z != mu;
         let pdf = crate::probability::normal_pdf(z);
         return IntegratedInverseLinkJet {
             mean: crate::probability::normal_cdf(z),
-            d1: pdf,
-            d2: -z * pdf,
-            d3: (z * z - 1.0) * pdf,
+            d1: if clamp_active { 0.0 } else { pdf },
+            d2: if clamp_active { 0.0 } else { -z * pdf },
+            d3: if clamp_active {
+                0.0
+            } else {
+                (z * z - 1.0) * pdf
+            },
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
@@ -2342,22 +2363,34 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
 
 #[inline]
 fn logit_point_jet(x: f64) -> (f64, f64, f64, f64) {
+    let x_clamped = x.clamp(-700.0, 700.0);
     let p = sigmoid(x);
-    let d1 = p * (1.0 - p);
-    let d2 = d1 * (1.0 - 2.0 * p);
-    let d3 = d1 * (1.0 - 6.0 * d1);
+    let (d1, d2, d3) = if x_clamped == x {
+        let d1 = p * (1.0 - p);
+        let d2 = d1 * (1.0 - 2.0 * p);
+        let d3 = d1 * (1.0 - 6.0 * d1);
+        (d1, d2, d3)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
     (p, d1, d2, d3)
 }
 
 #[inline]
 fn cloglog_point_jet(x: f64) -> (f64, f64, f64, f64) {
     let z = x.clamp(-30.0, 30.0);
+    let clamp_active = z != x;
     let t = z.exp();
     let s = (-t).exp();
     let mean = 1.0 - s;
-    let d1 = t * s;
-    let d2 = d1 * (1.0 - t);
-    let d3 = d1 * (1.0 - 3.0 * t + t * t);
+    let (d1, d2, d3) = if clamp_active {
+        (0.0, 0.0, 0.0)
+    } else {
+        let d1 = t * s;
+        let d2 = d1 * (1.0 - t);
+        let d3 = d1 * (1.0 - 3.0 * t + t * t);
+        (d1, d2, d3)
+    };
     (mean, d1, d2, d3)
 }
 
@@ -3526,6 +3559,62 @@ mod tests {
         let fd = (plus - minus) / (2.0 * h);
         assert_eq!(out.dmean_dmu.signum(), fd.signum());
         assert_relative_eq!(out.dmean_dmu, fd, epsilon = 1e-6, max_relative = 5e-4);
+    }
+
+    #[test]
+    fn test_logit_exact_clamped_degenerate_branch_is_locally_flat() {
+        let out = logit_posterior_meanwith_deriv_exact(-710.0, 0.0).expect("exact logit");
+        let h = 1e-6;
+        let plus = logit_posterior_meanwith_deriv_exact(-710.0 + h, 0.0)
+            .expect("exact logit plus")
+            .mean;
+        let minus = logit_posterior_meanwith_deriv_exact(-710.0 - h, 0.0)
+            .expect("exact logit minus")
+            .mean;
+        let fd = (plus - minus) / (2.0 * h);
+        assert_eq!(fd, 0.0);
+        assert_eq!(out.dmean_dmu, 0.0);
+    }
+
+    #[test]
+    fn test_cloglog_taylor_clamped_branch_is_locally_flat() {
+        let out = cloglog_small_sigma_taylor(-40.0, 0.1);
+        let h = 1e-6;
+        let plus = cloglog_small_sigma_taylor(-40.0 + h, 0.1).mean;
+        let minus = cloglog_small_sigma_taylor(-40.0 - h, 0.1).mean;
+        let fd = (plus - minus) / (2.0 * h);
+        assert_eq!(fd, 0.0);
+        assert_eq!(out.dmean_dmu, 0.0);
+    }
+
+    #[test]
+    fn test_cloglog_degenerate_clamped_branch_is_locally_flat() {
+        let ctx = QuadratureContext::new();
+        let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0, 0.0);
+        let h = 1e-6;
+        let plus = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0 + h, 0.0).mean;
+        let minus = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0 - h, 0.0).mean;
+        let fd = (plus - minus) / (2.0 * h);
+        assert_eq!(fd, 0.0);
+        assert_eq!(out.dmean_dmu, 0.0);
+    }
+
+    #[test]
+    fn test_degenerate_inverse_link_jets_are_flat_on_active_clamps() {
+        let probit = integrated_probit_jet(-40.0, 0.0);
+        assert_eq!(probit.d1, 0.0);
+        assert_eq!(probit.d2, 0.0);
+        assert_eq!(probit.d3, 0.0);
+
+        let logit = logit_point_jet(-710.0);
+        assert_eq!(logit.1, 0.0);
+        assert_eq!(logit.2, 0.0);
+        assert_eq!(logit.3, 0.0);
+
+        let cloglog = cloglog_point_jet(-40.0);
+        assert_eq!(cloglog.1, 0.0);
+        assert_eq!(cloglog.2, 0.0);
+        assert_eq!(cloglog.3, 0.0);
     }
 
     #[test]

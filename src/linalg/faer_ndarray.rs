@@ -1522,4 +1522,60 @@ mod tests {
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(max_err < 1e-10, "zero matrix should yield identity basis");
     }
+
+    //
+    // Eigendecomposition NoConvergence on pathological matrices
+    //
+    // These tests demonstrate that FaerEigh::eigh fails (NoConvergence) when
+    // the input matrix contains NaN or Inf entries, even after the internal
+    // symmetrize-and-jitter retry.  This is the low-level trigger for the
+    // higher-level "exact-newton eigendecomposition failed" crash in the
+    // custom-family block-update path.
+    //
+
+    #[test]
+    fn eigh_noconvergence_when_nan_partially_contaminates_tridiagonal() {
+        // When a Hessian has NaN in a sub-diagonal position that only
+        // partially contaminates the tridiagonal form during Householder
+        // reduction, faer's QR algorithm fails to converge:
+        //
+        //  1. Tridiagonalization propagates NaN to SOME but not ALL
+        //     entries of the tridiagonal diag/offdiag vectors.
+        //  2. norm_max() returns the finite maximum (Rust's f64::max
+        //     returns the non-NaN argument), so the early-return for
+        //     zero max is NOT taken.
+        //  3. The convergence check `offdiag[i] == 0.0` is false for
+        //     NaN, so the QR iteration runs to max_iters and returns
+        //     NoConvergence.
+        //
+        // This is the exact mechanism behind the production
+        // "exact-newton eigendecomposition failed: NoConvergence"
+        // crash in survival/binomial GAMLSS log_sigma blocks.
+        let mat = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 3.0, f64::NAN],
+            [0.0, 0.0, f64::NAN, 4.0]
+        ];
+        let result = mat.eigh(Side::Lower);
+        assert!(
+            result.is_err(),
+            "eigh should fail with NoConvergence when NaN partially \
+             contaminates the tridiagonal form, but succeeded with: {:?}",
+            result.as_ref().map(|(evals, _)| evals)
+        );
+    }
+
+    #[test]
+    fn eigh_succeeds_on_same_structure_without_nan() {
+        // Control: the same matrix with finite values produces finite eigenvalues.
+        let mat = array![[1.0, 0.5, 0.1], [0.5, 2.0, 0.3], [0.1, 0.3, 1.5]];
+        let (evals, _) = mat
+            .eigh(Side::Lower)
+            .expect("eigh should succeed on a well-conditioned finite matrix");
+        assert!(
+            evals.iter().all(|&v| v.is_finite()),
+            "all eigenvalues should be finite"
+        );
+    }
 }

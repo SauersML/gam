@@ -114,12 +114,6 @@ _LEAN_PROFILE_EXCLUDED_CONTENDERS = {
     "python_lifelines_lognormal_aft",
     "python_xgboost_aft",
 }
-_GLOBALLY_DISABLED_CONTENDERS = {
-    "rust_gamlss",
-    "rust_gamlss_flexible",
-    "rust_gamlss_survival",
-    "r_gamlss",
-}
 _SYNTHETIC_PC_PANEL_SEED = 20260329
 _SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP = 40
 _SYNTHETIC_PC_PANEL: pd.DataFrame | None = None
@@ -7353,8 +7347,6 @@ def _extra_excluded_contenders_for_profile() -> set[str]:
 
 
 def _is_contender_enabled(s_cfg, contender: str) -> bool:
-    if contender in _GLOBALLY_DISABLED_CONTENDERS:
-        return False
     excluded = set(s_cfg.get("exclude_contenders", []))
     excluded.update(_extra_excluded_contenders_for_profile())
     return contender not in excluded
@@ -7589,6 +7581,41 @@ def main():
             )
             if rust_sas_row is not None:
                 results.append(rust_sas_row)
+            rust_gamlss_row = run_rust_gamlss_scenario_cv(
+                s_cfg,
+                ds=ds,
+                folds=folds,
+                shared_fold_artifacts=shared_fold_artifacts,
+            )
+            if rust_gamlss_row is not None:
+                results.append(rust_gamlss_row)
+                if ds["family"] == "binomial" and _is_contender_enabled(
+                    s_cfg, "rust_gamlss_flexible"
+                ):
+                    results.append(
+                        run_rust_gamlss_scenario_cv(
+                            s_cfg,
+                            contender_name="rust_gamlss_flexible",
+                            binomial_cli_family=_flexible_link_name("probit"),
+                            ds=ds,
+                            folds=folds,
+                            shared_fold_artifacts=shared_fold_artifacts,
+                        )
+                    )
+            rust_gamlss_surv_row = (
+                run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "rust_gamlss_survival")
+                else None
+            )
+            if rust_gamlss_surv_row is not None:
+                results.append(rust_gamlss_surv_row)
+            r_gamlss_row = (
+                run_external_r_gamlss_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_gamlss")
+                else None
+            )
+            if r_gamlss_row is not None:
+                results.append(r_gamlss_row)
             if _is_contender_enabled(s_cfg, "r_mgcv"):
                 results.append(run_external_mgcv_cv(s_cfg, ds=ds, folds=folds))
             mgcv_gaulss_row = (
@@ -7683,9 +7710,7 @@ def main():
     for s_cfg in scenarios:
         s_name = s_cfg["name"]
         ds = dataset_for_scenario(s_cfg)
-        required_contender = None if ds["family"] == "survival" else "rust_gam"
-        if required_contender is None:
-            continue
+        required_contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
         has_required_ok = any(
             r.get("scenario_name") == s_name
             and r.get("contender") == required_contender
