@@ -2,8 +2,6 @@
 #![deny(unused_variables)]
 #![deny(unused_imports)]
 
-mod estimation_numerics;
-
 pub mod families;
 pub mod inference;
 pub mod linalg;
