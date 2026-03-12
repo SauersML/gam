@@ -56,7 +56,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+        run: cargo clippy --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
 
   test:
     name: Test
