@@ -479,9 +479,9 @@ impl<'a> RemlState<'a> {
                 .with_factor(z)
                 .materialize()
         });
-        let x_dense_eval = x_dense_eval_owned.as_ref().unwrap_or_else(|| {
-            x_dense_orig_arc.as_ref()
-        });
+        let x_dense_eval = x_dense_eval_owned
+            .as_ref()
+            .unwrap_or_else(|| x_dense_orig_arc.as_ref());
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let mut e_eval = reparam_result.e_transformed.clone();
 

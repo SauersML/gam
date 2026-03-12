@@ -358,10 +358,7 @@ impl<'a> RemlState<'a> {
                 return true;
             }
             if let Some(x2) = dir.x_tau_tau_original.as_ref() {
-                return x2
-                    .iter()
-                    .flatten()
-                    .any(HyperDesignDerivative::any_nonzero);
+                return x2.iter().flatten().any(HyperDesignDerivative::any_nonzero);
             }
             false
         });
