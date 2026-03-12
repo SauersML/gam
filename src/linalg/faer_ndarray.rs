@@ -1095,14 +1095,45 @@ pub trait FaerEigh {
 
 impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
     fn eigh(&self, side: Side) -> Result<(Array1<f64>, Array2<f64>), FaerLinalgError> {
-        let faerview = FaerArrayView::new(self);
-        let eigen = faerview
-            .as_ref()
-            .self_adjoint_eigen(side)
-            .map_err(FaerLinalgError::SelfAdjointEigen)?;
-        let values = diag_to_array(eigen.S());
-        let vectors = mat_to_array(eigen.U());
-        Ok((values, vectors))
+        fn try_eigh(
+            matrix: &Array2<f64>,
+            side: Side,
+        ) -> Result<(Array1<f64>, Array2<f64>), FaerLinalgError> {
+            let faerview = FaerArrayView::new(matrix);
+            let eigen = faerview
+                .as_ref()
+                .self_adjoint_eigen(side)
+                .map_err(FaerLinalgError::SelfAdjointEigen)?;
+            let values = diag_to_array(eigen.S());
+            let vectors = mat_to_array(eigen.U());
+            Ok((values, vectors))
+        }
+
+        let owned = self.to_owned();
+        if let Ok(ok) = try_eigh(&owned, side) {
+            return Ok(ok);
+        }
+
+        // Rarely, near-singular block Hessians trigger backend EVD no-convergence.
+        // Retry on an explicitly symmetrized + lightly jittered copy.
+        let mut repaired = owned.clone();
+        let n = repaired.nrows();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let avg = 0.5 * (repaired[[i, j]] + repaired[[j, i]]);
+                repaired[[i, j]] = avg;
+                repaired[[j, i]] = avg;
+            }
+        }
+        let mut diag_scale = 0.0_f64;
+        for i in 0..n {
+            diag_scale = diag_scale.max(repaired[[i, i]].abs());
+        }
+        let base = (diag_scale.max(1.0)) * 1e-12;
+        for i in 0..n {
+            repaired[[i, i]] += base;
+        }
+        try_eigh(&repaired, side)
     }
 }
 

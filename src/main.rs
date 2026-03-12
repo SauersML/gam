@@ -3396,7 +3396,13 @@ fn build_survival_time_basis(
                 let mut d_i_log = vec![0.0_f64; p_time];
                 let mut d_i_log_full = vec![0.0_f64; p_time_full];
                 for j in (1..db_exit.ncols()).rev() {
-                    running += db_exit[[i, j]];
+                    // Boundary-knot derivative rows can contain removable 0/0 artifacts
+                    // from the B-spline derivative basis. The mathematical limit is 0,
+                    // so skip non-finite terms instead of propagating NaN into d_eta/dt.
+                    let term = db_exit[[i, j]];
+                    if term.is_finite() {
+                        running += term;
+                    }
                     d_i_log_full[j - 1] = running;
                 }
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
@@ -3404,6 +3410,16 @@ fn build_survival_time_basis(
                     d_i_log[j_new] = d_i_log_full[j_old];
                     x_derivative_time[[i, j_new]] = d_i_log[j_new] * chain;
                 }
+            }
+            if let Some((row, col)) = x_derivative_time
+                .indexed_iter()
+                .find_map(|((i, j), v)| if v.is_finite() { None } else { Some((i, j)) })
+            {
+                return Err(format!(
+                    "survival ispline derivative basis produced non-finite value at row {}, column {}",
+                    row + 1,
+                    col + 1
+                ));
             }
 
             // Reuse a B-spline roughness penalty on the same knot grid and
@@ -8539,13 +8555,13 @@ fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
 fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
     match v.trim() {
         "identity" => Ok(LinkFunction::Identity),
-        "logit" => Ok(LinkFunction::Logit),
-        "probit" => Ok(LinkFunction::Probit),
-        "cloglog" => Ok(LinkFunction::CLogLog),
+        "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
+        "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
+        "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
         "sas" => Ok(LinkFunction::Sas),
         "beta-logistic" => Ok(LinkFunction::BetaLogistic),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+            "unsupported --link '{other}'; use identity|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
         )),
     }
 }
@@ -11772,6 +11788,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_link_choice_accepts_binomial_aliases() {
+        let probit = parse_link_choice(Some("binomial-probit"), false)
+            .expect("parse binomial-probit")
+            .expect("link choice");
+        assert!(matches!(probit.link, LinkFunction::Probit));
+        assert!(probit.mixture_components.is_none());
+
+        let logit = parse_link_choice(Some("binomial-logit"), false)
+            .expect("parse binomial-logit")
+            .expect("link choice");
+        assert!(matches!(logit.link, LinkFunction::Logit));
+        assert!(logit.mixture_components.is_none());
+
+        let cloglog = parse_link_choice(Some("binomial-cloglog"), false)
+            .expect("parse binomial-cloglog")
+            .expect("link choice");
+        assert!(matches!(cloglog.link, LinkFunction::CLogLog));
+        assert!(cloglog.mixture_components.is_none());
+    }
+
+    #[test]
     fn parse_survival_inverse_link_accepts_sas_init() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
@@ -12755,6 +12792,26 @@ mod tests {
             }
             assert!(maxv - minv > 1e-12);
         }
+    }
+
+    #[test]
+    fn ispline_time_basis_derivative_is_finite_at_zero_entry_times() {
+        let age_entry = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0]);
+        let age_exit = Array1::from_vec(vec![1e-6, 0.1, 0.5, 2.0]);
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                keep_cols: Vec::new(),
+                smooth_lambda: 1e-2,
+            },
+            Some((6, 1e-6)),
+        )
+        .expect("build ispline time basis with zero entry times");
+
+        assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
     }
 
     #[test]
