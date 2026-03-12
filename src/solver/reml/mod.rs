@@ -2023,57 +2023,56 @@ impl RemlWorkspace {
 }
 
 struct PirlsLruCache {
-    map: HashMap<Vec<u64>, Arc<PirlsResult>>,
-    order: VecDeque<Vec<u64>>,
+    map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64)>,
     capacity: usize,
+    clock: u64,
 }
 
 impl PirlsLruCache {
     fn new(capacity: usize) -> Self {
         Self {
             map: HashMap::new(),
-            order: VecDeque::new(),
             capacity: capacity.max(1),
+            clock: 0,
         }
-    }
-
-    fn touch(&mut self, key: &Vec<u64>) {
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(key.clone());
     }
 
     fn get(&mut self, key: &Vec<u64>) -> Option<Arc<PirlsResult>> {
-        let value = self.map.get(key).cloned();
-        if value.is_some() {
-            self.touch(key);
+        if let Some(entry) = self.map.get_mut(key) {
+            self.clock += 1;
+            entry.1 = self.clock;
+            Some(entry.0.clone())
+        } else {
+            None
         }
-        value
     }
 
     fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
+        self.clock += 1;
         if self.map.contains_key(&key) {
-            self.map.insert(key.clone(), value);
-            self.touch(&key);
+            self.map.insert(key, (value, self.clock));
             return;
         }
 
         while self.map.len() >= self.capacity {
-            if let Some(evictkey) = self.order.pop_front() {
-                self.map.remove(&evictkey);
+            // Evict least-recently-used entry (lowest timestamp)
+            if let Some(evict_key) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&evict_key);
             } else {
                 break;
             }
         }
 
-        self.order.push_back(key.clone());
-        self.map.insert(key, value);
+        self.map.insert(key, (value, self.clock));
     }
 
     fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
     }
 }
 

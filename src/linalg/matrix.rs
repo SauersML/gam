@@ -1435,6 +1435,14 @@ impl DesignMatrix {
         <Self as LinearOperator>::ncols(self)
     }
 
+    /// Returns a reference to the inner dense array if this is a `Dense` variant.
+    pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
+        match self {
+            Self::Dense(matrix) => Some(matrix),
+            Self::Sparse(_) => None,
+        }
+    }
+
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(matrix) => matrix.clone(),

@@ -482,19 +482,23 @@ impl<'a> RemlState<'a> {
         let x_dense_eval = x_dense_eval_owned
             .as_ref()
             .unwrap_or_else(|| x_dense_orig_arc.as_ref());
-        let mut h_total_eval = bundle.h_total.as_ref().clone();
-        let mut e_eval = reparam_result.e_transformed.clone();
-
-        if let Some(z) = free_basis_opt.as_ref() {
-            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
+        let (h_total_eval, e_eval) = if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
             rs_eval = reparam_result
                 .rs_transformed
                 .iter()
                 .map(|r| r.dot(z))
                 .collect();
-            e_eval = reparam_result.e_transformed.dot(z);
-        }
+            (
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_total.as_ref().clone(),
+                reparam_result.e_transformed.clone(),
+            )
+        };
 
         let beta = &beta_eval;
         let rs_transformed = &rs_eval;

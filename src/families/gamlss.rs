@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::basis::{
     BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
     create_difference_penalty_matrix, evaluate_bspline_fourth_derivative_scalar,
@@ -3203,6 +3205,31 @@ fn binomial_location_scalerow(
     })
 }
 
+/// Compute only the log-likelihood scalar for the binomial location-scale model.
+/// This avoids allocating 7 n-vectors that `binomial_location_scale_core` would produce,
+/// making backtracking line searches much cheaper at biobank scale.
+fn binomial_location_scale_ll_only(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    eta_t: &Array1<f64>,
+    eta_ls: &Array1<f64>,
+    etawiggle: Option<&Array1<f64>>,
+    link_kind: &InverseLink,
+) -> Result<f64, String> {
+    let n = y.len();
+    let mut ll = 0.0;
+    for i in 0..n {
+        let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(eta_ls[i]);
+        let q0 = binomial_location_scale_q0(eta_t[i], sigma);
+        let q = q0 + etawiggle.map_or(0.0, |w| w[i]);
+        let jet = inverse_link_jet_for_inverse_link(link_kind, q)
+            .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+        let (mu_clamped, _) = clamped_binomial_probability(jet.mu);
+        ll += weights[i] * (y[i] * mu_clamped.ln() + (1.0 - y[i]) * (1.0 - mu_clamped).ln());
+    }
+    Ok(ll)
+}
+
 fn binomial_location_scale_core(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -3540,11 +3567,21 @@ fn gaussian_jointrow_scalars(
     if etamu.len() != nobs || eta_ls.len() != nobs || weights.len() != nobs {
         return Err("Gaussian joint row scalar input size mismatch".to_string());
     }
-    let sigma = eta_ls.mapv(|v| v.exp().max(1e-12));
-    let r = y - etamu;
-    let w = weights / sigma.mapv(|s| s * s);
-    let m = &r * &w;
-    let n = r.mapv(|ri| ri * ri) * &w;
+    let mut w = Array1::<f64>::uninit(nobs);
+    let mut m = Array1::<f64>::uninit(nobs);
+    let mut n = Array1::<f64>::uninit(nobs);
+    for i in 0..nobs {
+        let s = eta_ls[i].exp().max(1e-12);
+        let wi = weights[i] / (s * s);
+        let ri = y[i] - etamu[i];
+        w[i].write(wi);
+        m[i].write(ri * wi);
+        n[i].write(ri * ri * wi);
+    }
+    // SAFETY: all elements written in the loop above.
+    let w = unsafe { w.assume_init() };
+    let m = unsafe { m.assume_init() };
+    let n = unsafe { n.assume_init() };
     Ok(GaussianJointRowScalars { w, m, n })
 }
 
@@ -3553,9 +3590,23 @@ fn gaussian_joint_first_directionalweights(
     dotmu: &Array1<f64>,
     dot_eta: &Array1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let w_u = -2.0 * &scalars.w * dot_eta;
-    let c_u = -2.0 * &scalars.w * dotmu - 4.0 * &scalars.m * dot_eta;
-    let d_u = -4.0 * &scalars.m * dotmu - 4.0 * &scalars.n * dot_eta;
+    let nobs = scalars.w.len();
+    let mut w_u = Array1::<f64>::uninit(nobs);
+    let mut c_u = Array1::<f64>::uninit(nobs);
+    let mut d_u = Array1::<f64>::uninit(nobs);
+    for i in 0..nobs {
+        let wi = scalars.w[i];
+        let mi = scalars.m[i];
+        let ni = scalars.n[i];
+        let dm = dotmu[i];
+        let de = dot_eta[i];
+        w_u[i].write(-2.0 * wi * de);
+        c_u[i].write(-2.0 * wi * dm - 4.0 * mi * de);
+        d_u[i].write(-4.0 * mi * dm - 4.0 * ni * de);
+    }
+    let w_u = unsafe { w_u.assume_init() };
+    let c_u = unsafe { c_u.assume_init() };
+    let d_u = unsafe { d_u.assume_init() };
     (w_u, c_u, d_u)
 }
 
@@ -3566,12 +3617,27 @@ fn gaussian_jointsecond_directionalweights(
     dotmuv: &Array1<f64>,
     dot_etav: &Array1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let w_uv = 4.0 * &scalars.w * dot_eta_u * dot_etav;
-    let c_uv = 4.0 * &scalars.w * &(dotmu_u * dot_etav + dotmuv * dot_eta_u)
-        + 8.0 * &scalars.m * dot_eta_u * dot_etav;
-    let d_uv = 4.0 * &scalars.w * dotmu_u * dotmuv
-        + 8.0 * &scalars.m * &(dotmu_u * dot_etav + dotmuv * dot_eta_u)
-        + 8.0 * &scalars.n * dot_eta_u * dot_etav;
+    let nobs = scalars.w.len();
+    let mut w_uv = Array1::<f64>::uninit(nobs);
+    let mut c_uv = Array1::<f64>::uninit(nobs);
+    let mut d_uv = Array1::<f64>::uninit(nobs);
+    for i in 0..nobs {
+        let wi = scalars.w[i];
+        let mi = scalars.m[i];
+        let ni = scalars.n[i];
+        let dmu = dotmu_u[i];
+        let deu = dot_eta_u[i];
+        let dmv = dotmuv[i];
+        let dev = dot_etav[i];
+        w_uv[i].write(4.0 * wi * deu * dev);
+        c_uv[i].write(4.0 * wi * (dmu * dev + dmv * deu) + 8.0 * mi * deu * dev);
+        d_uv[i].write(
+            4.0 * wi * dmu * dmv + 8.0 * mi * (dmu * dev + dmv * deu) + 8.0 * ni * deu * dev,
+        );
+    }
+    let w_uv = unsafe { w_uv.assume_init() };
+    let c_uv = unsafe { c_uv.assume_init() };
+    let d_uv = unsafe { d_uv.assume_init() };
     (w_uv, c_uv, d_uv)
 }
 
@@ -3580,29 +3646,52 @@ fn gaussian_joint_psi_firstweights(
     mu_a: &Array1<f64>,
     eta_a: &Array1<f64>,
 ) -> GaussianJointPsiFirstWeights {
-    let scoremu = -&scalars.m;
-    let score_ls = 1.0 - &scalars.n;
-    let dscoremu = &scalars.w * mu_a + 2.0 * &scalars.m * eta_a;
-    let dscore_ls = 2.0 * &scalars.m * mu_a + 2.0 * &scalars.n * eta_a;
-    let hmumu = scalars.w.clone();
-    let hmu_ls = 2.0 * &scalars.m;
-    let h_ls_ls = 2.0 * &scalars.n;
-    let dhmumu = -2.0 * &scalars.w * eta_a;
-    let dhmu_ls = -2.0 * &scalars.w * mu_a - 4.0 * &scalars.m * eta_a;
-    let dh_ls_ls = -4.0 * &scalars.m * mu_a - 4.0 * &scalars.n * eta_a;
-    let objective_psirow = -&scalars.m * mu_a + &score_ls * eta_a;
-    GaussianJointPsiFirstWeights {
-        objective_psirow,
-        scoremu,
-        score_ls,
-        dscoremu,
-        dscore_ls,
-        hmumu,
-        hmu_ls,
-        h_ls_ls,
-        dhmumu,
-        dhmu_ls,
-        dh_ls_ls,
+    let nobs = scalars.w.len();
+    let mut objective_psirow = Array1::<f64>::uninit(nobs);
+    let mut scoremu = Array1::<f64>::uninit(nobs);
+    let mut score_ls = Array1::<f64>::uninit(nobs);
+    let mut dscoremu = Array1::<f64>::uninit(nobs);
+    let mut dscore_ls = Array1::<f64>::uninit(nobs);
+    let mut hmumu = Array1::<f64>::uninit(nobs);
+    let mut hmu_ls = Array1::<f64>::uninit(nobs);
+    let mut h_ls_ls = Array1::<f64>::uninit(nobs);
+    let mut dhmumu = Array1::<f64>::uninit(nobs);
+    let mut dhmu_ls = Array1::<f64>::uninit(nobs);
+    let mut dh_ls_ls = Array1::<f64>::uninit(nobs);
+    for i in 0..nobs {
+        let wi = scalars.w[i];
+        let mi = scalars.m[i];
+        let ni = scalars.n[i];
+        let ma = mu_a[i];
+        let ea = eta_a[i];
+        let smu = -mi;
+        let sls = 1.0 - ni;
+        scoremu[i].write(smu);
+        score_ls[i].write(sls);
+        dscoremu[i].write(wi * ma + 2.0 * mi * ea);
+        dscore_ls[i].write(2.0 * mi * ma + 2.0 * ni * ea);
+        hmumu[i].write(wi);
+        hmu_ls[i].write(2.0 * mi);
+        h_ls_ls[i].write(2.0 * ni);
+        dhmumu[i].write(-2.0 * wi * ea);
+        dhmu_ls[i].write(-2.0 * wi * ma - 4.0 * mi * ea);
+        dh_ls_ls[i].write(-4.0 * mi * ma - 4.0 * ni * ea);
+        objective_psirow[i].write(smu * ma + sls * ea);
+    }
+    unsafe {
+        GaussianJointPsiFirstWeights {
+            objective_psirow: objective_psirow.assume_init(),
+            scoremu: scoremu.assume_init(),
+            score_ls: score_ls.assume_init(),
+            dscoremu: dscoremu.assume_init(),
+            dscore_ls: dscore_ls.assume_init(),
+            hmumu: hmumu.assume_init(),
+            hmu_ls: hmu_ls.assume_init(),
+            h_ls_ls: h_ls_ls.assume_init(),
+            dhmumu: dhmumu.assume_init(),
+            dhmu_ls: dhmu_ls.assume_init(),
+            dh_ls_ls: dh_ls_ls.assume_init(),
+        }
     }
 }
 
@@ -3615,37 +3704,51 @@ fn gaussian_joint_psisecondweights(
     mu_ab: &Array1<f64>,
     eta_ab: &Array1<f64>,
 ) -> GaussianJointPsiSecondWeights {
-    let crossmu_eta = mu_a * eta_b + mu_b * eta_a;
-    let objective_psi_psirow = &scalars.w * mu_a * mu_b
-        + 2.0 * &scalars.m * &crossmu_eta
-        + 2.0 * &scalars.n * eta_a * eta_b
-        - &scalars.m * mu_ab
-        + (1.0 - &scalars.n) * eta_ab;
-    let d2scoremu =
-        &scalars.w * mu_ab - 2.0 * &scalars.w * &crossmu_eta - 4.0 * &scalars.m * eta_a * eta_b
-            + 2.0 * &scalars.m * eta_ab;
-    let d2score_ls = -2.0 * &scalars.w * mu_a * mu_b
-        - 4.0 * &scalars.m * &crossmu_eta
-        - 4.0 * &scalars.n * eta_a * eta_b
-        + 2.0 * &scalars.m * mu_ab
-        + 2.0 * &scalars.n * eta_ab;
-    let d2hmumu = 4.0 * &scalars.w * eta_a * eta_b - 2.0 * &scalars.w * eta_ab;
-    let d2hmu_ls = -2.0 * &scalars.w * mu_ab
-        + 4.0 * &scalars.w * &crossmu_eta
-        + 8.0 * &scalars.m * eta_a * eta_b
-        - 4.0 * &scalars.m * eta_ab;
-    let d2h_ls_ls = 4.0 * &scalars.w * mu_a * mu_b
-        + 8.0 * &scalars.m * &crossmu_eta
-        + 8.0 * &scalars.n * eta_a * eta_b
-        - 4.0 * &scalars.m * mu_ab
-        - 4.0 * &scalars.n * eta_ab;
-    GaussianJointPsiSecondWeights {
-        objective_psi_psirow,
-        d2scoremu,
-        d2score_ls,
-        d2hmumu,
-        d2hmu_ls,
-        d2h_ls_ls,
+    let nobs = scalars.w.len();
+    let mut objective_psi_psirow = Array1::<f64>::uninit(nobs);
+    let mut d2scoremu = Array1::<f64>::uninit(nobs);
+    let mut d2score_ls = Array1::<f64>::uninit(nobs);
+    let mut d2hmumu = Array1::<f64>::uninit(nobs);
+    let mut d2hmu_ls = Array1::<f64>::uninit(nobs);
+    let mut d2h_ls_ls = Array1::<f64>::uninit(nobs);
+    for i in 0..nobs {
+        let wi = scalars.w[i];
+        let mi = scalars.m[i];
+        let ni = scalars.n[i];
+        let ma = mu_a[i];
+        let ea = eta_a[i];
+        let mb = mu_b[i];
+        let eb = eta_b[i];
+        let mab = mu_ab[i];
+        let eab = eta_ab[i];
+        let cross = ma * eb + mb * ea;
+        let ea_eb = ea * eb;
+        let ma_mb = ma * mb;
+        objective_psi_psirow[i]
+            .write(wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * ea_eb - mi * mab + (1.0 - ni) * eab);
+        d2scoremu[i].write(wi * mab - 2.0 * wi * cross - 4.0 * mi * ea_eb + 2.0 * mi * eab);
+        d2score_ls[i].write(
+            -2.0 * wi * ma_mb - 4.0 * mi * cross - 4.0 * ni * ea_eb
+                + 2.0 * mi * mab
+                + 2.0 * ni * eab,
+        );
+        d2hmumu[i].write(4.0 * wi * ea_eb - 2.0 * wi * eab);
+        d2hmu_ls[i].write(-2.0 * wi * mab + 4.0 * wi * cross + 8.0 * mi * ea_eb - 4.0 * mi * eab);
+        d2h_ls_ls[i].write(
+            4.0 * wi * ma_mb + 8.0 * mi * cross + 8.0 * ni * ea_eb
+                - 4.0 * mi * mab
+                - 4.0 * ni * eab,
+        );
+    }
+    unsafe {
+        GaussianJointPsiSecondWeights {
+            objective_psi_psirow: objective_psi_psirow.assume_init(),
+            d2scoremu: d2scoremu.assume_init(),
+            d2score_ls: d2score_ls.assume_init(),
+            d2hmumu: d2hmumu.assume_init(),
+            d2hmu_ls: d2hmu_ls.assume_init(),
+            d2h_ls_ls: d2h_ls_ls.assume_init(),
+        }
     }
 }
 
@@ -3658,27 +3761,45 @@ fn gaussian_joint_psi_mixed_driftweights(
     dotmu_a: &Array1<f64>,
     dot_eta_a: &Array1<f64>,
 ) -> GaussianJointPsiMixedDriftWeights {
-    let (_, dhmu_ls_u, dh_ls_ls_u) =
-        gaussian_joint_first_directionalweights(scalars, dotmu, dot_eta);
-    let dhmumu_u = -2.0 * &scalars.w * dot_eta;
-    let d2hmumu = 4.0 * &scalars.w * dot_eta * eta_a - 2.0 * &scalars.w * dot_eta_a;
-    let crossmu_eta = dot_eta * mu_a + dotmu * eta_a;
-    let d2hmu_ls = -2.0 * &scalars.w * dotmu_a
-        + 4.0 * &scalars.w * &crossmu_eta
-        + 8.0 * &scalars.m * dot_eta * eta_a
-        - 4.0 * &scalars.m * dot_eta_a;
-    let d2h_ls_ls = 4.0 * &scalars.w * dotmu * mu_a
-        + 8.0 * &scalars.m * &crossmu_eta
-        + 8.0 * &scalars.n * dot_eta * eta_a
-        - 4.0 * &scalars.m * dotmu_a
-        - 4.0 * &scalars.n * dot_eta_a;
-    GaussianJointPsiMixedDriftWeights {
-        dhmumu_u,
-        dhmu_ls_u,
-        dh_ls_ls_u,
-        d2hmumu,
-        d2hmu_ls,
-        d2h_ls_ls,
+    let nobs = scalars.w.len();
+    let mut dhmumu_u = Array1::<f64>::uninit(nobs);
+    let mut dhmu_ls_u = Array1::<f64>::uninit(nobs);
+    let mut dh_ls_ls_u = Array1::<f64>::uninit(nobs);
+    let mut d2hmumu = Array1::<f64>::uninit(nobs);
+    let mut d2hmu_ls = Array1::<f64>::uninit(nobs);
+    let mut d2h_ls_ls = Array1::<f64>::uninit(nobs);
+    for i in 0..nobs {
+        let wi = scalars.w[i];
+        let mi = scalars.m[i];
+        let ni = scalars.n[i];
+        let dm = dotmu[i];
+        let de = dot_eta[i];
+        let ma = mu_a[i];
+        let ea = eta_a[i];
+        let dma = dotmu_a[i];
+        let dea = dot_eta_a[i];
+        let cross = de * ma + dm * ea;
+        // First directional: w_u not needed, compute c_u and d_u inline
+        dhmumu_u[i].write(-2.0 * wi * de);
+        dhmu_ls_u[i].write(-2.0 * wi * dm - 4.0 * mi * de);
+        dh_ls_ls_u[i].write(-4.0 * mi * dm - 4.0 * ni * de);
+        d2hmumu[i].write(4.0 * wi * de * ea - 2.0 * wi * dea);
+        d2hmu_ls[i].write(-2.0 * wi * dma + 4.0 * wi * cross + 8.0 * mi * de * ea - 4.0 * mi * dea);
+        d2h_ls_ls[i].write(
+            4.0 * wi * dm * ma + 8.0 * mi * cross + 8.0 * ni * de * ea
+                - 4.0 * mi * dma
+                - 4.0 * ni * dea,
+        );
+    }
+    unsafe {
+        GaussianJointPsiMixedDriftWeights {
+            dhmumu_u: dhmumu_u.assume_init(),
+            dhmu_ls_u: dhmu_ls_u.assume_init(),
+            dh_ls_ls_u: dh_ls_ls_u.assume_init(),
+            d2hmumu: d2hmumu.assume_init(),
+            d2hmu_ls: d2hmu_ls.assume_init(),
+            d2h_ls_ls: d2h_ls_ls.assume_init(),
+        }
     }
 }
 
@@ -3854,36 +3975,49 @@ impl GaussianLocationScaleFamily {
         self.mu_design.is_some() && self.log_sigma_design.is_some()
     }
 
-    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
+    fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let mu_design = self.mu_design.as_ref().ok_or_else(|| {
             "GaussianLocationScaleFamily exact path is missing mu design".to_string()
         })?;
         let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
             "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
         })?;
-        Ok((mu_design.to_dense(), log_sigma_design.to_dense()))
+        let xmu = match mu_design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(mu_design.to_dense()),
+        };
+        let x_ls = match log_sigma_design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(log_sigma_design.to_dense()),
+        };
+        Ok((xmu, x_ls))
     }
 
-    fn dense_block_designs_fromspecs(
+    fn dense_block_designs_fromspecs<'a>(
         &self,
-        specs: &[ParameterBlockSpec],
-    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        specs: &'a [ParameterBlockSpec],
+    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
         if specs.len() != 2 {
             return Err(format!(
                 "GaussianLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
                 specs.len()
             ));
         }
-        Ok((
-            specs[Self::BLOCK_MU].design.to_dense(),
-            specs[Self::BLOCK_LOG_SIGMA].design.to_dense(),
-        ))
+        let xmu = match specs[Self::BLOCK_MU].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_MU].design.to_dense()),
+        };
+        let x_ls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_LOG_SIGMA].design.to_dense()),
+        };
+        Ok((xmu, x_ls))
     }
 
-    fn exact_joint_dense_block_designs(
-        &self,
-        specs: Option<&[ParameterBlockSpec]>,
-    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+    fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
         if self.exact_joint_supported() {
             return self.dense_block_designs().map(Some);
         }
@@ -4557,29 +4691,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let mut sigma = Array1::<f64>::zeros(n);
-        let mut dsigma_deta = Array1::<f64>::zeros(n);
+        // SAFETY: every element is written before being read in the loop below.
+        let mut zmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
+        let mut wmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
+        let mut z_ls = unsafe { Array1::<f64>::uninit(n).assume_init() };
+        let mut w_ls = unsafe { Array1::<f64>::uninit(n).assume_init() };
         let mut ll = 0.0;
 
         for i in 0..n {
-            let sigma_i = eta_log_sigma[i].exp();
-            let dsigma_deta_i = sigma_i;
-            sigma[i] = sigma_i;
-            dsigma_deta[i] = dsigma_deta_i;
+            let sigma_i = eta_log_sigma[i].exp().max(1e-12);
             let r = self.y[i] - etamu[i];
-            let s2 = (sigma[i] * sigma[i]).max(1e-20);
+            let s2 = (sigma_i * sigma_i).max(1e-20);
             ll += self.weights[i] * (-0.5 * (r * r / s2 + (2.0 * std::f64::consts::PI * s2).ln()));
-        }
-
-        let mut zmu = Array1::<f64>::zeros(n);
-        let mut wmu = Array1::<f64>::zeros(n);
-        let mut z_ls = Array1::<f64>::zeros(n);
-        let mut w_ls = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let r = self.y[i] - etamu[i];
-            let s = sigma[i].max(1e-10);
-            let s2 = (s * s).max(1e-20);
 
             // mu block (identity): canonical WLS
             if self.weights[i] == 0.0 {
@@ -4591,16 +4714,13 @@ impl CustomFamily for GaussianLocationScaleFamily {
             }
 
             // log-sigma block: IRLS working response and weights.
-            // The score for log-sigma is d(ll)/d(eta_ls) = (r²/s² - 1) * dsigma/(sigma * deta).
-            // Working response: z_ls = eta_ls + score / info.
             let (dlogsigma_du, info_u) =
-                gaussian_log_sigma_irlsinfo(self.weights[i], s, dsigma_deta[i]);
+                gaussian_log_sigma_irlsinfo(self.weights[i], sigma_i, sigma_i);
             if info_u == 0.0 {
                 w_ls[i] = 0.0;
                 z_ls[i] = eta_log_sigma[i];
             } else {
                 w_ls[i] = info_u;
-                // Score: d(ll)/d(eta_ls) = w_i * (r²/s² - 1) * dsigma/sigma
                 let score_ls = self.weights[i] * (r * r / s2 - 1.0) * dlogsigma_du;
                 z_ls[i] = eta_log_sigma[i] + score_ls / info_u;
             }
@@ -4619,6 +4739,29 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 },
             ],
         })
+    }
+
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let etamu = &block_states[Self::BLOCK_MU].eta;
+        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if etamu.len() != n || eta_log_sigma.len() != n || self.weights.len() != n {
+            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
+        }
+        let mut ll = 0.0;
+        for i in 0..n {
+            let sigma_i = eta_log_sigma[i].exp().max(1e-12);
+            let r = self.y[i] - etamu[i];
+            let s2 = (sigma_i * sigma_i).max(1e-20);
+            ll += self.weights[i] * (-0.5 * (r * r / s2 + (2.0 * std::f64::consts::PI * s2).ln()));
+        }
+        Ok(ll)
     }
 
     fn exact_newton_joint_hessian(
@@ -5347,36 +5490,49 @@ impl BinomialLocationScaleFamily {
             && self.log_sigma_design.is_some()
     }
 
-    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
+    fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
         })?;
         let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
         })?;
-        Ok((threshold_design.to_dense(), log_sigma_design.to_dense()))
+        let xt = match threshold_design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(threshold_design.to_dense()),
+        };
+        let x_ls = match log_sigma_design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(log_sigma_design.to_dense()),
+        };
+        Ok((xt, x_ls))
     }
 
-    fn dense_block_designs_fromspecs(
+    fn dense_block_designs_fromspecs<'a>(
         &self,
-        specs: &[ParameterBlockSpec],
-    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        specs: &'a [ParameterBlockSpec],
+    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
         if specs.len() != 2 {
             return Err(format!(
                 "BinomialLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
                 specs.len()
             ));
         }
-        Ok((
-            specs[Self::BLOCK_T].design.to_dense(),
-            specs[Self::BLOCK_LOG_SIGMA].design.to_dense(),
-        ))
+        let xt = match specs[Self::BLOCK_T].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_T].design.to_dense()),
+        };
+        let x_ls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_LOG_SIGMA].design.to_dense()),
+        };
+        Ok((xt, x_ls))
     }
 
-    fn exact_joint_dense_block_designs(
-        &self,
-        specs: Option<&[ParameterBlockSpec]>,
-    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+    fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
         // The probit non-wiggle family is structurally capable of exact joint
         // outer rho-derivatives whenever the realized threshold and log-sigma
         // designs are available somewhere. Prefer cached family designs when
@@ -6772,7 +6928,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
             // objects from the rowwise eta-space chain rule. Entering that path
             // here is what makes the family consistent with the exact joint
             // outer-Hessian callbacks implemented below.
-            let (_, _, d2sigma_deta2, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
+            // For the exp link, sigma = d1 = d2 = d3 = exp(eta), so just compute once.
+            let d2sigma_deta2 = eta_ls.mapv(f64::exp);
             let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
                 "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
             })?;
@@ -6815,6 +6972,30 @@ impl CustomFamily for BinomialLocationScaleFamily {
             log_likelihood: core.log_likelihood,
             blockworking_sets: vec![tws, lsws],
         })
+    }
+
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
+        }
+        // Zero-allocation O(n) scalar loop — no working sets, no n-vector intermediates.
+        binomial_location_scale_ll_only(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -7393,45 +7574,49 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(out)
     }
 
-    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
-        let xt = self
-            .threshold_design
-            .as_ref()
-            .ok_or_else(|| {
-                "BinomialLocationScaleWiggleFamily exact path is missing threshold design"
-                    .to_string()
-            })?
-            .to_dense();
-        let xls = self
-            .log_sigma_design
-            .as_ref()
-            .ok_or_else(|| {
-                "BinomialLocationScaleWiggleFamily exact path is missing log-sigma design"
-                    .to_string()
-            })?
-            .to_dense();
+    fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
+        let td = self.threshold_design.as_ref().ok_or_else(|| {
+            "BinomialLocationScaleWiggleFamily exact path is missing threshold design".to_string()
+        })?;
+        let lsd = self.log_sigma_design.as_ref().ok_or_else(|| {
+            "BinomialLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
+        })?;
+        let xt = match td.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(td.to_dense()),
+        };
+        let xls = match lsd.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(lsd.to_dense()),
+        };
         Ok((xt, xls))
     }
 
-    fn dense_block_designs_fromspecs(
+    fn dense_block_designs_fromspecs<'a>(
         &self,
-        specs: &[ParameterBlockSpec],
-    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        specs: &'a [ParameterBlockSpec],
+    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
         if specs.len() != 3 {
             return Err(format!(
                 "BinomialLocationScaleWiggleFamily expects 3 specs, got {}",
                 specs.len()
             ));
         }
-        let xt = specs[Self::BLOCK_T].design.to_dense();
-        let xls = specs[Self::BLOCK_LOG_SIGMA].design.to_dense();
+        let xt = match specs[Self::BLOCK_T].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_T].design.to_dense()),
+        };
+        let xls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_LOG_SIGMA].design.to_dense()),
+        };
         Ok((xt, xls))
     }
 
-    fn exact_joint_dense_block_designs(
-        &self,
-        specs: Option<&[ParameterBlockSpec]>,
-    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+    fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
         if !self.exact_joint_supported() {
             return Ok(None);
         }
@@ -7452,8 +7637,8 @@ impl BinomialLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(x_t)),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
+            threshold_design: Some(DesignMatrix::Dense(x_t.into_owned())),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls.into_owned())),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
         }))
@@ -9286,7 +9471,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             self.wiggle_dq_dq0(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
         let d2q_dq02 =
             self.wiggle_d2q_dq02(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
-        let (_, _, d2sigma_deta2, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let d2sigma_deta2 = eta_ls.mapv(f64::exp);
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleWiggleFamily exact-newton path is missing threshold design"
                 .to_string()
@@ -9317,6 +9502,30 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             log_likelihood: core.log_likelihood,
             blockworking_sets: vec![tws, lsws, wws],
         })
+    }
+
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        if block_states.len() != 3 {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleWiggleFamily input size mismatch".to_string());
+        }
+        binomial_location_scale_ll_only(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            Some(etaw),
+            &self.link_kind,
+        )
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {

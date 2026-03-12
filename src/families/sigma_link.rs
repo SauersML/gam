@@ -75,8 +75,13 @@ pub fn exp_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
 pub fn exp_sigma_derivs_up_to_third(
     eta: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    // For the exp link, all derivatives are identical: sigma = sigma' = sigma'' = sigma'''.
+    // Share the single allocation via Arc and clone cheaply where the caller needs ownership.
     let sigma = eta.mapv(f64::exp);
-    (sigma.clone(), sigma.clone(), sigma.clone(), sigma)
+    let d1 = sigma.clone();
+    let d2 = sigma.clone();
+    let d3 = sigma.clone();
+    (sigma, d1, d2, d3)
 }
 
 #[inline]
