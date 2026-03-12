@@ -3385,46 +3385,6 @@ fn extract_spatial_operator_runtime_caches(
         .zip(design.smooth.terms.iter())
         .enumerate()
     {
-        let term_is_frozen = match (&termspec.basis, &term_fit.metadata) {
-            (
-                SmoothBasisSpec::Duchon { feature_cols, spec },
-                BasisMetadata::Duchon {
-                    identifiability_transform,
-                    ..
-                },
-            ) => {
-                matches!(
-                    spec.identifiability,
-                    SpatialIdentifiability::OrthogonalToParametric
-                        | SpatialIdentifiability::FrozenTransform { .. }
-                ) && identifiability_transform.is_some()
-                    && feature_cols.len() > 1
-            }
-            (
-                SmoothBasisSpec::ThinPlate { feature_cols, spec },
-                BasisMetadata::ThinPlate {
-                    identifiability_transform,
-                    ..
-                },
-            ) => {
-                matches!(
-                    spec.identifiability,
-                    SpatialIdentifiability::OrthogonalToParametric
-                        | SpatialIdentifiability::FrozenTransform { .. }
-                ) && identifiability_transform.is_some()
-                    && feature_cols.len() > 1
-            }
-            (SmoothBasisSpec::Matern { spec, .. }, BasisMetadata::Matern { .. }) => {
-                matches!(
-                    spec.identifiability,
-                    MaternIdentifiability::FrozenTransform { .. }
-                )
-            }
-            _ => false,
-        };
-        if term_is_frozen {
-            continue;
-        }
         let Some(global_base_idx) = smooth_term_penalty_index(spec, design, term_idx) else {
             continue;
         };

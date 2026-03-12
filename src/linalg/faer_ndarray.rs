@@ -620,70 +620,70 @@ pub fn fast_joint_hessian_2x2<
     let mut wab_xb_buf = Array2::<f64>::zeros((chunk_rows, pb).f());
     let mut wbb_xb_buf = Array2::<f64>::zeros((chunk_rows, pb).f());
     {
-    let mut out_mat = array2_to_matmut(&mut out);
+        let mut out_mat = array2_to_matmut(&mut out);
 
-    for start in (0..n).step_by(chunk_rows) {
-        let rows = (n - start).min(chunk_rows);
-        let xa_slice = x_a.slice(s![start..start + rows, ..]);
-        let xb_slice = x_b.slice(s![start..start + rows, ..]);
+        for start in (0..n).step_by(chunk_rows) {
+            let rows = (n - start).min(chunk_rows);
+            let xa_slice = x_a.slice(s![start..start + rows, ..]);
+            let xb_slice = x_b.slice(s![start..start + rows, ..]);
 
-        // Weight X_a and X_b in a single pass through this chunk
-        {
-            let mut waa_chunk = waa_xa_buf.slice_mut(s![0..rows, ..]);
-            let mut wab_chunk = wab_xb_buf.slice_mut(s![0..rows, ..]);
-            let mut wbb_chunk = wbb_xb_buf.slice_mut(s![0..rows, ..]);
-            for local in 0..rows {
-                let i = start + local;
-                let waa_i = w_aa[i];
-                let wab_i = w_ab[i];
-                let wbb_i = w_bb[i];
-                for col in 0..pa {
-                    waa_chunk[[local, col]] = xa_slice[[local, col]] * waa_i;
-                }
-                for col in 0..pb {
-                    wab_chunk[[local, col]] = xb_slice[[local, col]] * wab_i;
-                    wbb_chunk[[local, col]] = xb_slice[[local, col]] * wbb_i;
+            // Weight X_a and X_b in a single pass through this chunk
+            {
+                let mut waa_chunk = waa_xa_buf.slice_mut(s![0..rows, ..]);
+                let mut wab_chunk = wab_xb_buf.slice_mut(s![0..rows, ..]);
+                let mut wbb_chunk = wbb_xb_buf.slice_mut(s![0..rows, ..]);
+                for local in 0..rows {
+                    let i = start + local;
+                    let waa_i = w_aa[i];
+                    let wab_i = w_ab[i];
+                    let wbb_i = w_bb[i];
+                    for col in 0..pa {
+                        waa_chunk[[local, col]] = xa_slice[[local, col]] * waa_i;
+                    }
+                    for col in 0..pb {
+                        wab_chunk[[local, col]] = xb_slice[[local, col]] * wab_i;
+                        wbb_chunk[[local, col]] = xb_slice[[local, col]] * wbb_i;
+                    }
                 }
             }
+
+            let xa_view = FaerArrayView::new(&xa_slice);
+            let xb_view = FaerArrayView::new(&xb_slice);
+            let waa_xa_slice = waa_xa_buf.slice(s![0..rows, ..]);
+            let wab_xb_slice = wab_xb_buf.slice(s![0..rows, ..]);
+            let wbb_xb_slice = wbb_xb_buf.slice(s![0..rows, ..]);
+            let waa_xa_view = FaerArrayView::new(&waa_xa_slice);
+            let wab_xb_view = FaerArrayView::new(&wab_xb_slice);
+            let wbb_xb_view = FaerArrayView::new(&wbb_xb_slice);
+
+            // Block [0..pa, 0..pa]: X_a^T diag(w_aa) X_a
+            matmul(
+                out_mat.rb_mut().submatrix_mut(0, 0, pa, pa),
+                Accum::Add,
+                xa_view.as_ref().transpose(),
+                waa_xa_view.as_ref(),
+                1.0,
+                matmul_parallelism(pa, pa, rows),
+            );
+            // Block [0..pa, pa..total]: X_a^T diag(w_ab) X_b
+            matmul(
+                out_mat.rb_mut().submatrix_mut(0, pa, pa, pb),
+                Accum::Add,
+                xa_view.as_ref().transpose(),
+                wab_xb_view.as_ref(),
+                1.0,
+                matmul_parallelism(pa, pb, rows),
+            );
+            // Block [pa..total, pa..total]: X_b^T diag(w_bb) X_b
+            matmul(
+                out_mat.rb_mut().submatrix_mut(pa, 0, pb, pb),
+                Accum::Add,
+                xb_view.as_ref().transpose(),
+                wbb_xb_view.as_ref(),
+                1.0,
+                matmul_parallelism(pb, pb, rows),
+            );
         }
-
-        let xa_view = FaerArrayView::new(&xa_slice);
-        let xb_view = FaerArrayView::new(&xb_slice);
-        let waa_xa_slice = waa_xa_buf.slice(s![0..rows, ..]);
-        let wab_xb_slice = wab_xb_buf.slice(s![0..rows, ..]);
-        let wbb_xb_slice = wbb_xb_buf.slice(s![0..rows, ..]);
-        let waa_xa_view = FaerArrayView::new(&waa_xa_slice);
-        let wab_xb_view = FaerArrayView::new(&wab_xb_slice);
-        let wbb_xb_view = FaerArrayView::new(&wbb_xb_slice);
-
-        // Block [0..pa, 0..pa]: X_a^T diag(w_aa) X_a
-        matmul(
-            out_mat.rb_mut().submatrix_mut(0, 0, pa, pa),
-            Accum::Add,
-            xa_view.as_ref().transpose(),
-            waa_xa_view.as_ref(),
-            1.0,
-            matmul_parallelism(pa, pa, rows),
-        );
-        // Block [0..pa, pa..total]: X_a^T diag(w_ab) X_b
-        matmul(
-            out_mat.rb_mut().submatrix_mut(0, pa, pa, pb),
-            Accum::Add,
-            xa_view.as_ref().transpose(),
-            wab_xb_view.as_ref(),
-            1.0,
-            matmul_parallelism(pa, pb, rows),
-        );
-        // Block [pa..total, pa..total]: X_b^T diag(w_bb) X_b
-        matmul(
-            out_mat.rb_mut().submatrix_mut(pa, 0, pb, pb),
-            Accum::Add,
-            xb_view.as_ref().transpose(),
-            wbb_xb_view.as_ref(),
-            1.0,
-            matmul_parallelism(pb, pb, rows),
-        );
-    }
     } // out_mat dropped
     // Mirror upper triangle to lower
     for i in 0..total {
