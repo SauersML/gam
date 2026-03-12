@@ -1576,11 +1576,8 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let mut h_eff_eval = bundle.h_eff.as_ref().clone();
-        let mut h_total_eval = bundle.h_total.as_ref().clone();
-        let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
-        let mut x_transformed_eval = pirls_result.x_transformed.clone();
-        let mut e_eval = reparam_result.e_transformed.clone();
+        let (h_eff_eval, h_total_eval, beta_eval, e_eval);
+        let x_constrained_owned;
 
         let x_psi_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
 
@@ -1594,13 +1591,22 @@ impl<'a> RemlState<'a> {
                     "directional hyper-gradient with active constraints requires dense transformed design",
                 )
                 .map_err(EstimationError::InvalidInput)?;
-            x_transformed_eval = DesignMatrix::Dense(
+            x_constrained_owned = Some(DesignMatrix::Dense(
                 DenseRightProductView::new(x_dense_arc.as_ref())
                     .with_factor(z)
                     .materialize(),
-            );
+            ));
             e_eval = reparam_result.e_transformed.dot(z);
+        } else {
+            h_eff_eval = bundle.h_eff.as_ref().clone();
+            h_total_eval = bundle.h_total.as_ref().clone();
+            beta_eval = pirls_result.beta_transformed.as_ref().clone();
+            e_eval = reparam_result.e_transformed.clone();
+            x_constrained_owned = None;
         }
+        let x_transformed_eval = x_constrained_owned
+            .as_ref()
+            .unwrap_or(&pirls_result.x_transformed);
         let transformed_penalty_components = Self::transform_penalty_components(
             hyper_dir.penalty_first_components(),
             &reparam_result.qs,

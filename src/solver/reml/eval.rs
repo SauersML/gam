@@ -1,4 +1,5 @@
 use super::*;
+use crate::linalg::utils::enforce_symmetry;
 use crate::matrix::DenseRightProductView;
 use ndarray::ShapeBuilder;
 
@@ -1657,12 +1658,8 @@ impl<'a> RemlState<'a> {
 
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
         let reparam_result = &pirls_result.reparam_result;
-        let mut h_eff_eval = bundle.h_eff.as_ref().clone();
-        let mut e_eval = reparam_result.e_transformed.clone();
-        let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
-        let mut rs_eval = reparam_result.rs_transformed.clone();
-        let mut x_transformed_eval = pirls_result.x_transformed.clone();
-        let mut h_pos_factorw_eval = bundle.h_pos_factorw.as_ref().clone();
+        let (h_eff_eval, e_eval, beta_eval, rs_eval, h_pos_factorw_eval);
+        let x_constrained_owned;
 
         if let Some(z) = free_basis_opt.as_ref() {
             h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
@@ -1674,11 +1671,11 @@ impl<'a> RemlState<'a> {
                 .map(|r| r.dot(z))
                 .collect();
             let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
-            x_transformed_eval = DesignMatrix::Dense(
+            x_constrained_owned = Some(DesignMatrix::Dense(
                 DenseRightProductView::new(x_dense_arc.as_ref())
                     .with_factor(z)
                     .materialize(),
-            );
+            ));
 
             let (eigvals, eigvecs) = h_eff_eval
                 .eigh(Side::Lower)
@@ -1702,7 +1699,17 @@ impl<'a> RemlState<'a> {
                     .for_each(|w_elem, &u_elem| *w_elem = u_elem * scale);
             }
             h_pos_factorw_eval = w;
+        } else {
+            h_eff_eval = bundle.h_eff.as_ref().clone();
+            e_eval = reparam_result.e_transformed.clone();
+            beta_eval = pirls_result.beta_transformed.as_ref().clone();
+            rs_eval = reparam_result.rs_transformed.clone();
+            h_pos_factorw_eval = bundle.h_pos_factorw.as_ref().clone();
+            x_constrained_owned = None;
         }
+        let x_transformed_eval = x_constrained_owned
+            .as_ref()
+            .unwrap_or(&pirls_result.x_transformed);
         let h_eff = &h_eff_eval;
 
         // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.

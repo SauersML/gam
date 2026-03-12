@@ -2,6 +2,12 @@
 
 Generalized penalized likelihood engine with a formula-first CLI.
 
+## Requirements
+
+- Rust `1.93+` (when building from source)
+- CSV data with a header row
+- Shell support for quoted formulas (examples below assume `bash`/`zsh`)
+
 ## Install
 
 ### Prebuilt binary (macOS / Linux / Windows Git Bash)
@@ -35,6 +41,17 @@ Inspect options:
 ```bash
 gam <command> --help
 ```
+
+### Quick command/output reference
+
+| Command | Required args | Key options | Default output behavior |
+| --- | --- | --- | --- |
+| `gam fit` | `<DATA> <FORMULA>` | `--out`, `--predict-noise`, `--survival-likelihood` | No artifact written unless `--out` is provided |
+| `gam predict` | `<MODEL> <NEW_DATA>` | `--out` (required), `--uncertainty`, `--mode`, `--covariance-mode` | Writes the CSV passed via `--out` |
+| `gam report` | `<MODEL> [DATA] [OUT]` | positional `[OUT]` | Writes `<model_stem>.report.html` when `[OUT]` omitted |
+| `gam diagnose` | `<MODEL> <DATA>` | `--alo` | Prints terminal diagnostics table |
+| `gam sample` | `<MODEL> <DATA>` | `--chains`, `--samples`, `--warmup`, `--out` | Writes `posterior_samples.csv` when `--out` omitted |
+| `gam generate` | `<MODEL> <DATA>` | `--n-draws`, `--out` | Writes `synthetic.csv` when `--out` omitted |
 
 ## End-to-End Quickstart
 
@@ -196,7 +213,7 @@ Survival-specific behavior:
 
 - `survmodel(spec=...)` currently supports `spec=net`.
 - `survmodel(distribution=...)` supports `gaussian|gumbel|logistic` (aliases: `probit|cloglog|logit`).
-- `--time-basis` for survival currently supports `ispline` in structural mode.
+- For survival fitting, `--time-basis` currently accepts `ispline`.
 - Weibull likelihood mode uses built-in parametric baseline handling and rejects extra baseline-target parameterization flags.
 - `timewiggle(...)` is a baseline-target deformation for survival models.
   Current support: transformation or location-scale survival with `--baseline-target weibull|gompertz|gompertz-makeham`, and Weibull survival when you supply explicit `--baseline-scale` and `--baseline-shape`.
@@ -305,6 +322,19 @@ Prediction/report/sample/generate paths load new data with saved schema expectat
 - Column names and types must match training schema.
 - Unseen categories are treated as errors.
 - Missing training-header metadata in older models can cause feature-mapping errors; refit with current CLI if needed.
+
+## Troubleshooting
+
+- Error mentions missing columns/fields:
+  - Verify exact header spelling and presence in both the formula and CSV.
+- Error mentions unseen categories:
+  - Ensure factor/category levels in prediction data were present in training data.
+- Error mentions matrix conditioning/singularity:
+  - Remove redundant terms, avoid duplicate linear + smooth terms on the same feature, and reduce smooth basis complexity.
+- Error mentions shape/dimension mismatch:
+  - Re-check schema consistency and refit if the saved model predates current metadata fields.
+- Error mentions invalid probabilities for binomial:
+  - Ensure target values are strictly `0/1` (or valid two-level encoding before preprocessing).
 
 ## Practical Examples
 

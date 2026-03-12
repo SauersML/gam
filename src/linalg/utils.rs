@@ -182,6 +182,19 @@ pub(crate) fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
         .max(1.0)
 }
 
+/// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
+pub(crate) fn enforce_symmetry(matrix: &mut Array2<f64>) {
+    let n = matrix.nrows();
+    debug_assert_eq!(n, matrix.ncols());
+    for i in 0..n {
+        for j in i + 1..n {
+            let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+            matrix[[i, j]] = avg;
+            matrix[[j, i]] = avg;
+        }
+    }
+}
+
 pub(crate) fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     if ridge <= 0.0 {
         return matrix.clone();
