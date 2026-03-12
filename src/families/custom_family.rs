@@ -6211,7 +6211,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn block_solve_sparse_matches_dense() {
         let x_dense = array![
@@ -6266,7 +6265,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn block_solve_falls_backwhen_llt_rejects_indefinite_system() {
