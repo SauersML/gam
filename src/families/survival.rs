@@ -1,10 +1,11 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::linalg::utils::{default_slq_parameters, stochastic_lanczos_logdet_spd};
+use crate::matrix::FactorizedSystem;
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -1312,16 +1313,10 @@ impl WorkingModelSurvival {
                 .expect("survival Hessian solve should succeed")
         };
         let solvevec = |rhs: &Array1<f64>| -> Array1<f64> {
-            let rhs_mat = rhs.clone().insert_axis(Axis(1));
-            let solved = solve_mat(&rhs_mat);
-            solved.column(0).to_owned()
+            factor
+                .solve(rhs)
+                .expect("survival Hessian solve should succeed")
         };
-        let mut eye = Array2::<f64>::zeros((p, p));
-        for d in 0..p {
-            eye[[d, d]] = 1.0;
-        }
-        let h_inv = solve_mat(&eye);
-
         // Keep outer gradient contractions consistent with the fitted inner state:
         // the working predictor includes target baseline offsets plus learned deviation.
         let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
@@ -1400,10 +1395,18 @@ impl WorkingModelSurvival {
             // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
             let u_k = -solvevec(&a_k_beta);
 
-            // trace(H^{-1} A_k) on block support from precomputed H^{-1}.
-            // tr(H_inv_block * A_k^T) = element-wise sum of H_inv_block .* A_k^T
-            let h_inv_block = h_inv.slice(ndarray::s![start..end, start..end]);
-            let trace_hinv_ak = lambda * (&h_inv_block * &block.matrix.t()).sum();
+            // Exact trace(H^{-1} A_k) without assembling the full dense inverse.
+            // Since A_k is block-supported, solve only those block columns.
+            let block_width = end - start;
+            let mut rhs_block = Array2::<f64>::zeros((p, block_width));
+            rhs_block
+                .slice_mut(ndarray::s![start..end, ..])
+                .assign(&block.matrix.mapv(|v| lambda * v));
+            let solved_block = solve_mat(&rhs_block);
+            let mut trace_hinv_ak = 0.0;
+            for j in 0..block_width {
+                trace_hinv_ak += solved_block[[start + j, j]];
+            }
 
             // Exact directional derivative B = dH_nll/d beta [u_k].
             // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).
@@ -1502,7 +1505,11 @@ impl WorkingModelSurvival {
                 }
             }
 
-            let tracethird = (&h_inv * &b_dir.t()).sum();
+            let solved_b_dir = solve_mat(&b_dir);
+            let mut tracethird = 0.0;
+            for j in 0..p {
+                tracethird += solved_b_dir[[j, j]];
+            }
             let t_k = trace_hinv_ak + tracethird;
 
             // p_k = tr(S^+ A_k) restricted to this block.
@@ -2575,54 +2582,6 @@ mod tests {
             constraints.a[[0, 1]].abs() <= 1e-12,
             "first sparse row should leave column 1 unconstrained"
         );
-    }
-
-    fn modelwith_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
-        let mut model = base.clone();
-        assert_eq!(model.penalties.blocks.len(), rho.len());
-        for (k, block) in model.penalties.blocks.iter_mut().enumerate() {
-            block.lambda = rho[k].exp();
-        }
-        model
-    }
-
-    fn solve_inner_mode(model: &WorkingModelSurvival, beta_init: &Array1<f64>) -> Array1<f64> {
-        let mut model_local = model.clone();
-        let opts = crate::pirls::WorkingModelPirlsOptions {
-            max_iterations: 200,
-            convergence_tolerance: 1e-10,
-            max_step_halving: 40,
-            min_step_size: 1e-12,
-            firth_bias_reduction: false,
-            coefficient_lower_bounds: None,
-            linear_constraints: model_local.monotonicity_linear_constraints(),
-        };
-        let out = crate::pirls::runworking_model_pirls(
-            &mut model_local,
-            crate::types::Coefficients::new(beta_init.clone()),
-            &opts,
-            |info| {
-                let _ = info;
-            },
-        )
-        .expect("survival constrained PIRLS inner mode");
-        out.beta.0
-    }
-
-    fn lamlobjective_at_rho(
-        base: &WorkingModelSurvival,
-        rho: &Array1<f64>,
-        beta_init: &Array1<f64>,
-    ) -> (f64, Array1<f64>, Array1<f64>) {
-        let model = modelwith_rho(base, rho);
-        let beta_hat = solve_inner_mode(&model, beta_init);
-        let state = model
-            .update_state(&beta_hat)
-            .expect("state at inner mode for outer objective");
-        let (obj, grad) = model
-            .lamlobjective_and_rhogradient(&beta_hat, &state)
-            .expect("analytic laml objective/gradient");
-        (obj, grad, beta_hat)
     }
 
     #[test]

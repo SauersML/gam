@@ -3767,45 +3767,6 @@ mod tests {
         ]
     }
 
-    fn survival_outergradient_testspecs() -> Vec<ParameterBlockSpec> {
-        vec![
-            ParameterBlockSpec {
-                name: "time_transform".to_string(),
-                design: DesignMatrix::Dense(array![
-                    [1.0],
-                    [1.0],
-                    [1.0],
-                    [1.2],
-                    [0.9],
-                    [1.4],
-                    [1.0],
-                    [1.0],
-                    [1.0]
-                ]),
-                offset: Array1::zeros(9),
-                penalties: vec![Array2::eye(1)],
-                initial_log_lambdas: array![0.0],
-                initial_beta: Some(array![0.2]),
-            },
-            ParameterBlockSpec {
-                name: "threshold".to_string(),
-                design: DesignMatrix::Dense(array![[1.0], [0.4], [-0.6]]),
-                offset: Array1::zeros(3),
-                penalties: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(array![0.35]),
-            },
-            ParameterBlockSpec {
-                name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(array![[1.0], [-0.3], [0.5]]),
-                offset: Array1::zeros(3),
-                penalties: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(array![-0.15]),
-            },
-        ]
-    }
-
     fn survival_non_probit_test_links() -> Vec<(&'static str, InverseLink)> {
         vec![
             (
