@@ -1403,20 +1403,6 @@ pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize)
     density < 0.20 && num_basis_cols > 32
 }
 
-fn eval_kinds_from_orders(orders: &[usize]) -> Result<Vec<BasisEvalKind>, BasisError> {
-    orders
-        .iter()
-        .map(|&order| match order {
-            0 => Ok(BasisEvalKind::Basis),
-            1 => Ok(BasisEvalKind::FirstDerivative),
-            2 => Ok(BasisEvalKind::SecondDerivative),
-            _ => Err(BasisError::InvalidInput(format!(
-                "unsupported derivative order {order}"
-            ))),
-        })
-        .collect()
-}
-
 /// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
 /// The penalty is of the form `S = D' * D`, penalizing the squared `order`-th
 /// differences of the spline coefficients. This is the core of P-splines.

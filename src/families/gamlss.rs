@@ -13670,7 +13670,7 @@ mod tests {
     }
 
     #[test]
-    fn poisson_extreme_eta_produces_nonfinite_without_clamp() {
+    fn poisson_extreme_eta_stays_finite_with_safe_exp() {
         use crate::families::custom_family::{CustomFamily, ParameterBlockState};
         let poisson = PoissonLogFamily {
             y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
@@ -13704,7 +13704,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_location_scale_extreme_log_sigma_triggers_eigendecomposition_crash() {
+    fn gaussian_location_scale_extreme_log_sigma_survives() {
         use crate::families::custom_family::BlockwiseFitOptions;
         let n = 20;
         let y = Array1::from_shape_fn(n, |i| (i as f64) * 0.5 + 0.1);
