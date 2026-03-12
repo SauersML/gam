@@ -57,7 +57,7 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_ata,
     fast_atb,
 };
-use faer::MatRef;
+use faer::{MatRef, Side};
 
 use crate::diagnostics::{
     approx_f64, format_compact_series, format_cond, format_range, quantizevalue, quantizevec,
@@ -2166,7 +2166,7 @@ where
         };
 
         let c_arr = {
-            let mut c = Array1::from_vec(pirls_res.solve_c_array.clone());
+            let mut c = pirls_res.solve_c_array.clone();
             for val in c.iter_mut() {
                 if !val.is_finite() {
                     *val = 0.0;
