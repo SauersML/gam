@@ -46,9 +46,11 @@ use crate::faer_ndarray::{
 };
 use faer::Mat as FaerMat;
 use faer::Side;
+use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
+use faer::{Accum, Par};
 
 fn logit_from_prob(p: f64) -> f64 {
     let p = p.clamp(1e-8, 1.0 - 1e-8);
@@ -660,7 +662,7 @@ pub(crate) fn compute_smoothing_correction(
     let h_trans = &final_fit.stabilized_hessian_transformed;
 
     // Factor the Hessian for solving
-    let h_chol = match h_trans.clone().cholesky(Side::Lower) {
+    let h_chol = match h_trans.cholesky(Side::Lower) {
         Ok(c) => c,
         Err(_) => {
             log::warn!("Cholesky decomposition failed for smoothing correction; skipping.");
@@ -775,7 +777,7 @@ pub(crate) fn compute_smoothing_correction(
 
     // Ensure positive semi-definiteness by clamping negative eigenvalues
     // (can happen due to numerical noise)
-    match v_corr_orig.clone().eigh(Side::Lower) {
+    match v_corr_orig.eigh(Side::Lower) {
         Ok((eigenvalues, eigenvectors)) => {
             let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
             if min_eig < -1e-10 {
@@ -2765,7 +2767,7 @@ pub mod internal {
             for i in 0..p {
                 s_ridge[[i, i]] += ridge;
             }
-            let chol = s_ridge.clone().cholesky(Side::Lower).map_err(|_| {
+            let chol = s_ridge.cholesky(Side::Lower).map_err(|_| {
                 EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 }
@@ -3384,9 +3386,8 @@ pub mod internal {
         fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
             let (h_eff, _) = self.effective_hessian(&pr)?;
-            let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+            let chol = h_eff.cholesky(Side::Lower).map_err(|_| {
                 let min_eig = h_eff
-                    .clone()
                     .eigh(Side::Lower)
                     .ok()
                     .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
@@ -4699,11 +4700,12 @@ pub mod internal {
                                 let mut h_inv_u_perp =
                                     faer::Mat::<f64>::zeros(rows, truncated_count_gauss);
 
-                                for i in 0..rows.min(u_truncated_gauss.nrows()) {
-                                    for j in 0..truncated_count_gauss {
-                                        h_inv_u_perp[(i, j)] = u_truncated_gauss[(i, j)];
-                                    }
-                                }
+                                let u_copy_rows = rows.min(u_truncated_gauss.nrows());
+                                let u_view = FaerArrayView::new(u_truncated_gauss);
+                                h_inv_u_perp
+                                    .as_mut()
+                                    .subrows_mut(0, u_copy_rows)
+                                    .copy_from(u_view.as_ref().subrows(0, u_copy_rows));
 
                                 factor_g.solve_in_place(h_inv_u_perp.as_mut());
 
@@ -4711,15 +4713,16 @@ pub mod internal {
                                     truncated_count_gauss,
                                     truncated_count_gauss,
                                 );
-                                for i in 0..truncated_count_gauss {
-                                    for j in 0..truncated_count_gauss {
-                                        let mut sum = 0.0;
-                                        for r in 0..rows.min(u_truncated_gauss.nrows()) {
-                                            sum += u_truncated_gauss[(r, i)] * h_inv_u_perp[(r, j)];
-                                        }
-                                        m_perp[(i, j)] = sum;
-                                    }
-                                }
+                                let u_sub = u_view.as_ref().subrows(0, u_copy_rows);
+                                let h_sub = h_inv_u_perp.as_ref().subrows(0, u_copy_rows);
+                                matmul(
+                                    m_perp.as_mut(),
+                                    Accum::Replace,
+                                    u_sub.transpose(),
+                                    h_sub,
+                                    1.0,
+                                    Par::rayon(0),
+                                );
 
                                 let mut corrections = vec![0.0; lambdas.len()];
                                 for k_idx in 0..lambdas.len() {
@@ -4728,24 +4731,38 @@ pub mod internal {
 
                                     let mut w_k =
                                         faer::Mat::<f64>::zeros(rank_k, truncated_count_gauss);
-                                    for i in 0..rank_k {
-                                        for j in 0..truncated_count_gauss {
-                                            let mut sum = 0.0;
-                                            for l in 0..r_k.ncols().min(u_truncated_gauss.nrows()) {
-                                                sum += r_k[(i, l)] * u_truncated_gauss[(l, j)];
-                                            }
-                                            w_k[(i, j)] = sum;
-                                        }
-                                    }
+                                    let r_k_faer = FaerArrayView::new(r_k);
+                                    let u_mul_rows =
+                                        r_k.ncols().min(u_truncated_gauss.nrows());
+                                    let r_k_sub =
+                                        r_k_faer.as_ref().subcols(0, u_mul_rows);
+                                    let u_mul_sub =
+                                        u_view.as_ref().subrows(0, u_mul_rows);
+                                    matmul(
+                                        w_k.as_mut(),
+                                        Accum::Replace,
+                                        r_k_sub,
+                                        u_mul_sub,
+                                        1.0,
+                                        Par::rayon(0),
+                                    );
 
+                                    let mut wtw = faer::Mat::<f64>::zeros(
+                                        truncated_count_gauss,
+                                        truncated_count_gauss,
+                                    );
+                                    matmul(
+                                        wtw.as_mut(),
+                                        Accum::Replace,
+                                        w_k.as_ref().transpose(),
+                                        w_k.as_ref(),
+                                        1.0,
+                                        Par::rayon(0),
+                                    );
                                     let mut trace_error = 0.0;
                                     for i in 0..truncated_count_gauss {
                                         for j in 0..truncated_count_gauss {
-                                            let mut wtw_ij = 0.0;
-                                            for l in 0..rank_k {
-                                                wtw_ij += w_k[(l, i)] * w_k[(l, j)];
-                                            }
-                                            trace_error += m_perp[(i, j)] * wtw_ij;
+                                            trace_error += m_perp[(i, j)] * wtw[(i, j)];
                                         }
                                     }
 

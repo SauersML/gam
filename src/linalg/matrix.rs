@@ -1,4 +1,4 @@
-use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_xt_diag_x};
+use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_xt_diag_x};
 use crate::types::RidgePolicy;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
@@ -53,10 +53,10 @@ impl<'a> DenseRightProductView<'a> {
     pub fn materialize(&self) -> Array2<f64> {
         let mut out = self.base.clone();
         if let Some(factor) = self.first {
-            out = out.dot(factor);
+            out = fast_ab(&out, factor);
         }
         if let Some(factor) = self.second {
-            out = out.dot(factor);
+            out = fast_ab(&out, factor);
         }
         out
     }
@@ -171,74 +171,12 @@ impl<'a, O: LinearOperator + ?Sized> PenalizedWeightedNormalOperator<'a, O> {
 
 #[inline]
 fn dense_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
-    let nrows = matrix.nrows();
-    let ncols = matrix.ncols();
-    let mut out = Array1::<f64>::zeros(nrows);
-
-    if ncols == 0 || nrows == 0 {
-        return out;
-    }
-
-    if matrix.is_standard_layout()
-        && let (Some(ms), Some(vs), Some(os)) = (
-            matrix.as_slice_memory_order(),
-            vector.as_slice(),
-            out.as_slice_mut(),
-        )
-    {
-        for (i, row) in ms.chunks_exact(ncols).enumerate() {
-            let mut acc = 0.0_f64;
-            for j in 0..ncols {
-                acc += row[j] * vs[j];
-            }
-            os[i] = acc;
-        }
-        return out;
-    }
-
-    for i in 0..nrows {
-        let mut acc = 0.0_f64;
-        for j in 0..ncols {
-            acc += matrix[[i, j]] * vector[j];
-        }
-        out[i] = acc;
-    }
-    out
+    fast_av(matrix, vector)
 }
 
 #[inline]
 fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
-    let nrows = matrix.nrows();
-    let ncols = matrix.ncols();
-    let mut out = Array1::<f64>::zeros(ncols);
-
-    if ncols == 0 || nrows == 0 {
-        return out;
-    }
-
-    if matrix.is_standard_layout()
-        && let (Some(ms), Some(vs), Some(os)) = (
-            matrix.as_slice_memory_order(),
-            vector.as_slice(),
-            out.as_slice_mut(),
-        )
-    {
-        for (i, row) in ms.chunks_exact(ncols).enumerate() {
-            let vi = vs[i];
-            for j in 0..ncols {
-                os[j] += row[j] * vi;
-            }
-        }
-        return out;
-    }
-
-    for i in 0..nrows {
-        let vi = vector[i];
-        for j in 0..ncols {
-            out[j] += matrix[[i, j]] * vi;
-        }
-    }
-    out
+    fast_atv(matrix, vector)
 }
 
 #[derive(Clone)]
@@ -354,6 +292,13 @@ impl SymmetricMatrix {
         match self {
             Self::Dense(mat) => Some(mat),
             Self::Sparse(_) => None,
+        }
+    }
+
+    pub fn as_sparse(&self) -> Option<&faer::sparse::SparseColMat<usize, f64>> {
+        match self {
+            Self::Sparse(mat) => Some(mat),
+            Self::Dense(_) => None,
         }
     }
 
@@ -1056,10 +1001,7 @@ impl LinearOperator for DesignMatrix {
                 self.nrows()
             ));
         }
-        let mut wy = y.clone();
-        for i in 0..wy.len() {
-            wy[i] *= weights[i].max(0.0);
-        }
+        let wy = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
         Ok(self.matvec_trans(&wy))
     }
 
@@ -1077,7 +1019,7 @@ impl LinearOperator for DesignMatrix {
         let mut out = Array1::<f64>::zeros(self.nrows());
         match self {
             Self::Dense(xd) => {
-                let xc = xd.dot(middle);
+                let xc = fast_ab(xd, middle);
                 for i in 0..xd.nrows() {
                     out[i] = xd.row(i).dot(&xc.row(i)).max(0.0);
                 }
@@ -1121,23 +1063,23 @@ impl LinearOperator for DenseRightProductView<'_> {
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut rhs = vector.clone();
-        if let Some(factor) = self.second {
-            rhs = factor.dot(&rhs);
-        }
-        if let Some(factor) = self.first {
-            rhs = factor.dot(&rhs);
-        }
-        dense_matvec(self.base, &rhs)
+        let rhs;
+        let v = match (self.second, self.first) {
+            (None, None) => vector,
+            (Some(s), None) => { rhs = fast_av(s, vector); &rhs }
+            (None, Some(f)) => { rhs = fast_av(f, vector); &rhs }
+            (Some(s), Some(f)) => { let tmp = fast_av(s, vector); rhs = fast_av(f, &tmp); &rhs }
+        };
+        dense_matvec(self.base, v)
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         let mut out = dense_transpose_matvec(self.base, vector);
         if let Some(factor) = self.first {
-            out = factor.t().dot(&out);
+            out = fast_atv(factor, &out);
         }
         if let Some(factor) = self.second {
-            out = factor.t().dot(&out);
+            out = fast_atv(factor, &out);
         }
         out
     }
@@ -1152,10 +1094,10 @@ impl LinearOperator for DenseRightProductView<'_> {
         }
         let mut gram = fast_xt_diag_x(self.base, weights);
         if let Some(factor) = self.first {
-            gram = factor.t().dot(&gram).dot(factor);
+            gram = fast_ab(&fast_atb(factor, &gram), factor);
         }
         if let Some(factor) = self.second {
-            gram = factor.t().dot(&gram).dot(factor);
+            gram = fast_ab(&fast_atb(factor, &gram), factor);
         }
         Ok(gram)
     }
@@ -1173,10 +1115,7 @@ impl LinearOperator for DenseRightProductView<'_> {
                 self.nrows()
             ));
         }
-        let mut wy = y.clone();
-        for i in 0..wy.len() {
-            wy[i] *= weights[i].max(0.0);
-        }
+        let wy = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
         Ok(self.apply_transpose(&wy))
     }
 
@@ -1204,10 +1143,7 @@ impl LinearOperator for DenseRowScaledView<'_> {
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut scaled = vector.clone();
-        for i in 0..scaled.len() {
-            scaled[i] *= self.scale[i];
-        }
+        let scaled = Array1::from_shape_fn(vector.len(), |i| vector[i] * self.scale[i]);
         dense_transpose_matvec(self.matrix, &scaled)
     }
 
@@ -1219,10 +1155,7 @@ impl LinearOperator for DenseRowScaledView<'_> {
                 self.nrows()
             ));
         }
-        let mut combined = weights.clone();
-        for i in 0..combined.len() {
-            combined[i] *= self.scale[i] * self.scale[i];
-        }
+        let combined = Array1::from_shape_fn(weights.len(), |i| weights[i] * self.scale[i] * self.scale[i]);
         Ok(fast_xt_diag_x(self.matrix, &combined))
     }
 
@@ -1239,17 +1172,25 @@ impl LinearOperator for DenseRowScaledView<'_> {
                 self.nrows()
             ));
         }
-        let mut combined = y.clone();
-        for i in 0..combined.len() {
-            combined[i] *= weights[i].max(0.0) * self.scale[i];
-        }
+        let combined = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0) * self.scale[i]);
         Ok(dense_transpose_matvec(self.matrix, &combined))
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        let mut out = DesignMatrix::Dense(self.matrix.clone()).quadratic_form_diag(middle)?;
-        for i in 0..out.len() {
-            out[i] *= self.scale[i] * self.scale[i];
+        if middle.nrows() != self.ncols() || middle.ncols() != self.ncols() {
+            return Err(format!(
+                "quadratic_form_diag dimension mismatch: matrix is {}x{}, expected {}x{}",
+                middle.nrows(),
+                middle.ncols(),
+                self.ncols(),
+                self.ncols()
+            ));
+        }
+        let xm = fast_ab(self.matrix, middle);
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        for i in 0..self.matrix.nrows() {
+            let s2 = self.scale[i] * self.scale[i];
+            out[i] = (self.matrix.row(i).dot(&xm.row(i)) * s2).max(0.0);
         }
         Ok(out)
     }

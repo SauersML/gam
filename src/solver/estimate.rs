@@ -776,7 +776,7 @@ fn compute_smoothing_correction(
 
     // Ensure positive semi-definiteness by clamping negative eigenvalues
     // (can happen due to numerical noise)
-    match v_corr_orig.clone().eigh(faer::Side::Lower) {
+    match v_corr_orig.eigh(faer::Side::Lower) {
         Ok((eigenvalues, eigenvectors)) => {
             let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
             if min_eig < -1e-10 {
@@ -1289,15 +1289,20 @@ where
     } else if mixture_dim == 0 && sas_dim == 0 {
         let pure_smoothing_options = smoothing_options.clone();
         let outer_result =
-            crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient(
+            crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient_andhessian(
                 k,
                 heuristic_lambdas,
                 |rho: &Array1<f64>| {
                     outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                    reml_state.setwarm_start_original_beta(None);
+                    // Do NOT clear warm start: the PIRLS cache auto-updates beta after each
+                    // successful solve. Keeping the warm start lets nearby rho evaluations
+                    // (e.g. FD perturbations) converge in far fewer inner iterations.
                     let cost = reml_state.compute_cost(rho)?;
                     let grad = reml_state.compute_gradient(rho)?;
-                    Ok((cost, grad))
+                    let hessian = reml_state
+                        .compute_lamlhessian_consistent(rho)
+                        .ok();
+                    Ok((cost, grad, hessian))
                 },
                 &pure_smoothing_options,
             )?;

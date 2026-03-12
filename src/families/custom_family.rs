@@ -1600,7 +1600,7 @@ fn stable_logdet_with_ridge_policy(
 
     match resolved_ridge_determinant_mode(ridge_policy, p) {
         RidgeDeterminantMode::Full => {
-            let chol = a.clone().cholesky(Side::Lower).map_err(|_| {
+            let chol = a.cholesky(Side::Lower).map_err(|_| {
                 "cholesky failed while computing full ridge-aware logdet".to_string()
             })?;
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
@@ -1660,7 +1660,7 @@ fn stable_logdet_with_ridge_policy(
                     for d in 0..p {
                         ridged[[d, d]] = a[[d, d]] + bump;
                     }
-                    if let Ok(chol) = ridged.clone().cholesky(Side::Lower) {
+                    if let Ok(chol) = ridged.cholesky(Side::Lower) {
                         return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
                     }
                     bump *= 10.0;

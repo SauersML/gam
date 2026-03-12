@@ -141,31 +141,41 @@ pub struct SparsePirlsDecision {
     pub density_h_est: Option<f64>,
 }
 
+fn fmt_opt_usize(v: Option<usize>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string())
+}
+
+fn fmt_opt_f64(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:.4}")).unwrap_or_else(|| "na".to_string())
+}
+
 impl SparsePirlsDecision {
-    fn log_once(&self) {
-        let path = match self.path {
+    fn path_str(&self) -> &'static str {
+        match self.path {
             PirlsLinearSolvePath::DenseTransformed => "dense_transformed",
             PirlsLinearSolvePath::SparseNative => "sparse_native",
-        };
-        let repetition_count = pirls_decision_repetition_count(self.log_key(path));
+        }
+    }
+
+    fn format_fields(&self, path: &str) -> String {
+        format!(
+            "path={path} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
+            self.reason,
+            self.p,
+            self.nnz_x,
+            fmt_opt_usize(self.nnz_xtwx_symbolic),
+            self.nnz_s_lambda,
+            fmt_opt_usize(self.nnz_h_est),
+            fmt_opt_f64(self.density_h_est),
+        )
+    }
+
+    fn log_once(&self) {
+        let path = self.path_str();
+        let key = self.format_fields(path);
+        let repetition_count = pirls_decision_repetition_count(key.clone());
         if repetition_count == 1 {
-            log::info!(
-                "[pirls-path] path={} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
-                path,
-                self.reason,
-                self.p,
-                self.nnz_x,
-                self.nnz_xtwx_symbolic
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "na".to_string()),
-                self.nnz_s_lambda,
-                self.nnz_h_est
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "na".to_string()),
-                self.density_h_est
-                    .map(|v| format!("{v:.4}"))
-                    .unwrap_or_else(|| "na".to_string()),
-            );
+            log::info!("[pirls-path] {key}");
             return;
         }
 
@@ -179,24 +189,6 @@ impl SparsePirlsDecision {
         }
     }
 
-    fn log_key(&self, path: &'static str) -> String {
-        format!(
-            "path={path} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
-            self.reason,
-            self.p,
-            self.nnz_x,
-            self.nnz_xtwx_symbolic
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "na".to_string()),
-            self.nnz_s_lambda,
-            self.nnz_h_est
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "na".to_string()),
-            self.density_h_est
-                .map(|v| format!("{v:.4}"))
-                .unwrap_or_else(|| "na".to_string()),
-        )
-    }
 }
 
 fn pirls_decision_repetition_count(log_key: String) -> usize {
@@ -561,63 +553,18 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::BinomialLogit, None) => {
+            (
+                GlmLikelihoodFamily::BinomialLogit
+                | GlmLikelihoodFamily::BinomialProbit
+                | GlmLikelihoodFamily::BinomialCLogLog
+                | GlmLikelihoodFamily::BinomialSas
+                | GlmLikelihoodFamily::BinomialBetaLogistic,
+                None,
+            ) => {
                 update_glmvectors(
                     y,
                     eta,
-                    &InverseLink::Standard(LinkFunction::Logit),
-                    priorweights,
-                    mu,
-                    weights,
-                    z,
-                    derivatives,
-                )?;
-                Ok(())
-            }
-            (GlmLikelihoodFamily::BinomialProbit, None) => {
-                update_glmvectors(
-                    y,
-                    eta,
-                    &InverseLink::Standard(LinkFunction::Probit),
-                    priorweights,
-                    mu,
-                    weights,
-                    z,
-                    derivatives,
-                )?;
-                Ok(())
-            }
-            (GlmLikelihoodFamily::BinomialCLogLog, None) => {
-                update_glmvectors(
-                    y,
-                    eta,
-                    &InverseLink::Standard(LinkFunction::CLogLog),
-                    priorweights,
-                    mu,
-                    weights,
-                    z,
-                    derivatives,
-                )?;
-                Ok(())
-            }
-            (GlmLikelihoodFamily::BinomialSas, None) => {
-                update_glmvectors(
-                    y,
-                    eta,
-                    &InverseLink::Standard(LinkFunction::Sas),
-                    priorweights,
-                    mu,
-                    weights,
-                    z,
-                    derivatives,
-                )?;
-                Ok(())
-            }
-            (GlmLikelihoodFamily::BinomialBetaLogistic, None) => {
-                update_glmvectors(
-                    y,
-                    eta,
-                    &InverseLink::Standard(LinkFunction::BetaLogistic),
+                    &InverseLink::Standard(self.link_function()),
                     priorweights,
                     mu,
                     weights,
@@ -651,41 +598,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        match self {
-            GlmLikelihoodFamily::GaussianIdentity => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::Identity,
-                priorweights,
-            )),
-            GlmLikelihoodFamily::BinomialLogit => {
-                Ok(calculate_deviance(y, mu, LinkFunction::Logit, priorweights))
-            }
-            GlmLikelihoodFamily::BinomialProbit => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::Probit,
-                priorweights,
-            )),
-            GlmLikelihoodFamily::BinomialCLogLog => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::CLogLog,
-                priorweights,
-            )),
-            GlmLikelihoodFamily::BinomialSas => {
-                Ok(calculate_deviance(y, mu, LinkFunction::Sas, priorweights))
-            }
-            GlmLikelihoodFamily::BinomialBetaLogistic => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::BetaLogistic,
-                priorweights,
-            )),
-            GlmLikelihoodFamily::BinomialMixture => {
-                Ok(calculate_deviance(y, mu, LinkFunction::Logit, priorweights))
-            }
-        }
+        Ok(calculate_deviance(y, mu, self.link_function(), priorweights))
     }
 
     fn log_likelihood(
@@ -752,7 +665,6 @@ pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
     pub hessian: crate::linalg::matrix::SymmetricMatrix,
-    pub sparsehessian: Option<faer::sparse::SparseColMat<usize, f64>>,
     pub deviance: f64,
     pub penalty_term: f64,
     pub firth: FirthDiagnostics,
@@ -860,7 +772,8 @@ impl PirlsWorkspace {
     }
 
     fn add_dense_xtwx_streaming_from_sqrt<S>(
-        &mut self,
+        sqrtw: &Array1<f64>,
+        weighted_x_chunk: &mut Array2<f64>,
         x: &ArrayBase<S, Ix2>,
         out: &mut Array2<f64>,
         par: Par,
@@ -873,7 +786,7 @@ impl PirlsWorkspace {
             return;
         }
         debug_assert_eq!(
-            self.sqrtw.len(),
+            sqrtw.len(),
             n,
             "sqrtw length must match row count for streamed XtWX"
         );
@@ -884,8 +797,7 @@ impl PirlsWorkspace {
 
         if use_parallel {
             // Parallel: each rayon task owns a chunk buffer + p×p accumulator.
-            // Individual matmuls use Par::No since parallelism is at the chunk level.
-            let sqrtw = &self.sqrtw;
+            // Individual matmuls use Par::Seq since parallelism is at the chunk level.
             let partial_sums: Vec<Array2<f64>> = (0..num_chunks)
                 .into_par_iter()
                 .map(|ci| {
@@ -902,33 +814,34 @@ impl PirlsWorkspace {
                         });
                     let mut acc = Array2::<f64>::zeros((p, p).f());
                     let mut accview = array2_to_matmut(&mut acc);
-                    let chunkview = FaerArrayView::new(&chunk_buf.view());
+                    let chunk_view = chunk_buf.view();
+                    let chunkview = FaerArrayView::new(&chunk_view);
                     matmul(
                         accview.as_mut(),
                         Accum::Add,
                         chunkview.as_ref().transpose(),
                         chunkview.as_ref(),
                         1.0,
-                        Par::No,
+                        Par::Seq,
                     );
                     acc
                 })
                 .collect();
             for partial in &partial_sums {
-                Zip::from(out).and(partial).for_each(|o, &p_val| *o += p_val);
+                Zip::from(&mut *out).and(partial).for_each(|o, &p_val| *o += p_val);
             }
         } else {
             // Sequential: reuse workspace chunk buffer
-            if self.weighted_x_chunk.ncols() != p || self.weighted_x_chunk.nrows() != chunkrows {
-                self.weighted_x_chunk = Array2::zeros((chunkrows, p).f());
+            if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
+                *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
             }
             let mut outview = array2_to_matmut(out);
             for start in (0..n).step_by(chunkrows) {
                 let rows = (n - start).min(chunkrows);
                 {
-                    let mut chunk = self.weighted_x_chunk.slice_mut(s![0..rows, ..]);
+                    let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
                     let x_slice = x.slice(s![start..start + rows, ..]);
-                    let w_slice = self.sqrtw.slice(s![start..start + rows]);
+                    let w_slice = sqrtw.slice(s![start..start + rows]);
                     Zip::from(chunk.rows_mut())
                         .and(x_slice.rows())
                         .and(&w_slice)
@@ -936,7 +849,7 @@ impl PirlsWorkspace {
                             Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
                         });
                 }
-                let chunkrowsview = self.weighted_x_chunk.slice(s![0..rows, ..]);
+                let chunkrowsview = weighted_x_chunk.slice(s![0..rows, ..]);
                 let chunkview = FaerArrayView::new(&chunkrowsview);
                 matmul(
                     outview.as_mut(),
@@ -1342,7 +1255,9 @@ impl<'a> GamWorkingModel<'a> {
                 let p = x.ncols();
                 workspace.fill_sqrtweights(weights);
                 let mut xtwx = Array2::<f64>::zeros((p, p).f());
-                workspace.add_dense_xtwx_streaming_from_sqrt(
+                PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
+                    &workspace.sqrtw,
+                    &mut workspace.weighted_x_chunk,
                     x,
                     &mut xtwx,
                     get_global_parallelism(),
@@ -1355,33 +1270,15 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    /// Compute X^T W X + S_λ, reusing `workspace.hessian_buf` to avoid per-iteration allocation
-    /// for the common (TransformedExplicit / OriginalSparseNative) paths.
     fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                let x = x_transformed;
-                if let DesignMatrix::Dense(xd) = x {
-                    let p = xd.ncols();
-                    self.workspace.fill_sqrtweights(weights);
-                    // Reuse hessian_buf: start from penalty, accumulate XtWX in-place
-                    if self.workspace.hessian_buf.nrows() != p
-                        || self.workspace.hessian_buf.ncols() != p
-                    {
-                        self.workspace.hessian_buf = self.s_transformed.clone();
-                    } else {
-                        self.workspace.hessian_buf.assign(&self.s_transformed);
-                    }
-                    self.workspace.add_dense_xtwx_streaming_from_sqrt(
-                        xd,
-                        &mut self.workspace.hessian_buf,
-                        get_global_parallelism(),
-                    );
-                    Ok(self.workspace.hessian_buf.clone())
-                } else {
-                    let xtwx = Self::compute_xtwx_blas(&mut self.workspace, x, weights)?;
-                    Ok(xtwx + &self.s_transformed)
-                }
+                let xtwx = Self::compute_xtwx_blas(
+                    &mut self.workspace,
+                    x_transformed,
+                    weights,
+                )?;
+                Ok(xtwx + &self.s_transformed)
             }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
                 let xtwx = Self::compute_xtwx_blas(
@@ -1393,27 +1290,12 @@ impl<'a> GamWorkingModel<'a> {
                 Ok(fast_ab(&tmp, qs) + &self.s_transformed)
             }
             WorkingCoordinateDesign::OriginalSparseNative => {
-                let x = &self.x_original;
-                if let DesignMatrix::Dense(xd) = x {
-                    let p = xd.ncols();
-                    self.workspace.fill_sqrtweights(weights);
-                    if self.workspace.hessian_buf.nrows() != p
-                        || self.workspace.hessian_buf.ncols() != p
-                    {
-                        self.workspace.hessian_buf = self.s_transformed.clone();
-                    } else {
-                        self.workspace.hessian_buf.assign(&self.s_transformed);
-                    }
-                    self.workspace.add_dense_xtwx_streaming_from_sqrt(
-                        xd,
-                        &mut self.workspace.hessian_buf,
-                        get_global_parallelism(),
-                    );
-                    Ok(self.workspace.hessian_buf.clone())
-                } else {
-                    let xtwx = Self::compute_xtwx_blas(&mut self.workspace, x, weights)?;
-                    Ok(xtwx + &self.s_transformed)
-                }
+                let xtwx = Self::compute_xtwx_blas(
+                    &mut self.workspace,
+                    &self.x_original,
+                    weights,
+                )?;
+                Ok(xtwx + &self.s_transformed)
             }
         }
     }
@@ -1670,20 +1552,19 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
-        let hessian_diag = self
-            .observed_binomial_score_jacobian_diagonal()?
-            .unwrap_or_else(|| weights.clone());
+        let observed_diag = self.observed_binomial_score_jacobian_diagonal()?;
+        let hessian_diag = observed_diag.as_ref().unwrap_or(&weights);
 
         let (penalized_hessian, sparsehessian, ridge_used) = if matches!(
             self.coordinate_design,
             WorkingCoordinateDesign::OriginalSparseNative
         ) {
             let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
-                self.sparse_penalized_hessian(&hessian_diag, ridge)
+                self.sparse_penalized_hessian(hessian_diag, ridge)
             })?;
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
         } else {
-            let mut penalized_hessian = self.penalized_hessian(&hessian_diag)?;
+            let mut penalized_hessian = self.penalized_hessian(hessian_diag)?;
             #[cfg(debug_assertions)]
             debug_assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
             let ridge_used = ensure_positive_definitewithridge(
@@ -1708,20 +1589,24 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if ridge_used > 0.0 {
             let ridge_penalty = ridge_used * beta.as_ref().dot(beta.as_ref());
             penalty_term += ridge_penalty;
-            gradient += &beta.as_ref().mapv(|v| ridge_used * v);
+            gradient.zip_mut_with(beta.as_ref(), |g, &b| *g += ridge_used * b);
         }
 
         self.last_penalty_term = penalty_term;
 
         Ok(WorkingState {
-            eta: LinearPredictor::new(self.workspace.eta_buf.clone()),
+            eta: LinearPredictor::new(std::mem::replace(
+                &mut self.workspace.eta_buf,
+                Array1::zeros(0),
+            )),
             gradient,
-            hessian: if let Some(h_sparse) = sparsehessian.clone() {
-                crate::linalg::matrix::SymmetricMatrix::Sparse(h_sparse)
-            } else {
-                crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian)
+            hessian: match sparsehessian {
+                Some(h_sparse) => {
+                    crate::linalg::matrix::SymmetricMatrix::Sparse(h_sparse)
+                }
+                None => crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian),
             },
-            sparsehessian,
+
             deviance,
             penalty_term,
             firth,
@@ -1906,7 +1791,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
     // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
     ensure_positive_definitewith_label(&mut stabilized, "Firth Fisher information")?;
 
-    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
+    let chol = stabilized.cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
@@ -1960,7 +1845,9 @@ fn compute_firth_hat_and_half_logdet(
 
     workspace.fill_sqrtweights(&weights);
     let mut stabilized = Array2::<f64>::zeros((p, p).f());
-    workspace.add_dense_xtwx_streaming_from_sqrt(
+    PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
+        &workspace.sqrtw,
+        &mut workspace.weighted_x_chunk,
         &x_design,
         &mut stabilized,
         get_global_parallelism(),
@@ -1972,7 +1859,7 @@ fn compute_firth_hat_and_half_logdet(
     debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (dense)", 1e-8);
     ensure_positive_definitewith_label(&mut stabilized, "Firth Fisher information")?;
 
-    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
+    let chol = stabilized.cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
@@ -2112,15 +1999,20 @@ fn projected_gradient_norm(
     let Some(lb) = lower_bounds else {
         return gradient.dot(gradient).sqrt();
     };
-    let bound_tol = 1e-10;
     let mut sum_sq = 0.0;
     for i in 0..gradient.len() {
         let g = gradient[i];
-        // If variable is at its lower bound and gradient points into infeasible
-        // region (positive gradient = descent wants to decrease, but can't),
-        // this component is a constraint force, not a convergence defect.
-        if lb[i].is_finite() && (beta[i] - lb[i]).abs() < bound_tol && g > 0.0 {
-            continue;
+        if lb[i].is_finite() && g > 0.0 {
+            // Use a relative+absolute tolerance so near-bound coefficients
+            // (e.g. I-spline time coefficients at 1e-6) are recognized as
+            // active.  At a KKT point the gradient into the infeasible region
+            // is a multiplier, not a convergence defect.
+            let slack = beta[i] - lb[i];
+            let scale = beta[i].abs().max(lb[i].abs()).max(1.0);
+            let tol = 1e-6 * scale + 1e-10;
+            if slack < tol {
+                continue;
+            }
         }
         sum_sq += g * g;
     }
@@ -2230,18 +2122,6 @@ fn should_use_sparse_native_pirls(
     )
 }
 
-// Phase 2 hook for targeted tests and the eventual sparse-native PIRLS solve path.
-#[cfg(test)]
-fn assemble_sparse_penalized_hessian(
-    workspace: &mut PirlsWorkspace,
-    x: &SparseColMat<usize, f64>,
-    weights: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    ridge: f64,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
-}
-
 pub(crate) fn sparse_reml_penalized_hessian(
     workspace: &mut PirlsWorkspace,
     x: &SparseColMat<usize, f64>,
@@ -2251,6 +2131,10 @@ pub(crate) fn sparse_reml_penalized_hessian(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
 }
+
+// Phase 2 hook for targeted tests.
+#[cfg(test)]
+use sparse_reml_penalized_hessian as assemble_sparse_penalized_hessian;
 
 fn ensure_sparse_positive_definitewithridge<F>(
     mut assemble: F,
@@ -2554,11 +2438,17 @@ fn solve_newton_directionwith_lower_bounds(
             }
         }
     }
-    let active_tol = 1e-12;
     for i in 0..p {
         let lb = lower_bounds[i];
-        if lb.is_finite() && beta[i] <= lb + active_tol && gradient[i] > 0.0 {
-            active[i] = true;
+        if lb.is_finite() && gradient[i] > 0.0 {
+            // Use a relative+absolute tolerance matching projected_gradient_norm
+            // so coefficients near the bound (e.g. I-spline at 1e-6) with positive
+            // gradient (KKT multiplier) are correctly identified as active.
+            let scale = beta[i].abs().max(lb.abs()).max(1.0);
+            let tol = 1e-6 * scale + 1e-10;
+            if beta[i] <= lb + tol {
+                active[i] = true;
+            }
         }
     }
 
@@ -3045,8 +2935,14 @@ fn solve_newton_directionwith_linear_constraints(
             }
         }
 
-        x += &(d.mapv(|v| alpha * v));
-        d_total += &(d.mapv(|v| alpha * v));
+        ndarray::Zip::from(&mut x)
+            .and(&mut d_total)
+            .and(&d)
+            .for_each(|x_i, dt_i, &d_i| {
+                let alpha_d = alpha * d_i;
+                *x_i += alpha_d;
+                *dt_i += alpha_d;
+            });
         g_cur = gradient + &hessian.dot(&d_total);
 
         // Interior solution: if no constraints are active and this step does
@@ -3401,7 +3297,7 @@ where
 
             let has_constraints =
                 options.linear_constraints.is_some() || options.coefficient_lower_bounds.is_some();
-            let direction = match if let Some(h_sparse) = state.sparsehessian.as_ref() {
+            let direction = match if let Some(h_sparse) = state.hessian.as_sparse() {
                 if has_constraints {
                     Err(EstimationError::InvalidInput(
                         "sparse-native PIRLS does not support constrained solves".to_string(),
@@ -3487,11 +3383,19 @@ where
                     let actual_reduction = current_penalized - candidate_penalized;
 
                     // 4. Gain Ratio
-                    let rho = if predicted_reduction > 1e-15 {
+                    // When predicted reduction is at floating-point noise level
+                    // relative to the objective, both predicted and actual are
+                    // meaningless — treat as a neutral step (rho = 1) rather
+                    // than hard-rejecting on the sign of noise.
+                    let noise_floor = current_penalized.abs().max(1.0) * 1e-14;
+                    let rho = if predicted_reduction > noise_floor {
                         actual_reduction / predicted_reduction
+                    } else if actual_reduction >= -noise_floor {
+                        // Both reductions are noise — accept the step
+                        1.0
                     } else {
-                        // If predicted reduction is tiny/negative, model is weird.
-                        if actual_reduction > 0.0 { 1.0 } else { -1.0 }
+                        // Genuine increase despite tiny predicted reduction
+                        -1.0
                     };
 
                     // Guard: reject steps that produce non-finite gradients
@@ -4347,7 +4251,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             eta: LinearPredictor::new(finalmu.clone()),
             gradient: gradient.clone(),
             hessian: crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian.clone()),
-            sparsehessian: None,
+
             deviance,
             penalty_term,
             firth: FirthDiagnostics::Inactive,
@@ -5101,6 +5005,65 @@ pub fn update_glmvectors(
 ) -> Result<(), EstimationError> {
     let n = eta.len();
     let link = inverse_link.link_function();
+
+    // Fast vectorized path for pure logit (most common binomial link).
+    // Avoids per-element function dispatch; structured for SIMD auto-vectorization.
+    if matches!(link, LinkFunction::Logit)
+        && inverse_link.mixture_state().is_none()
+        && inverse_link.sas_state().is_none()
+    {
+        const MIN_WEIGHT: f64 = 1e-12;
+        const MIN_D_FOR_Z: f64 = 1e-6;
+        const PROB_EPS: f64 = 1e-8;
+
+        let mut derivatives = derivatives;
+        for i in 0..n {
+            let eta_raw = eta[i];
+            let eta_c = eta_raw.clamp(-700.0, 700.0);
+            // Numerically stable logistic
+            let mu_i = if eta_c >= 0.0 {
+                let ex = (-eta_c).exp();
+                1.0 / (1.0 + ex)
+            } else {
+                let ex = eta_c.exp();
+                ex / (1.0 + ex)
+            };
+            let d1 = mu_i * (1.0 - mu_i);
+            let v = d1.max(PROB_EPS);
+            // For logit: fisher = d1^2 / v, and since v ≈ d1, fisher ≈ d1
+            let fisher = (d1 * d1) / v;
+            let fisher_eff = fisher.max(MIN_WEIGHT);
+            mu[i] = mu_i;
+            weights[i] = priorweights[i] * fisher_eff;
+            z[i] = eta_c + (y[i] - mu_i) / d1.max(MIN_D_FOR_Z);
+
+            if let Some(derivs) = derivatives.as_mut() {
+                let nonsmooth = eta_raw != eta_c || fisher <= MIN_WEIGHT;
+                let d2 = d1 * (1.0 - 2.0 * mu_i);
+                let d3 = d1 * (1.0 - 6.0 * d1);
+                if nonsmooth {
+                    derivs.c[i] = 0.0;
+                    derivs.d[i] = 0.0;
+                } else {
+                    let n0 = d1 * d1;
+                    let v1 = d1 * (1.0 - 2.0 * mu_i);
+                    let v2 = d2 * (1.0 - 2.0 * mu_i) - 2.0 * d1 * d1;
+                    let n1 = 2.0 * d1 * d2;
+                    let n2 = 2.0 * (d2 * d2 + d1 * d3);
+                    let numer1 = n1 * v - n0 * v1;
+                    derivs.c[i] = priorweights[i] * numer1 / (v * v);
+                    derivs.d[i] = priorweights[i]
+                        * ((n2 * v - n0 * v2) / (v * v)
+                            - 2.0 * numer1 * v1 / (v * v * v));
+                }
+                derivs.dmu_deta[i] = d1;
+                derivs.d2mu_deta2[i] = d2;
+                derivs.d3mu_deta3[i] = d3;
+            }
+        }
+        return Ok(());
+    }
+
     match link {
         LinkFunction::Logit
         | LinkFunction::Probit
@@ -5687,7 +5650,9 @@ pub fn solve_penalized_least_squares(
 
     // 2. Form X'WX by streaming dense row chunks.
     let mut penalized_hessian = s_transformed.clone();
-    workspace.add_dense_xtwx_streaming_from_sqrt(
+    PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
+        &workspace.sqrtw,
+        &mut workspace.weighted_x_chunk,
         &x_transformed,
         &mut penalized_hessian,
         get_global_parallelism(),
@@ -6630,5 +6595,87 @@ mod tests {
             direction[0]
         );
         assert!(active_hint.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod root_cause_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// Hypothesis 1: `projected_gradient_norm` uses `bound_tol = 1e-10` which
+    /// is too tight.  A coefficient at 1e-6 above its lower bound with a
+    /// positive gradient (KKT multiplier) should be recognized as "at the
+    /// bound" and excluded from the projected gradient.
+    #[test]
+    fn projected_gradient_excludes_near_bound_kkt_forces() {
+        let gradient = array![0.5, 1e-4];
+        let beta = array![1e-6, 2.0];
+        let lower_bounds = array![0.0, f64::NEG_INFINITY];
+        let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
+        // Correct: only beta[1]'s gradient counts -> norm ~ 1e-4.
+        // BUG: bound_tol=1e-10 misses beta[0] at 1e-6 -> norm ~ 0.5.
+        assert!(
+            norm < 0.01,
+            "projected gradient should exclude near-bound KKT force (beta=1e-6, lb=0), got {:.6e}",
+            norm
+        );
+    }
+
+    /// Hypothesis 2: `solve_newton_directionwith_lower_bounds` uses
+    /// `active_tol = 1e-12`.  A coefficient at 1e-6 with positive gradient
+    /// is NOT identified as active, producing a clipped-but-nonzero direction.
+    #[test]
+    fn bound_solver_treats_near_bound_positive_grad_as_active() {
+        let hessian = array![[2.0, 0.0], [0.0, 2.0]];
+        let gradient = array![1.0, 0.0];
+        let beta = array![1e-6, 5.0];
+        let lower_bounds = array![0.0, f64::NEG_INFINITY];
+        let mut direction = Array1::zeros(2);
+        let mut active_hint = vec![];
+
+        solve_newton_directionwith_lower_bounds(
+            &hessian,
+            &gradient,
+            &beta,
+            &lower_bounds,
+            &mut direction,
+            Some(&mut active_hint),
+        )
+        .expect("solve should succeed");
+
+        // beta[0] is effectively at bound with positive gradient -> direction should be ~0.
+        // BUG: active_tol=1e-12 misses it -> unconstrained d[0]=-0.5, clips to -1e-6.
+        assert!(
+            direction[0].abs() < 1e-10,
+            "near-bound coeff with positive grad should have ~zero direction, got {:.6e}",
+            direction[0]
+        );
+    }
+
+    /// Hypothesis 3: LM gain-ratio fallback should accept when both predicted
+    /// and actual reduction are floating-point noise relative to the objective.
+    #[test]
+    fn lm_gain_ratio_accepts_zero_step_at_stationarity() {
+        // Simulate: objective ~ 9e5, predicted reduction ~ 5e-16, actual ~ -1e-14
+        let current_penalized = 9e5;
+        let predicted_reduction = 5e-16;
+        let actual_reduction = -1e-14;
+        let noise_floor = current_penalized.abs().max(1.0) * 1e-14; // ~9e-9
+
+        let rho = if predicted_reduction > noise_floor {
+            actual_reduction / predicted_reduction
+        } else if actual_reduction >= -noise_floor {
+            1.0 // both at noise level → accept
+        } else {
+            -1.0
+        };
+
+        // actual_reduction (-1e-14) >= -noise_floor (-9e-9) → rho = 1.0
+        assert!(
+            rho > 0.0,
+            "near-zero reductions should not hard-reject; rho={:.1}, pred={:.2e}, actual={:.2e}, noise={:.2e}",
+            rho, predicted_reduction, actual_reduction, noise_floor
+        );
     }
 }

@@ -6,7 +6,7 @@ use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayBase, Data, Ix1};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -208,7 +208,7 @@ pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>)
     dense
 }
 
-fn sparse_matvec(matrix: &SparseColMat<usize, f64>, vector: &Array1<f64>) -> Array1<f64> {
+fn sparse_matvec<S: Data<Elem = f64>>(matrix: &SparseColMat<usize, f64>, vector: &ArrayBase<S, Ix1>) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(matrix.nrows());
     let (symbolic, values) = matrix.parts();
     let col_ptr = symbolic.col_ptr();
@@ -225,9 +225,9 @@ fn sparse_matvec(matrix: &SparseColMat<usize, f64>, vector: &Array1<f64>) -> Arr
     out
 }
 
-pub fn sparse_symmetric_upper_matvec_public(
+pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     matrix: &SparseColMat<usize, f64>,
-    vector: &Array1<f64>,
+    vector: &ArrayBase<S, Ix1>,
 ) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(matrix.nrows());
     let (symbolic, values) = matrix.parts();
@@ -703,9 +703,9 @@ pub fn build_sparse_penalty_blocks(
     Ok(Some(blocks))
 }
 
-pub fn sparse_matvec_public(
+pub fn sparse_matvec_public<S: Data<Elem = f64>>(
     matrix: &SparseColMat<usize, f64>,
-    vector: &Array1<f64>,
+    vector: &ArrayBase<S, Ix1>,
 ) -> Array1<f64> {
     sparse_matvec(matrix, vector)
 }

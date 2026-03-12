@@ -113,6 +113,61 @@ pub enum LikelihoodFamily {
     RoystonParmar,
 }
 
+impl LikelihoodFamily {
+    #[inline]
+    pub fn link_function(self) -> LinkFunction {
+        match self {
+            Self::GaussianIdentity | Self::RoystonParmar => LinkFunction::Identity,
+            Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
+            Self::BinomialProbit => LinkFunction::Probit,
+            Self::BinomialCLogLog => LinkFunction::CLogLog,
+            Self::BinomialSas => LinkFunction::Sas,
+            Self::BinomialBetaLogistic => LinkFunction::BetaLogistic,
+        }
+    }
+
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GaussianIdentity => "gaussian",
+            Self::BinomialLogit => "binomial-logit",
+            Self::BinomialProbit => "binomial-probit",
+            Self::BinomialCLogLog => "binomial-cloglog",
+            Self::BinomialSas => "binomial-sas",
+            Self::BinomialBetaLogistic => "binomial-beta-logistic",
+            Self::BinomialMixture => "binomial-blended-inverse-link",
+            Self::RoystonParmar => "royston-parmar",
+        }
+    }
+
+    #[inline]
+    pub fn pretty_name(self) -> &'static str {
+        match self {
+            Self::GaussianIdentity => "Gaussian Identity",
+            Self::BinomialLogit => "Binomial Logit",
+            Self::BinomialProbit => "Binomial Probit",
+            Self::BinomialCLogLog => "Binomial CLogLog",
+            Self::BinomialSas => "Binomial SAS",
+            Self::BinomialBetaLogistic => "Binomial Beta-Logistic",
+            Self::BinomialMixture => "Binomial Blended Inverse-Link",
+            Self::RoystonParmar => "Royston Parmar",
+        }
+    }
+
+    #[inline]
+    pub fn is_binomial(self) -> bool {
+        matches!(
+            self,
+            Self::BinomialLogit
+                | Self::BinomialProbit
+                | Self::BinomialCLogLog
+                | Self::BinomialSas
+                | Self::BinomialBetaLogistic
+                | Self::BinomialMixture
+        )
+    }
+}
+
 /// GLM-compatible likelihood families (survival families excluded by type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GlmLikelihoodFamily {
@@ -123,6 +178,13 @@ pub enum GlmLikelihoodFamily {
     BinomialSas,
     BinomialBetaLogistic,
     BinomialMixture,
+}
+
+impl GlmLikelihoodFamily {
+    #[inline]
+    pub fn link_function(self) -> LinkFunction {
+        LikelihoodFamily::from(self).link_function()
+    }
 }
 
 impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {

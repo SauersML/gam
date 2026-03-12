@@ -374,15 +374,31 @@ impl<'a> RemlState<'a> {
         }
         let chunk = 32usize;
         let mut trace = 0.0_f64;
+        let mut basis_buf = Array2::<f64>::zeros((p, chunk));
+        // Lazily allocated for the final (potentially smaller) chunk; the initial
+        // value is never read — it is always overwritten inside the loop.
+        #[allow(unused_assignments)]
+        let mut small_buf = Array2::<f64>::zeros((0, 0));
         let mut start = 0usize;
         while start < p {
             let end = (start + chunk).min(p);
             let block_cols = end - start;
-            let mut basis_block = Array2::<f64>::zeros((p, block_cols));
-            for local_col in 0..block_cols {
-                basis_block[[start + local_col, local_col]] = 1.0;
-            }
-            let direction_block = apply_direction(&basis_block)?;
+            // Reuse pre-allocated buffer for full-size chunks; allocate only
+            // for the (at most one) final chunk that is smaller.
+            let basis_block_ref = if block_cols == chunk {
+                basis_buf.fill(0.0);
+                for local_col in 0..block_cols {
+                    basis_buf[[start + local_col, local_col]] = 1.0;
+                }
+                &basis_buf
+            } else {
+                small_buf = Array2::<f64>::zeros((p, block_cols));
+                for local_col in 0..block_cols {
+                    small_buf[[start + local_col, local_col]] = 1.0;
+                }
+                &small_buf
+            };
+            let direction_block = apply_direction(basis_block_ref)?;
             if direction_block.nrows() != p || direction_block.ncols() != block_cols {
                 return Err(EstimationError::InvalidInput(format!(
                     "trace_hinv_operator_sparse_exact apply returned {}x{} for basis block {}x{}",
@@ -972,7 +988,7 @@ impl<'a> RemlState<'a> {
                                     let mut akb =
                                         Array2::<f64>::zeros((p_dim, basis_block.ncols()));
                                     for col in 0..basis_block.ncols() {
-                                        let v = basis_block.column(col).to_owned();
+                                        let v = basis_block.column(col);
                                         let col_out = sparse_matvec_public(&block_k.s_k_sparse, &v)
                                             .mapv(|vv| lambdas[k] * vv);
                                         akb.column_mut(col).assign(&col_out);

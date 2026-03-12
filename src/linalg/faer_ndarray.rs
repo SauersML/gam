@@ -195,30 +195,10 @@ pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
 /// Uses zero-copy view when possible, falls back to copy for non-contiguous arrays.
 #[inline]
 pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
-    use faer::linalg::matmul::matmul;
-    use faer::{Accum, Mat};
-
-    let (n, p) = a.dim();
-
-    // For very small matrices, ndarray might be faster due to less overhead
-    // Threshold chosen empirically - faer wins above ~64 elements in inner dim
-    if !should_use_faer_matmul(p, p, n) {
-        return a.t().dot(a);
-    }
-
-    // Create output matrix
-    let mut result = Mat::<f64>::zeros(p, p);
-
-    let aview = FaerArrayView::new(a);
-    let a_ref = aview.as_ref();
-    let a_t = a_ref.transpose();
-
-    // dst = A^T * A
-    let par = matmul_parallelism(p, p, n);
-    matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
-
-    // Convert back to ndarray
-    mat_to_array(result.as_ref())
+    let p = a.ncols();
+    let mut out = Array2::<f64>::zeros((p, p));
+    fast_ata_into(a, &mut out);
+    out
 }
 
 /// Compute A^T * A into a pre-allocated output buffer.
@@ -295,28 +275,89 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    let (n, _) = a.dim();
+    let (_, q) = b.dim();
+    let mut out = Array2::<f64>::zeros((n, q));
+    fast_ab_into(a, b, &mut out);
+    out
+}
+
+/// Compute A * v using faer's SIMD-optimized GEMV.
+/// For A of shape (n, p) and v of shape (p,), this computes the (n,) result.
+#[inline]
+pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+) -> Array1<f64> {
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
     let (n, p) = a.dim();
-    let (p_b, q) = b.dim();
-    debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
+    debug_assert_eq!(p, v.len(), "A cols must match v length");
 
-    if !should_use_faer_matmul(n, q, p) {
-        return a.dot(b);
+    if !should_use_faer_matmul(n, 1, p) {
+        return a.dot(v);
     }
 
-    let mut result = Mat::<f64>::zeros(n, q);
+    let mut result = Mat::<f64>::zeros(n, 1);
 
     let aview = FaerArrayView::new(a);
-    let bview = FaerArrayView::new(b);
+    let vview = FaerColView::new(v);
     let a_ref = aview.as_ref();
-    let b_ref = bview.as_ref();
+    let v_ref = vview.as_ref();
 
-    let par = matmul_parallelism(n, q, p);
-    matmul(result.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
+    let par = matmul_parallelism(n, 1, p);
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        a_ref,
+        v_ref,
+        1.0,
+        par,
+    );
 
-    mat_to_array(result.as_ref())
+    let mut out = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        out[i] = result[(i, 0)];
+    }
+    out
+}
+
+/// Compute A * v into a pre-allocated output buffer.
+/// `out` must be length n where A is (n, p) and v is length p.
+#[inline]
+pub fn fast_av_into<S: Data<Elem = f64>>(
+    a: &ArrayBase<S, Ix2>,
+    v: &Array1<f64>,
+    out: &mut Array1<f64>,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+
+    let (n, p) = a.dim();
+    debug_assert_eq!(v.len(), p, "vector length must match A cols");
+    debug_assert_eq!(out.len(), n, "output length must match A rows");
+
+    if !should_use_faer_matmul(n, 1, p) {
+        out.assign(&a.dot(v));
+        return;
+    }
+
+    let mut outview = array1_to_col_matmut(out);
+
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
+    let par = matmul_parallelism(n, 1, p);
+    matmul(
+        outview.as_mut(),
+        Accum::Replace,
+        a_ref,
+        v_ref,
+        1.0,
+        par,
+    );
 }
 
 /// Compute A^T * v into a pre-allocated output buffer.
@@ -399,37 +440,184 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     out
 }
 
-/// Compute A^T * diag(W) * A
+/// Compute A^T * diag(W) * A using streaming chunks to avoid O(n*p) allocation.
 #[inline]
 pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
 ) -> Array2<f64> {
-    fast_xt_diag_y(x, w, x)
+    use faer::linalg::matmul::matmul;
+    use faer::Accum;
+    use ndarray::{s, ShapeBuilder};
+
+    let (n, p) = x.dim();
+    debug_assert_eq!(n, w.len(), "X rows must match W length");
+    if n == 0 || p == 0 {
+        return Array2::<f64>::zeros((p, p));
+    }
+    if !should_use_faer_matmul(p, p, n) {
+        let w_x = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
+        return x.t().dot(&w_x);
+    }
+
+    // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 512;
+    const MAX_ROWS: usize = 131_072;
+    let chunk_rows = (TARGET_BYTES / (p.max(1) * 8)).clamp(MIN_ROWS, MAX_ROWS).min(n);
+
+    let mut result = Array2::<f64>::zeros((p, p).f());
+    let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut out_view = array2_to_matmut(&mut result);
+
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let x_slice = x.slice(s![start..start + rows, ..]);
+            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+            for local in 0..rows {
+                let sqrtw = w[start + local].max(0.0).sqrt();
+                for col in 0..p {
+                    chunk[[local, col]] = x_slice[[local, col]] * sqrtw;
+                }
+            }
+        }
+        let chunk_slice = weighted_chunk.slice(s![0..rows, ..]);
+        let chunk_view = FaerArrayView::new(&chunk_slice);
+        let par = matmul_parallelism(p, p, rows);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            chunk_view.as_ref().transpose(),
+            chunk_view.as_ref(),
+            1.0,
+            par,
+        );
+    }
+
+    result
 }
 
-/// Compute A^T * diag(W) * B
+/// Compute A^T * diag(W) * B using streaming chunks.
 #[inline]
 pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
+    use faer::linalg::matmul::matmul;
+    use faer::Accum;
+    use ndarray::{s, ShapeBuilder};
+
     let (n, q) = y.dim();
+    let px = x.ncols();
     debug_assert_eq!(n, w.len(), "Y rows must match W length");
     debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
-    let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
-    fast_atb(x, &w_y)
+    if n == 0 || px == 0 || q == 0 {
+        return Array2::<f64>::zeros((px, q));
+    }
+    if !should_use_faer_matmul(px, q, n) {
+        let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
+        return x.t().dot(&w_y);
+    }
+
+    // Streaming: only allocate chunk_rows × q for the weighted Y slice.
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 512;
+    const MAX_ROWS: usize = 131_072;
+    let total_cols = px + q;
+    let chunk_rows = (TARGET_BYTES / (total_cols.max(1) * 8)).clamp(MIN_ROWS, MAX_ROWS).min(n);
+
+    let mut result = Array2::<f64>::zeros((px, q).f());
+    let mut wy_chunk = Array2::<f64>::zeros((chunk_rows, q).f());
+    let mut out_view = array2_to_matmut(&mut result);
+
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let y_slice = y.slice(s![start..start + rows, ..]);
+            let mut chunk = wy_chunk.slice_mut(s![0..rows, ..]);
+            for local in 0..rows {
+                let wi = w[start + local];
+                for col in 0..q {
+                    chunk[[local, col]] = y_slice[[local, col]] * wi;
+                }
+            }
+        }
+        let x_slice = x.slice(s![start..start + rows, ..]);
+        let wy_slice = wy_chunk.slice(s![0..rows, ..]);
+        let x_view = FaerArrayView::new(&x_slice);
+        let wy_view = FaerArrayView::new(&wy_slice);
+        let par = matmul_parallelism(px, q, rows);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            x_view.as_ref().transpose(),
+            wy_view.as_ref(),
+            1.0,
+            par,
+        );
+    }
+
+    result
 }
 
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
-    for j in 0..mat.ncols() {
-        for i in 0..mat.nrows() {
-            out[[i, j]] = mat[(i, j)];
+    let nrows = mat.nrows();
+    let ncols = mat.ncols();
+    let mut out = Array2::<f64>::zeros((nrows, ncols));
+    if nrows == 0 || ncols == 0 {
+        return out;
+    }
+    // ndarray is row-major by default. Write row-by-row for best cache behavior
+    // on the output side.
+    if let Some(out_slice) = out.as_slice_memory_order_mut() {
+        // Row-major: out_slice[i * ncols + j] = mat[(i, j)]
+        for i in 0..nrows {
+            let row_start = i * ncols;
+            for j in 0..ncols {
+                out_slice[row_start + j] = mat[(i, j)];
+            }
+        }
+    } else {
+        for j in 0..ncols {
+            for i in 0..nrows {
+                out[[i, j]] = mat[(i, j)];
+            }
         }
     }
     out
+}
+
+/// Write faer matmul result A*B directly into a pre-allocated ndarray Array2.
+/// Avoids the intermediate faer::Mat allocation and mat_to_array copy.
+#[inline]
+pub fn fast_ab_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+    out: &mut Array2<f64>,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+
+    let (n, p) = a.dim();
+    let (p_b, q) = b.dim();
+    debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
+    debug_assert_eq!(out.dim(), (n, q), "output dimensions must match A*B result");
+
+    if !should_use_faer_matmul(n, q, p) {
+        out.assign(&a.dot(b));
+        return;
+    }
+
+    let aview = FaerArrayView::new(a);
+    let bview = FaerArrayView::new(b);
+    let a_ref = aview.as_ref();
+    let b_ref = bview.as_ref();
+
+    let par = matmul_parallelism(n, q, p);
+    let mut outview = array2_to_matmut(out);
+    matmul(outview.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
 }
 
 fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {

@@ -100,16 +100,7 @@ impl ResolvedFamilyStrategy {
 
 impl FamilyStrategy for ResolvedFamilyStrategy {
     fn name(&self) -> &'static str {
-        match self.family {
-            LikelihoodFamily::GaussianIdentity => "gaussian",
-            LikelihoodFamily::BinomialLogit => "binomial-logit",
-            LikelihoodFamily::BinomialProbit => "binomial-probit",
-            LikelihoodFamily::BinomialCLogLog => "binomial-cloglog",
-            LikelihoodFamily::BinomialSas => "binomial-sas",
-            LikelihoodFamily::BinomialBetaLogistic => "binomial-beta-logistic",
-            LikelihoodFamily::BinomialMixture => "binomial-blended-inverse-link",
-            LikelihoodFamily::RoystonParmar => "royston-parmar",
-        }
+        self.family.name()
     }
 
     fn family(&self) -> LikelihoodFamily {
@@ -120,16 +111,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         if let Some(inverse_link) = &self.inverse_link {
             return inverse_link.link_function();
         }
-        match self.family {
-            LikelihoodFamily::GaussianIdentity => LinkFunction::Identity,
-            LikelihoodFamily::BinomialLogit => LinkFunction::Logit,
-            LikelihoodFamily::BinomialProbit => LinkFunction::Probit,
-            LikelihoodFamily::BinomialCLogLog => LinkFunction::CLogLog,
-            LikelihoodFamily::BinomialSas => LinkFunction::Sas,
-            LikelihoodFamily::BinomialBetaLogistic => LinkFunction::BetaLogistic,
-            LikelihoodFamily::BinomialMixture => LinkFunction::Logit,
-            LikelihoodFamily::RoystonParmar => LinkFunction::Identity,
-        }
+        self.family.link_function()
     }
 
     fn inverse_link(&self, eta: f64) -> Result<f64, EstimationError> {

@@ -1676,7 +1676,7 @@ impl<'a> JointRemlState<'a> {
 
         // h_full already contains the full coupled penalized Hessian J'WJ + S_lambda.
 
-        let log_det_a = match h_full.clone().eigh(Side::Lower) {
+        let log_det_a = match h_full.eigh(Side::Lower) {
             Ok((eigs, _)) => {
                 // Spectral log-det: sum of log of positive eigenvalues
                 let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
@@ -2149,7 +2149,7 @@ impl<'a> JointRemlState<'a> {
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
         let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) =
-            h_mat.clone().eigh(Side::Lower).map_err(|_| {
+            h_mat.eigh(Side::Lower).map_err(|_| {
                 EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 }

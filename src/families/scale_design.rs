@@ -106,10 +106,26 @@ pub fn build_scale_deviation_transform(
     let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
     let mut weighted_column_mean = Array1::<f64>::zeros(p_noise);
     let mut rescale = Array1::<f64>::ones(p_noise);
+    // Pre-compute QR factorization once for all columns
+    let n = primary_design.nrows();
+    let qr_factored = if non_intercept_start.min(p_noise) < p_noise {
+        let mut wx = Array2::<f64>::zeros((n, p_primary));
+        for i in 0..n {
+            let sw = weights[i].sqrt();
+            for j2 in 0..p_primary {
+                wx[[i, j2]] = sw * primary_design[[i, j2]];
+            }
+        }
+        let wx_faer = FaerArrayView::new(&wx);
+        Some((wx_faer.as_ref().col_piv_qr(), wx))
+    } else {
+        None
+    };
+    let _ = &qr_factored; // keep borrow alive
     for j in non_intercept_start.min(p_noise)..p_noise {
         let col = noise_design.column(j).to_owned();
         let proj = solveweighted_projection_dense(primary_design, &col, weights)?;
-        let fitted = primary_design.dot(&proj);
+        let fitted = crate::faer_ndarray::fast_av(primary_design, &proj);
         let mut residual = &col - &fitted;
         let center = weighted_mean(residual.view(), weights)?;
         residual.mapv_inplace(|v| v - center);
@@ -150,7 +166,7 @@ pub fn apply_scale_deviation_transform(
         return Err("scale deviation apply column mismatch".to_string());
     }
     let mut out = rawnoise_design.clone();
-    let projected = primary_design.dot(&transform.projection_coef);
+    let projected = crate::faer_ndarray::fast_ab(primary_design, &transform.projection_coef);
     for j in transform.non_intercept_start.min(out.ncols())..out.ncols() {
         for i in 0..out.nrows() {
             out[[i, j]] = (out[[i, j]] - projected[[i, j]] - transform.weighted_column_mean[j])
@@ -158,4 +174,59 @@ pub fn apply_scale_deviation_transform(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: solveweighted_projection_dense must handle overdetermined
+    /// systems (n >> p) without panicking. The old code used `qr.solve_in_place()`
+    /// which asserts nrows == ncols (square). The fix uses `solve_lstsq_in_place()`.
+    #[test]
+    fn overdetermined_weighted_projection_does_not_panic() {
+        // n=500, p=5: strongly overdetermined, like biobank-scale GAMLSS
+        let n = 500;
+        let p = 5;
+        let design = Array2::<f64>::ones((n, p));
+        // Make columns distinguishable
+        let mut design = design;
+        for j in 0..p {
+            for i in 0..n {
+                design[[i, j]] = ((i + j * 7) as f64).sin();
+            }
+        }
+        let target = Array1::<f64>::from_vec((0..n).map(|i| (i as f64) * 0.01).collect());
+        let weights = Array1::<f64>::ones(n);
+
+        // This panicked with solve_in_place; should succeed with solve_lstsq_in_place
+        let result = solveweighted_projection_dense(&design, &target, &weights);
+        assert!(result.is_ok(), "overdetermined solve failed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), p);
+    }
+
+    /// Verify the full build_scale_deviation_transform pipeline for n >> p.
+    #[test]
+    fn scale_deviation_transform_overdetermined() {
+        let n = 1000;
+        let p_primary = 10;
+        let p_noise = 5;
+
+        let mut primary = Array2::<f64>::zeros((n, p_primary));
+        let mut noise = Array2::<f64>::zeros((n, p_noise));
+        for i in 0..n {
+            for j in 0..p_primary {
+                primary[[i, j]] = ((i * 3 + j * 11) as f64 * 0.1).sin();
+            }
+            for j in 0..p_noise {
+                noise[[i, j]] = ((i * 5 + j * 13) as f64 * 0.1).cos();
+            }
+        }
+        // Intercept-like first column
+        noise.column_mut(0).fill(1.0);
+        let weights = Array1::<f64>::ones(n);
+
+        let transform = build_scale_deviation_transform(&primary, &noise, &weights, 1);
+        assert!(transform.is_ok(), "transform failed: {:?}", transform.err());
+    }
 }

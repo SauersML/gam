@@ -19,7 +19,7 @@
       "family": "binomial",
       "spatial_basis": "thinplate",
       "centers": 60,
-      "smooth_kind": "separate",
+      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
@@ -29,7 +29,7 @@
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 60,
-      "smooth_kind": "separate",
+      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
@@ -39,7 +39,7 @@
       "family": "binomial",
       "spatial_basis": "matern",
       "centers": 60,
-      "smooth_kind": "separate",
+      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
