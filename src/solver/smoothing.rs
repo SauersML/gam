@@ -1255,7 +1255,6 @@ mod tests {
         assert!(screened[0].1.iter().any(|v| v.abs() > 1e-12));
     }
 
-
     #[test]
     fn finite_difference_parallel_matches_sequential() {
         let mut options = SmoothingBfgsOptions {
@@ -1289,5 +1288,4 @@ mod tests {
             assert!((seq.rho[i] - par.rho[i]).abs() < 1e-5);
         }
     }
-
 }

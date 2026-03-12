@@ -6129,36 +6129,46 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
     let n = data.nrows();
     let k = centers.nrows();
-    let mut kernel_psi = Array2::<f64>::zeros((n, k));
-    let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
-    for i in 0..n {
-        for j in 0..k {
-            let r = data_center_r[[i, j]];
-            let core = duchon_radial_core_psi_triplet(
-                r,
-                length_scale,
-                p_order,
-                s_order,
-                data.ncols(),
-                &coeffs,
-            )?;
-            kernel_psi[[i, j]] = core.phi.psi;
-            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
-        }
-    }
-    let kernel_psi = fast_ab(&kernel_psi, &z_kernel);
-    let kernel_psi_psi = fast_ab(&kernel_psi_psi, &z_kernel);
     let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
-    let kernel_cols = kernel_psi.ncols();
+    let kernel_cols = z_kernel.ncols();
     let total_cols = kernel_cols + poly_cols;
     let mut out_psi = Array2::<f64>::zeros((n, total_cols));
     let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
-    out_psi
-        .slice_mut(s![.., 0..kernel_cols])
-        .assign(&kernel_psi);
-    out_psi_psi
-        .slice_mut(s![.., 0..kernel_cols])
-        .assign(&kernel_psi_psi);
+    let derivative_result: Result<(), BasisError> = out_psi
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .zip(out_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
+        .enumerate()
+        .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
+            let mut local_psi = vec![0.0; k];
+            let mut local_psi_psi = vec![0.0; k];
+            for j in 0..k {
+                let r = data_center_r[[i, j]];
+                let core = duchon_radial_core_psi_triplet(
+                    r,
+                    length_scale,
+                    p_order,
+                    s_order,
+                    data.ncols(),
+                    &coeffs,
+                )?;
+                local_psi[j] = core.phi.psi;
+                local_psi_psi[j] = core.phi.psi_psi;
+            }
+            for col in 0..kernel_cols {
+                let mut acc_psi = 0.0;
+                let mut acc_psi_psi = 0.0;
+                for j in 0..k {
+                    let z_jc = z_kernel[[j, col]];
+                    acc_psi += local_psi[j] * z_jc;
+                    acc_psi_psi += local_psi_psi[j] * z_jc;
+                }
+                row_psi[col] = acc_psi;
+                row_psi_psi[col] = acc_psi_psi;
+            }
+            Ok(())
+        });
+    derivative_result?;
     if let Some(zf) = identifiability_transform {
         if total_cols != zf.nrows() {
             return Err(BasisError::DimensionMismatch(format!(
@@ -6454,15 +6464,19 @@ fn build_duchon_basis_designwithworkspace(
     }
 
     let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+    let kernel_cols = z.ncols();
+    let poly_cols = poly_block.ncols();
+    let total_cols = kernel_cols + poly_cols;
 
-    let mut kernel_block = Array2::<f64>::zeros((n, k));
-    let kernel_result: Result<(), BasisError> = kernel_block
+    let mut basis = Array2::<f64>::zeros((n, total_cols));
+    let basis_result: Result<(), BasisError> = basis
         .axis_iter_mut(Axis(0))
         .into_par_iter()
         .enumerate()
         .try_for_each(|(i, mut row)| {
+            let mut kernel_row = vec![0.0; k];
             for j in 0..k {
-                row[j] = duchon_matern_kernel_general_from_distance(
+                kernel_row[j] = duchon_matern_kernel_general_from_distance(
                     data_center_r[[i, j]],
                     length_scale,
                     p_order,
@@ -6471,19 +6485,16 @@ fn build_duchon_basis_designwithworkspace(
                     coeffs.as_ref(),
                 )?;
             }
+            for col in 0..kernel_cols {
+                let mut acc = 0.0;
+                for j in 0..k {
+                    acc += kernel_row[j] * z[[j, col]];
+                }
+                row[col] = acc;
+            }
             Ok(())
         });
-    kernel_result?;
-
-    let kernel_constrained = fast_ab(&kernel_block, &z);
-    let kernel_cols = kernel_constrained.ncols();
-    let poly_cols = poly_block.ncols();
-    let total_cols = kernel_cols + poly_cols;
-
-    let mut basis = Array2::<f64>::zeros((n, total_cols));
-    basis
-        .slice_mut(s![.., 0..kernel_cols])
-        .assign(&kernel_constrained);
+    basis_result?;
     if poly_cols > 0 {
         basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
     }
@@ -6520,16 +6531,17 @@ pub fn build_duchon_basiswithworkspace(
         spec.nullspace_order,
         workspace,
     )?;
+    let basis = d.basis;
     let identifiability_transform = spatial_identifiability_transform_from_design(
         data,
-        d.basis.view(),
+        basis.view(),
         &spec.identifiability,
         "Duchon",
     )?;
     let design = if let Some(z) = identifiability_transform.as_ref() {
-        fast_ab(&d.basis, z)
+        fast_ab(&basis, z)
     } else {
-        d.basis.clone()
+        basis
     };
     let ops = build_duchon_collocation_operator_matriceswithworkspace(
         centers.view(),
