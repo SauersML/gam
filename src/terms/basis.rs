@@ -8503,7 +8503,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_plate_unsupported_dimension_rejected() {
+    fn test_thin_plate_dimension4_builds_finite_basis() {
         let data = array![[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]];
         let knots = array![
             [0.0, 0.0, 0.0, 0.0],
@@ -8512,12 +8512,18 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
         ];
-        match create_thin_plate_spline_basis(data.view(), knots.view()) {
-            Err(BasisError::InvalidInput(msg)) => {
-                assert!(msg.contains("supports dimensions 1..=3"));
-            }
-            other => panic!("Expected InvalidInput for unsupported TPS dimension, got {other:?}"),
-        }
+        let tps = create_thin_plate_spline_basis(data.view(), knots.view())
+            .expect("dimension-4 TPS should build via general polyharmonic kernel");
+        assert_eq!(tps.dimension, 4);
+        assert_eq!(tps.num_polynomial_basis, 5);
+        assert_eq!(tps.basis.nrows(), data.nrows());
+        assert_eq!(
+            tps.basis.ncols(),
+            tps.num_kernel_basis + tps.num_polynomial_basis
+        );
+        assert!(tps.basis.iter().all(|v| v.is_finite()));
+        assert!(tps.penalty_bending.iter().all(|v| v.is_finite()));
+        assert!(tps.penalty_ridge.iter().all(|v| v.is_finite()));
     }
 
     #[test]
