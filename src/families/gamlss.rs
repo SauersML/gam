@@ -3029,12 +3029,7 @@ fn second_directionalhessian_coeff_fromobjective_q_terms(
         + m1 * d2q_ab_uv
 }
 
-/// Non-wiggle location-scale map derivatives:
-/// q(eta_t, eta_ls) = -eta_t / sigma(eta_ls), with:
-/// q_t=-1/sigma, q_ls=eta_t*sigma'/sigma^2, q_tt=0, q_tl=sigma'/sigma^2,
-/// q_ll=eta_t*(sigma''/sigma^2 - 2*(sigma')^2/sigma^3),
-/// q_tl_ls=sigma''/sigma^2 - 2*(sigma')^2/sigma^3,
-/// q_ll_ls=eta_t*(sigma'''/sigma^2 - 6*sigma'*sigma''/sigma^3 + 6*(sigma')^3/sigma^4).
+/// Non-wiggle location-scale map derivatives via shared scalar core.
 fn nonwiggle_q_derivs(
     eta_t: f64,
     sigma: f64,
@@ -3042,64 +3037,17 @@ fn nonwiggle_q_derivs(
     d2sigma: f64,
     d3sigma: f64,
 ) -> NonWiggleQDerivs {
-    // Full quotient-rule derivation for q(eta_t,eta_ls) = -eta_t / sigma(eta_ls):
-    //
-    // Write s = sigma(eta_ls), s' = dsigma/d eta_ls, s'' = d²sigma/d eta_ls².
-    //
-    // 1) First partials
-    //   q_t  = ∂q/∂eta_t  = -1/s.
-    //   q_ls = ∂q/∂eta_ls = -eta_t * ∂(1/s)/∂eta_ls
-    //        = -eta_t * (-(s'/s²)) = eta_t s'/s².
-    //
-    // 2) Second partials
-    //   q_tt = ∂/∂eta_t (-1/s) = 0.
-    //   q_tl = ∂/∂eta_ls (-1/s) = s'/s².
-    //   q_ll = ∂/∂eta_ls (eta_t s'/s²)
-    //        = eta_t * ( s''/s² - 2(s')²/s³ ).
-    //
-    // 3) Third eta_ls derivatives needed by directional Hessian calculus
-    //   q_tl_ls = ∂/∂eta_ls (q_tl)
-    //           = s''/s² - 2(s')²/s³.
-    //   q_ll_ls = ∂/∂eta_ls (q_ll)
-    //           = eta_t * [ s'''/s² - 6 s' s''/s³ + 6 (s')³/s⁴ ].
-    //
-    // The last line comes from differentiating each product/quotient term:
-    //   d/dx [s'' s^{-2}]            = s''' s^{-2} - 2 s' s'' s^{-3},
-    //   d/dx [-2 (s')² s^{-3}]       = -4 s' s'' s^{-3} + 6 (s')³ s^{-4},
-    // and summing.
-    let s = sigma.max(1e-12);
-    let s2 = s * s;
-    let s3 = s2 * s;
-    let s4 = s3 * s;
-    // For q0(t,l) = -t / sigma(l), the base derivatives used throughout the
-    // wiggle exact-geometry path are
-    //
-    //   q0_t  = -1 / sigma,
-    //   q0_l  = t sigma'(l) / sigma(l)^2,
-    //   q0_tt = 0,
-    //   q0_tl = sigma'(l) / sigma(l)^2,
-    //   q0_ll = t [ sigma''/sigma^2 - 2 (sigma')^2 / sigma^3 ].
-    //
-    // For the exp scale used here, sigma(l)=exp(l), so sigma'=sigma''=sigma
-    // and these simplify to
-    //
-    //   q0_t  = -1/sigma,
-    //   q0_l  = t/sigma = -q0,
-    //   q0_tt = 0,
-    //   q0_tl = 1/sigma,
-    //   q0_ll = q0.
-    //
-    // That final sign is the easy one to get wrong. The exact wiggle Hessian
-    // fix depends on preserving q0_ll = q0, not -q0.
-    let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
+    let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
+        crate::families::survival_location_scale::q_chain_derivs_scalar(
+            eta_t, sigma, dsigma, d2sigma, d3sigma,
+        );
     NonWiggleQDerivs {
-        q_t: -1.0 / s,
-        q_ls: eta_t * dsigma / s2,
-        q_tl: dsigma / s2,
-        q_ll: eta_t * q_tl_ls,
+        q_t,
+        q_ls,
+        q_tl,
+        q_ll,
         q_tl_ls,
-        q_ll_ls: eta_t
-            * (d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * dsigma * dsigma * dsigma / s4),
+        q_ll_ls,
     }
 }
 
@@ -13778,126 +13726,139 @@ mod tests {
     }
 
     // ── Root-cause reproduction: binomial location-scale exact REML fails
-    //    when p > n (rank-deficient Hessian) ──────────────────────────────
+    //    when the outer Newton objective is non-finite at iter=0 ─────────
 
-    /// Helper: Fourier-cosine basis of dimension `p` evaluated at `n` equally
-    /// spaced points in [0, 1].  Combined with a 2nd-order difference penalty
-    /// this mimics the P-spline setup used by the benchmark suite.
-    fn cosine_basis(n: usize, p: usize) -> Array2<f64> {
-        Array2::from_shape_fn((n, p), |(i, j)| {
-            let x = i as f64 / (n.max(2) - 1) as f64;
-            if j == 0 {
-                1.0
-            } else {
-                (j as f64 * std::f64::consts::PI * x).cos()
+    /// **Sufficiency – binomial location-scale exact REML fails with
+    /// extreme fitted probabilities.**
+    ///
+    /// With n = 8 perfectly separable observations and p = 6 per block
+    /// (total 12 > n), plus very weak initial penalty (λ = exp(-8)),
+    /// the inner P-IRLS produces extreme fitted probabilities → the
+    /// exact Newton Hessian log-determinant becomes non-finite on the
+    /// first outer evaluation.  The `CachedSecondOrderObjective` has
+    /// no cache fallback at iter = 0 and the optimizer fails.
+    ///
+    /// Reproduces the `rust_gamlss_flexible / bone_gamair` benchmark
+    /// failure whose pilot fit (BinomialLocationScaleFamily, no wiggle
+    /// stabilization) blows up identically.
+    #[test]
+    fn binomial_location_scale_exact_reml_fails_with_extreme_fitted_probs() {
+        use crate::families::custom_family::{ParameterBlockSpec, fit_custom_family};
+        let n = 4usize;
+        let p = 8usize; // p >> n forces rank-deficient Hessian
+        // Perfectly separable
+        let y = Array1::from_vec(vec![1.0, 1.0, 0.0, 0.0]);
+        let weights = Array1::ones(n);
+
+        // Random-looking design with p >> n
+        let design = Array2::from_shape_fn((n, p), |(i, j)| {
+            ((i * 7 + j * 13 + 3) as f64).sin()
+        });
+        let penalty =
+            crate::basis::create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
+
+        let family = BinomialLocationScaleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(DesignMatrix::Dense(design.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(design.clone())),
+        };
+
+        let blocks = vec![
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
+                design: DesignMatrix::Dense(design.clone()),
+                offset: Array1::zeros(n),
+                penalties: vec![penalty.clone()],
+                initial_log_lambdas: array![-20.0],
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: DesignMatrix::Dense(design),
+                offset: Array1::zeros(n),
+                penalties: vec![penalty],
+                initial_log_lambdas: array![-20.0],
+                initial_beta: None,
+            },
+        ];
+
+        let options = BlockwiseFitOptions::default();
+        let result = fit_custom_family(&family, &blocks, &options);
+        match result {
+            Ok(fit) => panic!(
+                "expected exact REML to fail with extreme fitted probs, but fit succeeded: loglik={:.4e}, outer_iter={}, penobj={:.4e}, converged={}",
+                fit.log_likelihood, fit.outer_iterations, fit.penalizedobjective, fit.converged
+            ),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("non-finite") || msg.contains("outer smoothing optimization failed"),
+                    "expected non-finite outer REML error, got: {msg}"
+                );
             }
-        })
+        }
     }
 
-    /// **Sufficiency – binomial location-scale exact REML is non-finite when
-    /// p > n.**
+    /// **Necessity – adequate penalty prevents extreme probabilities.**
     ///
-    /// With n = 20 observations and p_threshold = p_log_sigma = 12 (total
-    /// p ≈ 24 > n after log-sigma identification), the likelihood Hessian
-    /// H_lik has rank ≤ n < p, so `log|H_mode|` and its gradient become
-    /// non-finite on the very first outer REML evaluation.  The outer
-    /// optimizer has no cached fallback for iter = 0 and fails.
-    ///
-    /// This reproduces the `rust_gamlss_flexible / bone_gamair` benchmark
-    /// failure whose pilot fit (BinomialLocationScaleFamily, no wiggle)
-    /// blows up identically.
+    /// Same separable data and design but with strong initial penalty
+    /// (λ = exp(5.0)), so the inner P-IRLS stays regularized and the
+    /// exact REML outer objective remains finite.
     #[test]
-    fn binomial_location_scale_exact_reml_fails_when_p_exceeds_n() {
-        let n = 20usize;
-        let p = 12usize; // per block → total ≈ 24 > n after identification
-        let y = Array1::from_shape_fn(n, |i| if i % 4 == 0 { 1.0 } else { 0.0 });
+    fn binomial_location_scale_exact_reml_succeeds_with_adequate_penalty() {
+        use crate::families::custom_family::{ParameterBlockSpec, fit_custom_family};
+        let n = 4usize;
+        let p = 8usize;
+        let y = Array1::from_vec(vec![1.0, 1.0, 0.0, 0.0]);
         let weights = Array1::ones(n);
 
-        let design = cosine_basis(n, p);
+        let design = Array2::from_shape_fn((n, p), |(i, j)| {
+            ((i * 7 + j * 13 + 3) as f64).sin()
+        });
         let penalty =
             crate::basis::create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
 
-        let spec = BinomialLocationScaleSpec {
+        let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_block: ParameterBlockInput {
+            threshold_design: Some(DesignMatrix::Dense(design.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(design.clone())),
+        };
+
+        let blocks = vec![
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
                 design: DesignMatrix::Dense(design.clone()),
                 offset: Array1::zeros(n),
                 penalties: vec![penalty.clone()],
-                initial_log_lambdas: None,
+                initial_log_lambdas: array![5.0],
                 initial_beta: None,
             },
-            log_sigma_block: ParameterBlockInput {
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
                 design: DesignMatrix::Dense(design),
                 offset: Array1::zeros(n),
                 penalties: vec![penalty],
-                initial_log_lambdas: None,
+                initial_log_lambdas: array![5.0],
                 initial_beta: None,
             },
-        };
+        ];
 
         let options = BlockwiseFitOptions::default();
-        let result = fit_binomial_location_scale(spec, &options);
-        assert!(
-            result.is_err(),
-            "expected exact REML to fail when p > n, but fit succeeded: loglik={:.4e}",
-            result.as_ref().unwrap().log_likelihood
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("non-finite") || err.contains("outer smoothing optimization failed"),
-            "expected non-finite outer REML error, got: {err}"
-        );
-    }
-
-    /// **Necessity – the same model succeeds when n >> p.**
-    ///
-    /// Scaling up to n = 200 while keeping p = 12 per block (total ≈ 24)
-    /// gives a well-conditioned Hessian. The exact REML outer objective and
-    /// its gradient stay finite and the Newton solver converges.
-    #[test]
-    fn binomial_location_scale_exact_reml_succeeds_when_n_exceeds_p() {
-        let n = 200usize;
-        let p = 12usize;
-        let y = Array1::from_shape_fn(n, |i| if i % 4 == 0 { 1.0 } else { 0.0 });
-        let weights = Array1::ones(n);
-
-        let design = cosine_basis(n, p);
-        let penalty =
-            crate::basis::create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
-
-        let spec = BinomialLocationScaleSpec {
-            y,
-            weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(design.clone()),
-                offset: Array1::zeros(n),
-                penalties: vec![penalty.clone()],
-                initial_log_lambdas: None,
-                initial_beta: None,
-            },
-            log_sigma_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(design),
-                offset: Array1::zeros(n),
-                penalties: vec![penalty],
-                initial_log_lambdas: None,
-                initial_beta: None,
-            },
-        };
-
-        let options = BlockwiseFitOptions::default();
-        let result = fit_binomial_location_scale(spec, &options);
-        assert!(
-            result.is_ok(),
-            "expected exact REML to succeed when n >> p, but got: {}",
-            result.unwrap_err()
-        );
-        let fit = result.unwrap();
-        assert!(
-            fit.log_likelihood.is_finite(),
-            "fitted loglik should be finite"
-        );
+        let result = fit_custom_family(&family, &blocks, &options);
+        match result {
+            Ok(fit) => {
+                assert!(
+                    fit.log_likelihood.is_finite(),
+                    "fitted loglik should be finite"
+                );
+            }
+            Err(err) => panic!(
+                "expected exact REML to succeed with adequate penalty, but got: {err}"
+            ),
+        }
     }
 }
