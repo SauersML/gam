@@ -1791,6 +1791,23 @@ fn main() {
     emit_stage_detail(&meaningless_cond_report);
     allviolations.extend(meaningless_condviolations);
 
+    // Guard: Cargo.toml must keep warnings = "deny" under [lints.rust].
+    update_stage("check Cargo.toml lint level");
+    if let Ok(cargo_toml) = std::fs::read_to_string("Cargo.toml") {
+        let in_lints_rust = cargo_toml.contains("[lints.rust]");
+        let has_deny = cargo_toml.lines().any(|l| {
+            let t = l.trim();
+            t.starts_with("warnings") && t.contains('=') && t.contains("\"deny\"")
+        });
+        if in_lints_rust && !has_deny {
+            allviolations.push(
+                "\n\u{274c} ERROR: Cargo.toml [lints.rust] must have warnings = \"deny\".\n   \
+                 Downgrading to \"warn\" disables the safety net. Revert this change."
+                    .to_string(),
+            );
+        }
+    }
+
     // Scan for fake usage patterns (dummy checks masking unused variables)
     update_stage("scan fake usage patterns");
     let fake_usageviolations = scan_for_fake_usage();
