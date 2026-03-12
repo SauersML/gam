@@ -48,32 +48,6 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 type InverseLinkJet = MixtureInverseLinkJet;
 
-pub struct LltView<'a> {
-    pub matrix: MatRef<'a, f64>,
-}
-
-impl<'a> LltView<'a> {
-    pub fn solve_into(&self, rhs: MatRef<f64>, out: &mut Array2<f64>, stack: &mut MemStack) {
-        if out.nrows() != rhs.nrows() || out.ncols() != rhs.ncols() {
-            *out = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
-        }
-        let mut out_mat = array2_to_matmut(out);
-        out_mat.as_mut().copy_from(rhs);
-        faer::linalg::cholesky::llt::solve::solve_in_place(
-            self.matrix,
-            out_mat.as_mut(),
-            faer::Par::Seq,
-            stack,
-        );
-    }
-
-    pub fn solve(&self, rhs: MatRef<f64>, stack: &mut MemStack) -> Array2<f64> {
-        let mut result = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
-        self.solve_into(rhs, &mut result, stack);
-        result
-    }
-}
-
 #[inline]
 fn array1_is_finite(values: &Array1<f64>) -> bool {
     values.iter().all(|v| v.is_finite())
@@ -4889,47 +4863,6 @@ pub fn undroprows(src: &Array1<f64>, droppedrows: &[usize], dst: &mut Array1<f64
     }
 }
 
-/// Performs the complement operation to undroprows - it removes specified rows from a vector
-/// This simulates the behavior of drop_cols in the C code but for a 1D vector
-pub fn droprows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
-    let n_drop = drop_indices.len();
-
-    if n_drop == 0 {
-        // If no rows to drop, just copy src to dst
-        if src.len() == dst.len() {
-            dst.assign(src);
-        }
-        return;
-    }
-
-    // Validate that the dimensions are compatible
-    assert_eq!(
-        src.len(),
-        dst.len() + n_drop,
-        "Source length must equal destination length + dropped rows"
-    );
-
-    // Ensure drop_indices is in ascending order
-    for i in 1..n_drop {
-        assert!(
-            drop_indices[i] > drop_indices[i - 1],
-            "drop_indices must be in ascending order"
-        );
-    }
-
-    // O(n + n_drop) two-pointer pass.
-    let mut dst_idx = 0usize;
-    let mut drop_ptr = 0usize;
-    for src_idx in 0..src.len() {
-        if drop_ptr < n_drop && drop_indices[drop_ptr] == src_idx {
-            drop_ptr += 1;
-            continue;
-        }
-        dst[dst_idx] = src[src_idx];
-        dst_idx += 1;
-    }
-}
-
 #[inline]
 fn logit_clampzero_enabled() -> bool {
     // Auto-correct behavior: when logit geometry enters hard-clamped/nonsmooth
@@ -5944,66 +5877,6 @@ fn calculate_scale(
             (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
         }
     }
-}
-
-/// Compute penalized Hessian matrix X'WX + S_λ correctly handling negative weights
-/// Used after P-IRLS convergence for final result
-pub fn compute_final_penalized_hessian(
-    x: ArrayView2<f64>,
-    weights: &Array1<f64>,
-    s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
-) -> Result<Array2<f64>, EstimationError> {
-    use faer::linalg::matmul::matmul;
-    use faer::{Accum, Par};
-
-    if x.nrows() != weights.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "weights length {} does not match design rows {}",
-            weights.len(),
-            x.nrows()
-        )));
-    }
-    let p = x.ncols();
-    let n = x.nrows();
-    let mut xtwx = Array2::<f64>::zeros((p, p));
-    if n == 0 || p == 0 {
-        return Ok(xtwx + s_lambda);
-    }
-
-    const MIN_ROWS: usize = 512;
-    const MAX_ROWS: usize = 2048;
-    const TARGET_BYTES: usize = 2 * 1024 * 1024;
-    let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
-    let chunk_rows = (TARGET_BYTES / bytes_per_row)
-        .clamp(MIN_ROWS, MAX_ROWS)
-        .min(n);
-    let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
-    let mut xtwx_mat = array2_to_matmut(&mut xtwx);
-    for start in (0..n).step_by(chunk_rows) {
-        let rows = (n - start).min(chunk_rows);
-        {
-            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
-            for local_row in 0..rows {
-                let src_row = start + local_row;
-                let sqrtw = weights[src_row].max(0.0).sqrt();
-                for col in 0..p {
-                    chunk[[local_row, col]] = x[[src_row, col]] * sqrtw;
-                }
-            }
-        }
-        let chunkview = weighted_chunk.slice(s![0..rows, ..]);
-        let faer_chunk = FaerArrayView::new(&chunkview);
-        matmul(
-            xtwx_mat.as_mut(),
-            Accum::Add,
-            faer_chunk.as_ref().transpose(),
-            faer_chunk.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-    }
-
-    Ok(xtwx + s_lambda)
 }
 
 #[cfg(test)]

@@ -741,14 +741,6 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     }
 }
 
-#[inline]
-pub fn inverse_link_param_partials_for_inverse_link(
-    link: &InverseLink,
-    eta: f64,
-) -> Result<Option<LinkParamPartials>, EstimationError> {
-    link.param_partials(eta)
-}
-
 pub fn inverse_link_jet_for_link_function(
     link: LinkFunction,
     eta: f64,

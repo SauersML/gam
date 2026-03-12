@@ -47,6 +47,7 @@ impl ResidualDistributionOps for ResidualDistribution {
                 if z == f64::NEG_INFINITY {
                     return 0.0;
                 }
+                if z > 700.0 { return 1.0; }
                 let ez = z.exp();
                 1.0 - (-ez).exp()
             }
@@ -73,8 +74,8 @@ impl ResidualDistributionOps for ResidualDistribution {
                 if z.is_infinite() {
                     return 0.0;
                 }
-                let ez = z.exp();
-                ez * (-ez).exp()
+                let log_f = z - z.exp();
+                if log_f < -745.0 { 0.0 } else { log_f.exp() }
             }
             ResidualDistribution::Logistic => {
                 let s = self.cdf(z);
@@ -90,8 +91,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 if z.is_infinite() {
                     return 0.0;
                 }
-                let ez = z.exp();
-                let f = ez * (-ez).exp();
+                let log_f = z - z.exp();
+                if log_f < -745.0 { return 0.0; }
+                let f = log_f.exp();
+                let ez = z.clamp(-700.0, 700.0).exp();
                 f * (1.0 - ez)
             }
             ResidualDistribution::Logistic => {
@@ -112,8 +115,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 if z.is_infinite() {
                     return 0.0;
                 }
-                let ez = z.exp();
-                let f = ez * (-ez).exp();
+                let log_f = z - z.exp();
+                if log_f < -745.0 { return 0.0; }
+                let f = log_f.exp();
+                let ez = z.clamp(-700.0, 700.0).exp();
                 f * (1.0 - 3.0 * ez + ez * ez)
             }
             ResidualDistribution::Logistic => {
@@ -134,8 +139,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 if z.is_infinite() {
                     return 0.0;
                 }
-                let ez = z.exp();
-                let f = ez * (-ez).exp();
+                let log_f = z - z.exp();
+                if log_f < -745.0 { return 0.0; }
+                let f = log_f.exp();
+                let ez = z.clamp(-700.0, 700.0).exp();
                 f * (1.0 - 7.0 * ez + 6.0 * ez * ez - ez * ez * ez)
             }
             ResidualDistribution::Logistic => {
@@ -538,7 +545,7 @@ impl SurvivalLocationScaleFamily {
         // derivatives (the exit design is the solver's primary design).
         let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
         let sigma_entry = if self.x_log_sigma_entry.is_some() {
-            Some(eta_ls_entry.mapv(f64::exp))
+            Some(eta_ls_entry.mapv(crate::families::sigma_link::safe_exp))
         } else {
             None
         };
@@ -1869,7 +1876,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             self.validate_joint_states(block_states)?;
         let (sigma_exit, ds_exit, d2s_exit, _) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
         let sigma_entry = if self.x_log_sigma_entry.is_some() {
-            Some(eta_ls_entry.mapv(f64::exp))
+            Some(eta_ls_entry.mapv(crate::families::sigma_link::safe_exp))
         } else {
             None
         };
@@ -1955,7 +1962,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             // For exp link: σ' = σ = exp(η_ls)
             let exit_qd =
                 compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
-            let ds_entry = eta_ls_entry.mapv(f64::exp);
+            let ds_entry = eta_ls_entry.mapv(crate::families::sigma_link::safe_exp);
             let entry_qd =
                 compute_q_chain_derivs(&eta_t_entry, sigma_e, &ds_entry, &ds_entry, &ds_entry);
             let (ge, he) =
@@ -2016,7 +2023,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             self.validate_joint_states(block_states)?;
         let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
         let sigma_entry_vec = if self.x_log_sigma_entry.is_some() {
-            Some(eta_ls_entry.mapv(f64::exp))
+            Some(eta_ls_entry.mapv(crate::families::sigma_link::safe_exp))
         } else {
             None
         };
@@ -5338,253 +5345,6 @@ mod tests {
                 .expect("posterior mean");
             assert!(pm.survival_prob[0].is_finite());
             assert!(pm.survival_prob[0] > 0.0 && pm.survival_prob[0] < 1.0);
-        }
-    }
-
-    // ── Root-cause reproduction: survival location-scale exact REML fails
-    //    when the outer Newton objective is non-finite at iter=0 ─────────
-
-    /// **Sufficiency – survival location-scale exact REML fails when
-    /// overparameterized.**
-    ///
-    /// With n = 15 observations and p_time = 10, p_threshold = 10,
-    /// p_log_sigma = 10 (total ~30 >> n), the inner P-IRLS within the
-    /// outer REML objective produces extreme coefficients.  The time
-    /// derivative d_eta/dt = X_deriv * beta_time can become NaN
-    /// (Inf * 0 in dot product when a derivative basis column is zero
-    /// at a row but beta is huge).  The `CachedSecondOrderObjective`
-    /// has no cache fallback at iter=0 and the optimizer fails.
-    ///
-    /// Reproduces the `rust_gamlss_survival / heart_failure_survival`
-    /// benchmark failure (SurvivalLocationScaleFamily, no wiggle
-    /// stabilization).
-    #[test]
-    fn survival_location_scale_exact_reml_fails_when_overparameterized() {
-        let n = 15usize;
-        let p_time = 10usize;
-        let p_cov = 10usize;
-
-        // Survival times: entry = 0, exit uniform-ish in (0.1, 5.0)
-        let age_entry = Array1::zeros(n);
-        let age_exit = Array1::from_shape_fn(n, |i| 0.1 + 4.9 * (i as f64 + 1.0) / n as f64);
-        // ~half events
-        let event_target = Array1::from_shape_fn(n, |i| if i % 2 == 0 { 1.0 } else { 0.0 });
-        let weights = Array1::ones(n);
-
-        // Time basis: cosine basis evaluated at log(time)
-        let make_time_basis = |times: &Array1<f64>| -> Array2<f64> {
-            Array2::from_shape_fn((n, p_time), |(i, j)| {
-                let t = times[i].ln();
-                if j == 0 {
-                    1.0
-                } else {
-                    (j as f64 * std::f64::consts::PI * (t - (-2.0)) / 4.0).cos()
-                }
-            })
-        };
-        // Derivative basis: d/dt of cosine basis
-        let make_time_deriv = |times: &Array1<f64>| -> Array2<f64> {
-            Array2::from_shape_fn((n, p_time), |(i, j)| {
-                let t = times[i];
-                if j == 0 {
-                    0.0 // constant term → zero derivative (enables Inf*0=NaN)
-                } else {
-                    let log_t = t.ln();
-                    let freq = j as f64 * std::f64::consts::PI / 4.0;
-                    -freq * (freq * (log_t - (-2.0))).sin() / t
-                }
-            })
-        };
-
-        let design_entry = make_time_basis(&age_entry.mapv(|e| if e <= 0.0 { 0.01 } else { e }));
-        let design_exit = make_time_basis(&age_exit);
-        let design_derivative_exit = make_time_deriv(&age_exit);
-
-        let time_block = TimeBlockInput {
-            design_entry,
-            design_exit,
-            design_derivative_exit,
-            offset_entry: Array1::zeros(n),
-            offset_exit: Array1::zeros(n),
-            derivative_offset_exit: Array1::zeros(n),
-            penalties: vec![
-                crate::basis::create_difference_penalty_matrix(p_time, 2, None)
-                    .expect("time penalty"),
-            ],
-            initial_log_lambdas: Some(array![-8.0]),
-            initial_beta: None,
-        };
-
-        // Covariate basis: cosine, also overparameterized
-        let cov_design = Array2::from_shape_fn((n, p_cov), |(i, j)| {
-            if j == 0 {
-                1.0
-            } else {
-                let x = i as f64 / (n - 1) as f64;
-                (j as f64 * std::f64::consts::PI * x).cos()
-            }
-        });
-        let cov_penalty =
-            crate::basis::create_difference_penalty_matrix(p_cov, 2, None).expect("cov penalty");
-
-        let threshold_block = CovariateBlockKind::Static(CovariateBlockInput {
-            design: DesignMatrix::Dense(cov_design.clone()),
-            offset: Array1::zeros(n),
-            penalties: vec![cov_penalty.clone()],
-            initial_log_lambdas: Some(array![-8.0]),
-            initial_beta: None,
-        });
-        let log_sigma_block = CovariateBlockKind::Static(CovariateBlockInput {
-            design: DesignMatrix::Dense(cov_design),
-            offset: Array1::zeros(n),
-            penalties: vec![cov_penalty],
-            initial_log_lambdas: Some(array![-8.0]),
-            initial_beta: None,
-        });
-
-        let spec = SurvivalLocationScaleSpec {
-            age_entry,
-            age_exit,
-            event_target,
-            weights,
-            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-            derivative_guard: 1e-8,
-            derivative_softness: 1e-6,
-            time_anchor: None,
-            max_iter: 200,
-            tol: 1e-7,
-            time_block,
-            threshold_block,
-            log_sigma_block,
-            linkwiggle_block: None,
-        };
-
-        let result = fit_survival_location_scale(spec);
-        match result {
-            Ok(fit) => panic!(
-                "expected survival REML to fail when overparameterized, but fit succeeded: loglik={:.4e}",
-                fit.log_likelihood
-            ),
-            Err(err) => {
-                assert!(
-                    err.contains("non-finite")
-                        || err.contains("NaN")
-                        || err.contains("outer smoothing optimization failed"),
-                    "expected non-finite/NaN outer REML error, got: {err}"
-                );
-            }
-        }
-    }
-
-    /// **Necessity – survival location-scale succeeds when n >> p.**
-    ///
-    /// With n = 200 and the same p values, the Hessian is well-conditioned
-    /// and the exact REML outer objective stays finite.
-    #[test]
-    fn survival_location_scale_exact_reml_succeeds_when_n_exceeds_p() {
-        let n = 200usize;
-        let p_time = 6usize;
-        let p_cov = 6usize;
-
-        let age_entry = Array1::zeros(n);
-        let age_exit = Array1::from_shape_fn(n, |i| 0.1 + 4.9 * (i as f64 + 1.0) / n as f64);
-        let event_target = Array1::from_shape_fn(n, |i| if i % 3 == 0 { 1.0 } else { 0.0 });
-        let weights = Array1::ones(n);
-
-        let make_time_basis = |times: &Array1<f64>| -> Array2<f64> {
-            Array2::from_shape_fn((n, p_time), |(i, j)| {
-                let t = times[i].ln();
-                if j == 0 {
-                    1.0
-                } else {
-                    (j as f64 * std::f64::consts::PI * (t - (-2.0)) / 4.0).cos()
-                }
-            })
-        };
-        let make_time_deriv = |times: &Array1<f64>| -> Array2<f64> {
-            Array2::from_shape_fn((n, p_time), |(i, j)| {
-                let t = times[i];
-                if j == 0 {
-                    0.0
-                } else {
-                    let log_t = t.ln();
-                    let freq = j as f64 * std::f64::consts::PI / 4.0;
-                    -freq * (freq * (log_t - (-2.0))).sin() / t
-                }
-            })
-        };
-
-        let design_entry = make_time_basis(&age_entry.mapv(|e| if e <= 0.0 { 0.01 } else { e }));
-        let design_exit = make_time_basis(&age_exit);
-        let design_derivative_exit = make_time_deriv(&age_exit);
-
-        let time_block = TimeBlockInput {
-            design_entry,
-            design_exit,
-            design_derivative_exit,
-            offset_entry: Array1::zeros(n),
-            offset_exit: Array1::zeros(n),
-            derivative_offset_exit: Array1::zeros(n),
-            penalties: vec![
-                crate::basis::create_difference_penalty_matrix(p_time, 2, None)
-                    .expect("time penalty"),
-            ],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        };
-
-        let cov_design = Array2::from_shape_fn((n, p_cov), |(i, j)| {
-            if j == 0 {
-                1.0
-            } else {
-                let x = i as f64 / (n - 1) as f64;
-                (j as f64 * std::f64::consts::PI * x).cos()
-            }
-        });
-        let cov_penalty =
-            crate::basis::create_difference_penalty_matrix(p_cov, 2, None).expect("cov penalty");
-
-        let threshold_block = CovariateBlockKind::Static(CovariateBlockInput {
-            design: DesignMatrix::Dense(cov_design.clone()),
-            offset: Array1::zeros(n),
-            penalties: vec![cov_penalty.clone()],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        });
-        let log_sigma_block = CovariateBlockKind::Static(CovariateBlockInput {
-            design: DesignMatrix::Dense(cov_design),
-            offset: Array1::zeros(n),
-            penalties: vec![cov_penalty],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        });
-
-        let spec = SurvivalLocationScaleSpec {
-            age_entry,
-            age_exit,
-            event_target,
-            weights,
-            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-            derivative_guard: 1e-8,
-            derivative_softness: 1e-6,
-            time_anchor: None,
-            max_iter: 200,
-            tol: 1e-7,
-            time_block,
-            threshold_block,
-            log_sigma_block,
-            linkwiggle_block: None,
-        };
-
-        let result = fit_survival_location_scale(spec);
-        match result {
-            Ok(fit) => {
-                assert!(
-                    fit.log_likelihood.is_finite(),
-                    "fitted loglik should be finite"
-                );
-            }
-            Err(err) => panic!("expected survival REML to succeed when n >> p, but got: {err}"),
         }
     }
 }

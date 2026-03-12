@@ -36,7 +36,10 @@ use gam::gamlss::{
     fit_gaussian_location_scale_terms,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
-use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
+use gam::hmc::{
+    FamilyNutsInputs, GlmFlatInputs, JointSplineArtifacts, NutsConfig,
+    run_joint_nuts_sampling, run_nuts_sampling_flattened_family,
+};
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
     load_csvwith_schema,
@@ -330,12 +333,12 @@ struct DiagnoseArgs {
 struct SampleArgs {
     model: PathBuf,
     data: PathBuf,
-    #[arg(long = "chains", default_value_t = 4)]
-    chains: usize,
-    #[arg(long = "samples", default_value_t = 2000)]
-    samples: usize,
-    #[arg(long = "warmup", default_value_t = 1000)]
-    warmup: usize,
+    #[arg(long = "chains")]
+    chains: Option<usize>,
+    #[arg(long = "samples")]
+    samples: Option<usize>,
+    #[arg(long = "warmup")]
+    warmup: Option<usize>,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -4938,11 +4941,22 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     let family = model.likelihood();
+    let n_base_params = model
+        .fit_result
+        .as_ref()
+        .map(|fr| fr.beta.len())
+        .unwrap_or(0);
+    let n_link_params = model
+        .joint_beta_link
+        .as_ref()
+        .map(|bl| bl.len())
+        .unwrap_or(0);
+    let adaptive = NutsConfig::for_dimension(n_base_params + n_link_params);
     let cfg = NutsConfig {
-        n_samples: args.samples,
-        nwarmup: args.warmup,
-        n_chains: args.chains,
-        ..NutsConfig::default()
+        n_samples: args.samples.unwrap_or(adaptive.n_samples),
+        nwarmup: args.warmup.unwrap_or(adaptive.nwarmup),
+        n_chains: args.chains.unwrap_or(adaptive.n_chains),
+        ..adaptive
     };
 
     progress.set_stage("sample", "running posterior sampling");
@@ -4982,7 +4996,43 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     progress.start_workflow("Sample", 5);
     progress.advance_workflow(4);
     progress.set_stage("sample", "writing posterior draws");
-    write_matrix_csv(&out, &nuts.samples, "beta")?;
+
+    // Determine how many columns are base coefficients vs link-wiggle
+    // coefficients.  When joint sampling was used the sample matrix has
+    // p_base + p_link columns; otherwise all columns are base coefficients.
+    let n_coeffs = nuts.samples.ncols();
+    let p_base = model
+        .fit_result
+        .as_ref()
+        .map(|fr| fr.beta.len())
+        .unwrap_or(n_coeffs);
+    let coeff_name = |j: usize| -> String {
+        if j < p_base {
+            format!("beta_{j}")
+        } else {
+            format!("theta_{}", j - p_base)
+        }
+    };
+
+    // Write raw posterior samples CSV with appropriate column headers.
+    {
+        let headers: Vec<String> = (0..n_coeffs).map(|j| coeff_name(j)).collect();
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(true)
+            .from_path(&out)
+            .map_err(|e| format!("failed to create output csv '{}': {e}", out.display()))?;
+        wtr.write_record(&headers)
+            .map_err(|e| format!("failed to write csv header: {e}"))?;
+        for i in 0..nuts.samples.nrows() {
+            let row: Vec<String> = (0..n_coeffs)
+                .map(|j| format!("{:.12}", nuts.samples[[i, j]]))
+                .collect();
+            wtr.write_record(&row)
+                .map_err(|e| format!("failed to write csv row {i}: {e}"))?;
+        }
+        wtr.flush()
+            .map_err(|e| format!("failed to flush posterior samples csv: {e}"))?;
+    }
     progress.advance_workflow(5);
     progress.finish_progress("sampling complete");
     println!(
@@ -4993,7 +5043,6 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     );
 
     // Print posterior coefficient summary with 95% credible intervals.
-    let n_coeffs = nuts.samples.ncols();
     println!();
     println!(
         "  {:<10} {:>12} {:>12} {:>12} {:>12}",
@@ -5007,7 +5056,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         let (lo, hi) = nuts.posterior_interval_of(|row| row[j], 2.5, 97.5);
         println!(
             "  {:<10} {:>12.6} {:>12.6} {:>12.6} {:>12.6}",
-            format!("beta_{j}"),
+            coeff_name(j),
             pm,
             nuts.posterior_std[j],
             lo,
@@ -5044,7 +5093,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             let pm = nuts.posterior_mean_of(|row| row[j]);
             let (lo, hi) = nuts.posterior_interval_of(|row| row[j], 2.5, 97.5);
             wtr.write_record(&[
-                format!("beta_{j}"),
+                coeff_name(j),
                 format!("{pm:.8}"),
                 format!("{:.8}", nuts.posterior_std[j]),
                 format!("{lo:.8}"),
@@ -5369,6 +5418,94 @@ fn run_sample_standard(
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
     progress.advance_workflow(3);
     let penalty = weighted_penalty_matrix(&design.penalties, fit.lambdas.view())?;
+
+    // Check if the model has a learned joint link wiggle; if so, attempt
+    // joint (beta, theta) sampling via run_joint_nuts_sampling.
+    if let Some(joint) = load_joint_result(model, family)? {
+        let base_link = joint.link;
+        let is_logit = match base_link {
+            LinkFunction::Logit => true,
+            LinkFunction::Identity => false,
+            other => {
+                eprintln!(
+                    "warning: joint NUTS sampling only supports logit and identity base links; \
+                     model uses {:?} -- falling back to base-only sampling with link wiggle fixed at MAP",
+                    other
+                );
+                // Fall back to base-only sampling.
+                return run_nuts_sampling_flattened_family(
+                    family,
+                    FamilyNutsInputs::Glm(GlmFlatInputs {
+                        x: design.design.view(),
+                        y: y.view(),
+                        weights: weights.view(),
+                        penalty_matrix: penalty.view(),
+                        mode: fit.beta.view(),
+                        hessian: fit
+                            .penalized_hessian()
+                            .ok_or_else(|| {
+                                "fit result is missing inference Hessian; refit with inference enabled"
+                                    .to_string()
+                            })?
+                            .view(),
+                        firth_bias_reduction: false,
+                    }),
+                    cfg,
+                )
+                .map_err(|e| format!("NUTS sampling failed: {e}"));
+            }
+        };
+
+        let scale = fit.standard_deviation;
+        let spline = JointSplineArtifacts {
+            knot_range: joint.knot_range,
+            knot_vector: joint.knot_vector.clone(),
+            link_transform: joint.link_transform.clone(),
+            degree: joint.degree,
+        };
+        let penalty_link = joint.s_link_constrained.clone();
+        let mode_theta = joint.beta_link.clone();
+
+        // Build the joint penalized Hessian by augmenting the base Hessian
+        // with the link penalty block.
+        let base_hessian = fit
+            .penalized_hessian()
+            .ok_or_else(|| {
+                "fit result is missing inference Hessian; refit with inference enabled".to_string()
+            })?;
+        let p_base = base_hessian.nrows();
+        let p_link = penalty_link.nrows();
+        let dim = p_base + p_link;
+        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
+        joint_hessian
+            .slice_mut(ndarray::s![..p_base, ..p_base])
+            .assign(base_hessian);
+        joint_hessian
+            .slice_mut(ndarray::s![p_base.., p_base..])
+            .assign(&penalty_link);
+
+        eprintln!(
+            "info: using joint (beta, theta) NUTS sampling with {} base + {} link-wiggle parameters",
+            p_base, p_link
+        );
+
+        return run_joint_nuts_sampling(
+            design.design.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            penalty_link.view(),
+            fit.beta.view(),
+            mode_theta.view(),
+            joint_hessian.view(),
+            spline,
+            cfg,
+            is_logit,
+            scale,
+        )
+        .map_err(|e| format!("joint NUTS sampling failed: {e}"));
+    }
+
     run_nuts_sampling_flattened_family(
         family,
         FamilyNutsInputs::Glm(GlmFlatInputs {
@@ -5729,8 +5866,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         })
         .collect();
 
-    let edf_blocks: Vec<(usize, f64)> =
-        fit.edf_by_block().iter().copied().enumerate().collect();
+    let edf_blocks: Vec<(usize, f64)> = fit.edf_by_block().iter().copied().enumerate().collect();
 
     let mut notes = Vec::new();
     let mut diagnostics = None;
@@ -5782,7 +5918,11 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 if matches!(family, LikelihoodFamily::GaussianIdentity) {
                     let y_mean = y.mean().unwrap_or(0.0);
                     let ss_tot: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
-                    let ss_res: f64 = y.iter().zip(pred.mean.iter()).map(|(&yi, &pi)| (yi - pi).powi(2)).sum();
+                    let ss_res: f64 = y
+                        .iter()
+                        .zip(pred.mean.iter())
+                        .map(|(&yi, &pi)| (yi - pi).powi(2))
+                        .sum();
                     if ss_tot > 1e-15 {
                         r_squared = Some(1.0 - ss_res / ss_tot);
                     }
@@ -5791,7 +5931,12 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 // Continuous smoothness order
                 let reportweights = Array1::<f64>::ones(ds.values.nrows());
                 let summary = build_model_summary(
-                    &design, &spec, &fit, family, y.view(), reportweights.view(),
+                    &design,
+                    &spec,
+                    &fit,
+                    family,
+                    y.view(),
+                    reportweights.view(),
                 );
                 for st in &summary.smooth_terms {
                     if let Some(ord) = st.continuous_order.as_ref() {
@@ -5817,9 +5962,11 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 }
 
                 // Residual QQ data
-                let residuals: Vec<f64> = y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
+                let residuals: Vec<f64> =
+                    y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
                 let mut residuals_sorted = residuals.clone();
-                residuals_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                residuals_sorted
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let n = residuals_sorted.len().max(1);
                 let theoretical_quantiles = (0..n)
                     .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
@@ -5845,7 +5992,10 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                             or.push((bin_obs[b] / counts[b] as f64).clamp(0.0, 1.0));
                         }
                     }
-                    Some(report::CalibrationData { mean_predicted: mp, observed_rate: or })
+                    Some(report::CalibrationData {
+                        mean_predicted: mp,
+                        observed_rate: or,
+                    })
                 } else {
                     None
                 };
@@ -5885,18 +6035,18 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 for st in &spec.smooth_terms {
                     if let Some(col) = smooth_term_primary_column(st) {
                         if col < ds.values.ncols() {
-                            if let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name) {
+                            if let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name)
+                            {
                                 let x_col = ds.values.column(col);
                                 let contrib = design
                                     .design
                                     .slice(s![.., dt.coeff_range.clone()])
                                     .dot(&fit.beta.slice(s![dt.coeff_range.clone()]));
-                                let mut pairs: Vec<(f64, f64)> = x_col
-                                    .iter()
-                                    .copied()
-                                    .zip(contrib.iter().copied())
-                                    .collect();
-                                pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                let mut pairs: Vec<(f64, f64)> =
+                                    x_col.iter().copied().zip(contrib.iter().copied()).collect();
+                                pairs.sort_by(|a, b| {
+                                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                                });
                                 smooth_plots.push(report::SmoothPlotData {
                                     name: st.name.clone(),
                                     x: pairs.iter().map(|p| p.0).collect(),
@@ -9002,6 +9152,7 @@ fn build_model_summary(
             Array1::from_elem(y.len(), p)
         }
         LikelihoodFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
+        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => todo!(),
     };
     let null_dev = gam::pirls::calculate_deviance(y, &nullmu, link, weights);
     let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
@@ -9326,6 +9477,7 @@ fn response_sd_from_eta_for_family(
                 v
             }
             LikelihoodFamily::GaussianIdentity => 0.0,
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => todo!(),
         };
         var.max(0.0).sqrt()
     })))

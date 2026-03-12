@@ -16,6 +16,7 @@ use crate::families::scale_design::{
 };
 use crate::families::sigma_link::{
     SigmaJet1, exp_sigma_derivs_up_to_third, exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar,
+    safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::{
@@ -3374,7 +3375,7 @@ fn gaussian_jointrow_scalars(
     let mut m = Array1::<f64>::uninit(nobs);
     let mut n = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let s = eta_ls[i].exp().max(1e-12);
+        let s = safe_exp(eta_ls[i]).max(1e-12);
         let wi = weights[i] / (s * s);
         let ri = y[i] - etamu[i];
         w[i].write(wi);
@@ -4570,7 +4571,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             for i in 0..n {
                 let eta_ls_i = ls_s[i];
                 let two_eta = 2.0 * eta_ls_i;
-                let sigma_i = eta_ls_i.exp().max(1e-12);
+                let sigma_i = safe_exp(eta_ls_i).max(1e-12);
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let r = y_s[i] - mu_s[i];
                 let weight_i = w_s[i];
@@ -4604,7 +4605,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             for i in 0..n {
                 let eta_ls_i = eta_log_sigma[i];
                 let two_eta = 2.0 * eta_ls_i;
-                let sigma_i = eta_ls_i.exp().max(1e-12);
+                let sigma_i = safe_exp(eta_ls_i).max(1e-12);
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let r = self.y[i] - etamu[i];
                 let weight_i = self.weights[i];
@@ -4675,14 +4676,14 @@ impl CustomFamily for GaussianLocationScaleFamily {
         ) {
             for i in 0..n {
                 let two_eta = 2.0 * ls_s[i];
-                let inv_s2 = (-two_eta).exp().min(1e24);
+                let inv_s2 = safe_exp(-two_eta).min(1e24);
                 let r = y_s[i] - mu_s[i];
                 ll += w_s[i] * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
             }
         } else {
             for i in 0..n {
                 let two_eta = 2.0 * eta_log_sigma[i];
-                let inv_s2 = (-two_eta).exp().min(1e24);
+                let inv_s2 = safe_exp(-two_eta).min(1e24);
                 let r = self.y[i] - etamu[i];
                 ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
             }
@@ -5168,7 +5169,7 @@ impl CustomFamily for PoissonLogFamily {
                 ));
             }
             let e = eta[i];
-            let m = e.exp().max(1e-12);
+            let m = safe_exp(e).max(1e-12);
             mu[i] = m;
             // Drop log(y!) constant in objective.
             ll += self.weights[i] * (yi * e - m);
@@ -5260,7 +5261,7 @@ impl CustomFamily for GammaLogFamily {
                 ));
             }
             let e = eta[i];
-            let m = e.exp().max(1e-12);
+            let m = safe_exp(e).max(1e-12);
             mu[i] = m;
             // Gamma(shape=k, scale=mu/k), dropping constants independent of eta.
             ll += self.weights[i] * (-self.shape * (yi / m + m.ln()));
@@ -10778,8 +10779,8 @@ mod tests {
                 let w = weights[i];
                 let eta = eta_ls[i];
                 let two_eta = 2.0 * eta;
-                let sigma = eta.exp().max(1e-12);
-                let inv_s2 = (-two_eta).exp().min(1e24);
+                let sigma = safe_exp(eta).max(1e-12);
+                let inv_s2 = safe_exp(-two_eta).min(1e24);
                 let r = y[i] - mu[i];
                 ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
                 if w == 0.0 {
@@ -10813,7 +10814,7 @@ mod tests {
             for i in 0..n {
                 let eta = eta_ls[i];
                 let two_eta = 2.0 * eta;
-                let sigma = eta.exp().max(1e-12);
+                let sigma = safe_exp(eta).max(1e-12);
                 let inv_s2 = (sigma * sigma).recip().min(1e24);
                 let w = weights[i];
                 let r = y[i] - mu[i];

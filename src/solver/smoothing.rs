@@ -987,57 +987,6 @@ where
     }
 }
 
-/// Parallelized multi-start exact-gradient optimizer.
-///
-/// This variant runs seed screening and candidate BFGS probes concurrently.
-/// It requires a thread-safe objective callback.
-pub fn optimize_log_smoothingwithmultistartwithgradient_parallel<F>(
-    num_penalties: usize,
-    heuristic_lambdas: Option<&[f64]>,
-    objectivewithgradient: F,
-    options: &SmoothingBfgsOptions,
-) -> Result<SmoothingBfgsResult, EstimationError>
-where
-    F: Fn(&Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError> + Sync,
-{
-    if num_penalties == 0 {
-        let rho = Array1::<f64>::zeros(0);
-        let (value, grad) = objectivewithgradient(&rho)?;
-        let grad_norm = grad.dot(&grad).sqrt();
-        return Ok(SmoothingBfgsResult {
-            rho,
-            final_value: value,
-            iterations: 0,
-            finalgrad_norm: grad_norm,
-            final_stationarity_residual: grad_norm,
-            final_boundviolation: 0.0,
-            stationary: grad_norm <= options.tol.max(1e-6),
-        });
-    }
-    if options.optimizer_kind == SmoothingOptimizerKind::Arc {
-        return optimize_log_smoothingwithmultistartwithgradient(
-            num_penalties,
-            heuristic_lambdas,
-            |rho| objectivewithgradient(rho),
-            options,
-        );
-    }
-    if !should_parallelize_smoothing_candidates(num_penalties, options) {
-        return optimize_log_smoothingwithmultistartwithgradient(
-            num_penalties,
-            heuristic_lambdas,
-            |rho| objectivewithgradient(rho),
-            options,
-        );
-    }
-    runmultistart_bfgs_parallel(
-        num_penalties,
-        heuristic_lambdas,
-        &objectivewithgradient,
-        options,
-    )
-}
-
 /// Parallelized multi-start finite-difference optimizer.
 ///
 /// This variant runs seed screening and candidate outer probes concurrently and

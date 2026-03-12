@@ -29,22 +29,6 @@ pub enum SurvivalError {
     NonPositiveHazard,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct AgeTransform {
-    pub minimum_age: f64,
-    pub delta: f64,
-}
-
-impl AgeTransform {
-    pub fn transform(&self, age: f64) -> Result<f64, SurvivalError> {
-        let shifted = age - self.minimum_age + self.delta;
-        if !shifted.is_finite() || shifted <= 0.0 {
-            return Err(SurvivalError::NonFiniteInput);
-        }
-        Ok(shifted.ln())
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SurvivalSpec {
     #[default]
