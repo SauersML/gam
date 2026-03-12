@@ -6606,4 +6606,226 @@ mod root_cause_tests {
             noise_floor
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Deviance monotonicity tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: assert that the penalized deviance trace is non-increasing
+    /// across P-IRLS iterations, allowing a small tolerance for floating-point
+    /// rounding.
+    fn assert_deviance_monotone(trace: &[f64], label: &str) {
+        assert!(
+            trace.len() >= 2,
+            "{}: expected at least 2 deviance recordings, got {}",
+            label,
+            trace.len()
+        );
+        for i in 1..trace.len() {
+            let prev = trace[i - 1];
+            let curr = trace[i];
+            // Allow tiny increases up to a relative tolerance of 1e-8 plus
+            // an absolute tolerance of 1e-12, to account for floating-point noise.
+            let tol = 1e-8 * prev.abs() + 1e-12;
+            assert!(
+                curr <= prev + tol,
+                "{}: deviance increased at iteration {} -> {}: {:.12e} -> {:.12e} (delta = {:.3e})",
+                label,
+                i - 1,
+                i,
+                prev,
+                curr,
+                curr - prev,
+            );
+        }
+    }
+
+    #[test]
+    fn test_deviance_monotonicity_gaussian() {
+        // Simple Gaussian GAM: y ~ X beta with a smooth penalty.
+        // Design matrix with an intercept column and one covariate.
+        let n = 20;
+        let mut x_data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64;
+            x_data[[i, 0]] = 1.0; // intercept
+            x_data[[i, 1]] = t; // covariate
+            // true relationship: y = 3 + 2*t + deterministic pseudo-noise
+            y[i] = 3.0 + 2.0 * t + 0.3 * (((i * 17 + 5) % 11) as f64 / 11.0 - 0.5);
+        }
+
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0]; // log(lambda) = 0, so lambda = 1
+        // Penalty on the second coefficient only (leave intercept unpenalized).
+        let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
+        let config = PirlsConfig {
+            link_kind: InverseLink::Standard(LinkFunction::Identity),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+        };
+
+        let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+            fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(rho.view()),
+                PirlsProblem {
+                    x: x_data.view(),
+                    offset: offset.view(),
+                    y: y.view(),
+                    priorweights: w.view(),
+                    covariate_se: None,
+                },
+                PenaltyConfig {
+                    rs_original: &rs,
+                    balanced_penalty_root: None,
+                    reparam_invariant: None,
+                    p: 2,
+                    coefficient_lower_bounds: None,
+                    linear_constraints_original: None,
+                },
+                &config,
+                None,
+            )
+        });
+        result.expect("Gaussian P-IRLS fit should succeed");
+        assert_deviance_monotone(&trace, "Gaussian");
+    }
+
+    #[test]
+    fn test_deviance_monotonicity_logistic() {
+        // Logistic regression: binary y with a single covariate plus intercept.
+        let n = 30;
+        let mut x_data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64 / (n - 1) as f64) * 4.0 - 2.0; // t in [-2, 2]
+            x_data[[i, 0]] = 1.0;
+            x_data[[i, 1]] = t;
+            // Deterministic binary labels: P(y=1) = sigmoid(0.5 + 1.5*t)
+            let eta = 0.5 + 1.5 * t;
+            let p = 1.0 / (1.0 + (-eta).exp());
+            let pseudo_random = ((i * 31 + 7) % 17) as f64 / 17.0;
+            y[i] = if pseudo_random < p { 1.0 } else { 0.0 };
+        }
+
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
+        let config = PirlsConfig {
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+        };
+
+        let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+            fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(rho.view()),
+                PirlsProblem {
+                    x: x_data.view(),
+                    offset: offset.view(),
+                    y: y.view(),
+                    priorweights: w.view(),
+                    covariate_se: None,
+                },
+                PenaltyConfig {
+                    rs_original: &rs,
+                    balanced_penalty_root: None,
+                    reparam_invariant: None,
+                    p: 2,
+                    coefficient_lower_bounds: None,
+                    linear_constraints_original: None,
+                },
+                &config,
+                None,
+            )
+        });
+        result.expect("Logistic P-IRLS fit should succeed");
+        assert_deviance_monotone(&trace, "Logistic");
+    }
+
+    #[test]
+    fn test_deviance_monotonicity_logistic_multiseed() {
+        // Run logistic regression with multiple deterministic "seeds" to
+        // stress-test monotonicity under varied label configurations.
+        let seeds: &[u64] = &[42, 137, 271, 314, 997];
+        let n = 25;
+
+        for &seed in seeds {
+            let mut x_data = Array2::<f64>::zeros((n, 3));
+            let mut y = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let t1 = (i as f64 / (n - 1) as f64) * 6.0 - 3.0;
+                // Second covariate derived from seed for variety
+                let t2 = ((i as u64).wrapping_mul(seed).wrapping_add(13) % 100) as f64 / 100.0
+                    - 0.5;
+                x_data[[i, 0]] = 1.0;
+                x_data[[i, 1]] = t1;
+                x_data[[i, 2]] = t2;
+                let eta = -0.3 + 1.0 * t1 + 0.8 * t2;
+                let p = 1.0 / (1.0 + (-eta).exp());
+                // Deterministic label assignment using a hash of (i, seed)
+                let hash = (i as u64)
+                    .wrapping_mul(seed)
+                    .wrapping_add(seed >> 2)
+                    .wrapping_mul(2654435761);
+                let pseudo_uniform = (hash % 10000) as f64 / 10000.0;
+                y[i] = if pseudo_uniform < p { 1.0 } else { 0.0 };
+            }
+
+            // Ensure we have at least one of each class; if not, force one.
+            let ones: f64 = y.iter().sum();
+            if ones < 1.0 {
+                y[0] = 1.0;
+            }
+            if ones > (n as f64 - 1.0) {
+                y[n - 1] = 0.0;
+            }
+
+            let w = Array1::ones(n);
+            let offset = Array1::zeros(n);
+            let rho = array![0.0, 0.0];
+            let rs = vec![
+                // Penalty matrices: penalize 2nd and 3rd coefficients independently
+                array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+                array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            ];
+            let config = PirlsConfig {
+                link_kind: InverseLink::Standard(LinkFunction::Logit),
+                max_iterations: 100,
+                convergence_tolerance: 1e-8,
+                firth_bias_reduction: false,
+            };
+
+            let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+                fit_model_for_fixed_rho(
+                    LogSmoothingParamsView::new(rho.view()),
+                    PirlsProblem {
+                        x: x_data.view(),
+                        offset: offset.view(),
+                        y: y.view(),
+                        priorweights: w.view(),
+                        covariate_se: None,
+                    },
+                    PenaltyConfig {
+                        rs_original: &rs,
+                        balanced_penalty_root: None,
+                        reparam_invariant: None,
+                        p: 3,
+                        coefficient_lower_bounds: None,
+                        linear_constraints_original: None,
+                    },
+                    &config,
+                    None,
+                )
+            });
+            result.unwrap_or_else(|e| {
+                panic!("Logistic P-IRLS fit failed for seed {}: {:?}", seed, e)
+            });
+            assert_deviance_monotone(&trace, &format!("Logistic(seed={})", seed));
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use ndarray::Array1;
+use ndarray::{Array1, ArrayView1};
 #[cfg(test)]
 use std::fs;
 #[cfg(test)]

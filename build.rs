@@ -1657,6 +1657,12 @@ fn main() {
     // Collect all violations from all checks
     let mut allviolations = Vec::new();
 
+    // Pre-build stripped file contents cache for cross-file reference analysis.
+    // Each entry is (path, comment/string-stripped content).  Built once, shared
+    // by any scan that needs codebase-wide reference counting.
+    update_stage("build stripped file contents cache");
+    let file_contents_cache = build_stripped_file_cache();
+
     // Scan Rust source files for underscore prefixed variables
     update_stage("scan underscore-prefixed bindings");
     let underscoreviolations = scan_for_underscore_prefixes();
@@ -1833,6 +1839,16 @@ fn main() {
     );
     emit_stage_detail(&placeholder_report);
     allviolations.extend(placeholderviolations);
+
+    // Scan for dead public items (pub but never referenced anywhere)
+    update_stage("scan dead public items");
+    let dead_pubviolations = scan_for_dead_public_items(&file_contents_cache);
+    let dead_pub_report = format!(
+        "dead public item scan identified {} violation groups",
+        dead_pubviolations.len()
+    );
+    emit_stage_detail(&dead_pub_report);
+    allviolations.extend(dead_pubviolations);
 
     // If any violations were found, print them all and exit with error
     if !allviolations.is_empty() {
@@ -3718,4 +3734,139 @@ fn isword_boundary(text: &str, idx: usize, len: usize) -> bool {
         return false;
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Dead public item detection
+// ---------------------------------------------------------------------------
+
+/// Stripped file contents: (path, comment/string-stripped source text).
+struct StrippedFile {
+    path: PathBuf,
+    stripped: String,
+}
+
+/// Walk all `.rs` files (excluding build.rs and ignored directories), read each,
+/// strip comments and string literals, and return the collection.
+fn build_stripped_file_cache() -> Vec<StrippedFile> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !is_in_ignored_directory(e.path()))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path().to_path_buf();
+        if path.file_name().is_some_and(|f| f == "build.rs") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let stripped_bytes = strip_comments_and_strings_for_content(&content);
+        let stripped = String::from_utf8_lossy(&stripped_bytes).to_string();
+        files.push(StrippedFile { path, stripped });
+    }
+    files
+}
+
+/// Try to extract a public item name from a single (stripped) source line.
+///
+/// Matches: `pub fn name`, `pub struct Name`, `pub enum Name`, `pub type Name`,
+///          `pub unsafe fn name`, `pub async fn name`, `pub const fn name`.
+/// Skips:   `pub(crate) ...`, `pub(super) ...`, `pub(in ...) ...`.
+fn extract_pub_item_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    // Skip restricted visibility — the compiler already warns about those.
+    if trimmed.starts_with("pub(") {
+        return None;
+    }
+    let after_pub = trimmed.strip_prefix("pub ")?;
+    // Strip optional qualifiers that can appear between `pub` and the keyword.
+    let rest = after_pub
+        .strip_prefix("unsafe ")
+        .or_else(|| after_pub.strip_prefix("async "))
+        .or_else(|| after_pub.strip_prefix("const "))
+        .unwrap_or(after_pub);
+    // Must start with a defining keyword.
+    let after_kw = rest
+        .strip_prefix("fn ")
+        .or_else(|| rest.strip_prefix("struct "))
+        .or_else(|| rest.strip_prefix("enum "))
+        .or_else(|| rest.strip_prefix("type "))?;
+    // Extract the identifier (alphanumeric + _).
+    let end = after_kw
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(after_kw.len());
+    let name = &after_kw[..end];
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Scan every `.rs` file for `pub` items whose name appears exactly once across the
+/// entire codebase (comment/string-stripped).  A count of 1 means the name exists
+/// only at its definition — nothing else references it.
+fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut allviolations = Vec::new();
+
+    // Common trait method names and very short identifiers that would produce
+    // false positives because they collide with unrelated identifiers.
+    let skip_names: HashSet<&str> = [
+        // Trait methods
+        "new", "default", "from", "into", "fmt", "clone", "drop",
+        "eq", "ne", "cmp", "partial_cmp", "hash",
+        "deref", "deref_mut", "index", "index_mut",
+        "next", "size_hint", "try_from", "try_into",
+        "serialize", "deserialize", "matched", "main",
+        // Too short / too common
+        "run", "get", "set", "add", "len",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    // Phase 1: extract all pub item definitions.
+    struct PubItem {
+        name: String,
+        file: String,
+        line: usize,
+    }
+    let mut pub_items: Vec<PubItem> = Vec::new();
+
+    for sf in cache {
+        for (line_idx, line) in sf.stripped.lines().enumerate() {
+            if let Some(name) = extract_pub_item_name(line) {
+                if name.len() >= 4 && !skip_names.contains(name) {
+                    pub_items.push(PubItem {
+                        name: name.to_string(),
+                        file: sf.path.to_string_lossy().to_string(),
+                        line: line_idx + 1,
+                    });
+                }
+            }
+        }
+    }
+
+    // Phase 2: for each pub item, count word-boundary references across ALL files.
+    for item in &pub_items {
+        let mut total_count: usize = 0;
+        for sf in cache {
+            total_count += countvariable_occurrences(&sf.stripped, &item.name);
+        }
+        if total_count <= 1 {
+            allviolations.push(format!(
+                "\n\u{274c} ERROR: Dead public item '{}' at {}:{}\n\
+                 \u{26a0}\u{fe0f} This item is `pub` but never referenced anywhere in the codebase.\n\
+                 Remove it, or reduce visibility to pub(crate) if used only internally.",
+                item.name, item.file, item.line
+            ));
+        }
+    }
+
+    allviolations
 }
