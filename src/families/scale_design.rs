@@ -1,8 +1,9 @@
-use crate::faer_ndarray::FaerArrayView;
+use crate::faer_ndarray::{FaerArrayView, fast_av};
 use faer::prelude::SolveLstsq;
 use ndarray::{Array1, Array2, ArrayView1, s};
 
 const COLUMN_TOL: f64 = 1e-12;
+const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ScaleDeviationTransform {
@@ -71,30 +72,43 @@ pub fn build_scale_deviation_transform(
     if first_active < p_noise {
         let n = primary_design.nrows();
         let active_cols = p_noise - first_active;
+        let sqrtw = weights.mapv(f64::sqrt);
         let mut wx = Array2::<f64>::zeros((n, p_primary));
-        let mut wy = Array2::<f64>::zeros((n, active_cols));
         for i in 0..n {
-            let sw = weights[i].sqrt();
+            let sw = sqrtw[i];
             for j in 0..p_primary {
                 wx[[i, j]] = sw * primary_design[[i, j]];
-            }
-            for j in 0..active_cols {
-                wy[[i, j]] = sw * noise_design[[i, first_active + j]];
             }
         }
         let wx_faer = FaerArrayView::new(&wx);
         let qr = wx_faer.as_ref().col_piv_qr();
-        let mut rhs = wy;
-        let mut rhs_mat = crate::faer_ndarray::array2_to_matmut(&mut rhs);
-        qr.solve_lstsq_in_place(rhs_mat.as_mut());
-        projection_coef
-            .slice_mut(s![.., first_active..])
-            .assign(&rhs.slice(s![..p_primary, ..]));
+        let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES
+            / (n.max(1) * std::mem::size_of::<f64>()))
+        .max(1)
+        .min(active_cols);
+        let mut rhs = Array2::<f64>::zeros((n, chunk_cols));
+        for chunk_start in (0..active_cols).step_by(chunk_cols) {
+            let width = (active_cols - chunk_start).min(chunk_cols);
+            rhs.fill(0.0);
+            for i in 0..n {
+                let sw = sqrtw[i];
+                for j in 0..width {
+                    rhs[[i, j]] = sw * noise_design[[i, first_active + chunk_start + j]];
+                }
+            }
+            let mut rhs_mat = crate::faer_ndarray::array2_to_matmut(&mut rhs);
+            qr.solve_lstsq_in_place(rhs_mat.as_mut());
+            projection_coef
+                .slice_mut(s![
+                    ..,
+                    first_active + chunk_start..first_active + chunk_start + width
+                ])
+                .assign(&rhs.slice(s![..p_primary, ..width]));
+        }
     }
     for j in first_active..p_noise {
-        let col = noise_design.column(j).to_owned();
-        let proj = projection_coef.column(j).to_owned();
-        let fitted = crate::faer_ndarray::fast_av(primary_design, &proj);
+        let col = noise_design.column(j);
+        let fitted = fast_av(primary_design, &projection_coef.column(j));
         let mut residual = &col - &fitted;
         let center = weighted_mean(residual.view(), weights)?;
         residual.mapv_inplace(|v| v - center);
@@ -109,7 +123,6 @@ pub fn build_scale_deviation_transform(
         } else {
             1.0
         };
-        projection_coef.column_mut(j).assign(&proj);
         weighted_column_mean[j] = center;
         rescale[j] = scale;
     }
@@ -135,10 +148,10 @@ pub fn apply_scale_deviation_transform(
         return Err("scale deviation apply column mismatch".to_string());
     }
     let mut out = rawnoise_design.clone();
-    let projected = crate::faer_ndarray::fast_ab(primary_design, &transform.projection_coef);
     for j in transform.non_intercept_start.min(out.ncols())..out.ncols() {
+        let projected = fast_av(primary_design, &transform.projection_coef.column(j));
         for i in 0..out.nrows() {
-            out[[i, j]] = (out[[i, j]] - projected[[i, j]] - transform.weighted_column_mean[j])
+            out[[i, j]] = (out[[i, j]] - projected[i] - transform.weighted_column_mean[j])
                 * transform.rescale[j];
         }
     }

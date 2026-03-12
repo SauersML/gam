@@ -3,6 +3,8 @@
 #![deny(unused_variables)]
 #![deny(unused_imports)]
 
+mod estimate_shared;
+
 pub mod families;
 pub mod inference;
 pub mod linalg;

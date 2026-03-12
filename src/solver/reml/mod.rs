@@ -1200,7 +1200,7 @@ trait PenalizedGeometry {
 
 #[derive(Clone)]
 pub(crate) struct HyperDesignDerivative {
-    dense: Array2<f64>,
+    dense: Option<Array2<f64>>,
     embedded: Option<(Array2<f64>, Range<usize>, usize)>,
 }
 
@@ -1210,24 +1210,149 @@ impl HyperDesignDerivative {
         global_range: Range<usize>,
         total_cols: usize,
     ) -> Self {
-        let mut dense = Array2::<f64>::zeros((local.nrows(), total_cols));
-        dense.slice_mut(s![.., global_range.clone()]).assign(&local);
         Self {
-            dense,
+            dense: None,
             embedded: Some((local, global_range, total_cols)),
         }
     }
 
     pub(crate) fn nrows(&self) -> usize {
-        self.dense.nrows()
+        self.embedded.as_ref().map_or_else(
+            || self.dense.as_ref().map_or(0, Array2::nrows),
+            |(local, _, _)| local.nrows(),
+        )
     }
 
     pub(crate) fn ncols(&self) -> usize {
-        self.dense.ncols()
+        self.embedded.as_ref().map_or_else(
+            || self.dense.as_ref().map_or(0, Array2::ncols),
+            |(_, _, total_cols)| *total_cols,
+        )
     }
 
     pub(crate) fn materialize(&self) -> Array2<f64> {
-        self.dense.clone()
+        if let Some(dense) = self.dense.as_ref() {
+            return dense.clone();
+        }
+        let (local, global_range, total_cols) = self
+            .embedded
+            .as_ref()
+            .expect("HyperDesignDerivative must be dense or embedded");
+        let mut dense = Array2::<f64>::zeros((local.nrows(), *total_cols));
+        dense.slice_mut(s![.., global_range.clone()]).assign(local);
+        dense
+    }
+
+    pub(crate) fn any_nonzero(&self) -> bool {
+        if let Some((local, _, _)) = self.embedded.as_ref() {
+            local.iter().any(|v| *v != 0.0)
+        } else {
+            self.dense
+                .as_ref()
+                .is_some_and(|dense| dense.iter().any(|v| *v != 0.0))
+        }
+    }
+
+    pub(crate) fn t_dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
+            let mut out = Array1::<f64>::zeros(*total_cols);
+            out.slice_mut(s![global_range.clone()])
+                .assign(&local.t().dot(rhs));
+            out
+        } else {
+            self.dense
+                .as_ref()
+                .expect("dense HyperDesignDerivative missing matrix")
+                .t()
+                .dot(rhs)
+        }
+    }
+
+    pub(crate) fn dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        if let Some((local, global_range, _)) = self.embedded.as_ref() {
+            local.dot(&rhs.slice(s![global_range.clone(), ..]))
+        } else {
+            self.dense
+                .as_ref()
+                .expect("dense HyperDesignDerivative missing matrix")
+                .dot(rhs)
+        }
+    }
+
+    pub(crate) fn t_dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
+            let mut out = Array2::<f64>::zeros((*total_cols, rhs.ncols()));
+            out.slice_mut(s![global_range.clone(), ..])
+                .assign(&local.t().dot(rhs));
+            out
+        } else {
+            self.dense
+                .as_ref()
+                .expect("dense HyperDesignDerivative missing matrix")
+                .t()
+                .dot(rhs)
+        }
+    }
+
+    pub(crate) fn transpose_row_block(&self, rows: Range<usize>) -> Array2<f64> {
+        if let Some((local, global_range, total_cols)) = self.embedded.as_ref() {
+            let start = rows.start.min(local.nrows());
+            let end = rows.end.min(local.nrows());
+            let block_cols = end.saturating_sub(start);
+            let mut out = Array2::<f64>::zeros((*total_cols, block_cols));
+            if block_cols > 0 {
+                out.slice_mut(s![global_range.clone(), ..])
+                    .assign(&local.slice(s![start..end, ..]).t());
+            }
+            out
+        } else {
+            self.dense
+                .as_ref()
+                .expect("dense HyperDesignDerivative missing matrix")
+                .slice(s![rows, ..])
+                .t()
+                .to_owned()
+        }
+    }
+
+    pub(crate) fn scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        match self.embedded.as_ref() {
+            None => {
+                let dense = self
+                    .dense
+                    .as_ref()
+                    .expect("dense HyperDesignDerivative missing matrix");
+                if target.raw_dim() != dense.raw_dim() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense hyper design derivative shape mismatch: target={}x{}, matrix={}x{}",
+                        target.nrows(),
+                        target.ncols(),
+                        dense.nrows(),
+                        dense.ncols()
+                    )));
+                }
+                target.scaled_add(amp, dense);
+            }
+            Some((local, global_range, total_cols)) => {
+                if target.nrows() != local.nrows() || target.ncols() != *total_cols {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded hyper design derivative shape mismatch: target={}x{}, expected {}x{}",
+                        target.nrows(),
+                        target.ncols(),
+                        local.nrows(),
+                        total_cols
+                    )));
+                }
+                target
+                    .slice_mut(s![.., global_range.clone()])
+                    .scaled_add(amp, local);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn transformed(
@@ -1249,10 +1374,14 @@ impl HyperDesignDerivative {
                 .with_optional_factor(free_basis_opt)
                 .materialize())
         } else {
-            Ok(crate::matrix::DenseRightProductView::new(&self.dense)
-                .with_factor(qs)
-                .with_optional_factor(free_basis_opt)
-                .materialize())
+            Ok(crate::matrix::DenseRightProductView::new(
+                self.dense
+                    .as_ref()
+                    .expect("dense HyperDesignDerivative missing matrix"),
+            )
+            .with_factor(qs)
+            .with_optional_factor(free_basis_opt)
+            .materialize())
         }
     }
 
@@ -1260,7 +1389,10 @@ impl HyperDesignDerivative {
         if let Some((local, global_range, _)) = self.embedded.as_ref() {
             local.dot(&rhs.slice(s![global_range.clone()]))
         } else {
-            self.dense.dot(rhs)
+            self.dense
+                .as_ref()
+                .expect("dense HyperDesignDerivative missing matrix")
+                .dot(rhs)
         }
     }
 }
@@ -1268,23 +1400,15 @@ impl HyperDesignDerivative {
 impl From<Array2<f64>> for HyperDesignDerivative {
     fn from(value: Array2<f64>) -> Self {
         Self {
-            dense: value,
+            dense: Some(value),
             embedded: None,
         }
     }
 }
 
-impl std::ops::Deref for HyperDesignDerivative {
-    type Target = Array2<f64>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.dense
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct HyperPenaltyDerivative {
-    dense: Array2<f64>,
+    dense: Option<Array2<f64>>,
     embedded: Option<(Array2<f64>, Range<usize>, usize)>,
 }
 
@@ -1294,18 +1418,17 @@ impl HyperPenaltyDerivative {
         global_range: Range<usize>,
         total_dim: usize,
     ) -> Self {
-        let mut dense = Array2::<f64>::zeros((total_dim, total_dim));
-        dense
-            .slice_mut(s![global_range.clone(), global_range.clone()])
-            .assign(&local);
         Self {
-            dense,
+            dense: None,
             embedded: Some((local, global_range, total_dim)),
         }
     }
 
     pub(crate) fn nrows(&self) -> usize {
-        self.dense.nrows()
+        self.embedded.as_ref().map_or_else(
+            || self.dense.as_ref().map_or(0, Array2::nrows),
+            |(_, _, total_dim)| *total_dim,
+        )
     }
 
     pub(crate) fn ncols(&self) -> usize {
@@ -1313,7 +1436,25 @@ impl HyperPenaltyDerivative {
     }
 
     pub(crate) fn materialize(&self) -> Array2<f64> {
-        self.dense.clone()
+        if let Some(dense) = self.dense.as_ref() {
+            return dense.clone();
+        }
+        let (local, global_range, total_dim) = self
+            .embedded
+            .as_ref()
+            .expect("HyperPenaltyDerivative must be dense or embedded");
+        let mut dense = Array2::<f64>::zeros((*total_dim, *total_dim));
+        dense
+            .slice_mut(s![global_range.clone(), global_range.clone()])
+            .assign(local);
+        dense
+    }
+
+    pub(crate) fn scaled_materialize(&self, amp: f64) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.nrows(), self.ncols()));
+        self.scaled_add_to(&mut out, amp)
+            .expect("scaled materialize uses matching target shape");
+        out
     }
 
     pub(crate) fn transformed(
@@ -1336,7 +1477,11 @@ impl HyperPenaltyDerivative {
             }
             Ok(transformed)
         } else {
-            let mut transformed = qs.t().dot(&self.dense).dot(qs);
+            let dense = self
+                .dense
+                .as_ref()
+                .expect("dense HyperPenaltyDerivative missing matrix");
+            let mut transformed = qs.t().dot(dense).dot(qs);
             if let Some(z) = free_basis_opt {
                 transformed = z.t().dot(&transformed).dot(z);
             }
@@ -1351,16 +1496,20 @@ impl HyperPenaltyDerivative {
     ) -> Result<(), EstimationError> {
         match self.embedded.as_ref() {
             None => {
-                if target.raw_dim() != self.dense.raw_dim() {
+                let dense = self
+                    .dense
+                    .as_ref()
+                    .expect("dense HyperPenaltyDerivative missing matrix");
+                if target.raw_dim() != dense.raw_dim() {
                     return Err(EstimationError::InvalidInput(format!(
                         "dense hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
                         target.nrows(),
                         target.ncols(),
-                        self.dense.nrows(),
-                        self.dense.ncols()
+                        dense.nrows(),
+                        dense.ncols()
                     )));
                 }
-                target.scaled_add(amp, &self.dense);
+                target.scaled_add(amp, dense);
             }
             Some((local, global_range, total_dim)) => {
                 if target.nrows() != *total_dim || target.ncols() != *total_dim {
@@ -1384,17 +1533,9 @@ impl HyperPenaltyDerivative {
 impl From<Array2<f64>> for HyperPenaltyDerivative {
     fn from(value: Array2<f64>) -> Self {
         Self {
-            dense: value,
+            dense: Some(value),
             embedded: None,
         }
-    }
-}
-
-impl std::ops::Deref for HyperPenaltyDerivative {
-    type Target = Array2<f64>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.dense
     }
 }
 

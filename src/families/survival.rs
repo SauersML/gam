@@ -1,7 +1,6 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::linalg::utils::{default_slq_parameters, stochastic_lanczos_logdet_spd};
-use crate::matrix::FactorizedSystem;
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
 use faer::Side;
@@ -11,6 +10,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 use thiserror::Error;
+
+const SURVIVAL_TRACE_SOLVE_TARGET_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum SurvivalError {
@@ -1340,6 +1341,7 @@ impl WorkingModelSurvival {
         let mut te = vec![0.0_f64; p];
         let mut ts = vec![0.0_f64; p];
         let mut tsd = vec![0.0_f64; p];
+        let mut rhs_block = Array2::<f64>::zeros((p, 1));
 
         let jac = Array1::<f64>::ones(p);
         let curvature = Array1::<f64>::zeros(p);
@@ -1398,9 +1400,13 @@ impl WorkingModelSurvival {
             // Exact trace(H^{-1} A_k) without assembling the full dense inverse.
             // Since A_k is block-supported, solve only those block columns.
             let block_width = end - start;
-            let mut rhs_block = Array2::<f64>::zeros((p, block_width));
+            if rhs_block.ncols() != block_width {
+                rhs_block = Array2::<f64>::zeros((p, block_width.max(1)));
+            } else {
+                rhs_block.fill(0.0);
+            }
             rhs_block
-                .slice_mut(ndarray::s![start..end, ..])
+                .slice_mut(ndarray::s![start..end, ..block_width])
                 .assign(&block.matrix.mapv(|v| lambda * v));
             let solved_block = solve_mat(&rhs_block);
             let mut trace_hinv_ak = 0.0;
@@ -1505,10 +1511,22 @@ impl WorkingModelSurvival {
                 }
             }
 
-            let solved_b_dir = solve_mat(&b_dir);
             let mut tracethird = 0.0;
-            for j in 0..p {
-                tracethird += solved_b_dir[[j, j]];
+            let trace_chunk_cols = (SURVIVAL_TRACE_SOLVE_TARGET_BYTES
+                / (p.max(1) * std::mem::size_of::<f64>()))
+            .max(1)
+            .min(p);
+            let mut rhs_trace = Array2::<f64>::zeros((p, trace_chunk_cols));
+            for chunk_start in (0..p).step_by(trace_chunk_cols) {
+                let width = (p - chunk_start).min(trace_chunk_cols);
+                rhs_trace.fill(0.0);
+                rhs_trace
+                    .slice_mut(ndarray::s![.., ..width])
+                    .assign(&b_dir.slice(ndarray::s![.., chunk_start..chunk_start + width]));
+                let solved_chunk = solve_mat(&rhs_trace);
+                for j in 0..width {
+                    tracethird += solved_chunk[[chunk_start + j, j]];
+                }
             }
             let t_k = trace_hinv_ak + tracethird;
 

@@ -873,6 +873,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 choice.link,
                 geometry,
                 config,
+                args.out.is_some(),
             )
             .map_err(|e| {
                 emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);

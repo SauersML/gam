@@ -1118,6 +1118,11 @@ impl FaerCholeskyFactor {
         rhs
     }
 
+    pub fn solve_mat_in_place(&self, rhs: &mut Array2<f64>) {
+        let mut rhsview = array2_to_matmut(rhs);
+        self.factor.solve_in_place(rhsview.as_mut());
+    }
+
     pub fn solve_mat_into<S: Data<Elem = f64>>(
         &self,
         rhs: &ArrayBase<S, Ix2>,
@@ -1127,8 +1132,7 @@ impl FaerCholeskyFactor {
             *out = Array2::<f64>::zeros(rhs.dim());
         }
         out.assign(rhs);
-        let mut rhsview = array2_to_matmut(out);
-        self.factor.solve_in_place(rhsview.as_mut());
+        self.solve_mat_in_place(out);
     }
 
     pub fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {

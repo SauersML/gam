@@ -43,38 +43,60 @@ impl<'a> JointHyperThetaBlocks<'a> {
 }
 
 impl<'a> RemlState<'a> {
+    fn append_penalty_component(
+        out: &mut Vec<(usize, Array2<f64>)>,
+        p: usize,
+        penalty_index: usize,
+        matrix: &HyperPenaltyDerivative,
+        scale: f64,
+    ) -> Result<(), EstimationError> {
+        if matrix.nrows() != p || matrix.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "penalty derivative component shape mismatch: expected {}x{}, got {}x{}",
+                p,
+                p,
+                matrix.nrows(),
+                matrix.ncols()
+            )));
+        }
+        if let Some((_, existing)) = out
+            .iter_mut()
+            .find(|(existing_index, _)| *existing_index == penalty_index)
+        {
+            matrix.scaled_add_to(existing, scale)?;
+        } else {
+            let mut assembled = Array2::<f64>::zeros((p, p));
+            matrix.scaled_add_to(&mut assembled, scale)?;
+            out.push((penalty_index, assembled));
+        }
+        Ok(())
+    }
+
     fn sum_penalty_components(
         p: usize,
         base: &[PenaltyDerivativeComponent],
         extra: Option<&[PenaltyDerivativeComponent]>,
         scale: f64,
     ) -> Result<Vec<(usize, Array2<f64>)>, EstimationError> {
-        let mut out: Vec<(usize, Array2<f64>)> = base
-            .iter()
-            .map(|component| (component.penalty_index, component.matrix.materialize()))
-            .collect();
+        let mut out: Vec<(usize, Array2<f64>)> = Vec::with_capacity(base.len());
+        for component in base {
+            Self::append_penalty_component(
+                &mut out,
+                p,
+                component.penalty_index,
+                &component.matrix,
+                1.0,
+            )?;
+        }
         if let Some(extra_components) = extra {
             for component in extra_components {
-                if component.matrix.nrows() != p || component.matrix.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "penalty derivative component shape mismatch: expected {}x{}, got {}x{}",
-                        p,
-                        p,
-                        component.matrix.nrows(),
-                        component.matrix.ncols()
-                    )));
-                }
-                if let Some((_, existing)) = out
-                    .iter_mut()
-                    .find(|(penalty_index, _)| *penalty_index == component.penalty_index)
-                {
-                    existing.scaled_add(scale, &component.matrix.materialize());
-                } else {
-                    out.push((
-                        component.penalty_index,
-                        component.matrix.materialize().mapv(|v| scale * v),
-                    ));
-                }
+                Self::append_penalty_component(
+                    &mut out,
+                    p,
+                    component.penalty_index,
+                    &component.matrix,
+                    scale,
+                )?;
             }
         }
         Ok(out)
@@ -89,11 +111,16 @@ impl<'a> RemlState<'a> {
         let mut out = Vec::with_capacity(psi_dim);
         for j in 0..psi_dim {
             let mut x_j = hyper_dirs[j].x_tau_dense();
-            let mut s_j = hyper_dirs[j]
-                .penalty_first_components()
-                .iter()
-                .map(|component| (component.penalty_index, component.matrix.materialize()))
-                .collect::<Vec<_>>();
+            let mut s_j = Vec::with_capacity(hyper_dirs[j].penalty_first_components().len());
+            for component in hyper_dirs[j].penalty_first_components() {
+                Self::append_penalty_component(
+                    &mut s_j,
+                    p,
+                    component.penalty_index,
+                    &component.matrix,
+                    1.0,
+                )?;
+            }
             for i in 0..psi_dim {
                 let amp = psi[i];
                 if amp == 0.0 {
@@ -157,7 +184,9 @@ impl<'a> RemlState<'a> {
                     s_mod.len()
                 )));
             }
-            s_mod[component.penalty_index].scaled_add(amp, &component.matrix);
+            component
+                .matrix
+                .scaled_add_to(&mut s_mod[component.penalty_index], amp)?;
         }
         Ok(())
     }
@@ -325,7 +354,7 @@ impl<'a> RemlState<'a> {
             if psi[j] == 0.0 {
                 return false;
             }
-            if dir.x_tau_original.iter().any(|v| *v != 0.0) {
+            if dir.x_tau_original.any_nonzero() {
                 return true;
             }
             if let Some(x2) = dir.x_tau_tau_original.as_ref() {
@@ -351,7 +380,8 @@ impl<'a> RemlState<'a> {
                 continue;
             }
             if let Some(x_mod) = x_mod_dense.as_ref()
-                && dir.x_tau_original.raw_dim() != x_mod.raw_dim()
+                && (dir.x_tau_original.nrows() != x_mod.nrows()
+                    || dir.x_tau_original.ncols() != x_mod.ncols())
             {
                 return Err(EstimationError::InvalidInput(format!(
                     "joint perturbation X_tau shape mismatch: expected {}x{}, got {}x{}",
@@ -367,7 +397,7 @@ impl<'a> RemlState<'a> {
                 "joint perturbation S_tau",
             )?;
             if let Some(x_mod) = x_mod_dense.as_mut() {
-                x_mod.scaled_add(amp, &dir.x_tau_original);
+                dir.x_tau_original.scaled_add_to(x_mod, amp)?;
             }
             Self::add_penalty_components_to_state(&mut s_mod, dir.penalty_first_components(), amp)?;
         }
@@ -599,9 +629,20 @@ impl<'a> RemlState<'a> {
             .x_transformed
             .try_to_dense_arc("exact tau directional calculus requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
-        let x_eval = DenseRightProductView::new(x_eval_dense.as_ref())
-            .with_optional_factor(free_basis_opt.as_ref())
-            .materialize();
+        let x_eval_owned;
+        let x_eval = if let Some(z) = free_basis_opt.as_ref() {
+            x_eval_owned = Some(
+                DenseRightProductView::new(x_eval_dense.as_ref())
+                    .with_factor(z)
+                    .materialize(),
+            );
+            x_eval_owned
+                .as_ref()
+                .expect("owned constrained design")
+        } else {
+            x_eval_owned = None;
+            x_eval_dense.as_ref()
+        };
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let x_tau_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
@@ -635,7 +676,9 @@ impl<'a> RemlState<'a> {
                         rho.len()
                     )));
                 }
-                acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                component
+                    .matrix
+                    .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
                 Ok(acc)
             },
         )?;
@@ -899,7 +942,7 @@ impl<'a> RemlState<'a> {
             let a_k_tau = penalty_first_components_t
                 .iter()
                 .find(|component| component.penalty_index == k)
-                .map(|component| component.matrix.mapv(|v| lambdas[k] * v))
+                .map(|component| component.matrix.scaled_materialize(lambdas[k]))
                 .unwrap_or_else(|| Array2::<f64>::zeros((p_dim, p_dim)));
             // B_{k,τ} solve:
             //   H B_{k,τ} = -(H_τ B_k + A_k β_τ + A_{k,τ} β).
@@ -990,9 +1033,20 @@ impl<'a> RemlState<'a> {
             .x_transformed
             .try_to_dense_arc("exact tau/tau calculus requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
-        let x_eval = DenseRightProductView::new(x_eval_dense.as_ref())
-            .with_optional_factor(free_basis_opt.as_ref())
-            .materialize();
+        let x_eval_owned;
+        let x_eval = if let Some(z) = free_basis_opt.as_ref() {
+            x_eval_owned = Some(
+                DenseRightProductView::new(x_eval_dense.as_ref())
+                    .with_factor(z)
+                    .materialize(),
+            );
+            x_eval_owned
+                .as_ref()
+                .expect("owned constrained design")
+        } else {
+            x_eval_owned = None;
+            x_eval_dense.as_ref()
+        };
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         if let Some(z) = free_basis_opt.as_ref() {
@@ -1172,7 +1226,10 @@ impl<'a> RemlState<'a> {
                 components.iter().fold(
                     Array2::<f64>::zeros((p_dim, p_dim)),
                     |mut acc, component| {
-                        acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                        component
+                            .matrix
+                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())
+                            .expect("valid transformed penalty component");
                         acc
                     },
                 )
@@ -1194,7 +1251,10 @@ impl<'a> RemlState<'a> {
                 let total = transformed.iter().fold(
                     Array2::<f64>::zeros((p_dim, p_dim)),
                     |mut acc, component| {
-                        acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                        component
+                            .matrix
+                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())
+                            .expect("valid transformed penalty component");
                         acc
                     },
                 );
@@ -1616,7 +1676,9 @@ impl<'a> RemlState<'a> {
                         rho.len()
                     )));
                 }
-                acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                component
+                    .matrix
+                    .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
                 Ok(acc)
             },
         )?;

@@ -1845,8 +1845,9 @@ fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
     let chol = sym
         .cholesky(Side::Lower)
         .map_err(|_| "strict pseudo-laplace SPD inverse failed".to_string())?;
-    let ident = Array2::<f64>::eye(matrix.nrows());
-    Ok(chol.solve_mat(&ident))
+    let mut ident = Array2::<f64>::eye(matrix.nrows());
+    chol.solve_mat_in_place(&mut ident);
+    Ok(ident)
 }
 
 fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {

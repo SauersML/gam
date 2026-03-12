@@ -293,6 +293,15 @@ impl<'a> RemlState<'a> {
         op.exact_tau_kernel(x_tau, beta, include_hphi_tau_kernel)
     }
 
+    pub(super) fn firth_exact_tau_kernel_compact(
+        op: &FirthDenseOperator,
+        x_tau: &HyperDesignDerivative,
+        beta: &Array1<f64>,
+        include_hphi_tau_kernel: bool,
+    ) -> FirthTauExactKernel {
+        op.exact_tau_kernel_compact(x_tau, beta, include_hphi_tau_kernel)
+    }
+
     pub(super) fn firth_hphi_tau_partial_prepare(
         op: &FirthDenseOperator,
         x_tau: &Array2<f64>,
@@ -318,6 +327,16 @@ impl<'a> RemlState<'a> {
         rhs: &Array2<f64>,
     ) -> Array2<f64> {
         op.hphi_trace_apply_combined(dir, x_tau, tau_kernel, rhs)
+    }
+
+    pub(super) fn firth_hphi_trace_apply_combined_compact(
+        op: &FirthDenseOperator,
+        dir: &FirthDirection,
+        x_tau: &HyperDesignDerivative,
+        tau_kernel: Option<&FirthTauPartialKernel>,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        op.hphi_trace_apply_combined_compact(dir, x_tau, tau_kernel, rhs)
     }
 }
 
@@ -821,9 +840,9 @@ impl FirthDenseOperator {
         Self::rowwise_dot(&am, b)
     }
 
-    pub(crate) fn dot_i_and_h(
+    fn dot_i_and_h_from_reduced(
         &self,
-        x_tau: &Array2<f64>,
+        x_tau_reduced: &Array2<f64>,
         deta: &Array1<f64>,
     ) -> (Array2<f64>, Array1<f64>) {
         // Reduced Fisher directional derivative under fixed identifiable basis:
@@ -845,11 +864,9 @@ impl FirthDenseOperator {
         // We return:
         //   dot_i  = I_{r,tau}|beta,
         //   dot_h  = h_tau|beta.
-        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
-
         let dw = &self.w1 * deta;
-        let dot_i = RemlState::weighted_cross(&x_tau_reduced, &self.x_reduced, &self.w)
-            + RemlState::weighted_cross(&self.x_reduced, &x_tau_reduced, &self.w)
+        let dot_i = RemlState::weighted_cross(x_tau_reduced, &self.x_reduced, &self.w)
+            + RemlState::weighted_cross(&self.x_reduced, x_tau_reduced, &self.w)
             + crate::faer_ndarray::fast_xt_diag_x(&self.x_reduced, &dw);
 
         let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
@@ -858,6 +875,15 @@ impl FirthDenseOperator {
         let dot_h_implicit = Self::rowwise_dot(&self.x_reduced.dot(&dot_k), &self.x_reduced);
         let dot_h = dot_h_explicit + dot_h_implicit;
         (dot_i, dot_h)
+    }
+
+    pub(crate) fn dot_i_and_h(
+        &self,
+        x_tau: &Array2<f64>,
+        deta: &Array1<f64>,
+    ) -> (Array2<f64>, Array1<f64>) {
+        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
+        self.dot_i_and_h_from_reduced(&x_tau_reduced, deta)
     }
 
     pub(crate) fn exact_tau_kernel(
@@ -885,7 +911,8 @@ impl FirthDenseOperator {
         //
         // These are the literal trace/hat closed forms for Phi_tau and Phi_beta,tau.
         let deta_partial = x_tau.dot(beta);
-        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h(x_tau, &deta_partial);
+        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
+        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
 
         let first = 0.5 * x_tau.t().dot(&(&self.w1 * &self.h_diag));
         let secondvec =
@@ -896,7 +923,7 @@ impl FirthDenseOperator {
 
         let tau_kernel = if include_hphi_tau_kernel {
             Some(self.hphi_tau_partial_prepare_from_partials(
-                x_tau,
+                x_tau_reduced,
                 &deta_partial,
                 dot_h_partial,
                 dot_i_partial,
@@ -911,15 +938,53 @@ impl FirthDenseOperator {
         }
     }
 
+    pub(crate) fn exact_tau_kernel_compact(
+        &self,
+        x_tau: &HyperDesignDerivative,
+        beta: &Array1<f64>,
+        include_hphi_tau_kernel: bool,
+    ) -> FirthTauExactKernel {
+        let deta_partial = x_tau.dot(beta);
+        let x_tau_reduced = x_tau.dot_mat(&self.q_basis);
+        let (dot_i_partial, dot_h_partial) =
+            self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
+
+        let first = 0.5 * x_tau.t_dot(&(&self.w1 * &self.h_diag));
+        let secondvec =
+            &(&(&self.w2 * &deta_partial) * &self.h_diag) + &(&self.w1 * &dot_h_partial);
+        let second = 0.5 * self.x_dense.t().dot(&secondvec);
+        let gphi_tau = first + second;
+        let phi_tau_partial = 0.5 * RemlState::trace_product(&self.k_reduced, &dot_i_partial);
+
+        let tau_kernel = if include_hphi_tau_kernel {
+            Some(self.hphi_tau_partial_prepare_from_partials(
+                x_tau_reduced,
+                &deta_partial,
+                dot_h_partial,
+                dot_i_partial,
+            ))
+        } else {
+            None
+        };
+
+        FirthTauExactKernel {
+            gphi_tau,
+            phi_tau_partial,
+            tau_kernel,
+        }
+    }
+
     pub(crate) fn hphi_tau_partial_prepare(
         &self,
         x_tau: &Array2<f64>,
         beta: &Array1<f64>,
     ) -> FirthTauPartialKernel {
         let deta_partial = x_tau.dot(beta);
-        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h(x_tau, &deta_partial);
+        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
+        let (dot_i_partial, dot_h_partial) =
+            self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
         self.hphi_tau_partial_prepare_from_partials(
-            x_tau,
+            x_tau_reduced,
             &deta_partial,
             dot_h_partial,
             dot_i_partial,
@@ -928,14 +993,13 @@ impl FirthDenseOperator {
 
     fn hphi_tau_partial_prepare_from_partials(
         &self,
-        x_tau: &Array2<f64>,
+        x_tau_reduced: Array2<f64>,
         deta_partial: &Array1<f64>,
         dot_h_partial: Array1<f64>,
         dot_i_partial: Array2<f64>,
     ) -> FirthTauPartialKernel {
         let dotw1 = &self.w2 * deta_partial;
         let dotw2 = &self.w3 * deta_partial;
-        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
         let dot_k = -self.k_reduced.dot(&dot_i_partial).dot(&self.k_reduced);
         FirthTauPartialKernel {
             dotw1,
@@ -1114,6 +1178,70 @@ impl FirthDenseOperator {
                 - &(&m_qv_kernel * &kernel.dotw1.view().insert_axis(Axis(1))
                     + &m_qv_tau * &self.w1.view().insert_axis(Axis(1)));
             out += &(0.5 * (x_tau.t().dot(&rv) + self.x_dense.t().dot(&rv_tau)));
+        }
+        out
+    }
+
+    pub(crate) fn hphi_trace_apply_combined_compact(
+        &self,
+        dir: &FirthDirection,
+        x_tau: &HyperDesignDerivative,
+        tau_kernel: Option<&FirthTauPartialKernel>,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        let p = self.x_dense.ncols();
+        if rhs.nrows() != p {
+            return Array2::<f64>::zeros((p, rhs.ncols()));
+        }
+        if rhs.ncols() == 0 || p == 0 {
+            return Array2::<f64>::zeros((p, rhs.ncols()));
+        }
+
+        let etav = self.x_dense.dot(rhs);
+        let qv = &etav * &self.w1.view().insert_axis(Axis(1));
+
+        let m_qv = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &qv,
+        );
+        let buvec = &self.w2 * &dir.deta;
+        let m_buv = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &(&etav * &buvec.view().insert_axis(Axis(1))),
+        );
+        let p_u_qv = self.apply_p_u_to_matrix(&dir.a_u_reduced, &qv);
+        let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
+        let diag_term = self
+            .x_dense
+            .t()
+            .dot(&(&etav * &c_u.view().insert_axis(Axis(1))));
+        let term1 = self.left_scaled_xt(&buvec, &m_qv);
+        let term2 = self.left_scaled_xt(&self.w1, &m_buv);
+        let term3 = self.left_scaled_xt(&self.w1, &p_u_qv);
+        let mut out = 0.5 * (diag_term - (term1 + term2 + term3));
+
+        if let Some(kernel) = tau_kernel {
+            let etav_tau = x_tau.dot_mat(rhs);
+            let qv_tau = &etav * &kernel.dotw1.view().insert_axis(Axis(1))
+                + &etav_tau * &self.w1.view().insert_axis(Axis(1));
+            let m_qv_kernel = self.apply_pbar_to_matrix(&qv);
+            let m_qv_tau =
+                self.apply_mtau_to_matrix(kernel, &qv) + self.apply_pbar_to_matrix(&qv_tau);
+            let rv = &(&etav * &self.w2.view().insert_axis(Axis(1)))
+                * &self.h_diag.view().insert_axis(Axis(1))
+                - &(&m_qv_kernel * &self.w1.view().insert_axis(Axis(1)));
+            let rv_tau = (&(&etav * &kernel.dotw2.view().insert_axis(Axis(1)))
+                + &(&etav_tau * &self.w2.view().insert_axis(Axis(1))))
+                * &self.h_diag.view().insert_axis(Axis(1))
+                + &(&etav * &self.w2.view().insert_axis(Axis(1)))
+                    * &kernel.dot_h_partial.view().insert_axis(Axis(1))
+                - &(&m_qv_kernel * &kernel.dotw1.view().insert_axis(Axis(1))
+                    + &m_qv_tau * &self.w1.view().insert_axis(Axis(1)));
+            out += &(0.5 * (x_tau.t_dot_mat(&rv) + self.x_dense.t().dot(&rv_tau)));
         }
         out
     }
