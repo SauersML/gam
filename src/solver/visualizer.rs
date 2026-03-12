@@ -610,7 +610,8 @@ impl VisualizerSession {
         !matches!(self.state, VisualizerState::Disabled)
     }
 
-    pub fn is_interactive(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_interactive(&self) -> bool {
         matches!(self.state, VisualizerState::Interactive(_))
     }
 

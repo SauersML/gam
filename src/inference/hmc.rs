@@ -1770,7 +1770,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 /// * `is_logit` - True for logistic regression, false for Gaussian
 /// * `firth_bias_reduction` - Whether Firth bias reduction was used in training
 /// * `config` - NUTS configuration
-pub fn run_nuts_sampling(
+pub(crate) fn run_nuts_sampling(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
     weights: ArrayView1<f64>,

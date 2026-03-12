@@ -11,13 +11,12 @@ use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
-    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec,
-    MixtureLinkState, RidgePassport, RidgePolicy, SasLinkSpec, SasLinkState,
+    GlmLikelihoodFamily, InverseLink, LinkFunction,
+    MixtureLinkState, RidgePassport, RidgePolicy, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -427,7 +426,7 @@ pub trait WorkingModel {
 
 /// Uncertainty inputs for integrated (GHQ) IRLS updates.
 #[derive(Clone, Copy)]
-pub struct IntegratedWorkingInput<'a> {
+pub(crate) struct IntegratedWorkingInput<'a> {
     pub quadctx: &'a crate::quadrature::QuadratureContext,
     pub se: ArrayView1<'a, f64>,
 }
@@ -454,7 +453,7 @@ struct WorkingBernoulliGeometry {
 /// This keeps the update/deviance math in one place so engine-level likelihoods
 /// and higher-level wrappers (custom family, GAMLSS warm starts) can share a
 /// consistent implementation.
-pub trait WorkingLikelihood {
+pub(crate) trait WorkingLikelihood {
     fn irls_update(
         &self,
         y: ArrayView1<f64>,
@@ -470,20 +469,6 @@ pub trait WorkingLikelihood {
     fn loglik_deviance(
         &self,
         y: ArrayView1<f64>,
-        mu: &Array1<f64>,
-        priorweights: ArrayView1<f64>,
-    ) -> Result<f64, EstimationError>;
-
-    /// Weighted log-likelihood used by blockwise/custom-family wrappers.
-    ///
-    /// Conventions:
-    /// - Binomial families return the full Bernoulli log-likelihood.
-    /// - Gaussian identity returns the quadratic term `-0.5 * sum w*(y-mu)^2`
-    ///   (constant terms omitted, consistent with optimization use).
-    fn log_likelihood(
-        &self,
-        y: ArrayView1<f64>,
-        eta: &Array1<f64>,
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
@@ -577,42 +562,6 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
             self.link_function(),
             priorweights,
         ))
-    }
-
-    fn log_likelihood(
-        &self,
-        y: ArrayView1<f64>,
-        _: &Array1<f64>,
-        mu: &Array1<f64>,
-        priorweights: ArrayView1<f64>,
-    ) -> Result<f64, EstimationError> {
-        match self {
-            GlmLikelihoodFamily::GaussianIdentity => {
-                let ll = ndarray::Zip::from(y).and(mu).and(priorweights).fold(
-                    0.0,
-                    |acc, &yi, &mui, &wi| {
-                        let r = yi - mui;
-                        acc - 0.5 * wi * r * r
-                    },
-                );
-                Ok(ll)
-            }
-            GlmLikelihoodFamily::BinomialLogit
-            | GlmLikelihoodFamily::BinomialProbit
-            | GlmLikelihoodFamily::BinomialCLogLog
-            | GlmLikelihoodFamily::BinomialSas
-            | GlmLikelihoodFamily::BinomialBetaLogistic
-            | GlmLikelihoodFamily::BinomialMixture => {
-                let ll = ndarray::Zip::from(y).and(mu).and(priorweights).fold(
-                    0.0,
-                    |acc, &yi, &mui, &wi| {
-                        let p = mui;
-                        acc + wi * (yi * p.ln() + (1.0 - yi) * (1.0 - p).ln())
-                    },
-                );
-                Ok(ll)
-            }
-        }
     }
 }
 
@@ -4526,16 +4475,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 }
 
 #[derive(Clone)]
-pub struct RunPirlsOptions {
-    pub family: LikelihoodFamily,
-    pub mixture_linkspec: Option<MixtureLinkSpec>,
-    pub sas_linkspec: Option<SasLinkSpec>,
-    pub max_iter: usize,
-    pub tol: f64,
-    pub firth_bias_reduction: bool,
-}
-
-#[derive(Clone)]
 pub struct PirlsConfig {
     pub link_kind: InverseLink,
     pub max_iterations: usize,
@@ -4548,113 +4487,6 @@ impl PirlsConfig {
     pub fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
-}
-
-fn resolve_pirls_family(
-    family: LikelihoodFamily,
-    firth_bias_reduction: bool,
-) -> Result<(LinkFunction, bool), EstimationError> {
-    match family {
-        LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
-        LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, firth_bias_reduction)),
-        LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
-        LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
-        LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
-        LikelihoodFamily::BinomialBetaLogistic => Ok((LinkFunction::BetaLogistic, false)),
-        LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
-        LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-            "run_pirls does not support PoissonLog; use fit_poisson_log".to_string(),
-        )),
-        LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-            "run_pirls does not support GammaLog; use fit_gamma_log".to_string(),
-        )),
-        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-            "run_pirls does not support RoystonParmar; use survival-specific working models"
-                .to_string(),
-        )),
-    }
-}
-
-/// Engine-facing PIRLS entrypoint with the canonical layout contract.
-pub fn run_pirls<'a>(
-    rho: LogSmoothingParamsView<'_>,
-    x: ArrayView2<'a, f64>,
-    offset: ArrayView1<f64>,
-    y: ArrayView1<'a, f64>,
-    priorweights: ArrayView1<'a, f64>,
-    rs_original: &[Array2<f64>],
-    balanced_penalty_root: Option<&Array2<f64>>,
-    reparam_invariant: Option<&crate::construction::ReparamInvariant>,
-    p: usize,
-    k: usize,
-    opts: &RunPirlsOptions,
-    warm_start_beta: Option<&Coefficients>,
-    coefficient_lower_bounds: Option<&Array1<f64>>,
-    linear_constraints_original: Option<&LinearInequalityConstraints>,
-    covariate_se: Option<&Array1<f64>>,
-) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    let (link, firth_active) = resolve_pirls_family(opts.family, opts.firth_bias_reduction)?;
-    let mixture_link_state = match &opts.mixture_linkspec {
-        Some(spec) => Some(state_fromspec(spec).map_err(|e| {
-            EstimationError::InvalidInput(format!("invalid mixture link spec: {e}"))
-        })?),
-        None => None,
-    };
-    let sas_link_state = match opts.sas_linkspec {
-        Some(spec) => Some(if matches!(link, LinkFunction::BetaLogistic) {
-            state_from_beta_logisticspec(spec).map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid Beta-Logistic link spec: {e}"))
-            })?
-        } else {
-            state_from_sasspec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link spec: {e}")))?
-        }),
-        None => None,
-    };
-    if k != rs_original.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "run_pirls: k={} does not match number of penalty roots {}",
-            k,
-            rs_original.len()
-        )));
-    }
-    let link_kind = if let Some(state) = mixture_link_state {
-        InverseLink::Mixture(state)
-    } else if let Some(state) = sas_link_state {
-        if matches!(link, LinkFunction::BetaLogistic) {
-            InverseLink::BetaLogistic(state)
-        } else {
-            InverseLink::Sas(state)
-        }
-    } else {
-        InverseLink::Standard(link)
-    };
-    let cfg = PirlsConfig {
-        link_kind,
-        max_iterations: opts.max_iter,
-        convergence_tolerance: opts.tol,
-        firth_bias_reduction: firth_active,
-    };
-    fit_model_for_fixed_rho(
-        rho,
-        PirlsProblem {
-            x,
-            offset,
-            y,
-            priorweights,
-            covariate_se: covariate_se.map(|se| se.view()),
-        },
-        PenaltyConfig {
-            rs_original,
-            balanced_penalty_root,
-            reparam_invariant,
-            p,
-            coefficient_lower_bounds,
-            linear_constraints_original,
-        },
-        &cfg,
-        warm_start_beta,
-    )
 }
 
 fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
@@ -4795,72 +4627,6 @@ fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
         .ok()
         .map(DesignMatrix::from)
-}
-
-/// Insert zero rows into a vector at locations specified by `drop_indices`.
-/// This is a direct translation of `undroprows` from mgcv's C code:
-///
-/// ```c
-/// void undroprows(double *X, int r, int c, int *drop, int n_drop) {
-///   double *Xs;
-///   int i,j,k;
-///   if (n_drop <= 0) return;
-///   Xs = X + (r-n_drop)*c - 1; /* position of the end of input X */
-///   X += r*c - 1;              /* end of final X */
-///   for (j=c-1;j>=0;j--) { /* back through columns */
-///     for (i=r-1;i>drop[n_drop-1];i--,X--,Xs--) *X = *Xs;
-///     *x = 0.0; x--;
-///     for (k=n_drop-1;k>0;k--) {
-///       for (i=drop[k]-1;i>drop[k-1];i--,X--,Xs--) *X = *Xs;
-///       *x = 0.0; x--;
-///     }
-///     for (i=drop[0]-1;i>=0;i--,X--,Xs--) *X = *Xs;
-///   }
-/// }
-/// ```
-///
-/// Parameters:
-/// * `src`: Source vector without the dropped rows (length = total - n_drop)
-/// * `droppedrows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
-/// * `dst`: Destination vector where zeros will be inserted (length = total)
-pub fn undroprows(src: &Array1<f64>, droppedrows: &[usize], dst: &mut Array1<f64>) {
-    let n_drop = droppedrows.len();
-
-    if n_drop == 0 {
-        // If no rows to drop, just copy src to dst
-        if src.len() == dst.len() {
-            dst.assign(src);
-        }
-        return;
-    }
-
-    // Validate that the dimensions are compatible
-    assert_eq!(
-        src.len() + n_drop,
-        dst.len(),
-        "Source length + dropped rows must equal destination length"
-    );
-
-    // Ensure droppedrows is in ascending order
-    for i in 1..n_drop {
-        assert!(
-            droppedrows[i] > droppedrows[i - 1],
-            "droppedrows must be in ascending order"
-        );
-    }
-
-    // O(n + n_drop) two-pointer pass.
-    dst.fill(0.0);
-    let mut src_idx = 0usize;
-    let mut drop_ptr = 0usize;
-    for dst_idx in 0..dst.len() {
-        if drop_ptr < n_drop && droppedrows[drop_ptr] == dst_idx {
-            drop_ptr += 1;
-            continue;
-        }
-        dst[dst_idx] = src[src_idx];
-        src_idx += 1;
-    }
 }
 
 #[inline]
@@ -6606,10 +6372,6 @@ mod root_cause_tests {
             noise_floor
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Deviance monotonicity tests
-    // -----------------------------------------------------------------------
 
     /// Helper: assert that the penalized deviance trace is non-increasing
     /// across P-IRLS iterations, allowing a small tolerance for floating-point

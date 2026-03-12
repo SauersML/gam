@@ -163,7 +163,7 @@ impl LikelihoodFamily {
     }
 
     #[inline]
-    pub fn is_binomial(self) -> bool {
+    pub(crate) fn is_binomial(self) -> bool {
         matches!(
             self,
             Self::BinomialLogit

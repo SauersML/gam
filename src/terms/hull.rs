@@ -24,7 +24,7 @@ pub struct PeeledHull {
 
 impl PeeledHull {
     /// Projects points in place onto the hull if needed. Returns the count of projected points.
-    pub fn project_in_place(&self, mut points: ArrayViewMut2<'_, f64>) -> usize {
+    pub(crate) fn project_in_place(&self, mut points: ArrayViewMut2<'_, f64>) -> usize {
         if points.nrows() == 0 {
             return 0;
         }

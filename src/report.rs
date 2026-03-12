@@ -72,7 +72,7 @@ pub struct SmoothPlotData {
 }
 
 /// Write the report HTML to the output path, returning the path written.
-pub fn write_report(
+pub(crate) fn write_report(
     input: &ReportInput,
     out: Option<&Path>,
     model_path: &Path,

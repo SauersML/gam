@@ -1058,7 +1058,7 @@ where
 /// adapter builds a symmetric finite-difference Hessian from exact gradients.
 /// That keeps the outer solver on the same `opt` path instead of maintaining a
 /// duplicate fallback optimizer API locally.
-pub fn optimize_log_smoothingwithmultistartwithgradient_andhessian<F>(
+pub(crate) fn optimize_log_smoothingwithmultistartwithgradient_andhessian<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     mut objectivewithgradienthessian: F,

@@ -394,7 +394,7 @@ impl SymmetricMatrix {
         }
     }
 
-    pub fn add_dense(&self, other: &Array2<f64>) -> Result<Self, String> {
+    pub(crate) fn add_dense(&self, other: &Array2<f64>) -> Result<Self, String> {
         if self.nrows() != other.nrows() || self.ncols() != other.ncols() {
             return Err(format!(
                 "SymmetricMatrix::add_dense shape mismatch: lhs {}x{}, rhs {}x{}",

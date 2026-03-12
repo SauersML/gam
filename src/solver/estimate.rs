@@ -3082,7 +3082,8 @@ pub fn compute_continuous_smoothness_order(
     }
 }
 
-pub fn try_compute_continuous_smoothness_order(
+#[cfg(test)]
+pub(crate) fn try_compute_continuous_smoothness_order(
     lambda_tilde: &[f64],
     normalization_scale: &[f64],
     eps: f64,

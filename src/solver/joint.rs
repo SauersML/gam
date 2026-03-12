@@ -1267,7 +1267,7 @@ pub fn fit_joint_model_engine<'a>(
 
 /// State for REML optimization of the joint model
 /// Wraps JointModelState and provides outer objective derivatives over ρ.
-pub struct JointCore<'a> {
+pub(crate) struct JointCore<'a> {
     state: JointModelState<'a>,
     config: JointModelConfig,
     base_reparam_invariant: Option<ReparamInvariant>,
