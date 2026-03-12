@@ -1258,8 +1258,7 @@ impl HyperDesignDerivative {
 
     pub(crate) fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         if let Some((local, global_range, _)) = self.embedded.as_ref() {
-            let rhs_local = rhs.slice(s![global_range.clone()]).to_owned();
-            local.dot(&rhs_local)
+            local.dot(&rhs.slice(s![global_range.clone()]))
         } else {
             self.dense.dot(rhs)
         }

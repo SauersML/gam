@@ -9,6 +9,10 @@ concurrency:
   group: biobank-scale-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   prepare:
     runs-on: ubuntu-latest

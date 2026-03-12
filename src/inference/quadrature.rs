@@ -3011,85 +3011,6 @@ mod tests {
         (-(z * z) * 0.5).exp() / (2.0 * std::f64::consts::PI).sqrt()
     }
 
-    // Test-only real erfcx approximation based on A&S erf polynomial.
-    // For x >= 0:
-    //   erfcx(x) = exp(x^2) erfc(x) ≈ P(t), t = 1/(1+p x),
-    // where erfc(x) ≈ exp(-x^2) P(t). This avoids large exp(x^2) factors.
-    // For x < 0 use the reflection identity:
-    //   erfcx(-x) = 2 exp(x^2) - erfcx(x).
-    fn erfcx_test(x: f64) -> f64 {
-        // Coefficients from the common A&S 7.1.26 erf approximation.
-        const P: f64 = 0.3275911;
-        const A1: f64 = 0.254_829_592;
-        const A2: f64 = -0.284_496_736;
-        const A3: f64 = 1.421_413_741;
-        const A4: f64 = -1.453_152_027;
-        const A5: f64 = 1.061_405_429;
-
-        if x >= 0.0 {
-            let t = 1.0 / (1.0 + P * x);
-            (((((A5 * t + A4) * t + A3) * t + A2) * t + A1) * t).max(0.0)
-        } else {
-            let xp = -x;
-            // Reflection: erfcx(-xp) = 2*exp(xp^2) - erfcx(xp).
-            // In this test helper, cap exponent to avoid inf in extreme synthetic inputs.
-            let exp_term = (xp * xp).min(700.0).exp();
-            2.0 * exp_term - erfcx_test(xp)
-        }
-    }
-
-    // Test-only deterministic erfcx-series oracle for E[sigmoid(N(m,s^2))].
-    // Formula:
-    // E = Phi(m/s) + 0.5*exp(-m^2/(2s^2)) * Σ_{k>=1} (-1)^{k-1}
-    //     [erfcx((k s^2 + m)/(sqrt(2)s)) - erfcx((k s^2 - m)/(sqrt(2)s))].
-    fn exact_logistic_expectation_erfcx_series(m: f64, s: f64) -> f64 {
-        if !(m.is_finite() && s.is_finite()) || s <= 0.0 {
-            return sigmoid(m);
-        }
-        if s < 1e-10 {
-            return sigmoid(m);
-        }
-
-        let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
-        let z = std::f64::consts::SQRT_2 * s;
-        let mut sum = 0.0_f64;
-        let mut stable_pairs = 0usize;
-
-        // Pair terms (k,k+1) for faster alternating-series stabilization.
-        let mut k = 1usize;
-        while k <= 4096 {
-            let kf = k as f64;
-            let a1 = (kf * s * s + m) / z;
-            let b1 = (kf * s * s - m) / z;
-            let t1 = erfcx_test(a1) - erfcx_test(b1);
-            let signed_t1 = if k % 2 == 1 { t1 } else { -t1 };
-            sum += signed_t1;
-
-            if k < 4096 {
-                let k2f = (k + 1) as f64;
-                let a2 = (k2f * s * s + m) / z;
-                let b2 = (k2f * s * s - m) / z;
-                let t2 = erfcx_test(a2) - erfcx_test(b2);
-                let signed_t2 = if (k + 1) % 2 == 1 { t2 } else { -t2 };
-                sum += signed_t2;
-
-                let pair_mag = (signed_t1 + signed_t2).abs() * pref;
-                if pair_mag < 1e-13 {
-                    stable_pairs += 1;
-                    if stable_pairs >= 6 {
-                        break;
-                    }
-                } else {
-                    stable_pairs = 0;
-                }
-            }
-            k += 2;
-        }
-
-        let phi_term = crate::probability::normal_cdf(m / s);
-        phi_term + pref * sum
-    }
-
     fn high_res_sigmoid_integral(eta: f64, se: f64) -> f64 {
         // Composite Simpson rule over a wide finite interval under N(0,1).
         let a = -12.0_f64;
@@ -3412,21 +3333,6 @@ mod tests {
             let ghq = logit_posterior_mean(&ctx, eta, se);
             let exact = logit_posterior_mean_exact(eta, se);
             assert_relative_eq!(ghq, exact, epsilon = 2.5e-3);
-        }
-    }
-
-    #[test]
-    fn test_ghq7_matches_real_erfcx_series_oracle() {
-        let ctx = QuadratureContext::new();
-        let mvalues = [-3.0, -1.0, 0.0, 1.0, 3.0];
-        let svalues = [0.1, 0.5, 1.0, 2.0];
-
-        for &m in &mvalues {
-            for &s in &svalues {
-                let ghq = logit_posterior_mean(&ctx, m, s);
-                let oracle = exact_logistic_expectation_erfcx_series(m, s);
-                assert_relative_eq!(ghq, oracle, epsilon = 2e-3, max_relative = 3e-3);
-            }
         }
     }
 

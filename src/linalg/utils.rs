@@ -5,7 +5,7 @@ use crate::faer_ndarray::{
     factorize_symmetricwith_fallback,
 };
 use faer::Side;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
@@ -180,6 +180,89 @@ pub(crate) fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
         .map(f64::abs)
         .fold(0.0, f64::max)
         .max(1.0)
+}
+
+pub(crate) fn row_mismatch_message(
+    y_len: usize,
+    w_len: usize,
+    x_rows: usize,
+    offset_len: usize,
+) -> Option<String> {
+    if y_len == w_len && y_len == x_rows && y_len == offset_len {
+        None
+    } else {
+        Some(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y_len, w_len, x_rows, offset_len
+        ))
+    }
+}
+
+pub(crate) fn predict_gam_dimension_mismatch_message(
+    x_rows: usize,
+    x_cols: usize,
+    beta_len: usize,
+    offset_len: usize,
+) -> Option<String> {
+    if x_cols != beta_len {
+        return Some(format!(
+            "predict_gam dimension mismatch: X has {} columns but beta has length {}",
+            x_cols, beta_len
+        ));
+    }
+    if x_rows != offset_len {
+        return Some(format!(
+            "predict_gam dimension mismatch: X has {} rows but offset has length {}",
+            x_rows, offset_len
+        ));
+    }
+    None
+}
+
+pub(crate) fn add_relative_diag_ridge(matrix: &mut Array2<f64>, scale: f64, floor: f64) -> f64 {
+    let ridge = scale
+        * matrix
+            .diag()
+            .iter()
+            .map(|&value| value.abs())
+            .fold(0.0, f64::max)
+            .max(floor);
+    for idx in 0..matrix.nrows() {
+        matrix[[idx, idx]] += ridge;
+    }
+    ridge
+}
+
+pub(crate) fn boundary_hit_indices(
+    values: ArrayView1<'_, f64>,
+    bound: f64,
+    tolerance: f64,
+) -> (Vec<usize>, Vec<usize>) {
+    let at_lower = values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| (value <= -bound + tolerance).then_some(idx))
+        .collect();
+    let at_upper = values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| (value >= bound - tolerance).then_some(idx))
+        .collect();
+    (at_lower, at_upper)
+}
+
+pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
+    matrix
+        .eigh(Side::Lower)
+        .ok()
+        .map(|(evals, _)| {
+            let min = evals.iter().fold(f64::INFINITY, |acc, &value| acc.min(value));
+            let max = evals
+                .iter()
+                .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
+            max / min.max(1e-12)
+        })
+        .unwrap_or(f64::NAN)
 }
 
 /// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.

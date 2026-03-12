@@ -27,7 +27,9 @@ use crate::construction::{
     stable_reparameterizationwith_invariant_engine,
 };
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
+use crate::faer_ndarray::{
+    FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv, fast_atv_into, fast_xt_diag_x, fast_xt_diag_y,
+};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
@@ -822,15 +824,17 @@ impl<'a> JointModelState<'a> {
     /// For the analytic gradient to be exact, the cost function must include
     /// the same δ||β||² term. Otherwise, ∇_β V(β̂) ≠ 0 and the Envelope
     /// Theorem fails, introducing gradient error proportional to δ*||β||.
-    fn solveweighted_ls(
-        x: &Array2<f64>,
+    fn solveweighted_ls<S>(
+        x: &ndarray::ArrayBase<S, ndarray::Ix2>,
         z: &Array1<f64>,
         w: &Array1<f64>,
         penalty: &Array2<f64>,
         lambda: f64,
-    ) -> (Array1<f64>, f64) {
+    ) -> (Array1<f64>, f64)
+    where
+        S: ndarray::Data<Elem = f64>,
+    {
         use crate::faer_ndarray::FaerCholesky;
-        use crate::faer_ndarray::{fast_ata, fast_atv};
         use faer::Side;
 
         let p = x.ncols();
@@ -839,15 +843,7 @@ impl<'a> JointModelState<'a> {
             return (Array1::zeros(0), 0.0);
         }
 
-        // Compute X'WX via weighted design
-        let mut xweighted = x.clone();
-        let mut zweighted = z.clone();
-        let sqrtw = w.mapv(|wi| wi.max(0.0).sqrt());
-        ndarray::Zip::from(xweighted.rows_mut())
-            .and(sqrtw.view())
-            .for_each(|mut row, wi| row *= *wi);
-        zweighted *= &sqrtw;
-        let mut xwx = fast_ata(&xweighted);
+        let mut xwx = fast_xt_diag_x(x, w);
 
         // Add penalty: X'WX + λS (only if penalty matches dimensions)
         if penalty.nrows() == p && penalty.ncols() == p {
@@ -859,8 +855,10 @@ impl<'a> JointModelState<'a> {
         // to satisfy the Envelope Theorem (see docstring).
         let ridge_used = ensure_positive_definite_joint(&mut xwx);
 
-        // Compute X'Wz via weighted design
-        let xwz = fast_atv(&xweighted, &zweighted);
+        let mut wz = z.clone();
+        wz *= w;
+        let mut xwz = Array1::<f64>::zeros(p);
+        fast_atv_into(x, &wz, &mut xwz);
 
         // Solve (X'WX + λS + δI)β = X'Wz using Cholesky
         let coeffs = match xwx.cholesky(Side::Lower) {
@@ -921,7 +919,9 @@ impl<'a> JointModelState<'a> {
             }
         })?;
         let half_log_det = chol.diag().mapv(f64::ln).sum();
-        let solvedweighted_t = chol.solve_mat(&joint_design.t().to_owned());
+        let joint_design_t = joint_design.view().reversed_axes();
+        let mut solvedweighted_t = Array2::<f64>::zeros(joint_design_t.raw_dim());
+        chol.solve_mat_into(&joint_design_t, &mut solvedweighted_t);
 
         let mut hat_diag = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -1086,7 +1086,7 @@ impl<'a> JointModelState<'a> {
         // Solve PWLS: (X'W_eff X + S + δI)β = X'W_eff z_eff
         // Track ridge δ to include 0.5*δ||β||² in cost (Envelope Theorem).
         let (new_beta, ridge_base) =
-            Self::solveweighted_ls(&self.x_base.to_owned(), &z_eff, &w_eff, &penalty, 1.0);
+            Self::solveweighted_ls(&self.x_base, &z_eff, &w_eff, &penalty, 1.0);
         self.ridge_base_used = ridge_base;
         // Accumulate ridge (take max of base and link ridges for joint system)
         self.ridge_used = self.ridge_used.max(ridge_base);
@@ -1854,12 +1854,7 @@ impl<'a> JointRemlState<'a> {
         for i in 0..n {
             w_eff[i] = weights[i] * g_prime[i] * g_prime[i];
         }
-        let mut xweighted = state.x_base.to_owned();
-        let sqrtw_eff = w_eff.mapv(f64::sqrt);
-        ndarray::Zip::from(xweighted.rows_mut())
-            .and(sqrtw_eff.view())
-            .for_each(|mut row, wi| row *= *wi);
-        let mut a_mat = crate::faer_ndarray::fast_ata(&xweighted);
+        let mut a_mat = fast_xt_diag_x(&state.x_base, &w_eff);
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
             if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
@@ -1867,19 +1862,10 @@ impl<'a> JointRemlState<'a> {
             }
         }
 
-        let mut wb = bwiggle.clone();
         let wg = weights * g_prime;
-        ndarray::Zip::from(wb.rows_mut())
-            .and(wg.view())
-            .for_each(|mut row, wi| row *= *wi);
-        let c_mat = crate::faer_ndarray::fast_atb(&state.x_base, &wb);
+        let c_mat = fast_xt_diag_y(&state.x_base, &wg, bwiggle);
 
-        let mut bweighted = bwiggle.clone();
-        let sqrtw = weights.mapv(f64::sqrt);
-        ndarray::Zip::from(bweighted.rows_mut())
-            .and(sqrtw.view())
-            .for_each(|mut row, wi| row *= *wi);
-        let mut d_mat = crate::faer_ndarray::fast_ata(&bweighted);
+        let mut d_mat = fast_xt_diag_x(bwiggle, weights);
         let link_penalty = state.build_link_penalty();
         if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
             d_mat.scaled_add(lambda_link, &link_penalty);
@@ -2198,10 +2184,6 @@ impl<'a> JointRemlState<'a> {
             }
         }
 
-        let mut kw = k_mat.clone();
-        ndarray::Zip::from(kw.columns_mut())
-            .and(weights.view())
-            .for_each(|mut col, w| col *= *w);
         let mut diag_proj = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mut acc = 0.0;
@@ -2235,6 +2217,9 @@ impl<'a> JointRemlState<'a> {
                 p_link.max(1) as f64,
             ),
         ];
+        ndarray::Zip::from(k_mat.columns_mut())
+            .and(weights.view())
+            .for_each(|mut col, w| col *= *w);
 
         // Precompute H†_{theta,theta} for penalty sensitivity trace using pseudo-inverse
         let mut h_inv_theta = Array2::<f64>::zeros((p_link, p_link));
@@ -2673,7 +2658,7 @@ impl<'a> JointRemlState<'a> {
             for i in 0..n {
                 let mut acc = 0.0;
                 for j in 0..p_total {
-                    acc += kw[[j, i]] * dot_j[[i, j]];
+                    acc += k_mat[[j, i]] * dot_j[[i, j]];
                 }
                 trace_k += acc;
                 trace += diag_proj[i] * w_dot[i];
@@ -2841,22 +2826,6 @@ impl<'a> JointRemlState<'a> {
             }
             Err(err) => Err(err),
         }
-    }
-
-    #[cfg(test)]
-    pub fn compute_gradient_analytic_for_test(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Result<(Array1<f64>, bool), EstimationError> {
-        self.compute_gradient_analytic(rho)
-    }
-
-    #[cfg(test)]
-    pub fn compute_gradient_fd_for_test(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        self.compute_gradient_fd(rho)
     }
 
     /// Combined cost and gradient for outer optimization
@@ -3820,8 +3789,8 @@ mod tests {
                 }
 
                 let rho = Array1::from_vec(vec![0.0, 5.0]);
-                match reml_state.compute_gradient_analytic_for_test(&rho) {
-                    Ok((ga, audit_needed)) => match reml_state.compute_gradient_fd_for_test(&rho) {
+                match reml_state.compute_gradient_analytic(&rho) {
+                    Ok((ga, audit_needed)) => match reml_state.compute_gradient_fd(&rho) {
                         Ok(gf) => return Ok(Some((ga, gf, audit_needed))),
                         Err(err) => {
                             last_err = Some(err.to_string());
@@ -3926,7 +3895,7 @@ mod tests {
 
         let rho = Array1::from_vec(vec![0.0, 4.0]);
         let (grad, audit) = reml_state
-            .compute_gradient_analytic_for_test(&rho)
+            .compute_gradient_analytic(&rho)
             .expect("integrated logit analytic gradient");
         let _ = audit;
         assert!(grad.iter().all(|v| v.is_finite()));

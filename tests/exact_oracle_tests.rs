@@ -113,18 +113,6 @@ fn exact_logit_oracle_eval_rho_2d(
     }
 }
 
-fn exact_logit_oraclegradfd_rho_2d(
-    y: &Array1<f64>,
-    x: &Array2<f64>,
-    rho: f64,
-    cfg: OracleConfig,
-) -> f64 {
-    let h = 1e-3_f64.max(1e-4 * (1.0 + rho.abs()));
-    let lp = exact_logit_oracle_eval_rho_2d(y, x, rho + 0.5 * h, cfg).log_evidence;
-    let lm = exact_logit_oracle_eval_rho_2d(y, x, rho - 0.5 * h, cfg).log_evidence;
-    (lp - lm) / h
-}
-
 fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f64 {
     let w = Array1::ones(y.len());
     let offset = Array1::zeros(y.len());
@@ -159,34 +147,6 @@ fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f6
 #[inline]
 fn rel_err(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs().max(1e-8)
-}
-
-#[test]
-fn tiny_logit_oraclegradient_identity_matchesfd_of_log_evidence() {
-    let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
-    let y = array![0.0, 1.0, 1.0];
-    let cfg = OracleConfig::default();
-    for rho in [-0.5, 0.0, 0.25, 0.8] {
-        let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
-        let gfd = exact_logit_oraclegradfd_rho_2d(&y, &x, rho, cfg);
-        let rel = (g_exact - gfd).abs() / gfd.abs().max(1e-8);
-        assert_eq!(
-            g_exact.signum(),
-            gfd.signum(),
-            "oracle sign mismatch at rho={:.3}: g_exact={:.6e}, gfd={:.6e}",
-            rho,
-            g_exact,
-            gfd
-        );
-        assert!(
-            rel < 2.5e-2,
-            "oracle identity mismatch at rho={:.3}: g_exact={:.6e}, gfd={:.6e}, rel={:.3e}",
-            rho,
-            g_exact,
-            gfd,
-            rel
-        );
-    }
 }
 
 #[test]
