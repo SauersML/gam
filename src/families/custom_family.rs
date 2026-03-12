@@ -10,7 +10,7 @@ use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 use opt::{
     Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
@@ -1781,14 +1781,71 @@ fn trace_product_block(a: &Array2<f64>, b_block: &Array2<f64>, start: usize, end
 }
 
 fn leverage_quadratic_forms(x: &DesignMatrix, h_inv: &Array2<f64>) -> Array1<f64> {
-    let x_dense_arc = x.to_dense_arc();
-    let x_dense = x_dense_arc.as_ref();
-    let x_hinv = x_dense.dot(h_inv);
-    let mut out = Array1::<f64>::zeros(x_dense.nrows());
-    for i in 0..x_dense.nrows() {
-        out[i] = x_hinv.row(i).dot(&x_dense.row(i));
+    let n = x.nrows();
+    let p = x.ncols();
+    match x {
+        DesignMatrix::Dense(x_dense) => {
+            // Dense path: form X H^{-1} (n×p) then row-wise dot with X.
+            // Process in chunks to bound peak memory for very large n.
+            let chunk_rows = (256 * 1024 * 1024 / (p * 8)).max(1024).min(n);
+            let mut out = Array1::<f64>::zeros(n);
+            for start in (0..n).step_by(chunk_rows) {
+                let end = (start + chunk_rows).min(n);
+                let x_chunk = x_dense.slice(s![start..end, ..]);
+                let xh_chunk = x_chunk.dot(h_inv);
+                for i in 0..xh_chunk.nrows() {
+                    out[start + i] = xh_chunk.row(i).dot(&x_chunk.row(i));
+                }
+            }
+            out
+        }
+        DesignMatrix::Sparse(sp) => {
+            // Sparse path: scatter sparse rows into dense chunk, BLAS matmul,
+            // then row-wise dot. Avoids full n×p dense materialization.
+            let chunk_rows = (256 * 1024 * 1024 / (p * 8)).max(1024).min(n);
+            let mut out = Array1::<f64>::zeros(n);
+            if let Some(csr) = sp.to_csr_arc() {
+                let sym = csr.symbolic();
+                let row_ptrs = sym.row_ptr();
+                let col_indices = sym.col_idx();
+                let values = csr.val();
+                let mut x_chunk = Array2::<f64>::zeros((chunk_rows, p));
+                for start in (0..n).step_by(chunk_rows) {
+                    let end = (start + chunk_rows).min(n);
+                    let rows = end - start;
+                    let mut chunk_view = x_chunk.slice_mut(s![0..rows, ..]);
+                    chunk_view.fill(0.0);
+                    for i in 0..rows {
+                        let rs = row_ptrs[start + i];
+                        let re = row_ptrs[start + i + 1];
+                        for idx in rs..re {
+                            chunk_view[[i, col_indices[idx]]] = values[idx];
+                        }
+                    }
+                    let xh_chunk = chunk_view.dot(h_inv);
+                    for i in 0..rows {
+                        out[start + i] = xh_chunk.row(i).dot(&chunk_view.row(i));
+                    }
+                }
+            } else {
+                // Fallback: no CSR available, use dense with chunking.
+                let x_dense_arc = sp
+                    .try_to_dense_arc("leverage_quadratic_forms sparse fallback")
+                    .unwrap_or_else(|_| std::sync::Arc::new(Array2::zeros((n, p))));
+                let x_dense = x_dense_arc.as_ref();
+                let chunk_rows_fb = (256 * 1024 * 1024 / (p * 8)).max(1024).min(n);
+                for start in (0..n).step_by(chunk_rows_fb) {
+                    let end = (start + chunk_rows_fb).min(n);
+                    let x_chunk = x_dense.slice(s![start..end, ..]);
+                    let xh_chunk = x_chunk.dot(h_inv);
+                    for i in 0..xh_chunk.nrows() {
+                        out[start + i] = xh_chunk.row(i).dot(&x_chunk.row(i));
+                    }
+                }
+            }
+            out
+        }
     }
-    out
 }
 
 fn inverse_spdwith_retry(
