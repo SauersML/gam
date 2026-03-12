@@ -1286,17 +1286,22 @@ impl<'a> GamWorkingModel<'a> {
     fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                let xtwx = Self::compute_xtwx_blas(&mut self.workspace, x_transformed, weights)?;
-                Ok(xtwx + &self.s_transformed)
+                let mut h = Self::compute_xtwx_blas(&mut self.workspace, x_transformed, weights)?;
+                h += &self.s_transformed;
+                Ok(h)
             }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
                 let xtwx = Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
                 let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);
-                Ok(fast_ab(&tmp, qs) + &self.s_transformed)
+                let mut h = fast_ab(&tmp, qs);
+                h += &self.s_transformed;
+                Ok(h)
             }
             WorkingCoordinateDesign::OriginalSparseNative => {
-                let xtwx = Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
-                Ok(xtwx + &self.s_transformed)
+                let mut h =
+                    Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
+                h += &self.s_transformed;
+                Ok(h)
             }
         }
     }
@@ -4971,20 +4976,15 @@ fn write_identityworking_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
-    let n = eta.len();
-    for i in 0..n {
-        mu[i] = eta[i];
-        weights[i] = priorweights[i];
-        z[i] = y[i];
-    }
+    mu.assign(eta);
+    weights.assign(&priorweights);
+    z.assign(&y);
     if let Some(derivs) = derivatives {
-        for i in 0..n {
-            derivs.c[i] = 0.0;
-            derivs.d[i] = 0.0;
-            derivs.dmu_deta[i] = 1.0;
-            derivs.d2mu_deta2[i] = 0.0;
-            derivs.d3mu_deta3[i] = 0.0;
-        }
+        derivs.c.fill(0.0);
+        derivs.d.fill(0.0);
+        derivs.dmu_deta.fill(1.0);
+        derivs.d2mu_deta2.fill(0.0);
+        derivs.d3mu_deta3.fill(0.0);
     }
 }
 

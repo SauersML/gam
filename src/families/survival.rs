@@ -252,9 +252,11 @@ impl SurvivalDesign {
     fn p_total(&self) -> usize {
         match self {
             Self::Flat { x_exit, .. } => x_exit.ncols(),
-            Self::TimeCovariateShared { time_exit, covariates, .. } => {
-                time_exit.ncols() + covariates.ncols()
-            }
+            Self::TimeCovariateShared {
+                time_exit,
+                covariates,
+                ..
+            } => time_exit.ncols() + covariates.ncols(),
         }
     }
 
@@ -348,7 +350,7 @@ impl SurvivalWorkspace {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
     age_exit: Array1<f64>,
@@ -363,7 +365,29 @@ pub struct WorkingModelSurvival {
     monotonicity: MonotonicityPenalty,
     structurally_monotonic: bool,
     structural_time_columns: usize,
-    workspace: SurvivalWorkspace,
+    workspace: std::sync::Mutex<SurvivalWorkspace>,
+}
+
+impl Clone for WorkingModelSurvival {
+    fn clone(&self) -> Self {
+        let workspace = self.workspace.lock().unwrap().clone();
+        Self {
+            age_entry: self.age_entry.clone(),
+            age_exit: self.age_exit.clone(),
+            entry_at_origin: self.entry_at_origin.clone(),
+            event_target: self.event_target.clone(),
+            sampleweight: self.sampleweight.clone(),
+            design: self.design.clone(),
+            offset_eta_entry: self.offset_eta_entry.clone(),
+            offset_eta_exit: self.offset_eta_exit.clone(),
+            offset_derivative_exit: self.offset_derivative_exit.clone(),
+            penalties: self.penalties.clone(),
+            monotonicity: self.monotonicity.clone(),
+            structurally_monotonic: self.structurally_monotonic,
+            structural_time_columns: self.structural_time_columns,
+            workspace: std::sync::Mutex::new(workspace),
+        }
+    }
 }
 
 impl WorkingModelSurvival {
@@ -465,9 +489,12 @@ impl WorkingModelSurvival {
     fn derivative_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         let time_mat = match &self.design {
             SurvivalDesign::Flat { x_derivative, .. } => x_derivative,
-            SurvivalDesign::TimeCovariateShared { time_derivative, .. } => time_derivative,
+            SurvivalDesign::TimeCovariateShared {
+                time_derivative, ..
+            } => time_derivative,
         };
-        self.design.transpose_vector_multiply(time_mat, vector, false)
+        self.design
+            .transpose_vector_multiply(time_mat, vector, false)
     }
 
     fn exit_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
@@ -475,7 +502,8 @@ impl WorkingModelSurvival {
             SurvivalDesign::Flat { x_exit, .. } => x_exit,
             SurvivalDesign::TimeCovariateShared { time_exit, .. } => time_exit,
         };
-        self.design.transpose_vector_multiply(time_mat, vector, true)
+        self.design
+            .transpose_vector_multiply(time_mat, vector, true)
     }
 
     fn derivative_xt_diag_x(&self, weights: &Array1<f64>) -> Array2<f64> {
@@ -500,11 +528,7 @@ impl WorkingModelSurvival {
     /// Compute the full p×p Hessian contribution for the interval terms:
     ///   H = X_exit^T diag(w_exit) X_exit - X_entry^T diag(w_entry) X_entry
     /// using faer-accelerated BLAS on the stored design matrix blocks.
-    fn interval_hessian_blas(
-        &self,
-        w_exit: &Array1<f64>,
-        w_entry: &Array1<f64>,
-    ) -> Array2<f64> {
+    fn interval_hessian_blas(&self, w_exit: &Array1<f64>, w_entry: &Array1<f64>) -> Array2<f64> {
         match &self.design {
             SurvivalDesign::Flat {
                 x_entry, x_exit, ..
@@ -776,7 +800,6 @@ impl WorkingModelSurvival {
         event_target: &ArrayView1<u8>,
         event_competing: &ArrayView1<u8>,
         sampleweight: &ArrayView1<f64>,
-        _design_matrices: &[usize],
     ) -> Result<(), SurvivalError> {
         if age_entry.iter().any(|v| !v.is_finite())
             || age_exit.iter().any(|v| !v.is_finite())
@@ -820,7 +843,7 @@ impl WorkingModelSurvival {
             monotonicity,
             structurally_monotonic: false,
             structural_time_columns: 0,
-            workspace: SurvivalWorkspace::new(n),
+            workspace: std::sync::Mutex::new(SurvivalWorkspace::new(n)),
         }
     }
 
@@ -850,9 +873,11 @@ impl WorkingModelSurvival {
         }
         Self::validate_penalties(&penalties, p)?;
         Self::validate_common_inputs(
-            &inputs.age_entry, &inputs.age_exit,
-            &inputs.event_target, &inputs.event_competing,
-            &inputs.sampleweight, &[],
+            &inputs.age_entry,
+            &inputs.age_exit,
+            &inputs.event_target,
+            &inputs.event_competing,
+            &inputs.sampleweight,
         )?;
         if inputs.x_entry.iter().any(|v| !v.is_finite())
             || inputs.x_exit.iter().any(|v| !v.is_finite())
@@ -864,15 +889,20 @@ impl WorkingModelSurvival {
             Self::validate_offsets(offsets, n)?;
 
         Ok(Self::finish_construction(
-            inputs.age_entry, inputs.age_exit,
-            inputs.event_target, inputs.sampleweight,
+            inputs.age_entry,
+            inputs.age_exit,
+            inputs.event_target,
+            inputs.sampleweight,
             SurvivalDesign::Flat {
                 x_entry: inputs.x_entry.to_owned(),
                 x_exit: inputs.x_exit.to_owned(),
                 x_derivative: inputs.x_derivative.to_owned(),
             },
-            offset_eta_entry, offset_eta_exit, offset_derivative_exit,
-            penalties, monotonicity,
+            offset_eta_entry,
+            offset_eta_exit,
+            offset_derivative_exit,
+            penalties,
+            monotonicity,
         ))
     }
 
@@ -905,9 +935,11 @@ impl WorkingModelSurvival {
         }
         Self::validate_penalties(&penalties, p)?;
         Self::validate_common_inputs(
-            &inputs.age_entry, &inputs.age_exit,
-            &inputs.event_target, &inputs.event_competing,
-            &inputs.sampleweight, &[],
+            &inputs.age_entry,
+            &inputs.age_exit,
+            &inputs.event_target,
+            &inputs.event_competing,
+            &inputs.sampleweight,
         )?;
         if inputs.time_entry.iter().any(|v| !v.is_finite())
             || inputs.time_exit.iter().any(|v| !v.is_finite())
@@ -920,16 +952,21 @@ impl WorkingModelSurvival {
             Self::validate_offsets(offsets, n)?;
 
         Ok(Self::finish_construction(
-            inputs.age_entry, inputs.age_exit,
-            inputs.event_target, inputs.sampleweight,
+            inputs.age_entry,
+            inputs.age_exit,
+            inputs.event_target,
+            inputs.sampleweight,
             SurvivalDesign::TimeCovariateShared {
                 time_entry: inputs.time_entry.to_owned(),
                 time_exit: inputs.time_exit.to_owned(),
                 time_derivative: inputs.time_derivative.to_owned(),
                 covariates: inputs.covariates.to_owned(),
             },
-            offset_eta_entry, offset_eta_exit, offset_derivative_exit,
-            penalties, monotonicity,
+            offset_eta_entry,
+            offset_eta_exit,
+            offset_derivative_exit,
+            penalties,
+            monotonicity,
         ))
     }
 
@@ -1023,17 +1060,18 @@ impl WorkingModelSurvival {
         let derivative_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
 
         let mut nll = 0.0;
-        let mut w_event = Array1::<f64>::zeros(n);
-        let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
-        let mut w_event_outer = Array1::<f64>::zeros(n);
-        // Per-observation weights for the BLAS Hessian/gradient:
-        //   w_exit[i]  = sampleweight * exp(eta_exit)
-        //   w_entry[i] = sampleweight * exp(eta_entry)  (0 when entry is at origin)
-        let mut w_hess_exit = Array1::<f64>::zeros(n);
-        let mut w_hess_entry = Array1::<f64>::zeros(n);
-
         let derivative_guard = self.derivative_guard();
         let derivative_guard_numerical = self.derivative_guard_numerical();
+        let mut workspace = self.workspace.lock().unwrap();
+        workspace.reset(n);
+        let SurvivalWorkspace {
+            w_event,
+            w_event_inv_deriv,
+            w_event_outer,
+            w_hess_exit,
+            w_hess_entry,
+        } = &mut *workspace;
+
         // Phase 1: Scalar loop — compute per-observation weights, NLL, validation.
         for i in 0..n {
             let w = self.sampleweight[i];
@@ -1365,9 +1403,7 @@ impl WorkingModelSurvival {
             // trace(H^{-1} A_k) on block support from precomputed H^{-1}.
             // tr(H_inv_block * A_k^T) = element-wise sum of H_inv_block .* A_k^T
             let h_inv_block = h_inv.slice(ndarray::s![start..end, start..end]);
-            let trace_hinv_ak = lambda
-                * (&h_inv_block * &block.matrix.t())
-                    .sum();
+            let trace_hinv_ak = lambda * (&h_inv_block * &block.matrix.t()).sum();
 
             // Exact directional derivative B = dH_nll/d beta [u_k].
             // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).

@@ -1,6 +1,6 @@
 use crate::faer_ndarray::FaerArrayView;
 use faer::prelude::SolveLstsq;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, s};
 
 const COLUMN_TOL: f64 = 1e-12;
 
@@ -106,25 +106,33 @@ pub fn build_scale_deviation_transform(
     let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
     let mut weighted_column_mean = Array1::<f64>::zeros(p_noise);
     let mut rescale = Array1::<f64>::ones(p_noise);
-    // Pre-compute QR factorization once for all columns
-    let n = primary_design.nrows();
-    let qr_factored = if non_intercept_start.min(p_noise) < p_noise {
+    let first_active = non_intercept_start.min(p_noise);
+    if first_active < p_noise {
+        let n = primary_design.nrows();
+        let active_cols = p_noise - first_active;
         let mut wx = Array2::<f64>::zeros((n, p_primary));
+        let mut wy = Array2::<f64>::zeros((n, active_cols));
         for i in 0..n {
             let sw = weights[i].sqrt();
-            for j2 in 0..p_primary {
-                wx[[i, j2]] = sw * primary_design[[i, j2]];
+            for j in 0..p_primary {
+                wx[[i, j]] = sw * primary_design[[i, j]];
+            }
+            for j in 0..active_cols {
+                wy[[i, j]] = sw * noise_design[[i, first_active + j]];
             }
         }
         let wx_faer = FaerArrayView::new(&wx);
-        Some((wx_faer.as_ref().col_piv_qr(), wx))
-    } else {
-        None
-    };
-    let _ = &qr_factored; // keep borrow alive
-    for j in non_intercept_start.min(p_noise)..p_noise {
+        let qr = wx_faer.as_ref().col_piv_qr();
+        let mut rhs = wy;
+        let mut rhs_mat = crate::faer_ndarray::array2_to_matmut(&mut rhs);
+        qr.solve_lstsq_in_place(rhs_mat.as_mut());
+        projection_coef
+            .slice_mut(s![.., first_active..])
+            .assign(&rhs.slice(s![..p_primary, ..]));
+    }
+    for j in first_active..p_noise {
         let col = noise_design.column(j).to_owned();
-        let proj = solveweighted_projection_dense(primary_design, &col, weights)?;
+        let proj = projection_coef.column(j).to_owned();
         let fitted = crate::faer_ndarray::fast_av(primary_design, &proj);
         let mut residual = &col - &fitted;
         let center = weighted_mean(residual.view(), weights)?;
