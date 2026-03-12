@@ -3,7 +3,7 @@
 #![deny(unused_variables)]
 #![deny(unused_imports)]
 
-mod estimate_shared;
+mod estimation_numerics;
 
 pub mod families;
 pub mod inference;
