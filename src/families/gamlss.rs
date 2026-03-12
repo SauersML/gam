@@ -4806,12 +4806,16 @@ impl CustomFamily for GaussianLocationScaleFamily {
         if etamu.len() != n || eta_log_sigma.len() != n || self.weights.len() != n {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
+        // -0.5 * (r²/s² + ln(2π s²)) = -0.5 * (r²/s² + ln(2π) + 2*eta_ls)
+        // since s² = exp(2*eta_ls), ln(s²) = 2*eta_ls.
+        // This avoids exp() + ln() per observation.
+        let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
         for i in 0..n {
-            let sigma_i = eta_log_sigma[i].exp().max(1e-12);
+            let two_eta = 2.0 * eta_log_sigma[i];
+            let inv_s2 = (-two_eta).exp().min(1e24);
             let r = self.y[i] - etamu[i];
-            let s2 = (sigma_i * sigma_i).max(1e-20);
-            ll += self.weights[i] * (-0.5 * (r * r / s2 + (2.0 * std::f64::consts::PI * s2).ln()));
+            ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
         }
         Ok(ll)
     }
