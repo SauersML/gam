@@ -515,7 +515,7 @@ impl DeadCodeCollector {
         error_msg.push_str("   - #[allow(dead_code)]\n");
         error_msg.push_str("   - #[allow(unused)] / #![allow(unused)]\n");
         error_msg.push_str("   - #[allow(unused_imports)]\n");
-        error_msg.push_str("   - #[allow(unusedvariables)]\n");
+        error_msg.push_str("   - #[allow(unused_variables)]\n");
         error_msg.push_str(
             "\n   Do not suppress these warnings. Delete or use the unused code/imports instead.\n",
         );
@@ -1860,7 +1860,7 @@ fn main() {
 
 // This function manually checks for unused variables in the current file
 fn manually_check_for_unusedvariables() {
-    // Force compilation to fail with unusedvariables, dead_code, and unused_imports lint
+    // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
     // This ensures build.rs itself follows the strict coding policy
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
@@ -2059,7 +2059,7 @@ fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
         OsString::from("--emit"),
         OsString::from("metadata"),
         OsString::from("-D"),
-        OsString::from("unusedvariables"),
+        OsString::from("unused_variables"),
         OsString::from("-D"),
         OsString::from("dead_code"),
         OsString::from("-D"),
@@ -2491,9 +2491,9 @@ fn scan_for_allow_dead_code() -> Vec<String> {
     // - #[allow(dead_code)] or #![allow(dead_code)]
     // - #[allow(unused)]
     // - #[allow(unused_imports)]
-    // - #[allow(unusedvariables)]
+    // - #[allow(unused_variables)]
     // - #[allow(..., unused, ...)] (inside lists)
-    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unusedvariables)\b[^)]*\)\s*\]";
+    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unused_variables)\b[^)]*\)\s*\]";
     let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
