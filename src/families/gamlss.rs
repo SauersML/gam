@@ -50,18 +50,6 @@ fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
 }
 
 #[inline]
-fn gaussian_log_sigma_irlsinfo(weight: f64, sigma: f64, d_sigma: f64) -> (f64, f64) {
-    let s = sigma.max(1e-10);
-    let dlogsigma_du = if d_sigma == 0.0 {
-        0.0
-    } else {
-        (d_sigma / s).clamp(-1.0, 1.0)
-    };
-    let info_u = floor_positiveweight(2.0 * weight * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
-    (dlogsigma_du, info_u)
-}
-
-#[inline]
 fn gaussian_log_sigma_irlsinfo_directional_derivative(
     weight: f64,
     sigma: f64,
@@ -11050,7 +11038,9 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let (dlogsigma_du, info_u) = gaussian_log_sigma_irlsinfo(w, sigma, sigma);
+                let dlogsigma_du = if sigma <= 1e-10 { sigma * 1e10 } else { 1.0 };
+                let info_u =
+                    floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
                     wls[i] = 0.0;
                     zls[i] = eta;
