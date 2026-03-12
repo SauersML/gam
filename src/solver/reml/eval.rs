@@ -474,20 +474,14 @@ impl<'a> RemlState<'a> {
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         let mut rs_eval = reparam_result.rs_transformed.clone();
         let x_dense_orig_arc = pirls_result.x_transformed.to_dense_arc();
-        let x_dense_eval_owned;
-        let x_dense_eval = if let Some(z) = free_basis_opt.as_ref() {
-            x_dense_eval_owned = Some(
-                DenseRightProductView::new(x_dense_orig_arc.as_ref())
-                    .with_factor(z)
-                    .materialize(),
-            );
-            x_dense_eval_owned
-                .as_ref()
-                .expect("owned constrained design")
-        } else {
-            x_dense_eval_owned = None;
+        let x_dense_eval_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_dense_orig_arc.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_dense_eval = x_dense_eval_owned.as_ref().unwrap_or_else(|| {
             x_dense_orig_arc.as_ref()
-        };
+        });
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let mut e_eval = reparam_result.e_transformed.clone();
 

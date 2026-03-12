@@ -358,7 +358,10 @@ impl<'a> RemlState<'a> {
                 return true;
             }
             if let Some(x2) = dir.x_tau_tau_original.as_ref() {
-                return x2.iter().flatten().any(|m| m.iter().any(|v| *v != 0.0));
+                return x2
+                    .iter()
+                    .flatten()
+                    .any(HyperDesignDerivative::any_nonzero);
             }
             false
         });
@@ -629,20 +632,14 @@ impl<'a> RemlState<'a> {
             .x_transformed
             .try_to_dense_arc("exact tau directional calculus requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
-        let x_eval_owned;
-        let x_eval = if let Some(z) = free_basis_opt.as_ref() {
-            x_eval_owned = Some(
-                DenseRightProductView::new(x_eval_dense.as_ref())
-                    .with_factor(z)
-                    .materialize(),
-            );
-            x_eval_owned
-                .as_ref()
-                .expect("owned constrained design")
-        } else {
-            x_eval_owned = None;
-            x_eval_dense.as_ref()
-        };
+        let x_eval_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_eval_dense.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_eval = x_eval_owned
+            .as_ref()
+            .unwrap_or_else(|| x_eval_dense.as_ref());
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let x_tau_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
@@ -1033,20 +1030,14 @@ impl<'a> RemlState<'a> {
             .x_transformed
             .try_to_dense_arc("exact tau/tau calculus requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
-        let x_eval_owned;
-        let x_eval = if let Some(z) = free_basis_opt.as_ref() {
-            x_eval_owned = Some(
-                DenseRightProductView::new(x_eval_dense.as_ref())
-                    .with_factor(z)
-                    .materialize(),
-            );
-            x_eval_owned
-                .as_ref()
-                .expect("owned constrained design")
-        } else {
-            x_eval_owned = None;
-            x_eval_dense.as_ref()
-        };
+        let x_eval_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_eval_dense.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_eval = x_eval_owned
+            .as_ref()
+            .unwrap_or_else(|| x_eval_dense.as_ref());
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         if let Some(z) = free_basis_opt.as_ref() {
@@ -1631,7 +1622,8 @@ impl<'a> RemlState<'a> {
         let reparam_result = &pirls_result.reparam_result;
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
         let (h_eff_eval, h_total_eval, beta_eval, e_eval);
-        let x_constrained_owned;
+        let x_dense_arc;
+        let x_dense_owned;
 
         let x_psi_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
 
@@ -1639,28 +1631,40 @@ impl<'a> RemlState<'a> {
             h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
             h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
-            let x_dense_arc = pirls_result
+            let constrained_dense = pirls_result
                 .x_transformed
                 .try_to_dense_arc(
                     "directional hyper-gradient with active constraints requires dense transformed design",
                 )
                 .map_err(EstimationError::InvalidInput)?;
-            x_constrained_owned = Some(DesignMatrix::Dense(
-                DenseRightProductView::new(x_dense_arc.as_ref())
+            x_dense_owned = Some(
+                DenseRightProductView::new(constrained_dense.as_ref())
                     .with_factor(z)
                     .materialize(),
-            ));
+            );
+            x_dense_arc = None;
             e_eval = reparam_result.e_transformed.dot(z);
         } else {
             h_eff_eval = bundle.h_eff.as_ref().clone();
             h_total_eval = bundle.h_total.as_ref().clone();
             beta_eval = pirls_result.beta_transformed.as_ref().clone();
             e_eval = reparam_result.e_transformed.clone();
-            x_constrained_owned = None;
+            x_dense_arc = Some(
+                pirls_result
+                    .x_transformed
+                    .try_to_dense_arc(
+                        "exact directional hyper-gradient requires dense transformed design",
+                    )
+                    .map_err(EstimationError::InvalidInput)?,
+            );
+            x_dense_owned = None;
         }
-        let x_transformed_eval = x_constrained_owned
-            .as_ref()
-            .unwrap_or(&pirls_result.x_transformed);
+        let x_dense = x_dense_owned.as_ref().unwrap_or_else(|| {
+            x_dense_arc
+                .as_ref()
+                .expect("dense design arc missing")
+                .as_ref()
+        });
         let transformed_penalty_components = Self::transform_penalty_components(
             hyper_dir.penalty_first_components(),
             &reparam_result.qs,
@@ -1702,10 +1706,6 @@ impl<'a> RemlState<'a> {
             )));
         }
         let s_psi_total_t = s_psi_t.clone();
-        let x_dense_arc = x_transformed_eval
-            .try_to_dense_arc("exact directional hyper-gradient requires dense transformed design")
-            .map_err(EstimationError::InvalidInput)?;
-        let x_dense = x_dense_arc.as_ref();
         let firth_op = if firth_logit_active {
             if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                 Some(cached.as_ref().clone())
@@ -1875,10 +1875,9 @@ impl<'a> RemlState<'a> {
             //     + 0.5 X'((w'' ⊙ (X_tau β)) ⊙ h + w' ⊙ h_tau|beta),
             //   Phi_tau|beta = 0.5 tr(I_r^{-1} I_{r,tau}),
             // with I_r = X_r' W X_r and h_i = x_{r,i}' I_r^{-1} x_{r,i}.
-            let x_psi_t_dense = x_psi_t.clone();
-            let need_tau_kernel = x_psi_t_dense.iter().any(|v| *v != 0.0);
+            let need_tau_kernel = x_psi_t.iter().any(|v| *v != 0.0);
             let tau_bundle =
-                Self::firth_exact_tau_kernel(op, &x_psi_t_dense, &beta_eval, need_tau_kernel);
+                Self::firth_exact_tau_kernel(op, &x_psi_t, &beta_eval, need_tau_kernel);
             g_psi -= &tau_bundle.gphi_tau;
             fit_firth_partial = tau_bundle.phi_tau_partial;
             if need_tau_kernel {
@@ -1921,10 +1920,9 @@ impl<'a> RemlState<'a> {
         //   D_{p,τ} = 2*fit_block and profiled_fit_term = D_{p,τ}/(2φ̂).
 
         let w = &pirls_result.solveweights;
-        let x_psi_t_dense = x_psi_t.clone();
         let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
-        let mut h_psi = Self::weighted_cross(&x_psi_t_dense, &x_dense, w);
-        h_psi += &Self::weighted_cross(&x_dense, &x_psi_t_dense, w);
+        let mut h_psi = Self::weighted_cross(&x_psi_t, &x_dense, w);
+        h_psi += &Self::weighted_cross(&x_dense, &x_psi_t, w);
 
         match self.config.link_function() {
             LinkFunction::Identity => {
@@ -2007,14 +2005,13 @@ impl<'a> RemlState<'a> {
                     //                 - D(Hphi)[beta_tau].
                     //
                     // We apply both terms explicitly.
-                    let x_psi_t_dense = x_psi_t.clone();
-                    if x_psi_t_dense.iter().any(|v| *v != 0.0) {
+                    if x_psi_t.iter().any(|v| *v != 0.0) {
                         let kernel = tau_kernel_opt.as_ref().expect(
                             "exact directional assembly requires cached tau kernel for Hphi,tau",
                         );
                         let eye = Array2::<f64>::eye(beta_eval.len());
                         let hphi_tau_partial =
-                            Self::firth_hphi_tau_partial_apply(op, &x_psi_t_dense, kernel, &eye);
+                            Self::firth_hphi_tau_partial_apply(op, &x_psi_t, kernel, &eye);
                         h_psi -= &hphi_tau_partial;
                     }
                     let firth_dir = Self::firth_direction(op, &beta_psi);

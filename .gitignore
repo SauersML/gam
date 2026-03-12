@@ -79,3 +79,6 @@ rust_digest.txt
 *.olean.trace
 *.ilean
 *.c
+
+# local codex worktrees
+.claude/worktrees/
