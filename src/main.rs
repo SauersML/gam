@@ -825,7 +825,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.finish_secondary_progress("design matrices assembled");
     progress.advance_workflow(3);
 
-    let fit_max_iter = 80usize;
+    let fit_max_iter = 200usize;
     let fit_tol = 1e-6f64;
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());

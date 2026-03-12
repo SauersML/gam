@@ -100,6 +100,7 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     "rust_gamlss",
     "r_gamboostlss",
     "r_bamlss",
+    "r_brms",
 }
 _BENCH_CI_PROFILE = os.environ.get("BENCH_CI_PROFILE", "full").strip().lower() or "full"
 _LEAN_PROFILE_EXCLUDED_CONTENDERS = {
