@@ -8554,7 +8554,11 @@ mod tests {
             build_term_collection_design(data.view(), &spec).expect("term collection design");
         let caches =
             extract_spatial_operator_runtime_caches(&spec, &design).expect("adaptive caches");
-        assert_eq!(caches.len(), 0);
+        assert_eq!(caches.len(), 1);
+        assert_eq!(
+            caches[0].coeff_global_range.len(),
+            design.smooth.terms[0].coeff_range.len()
+        );
     }
 
     #[test]
@@ -8593,7 +8597,8 @@ mod tests {
         let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
         let caches =
             extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
-        assert_eq!(caches.len(), 0);
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].termname, "duchon_joint");
         assert_eq!(rebuilt.smooth.terms[0].coeff_range.len(), 3);
     }
 
@@ -8633,7 +8638,8 @@ mod tests {
         let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
         let caches =
             extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
-        assert_eq!(caches.len(), 0);
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].termname, "matern_joint");
         assert_eq!(rebuilt.smooth.terms.len(), 1);
         assert!(!rebuilt.smooth.terms[0].coeff_range.is_empty());
     }
