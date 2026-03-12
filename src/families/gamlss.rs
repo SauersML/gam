@@ -80,7 +80,6 @@ fn gaussian_log_sigma_irlsinfo_directional_derivative(
     if dw.is_finite() { dw } else { 0.0 }
 }
 
-
 #[derive(Clone, Copy)]
 struct GamlssLambdaLayout {
     k_mean: usize,
@@ -13682,25 +13681,23 @@ mod tests {
             eta: extreme_eta,
         }]);
         match eval_result {
-            Ok(eval) => {
-                match &eval.blockworking_sets[0] {
-                    crate::families::custom_family::BlockWorkingSet::Diagonal {
-                        working_response,
-                        working_weights,
-                    } => {
-                        let all_finite = working_response.iter().all(|v| v.is_finite())
-                            && working_weights.iter().all(|v| v.is_finite())
-                            && eval.log_likelihood.is_finite();
-                        assert!(
-                            all_finite,
-                            "Poisson evaluate should produce finite outputs for all eta, \
+            Ok(eval) => match &eval.blockworking_sets[0] {
+                crate::families::custom_family::BlockWorkingSet::Diagonal {
+                    working_response,
+                    working_weights,
+                } => {
+                    let all_finite = working_response.iter().all(|v| v.is_finite())
+                        && working_weights.iter().all(|v| v.is_finite())
+                        && eval.log_likelihood.is_finite();
+                    assert!(
+                        all_finite,
+                        "Poisson evaluate should produce finite outputs for all eta, \
                              but got non-finite values: ll={}, z={:?}, w={:?}",
-                            eval.log_likelihood, working_response, working_weights
-                        );
-                    }
-                    _ => panic!("expected Diagonal block"),
+                        eval.log_likelihood, working_response, working_weights
+                    );
                 }
-            }
+                _ => panic!("expected Diagonal block"),
+            },
             Err(_) => {}
         }
     }
@@ -13718,12 +13715,14 @@ mod tests {
             weights,
             mu_block: ParameterBlockInput {
                 design: DesignMatrix::Dense(mu_design),
+                offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: None,
                 initial_beta: Some(array![0.0, 1.0]),
             },
             log_sigma_block: ParameterBlockInput {
                 design: DesignMatrix::Dense(ls_design),
+                offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: None,
                 initial_beta: Some(array![500.0, 0.0]),
@@ -13738,9 +13737,10 @@ mod tests {
         let result = fit_gaussian_location_scale(spec, &options);
         match result {
             Ok(fit) => {
-                let all_finite = fit.block_results.iter().all(|br| {
-                    br.beta.iter().all(|v| v.is_finite())
-                });
+                let all_finite = fit
+                    .block_states
+                    .iter()
+                    .all(|state| state.beta.iter().all(|v| v.is_finite()));
                 assert!(
                     all_finite,
                     "fit succeeded but produced non-finite coefficients"

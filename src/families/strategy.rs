@@ -175,6 +175,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                     mixture_inverse_link_jet(state, x).mu
                 }))
             }
+            LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+                "PoissonLog posterior mean is not exposed via generic family strategy; use fit_poisson_log outputs directly"
+                    .to_string(),
+            )),
+            LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+                "GammaLog posterior mean is not exposed via generic family strategy; use fit_gamma_log outputs directly"
+                    .to_string(),
+            )),
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar posterior mean is not exposed via generic family strategy"
                     .to_string(),
@@ -247,6 +255,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
+            LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+                "PoissonLog posterior moments are not exposed via generic family strategy; use fit_poisson_log outputs directly"
+                    .to_string(),
+            )),
+            LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+                "GammaLog posterior moments are not exposed via generic family strategy; use fit_gamma_log outputs directly"
+                    .to_string(),
+            )),
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar posterior mean is not exposed via generic family strategy"
                     .to_string(),
@@ -272,6 +288,11 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
+            LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
+            LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+                "GammaLog generative noise requires family shape; use fit_gamma_log outputs directly"
+                    .to_string(),
+            )),
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic family strategy"
                     .to_string(),
