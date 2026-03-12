@@ -32,9 +32,10 @@
 //! Cholesky-based logdet while gradient uses eigendecomposition-based traces
 //! with a different numerical threshold.
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Zip};
 
 use crate::faer_ndarray::FaerEigh;
+use crate::linalg::matrix::DesignMatrix;
 use crate::types::RidgePassport;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -139,6 +140,124 @@ impl HessianDerivativeProvider for GaussianDerivatives {
     }
     fn has_corrections(&self) -> bool {
         false
+    }
+}
+
+/// Single-predictor GLM derivative provider.
+///
+/// For non-Gaussian single-predictor models, the third-derivative correction is:
+///   Cₖ = Xᵀ diag(c ⊙ X vₖ) X
+/// where c is the first eta-derivative of the working curvature W(η),
+/// and vₖ = H⁻¹(Aₖβ̂) is the mode response.
+pub struct SinglePredictorGlmDerivatives {
+    /// c_array: −∂³ℓᵢ/∂ηᵢ³, the third-derivative of the negative log-likelihood.
+    pub c_array: Array1<f64>,
+    /// d_array: fourth-derivative (for second-order Hessian corrections).
+    pub d_array: Option<Array1<f64>>,
+    /// Design matrix X in the transformed basis.
+    pub x_transformed: DesignMatrix,
+}
+
+impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        // Cₖ = Xᵀ diag(c ⊙ X vₖ) X
+        // where vₖ is the mode response H⁻¹(Aₖβ̂).
+        // Note: vₖ here is already −dβ̂/dρₖ (the sign convention from the solve).
+        let x = self.x_transformed.to_dense_arc();
+        let x_v = x.dot(v_k); // X vₖ: n-vector
+
+        // Elementwise: c ⊙ (X vₖ)
+        let mut c_xv = x_v;
+        Zip::from(&mut c_xv)
+            .and(&self.c_array)
+            .for_each(|xv_i, &c_i| *xv_i *= c_i);
+
+        // Xᵀ diag(c_xv) X
+        let x_ref = x.as_ref();
+        let n = x_ref.nrows();
+        let p = x_ref.ncols();
+        let mut result = Array2::zeros((p, p));
+        for i in 0..n {
+            let w = c_xv[i];
+            if w.abs() > 0.0 {
+                let xi = x_ref.row(i);
+                for a in 0..p {
+                    let wa = w * xi[a];
+                    for b in a..p {
+                        let val = wa * xi[b];
+                        result[[a, b]] += val;
+                        if a != b {
+                            result[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(result)
+    }
+
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        // Second-order correction for the outer Hessian.
+        // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
+        //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
+        let x = self.x_transformed.to_dense_arc();
+        let x_vk = x.dot(v_k);
+        let x_vl = x.dot(v_l);
+        let x_ukl = x.dot(u_kl);
+
+        let n = x.nrows();
+        let p = x.ncols();
+        let mut weights = Array1::zeros(n);
+
+        // c ⊙ X u_{kl}
+        Zip::from(&mut weights)
+            .and(&self.c_array)
+            .and(&x_ukl)
+            .for_each(|w, &c, &xu| *w = c * xu);
+
+        // + d ⊙ (X vₖ) ⊙ (X vₗ)
+        if let Some(ref d_array) = self.d_array {
+            Zip::from(&mut weights)
+                .and(d_array)
+                .and(&x_vk)
+                .and(&x_vl)
+                .for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
+        }
+
+        // Xᵀ diag(weights) X
+        let x_ref = x.as_ref();
+        let mut result = Array2::zeros((p, p));
+        for i in 0..n {
+            let wi = weights[i];
+            if wi.abs() > 0.0 {
+                let xi = x_ref.row(i);
+                for a in 0..p {
+                    let wa = wi * xi[a];
+                    for b in a..p {
+                        let val = wa * xi[b];
+                        result[[a, b]] += val;
+                        if a != b {
+                            result[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(result)
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
     }
 }
 
@@ -719,6 +838,253 @@ impl HessianOperator for DenseSpectralOperator {
     fn dim(&self) -> usize {
         self.n_dim
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Sparse Cholesky HessianOperator implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Sparse Cholesky Hessian operator.
+///
+/// Wraps an existing `SparseExactFactor` and provides logdet, trace, and solve
+/// from the same Cholesky factorization.
+///
+/// Spectral consistency: logdet uses `2 Σ log(L_ii)` and trace uses the
+/// selected-inverse diagonal, both derived from the same sparse factor.
+pub struct SparseCholeskyOperator {
+    /// The sparse Cholesky factorization.
+    factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
+    /// Precomputed log-determinant from the Cholesky diagonal.
+    cached_logdet: f64,
+    /// Dimension of H.
+    n_dim: usize,
+}
+
+impl SparseCholeskyOperator {
+    /// Create from an existing sparse factorization and its precomputed logdet.
+    pub fn new(
+        factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
+        logdet_h: f64,
+        dim: usize,
+    ) -> Self {
+        Self {
+            factor,
+            cached_logdet: logdet_h,
+            n_dim: dim,
+        }
+    }
+}
+
+impl HessianOperator for SparseCholeskyOperator {
+    fn logdet(&self) -> f64 {
+        self.cached_logdet
+    }
+
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        // For sparse: tr(H⁻¹ A) = tr(L⁻ᵀ L⁻¹ A) using the selected inverse.
+        // Delegate to the sparse trace infrastructure.
+        // For now, fall back to solving columns of A and computing the trace.
+        let mut trace = 0.0;
+        for j in 0..a.ncols() {
+            let col = a.column(j).to_owned();
+            match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, &col) {
+                Ok(sol) => trace += sol[j],
+                Err(e) => {
+                    log::warn!("SparseCholeskyOperator::trace_hinv_product solve failed: {e}");
+                    return f64::NAN;
+                }
+            }
+        }
+        trace
+    }
+
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!("SparseCholeskyOperator::solve failed: {e}");
+                Array1::zeros(self.n_dim)
+            }
+        }
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!("SparseCholeskyOperator::solve_multi failed: {e}");
+                Array2::zeros((self.n_dim, rhs.ncols()))
+            }
+        }
+    }
+
+    fn active_rank(&self) -> usize {
+        self.n_dim
+    }
+
+    fn dim(&self) -> usize {
+        self.n_dim
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Conversions: existing solver outputs → InnerSolution
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Configuration for converting a PirlsResult into an InnerSolution.
+pub struct PirlsConversionConfig {
+    /// Number of observations.
+    pub n_observations: usize,
+    /// Whether this is a Gaussian identity-link model (profiled scale) or GLM (fixed φ).
+    pub is_gaussian_identity: bool,
+    /// Dispersion parameter for non-Gaussian families (typically 1.0).
+    pub fixed_dispersion: f64,
+    /// Precomputed Tierney-Kadane correction (0.0 if not applicable).
+    pub tk_correction: f64,
+    /// Gradient of TK correction w.r.t. ρ (None if not applicable).
+    pub tk_gradient: Option<Array1<f64>>,
+    /// Nullspace dimensions per penalty block.
+    pub nullspace_dims: Vec<usize>,
+    /// Ridge to include in penalty logdet computation.
+    pub penalty_logdet_ridge: f64,
+}
+
+/// Convert a PirlsResult (from the existing single-predictor inner solver)
+/// into an InnerSolution for the unified evaluator.
+///
+/// This is the bridge between the legacy PIRLS path and the unified REML/LAML
+/// evaluator. It extracts all relevant quantities from PirlsResult and
+/// packages them into the InnerSolution format.
+pub fn pirls_result_to_inner_solution(
+    pirls: &crate::pirls::PirlsResult,
+    config: &PirlsConversionConfig,
+) -> Result<InnerSolution, String> {
+    let reparam = &pirls.reparam_result;
+
+    // Build the HessianOperator from the stabilized Hessian.
+    let hessian_op = Box::new(
+        DenseSpectralOperator::from_symmetric(&pirls.stabilizedhessian_transformed)
+            .map_err(|e| format!("Failed to build HessianOperator from PIRLS Hessian: {e}"))?,
+    );
+
+    // Compute penalty logdet derivatives from the reparameterization result.
+    let penalty_logdet = PenaltyLogdetDerivs {
+        value: reparam.log_det,
+        first: reparam.det1.clone(),
+        second: None, // Will be computed on demand for outer Hessian.
+    };
+
+    // Determine nullspace dimension.
+    let penalty_rank = reparam.e_transformed.nrows();
+    let p_dim = pirls.stabilizedhessian_transformed.ncols();
+    let nullspace_dim = p_dim.saturating_sub(penalty_rank) as f64;
+
+    // Build derivative provider based on family type.
+    let deriv_provider: Box<dyn HessianDerivativeProvider> = if config.is_gaussian_identity {
+        Box::new(GaussianDerivatives)
+    } else {
+        Box::new(SinglePredictorGlmDerivatives {
+            c_array: pirls.solve_c_array.clone(),
+            d_array: Some(pirls.solve_d_array.clone()),
+            x_transformed: pirls.x_transformed.clone(),
+        })
+    };
+
+    // Dispersion handling.
+    let dispersion = if config.is_gaussian_identity {
+        DispersionHandling::ProfiledGaussian
+    } else {
+        DispersionHandling::Fixed {
+            phi: config.fixed_dispersion,
+        }
+    };
+
+    // Firth log-det contribution.
+    let firth_logdet = match &pirls.firth {
+        crate::pirls::FirthDiagnostics::Active { log_det, .. } => *log_det,
+        crate::pirls::FirthDiagnostics::Inactive => 0.0,
+    };
+
+    // For Gaussian, log_likelihood = -0.5 * deviance (so that -2*ll = deviance).
+    // For GLMs, deviance = -2 * log_likelihood, so log_likelihood = -0.5 * deviance.
+    let log_likelihood = -0.5 * pirls.deviance;
+
+    Ok(InnerSolution {
+        log_likelihood,
+        penalty_quadratic: pirls.stable_penalty_term,
+        ridge_passport: pirls.ridge_passport,
+        hessian_op,
+        beta: pirls.beta_transformed.as_ref().clone(),
+        penalty_roots: reparam.rs_transformed.clone(),
+        penalty_logdet,
+        deriv_provider,
+        tk_correction: config.tk_correction,
+        tk_gradient: config.tk_gradient.clone(),
+        firth_logdet,
+        firth_gradient: None, // Firth gradient handled separately for now.
+        n_observations: config.n_observations,
+        nullspace_dim,
+        dispersion,
+    })
+}
+
+/// Convert a BlockwiseInnerResult (from the custom family engine) into an InnerSolution.
+///
+/// Configuration for the block-coupled conversion.
+pub struct BlockwiseConversionConfig {
+    /// Number of observations.
+    pub n_observations: usize,
+    /// Joint Hessian (including off-diagonal coupling blocks).
+    pub joint_hessian: Array2<f64>,
+    /// Joint coefficients (concatenated across all blocks).
+    pub joint_beta: Array1<f64>,
+    /// Penalty roots for each smoothing parameter.
+    pub penalty_roots: Vec<Array2<f64>>,
+    /// Penalty logdet derivatives.
+    pub penalty_logdet: PenaltyLogdetDerivs,
+    /// Nullspace dimension (unpenalized coefficients).
+    pub nullspace_dim: f64,
+    /// Dispersion parameter (typically 1.0 for non-Gaussian).
+    pub fixed_dispersion: f64,
+    /// Ridge passport.
+    pub ridge_passport: RidgePassport,
+    /// Family-specific derivative provider.
+    pub deriv_provider: Box<dyn HessianDerivativeProvider>,
+    /// Tierney-Kadane correction.
+    pub tk_correction: f64,
+    /// TK gradient.
+    pub tk_gradient: Option<Array1<f64>>,
+}
+
+/// Convert a BlockwiseInnerResult into an InnerSolution.
+pub fn blockwise_result_to_inner_solution(
+    inner: &crate::families::custom_family::BlockwiseInnerResult,
+    config: BlockwiseConversionConfig,
+) -> Result<InnerSolution, String> {
+    let hessian_op = Box::new(
+        DenseSpectralOperator::from_symmetric(&config.joint_hessian)
+            .map_err(|e| format!("Failed to build HessianOperator from joint Hessian: {e}"))?,
+    );
+
+    Ok(InnerSolution {
+        log_likelihood: inner.log_likelihood,
+        penalty_quadratic: inner.penalty_value,
+        ridge_passport: config.ridge_passport,
+        hessian_op,
+        beta: config.joint_beta,
+        penalty_roots: config.penalty_roots,
+        penalty_logdet: config.penalty_logdet,
+        deriv_provider: config.deriv_provider,
+        tk_correction: config.tk_correction,
+        tk_gradient: config.tk_gradient,
+        firth_logdet: 0.0,
+        firth_gradient: None,
+        n_observations: config.n_observations,
+        nullspace_dim: config.nullspace_dim,
+        dispersion: DispersionHandling::Fixed {
+            phi: config.fixed_dispersion,
+        },
+    })
 }
 
 #[cfg(test)]
