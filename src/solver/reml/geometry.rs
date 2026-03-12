@@ -675,7 +675,7 @@ impl<'a> RemlState<'a> {
                     "failed to access dense design for exact Hessian".to_string(),
                 )
             })?;
-            let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
+            let mut weighted = Array2::<f64>::zeros((0, 0));
             Ok(Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted))
         }
     }

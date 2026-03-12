@@ -7,6 +7,21 @@ impl<'a> RemlState<'a> {
         diag: &Array1<f64>,
         weighted: &mut Array2<f64>,
     ) -> Array2<f64> {
+        let (n, p) = x.dim();
+        if n == 0 || p == 0 {
+            return Array2::<f64>::zeros((p, p));
+        }
+        const STREAMING_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
+        let dense_work_bytes = n
+            .checked_mul(p)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+            .unwrap_or(usize::MAX);
+        if dense_work_bytes > STREAMING_BYTES_THRESHOLD {
+            return Self::xt_diag_x_dense_chunked_into(x, diag, weighted);
+        }
+        if weighted.raw_dim() != x.raw_dim() {
+            *weighted = Array2::<f64>::zeros(x.raw_dim());
+        }
         weighted.assign(x);
         ndarray::Zip::from(weighted.rows_mut())
             .and(diag.view())
@@ -74,11 +89,7 @@ impl<'a> RemlState<'a> {
     ) -> Array2<f64> {
         debug_assert_eq!(left.nrows(), right.nrows());
         debug_assert_eq!(left.nrows(), weights.len());
-        let mut weighted_right = right.clone();
-        ndarray::Zip::from(weighted_right.rows_mut())
-            .and(weights.view())
-            .for_each(|mut row, w| row *= *w);
-        fast_atb(left, &weighted_right)
+        crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
     }
 
     pub(crate) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
@@ -447,12 +458,11 @@ impl FirthDenseOperator {
         };
         let r = q_basis.ncols();
 
-        let weighted_x_reduced = RemlState::row_scale(&x_reduced, &w);
         // Reduced Fisher on the identifiable subspace:
         //   I_r = X_rᵀ W X_r = Zᵀ Z.
         // Under finite-logit eta, W has strictly positive diagonal entries and
         // X_r has full column rank by construction, so I_r is SPD.
-        let fisher_reduced = fast_atb(&x_reduced, &weighted_x_reduced);
+        let fisher_reduced = crate::faer_ndarray::fast_xt_diag_x(&x_reduced, &w);
         // Smooth-regime diagnostic:
         // for exact pseudodet derivatives we require I_r to stay SPD on the
         // fixed identifiable subspace. Emit a warning when I_r appears close
@@ -837,15 +847,10 @@ impl FirthDenseOperator {
         //   dot_h  = h_tau|beta.
         let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
 
-        let wx_reduced = RemlState::row_scale(&self.x_reduced, &self.w);
-        let wx_tau_reduced = RemlState::row_scale(&x_tau_reduced, &self.w);
-
         let dw = &self.w1 * deta;
-        let dwx_reduced = RemlState::row_scale(&self.x_reduced, &dw);
-
-        let dot_i = fast_ab(&x_tau_reduced.t().to_owned(), &wx_reduced)
-            + fast_ab(&self.x_reduced.t().to_owned(), &wx_tau_reduced)
-            + fast_ab(&self.x_reduced.t().to_owned(), &dwx_reduced);
+        let dot_i = Self::weighted_cross(&x_tau_reduced, &self.x_reduced, &self.w)
+            + Self::weighted_cross(&self.x_reduced, &x_tau_reduced, &self.w)
+            + crate::faer_ndarray::fast_xt_diag_x(&self.x_reduced, &dw);
 
         let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
         let x_tauk = x_tau_reduced.dot(&self.k_reduced);

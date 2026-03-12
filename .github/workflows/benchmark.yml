@@ -182,47 +182,12 @@ jobs:
           )
           PY
 
-      - name: Bundle source workspace
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar --exclude=.git -czf "${RUNNER_TEMP}/benchmark-source.tar.gz" -C "${GITHUB_WORKSPACE}" .
-
-      - name: Upload source workspace artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-source
-          path: ${{ runner.temp }}/benchmark-source.tar.gz
-          if-no-files-found: error
-
   bootstrap-runtime:
     name: Bootstrap benchmark runtime
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Download source workspace
-        id: source-download
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-source
-          path: ${{ runner.temp }}/benchmark-source
-
-      - name: Restore source workspace
-        id: source-restore
-        shell: bash
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
-          if [ -f "${src}" ]; then
-            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
-            echo "restored=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "restored=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Fallback checkout
-        if: ${{ steps.source-restore.outputs.restored != 'true' }}
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -301,29 +266,7 @@ jobs:
       BENCH_BLAS_THREADS: "1"
       BENCH_CMD_TIMEOUT_SEC: "10800"
     steps:
-      - name: Download source workspace
-        id: source-download
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-source
-          path: ${{ runner.temp }}/benchmark-source
-
-      - name: Restore source workspace
-        id: source-restore
-        shell: bash
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
-          if [ -f "${src}" ]; then
-            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
-            echo "restored=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "restored=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Fallback checkout
-        if: ${{ steps.source-restore.outputs.restored != 'true' }}
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -339,10 +282,45 @@ jobs:
           r-version: ${{ env.BENCH_R_VERSION }}
 
       - name: Download shared runtime
-        uses: actions/download-artifact@v4
-        with:
-          name: bench-runtime
-          path: bench/runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          repo = "${{ github.repository }}"
+          run_id = "${{ github.run_id }}"
+          target_name = "bench-runtime"
+          out_dir = Path("bench/runtime")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          proc = subprocess.run(
+              ["gh", "api", f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          artifacts = json.loads(proc.stdout).get("artifacts", [])
+          match = next((a for a in artifacts if a.get("name") == target_name and not a.get("expired")), None)
+          if match is None:
+              raise SystemExit(f"artifact {target_name!r} not found for run {run_id}")
+
+          zip_path = Path("bench-runtime.zip")
+          with zip_path.open("wb") as fh:
+              subprocess.run(
+                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{match['id']}/zip"],
+                  check=True,
+                  stdout=fh,
+              )
+          with zipfile.ZipFile(zip_path) as zf:
+              zf.extractall(out_dir)
+          zip_path.unlink()
+          PY
 
       - name: Run scenario shard
         shell: bash
@@ -429,29 +407,7 @@ jobs:
       BENCH_BLAS_THREADS: "1"
       BENCH_CMD_TIMEOUT_SEC: "10800"
     steps:
-      - name: Download source workspace
-        id: source-download
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-source
-          path: ${{ runner.temp }}/benchmark-source
-
-      - name: Restore source workspace
-        id: source-restore
-        shell: bash
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
-          if [ -f "${src}" ]; then
-            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
-            echo "restored=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "restored=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Fallback checkout
-        if: ${{ steps.source-restore.outputs.restored != 'true' }}
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -467,10 +423,45 @@ jobs:
           r-version: ${{ env.BENCH_R_VERSION }}
 
       - name: Download shared runtime
-        uses: actions/download-artifact@v4
-        with:
-          name: bench-runtime
-          path: bench/runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          repo = "${{ github.repository }}"
+          run_id = "${{ github.run_id }}"
+          target_name = "bench-runtime"
+          out_dir = Path("bench/runtime")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          proc = subprocess.run(
+              ["gh", "api", f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          artifacts = json.loads(proc.stdout).get("artifacts", [])
+          match = next((a for a in artifacts if a.get("name") == target_name and not a.get("expired")), None)
+          if match is None:
+              raise SystemExit(f"artifact {target_name!r} not found for run {run_id}")
+
+          zip_path = Path("bench-runtime.zip")
+          with zip_path.open("wb") as fh:
+              subprocess.run(
+                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{match['id']}/zip"],
+                  check=True,
+                  stdout=fh,
+              )
+          with zipfile.ZipFile(zip_path) as zf:
+              zf.extractall(out_dir)
+          zip_path.unlink()
+          PY
 
       - name: Run scenario shard
         shell: bash
@@ -552,38 +543,59 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Download source workspace
-        id: source-download
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-source
-          path: ${{ runner.temp }}/benchmark-source
-
-      - name: Restore source workspace
-        id: source-restore
-        shell: bash
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
-          if [ -f "${src}" ]; then
-            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
-            echo "restored=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "restored=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Fallback checkout for figure generation
-        if: ${{ steps.source-restore.outputs.restored != 'true' }}
+      - name: Checkout for figure generation
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           sparse-checkout: bench
 
       - name: Download all shard artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: bench/artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          repo = "${{ github.repository }}"
+          run_id = "${{ github.run_id }}"
+          root = Path("bench/artifacts")
+          root.mkdir(parents=True, exist_ok=True)
+
+          proc = subprocess.run(
+              ["gh", "api", f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          artifacts = json.loads(proc.stdout).get("artifacts", [])
+          shard_artifacts = [
+              a for a in artifacts
+              if str(a.get("name", "")).startswith("bench-")
+              and str(a.get("name", "")) != "bench-runtime"
+              and not a.get("expired")
+          ]
+          if not shard_artifacts:
+              raise SystemExit("No shard artifacts found to merge.")
+
+          for artifact in shard_artifacts:
+              artifact_dir = root / str(artifact["name"])
+              artifact_dir.mkdir(parents=True, exist_ok=True)
+              zip_path = artifact_dir.with_suffix(".zip")
+              with zip_path.open("wb") as fh:
+                  subprocess.run(
+                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip"],
+                      check=True,
+                      stdout=fh,
+                  )
+              with zipfile.ZipFile(zip_path) as zf:
+                  zf.extractall(artifact_dir)
+              zip_path.unlink()
+          PY
 
       - name: Merge shard JSON outputs
         shell: bash

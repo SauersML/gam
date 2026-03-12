@@ -33,7 +33,8 @@ use crate::construction::{
 };
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
-    KahanSum, RidgePlanner, StableSolver, addridge, matrix_inversewith_regularization, max_abs_diag,
+    KahanSum, RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
+    matrix_inversewith_regularization, max_abs_diag, row_mismatch_message,
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
@@ -708,26 +709,11 @@ fn compute_smoothing_correction(
     };
 
     // Symmetrize the Hessian
-    for i in 0..n_rho {
-        for j in (i + 1)..n_rho {
-            let avg = 0.5 * (hessian_rho[[i, j]] + hessian_rho[[j, i]]);
-            hessian_rho[[i, j]] = avg;
-            hessian_rho[[j, i]] = avg;
-        }
-    }
+    enforce_symmetry(&mut hessian_rho);
 
     // Step 3: Invert Hessian to get V_rho.
     // Add a small ridge before factorization to regularize weakly identified ρ directions.
-    let ridge = 1e-8
-        * hessian_rho
-            .diag()
-            .iter()
-            .map(|&v| v.abs())
-            .fold(0.0, f64::max)
-            .max(1e-8);
-    for i in 0..n_rho {
-        hessian_rho[[i, i]] += ridge;
-    }
+    let ridge = add_relative_diag_ridge(&mut hessian_rho, 1e-8, 1e-8);
 
     let v_rho = match hessian_rho.cholesky(faer::Side::Lower) {
         Ok(chol) => {
@@ -1174,14 +1160,8 @@ where
         ));
     }
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
 
     use crate::construction::compute_penalty_square_roots;
@@ -2062,14 +2042,8 @@ where
     F: for<'a> FnOnce(&RemlState<'a>, &[DirectionalHyperParam]) -> Result<T, EstimationError>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
     if rho_dim > theta.len() {
         return Err(EstimationError::InvalidInput(format!(
@@ -3666,14 +3640,8 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
 
     let p = x.ncols();
@@ -3739,14 +3707,8 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
 
     let p = x.ncols();
@@ -3814,14 +3776,8 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
     }
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "evaluate_external_thetacostgradient")?;

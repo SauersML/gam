@@ -1,5 +1,5 @@
 use super::*;
-use crate::matrix::{DenseRightProductView, DenseRowScaledView};
+use crate::matrix::DenseRightProductView;
 
 struct JointHyperThetaBlocks<'a> {
     theta: &'a Array1<f64>,
@@ -828,11 +828,9 @@ impl<'a> RemlState<'a> {
         let c = &pirls_result.solve_c_array;
         let d = &pirls_result.solve_d_array;
         let c_tau = d * &eta_tau;
-        let mut weighted = Array2::<f64>::zeros(x_eval.raw_dim());
-        let wx = DenseRowScaledView::new(&x_eval, &pirls_result.solveweights).materialize();
-        let wx_tau = DenseRowScaledView::new(&x_tau_t, &pirls_result.solveweights).materialize();
-        let mut h_tau = x_tau_t.t().dot(&wx)
-            + x_eval.t().dot(&wx_tau)
+        let mut weighted = Array2::<f64>::zeros((0, 0));
+        let mut h_tau = Self::weighted_cross(&x_tau_t, &x_eval, &pirls_result.solveweights)
+            + Self::weighted_cross(&x_eval, &x_tau_t, &pirls_result.solveweights)
             + Self::xt_diag_x_dense_into(&x_eval, &w_tau, &mut weighted)
             + &s_tau_total_t;
         if let Some(op) = firth_op.as_ref() {
@@ -915,12 +913,8 @@ impl<'a> RemlState<'a> {
             // d/dτ [c ⊙ u_k] = c_τ ⊙ u_k + c ⊙ (X_τ B_k) + c ⊙ (X B_{k,τ}).
             let diag_q_tau = &(&c_tau * &u_k) + &(c * &x_tau_bk) + &(c * &u_k_tau);
             let mut h_k_tau = a_k_tau.clone();
-            h_k_tau += &x_tau_t
-                .t()
-                .dot(&DenseRowScaledView::new(&x_eval, &diag_q).materialize());
-            h_k_tau += &x_eval
-                .t()
-                .dot(&DenseRowScaledView::new(&x_tau_t, &diag_q).materialize());
+            h_k_tau += &Self::weighted_cross(&x_tau_t, &x_eval, &diag_q);
+            h_k_tau += &Self::weighted_cross(&x_eval, &x_tau_t, &diag_q);
             h_k_tau += &Self::xt_diag_x_dense_into(&x_eval, &diag_q_tau, &mut weighted);
             let mut d1_trace_correction = 0.0_f64;
             let mut d2_trace_correction = 0.0_f64;
@@ -1230,7 +1224,7 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .map(|_| Vec::<FirthTauPartialKernel>::with_capacity(psi_dim));
         let mut x_tau_beta = vec![Array1::<f64>::zeros(x_eval.nrows()); psi_dim];
-        let mut weighted = Array2::<f64>::zeros(x_eval.raw_dim());
+        let mut weighted = Array2::<f64>::zeros((0, 0));
         for j in 0..psi_dim {
             let x_tau_j = transform_x_tau(&hyper_dirs[j]);
             x_tau_beta[j] = x_tau_j.dot(&beta_eval);
@@ -1865,12 +1859,10 @@ impl<'a> RemlState<'a> {
         //   D_{p,τ} = 2*fit_block and profiled_fit_term = D_{p,τ}/(2φ̂).
 
         let w = &pirls_result.solveweights;
-        let wx = Self::row_scale(&x_dense, w);
         let x_psi_t_dense = x_psi_t.clone();
-        let wx_psi = Self::row_scale(&x_psi_t_dense, w);
-
-        let mut h_psi = x_psi_t_dense.t().dot(&wx);
-        h_psi += &x_dense.t().dot(&wx_psi);
+        let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
+        let mut h_psi = Self::weighted_cross(&x_psi_t_dense, &x_dense, w);
+        h_psi += &Self::weighted_cross(&x_dense, &x_psi_t_dense, w);
 
         match self.config.link_function() {
             LinkFunction::Identity => {
@@ -1925,7 +1917,6 @@ impl<'a> RemlState<'a> {
                     &pirls_result.solveweights,
                     &eta_psi,
                 )?;
-                let mut xwpsi = x_dense.clone();
                 match &w_direction {
                     // Directional curvature derivative:
                     //   W_τ = T[η̇].
@@ -1934,13 +1925,13 @@ impl<'a> RemlState<'a> {
                     // this derivative. Built-in links are diagonal in observation space,
                     // so the operator is represented by the per-row vector `w_direction`.
                     DirectionalWorkingCurvature::Diagonal(w_direction) => {
-                        xwpsi = Self::row_scale(&xwpsi, w_direction);
+                        h_psi +=
+                            &Self::xt_diag_x_dense_into(&x_dense, w_direction, &mut weighted_xtdx);
                     }
                 }
                 // Exact total curvature derivative:
                 //   H_τ = d/dτ(X^T W X + S)
                 //       = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ.
-                h_psi += &x_dense.t().dot(&xwpsi);
                 h_psi += &s_psi_total_t;
                 if let Some(op) = firth_op.as_ref() {
                     // Firth-adjusted curvature surface:
