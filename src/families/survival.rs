@@ -314,6 +314,40 @@ impl SurvivalDesign {
     }
 }
 
+/// Pre-allocated workspace buffers for `update_state` to avoid per-iteration allocations.
+#[derive(Debug, Clone)]
+struct SurvivalWorkspace {
+    w_event: Array1<f64>,
+    w_event_inv_deriv: Array1<f64>,
+    w_event_outer: Array1<f64>,
+    w_hess_exit: Array1<f64>,
+    w_hess_entry: Array1<f64>,
+}
+
+impl SurvivalWorkspace {
+    fn new(n: usize) -> Self {
+        Self {
+            w_event: Array1::zeros(n),
+            w_event_inv_deriv: Array1::zeros(n),
+            w_event_outer: Array1::zeros(n),
+            w_hess_exit: Array1::zeros(n),
+            w_hess_entry: Array1::zeros(n),
+        }
+    }
+
+    fn reset(&mut self, n: usize) {
+        if self.w_event.len() != n {
+            *self = Self::new(n);
+        } else {
+            self.w_event.fill(0.0);
+            self.w_event_inv_deriv.fill(0.0);
+            self.w_event_outer.fill(0.0);
+            self.w_hess_exit.fill(0.0);
+            self.w_hess_entry.fill(0.0);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
@@ -329,6 +363,7 @@ pub struct WorkingModelSurvival {
     monotonicity: MonotonicityPenalty,
     structurally_monotonic: bool,
     structural_time_columns: usize,
+    workspace: SurvivalWorkspace,
 }
 
 impl WorkingModelSurvival {
@@ -741,7 +776,7 @@ impl WorkingModelSurvival {
         event_target: &ArrayView1<u8>,
         event_competing: &ArrayView1<u8>,
         sampleweight: &ArrayView1<f64>,
-        design_matrices: &[&dyn ndarray::RawData],
+        _design_matrices: &[usize],
     ) -> Result<(), SurvivalError> {
         if age_entry.iter().any(|v| !v.is_finite())
             || age_exit.iter().any(|v| !v.is_finite())
@@ -770,6 +805,7 @@ impl WorkingModelSurvival {
         penalties: PenaltyBlocks,
         monotonicity: MonotonicityPenalty,
     ) -> Self {
+        let n = age_entry.len();
         Self {
             age_entry: age_entry.to_owned(),
             age_exit: age_exit.to_owned(),
@@ -784,6 +820,7 @@ impl WorkingModelSurvival {
             monotonicity,
             structurally_monotonic: false,
             structural_time_columns: 0,
+            workspace: SurvivalWorkspace::new(n),
         }
     }
 

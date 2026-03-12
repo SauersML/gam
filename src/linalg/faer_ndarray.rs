@@ -307,14 +307,7 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_ref = vview.as_ref();
 
     let par = matmul_parallelism(n, 1, p);
-    matmul(
-        result.as_mut(),
-        Accum::Replace,
-        a_ref,
-        v_ref,
-        1.0,
-        par,
-    );
+    matmul(result.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
 
     let mut out = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -350,14 +343,7 @@ pub fn fast_av_into<S: Data<Elem = f64>>(
     let a_ref = aview.as_ref();
     let v_ref = vview.as_ref();
     let par = matmul_parallelism(n, 1, p);
-    matmul(
-        outview.as_mut(),
-        Accum::Replace,
-        a_ref,
-        v_ref,
-        1.0,
-        par,
-    );
+    matmul(outview.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
 }
 
 /// Compute A^T * v into a pre-allocated output buffer.
@@ -446,9 +432,9 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
 ) -> Array2<f64> {
-    use faer::linalg::matmul::matmul;
     use faer::Accum;
-    use ndarray::{s, ShapeBuilder};
+    use faer::linalg::matmul::matmul;
+    use ndarray::{ShapeBuilder, s};
 
     let (n, p) = x.dim();
     debug_assert_eq!(n, w.len(), "X rows must match W length");
@@ -464,7 +450,9 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 131_072;
-    let chunk_rows = (TARGET_BYTES / (p.max(1) * 8)).clamp(MIN_ROWS, MAX_ROWS).min(n);
+    let chunk_rows = (TARGET_BYTES / (p.max(1) * 8))
+        .clamp(MIN_ROWS, MAX_ROWS)
+        .min(n);
 
     let mut result = Array2::<f64>::zeros((p, p).f());
     let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
@@ -505,9 +493,9 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
-    use faer::linalg::matmul::matmul;
     use faer::Accum;
-    use ndarray::{s, ShapeBuilder};
+    use faer::linalg::matmul::matmul;
+    use ndarray::{ShapeBuilder, s};
 
     let (n, q) = y.dim();
     let px = x.ncols();
@@ -526,7 +514,9 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 131_072;
     let total_cols = px + q;
-    let chunk_rows = (TARGET_BYTES / (total_cols.max(1) * 8)).clamp(MIN_ROWS, MAX_ROWS).min(n);
+    let chunk_rows = (TARGET_BYTES / (total_cols.max(1) * 8))
+        .clamp(MIN_ROWS, MAX_ROWS)
+        .min(n);
 
     let mut result = Array2::<f64>::zeros((px, q).f());
     let mut wy_chunk = Array2::<f64>::zeros((chunk_rows, q).f());

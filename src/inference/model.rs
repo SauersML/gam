@@ -668,11 +668,9 @@ impl FittedModel {
         if needs_covariance {
             if let Some(fit) = self.fit_result.as_ref() {
                 if fit.beta_covariance().is_none() {
-                    return Err(
-                        "nonlinear model is missing beta_covariance in fit_result; \
+                    return Err("nonlinear model is missing beta_covariance in fit_result; \
                          posterior-mean prediction requires covariance at save time"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
             }
         }

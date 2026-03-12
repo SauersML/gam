@@ -48,11 +48,11 @@ pub use families::strategy::{
 };
 pub use families::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
-    ResidualDistributionOps, TimeDependentCovariateBlockInput,
-    SurvivalLocationScaleFitResult, SurvivalLocationScalePredictInput,
+    ResidualDistributionOps, SurvivalLocationScaleFitResult, SurvivalLocationScalePredictInput,
     SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
-    SurvivalLocationScaleSpec, TimeBlockInput, fit_survival_location_scale,
-    predict_survival_location_scale, predict_survival_location_scale_posterior_mean,
+    SurvivalLocationScaleSpec, TimeBlockInput, TimeDependentCovariateBlockInput,
+    fit_survival_location_scale, predict_survival_location_scale,
+    predict_survival_location_scale_posterior_mean,
     predict_survival_location_scalewith_uncertainty,
 };
 pub use inference::alo::{

@@ -65,9 +65,9 @@ use gam::smoothing::{SmoothingBfgsOptions, optimize_log_smoothingwithmultistart}
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
-    SurvivalLocationScalePredictInput, SurvivalLocationScaleSpec,
-    TimeDependentCovariateBlockInput, TimeBlockInput, fit_survival_location_scale,
-    predict_survival_location_scale, residual_distribution_inverse_link,
+    SurvivalLocationScalePredictInput, SurvivalLocationScaleSpec, TimeBlockInput,
+    TimeDependentCovariateBlockInput, fit_survival_location_scale, predict_survival_location_scale,
+    residual_distribution_inverse_link,
 };
 use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
@@ -3055,10 +3055,7 @@ fn build_survival_time_basis(
     // including them in knot placement would set the boundary knot far from
     // actual observation times, creating saturated I-spline columns collinear
     // with the intercept. Use only exit times in that case.
-    fn survival_time_knot_input(
-        log_entry: &Array1<f64>,
-        log_exit: &Array1<f64>,
-    ) -> Array1<f64> {
+    fn survival_time_knot_input(log_entry: &Array1<f64>, log_exit: &Array1<f64>) -> Array1<f64> {
         let n = log_entry.len();
         let entry_range = log_entry
             .iter()
@@ -9914,7 +9911,9 @@ mod tests {
                 gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum
             ),
             "unexpected PIRLS status: {:?} after {} iterations, grad_norm={:.3e}",
-            summary.status, summary.iterations, summary.lastgradient_norm
+            summary.status,
+            summary.iterations,
+            summary.lastgradient_norm
         );
         let beta = summary.beta.as_ref().to_owned();
         let eta = time_build.x_exit_time.dot(&beta);
@@ -12221,8 +12220,7 @@ mod tests {
         let age_entry_days = Array1::from_vec(vec![10.0, 20.0, 40.0, 80.0, 120.0, 160.0]);
         let age_exit_days = Array1::from_vec(vec![15.0, 35.0, 60.0, 100.0, 150.0, 220.0]);
         let event_target = Array1::from_vec(vec![1u8, 0u8, 1u8, 0u8, 1u8, 1u8]);
-        let knots_days =
-            Array1::from_vec(vec![2.0, 2.0, 2.0, 2.0, 4.0, 5.5, 5.5, 5.5, 5.5]);
+        let knots_days = Array1::from_vec(vec![2.0, 2.0, 2.0, 2.0, 4.0, 5.5, 5.5, 5.5, 5.5]);
 
         let (eta_days, surv_days, deviance_days) = fit_structural_survival_eta_for_unit_test(
             &age_entry_days,

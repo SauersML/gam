@@ -20,7 +20,6 @@ use crate::types::{
     MixtureLinkState, RidgePassport, RidgePolicy, SasLinkSpec, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::sparse::linalg::matmul::{
@@ -34,6 +33,7 @@ use log;
 use ndarray::{
     Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Data, Ix1, Ix2, ShapeBuilder, Zip, s,
 };
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
@@ -146,7 +146,8 @@ fn fmt_opt_usize(v: Option<usize>) -> String {
 }
 
 fn fmt_opt_f64(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.4}")).unwrap_or_else(|| "na".to_string())
+    v.map(|v| format!("{v:.4}"))
+        .unwrap_or_else(|| "na".to_string())
 }
 
 impl SparsePirlsDecision {
@@ -188,7 +189,6 @@ impl SparsePirlsDecision {
             );
         }
     }
-
 }
 
 fn pirls_decision_repetition_count(log_key: String) -> usize {
@@ -598,7 +598,12 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        Ok(calculate_deviance(y, mu, self.link_function(), priorweights))
+        Ok(calculate_deviance(
+            y,
+            mu,
+            self.link_function(),
+            priorweights,
+        ))
     }
 
     fn log_likelihood(
@@ -828,7 +833,9 @@ impl PirlsWorkspace {
                 })
                 .collect();
             for partial in &partial_sums {
-                Zip::from(&mut *out).and(partial).for_each(|o, &p_val| *o += p_val);
+                Zip::from(&mut *out)
+                    .and(partial)
+                    .for_each(|o, &p_val| *o += p_val);
             }
         } else {
             // Sequential: reuse workspace chunk buffer
@@ -1279,28 +1286,16 @@ impl<'a> GamWorkingModel<'a> {
     fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                let xtwx = Self::compute_xtwx_blas(
-                    &mut self.workspace,
-                    x_transformed,
-                    weights,
-                )?;
+                let xtwx = Self::compute_xtwx_blas(&mut self.workspace, x_transformed, weights)?;
                 Ok(xtwx + &self.s_transformed)
             }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
-                let xtwx = Self::compute_xtwx_blas(
-                    &mut self.workspace,
-                    &self.x_original,
-                    weights,
-                )?;
+                let xtwx = Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
                 let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);
                 Ok(fast_ab(&tmp, qs) + &self.s_transformed)
             }
             WorkingCoordinateDesign::OriginalSparseNative => {
-                let xtwx = Self::compute_xtwx_blas(
-                    &mut self.workspace,
-                    &self.x_original,
-                    weights,
-                )?;
+                let xtwx = Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
                 Ok(xtwx + &self.s_transformed)
             }
         }
@@ -1607,9 +1602,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             )),
             gradient,
             hessian: match sparsehessian {
-                Some(h_sparse) => {
-                    crate::linalg::matrix::SymmetricMatrix::Sparse(h_sparse)
-                }
+                Some(h_sparse) => crate::linalg::matrix::SymmetricMatrix::Sparse(h_sparse),
                 None => crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian),
             },
 
@@ -3410,10 +3403,8 @@ where
                     // ridge, sending eta to extreme values where the gradient
                     // overflows.  Treating these as rejected steps lets the
                     // LM damping increase until the step is tamed.
-                    let candidate_grad_finite = candidate_state
-                        .gradient
-                        .iter()
-                        .all(|g| g.is_finite());
+                    let candidate_grad_finite =
+                        candidate_state.gradient.iter().all(|g| g.is_finite());
                     let candidate_max_eta = candidate_state
                         .eta
                         .iter()
@@ -5059,8 +5050,7 @@ pub fn update_glmvectors(
                     let numer1 = n1 * v - n0 * v1;
                     derivs.c[i] = priorweights[i] * numer1 / (v * v);
                     derivs.d[i] = priorweights[i]
-                        * ((n2 * v - n0 * v2) / (v * v)
-                            - 2.0 * numer1 * v1 / (v * v * v));
+                        * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
                 }
                 derivs.dmu_deta[i] = d1;
                 derivs.d2mu_deta2[i] = d2;
@@ -6690,7 +6680,10 @@ mod root_cause_tests {
         assert!(
             rho > 0.0,
             "near-zero reductions should not hard-reject; rho={:.1}, pred={:.2e}, actual={:.2e}, noise={:.2e}",
-            rho, predicted_reduction, actual_reduction, noise_floor
+            rho,
+            predicted_reduction,
+            actual_reduction,
+            noise_floor
         );
     }
 }

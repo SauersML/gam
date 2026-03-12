@@ -201,7 +201,11 @@ mod tests {
 
         // This panicked with solve_in_place; should succeed with solve_lstsq_in_place
         let result = solveweighted_projection_dense(&design, &target, &weights);
-        assert!(result.is_ok(), "overdetermined solve failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "overdetermined solve failed: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap().len(), p);
     }
 

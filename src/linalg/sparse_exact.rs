@@ -208,7 +208,10 @@ pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>)
     dense
 }
 
-fn sparse_matvec<S: Data<Elem = f64>>(matrix: &SparseColMat<usize, f64>, vector: &ArrayBase<S, Ix1>) -> Array1<f64> {
+fn sparse_matvec<S: Data<Elem = f64>>(
+    matrix: &SparseColMat<usize, f64>,
+    vector: &ArrayBase<S, Ix1>,
+) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(matrix.nrows());
     let (symbolic, values) = matrix.parts();
     let col_ptr = symbolic.col_ptr();

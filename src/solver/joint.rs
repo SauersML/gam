@@ -2149,11 +2149,11 @@ impl<'a> JointRemlState<'a> {
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
         let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) =
-            h_mat.eigh(Side::Lower).map_err(|_| {
-                EstimationError::ModelIsIllConditioned {
+            h_mat
+                .eigh(Side::Lower)
+                .map_err(|_| EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
-                }
-            })?;
+                })?;
         let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
         let h_tol = (h_max_eig * 1e-12).max(1e-100);
         let mut h_min_pos = f64::INFINITY;

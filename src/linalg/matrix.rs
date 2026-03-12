@@ -1,8 +1,10 @@
-use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_xt_diag_x};
+use crate::faer_ndarray::{
+    FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_xt_diag_x,
+};
 use crate::types::RidgePolicy;
+use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use faer::Accum;
 use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder, s};
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -1066,9 +1068,19 @@ impl LinearOperator for DenseRightProductView<'_> {
         let rhs;
         let v = match (self.second, self.first) {
             (None, None) => vector,
-            (Some(s), None) => { rhs = fast_av(s, vector); &rhs }
-            (None, Some(f)) => { rhs = fast_av(f, vector); &rhs }
-            (Some(s), Some(f)) => { let tmp = fast_av(s, vector); rhs = fast_av(f, &tmp); &rhs }
+            (Some(s), None) => {
+                rhs = fast_av(s, vector);
+                &rhs
+            }
+            (None, Some(f)) => {
+                rhs = fast_av(f, vector);
+                &rhs
+            }
+            (Some(s), Some(f)) => {
+                let tmp = fast_av(s, vector);
+                rhs = fast_av(f, &tmp);
+                &rhs
+            }
         };
         dense_matvec(self.base, v)
     }
@@ -1155,7 +1167,9 @@ impl LinearOperator for DenseRowScaledView<'_> {
                 self.nrows()
             ));
         }
-        let combined = Array1::from_shape_fn(weights.len(), |i| weights[i] * self.scale[i] * self.scale[i]);
+        let combined = Array1::from_shape_fn(weights.len(), |i| {
+            weights[i] * self.scale[i] * self.scale[i]
+        });
         Ok(fast_xt_diag_x(self.matrix, &combined))
     }
 
@@ -1172,7 +1186,8 @@ impl LinearOperator for DenseRowScaledView<'_> {
                 self.nrows()
             ));
         }
-        let combined = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0) * self.scale[i]);
+        let combined =
+            Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0) * self.scale[i]);
         Ok(dense_transpose_matvec(self.matrix, &combined))
     }
 
@@ -1290,10 +1305,7 @@ fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Ar
     const TARGET_BYTES: usize = 2 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 2048;
-    let chunk_rows = (TARGET_BYTES / (p * 8))
-        .max(MIN_ROWS)
-        .min(MAX_ROWS)
-        .min(n);
+    let chunk_rows = (TARGET_BYTES / (p * 8)).max(MIN_ROWS).min(MAX_ROWS).min(n);
 
     let par = faer::get_global_parallelism();
     let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
