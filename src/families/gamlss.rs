@@ -3868,15 +3868,16 @@ fn gaussian_joint_psihessian_fromweights(
     x_ls_psi: &Array2<f64>,
     weights: &GaussianJointPsiFirstWeights,
 ) -> Result<Array2<f64>, String> {
-    let hmumu = xt_diag_y_dense(xmu_psi, &weights.hmumu, xmu)?
-        + &xt_diag_y_dense(xmu, &weights.hmumu, xmu_psi)?
-        + &xt_diag_x_dense(xmu, &weights.dhmumu)?;
+    // For the symmetric blocks (hmumu, h_ls_ls), the pair
+    //   X_psi^T D X  and  X^T D X_psi
+    // are transposes of each other, so compute one and add its transpose.
+    let a_mu = xt_diag_y_dense(xmu_psi, &weights.hmumu, xmu)?;
+    let hmumu = &a_mu + &a_mu.t() + &xt_diag_x_dense(xmu, &weights.dhmumu)?;
     let hmu_ls = xt_diag_y_dense(xmu_psi, &weights.hmu_ls, x_ls)?
         + &xt_diag_y_dense(xmu, &weights.hmu_ls, x_ls_psi)?
         + &xt_diag_y_dense(xmu, &weights.dhmu_ls, x_ls)?;
-    let h_ls_ls = xt_diag_y_dense(x_ls_psi, &weights.h_ls_ls, x_ls)?
-        + &xt_diag_y_dense(x_ls, &weights.h_ls_ls, x_ls_psi)?
-        + &xt_diag_x_dense(x_ls, &weights.dh_ls_ls)?;
+    let a_ls = xt_diag_y_dense(x_ls_psi, &weights.h_ls_ls, x_ls)?;
+    let h_ls_ls = &a_ls + &a_ls.t() + &xt_diag_x_dense(x_ls, &weights.dh_ls_ls)?;
     Ok(gaussian_pack_joint_symmetrichessian(
         &hmumu, &hmu_ls, &h_ls_ls,
     ))
@@ -3895,15 +3896,22 @@ fn gaussian_joint_psisecondhessian_fromweights(
     weights_j: &GaussianJointPsiFirstWeights,
     secondweights: &GaussianJointPsiSecondWeights,
 ) -> Result<Array2<f64>, String> {
-    let hmumu = xt_diag_y_dense(xmu_ab, &weights_i.hmumu, xmu)?
-        + &xt_diag_y_dense(xmu_i, &weights_i.hmumu, xmu_j)?
-        + &xt_diag_y_dense(xmu_j, &weights_i.hmumu, xmu_i)?
-        + &xt_diag_y_dense(xmu_i, &weights_j.dhmumu, xmu)?
-        + &xt_diag_y_dense(xmu_j, &weights_i.dhmumu, xmu)?
-        + &xt_diag_y_dense(xmu, &weights_i.dhmumu, xmu_j)?
-        + &xt_diag_y_dense(xmu, &weights_j.dhmumu, xmu_i)?
-        + &xt_diag_x_dense(xmu, &secondweights.d2hmumu)?
-        + &xt_diag_y_dense(xmu, &weights_i.hmumu, xmu_ab)?;
+    // Exploit transpose symmetry: X_a^T D X_b and X_b^T D X_a are transposes.
+    // For each such pair in the symmetric blocks (hmumu, h_ls_ls), compute one
+    // and add its transpose, halving the number of O(np²) products.
+    let a_ab_mu = xt_diag_y_dense(xmu_ab, &weights_i.hmumu, xmu)?;
+    let a_ij_mu = xt_diag_y_dense(xmu_i, &weights_i.hmumu, xmu_j)?;
+    let a_iwj_mu = xt_diag_y_dense(xmu_i, &weights_j.dhmumu, xmu)?;
+    let a_jwi_mu = xt_diag_y_dense(xmu_j, &weights_i.dhmumu, xmu)?;
+    let hmumu = &a_ab_mu
+        + &a_ab_mu.t()
+        + &a_ij_mu
+        + &a_ij_mu.t()
+        + &a_iwj_mu
+        + &a_iwj_mu.t()
+        + &a_jwi_mu
+        + &a_jwi_mu.t()
+        + &xt_diag_x_dense(xmu, &secondweights.d2hmumu)?;
     let hmu_ls = xt_diag_y_dense(xmu_ab, &weights_i.hmu_ls, x_ls)?
         + &xt_diag_y_dense(xmu_i, &weights_i.hmu_ls, x_ls_j)?
         + &xt_diag_y_dense(xmu_j, &weights_i.hmu_ls, x_ls_i)?
@@ -3913,15 +3921,19 @@ fn gaussian_joint_psisecondhessian_fromweights(
         + &xt_diag_y_dense(xmu, &weights_j.dhmu_ls, x_ls_i)?
         + &xt_diag_y_dense(xmu, &secondweights.d2hmu_ls, x_ls)?
         + &xt_diag_y_dense(xmu, &weights_i.hmu_ls, x_ls_ab)?;
-    let h_ls_ls = xt_diag_y_dense(x_ls_ab, &weights_i.h_ls_ls, x_ls)?
-        + &xt_diag_y_dense(x_ls_i, &weights_i.h_ls_ls, x_ls_j)?
-        + &xt_diag_y_dense(x_ls_j, &weights_i.h_ls_ls, x_ls_i)?
-        + &xt_diag_y_dense(x_ls_i, &weights_j.dh_ls_ls, x_ls)?
-        + &xt_diag_y_dense(x_ls_j, &weights_i.dh_ls_ls, x_ls)?
-        + &xt_diag_y_dense(x_ls, &weights_i.dh_ls_ls, x_ls_j)?
-        + &xt_diag_y_dense(x_ls, &weights_j.dh_ls_ls, x_ls_i)?
-        + &xt_diag_x_dense(x_ls, &secondweights.d2h_ls_ls)?
-        + &xt_diag_y_dense(x_ls, &weights_i.h_ls_ls, x_ls_ab)?;
+    let a_ab_ls = xt_diag_y_dense(x_ls_ab, &weights_i.h_ls_ls, x_ls)?;
+    let a_ij_ls = xt_diag_y_dense(x_ls_i, &weights_i.h_ls_ls, x_ls_j)?;
+    let a_iwj_ls = xt_diag_y_dense(x_ls_i, &weights_j.dh_ls_ls, x_ls)?;
+    let a_jwi_ls = xt_diag_y_dense(x_ls_j, &weights_i.dh_ls_ls, x_ls)?;
+    let h_ls_ls = &a_ab_ls
+        + &a_ab_ls.t()
+        + &a_ij_ls
+        + &a_ij_ls.t()
+        + &a_iwj_ls
+        + &a_iwj_ls.t()
+        + &a_jwi_ls
+        + &a_jwi_ls.t()
+        + &xt_diag_x_dense(x_ls, &secondweights.d2h_ls_ls)?;
     Ok(gaussian_pack_joint_symmetrichessian(
         &hmumu, &hmu_ls, &h_ls_ls,
     ))
@@ -3934,15 +3946,13 @@ fn gaussian_joint_psi_mixedhessian_drift_fromweights(
     x_ls_psi: &Array2<f64>,
     mixedweights: &GaussianJointPsiMixedDriftWeights,
 ) -> Result<Array2<f64>, String> {
-    let hmumu = xt_diag_y_dense(xmu_psi, &mixedweights.dhmumu_u, xmu)?
-        + &xt_diag_y_dense(xmu, &mixedweights.dhmumu_u, xmu_psi)?
-        + &xt_diag_x_dense(xmu, &mixedweights.d2hmumu)?;
+    let a_mu = xt_diag_y_dense(xmu_psi, &mixedweights.dhmumu_u, xmu)?;
+    let hmumu = &a_mu + &a_mu.t() + &xt_diag_x_dense(xmu, &mixedweights.d2hmumu)?;
     let hmu_ls = xt_diag_y_dense(xmu_psi, &mixedweights.dhmu_ls_u, x_ls)?
         + &xt_diag_y_dense(xmu, &mixedweights.dhmu_ls_u, x_ls_psi)?
         + &xt_diag_y_dense(xmu, &mixedweights.d2hmu_ls, x_ls)?;
-    let h_ls_ls = xt_diag_y_dense(x_ls_psi, &mixedweights.dh_ls_ls_u, x_ls)?
-        + &xt_diag_y_dense(x_ls, &mixedweights.dh_ls_ls_u, x_ls_psi)?
-        + &xt_diag_x_dense(x_ls, &mixedweights.d2h_ls_ls)?;
+    let a_ls = xt_diag_y_dense(x_ls_psi, &mixedweights.dh_ls_ls_u, x_ls)?;
+    let h_ls_ls = &a_ls + &a_ls.t() + &xt_diag_x_dense(x_ls, &mixedweights.d2h_ls_ls)?;
     Ok(gaussian_pack_joint_symmetrichessian(
         &hmumu, &hmu_ls, &h_ls_ls,
     ))
