@@ -428,16 +428,23 @@ fn validate_term_datarows(context: &str, expected: usize, found: usize) -> Resul
     Ok(())
 }
 
+fn validate_term_weights(
+    data: ndarray::ArrayView2<'_, f64>,
+    y_len: usize,
+    weights: &Array1<f64>,
+    context: &str,
+) -> Result<(), String> {
+    validate_term_datarows(context, y_len, data.nrows())?;
+    validate_len_match("weights vs y", y_len, weights.len())?;
+    validateweights(weights, context)
+}
+
 fn validate_gaussian_location_scale_termspec(
     data: ndarray::ArrayView2<'_, f64>,
     spec: &GaussianLocationScaleTermSpec,
     context: &str,
 ) -> Result<(), String> {
-    let n = spec.y.len();
-    validate_term_datarows(context, n, data.nrows())?;
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, context)?;
-    Ok(())
+    validate_term_weights(data, spec.y.len(), &spec.weights, context)
 }
 
 fn validate_binomial_location_scale_termspec(
@@ -445,10 +452,7 @@ fn validate_binomial_location_scale_termspec(
     spec: &BinomialLocationScaleTermSpec,
     context: &str,
 ) -> Result<(), String> {
-    let n = spec.y.len();
-    validate_term_datarows(context, n, data.nrows())?;
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, context)?;
+    validate_term_weights(data, spec.y.len(), &spec.weights, context)?;
     validate_binomial_response(&spec.y, context)?;
     Ok(())
 }
@@ -459,9 +463,7 @@ fn validate_binomial_location_scalewiggle_termspec(
     context: &str,
 ) -> Result<(), String> {
     let n = spec.y.len();
-    validate_term_datarows(context, n, data.nrows())?;
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, context)?;
+    validate_term_weights(data, n, &spec.weights, context)?;
     validate_binomial_response(&spec.y, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     if spec.wiggle_degree < 1 {
@@ -5446,6 +5448,68 @@ impl BinomialLocationScaleFamily {
             &x_ls,
             d_beta_u_flat,
             d_betav_flat,
+        )
+    }
+
+    fn exact_newton_joint_psi_terms_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_terms_from_designs(
+            block_states,
+            specs,
+            derivative_blocks,
+            psi_index,
+            &x_t,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psisecond_order_terms_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psisecond_order_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            &x_t,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psihessian_directional_derivative_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &x_t,
+            &x_ls,
         )
     }
 

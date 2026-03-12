@@ -1368,11 +1368,12 @@ impl HyperDesignDerivative {
                     qs.nrows()
                 )));
             }
-            let qs_local = qs.slice(s![global_range.clone(), ..]).to_owned();
-            Ok(crate::matrix::DenseRightProductView::new(local)
-                .with_factor(&qs_local)
-                .with_optional_factor(free_basis_opt)
-                .materialize())
+            let qs_local = qs.slice(s![global_range.clone(), ..]);
+            let mut transformed = local.dot(&qs_local);
+            if let Some(z) = free_basis_opt {
+                transformed = transformed.dot(z);
+            }
+            Ok(transformed)
         } else {
             Ok(crate::matrix::DenseRightProductView::new(
                 self.dense
@@ -1435,21 +1436,6 @@ impl HyperPenaltyDerivative {
         self.nrows()
     }
 
-    pub(crate) fn materialize(&self) -> Array2<f64> {
-        if let Some(dense) = self.dense.as_ref() {
-            return dense.clone();
-        }
-        let (local, global_range, total_dim) = self
-            .embedded
-            .as_ref()
-            .expect("HyperPenaltyDerivative must be dense or embedded");
-        let mut dense = Array2::<f64>::zeros((*total_dim, *total_dim));
-        dense
-            .slice_mut(s![global_range.clone(), global_range.clone()])
-            .assign(local);
-        dense
-    }
-
     pub(crate) fn scaled_materialize(&self, amp: f64) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.nrows(), self.ncols()));
         self.scaled_add_to(&mut out, amp)
@@ -1470,7 +1456,7 @@ impl HyperPenaltyDerivative {
                     qs.nrows()
                 )));
             }
-            let qs_local = qs.slice(s![global_range.clone(), ..]).to_owned();
+            let qs_local = qs.slice(s![global_range.clone(), ..]);
             let mut transformed = qs_local.t().dot(local).dot(&qs_local);
             if let Some(z) = free_basis_opt {
                 transformed = z.t().dot(&transformed).dot(z);

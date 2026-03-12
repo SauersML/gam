@@ -22,6 +22,11 @@
 
 use self::reml::{DirectionalHyperParam, RemlState};
 use crate::basis::analyze_penalty_block;
+use crate::estimation_numerics::{
+    FdGradientState, compute_fd_gradient, faer_frob_inner, kahan_sum,
+    smooth_floor_dp as smooth_floor_dp_impl,
+    validate_full_size_penalties as validate_full_size_penalties_impl,
+};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::fmt;
 use std::time::Instant;
@@ -33,7 +38,7 @@ use crate::construction::{
 };
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
-    KahanSum, RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
+    RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
     matrix_inversewith_regularization, max_abs_diag, row_mismatch_message,
 };
 use crate::matrix::DesignMatrix;
@@ -69,41 +74,18 @@ use serde::{Deserialize, Serialize};
 // The SE is passed through to PIRLS which integrates over uncertainty
 // in the likelihood, rather than using ad-hoc weight adjustment.
 
-fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
-    let (m, n) = (a.nrows(), a.ncols());
-    // Hot-path optimization:
-    // - small matrices: plain accumulation is faster and sufficiently accurate
-    // - larger matrices: compensated (Kahan) sum protects trace/EDF numerics
-    const KAHAN_SWITCH_ELEMS: usize = 10_000;
-    let elem_count = m.saturating_mul(n);
-    if elem_count < KAHAN_SWITCH_ELEMS {
-        let mut sum = 0.0_f64;
-        for j in 0..n {
-            for i in 0..m {
-                sum += a[(i, j)] * b[(i, j)];
-            }
-        }
-        sum
-    } else {
-        let mut sum = KahanSum::default();
-        for j in 0..n {
-            for i in 0..m {
-                sum.add(a[(i, j)] * b[(i, j)]);
-            }
-        }
-        sum.sum()
+impl FdGradientState<EstimationError> for RemlState<'_> {
+    fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        RemlState::compute_cost(self, rho)
     }
-}
 
-fn kahan_sum<I>(iter: I) -> f64
-where
-    I: IntoIterator<Item = f64>,
-{
-    let mut acc = KahanSum::default();
-    for value in iter {
-        acc.add(value);
+    fn compute_gradient(&self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        RemlState::compute_gradient(self, rho)
     }
-    acc.sum()
+
+    fn last_ridge_used(&self) -> Option<f64> {
+        RemlState::lastridge_used(self)
+    }
 }
 
 fn signed_xtv_x(
@@ -496,17 +478,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
 const LAML_RIDGE: f64 = 1e-8;
-const MAX_PIRLS_CACHE_ENTRIES: usize = 128;
-/// Smallest penalized deviance value we allow when profiling the Gaussian scale.
-/// Prevents logarithms and divisions by nearly-zero D_p from destabilizing the
-/// REML objective and its gradient in near-perfect-fit regimes.
 const DP_FLOOR: f64 = 1e-12;
-/// Width for the smooth deviance floor transition.
-///
-/// Kept generous (1e-8) so that finite-difference probes cannot straddle a
-/// sharp kink when the penalized deviance is near zero, yet still tiny relative
-/// to the typical residual sums of squares encountered during estimation.
 const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
+const MAX_PIRLS_CACHE_ENTRIES: usize = 128;
 // Unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
 // Additional headroom reduces frequent contact with the hard box constraints.
 pub(crate) const RHO_BOUND: f64 = 30.0;
@@ -524,30 +498,7 @@ const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
 ///
 /// Returns the smoothed value and its derivative with respect to `dp`.
 fn smooth_floor_dp(dp: f64) -> (f64, f64) {
-    // Degenerate tau would reduce to the original hard max; guard against it.
-    let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
-    let scaled = (dp - DP_FLOOR) / tau;
-
-    // Stable softplus implementation.
-    let softplus = if scaled > 20.0 {
-        scaled + (-scaled).exp()
-    } else if scaled < -20.0 {
-        scaled.exp()
-    } else {
-        (1.0 + scaled.exp()).ln()
-    };
-
-    // Logistic function (softplus derivative) evaluated stably.
-    let sigma = if scaled >= 0.0 {
-        let exp_neg = (-scaled).exp();
-        1.0 / (1.0 + exp_neg)
-    } else {
-        let exp_pos = scaled.exp();
-        exp_pos / (1.0 + exp_pos)
-    };
-
-    let dp_c = DP_FLOOR + tau * softplus;
-    (dp_c, sigma)
+    smooth_floor_dp_impl(dp, DP_FLOOR, DP_FLOOR_SMOOTH_WIDTH)
 }
 
 /// Compute the smoothing parameter uncertainty correction matrix `V_corr = J * V_rho * J^T`.
@@ -1046,15 +997,7 @@ fn validate_full_size_penalties(
     p: usize,
     context: &str,
 ) -> Result<(), EstimationError> {
-    for (idx, s) in s_list.iter().enumerate() {
-        let (rows, cols) = s.dim();
-        if rows != p || cols != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "{context}: penalty matrix {idx} must be {p}x{p}, got {rows}x{cols}"
-            )));
-        }
-    }
-    Ok(())
+    validate_full_size_penalties_impl(s_list, p, context, EstimationError::InvalidInput)
 }
 
 fn canonicalize_active_penalties(
@@ -3236,12 +3179,6 @@ where
     fit_gamwith_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
 }
 
-/// Computes the gradient of the LAML cost function using the central finite-difference method.
-const FD_REL_GAP_THRESHOLD: f64 = 0.2;
-const FD_MIN_BASE_STEP: f64 = 1e-6;
-const FD_MAX_REFINEMENTS: usize = 4;
-const FD_RIDGE_REL_JITTER_THRESHOLD: f64 = 1e-3;
-const FD_RIDGE_ABS_JITTER_THRESHOLD: f64 = 1e-12;
 const GRAD_DIAG_FD_WARMUP_EVALS: u64 = 5;
 const GRAD_DIAG_FD_INTERVAL: u64 = 25;
 const GRAD_DIAG_SEVERE_KKT_NORM: f64 = 1e-2;
@@ -3343,287 +3280,11 @@ fn should_enable_firth_from_class_support(minority_support: f64, n_features: usi
     minority_support < complexity_threshold
 }
 
-struct FdEval {
-    f_p: f64,
-    f_m: f64,
-    f_p2: f64,
-    f_m2: f64,
-    d_small: f64,
-    d_big: f64,
-    ridge_min: f64,
-    ridge_max: f64,
-    ridge_rel_span: f64,
-    ridge_jitter: bool,
-}
-
-fn evaluatefd_pair(
-    reml_state: &RemlState,
-    rho: &Array1<f64>,
-    coord: usize,
-    base_h: f64,
-) -> Result<FdEval, EstimationError> {
-    let mut rho_p = rho.clone();
-    rho_p[coord] += 0.5 * base_h;
-    let mut rho_m = rho.clone();
-    rho_m[coord] -= 0.5 * base_h;
-    let f_p = reml_state.compute_cost(&rho_p)?;
-    let ridge_p = reml_state.lastridge_used().unwrap_or(f64::NAN);
-
-    let f_m = reml_state.compute_cost(&rho_m)?;
-    let ridge_m = reml_state.lastridge_used().unwrap_or(f64::NAN);
-    let d_small = (f_p - f_m) / base_h;
-
-    let h2 = 2.0 * base_h;
-    let mut rho_p2 = rho.clone();
-    rho_p2[coord] += 0.5 * h2;
-    let mut rho_m2 = rho.clone();
-    rho_m2[coord] -= 0.5 * h2;
-    let f_p2 = reml_state.compute_cost(&rho_p2)?;
-    let ridge_p2 = reml_state.lastridge_used().unwrap_or(f64::NAN);
-
-    let f_m2 = reml_state.compute_cost(&rho_m2)?;
-    let ridge_m2 = reml_state.lastridge_used().unwrap_or(f64::NAN);
-    let d_big = (f_p2 - f_m2) / h2;
-
-    let finiteridges: Vec<f64> = [ridge_p, ridge_m, ridge_p2, ridge_m2]
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .collect();
-    let (ridge_min, ridge_max, ridge_span, ridge_rel_span) = if finiteridges.is_empty() {
-        (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
-    } else {
-        let mut minv = f64::INFINITY;
-        let mut maxv = f64::NEG_INFINITY;
-        for v in finiteridges {
-            minv = minv.min(v);
-            maxv = maxv.max(v);
-        }
-        let span = maxv - minv;
-        let rel = span / maxv.abs().max(1e-12);
-        (minv, maxv, span, rel)
-    };
-    let ridge_jitter = ridge_span.is_finite()
-        && ridge_rel_span.is_finite()
-        && (ridge_span > FD_RIDGE_ABS_JITTER_THRESHOLD
-            && ridge_rel_span > FD_RIDGE_REL_JITTER_THRESHOLD);
-
-    Ok(FdEval {
-        f_p,
-        f_m,
-        f_p2,
-        f_m2,
-        d_small,
-        d_big,
-        ridge_min,
-        ridge_max,
-        ridge_rel_span,
-        ridge_jitter,
-    })
-}
-
-fn fd_same_sign(d_small: f64, d_big: f64) -> bool {
-    if !d_small.is_finite() || !d_big.is_finite() {
-        false
-    } else {
-        (d_small >= 0.0 && d_big >= 0.0) || (d_small <= 0.0 && d_big <= 0.0)
-    }
-}
-
-fn selectfd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
-    match (d_small.is_finite(), d_big.is_finite()) {
-        (true, true) => {
-            if same_sign {
-                d_small
-            } else {
-                d_big
-            }
-        }
-        (true, false) => d_small,
-        (false, true) => d_big,
-        (false, false) => 0.0,
-    }
-}
-
-fn computefdgradient_internal(
-    reml_state: &RemlState,
-    rho: &Array1<f64>,
-    emit_logs: bool,
-    allow_analytic_fallback: bool,
-) -> Result<Array1<f64>, EstimationError> {
-    let mut fdgrad = Array1::zeros(rho.len());
-    let mut analytic_fallback: Option<Array1<f64>> = None;
-
-    let mut log_lines: Vec<String> = Vec::new();
-    let (rho_min, rho_max) = rho
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
-            (min.min(v), max.max(v))
-        });
-    let rho_summary = format!("len={} range=[{:.3e},{:.3e}]", rho.len(), rho_min, rho_max);
-    match reml_state.lastridge_used() {
-        Some(ridge) => log_lines.push(format!(
-            "[FD RIDGE] Baseline cached ridge: {ridge:.3e} for rho {rho_summary}",
-        )),
-        None => log_lines.push(format!(
-            "[FD RIDGE] No cached baseline ridge available for rho {rho_summary}",
-        )),
-    }
-
-    for i in 0..rho.len() {
-        let h_rel = 1e-4_f64 * (1.0 + rho[i].abs());
-        let h_abs = 1e-5_f64;
-        let mut base_h = h_rel.max(h_abs);
-
-        log_lines.push(format!("[FD RIDGE] coord {i} rho={:+.6e}", rho[i]));
-
-        let mut d_small = 0.0;
-        let mut d_big = 0.0;
-        let mut derivative: Option<f64> = None;
-        let mut best_rel_gap = f64::INFINITY;
-        let mut best_derivative: Option<f64> = None;
-        let mut last_rel_gap = f64::INFINITY;
-        let mut refine_steps = 0usize;
-        let mut rel_gap_first = None;
-        let mut rel_gap_max = 0.0;
-        let mut ridge_jitter_seen = false;
-        let mut ridge_rel_span_max = 0.0;
-        let h_start = base_h;
-
-        for attempt in 0..=FD_MAX_REFINEMENTS {
-            let eval = evaluatefd_pair(reml_state, rho, i, base_h)?;
-            d_small = eval.d_small;
-            d_big = eval.d_big;
-            ridge_jitter_seen |= eval.ridge_jitter;
-            if eval.ridge_rel_span.is_finite() && eval.ridge_rel_span > ridge_rel_span_max {
-                ridge_rel_span_max = eval.ridge_rel_span;
-            }
-
-            let denom = d_small.abs().max(d_big.abs()).max(1e-12);
-            let rel_gap = (d_small - d_big).abs() / denom;
-            let same_sign = fd_same_sign(d_small, d_big);
-
-            if same_sign && !eval.ridge_jitter {
-                if rel_gap <= best_rel_gap {
-                    best_rel_gap = rel_gap;
-                    best_derivative = Some(selectfd_derivative(d_small, d_big, same_sign));
-                }
-                if rel_gap > last_rel_gap {
-                    // Smaller steps are worsening the agreement; keep the best seen.
-                    derivative = best_derivative;
-                    break;
-                }
-                last_rel_gap = rel_gap;
-            }
-
-            let refine_for_rel_gap =
-                same_sign && rel_gap > FD_REL_GAP_THRESHOLD && base_h * 0.5 >= FD_MIN_BASE_STEP;
-            let refine_forridge = eval.ridge_jitter && base_h * 0.5 >= FD_MIN_BASE_STEP;
-            let refining = refine_for_rel_gap || refine_forridge;
-            if attempt == 0 {
-                rel_gap_first = Some(rel_gap);
-            }
-            if rel_gap.is_finite() && rel_gap > rel_gap_max {
-                rel_gap_max = rel_gap;
-            }
-            let last_attempt = attempt == FD_MAX_REFINEMENTS || !refining;
-            if attempt == 0 || last_attempt {
-                if attempt == 0 {
-                    log_lines.push(format!(
-                        "[FD RIDGE]   attempt {} h={:.3e} f(+/-0.5h)={:+.9e}/{:+.9e} \
-f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} ridge=[{:.3e},{:.3e}]",
-                        attempt + 1,
-                        base_h,
-                        eval.f_p,
-                        eval.f_m,
-                        eval.f_p2,
-                        eval.f_m2,
-                        d_small,
-                        d_big,
-                        eval.ridge_min,
-                        eval.ridge_max,
-                    ));
-                } else {
-                    log_lines.push(format!(
-                        "[FD RIDGE]   attempt {} h={:.3e} d_small={:+.9e} d_big={:+.9e} \
-rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
-                        attempt + 1,
-                        base_h,
-                        d_small,
-                        d_big,
-                        rel_gap,
-                        eval.ridge_min,
-                        eval.ridge_max,
-                        eval.ridge_rel_span
-                    ));
-                }
-            }
-
-            if refining {
-                base_h *= 0.5;
-                refine_steps += 1;
-                continue;
-            }
-
-            if eval.ridge_jitter {
-                derivative = None;
-            } else {
-                derivative = Some(selectfd_derivative(d_small, d_big, same_sign));
-            }
-            break;
-        }
-
-        if derivative.is_none() {
-            let same_sign = fd_same_sign(d_small, d_big);
-            if same_sign && !ridge_jitter_seen {
-                derivative = best_derivative
-                    .or_else(|| Some(selectfd_derivative(d_small, d_big, same_sign)));
-            } else if !ridge_jitter_seen {
-                derivative = Some(selectfd_derivative(d_small, d_big, same_sign));
-            }
-        }
-
-        if derivative.is_none() && allow_analytic_fallback {
-            if analytic_fallback.is_none() {
-                analytic_fallback = Some(reml_state.compute_gradient(rho)?);
-            }
-            derivative = analytic_fallback.as_ref().map(|g| g[i]);
-            log_lines.push(format!(
-                "[FD RIDGE]   coord {} fallback to analytic gradient due to ridge jitter (max rel span {:.3e})",
-                i, ridge_rel_span_max
-            ));
-        }
-
-        fdgrad[i] = derivative.unwrap_or(f64::NAN);
-        let rel_gap_first = rel_gap_first.unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]   refine steps={} h_start={:.3e} h_final={:.3e} rel_gap_first={:.3e} rel_gap_max={:.3e} ridge_jitter_seen={} ridge_rel_span_max={:.3e}",
-            refine_steps,
-            h_start,
-            base_h,
-            rel_gap_first,
-            rel_gap_max,
-            ridge_jitter_seen,
-            ridge_rel_span_max
-        ));
-        log_lines.push(format!(
-            "[FD RIDGE]   chosen derivative = {:+.9e}",
-            fdgrad[i]
-        ));
-    }
-
-    if emit_logs && !log_lines.is_empty() {
-        println!("{}", log_lines.join("\n"));
-    }
-
-    Ok(fdgrad)
-}
-
 fn computefdgradient(
     reml_state: &RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    computefdgradient_internal(reml_state, rho, true, true)
+    compute_fd_gradient(reml_state, rho, true, true)
 }
 
 /// Evaluate both analytic and finite-difference gradients for the external REML objective.
