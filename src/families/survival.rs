@@ -710,6 +710,83 @@ impl WorkingModelSurvival {
         Self::from_engine_inputswith_offsets(inputs, None, penalties, monotonicity, spec)
     }
 
+    fn validate_offsets(
+        offsets: Option<SurvivalBaselineOffsets<'_>>,
+        n: usize,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), SurvivalError> {
+        if let Some(off) = offsets {
+            if off.eta_entry.len() != n || off.eta_exit.len() != n || off.derivative_exit.len() != n
+            {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            if off.eta_entry.iter().any(|v| !v.is_finite())
+                || off.eta_exit.iter().any(|v| !v.is_finite())
+                || off.derivative_exit.iter().any(|v| !v.is_finite())
+            {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+            Ok((
+                off.eta_entry.to_owned(),
+                off.eta_exit.to_owned(),
+                off.derivative_exit.to_owned(),
+            ))
+        } else {
+            Ok((Array1::zeros(n), Array1::zeros(n), Array1::zeros(n)))
+        }
+    }
+
+    fn validate_common_inputs(
+        age_entry: &ArrayView1<f64>,
+        age_exit: &ArrayView1<f64>,
+        event_target: &ArrayView1<u8>,
+        event_competing: &ArrayView1<u8>,
+        sampleweight: &ArrayView1<f64>,
+        design_matrices: &[&dyn ndarray::RawData],
+    ) -> Result<(), SurvivalError> {
+        if age_entry.iter().any(|v| !v.is_finite())
+            || age_exit.iter().any(|v| !v.is_finite())
+            || sampleweight.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || event_target.iter().any(|&v| v > 1)
+            || event_competing.iter().any(|&v| v > 1)
+            || event_target
+                .iter()
+                .zip(event_competing.iter())
+                .any(|(&target, &competing)| target > 0 && competing > 0)
+        {
+            return Err(SurvivalError::NonFiniteInput);
+        }
+        Ok(())
+    }
+
+    fn finish_construction(
+        age_entry: ArrayView1<f64>,
+        age_exit: ArrayView1<f64>,
+        event_target: ArrayView1<u8>,
+        sampleweight: ArrayView1<f64>,
+        design: SurvivalDesign,
+        offset_eta_entry: Array1<f64>,
+        offset_eta_exit: Array1<f64>,
+        offset_derivative_exit: Array1<f64>,
+        penalties: PenaltyBlocks,
+        monotonicity: MonotonicityPenalty,
+    ) -> Self {
+        Self {
+            age_entry: age_entry.to_owned(),
+            age_exit: age_exit.to_owned(),
+            entry_at_origin: age_entry.mapv(|t| t <= 1e-8),
+            event_target: event_target.to_owned(),
+            sampleweight: sampleweight.to_owned(),
+            design,
+            offset_eta_entry,
+            offset_eta_exit,
+            offset_derivative_exit,
+            penalties,
+            monotonicity,
+            structurally_monotonic: false,
+            structural_time_columns: 0,
+        }
+    }
+
     pub fn from_engine_inputswith_offsets(
         inputs: SurvivalEngineInputs<'_>,
         offsets: Option<SurvivalBaselineOffsets<'_>>,
@@ -720,14 +797,6 @@ impl WorkingModelSurvival {
         if spec == SurvivalSpec::Crude {
             return Err(SurvivalError::UnsupportedSpec("crude"));
         }
-        // This constructor is the engine-level hook for transformation-model style
-        // baselines:
-        //   eta(t, x) = eta_target(t) + eta_deviation(t, x).
-        //
-        // Existing design matrices continue to represent eta_deviation. Offsets
-        // inject eta_target and its derivative. This keeps identifiability and
-        // allows REML-selected penalties to control how far we depart from the
-        // target in sparse-vs-rich data regimes.
         let n = inputs.age_entry.len();
         let p = inputs.x_entry.ncols();
         if inputs.age_exit.len() != n
@@ -743,67 +812,31 @@ impl WorkingModelSurvival {
             return Err(SurvivalError::DimensionMismatch);
         }
         Self::validate_penalties(&penalties, p)?;
-
-        if inputs.age_entry.iter().any(|v| !v.is_finite())
-            || inputs.age_exit.iter().any(|v| !v.is_finite())
-            || inputs
-                .sampleweight
-                .iter()
-                .any(|v| !v.is_finite() || *v < 0.0)
-            || inputs.x_entry.iter().any(|v| !v.is_finite())
+        Self::validate_common_inputs(
+            &inputs.age_entry, &inputs.age_exit,
+            &inputs.event_target, &inputs.event_competing,
+            &inputs.sampleweight, &[],
+        )?;
+        if inputs.x_entry.iter().any(|v| !v.is_finite())
             || inputs.x_exit.iter().any(|v| !v.is_finite())
             || inputs.x_derivative.iter().any(|v| !v.is_finite())
-            || inputs.event_target.iter().any(|&v| v > 1)
-            || inputs.event_competing.iter().any(|&v| v > 1)
-            || inputs
-                .event_target
-                .iter()
-                .zip(inputs.event_competing.iter())
-                .any(|(&target, &competing)| target > 0 && competing > 0)
         {
             return Err(SurvivalError::NonFiniteInput);
         }
+        let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) =
+            Self::validate_offsets(offsets, n)?;
 
-        let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) = if let Some(off) = offsets
-        {
-            if off.eta_entry.len() != n || off.eta_exit.len() != n || off.derivative_exit.len() != n
-            {
-                return Err(SurvivalError::DimensionMismatch);
-            }
-            if off.eta_entry.iter().any(|v| !v.is_finite())
-                || off.eta_exit.iter().any(|v| !v.is_finite())
-                || off.derivative_exit.iter().any(|v| !v.is_finite())
-            {
-                return Err(SurvivalError::NonFiniteInput);
-            }
-            (
-                off.eta_entry.to_owned(),
-                off.eta_exit.to_owned(),
-                off.derivative_exit.to_owned(),
-            )
-        } else {
-            (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n))
-        };
-
-        Ok(Self {
-            age_entry: inputs.age_entry.to_owned(),
-            age_exit: inputs.age_exit.to_owned(),
-            entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
-            event_target: inputs.event_target.to_owned(),
-            sampleweight: inputs.sampleweight.to_owned(),
-            design: SurvivalDesign::Flat {
+        Ok(Self::finish_construction(
+            inputs.age_entry, inputs.age_exit,
+            inputs.event_target, inputs.sampleweight,
+            SurvivalDesign::Flat {
                 x_entry: inputs.x_entry.to_owned(),
                 x_exit: inputs.x_exit.to_owned(),
                 x_derivative: inputs.x_derivative.to_owned(),
             },
-            offset_eta_entry,
-            offset_eta_exit,
-            offset_derivative_exit,
-            penalties,
-            monotonicity,
-            structurally_monotonic: false,
-            structural_time_columns: 0,
-        })
+            offset_eta_entry, offset_eta_exit, offset_derivative_exit,
+            penalties, monotonicity,
+        ))
     }
 
     pub fn from_time_covariate_inputswith_offsets(
@@ -834,67 +867,33 @@ impl WorkingModelSurvival {
             return Err(SurvivalError::DimensionMismatch);
         }
         Self::validate_penalties(&penalties, p)?;
-        if inputs.age_entry.iter().any(|v| !v.is_finite())
-            || inputs.age_exit.iter().any(|v| !v.is_finite())
-            || inputs
-                .sampleweight
-                .iter()
-                .any(|v| !v.is_finite() || *v < 0.0)
-            || inputs.time_entry.iter().any(|v| !v.is_finite())
+        Self::validate_common_inputs(
+            &inputs.age_entry, &inputs.age_exit,
+            &inputs.event_target, &inputs.event_competing,
+            &inputs.sampleweight, &[],
+        )?;
+        if inputs.time_entry.iter().any(|v| !v.is_finite())
             || inputs.time_exit.iter().any(|v| !v.is_finite())
             || inputs.time_derivative.iter().any(|v| !v.is_finite())
             || inputs.covariates.iter().any(|v| !v.is_finite())
-            || inputs.event_target.iter().any(|&v| v > 1)
-            || inputs.event_competing.iter().any(|&v| v > 1)
-            || inputs
-                .event_target
-                .iter()
-                .zip(inputs.event_competing.iter())
-                .any(|(&target, &competing)| target > 0 && competing > 0)
         {
             return Err(SurvivalError::NonFiniteInput);
         }
-        let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) = if let Some(off) = offsets
-        {
-            if off.eta_entry.len() != n || off.eta_exit.len() != n || off.derivative_exit.len() != n
-            {
-                return Err(SurvivalError::DimensionMismatch);
-            }
-            if off.eta_entry.iter().any(|v| !v.is_finite())
-                || off.eta_exit.iter().any(|v| !v.is_finite())
-                || off.derivative_exit.iter().any(|v| !v.is_finite())
-            {
-                return Err(SurvivalError::NonFiniteInput);
-            }
-            (
-                off.eta_entry.to_owned(),
-                off.eta_exit.to_owned(),
-                off.derivative_exit.to_owned(),
-            )
-        } else {
-            (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n))
-        };
+        let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) =
+            Self::validate_offsets(offsets, n)?;
 
-        Ok(Self {
-            age_entry: inputs.age_entry.to_owned(),
-            age_exit: inputs.age_exit.to_owned(),
-            entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
-            event_target: inputs.event_target.to_owned(),
-            sampleweight: inputs.sampleweight.to_owned(),
-            design: SurvivalDesign::TimeCovariateShared {
+        Ok(Self::finish_construction(
+            inputs.age_entry, inputs.age_exit,
+            inputs.event_target, inputs.sampleweight,
+            SurvivalDesign::TimeCovariateShared {
                 time_entry: inputs.time_entry.to_owned(),
                 time_exit: inputs.time_exit.to_owned(),
                 time_derivative: inputs.time_derivative.to_owned(),
                 covariates: inputs.covariates.to_owned(),
             },
-            offset_eta_entry,
-            offset_eta_exit,
-            offset_derivative_exit,
-            penalties,
-            monotonicity,
-            structurally_monotonic: false,
-            structural_time_columns: 0,
-        })
+            offset_eta_entry, offset_eta_exit, offset_derivative_exit,
+            penalties, monotonicity,
+        ))
     }
 
     /// Enable/disable monotonic time-block enforcement metadata.

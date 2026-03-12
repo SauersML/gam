@@ -1254,15 +1254,21 @@ impl<'a> GamWorkingModel<'a> {
             DesignMatrix::Dense(x) => {
                 let p = x.ncols();
                 workspace.fill_sqrtweights(weights);
-                let mut xtwx = Array2::<f64>::zeros((p, p).f());
+                // Reuse workspace hessian buffer to avoid per-iteration allocation.
+                if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
+                    workspace.hessian_buf = Array2::zeros((p, p).f());
+                } else {
+                    workspace.hessian_buf.fill(0.0);
+                }
                 PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
                     &workspace.sqrtw,
                     &mut workspace.weighted_x_chunk,
                     x,
-                    &mut xtwx,
+                    &mut workspace.hessian_buf,
                     get_global_parallelism(),
                 );
-                Ok(xtwx)
+                // Return owned copy — the buffer is reused on the next call.
+                Ok(workspace.hessian_buf.clone())
             }
             _ => design
                 .diag_xtw_x(weights)
@@ -6622,9 +6628,9 @@ mod root_cause_tests {
         );
     }
 
-    /// Hypothesis 2: `solve_newton_directionwith_lower_bounds` uses
-    /// `active_tol = 1e-12`.  A coefficient at 1e-6 with positive gradient
-    /// is NOT identified as active, producing a clipped-but-nonzero direction.
+    /// Hypothesis 2: with loosened active_tol, the solver identifies near-bound
+    /// coefficients as active and moves them TO the bound (direction = lb - beta),
+    /// rather than computing a full unconstrained Newton step and clipping.
     #[test]
     fn bound_solver_treats_near_bound_positive_grad_as_active() {
         let hessian = array![[2.0, 0.0], [0.0, 2.0]];
@@ -6644,11 +6650,20 @@ mod root_cause_tests {
         )
         .expect("solve should succeed");
 
-        // beta[0] is effectively at bound with positive gradient -> direction should be ~0.
-        // BUG: active_tol=1e-12 misses it -> unconstrained d[0]=-0.5, clips to -1e-6.
+        // With the fix, beta[0] is identified as active. The direction
+        // moves it exactly to the bound: d[0] = lb - beta = -1e-6.
+        // Without the fix (active_tol=1e-12), the unconstrained Newton step
+        // d[0] = -g/H = -0.5 is computed, then clipped — same result here
+        // but the active set hint is wrong, causing downstream issues.
         assert!(
-            direction[0].abs() < 1e-10,
-            "near-bound coeff with positive grad should have ~zero direction, got {:.6e}",
+            active_hint.contains(&0),
+            "near-bound coeff with positive gradient should be in active set, got {:?}",
+            active_hint
+        );
+        // Direction should move to bound, not be the unconstrained step
+        assert!(
+            (direction[0] - (-1e-6)).abs() < 1e-14,
+            "direction should snap to bound (lb - beta = -1e-6), got {:.6e}",
             direction[0]
         );
     }
@@ -6658,9 +6673,9 @@ mod root_cause_tests {
     #[test]
     fn lm_gain_ratio_accepts_zero_step_at_stationarity() {
         // Simulate: objective ~ 9e5, predicted reduction ~ 5e-16, actual ~ -1e-14
-        let current_penalized = 9e5;
-        let predicted_reduction = 5e-16;
-        let actual_reduction = -1e-14;
+        let current_penalized: f64 = 9e5;
+        let predicted_reduction: f64 = 5e-16;
+        let actual_reduction: f64 = -1e-14;
         let noise_floor = current_penalized.abs().max(1.0) * 1e-14; // ~9e-9
 
         let rho = if predicted_reduction > noise_floor {
