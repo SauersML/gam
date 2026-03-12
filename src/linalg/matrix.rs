@@ -834,12 +834,43 @@ impl LinearOperator for DesignMatrix {
                 out
             }
             Self::Sparse(_) => {
-                let xv = self.apply(vector);
-                let mut weighted_xv = xv;
-                for i in 0..weighted_xv.len() {
-                    weighted_xv[i] *= weights[i].max(0.0);
-                }
-                let mut out = self.apply_transpose(&weighted_xv);
+                let sparse = self
+                    .as_sparse()
+                    .expect("DesignMatrix::Sparse must expose sparse view");
+                let mut out = if let Some(csr) = sparse.to_csr_arc() {
+                    let sym = csr.symbolic();
+                    let row_ptr = sym.row_ptr();
+                    let col_idx = sym.col_idx();
+                    let vals = csr.val();
+                    let mut fused = Array1::<f64>::zeros(self.ncols());
+                    for i in 0..self.nrows() {
+                        let wi = weights[i].max(0.0);
+                        if wi == 0.0 {
+                            continue;
+                        }
+                        let start = row_ptr[i];
+                        let end = row_ptr[i + 1];
+                        let mut row_dot = 0.0_f64;
+                        for ptr in start..end {
+                            row_dot += vals[ptr] * vector[col_idx[ptr]];
+                        }
+                        if row_dot == 0.0 {
+                            continue;
+                        }
+                        let scaled = wi * row_dot;
+                        for ptr in start..end {
+                            fused[col_idx[ptr]] += vals[ptr] * scaled;
+                        }
+                    }
+                    fused
+                } else {
+                    let xv = self.apply(vector);
+                    let mut weighted_xv = xv;
+                    for i in 0..weighted_xv.len() {
+                        weighted_xv[i] *= weights[i].max(0.0);
+                    }
+                    self.apply_transpose(&weighted_xv)
+                };
                 if let Some(pen) = penalty {
                     out += &pen.dot(vector);
                 }
@@ -1003,8 +1034,33 @@ impl LinearOperator for DesignMatrix {
                 self.nrows()
             ));
         }
-        let wy = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
-        Ok(self.matvec_trans(&wy))
+        match self {
+            Self::Dense(_) => {
+                let wy = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
+                Ok(self.matvec_trans(&wy))
+            }
+            Self::Sparse(xs) => {
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in compute_xtwy".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                let mut out = Array1::<f64>::zeros(xs.ncols());
+                for i in 0..xs.nrows() {
+                    let scaled = weights[i].max(0.0) * y[i];
+                    if scaled == 0.0 {
+                        continue;
+                    }
+                    for idx in row_ptr[i]..row_ptr[i + 1] {
+                        out[col_idx[idx]] += vals[idx] * scaled;
+                    }
+                }
+                Ok(out)
+            }
+        }
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
@@ -1127,8 +1183,8 @@ impl LinearOperator for DenseRightProductView<'_> {
                 self.nrows()
             ));
         }
-        let wy = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
-        Ok(self.apply_transpose(&wy))
+        let weighted_y = Array1::from_shape_fn(y.len(), |i| y[i] * weights[i].max(0.0));
+        Ok(self.apply_transpose(&weighted_y))
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
