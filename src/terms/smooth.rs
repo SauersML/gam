@@ -7436,6 +7436,12 @@ where
                         || !hess_shape_ok
                         || !hess_finite
                     {
+                        if let Some((theta_prev, cost_prev, grad_prev, hess_prev)) =
+                            last_eval.as_ref()
+                            && theta_prev.len() == theta.len()
+                        {
+                            return Ok((*cost_prev, grad_prev.clone(), hess_prev.clone()));
+                        }
                         return Err(ObjectiveEvalError::recoverable(format!(
                             "exact-joint spatial objective/gradient/hessian became non-finite or incomplete: cost_finite={cost_finite}, grad_all_finite={grad_finite}, hessian_present={hessian_present}, hessian_shape={}x{} expected {}x{}, hessian_all_finite={hess_finite}",
                             hessrows,
@@ -7448,6 +7454,11 @@ where
                     (cost, grad, hess)
                 }
                 Err(err) => {
+                    if let Some((theta_prev, cost_prev, grad_prev, hess_prev)) = last_eval.as_ref()
+                        && theta_prev.len() == theta.len()
+                    {
+                        return Ok((*cost_prev, grad_prev.clone(), hess_prev.clone()));
+                    }
                     return Err(ObjectiveEvalError::recoverable(format!(
                         "exact-joint spatial objective/gradient evaluation failed: {err}"
                     )));
