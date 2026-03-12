@@ -1055,6 +1055,7 @@ fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn solve_blockweighted_system(
     x: &DesignMatrix,
     y_star: &Array1<f64>,
@@ -1192,16 +1193,22 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
             })
         } else {
             with_block_geometry(ctx.family, ctx.states, ctx.spec, ctx.block_idx, |x, off| {
-                let mut y_star = self.working_response.clone();
-                y_star -= off;
-                let beta = solve_blockweighted_system(
-                    x,
-                    &y_star,
-                    &w_clamped,
-                    ctx.s_lambda,
-                    ctx.options.ridge_floor,
-                    ctx.options.ridge_policy,
-                )?;
+                // Fuse offset subtraction into the weighted RHS: wy[i] = w[i] * (z[i] - off[i]).
+                // This avoids an O(n) working_response clone.
+                let n = self.working_response.len();
+                let wy = Array1::from_shape_fn(n, |i| {
+                    (self.working_response[i] - off[i]) * w_clamped[i].max(0.0)
+                });
+                let xtwy = x.transpose_vector_multiply(&wy);
+                let beta = x
+                    .solve_systemwith_policy(
+                        &w_clamped,
+                        &xtwy,
+                        Some(ctx.s_lambda),
+                        ctx.options.ridge_floor,
+                        ctx.options.ridge_policy,
+                    )
+                    .map_err(|_| "block solve failed after ridge retries".to_string())?;
                 Ok(BlockUpdateResult {
                     beta_new_raw: beta,
                     active_set: None,
