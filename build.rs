@@ -3738,16 +3738,42 @@ fn isword_boundary(text: &str, idx: usize, len: usize) -> bool {
 
 // ---------------------------------------------------------------------------
 // Dead public item detection
+//
+// Scans for `pub` and `pub(crate)` items that have no real production
+// references.  Designed to resist evasion by automated agents:
+//
+//   1. `pub` -> `pub(crate)` downgrade: both visibilities are scanned.
+//   2. Fake callers (`let _ = foo;`, `if false { foo(); }`): filtered out.
+//   3. Re-export padding (`pub use`): filtered out.
+//   4. Noop touch (`name;`): filtered out.
+//   5. Test-only usage: references in tests/ and #[cfg(test)] blocks are
+//      counted separately; items alive only in tests get a distinct error
+//      telling the author to move the item to #[cfg(test)] or wire it
+//      into production code.
 // ---------------------------------------------------------------------------
 
-/// Stripped file contents: (path, comment/string-stripped source text).
+/// Visibility level extracted from a definition line.
+#[derive(Clone, Copy, PartialEq)]
+enum PubVisibility {
+    Pub,
+    PubCrate,
+}
+
+/// Stripped file contents with production / test zone separation.
 struct StrippedFile {
     path: PathBuf,
+    /// Full comment/string-stripped source (for whole-file searches).
     stripped: String,
+    /// Lines outside `#[cfg(test)]` blocks (production code).
+    prod_text: String,
+    /// Lines inside `#[cfg(test)]` blocks (test code).
+    test_text: String,
+    /// `true` when the file lives under `tests/` or `benches/`.
+    is_test_file: bool,
 }
 
 /// Walk all `.rs` files (excluding build.rs and ignored directories), read each,
-/// strip comments and string literals, and return the collection.
+/// strip comments and string literals, split into prod/test zones, and return.
 fn build_stripped_file_cache() -> Vec<StrippedFile> {
     let mut files = Vec::new();
     for entry in WalkDir::new(".")
@@ -3766,36 +3792,117 @@ fn build_stripped_file_cache() -> Vec<StrippedFile> {
         };
         let stripped_bytes = strip_comments_and_strings_for_content(&content);
         let stripped = String::from_utf8_lossy(&stripped_bytes).to_string();
-        files.push(StrippedFile { path, stripped });
+
+        let is_test_file = is_test_or_bench_path(&path);
+        let (prod_text, test_text) = if is_test_file {
+            // Entire file is test code.
+            (String::new(), stripped.clone())
+        } else {
+            split_prod_test_text(&stripped)
+        };
+
+        files.push(StrippedFile {
+            path,
+            stripped,
+            prod_text,
+            test_text,
+            is_test_file,
+        });
     }
     files
 }
 
+/// Returns `true` for files under `tests/`, `benches/`, or test helper crates.
+fn is_test_or_bench_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/tests/") || s.contains("/benches/") || s.starts_with("./tests/") || s.starts_with("./benches/")
+}
+
+/// Split stripped source into production lines and `#[cfg(test)]` lines.
+///
+/// Uses brace-depth tracking: when a `#[cfg(test)]` attribute is seen, the
+/// next `{` opens the test module and everything until the matching `}` is
+/// classified as test text.  Everything else is production text.
+fn split_prod_test_text(stripped: &str) -> (String, String) {
+    let mut prod = String::with_capacity(stripped.len());
+    let mut test = String::with_capacity(stripped.len() / 4);
+
+    let mut in_test_block = false;
+    let mut pending_cfg_test = false;
+    let mut brace_depth: i64 = 0;
+    let mut test_start_depth: i64 = 0;
+
+    for line in stripped.lines() {
+        // Count braces on this line.
+        let opens = line.chars().filter(|&c| c == '{').count() as i64;
+        let closes = line.chars().filter(|&c| c == '}').count() as i64;
+
+        if pending_cfg_test && opens > 0 {
+            // The opening brace of the #[cfg(test)] block.
+            in_test_block = true;
+            test_start_depth = brace_depth; // depth *before* this line's braces
+            pending_cfg_test = false;
+        }
+
+        brace_depth += opens - closes;
+
+        if in_test_block {
+            test.push_str(line);
+            test.push('\n');
+            if brace_depth <= test_start_depth {
+                in_test_block = false;
+            }
+        } else {
+            // Detect #[cfg(test)] — the next block is a test module.
+            if line.contains("cfg(test)") {
+                pending_cfg_test = true;
+                test.push_str(line);
+                test.push('\n');
+            } else {
+                prod.push_str(line);
+                prod.push('\n');
+            }
+        }
+    }
+
+    (prod, test)
+}
+
 /// Try to extract a public item name from a single (stripped) source line.
 ///
-/// Matches: `pub fn name`, `pub struct Name`, `pub enum Name`, `pub type Name`,
-///          `pub unsafe fn name`, `pub async fn name`, `pub const fn name`.
-/// Skips:   `pub(crate) ...`, `pub(super) ...`, `pub(in ...) ...`.
-fn extract_pub_item_name(line: &str) -> Option<&str> {
+/// Matches both `pub` and `pub(crate)` items.  Returns the name and visibility.
+/// Skips `pub(super)` and `pub(in ...)` — those are too narrow to be evasion.
+fn extract_pub_item_name(line: &str) -> Option<(&str, PubVisibility)> {
     let trimmed = line.trim();
-    // Skip restricted visibility — the compiler already warns about those.
-    if trimmed.starts_with("pub(") {
+
+    // Determine visibility.
+    let (after_vis, visibility) = if trimmed.starts_with("pub(crate)") {
+        let rest = trimmed["pub(crate)".len()..].trim_start();
+        (rest, PubVisibility::PubCrate)
+    } else if trimmed.starts_with("pub(") {
+        // pub(super), pub(in ...) — skip entirely.
         return None;
-    }
-    let after_pub = trimmed.strip_prefix("pub ")?;
-    // Strip optional qualifiers that can appear between `pub` and the keyword.
-    let rest = after_pub
+    } else if let Some(rest) = trimmed.strip_prefix("pub ") {
+        (rest, PubVisibility::Pub)
+    } else {
+        return None;
+    };
+
+    // Strip optional qualifiers between visibility and keyword.
+    let rest = after_vis
         .strip_prefix("unsafe ")
-        .or_else(|| after_pub.strip_prefix("async "))
-        .or_else(|| after_pub.strip_prefix("const "))
-        .unwrap_or(after_pub);
+        .or_else(|| after_vis.strip_prefix("async "))
+        .or_else(|| after_vis.strip_prefix("const "))
+        .unwrap_or(after_vis);
+
     // Must start with a defining keyword.
     let after_kw = rest
         .strip_prefix("fn ")
         .or_else(|| rest.strip_prefix("struct "))
         .or_else(|| rest.strip_prefix("enum "))
         .or_else(|| rest.strip_prefix("type "))?;
-    // Extract the identifier (alphanumeric + _).
+
+    // Extract the identifier.
     let end = after_kw
         .find(|c: char| !c.is_alphanumeric() && c != '_')
         .unwrap_or(after_kw.len());
@@ -3803,19 +3910,121 @@ fn extract_pub_item_name(line: &str) -> Option<&str> {
     if name.is_empty() {
         return None;
     }
-    Some(name)
+    Some((name, visibility))
 }
 
-/// Scan every `.rs` file for `pub` items whose name appears exactly once across the
-/// entire codebase (comment/string-stripped).  A count of 1 means the name exists
-/// only at its definition — nothing else references it.
+/// Count references to `name` in `text`, excluding fake / evasive patterns.
+///
+/// Filtered patterns (per line):
+///   - `let _ = name` / `let mut _ = name` (discard binding)
+///   - `_ = name` (bare discard assignment)
+///   - `if false { ... name ... }` (dead branch)
+///   - `pub use ... name` / `pub(crate) use ...` (re-export padding)
+///   - bare `name;` on its own line (noop touch)
+fn count_real_references(text: &str, name: &str) -> usize {
+    let mut real_count: usize = 0;
+
+    for line in text.lines() {
+        let hits = countvariable_occurrences(line, name);
+        if hits == 0 {
+            continue;
+        }
+        let trimmed = line.trim();
+
+        // Filter: discard binding — `let _ = name` or `let mut _ = name`
+        if is_discard_binding(trimmed, name) {
+            continue;
+        }
+
+        // Filter: bare discard — `_ = name(...)`
+        if trimmed.starts_with("_ =") {
+            let after_eq = trimmed[2..].trim_start_matches('=').trim_start();
+            if after_eq.starts_with(name) {
+                continue;
+            }
+        }
+
+        // Filter: dead branch — `if false {`
+        if trimmed.starts_with("if false") {
+            continue;
+        }
+
+        // Filter: re-export padding — `pub use`, `pub(crate) use`
+        if is_reexport_line(trimmed) {
+            continue;
+        }
+
+        // Filter: noop touch — bare `name;` or just `name`
+        if trimmed == name || trimmed.strip_suffix(';').is_some_and(|s| s.trim() == name) {
+            continue;
+        }
+
+        real_count += hits;
+    }
+
+    real_count
+}
+
+/// Check if this line is a discard binding for the target name.
+/// Matches: `let _ = name`, `let _ = name(`, `let _ = name;`
+fn is_discard_binding(trimmed: &str, name: &str) -> bool {
+    let after_let = match trimmed.strip_prefix("let ") {
+        Some(s) => s.trim_start(),
+        None => return false,
+    };
+    // Must start with `_` and then `=` (possibly with `mut` in between).
+    if !after_let.starts_with('_') {
+        return false;
+    }
+    let after_underscore = if let Some(rest) = after_let.strip_prefix("mut _") {
+        rest
+    } else {
+        &after_let[1..]
+    };
+    // Next non-whitespace must be `=` (not `==`).
+    let after_ws = after_underscore.trim_start();
+    if !after_ws.starts_with('=') || after_ws.starts_with("==") {
+        return false;
+    }
+    let rhs = after_ws[1..].trim_start();
+    // RHS must reference our target name.
+    if !rhs.starts_with(name) {
+        return false;
+    }
+    let after_name = &rhs[name.len()..];
+    after_name.is_empty()
+        || after_name.starts_with(';')
+        || after_name.starts_with('(')
+        || after_name.starts_with('.')
+        || after_name.starts_with(' ')
+        || after_name.starts_with(':')
+}
+
+/// Check if the line is a `pub use` or `pub(crate) use` re-export.
+fn is_reexport_line(trimmed: &str) -> bool {
+    trimmed.starts_with("pub use ")
+        || trimmed.starts_with("pub(crate) use ")
+        || trimmed.starts_with("pub(super) use ")
+}
+
+/// Core dead-public-item scanner.
+///
+/// For each `pub` / `pub(crate)` item defined in production code (src/, outside
+/// `#[cfg(test)]`), counts real (non-fake) references in production zones
+/// vs test zones separately, then categorizes:
+///
+///   - **Dead everywhere**: zero real references in both prod and test.
+///   - **Dead in production**: zero prod refs, but test refs exist —
+///     tests are testing dead code; item should be `#[cfg(test)]` or wired
+///     into prod.
+///   - **pub(crate) downgrade**: item was made `pub(crate)` but is still dead.
 fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
     use std::collections::HashSet;
 
     let mut allviolations = Vec::new();
 
-    // Common trait method names and very short identifiers that would produce
-    // false positives because they collide with unrelated identifiers.
+    // Names to skip: common trait methods and very short / very common identifiers
+    // that would collide with unrelated identifiers producing false positives.
     let skip_names: HashSet<&str> = [
         // Trait methods
         "new", "default", "from", "into", "fmt", "clone", "drop",
@@ -3823,50 +4032,127 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
         "deref", "deref_mut", "index", "index_mut",
         "next", "size_hint", "try_from", "try_into",
         "serialize", "deserialize", "matched", "main",
-        // Too short / too common
+        // Too short / too common — high collision risk
         "run", "get", "set", "add", "len",
     ]
     .iter()
     .copied()
     .collect();
 
-    // Phase 1: extract all pub item definitions.
     struct PubItem {
         name: String,
         file: String,
         line: usize,
+        visibility: PubVisibility,
     }
     let mut pub_items: Vec<PubItem> = Vec::new();
 
+    // ---- Phase 1: extract definitions from production zones of src/ files ----
     for sf in cache {
-        for (line_idx, line) in sf.stripped.lines().enumerate() {
-            if let Some(name) = extract_pub_item_name(line) {
+        if sf.is_test_file {
+            continue; // Don't scan test files for dead definitions.
+        }
+        // Only extract from production lines (outside #[cfg(test)]).
+        for (line_idx, line) in sf.prod_text.lines().enumerate() {
+            if let Some((name, vis)) = extract_pub_item_name(line) {
                 if name.len() >= 4 && !skip_names.contains(name) {
                     pub_items.push(PubItem {
                         name: name.to_string(),
                         file: sf.path.to_string_lossy().to_string(),
-                        line: line_idx + 1,
+                        // Line number is approximate (prod_text lines != file lines).
+                        // Find exact line in full stripped text for accurate reporting.
+                        line: find_definition_line(&sf.stripped, name, line).unwrap_or(line_idx + 1),
+                        visibility: vis,
                     });
                 }
             }
         }
     }
 
-    // Phase 2: for each pub item, count word-boundary references across ALL files.
+    // ---- Phase 2: count prod refs vs test refs with fake-reference filtering ----
     for item in &pub_items {
-        let mut total_count: usize = 0;
+        let mut prod_refs: usize = 0;
+        let mut test_refs: usize = 0;
+
         for sf in cache {
-            total_count += countvariable_occurrences(&sf.stripped, &item.name);
+            if sf.is_test_file {
+                // Entire file is test code.
+                test_refs += count_real_references(&sf.stripped, &item.name);
+            } else {
+                prod_refs += count_real_references(&sf.prod_text, &item.name);
+                test_refs += count_real_references(&sf.test_text, &item.name);
+            }
         }
-        if total_count <= 1 {
-            allviolations.push(format!(
-                "\n\u{274c} ERROR: Dead public item '{}' at {}:{}\n\
-                 \u{26a0}\u{fe0f} This item is `pub` but never referenced anywhere in the codebase.\n\
-                 Remove it, or reduce visibility to pub(crate) if used only internally.",
-                item.name, item.file, item.line
+
+        // prod_refs includes the definition itself (count 1).
+        // If prod_refs <= 1, no production code calls this item.
+        if prod_refs > 1 {
+            continue; // Alive in production — not dead.
+        }
+
+        // ---- Phase 3: categorize the violation ----
+        let vis_label = match item.visibility {
+            PubVisibility::Pub => "pub",
+            PubVisibility::PubCrate => "pub(crate)",
+        };
+
+        let (category, guidance) = if item.visibility == PubVisibility::PubCrate {
+            (
+                "VISIBILITY DOWNGRADE EVASION",
+                "This item was changed to pub(crate) but is still dead.\n   \
+                 Reducing visibility does NOT constitute use.\n   \
+                 Wire this into production code, or delete it.",
+            )
+        } else if test_refs > 0 {
+            (
+                "DEAD IN PRODUCTION (test-only usage)",
+                "This item has no production callers \u{2014} it is only referenced from tests.\n   \
+                 Tests that test dead code are worse than no tests (they create false confidence).\n   \
+                 Either:\n   \
+                   \u{2022} Wire the item into production code (preferred), OR\n   \
+                   \u{2022} Move it to #[cfg(test)] if it is genuinely a test helper, OR\n   \
+                   \u{2022} Delete both the item and its tests.",
+            )
+        } else {
+            (
+                "DEAD EVERYWHERE",
+                "This item has no references anywhere in the codebase.\n   \
+                 Wire it into production code, or delete it.",
+            )
+        };
+
+        let mut msg = format!(
+            "\n\u{274c} ERROR: {category} \u{2014} `{vis}` item '{name}' at {file}:{line}",
+            vis = vis_label,
+            name = item.name,
+            file = item.file,
+            line = item.line,
+        );
+        msg.push_str(&format!("\n   {guidance}"));
+        if test_refs > 0 && item.visibility == PubVisibility::Pub {
+            msg.push_str(&format!(
+                "\n   (Found {} test-only reference(s) that do not count as production use.)",
+                test_refs
             ));
         }
+        allviolations.push(msg);
     }
 
     allviolations
+}
+
+/// Find the actual line number of a definition in the full stripped text.
+/// Searches for a line that both contains `name` at a word boundary AND
+/// matches the prod-text line content.
+fn find_definition_line(full_stripped: &str, name: &str, prod_line: &str) -> Option<usize> {
+    let prod_trimmed = prod_line.trim();
+    if prod_trimmed.is_empty() {
+        return None;
+    }
+    for (idx, line) in full_stripped.lines().enumerate() {
+        if line.trim() == prod_trimmed && countvariable_occurrences(line, name) > 0 {
+            return Some(idx + 1);
+        }
+    }
+    None
 }
