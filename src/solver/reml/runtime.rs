@@ -1708,6 +1708,7 @@ impl<'a> RemlState<'a> {
         let penalty_logdet = PenaltyLogdetDerivs {
             value: log_det_s,
             first: pirls_result.reparam_result.det1.clone(),
+            second: None,
         };
 
         // Penalty roots (possibly projected).
@@ -1754,6 +1755,7 @@ impl<'a> RemlState<'a> {
                 };
                 Box::new(SinglePredictorGlmDerivatives {
                     c_array,
+                    d_array: Some(pirls_result.solve_d_array.clone()),
                     x_transformed,
                 })
             };
