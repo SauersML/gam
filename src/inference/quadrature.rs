@@ -3760,6 +3760,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_logit_small_se_branch_loses_tail_derivative() {
+        let eta = 50.0_f64;
+        let stable_z = (-eta).exp();
+        let stable_dmu = stable_z / (1.0_f64 + stable_z).powi(2);
+        assert!(stable_dmu > 0.0);
+        let out = logit_posterior_meanwith_deriv_exact(eta, 0.0).expect("exact branch");
+        let dmu = out.dmean_dmu;
+        assert!(
+            (dmu - stable_dmu).abs() < 1e-30,
+            "exact logit small-se branch should use the stable derivative z/(1+z)^2 at eta={eta}; got {} vs {}",
+            dmu,
+            stable_dmu
+        );
+    }
+
+    #[test]
     fn integrated_family_moments_rejects_state_less_sas_and_mixture() {
         let ctx = QuadratureContext::new();
         let sas = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialSas, 0.2, 0.5)

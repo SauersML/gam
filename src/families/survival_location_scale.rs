@@ -5779,4 +5779,84 @@ mod tests {
             "q is locally constant in eta_ls on the active floor branch, so d3q/deta_ls3 must be 0; got {q_ll_ls}"
         );
     }
+
+    #[test]
+    fn logistic_residual_tail_derivatives_should_match_stable_closed_forms() {
+        let z = 50.0_f64;
+        let e = (-z).exp();
+        let denom = 1.0_f64 + e;
+        let stable_pdf = e / denom.powi(2);
+        let stable_d1 = e * (e - 1.0) / denom.powi(3);
+        let stable_d2 = e * (e * e - 4.0 * e + 1.0) / denom.powi(4);
+        let stable_d3 = e * (e * e * e - 11.0 * e * e + 11.0 * e - 1.0) / denom.powi(5);
+
+        let dist = ResidualDistribution::Logistic;
+        assert!(
+            (dist.pdf(z) - stable_pdf).abs() < 1e-30,
+            "logistic residual pdf should equal the stable tail formula at z={z}; got {} vs {}",
+            dist.pdf(z),
+            stable_pdf
+        );
+        assert!(
+            (dist.pdf_derivative(z) - stable_d1).abs() < 1e-30,
+            "logistic residual pdf' should equal the stable tail formula at z={z}; got {} vs {}",
+            dist.pdf_derivative(z),
+            stable_d1
+        );
+        assert!(
+            (dist.pdfsecond_derivative(z) - stable_d2).abs() < 1e-30,
+            "logistic residual pdf'' should equal the stable tail formula at z={z}; got {} vs {}",
+            dist.pdfsecond_derivative(z),
+            stable_d2
+        );
+        assert!(
+            (dist.pdfthird_derivative(z) - stable_d3).abs() < 1e-30,
+            "logistic residual pdf''' should equal the stable tail formula at z={z}; got {} vs {}",
+            dist.pdfthird_derivative(z),
+            stable_d3
+        );
+    }
+
+    #[test]
+    fn gumbel_cdf_negative_tail_should_match_expm1_form() {
+        let z = -50.0_f64;
+        let ez = z.exp();
+        let stable_cdf = -(-ez).exp_m1();
+        let dist = ResidualDistribution::Gumbel;
+        assert!(stable_cdf > 0.0);
+        assert!(
+            (dist.cdf(z) - stable_cdf).abs() < 1e-30,
+            "gumbel cdf should equal -expm1(-exp(z)) in the negative tail at z={z}; got {} vs {}",
+            dist.cdf(z),
+            stable_cdf
+        );
+    }
+
+    #[test]
+    fn probit_survival_helper_loses_upper_tail_probability() {
+        let eta = 10.0_f64;
+        let stable_survival = 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2);
+        assert!(stable_survival > 0.0);
+        let helper = inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::Probit), eta);
+        assert!(
+            (helper - stable_survival).abs() < 1e-30,
+            "probit survival helper should use the upper-tail erfc form at eta={eta}; got {} vs {}",
+            helper,
+            stable_survival
+        );
+    }
+
+    #[test]
+    fn cloglog_survival_helper_changes_the_negative_tail_function() {
+        let eta = -100.0_f64;
+        let stable_survival = (-(eta.exp())).exp();
+        let helper = inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::CLogLog), eta);
+        assert_eq!(stable_survival, 1.0);
+        assert!(
+            (helper - stable_survival).abs() < 1e-30,
+            "cloglog survival helper should evaluate exp(-exp(eta)) itself, not a clamped surrogate, at eta={eta}; got {} vs {}",
+            helper,
+            stable_survival
+        );
+    }
 }

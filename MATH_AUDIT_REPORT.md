@@ -77,8 +77,8 @@ Counterexample:
 - Then `sigma = exp(-30) < 1e-12`, so the implemented predictor is
   `q = -2 / 1e-12 = -2e12`, which is locally constant in `eta_ls`.
 - The correct `eta_ls` derivatives are all zero.
-- The code instead returns huge nonzero values, for example
-  `dq/deta_ls = eta_t * sigma / (1e-12)^2`, which is about `1.87e11`.
+- The code instead returns nonzero values, for example the failing test observes
+  `dq/deta_ls = 0.1871524593768035` instead of `0`.
 
 Failing test:
 
