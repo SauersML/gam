@@ -7,9 +7,9 @@ use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::solver::estimate::FitGeometry;
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DispersionHandling, EvalMode, InnerSolutionBuilder,
-    compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
-    reml_laml_evaluate,
+    BlockCoupledOperator, DispersionHandling, EvalMode,
+    HessianDerivativeProvider, InnerSolutionBuilder, compute_block_penalty_logdet_derivs,
+    embed_penalty_root, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
@@ -2491,6 +2491,55 @@ fn inner_blockwise_fit<F: CustomFamily>(
     })
 }
 
+/// Borrowed derivative provider for joint models that wraps closures with
+/// non-`'static` lifetimes.
+///
+/// The closures borrow data from the calling stack frame (family, synced states,
+/// specs), so we cannot use the `'static`-requiring `JointModelDerivProvider`.
+/// Instead we borrow the closures and implement `HessianDerivativeProvider` directly.
+///
+/// # Sign convention
+///
+/// The unified evaluator passes `v_k = H⁻¹(A_k β̂)` to `hessian_derivative_correction`.
+/// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
+/// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
+struct BorrowedJointDerivProvider<'a> {
+    compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    compute_d2h: Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>>,
+}
+
+// SAFETY: Only used synchronously within the same stack frame that creates it.
+// The provider is constructed, boxed, passed to `unified_joint_cost_gradient`,
+// consumed by the unified evaluator, and dropped — all within a single call to
+// `joint_outer_evaluate`. No cross-thread sharing occurs.
+unsafe impl Send for BorrowedJointDerivProvider<'_> {}
+unsafe impl Sync for BorrowedJointDerivProvider<'_> {}
+
+impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+        let neg_v = -v_k;
+        (self.compute_dh)(&neg_v).ok().flatten()
+    }
+
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        let d2h = self.compute_d2h.as_ref()?;
+        let term1 = (self.compute_dh)(u_kl).ok().flatten()?;
+        let neg_v_k = -v_k;
+        let neg_v_l = -v_l;
+        let term2 = d2h(&neg_v_l, &neg_v_k).ok().flatten()?;
+        Some(term1 + &term2)
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+}
+
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
 /// This is the bridge between the custom family's joint Hessian infrastructure
@@ -2512,8 +2561,8 @@ fn unified_joint_cost_gradient(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
-    precomputed_corrections: Vec<Option<Array2<f64>>>,
-    precomputed_h_ddot_traces: Option<Array2<f64>>,
+    deriv_provider: Box<dyn HessianDerivativeProvider>,
+    eval_mode: EvalMode,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
     // Build BlockCoupledOperator from the joint Hessian with block structure.
     let hop = BlockCoupledOperator::from_joint_hessian(j_for_traces, ranges.to_vec())
@@ -2559,17 +2608,8 @@ fn unified_joint_cost_gradient(
             include_logdet_s,
         },
     )
-    .precomputed_corrections(precomputed_corrections);
-    if let Some(traces) = precomputed_h_ddot_traces.clone() {
-        builder = builder.precomputed_h_ddot_traces(traces);
-    }
+    .deriv_provider(deriv_provider);
     let inner_solution = builder.build();
-
-    let eval_mode = if precomputed_h_ddot_traces.is_some() {
-        EvalMode::ValueGradientHessian
-    } else {
-        EvalMode::ValueAndGradient
-    };
 
     let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), eval_mode, None)?;
 
@@ -2577,88 +2617,6 @@ fn unified_joint_cost_gradient(
     let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
 
     Ok((cost, gradient, result.hessian))
-}
-
-/// Pre-compute third-derivative corrections for each smoothing parameter.
-///
-/// For each k, solves v_k = J_mode⁻¹(-A_k β̂) and calls `compute_dh(v_k)` to get
-/// the correction D_β H_L[v_k]. Also collects intermediate values needed for
-/// the outer Hessian (a_terms, a_beta_terms, u_terms, j_terms).
-///
-/// Returns (corrections, a_terms, a_beta_terms, u_terms, j_terms).
-fn precompute_joint_corrections(
-    specs: &[ParameterBlockSpec],
-    per_block: &[Array1<f64>],
-    beta_flat: &Array1<f64>,
-    j_mode_inv: &Array2<f64>,
-    ranges: &[(usize, usize)],
-    total: usize,
-    include_logdet_h: bool,
-    need_hessian: bool,
-    // Closure that computes D_β H_L[v] given direction v.
-    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-) -> Result<
-    (
-        Vec<Option<Array2<f64>>>,
-        Vec<Array2<f64>>,
-        Vec<Array1<f64>>,
-        Vec<Array1<f64>>,
-        Vec<Array2<f64>>,
-    ),
-    String,
-> {
-    let mut corrections = Vec::new();
-    let mut a_terms = Vec::new();
-    let mut a_beta_terms = Vec::new();
-    let mut u_terms = Vec::new();
-    let mut j_terms = Vec::new();
-
-    for b in 0..specs.len() {
-        let spec = &specs[b];
-        let (start, end) = ranges[b];
-        let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
-        let lambdas = per_block[b].mapv(f64::exp);
-
-        for (k, s_k) in spec.penalties.iter().enumerate() {
-            let local = s_k.mapv(|v| lambdas[k] * v);
-            let mut a_k_beta = Array1::<f64>::zeros(total);
-            a_k_beta
-                .slice_mut(ndarray::s![start..end])
-                .assign(&local.dot(&beta_block));
-            let mut a_k = Array2::<f64>::zeros((total, total));
-            a_k.slice_mut(ndarray::s![start..end, start..end])
-                .assign(&local);
-
-            let keep_second_order = need_hessian || include_logdet_h;
-            let u_k = if keep_second_order {
-                let rhs_k = -&a_k_beta;
-                j_mode_inv.dot(&rhs_k)
-            } else {
-                Array1::<f64>::zeros(total)
-            };
-
-            let correction = if include_logdet_h && u_k.dot(&u_k).sqrt() > 1e-14 {
-                compute_dh(&u_k)?
-            } else {
-                None
-            };
-
-            corrections.push(correction.clone());
-
-            if need_hessian {
-                let mut d_j_k = a_k.clone();
-                if let Some(ref c) = correction {
-                    d_j_k += c;
-                }
-                a_terms.push(a_k);
-                a_beta_terms.push(a_k_beta);
-                u_terms.push(u_k);
-                j_terms.push(d_j_k);
-            }
-        }
-    }
-
-    Ok((corrections, a_terms, a_beta_terms, u_terms, j_terms))
 }
 
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
@@ -2687,10 +2645,10 @@ fn joint_outer_evaluate(
     include_logdet_h: bool,
     include_logdet_s: bool,
     strict_spd: bool,
-    allow_semidefinite: bool,
+    _allow_semidefinite: bool,
     need_hessian: bool,
     options: &BlockwiseFitOptions,
-    tangent_basis: Option<&Array2<f64>>,
+    _tangent_basis: Option<&Array2<f64>>,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
 ) -> Result<OuterObjectiveEvalResult, String> {
@@ -2749,105 +2707,19 @@ fn joint_outer_evaluate(
         }
     }
 
-    let h_inv = logdet_trace_inverse_with_ridge_policy(
-        &j_for_traces,
-        options.ridge_floor,
-        options.ridge_policy,
-        strict_spd,
-        allow_semidefinite,
-    )?;
-
-    // Precompute J_mode inverse once (handles optional tangent-basis projection).
-    let j_mode_inv = if need_hessian || include_logdet_h || include_logdet_s {
-        let j_inv_raw = if strict_spd || extra_logdet_ridge == 0.0 {
-            std::borrow::Cow::Borrowed(&h_inv)
-        } else {
-            std::borrow::Cow::Owned(logdet_trace_inverse_with_ridge_policy(
-                &j_joint,
-                options.ridge_floor,
-                options.ridge_policy,
-                strict_spd,
-                allow_semidefinite,
-            )?)
-        };
-        match tangent_basis {
-            Some(basis) => {
-                let btjb = basis.t().dot(&j_joint).dot(basis);
-                let btjb_inv = if strict_spd {
-                    strict_inverse_spdwith_semidefinite_option(&btjb, allow_semidefinite)?
-                } else {
-                    logdet_trace_inverse_with_ridge_policy(
-                        &btjb,
-                        options.ridge_floor,
-                        options.ridge_policy,
-                        strict_spd,
-                        allow_semidefinite,
-                    )?
-                };
-                Some(basis.dot(&btjb_inv).dot(&basis.t()))
-            }
-            None => Some(j_inv_raw.into_owned()),
-        }
-    } else {
-        None
+    // Build derivative provider from the caller-supplied closures.
+    let compute_d2h_ref: Option<&dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>> =
+        Some(compute_d2h);
+    let provider = BorrowedJointDerivProvider {
+        compute_dh,
+        compute_d2h: compute_d2h_ref,
     };
+    let provider_box: Box<dyn HessianDerivativeProvider> = Box::new(provider);
 
-    let j_mode_inv_ref = j_mode_inv
-        .as_ref()
-        .ok_or_else(|| "missing j_mode_inv for joint outer path".to_string())?;
-
-    let (precomputed_corrections, a_terms, a_beta_terms, u_terms, j_terms) =
-        precompute_joint_corrections(
-            specs,
-            per_block,
-            beta_flat,
-            j_mode_inv_ref,
-            ranges,
-            total,
-            include_logdet_h,
-            need_hessian,
-            compute_dh,
-        )?;
-
-    // Pre-compute tr(H⁻¹ Ḧ_{kl}) for the outer Hessian when needed.
-    let h_ddot_traces = if need_hessian && include_logdet_h {
-        let k_count = rho.len();
-        let mut traces = Array2::<f64>::zeros((k_count, k_count));
-        let mut traces_available = true;
-        'outer_loop: for k in 0..k_count {
-            for l in k..k_count {
-                let delta_kl = if k == l { 1.0 } else { 0.0 };
-                let rhs_kl = -(a_terms[k].dot(&u_terms[l])
-                    + j_terms[l].dot(&u_terms[k])
-                    + delta_kl * a_beta_terms[k].clone());
-                let u_kl = j_mode_inv_ref.dot(&rhs_kl);
-                let dh_u_kl = match compute_dh(&u_kl)? {
-                    Some(v) => v,
-                    None => {
-                        traces_available = false;
-                        break 'outer_loop;
-                    }
-                };
-                let d2h_ul_uk = match compute_d2h(&u_terms[l], &u_terms[k])? {
-                    Some(v) => v,
-                    None => {
-                        traces_available = false;
-                        break 'outer_loop;
-                    }
-                };
-                let mut j_kl = dh_u_kl;
-                j_kl += &d2h_ul_uk;
-                if delta_kl > 0.0 {
-                    j_kl += &a_terms[k];
-                }
-                let trsecond = trace_product(&h_inv, &j_kl);
-                traces[[k, l]] = trsecond;
-                traces[[l, k]] = trsecond;
-            }
-        }
-        if traces_available { Some(traces) } else { None }
+    let eval_mode = if need_hessian {
+        EvalMode::ValueGradientHessian
     } else {
-        None
+        EvalMode::ValueAndGradient
     };
 
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
@@ -2863,8 +2735,8 @@ fn joint_outer_evaluate(
         include_logdet_h,
         include_logdet_s,
         options,
-        precomputed_corrections,
-        h_ddot_traces,
+        provider_box,
+        eval_mode,
     )?;
 
     let warm = ConstrainedWarmStart {
@@ -3243,119 +3115,100 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         Array2::<f64>::zeros((p, p))
     };
 
-    // Precompute correction matrices for each smoothing parameter.
+    // Build a derivative provider that computes D_β H_L[direction] on demand.
     let beta = &inner.block_states[b].beta;
-    let mut corrections: Vec<Option<Array2<f64>>> = Vec::new();
-    if include_logdet_h {
-        for (k, s_k) in spec.penalties.iter().enumerate() {
-            let a_k = s_k.mapv(|v| lambdas[k] * v);
-            let a_k_beta = a_k.dot(beta);
-            let rhs = -&a_k_beta;
-            let u_k = h_mode_inv.dot(&rhs);
-            let u_norm = u_k.dot(&u_k).sqrt();
-            if u_norm <= 1e-14 {
-                corrections.push(None);
-                continue;
+    let compute_dh = |direction: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+        if !include_logdet_h {
+            return Ok(None);
+        }
+        match work {
+            BlockWorkingSet::ExactNewton { .. } => {
+                match family.exact_newton_hessian_directional_derivative(
+                    &inner.block_states,
+                    b,
+                    direction,
+                )? {
+                    Some(h_exact) => Ok(Some(symmetrized_square_matrix(
+                        h_exact,
+                        p,
+                        &format!("block {b} exact-newton dH shape mismatch"),
+                    )?)),
+                    None => Err(format!(
+                        "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
+                    )),
+                }
             }
-            let correction = match work {
-                BlockWorkingSet::ExactNewton { .. } => {
-                    match family.exact_newton_hessian_directional_derivative(
-                        &inner.block_states,
-                        b,
-                        &u_k,
-                    )? {
-                        Some(h_exact) => Some(symmetrized_square_matrix(
-                            h_exact,
-                            p,
-                            &format!("block {b} exact-newton dH shape mismatch"),
-                        )?),
-                        None => {
-                            return Err(format!(
-                                "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
-                            ));
-                        }
-                    }
-                }
-                BlockWorkingSet::Diagonal {
-                    working_response: _,
-                    working_weights,
-                } => {
-                    // Build the full correction matrix D H_L[u_k]:
-                    //   C_k = (DX[u])' W X + X' W (DX[u]) + X' diag(dw) X
-                    let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
-                        format!("missing dynamic design for block {b} diagonal correction")
-                    })?;
-                    let wwork = floor_positiveworking_weights(working_weights, options.minweight);
-                    let x_dense = x_dyn.to_dense();
-                    let n = x_dense.nrows();
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => {
+                let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                    format!("missing dynamic design for block {b} diagonal correction")
+                })?;
+                let wwork = floor_positiveworking_weights(working_weights, options.minweight);
+                let x_dense = x_dyn.to_dense();
+                let n = x_dense.nrows();
 
-                    // Compute full d_eta with geometry augmentation.
-                    let mut d_eta = x_dyn.matrixvectormultiply(&u_k);
-                    let geom = family.block_geometry_directional_derivative(
-                        &inner.block_states,
-                        b,
-                        spec,
-                        &u_k,
-                    )?;
-                    let mut correction_mat = Array2::<f64>::zeros((p, p));
+                let mut d_eta = x_dyn.matrixvectormultiply(direction);
+                let geom = family.block_geometry_directional_derivative(
+                    &inner.block_states,
+                    b,
+                    spec,
+                    direction,
+                )?;
+                let mut correction_mat = Array2::<f64>::zeros((p, p));
 
-                    // Exploit block-diagonal structure: A_k is zero except in [start..end, start..end].
-                    // Geometry drift: (DX)' W X + X' W (DX).
-                    if let Some(geom_dir) = geom {
-                        d_eta += &geom_dir.d_offset;
-                        if let Some(dx) = geom_dir.d_design {
-                            d_eta += &dx.dot(beta);
-                            // Weight-scaled matrices for geometry trace.
-                            let mut wx = x_dense.clone();
-                            let mut wdx = dx.clone();
-                            for i in 0..n {
-                                let wi = wwork[i];
-                                if wi != 1.0 {
-                                    wx.row_mut(i).mapv_inplace(|v| v * wi);
-                                    wdx.row_mut(i).mapv_inplace(|v| v * wi);
-                                }
+                if let Some(geom_dir) = geom {
+                    d_eta += &geom_dir.d_offset;
+                    if let Some(dx) = geom_dir.d_design {
+                        d_eta += &dx.dot(beta);
+                        let mut wx = x_dense.clone();
+                        let mut wdx = dx.clone();
+                        for i in 0..n {
+                            let wi = wwork[i];
+                            if wi != 1.0 {
+                                wx.row_mut(i).mapv_inplace(|v| v * wi);
+                                wdx.row_mut(i).mapv_inplace(|v| v * wi);
                             }
-                            correction_mat += &dx.t().dot(&wx);
-                            correction_mat += &x_dense.t().dot(&wdx);
                         }
+                        correction_mat += &dx.t().dot(&wx);
+                        correction_mat += &x_dense.t().dot(&wdx);
                     }
-
-                    // Weight derivative: X' diag(dw) X.
-                    let dw = family
-                        .diagonalworking_weights_directional_derivative(
-                            &inner.block_states,
-                            b,
-                            &d_eta,
-                        )?
-                        .ok_or_else(|| {
-                            format!(
-                                "missing diagonal dW callback for block {b} while REML gradient requires H_beta term"
-                            )
-                        })?;
-                    if dw.len() != n {
-                        return Err(format!(
-                            "block {b} diagonal dW length mismatch: got {}, expected {}",
-                            dw.len(),
-                            n
-                        ));
-                    }
-                    // X' diag(dw) X
-                    let mut scaled_x = x_dense.clone();
-                    for i in 0..n {
-                        scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
-                    }
-                    correction_mat += &x_dense.t().dot(&scaled_x);
-
-                    Some(correction_mat)
                 }
-            };
-            corrections.push(correction);
+
+                let dw = family
+                    .diagonalworking_weights_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        &d_eta,
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "missing diagonal dW callback for block {b} while REML gradient requires H_beta term"
+                        )
+                    })?;
+                if dw.len() != n {
+                    return Err(format!(
+                        "block {b} diagonal dW length mismatch: got {}, expected {}",
+                        dw.len(),
+                        n
+                    ));
+                }
+                let mut scaled_x = x_dense.clone();
+                for i in 0..n {
+                    scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
+                }
+                correction_mat += &x_dense.t().dot(&scaled_x);
+
+                Ok(Some(correction_mat))
+            }
         }
-    } else {
-        for _ in 0..spec.penalties.len() {
-            corrections.push(None);
-        }
-    }
+    };
+
+    let provider = BorrowedJointDerivProvider {
+        compute_dh: &compute_dh,
+        compute_d2h: None,
+    };
 
     // Route through unified evaluator: build InnerSolution for this single block.
     let (objective, grad, _) = {
@@ -3374,8 +3227,8 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             include_logdet_h,
             include_logdet_s,
             options,
-            corrections,
-            None,
+            Box::new(provider),
+            EvalMode::ValueAndGradient,
         )?
     };
 

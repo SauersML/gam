@@ -1195,307 +1195,6 @@ impl WorkingModelSurvival {
 
         Ok(0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h - 0.5 * logdet_s)
     }
-
-    /// Evaluate the survival outer objective and exact `rho`-gradient at a
-    /// converged inner state.
-    ///
-    /// Objective and notation in this implementation:
-    /// - `rho_k = log(lambda_k)`, `lambda_k = exp(rho_k)`.
-    /// - `S(rho) = sum_k A_k`, where `A_k = dS/drho_k = lambda_k * S_k`.
-    /// - `H = X^T W X + S(rho)` from the inner model state.
-    /// - `V(rho) = 0.5*deviance(beta_hat) + penalty_term(beta_hat)
-    ///           + 0.5*log|H| - 0.5*log|S|_+`.
-    ///
-    /// Exact gradient used here (no finite differences):
-    ///   dV/drho_k
-    ///     = 0.5 * beta_hat^T A_k beta_hat
-    ///     + 0.5 * tr(H^{-1} dH/drho_k)
-    ///     - 0.5 * tr(S^+ A_k).
-    ///
-    /// For this Royston-Parmar survival likelihood, the hard part is the
-    /// `tr(H^{-1} dH/drho_k)` contraction. We evaluate it exactly as:
-    ///   tr(H^{-1} dH/drho_k)
-    ///     = tr(H^{-1} A_k) + tr(H^{-1} (dH_nll/d beta [u_k])),
-    /// where:
-    ///   u_k = d beta_hat / d rho_k = -H^{-1} A_k beta_hat
-    /// and `dH_nll/d beta [u_k]` is the exact directional derivative of the
-    /// (unpenalized) Hessian with respect to `beta` along `u_k`.
-    ///
-    /// This is exact for the constrained coefficient parameterization used by
-    /// the survival engine.
-    ///
-    /// Exact trace-contraction implementation details:
-    /// - factorize `H` once,
-    /// - compute `H^{-1}` actions by solves (`solvevec` / `solve_mat`),
-    /// - build directional Hessian derivative `dH_nll/d beta [u_k]` analytically,
-    /// - evaluate trace as `tr(H^{-1} B)` using `solve_mat(B)`.
-    ///
-    /// Complexity per outer evaluation (dense):
-    /// - shared precompute: `O(np^2 + p^3)`,
-    /// - per penalty block `k`: `O(np + p^2 + nnz(S_k))`.
-    ///
-    /// Ridge note:
-    /// - `state.penalty_term` includes the tiny stabilization ridge as
-    ///   `0.5 * ridge * ||beta||^2`, so the objective value is consistent with
-    ///   the solved mode and with the reported gradient/Hessian.
-    /// - this ridge is constant in `rho`, so it does not enter `A_k` nor
-    ///   `tr(S^+ A_k)`.
-    pub fn lamlobjective_and_rhogradient(
-        &self,
-        beta: &Array1<f64>,
-        state: &WorkingState,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
-        let p = beta.len();
-        let k_count = self.penalties.blocks.len();
-        let objective = self.lamlobjective_from_state(beta, state)?;
-
-        if k_count == 0 {
-            return Ok((objective, Array1::zeros(0)));
-        }
-
-        // Reuse one symmetric factorization for all H^{-1} applications.
-        // This is the core speed-up: exact contractions via solves, no dense
-        // inverse assembly.
-        let factor = state
-            .hessian
-            .factorize()
-            .map_err(EstimationError::InvalidInput)?;
-
-        let solve_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            factor
-                .solvemulti(rhs)
-                .expect("survival Hessian solve should succeed")
-        };
-        let solvevec = |rhs: &Array1<f64>| -> Array1<f64> {
-            factor
-                .solve(rhs)
-                .expect("survival Hessian solve should succeed")
-        };
-        // Keep outer gradient contractions consistent with the fitted inner state:
-        // the working predictor includes target baseline offsets plus learned deviation.
-        let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
-        let eta_exit = self.exit_dot(beta) + &self.offset_eta_exit;
-        let deriv_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
-        let exp_entry = eta_entry.mapv(f64::exp);
-        let exp_exit = eta_exit.mapv(f64::exp);
-        let guard = self.derivative_guard();
-        let guard_numerical = self.derivative_guard_numerical();
-        let n = self.nrows();
-        let mut row_exit = vec![0.0_f64; p];
-        let mut row_entry = vec![0.0_f64; p];
-        let mut row_derivative = vec![0.0_f64; p];
-        let mut b_dir = Array2::<f64>::zeros((p, p));
-        let mut ge = vec![0.0_f64; p];
-        let mut gs = vec![0.0_f64; p];
-        let mut gsd = vec![0.0_f64; p];
-        let mut he = vec![0.0_f64; p];
-        let mut hs = vec![0.0_f64; p];
-        let mut hsd = vec![0.0_f64; p];
-        let mut te = vec![0.0_f64; p];
-        let mut ts = vec![0.0_f64; p];
-        let mut tsd = vec![0.0_f64; p];
-        let mut rhs_block = Array2::<f64>::zeros((p, 1));
-
-        let jac = Array1::<f64>::ones(p);
-        let curvature = Array1::<f64>::zeros(p);
-        let third = Array1::<f64>::zeros(p);
-
-        // Assemble S(rho) in the same scaling used by update_state.
-        let mut s_total = Array2::<f64>::zeros((p, p));
-        for block in &self.penalties.blocks {
-            if block.lambda == 0.0 {
-                continue;
-            }
-            let start = block.range.start;
-            let end = block.range.end;
-            s_total
-                .slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(block.lambda, &block.matrix);
-        }
-
-        // Pseudo-logdet and pseudoinverse for S:
-        // d/drho_k [-0.5 log|S|_+] = -0.5 tr(S^+ A_k).
-        let (s_eval, s_evec) = s_total
-            .eigh(Side::Lower)
-            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-        let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let s_tol = (max_s_eval * 1e-12).max(1e-14);
-        // Build S^+ = U_+ diag(1/ev_j) U_+^T via scaled columns of U.
-        let mut u_scaled = s_evec.clone();
-        for j in 0..p {
-            let ev = s_eval[j];
-            if ev > s_tol {
-                let inv_ev_sqrt = (1.0 / ev).sqrt();
-                u_scaled.column_mut(j).mapv_inplace(|v| v * inv_ev_sqrt);
-            } else {
-                u_scaled.column_mut(j).fill(0.0);
-            }
-        }
-        let s_pinv = u_scaled.dot(&u_scaled.t());
-
-        let mut grad = Array1::<f64>::zeros(k_count);
-        for (k, block) in self.penalties.blocks.iter().enumerate() {
-            let lambda = block.lambda;
-            let start = block.range.start;
-            let end = block.range.end;
-
-            let b_block = beta.slice(ndarray::s![start..end]).to_owned();
-            let a_k_beta_block = block.matrix.dot(&b_block).mapv(|v| lambda * v);
-            let mut a_k_beta = Array1::<f64>::zeros(p);
-            a_k_beta
-                .slice_mut(ndarray::s![start..end])
-                .assign(&a_k_beta_block);
-
-            // Implicit inner derivative:
-            // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
-            let u_k = -solvevec(&a_k_beta);
-
-            // Exact trace(H^{-1} A_k) without assembling the full dense inverse.
-            // Since A_k is block-supported, solve only those block columns.
-            let block_width = end - start;
-            if rhs_block.ncols() != block_width {
-                rhs_block = Array2::<f64>::zeros((p, block_width.max(1)));
-            } else {
-                rhs_block.fill(0.0);
-            }
-            rhs_block
-                .slice_mut(ndarray::s![start..end, ..block_width])
-                .assign(&block.matrix.mapv(|v| lambda * v));
-            let solved_block = solve_mat(&rhs_block);
-            let mut trace_hinv_ak = 0.0;
-            for j in 0..block_width {
-                trace_hinv_ak += solved_block[[start + j, j]];
-            }
-
-            // Exact directional derivative B = dH_nll/d beta [u_k].
-            // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).
-            b_dir.fill(0.0);
-            for i in 0..n {
-                let w_i = self.sampleweight[i];
-                if w_i <= 0.0 {
-                    continue;
-                }
-                let has_entry = !self.entry_at_origin[i];
-                let mut deta_e = 0.0_f64;
-                let mut deta_s = 0.0_f64;
-                let mut ds = 0.0_f64;
-                self.fill_exit_row(i, &mut row_exit);
-                self.fill_entry_row(i, &mut row_entry);
-                self.fill_derivative_row(i, &mut row_derivative);
-                for j in 0..p {
-                    ge[j] = row_exit[j] * jac[j];
-                    gs[j] = row_entry[j] * jac[j];
-                    gsd[j] = row_derivative[j] * jac[j];
-                    he[j] = row_exit[j] * curvature[j];
-                    hs[j] = row_entry[j] * curvature[j];
-                    hsd[j] = row_derivative[j] * curvature[j];
-                    te[j] = row_exit[j] * third[j];
-                    ts[j] = row_entry[j] * third[j];
-                    tsd[j] = row_derivative[j] * third[j];
-                    deta_e += ge[j] * u_k[j];
-                    if has_entry {
-                        deta_s += gs[j] * u_k[j];
-                    }
-                    ds += gsd[j] * u_k[j];
-                }
-
-                // Interval part:
-                // d/dβ [ exp(eta) * (g g^T + diag(h)) ][u]
-                for r in 0..p {
-                    let dge_r = he[r] * u_k[r];
-                    let dgs_r = hs[r] * u_k[r];
-                    let dhe_r = te[r] * u_k[r];
-                    let dhs_r = ts[r] * u_k[r];
-                    for c in 0..p {
-                        let dge_c = he[c] * u_k[c];
-                        let dgs_c = hs[c] * u_k[c];
-                        let mut d_h_rc =
-                            exp_exit[i] * (deta_e * ge[r] * ge[c] + dge_r * ge[c] + ge[r] * dge_c);
-                        if r == c {
-                            d_h_rc += exp_exit[i] * (deta_e * he[r] + dhe_r);
-                        }
-                        if has_entry {
-                            d_h_rc -= exp_entry[i]
-                                * (deta_s * gs[r] * gs[c] + dgs_r * gs[c] + gs[r] * dgs_c);
-                            if r == c {
-                                d_h_rc -= exp_entry[i] * (deta_s * hs[r] + dhs_r);
-                            }
-                        }
-                        b_dir[[r, c]] += w_i * d_h_rc;
-                    }
-                }
-
-                // Event part:
-                // d/dβ [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u]
-                let s_i = self
-                    .stabilized_structural_derivative(deriv_raw[i])
-                    .unwrap_or(deriv_raw[i]);
-                if !s_i.is_finite() {
-                    return Err(EstimationError::ParameterConstraintViolation(format!(
-                        "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                        i, s_i, guard
-                    )));
-                }
-                if self.event_target[i] > 0 {
-                    if s_i < guard_numerical {
-                        return Err(EstimationError::ParameterConstraintViolation(format!(
-                            "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                            i, s_i, guard
-                        )));
-                    }
-                    let inv_s = 1.0 / s_i;
-                    let inv_s2 = inv_s * inv_s;
-                    let inv_s3 = inv_s2 * inv_s;
-                    for r in 0..p {
-                        let dgd_r = hsd[r] * u_k[r];
-                        let dte_r = te[r] * u_k[r];
-                        let dtsd_r = tsd[r] * u_k[r];
-                        for c in 0..p {
-                            let dgd_c = hsd[c] * u_k[c];
-                            let mut d_h_rc = (dgd_r * gsd[c] + gsd[r] * dgd_c) * inv_s2
-                                - 2.0 * gsd[r] * gsd[c] * ds * inv_s3;
-                            if r == c {
-                                d_h_rc += -dte_r;
-                                d_h_rc += -(dtsd_r * inv_s - hsd[r] * ds * inv_s2);
-                            }
-                            b_dir[[r, c]] += w_i * d_h_rc;
-                        }
-                    }
-                }
-            }
-
-            let mut tracethird = 0.0;
-            let trace_chunk_cols = (SURVIVAL_TRACE_SOLVE_TARGET_BYTES
-                / (p.max(1) * std::mem::size_of::<f64>()))
-            .max(1)
-            .min(p);
-            let mut rhs_trace = Array2::<f64>::zeros((p, trace_chunk_cols));
-            for chunk_start in (0..p).step_by(trace_chunk_cols) {
-                let width = (p - chunk_start).min(trace_chunk_cols);
-                rhs_trace.fill(0.0);
-                rhs_trace
-                    .slice_mut(ndarray::s![.., ..width])
-                    .assign(&b_dir.slice(ndarray::s![.., chunk_start..chunk_start + width]));
-                let solved_chunk = solve_mat(&rhs_trace);
-                for j in 0..width {
-                    tracethird += solved_chunk[[chunk_start + j, j]];
-                }
-            }
-            let t_k = trace_hinv_ak + tracethird;
-
-            // p_k = tr(S^+ A_k) restricted to this block.
-            let s_pinv_block = s_pinv.slice(ndarray::s![start..end, start..end]);
-            let p_k = lambda * (&s_pinv_block * &block.matrix.t()).sum();
-
-            // Final exact component:
-            // 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} dH/drho_k) - 0.5 * tr(S^+ A_k),
-            // with tr(H^{-1} dH/drho_k) = trace_hinv_ak + tracethird.
-            grad[k] = 0.5 * beta.dot(&a_k_beta) + 0.5 * t_k - 0.5 * p_k;
-        }
-
-        Ok((objective, grad))
-    }
-
     /// Compute the third-derivative correction matrix for a given mode response `u_k`.
     ///
     /// This is the directional derivative of the unpenalized NLL Hessian w.r.t.
@@ -1732,11 +1431,7 @@ impl WorkingModelSurvival {
     }
 
     /// Evaluate the survival outer objective and gradient via the unified REML/LAML
-    /// evaluator.
-    ///
-    /// This is the unified replacement for [`Self::lamlobjective_and_rhogradient`],
-    /// using the shared `reml_laml_evaluate` infrastructure. It produces numerically
-    /// equivalent results.
+    /// evaluator, using the shared `reml_laml_evaluate` infrastructure.
     pub fn unified_lamlobjective_and_rhogradient(
         &self,
         beta: &Array1<f64>,
@@ -2625,8 +2320,13 @@ mod tests {
         }]);
         let beta = array![0.2, 0.2, 0.1];
         let state = model.update_state(&beta).expect("state at structural beta");
+        let rho = Array1::from_iter(
+            model.penalties.blocks.iter()
+                .filter(|b| b.lambda > 0.0)
+                .map(|b| b.lambda.ln()),
+        );
         let (obj, grad) = model
-            .lamlobjective_and_rhogradient(&beta, &state)
+            .unified_lamlobjective_and_rhogradient(&beta, &state, &rho)
             .expect("laml gradient should work in structural mode");
         assert!(obj.is_finite());
         assert_eq!(grad.len(), 1);
@@ -3024,8 +2724,13 @@ mod tests {
         .expect("construct survival model");
 
         let state = model.update_state(&beta).expect("state at beta");
+        let rho = Array1::from_iter(
+            model.penalties.blocks.iter()
+                .filter(|b| b.lambda > 0.0)
+                .map(|b| b.lambda.ln()),
+        );
         let (obj, grad) = model
-            .lamlobjective_and_rhogradient(&beta, &state)
+            .unified_lamlobjective_and_rhogradient(&beta, &state, &rho)
             .expect("laml objective for no-penalty model");
 
         let h_dense = state.hessian.to_dense();
