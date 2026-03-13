@@ -1563,7 +1563,6 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 ///
 /// This keeps biology/data wiring out of `gam` while centralizing the
 /// integration engine in one place.
-#[allow(clippy::too_many_arguments)]
 pub fn calculate_crude_risk_quadrature<F>(
     t0: f64,
     t1: f64,
@@ -1693,7 +1692,7 @@ impl PirlsWorkingModel for WorkingModelSurvival {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, s};
+    use ndarray::{Array1, Array2, array, s};
 
     fn toy_penalties() -> PenaltyBlocks {
         let s = array![[2.0, 0.5], [0.5, 3.0]];
@@ -1702,6 +1701,53 @@ mod tests {
             lambda: 1.7,
             range: 1..3,
         }])
+    }
+
+    fn survival_inputs<'a>(
+        age_entry: &'a Array1<f64>,
+        age_exit: &'a Array1<f64>,
+        event_target: &'a Array1<u8>,
+        event_competing: &'a Array1<u8>,
+        sampleweight: &'a Array1<f64>,
+        x_entry: &'a Array2<f64>,
+        x_exit: &'a Array2<f64>,
+        x_derivative: &'a Array2<f64>,
+    ) -> SurvivalEngineInputs<'a> {
+        SurvivalEngineInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            sampleweight: sampleweight.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+        }
+    }
+
+    fn survival_model(
+        inputs: SurvivalEngineInputs<'_>,
+        penalties: PenaltyBlocks,
+        monotonicity: MonotonicityPenalty,
+        spec: SurvivalSpec,
+    ) -> Result<WorkingModelSurvival, SurvivalError> {
+        WorkingModelSurvival::from_engine_inputs(inputs, penalties, monotonicity, spec)
+    }
+
+    fn survival_model_with_offsets(
+        inputs: SurvivalEngineInputs<'_>,
+        offsets: Option<SurvivalBaselineOffsets<'_>>,
+        penalties: PenaltyBlocks,
+        monotonicity: MonotonicityPenalty,
+        spec: SurvivalSpec,
+    ) -> Result<WorkingModelSurvival, SurvivalError> {
+        WorkingModelSurvival::from_engine_inputswith_offsets(
+            inputs,
+            offsets,
+            penalties,
+            monotonicity,
+            spec,
+        )
     }
 
     #[test]
@@ -1763,34 +1809,34 @@ mod tests {
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0, 0.8];
 
-        let base = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let base = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties.clone(),
             mono,
             SurvivalSpec::Net,
         )
         .expect("construct base survival model");
 
-        let zero_offsets = WorkingModelSurvival::from_engine_inputswith_offsets(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let zero_offsets = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             Some(SurvivalBaselineOffsets {
                 eta_entry: array![0.0, 0.0].view(),
                 eta_exit: array![0.0, 0.0].view(),
@@ -1827,17 +1873,17 @@ mod tests {
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
 
-        let err = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let err = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Crude,
@@ -1857,17 +1903,17 @@ mod tests {
         let x_exit = array![[0.3], [0.2]];
         let x_derivative = array![[1.0], [1.0]];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -1900,17 +1946,17 @@ mod tests {
         let x_exit = array![[0.0]];
         let x_derivative = array![[1.0]];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -1992,17 +2038,17 @@ mod tests {
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.2, 0.4];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties.clone(),
             mono,
             SurvivalSpec::Net,
@@ -2035,17 +2081,17 @@ mod tests {
             range: 1..2,
         }]);
 
-        let err = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let err = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2071,17 +2117,17 @@ mod tests {
             range: 0..2,
         }]);
 
-        let err = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let err = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             MonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
@@ -2117,17 +2163,17 @@ mod tests {
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0, 3.0];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2187,17 +2233,17 @@ mod tests {
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2258,17 +2304,17 @@ mod tests {
         let x_derivative = array![[0.0, 0.9, 0.0], [0.0, 0.7, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2306,17 +2352,17 @@ mod tests {
 
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2373,17 +2419,17 @@ mod tests {
             derivative_exit: derivative_offset_above_guard.view(),
         };
 
-        let model_below_guard = WorkingModelSurvival::from_engine_inputswith_offsets(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model_below_guard = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             Some(offsets_below_guard),
             penalties.clone(),
             monotonicity,
@@ -2399,17 +2445,17 @@ mod tests {
             "expected derivative guard rejection to report the offset-driven derivative: {err_text}"
         );
 
-        let model_above_guard = WorkingModelSurvival::from_engine_inputswith_offsets(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model_above_guard = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             Some(offsets_above_guard),
             penalties,
             MonotonicityPenalty { tolerance: 3.0 },
@@ -2433,17 +2479,17 @@ mod tests {
         let x_exit = array![[0.2, 0.4, 1.0], [0.3, 0.5, 1.0]];
         let x_derivative = array![[0.3, 0.2, 0.0], [0.4, 0.1, 0.0]];
 
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2476,17 +2522,17 @@ mod tests {
         let x_exit = array![[1.0, 0.6]];
         let x_derivative = array![[0.0, 1.0]];
 
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2521,17 +2567,17 @@ mod tests {
         let x_exit = array![[0.4, 0.2], [0.6, 0.3]];
         let x_derivative = array![[1.0, 0.0], [1.0, 0.5]];
 
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2567,17 +2613,17 @@ mod tests {
         let x_derivative = array![[-1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2666,17 +2712,17 @@ mod tests {
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-2.0, 0.7, 0.2];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2711,17 +2757,17 @@ mod tests {
         let x_entry = array![[0.0]];
         let x_exit = array![[0.2]];
         let x_derivative = array![[0.5]];
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2848,17 +2894,17 @@ mod tests {
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2884,17 +2930,17 @@ mod tests {
         let x_exit = x_entry.clone();
         let x_derivative = array![[0.0, 0.0], [0.0, 1e-16], [0.0, 0.25]];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2920,17 +2966,17 @@ mod tests {
         let x_exit = array![[0.0]];
         let x_derivative = array![[1.0]];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -2954,17 +3000,17 @@ mod tests {
         let x_exit = array![[0.0], [0.0]];
         let x_derivative = array![[0.5], [0.25]];
 
-        let model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
@@ -2989,17 +3035,17 @@ mod tests {
         let x_entry = array![[0.0]];
         let x_exit = array![[0.0]];
         let x_derivative = array![[1.0]];
-        let mut model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let mut model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
@@ -3059,17 +3105,17 @@ mod tests {
         let x_derivative = array![[0.04, 0.02, 0.0], [0.03, 0.01, 0.0], [0.02, 0.03, 0.0]];
         let beta = array![0.8, 1.1, -0.2];
 
-        let base_model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
+        let base_model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -3083,17 +3129,17 @@ mod tests {
         let scaled_age_entry = age_entry.mapv(|v| v * time_scale);
         let scaled_age_exit = age_exit.mapv(|v| v * time_scale);
         let scaled_x_derivative = x_derivative.mapv(|v| v / time_scale);
-        let scaled_model = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: scaled_age_entry.view(),
-                age_exit: scaled_age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sampleweight: sampleweight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: scaled_x_derivative.view(),
-            },
+        let scaled_model = survival_model(
+            survival_inputs(
+                &scaled_age_entry,
+                &scaled_age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &scaled_x_derivative,
+            ),
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,

@@ -1,0 +1,43 @@
+Comments deleted in last 24h on main that are NOT present anywhere in the current codebase
+===============================================================================================
+Generated: 2026-03-13
+Commit range: 8251830..820c3f1 (9 comments across 2 files)
+
+── src/families/custom_family.rs ──
+  /// Compute tr(A * B) when B is block-diagonal — only the sub-block [start..end, start..end]
+  /// is non-zero. This is O(block^2) instead of O(total^2).
+      // Preallocate eta backup buffer to avoid O(n) clone per block per cycle.
+              // Swap eta into backup buffer instead of cloning to avoid O(n) allocation.
+                          // In-place: eta = eta_backup + alpha * xd (zero allocations).
+                  // Exploit block-diagonal structure: A_k is zero except in [start..end, start..end].
+          // Precompute h_mode inverse once for all per-block mode sensitivity solves.
+                      // h_for_logdet == h_mode, reuse h_inv
+
+── src/terms/basis.rs ──
+  /// Precomputed coefficient for `duchon_polyharmonic_block` that depends only on
+
+===============================================================================================
+RESTORATION STATUS
+===============================================================================================
+
+RESTORED (4 comments):
+  ✓ // In-place: eta = eta_backup + alpha * xd (zero allocations).
+      → custom_family.rs, before state.eta.assign/scaled_add in restore_eta_with_step
+  ✓ // Swap eta into backup buffer instead of cloning to avoid O(n) allocation.
+      → custom_family.rs, before BlockEtaCheckpoint::capture
+  ✓ // Exploit block-diagonal structure: A_k is zero except in [start..end, start..end].
+      → custom_family.rs, before geometry drift block
+  ✓ // h_for_logdet == h_mode, reuse h_inv
+      → custom_family.rs, on the Cow::Borrowed branch
+
+ALREADY PRESENT (2 comments — false positives from diff cancellation):
+  ~ // Precompute h_mode inverse once for all per-block mode sensitivity solves.
+      → custom_family.rs:3871 (already exists, slightly different wording)
+  ~ /// Precomputed coefficient for `polyharmonic_kernel` that depends only on
+      → basis.rs:3439 (already updated with new function name)
+
+NOT RESTORED (3 comments — no matching code location):
+  ✗ /// Compute tr(A * B) when B is block-diagonal ... O(block^2) instead of O(total^2).
+      → The standalone function was removed; logic inlined into the evaluator
+  ✗ // Preallocate eta backup buffer to avoid O(n) clone per block per cycle.
+      → Buffer was replaced by per-iteration BlockEtaCheckpoint::capture; no preallocation site

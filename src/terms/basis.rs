@@ -11779,4 +11779,30 @@ mod tests {
             assert!((weighted.d0[[1, j]] - unit.d0[[1, j]]).abs() < 1e-12);
         }
     }
+
+    #[test]
+    fn matern_closed_form_should_decay_to_zero_not_nan_at_huge_distance() {
+        let r = 1.0e308;
+        let value = matern_kernel_from_distance(r, 1.0, MaternNu::NineHalves).expect("kernel");
+        assert!(
+            value == 0.0,
+            "the Matérn kernel should decay to 0 for enormous finite distances, not produce NaN/Inf; got {value}"
+        );
+
+        let (value, dpsi, d2psi) =
+            matern_kernel_log_kappa_derivative_from_distance(r, 1.0, MaternNu::NineHalves)
+                .expect("kernel hyper-derivatives");
+        assert!(
+            value == 0.0,
+            "the same huge-distance Matérn value should remain 0 in the hyper-derivative helper; got {value}"
+        );
+        assert!(
+            dpsi == 0.0,
+            "the log-kappa derivative should also decay to 0 for enormous finite distances; got {dpsi}"
+        );
+        assert!(
+            d2psi == 0.0,
+            "the second log-kappa derivative should also decay to 0 for enormous finite distances; got {d2psi}"
+        );
+    }
 }

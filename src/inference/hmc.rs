@@ -2523,7 +2523,6 @@ mod survival_hmc {
 
     impl SurvivalPosterior {
         /// Creates a new survival posterior target.
-        #[allow(clippy::too_many_arguments)]
         pub fn new(
             age_entry: ArrayView1<'_, f64>,
             age_exit: ArrayView1<'_, f64>,
@@ -2646,7 +2645,6 @@ mod survival_hmc {
     }
 
     /// Runs NUTS sampling for survival models with whitened parameter space.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_survival_nuts_sampling(
         age_entry: ArrayView1<'_, f64>,
         age_exit: ArrayView1<'_, f64>,

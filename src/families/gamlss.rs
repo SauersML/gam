@@ -177,7 +177,6 @@ impl GamlssBetaLayout {
         self.pt + self.pls + self.pw
     }
 
-    #[allow(clippy::type_complexity)]
     fn split_three(
         self,
         flat: &Array1<f64>,
@@ -994,7 +993,6 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
     }
 }
 
-#[allow(clippy::type_complexity)]
 fn try_binomial_alpha_betawarm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -2804,7 +2802,6 @@ fn hessian_coeff_fromobjective_q_terms(m1: f64, m2: f64, q_a: f64, q_b: f64, q_a
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn directionalhessian_coeff_fromobjective_q_terms(
     m1: f64,
     m2: f64,
@@ -2823,7 +2820,6 @@ fn directionalhessian_coeff_fromobjective_q_terms(
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn second_directionalhessian_coeff_fromobjective_q_terms(
     m1: f64,
     m2: f64,
@@ -3088,7 +3084,6 @@ fn binomial_location_scale_core(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn binomial_location_scale_working_sets(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -3763,7 +3758,6 @@ fn gaussian_joint_psi_mixedhessian_drift_fromweights(
 }
 
 #[inline]
-#[allow(clippy::type_complexity)]
 fn gaussian_sigma_derivs_up_to_fourth(
     eta: ArrayView1<'_, f64>,
 ) -> (

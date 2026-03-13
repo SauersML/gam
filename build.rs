@@ -501,7 +501,7 @@ impl DeadCodeCollector {
 
         let filename = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
-            "\n❌ ERROR: Found {} forbidden 'allow(unused...)' attributes in {}:\n",
+            "\n❌ ERROR: Found {} forbidden 'allow(...)' attributes in {}:\n",
             self.violations.len(),
             filename
         );
@@ -516,8 +516,12 @@ impl DeadCodeCollector {
         error_msg.push_str("   - #[allow(unused)] / #![allow(unused)]\n");
         error_msg.push_str("   - #[allow(unused_imports)]\n");
         error_msg.push_str("   - #[allow(unused_variables)]\n");
+        error_msg.push_str("   - #[allow(clippy::*)] (any clippy lint)\n");
         error_msg.push_str(
             "\n   Do not suppress these warnings. Delete or use the unused code/imports instead.\n",
+        );
+        error_msg.push_str(
+            "   Clippy lints are pointless to suppress — we don't run clippy and don't care about its opinions.\n",
         );
 
         Some(error_msg)
@@ -2360,8 +2364,9 @@ fn scan_for_allow_dead_code() -> Vec<String> {
     // - #[allow(unused)]
     // - #[allow(unused_imports)]
     // - #[allow(unused_variables)]
+    // - #[allow(clippy::*)] (any clippy lint suppression)
     // - #[allow(..., unused, ...)] (inside lists)
-    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unused_variables)\b[^)]*\)\s*\]";
+    let pattern = r"#!?\s*\[\s*allow\s*\([^)]*\b(dead_code|unused|unused_imports|unused_variables|clippy::\w+)\b[^)]*\)\s*\]";
     let mut allviolations = Vec::new();
 
     match RegexMatcher::new_line_matcher(pattern) {
