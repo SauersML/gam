@@ -6586,6 +6586,125 @@ fn spatial_score_improves(candidate: f64, baseline: f64, rel_tol: f64) -> bool {
     candidate.is_finite() && candidate + rel_tol * (1.0 + baseline.abs()) < baseline
 }
 
+/// Action requested by the coordinate search from the caller's callback.
+enum SpatialSearchAction<'a> {
+    /// Evaluate cost at the given theta.
+    EvalCost(&'a Array1<f64>),
+    /// Notify that a new best point was found.
+    OnImprove(&'a Array1<f64>, f64),
+}
+
+/// Generic coordinate search on a bounded log-space grid.
+///
+/// This is the shared optimization loop used by both single-block and two-block
+/// spatial length-scale optimization. The caller provides a single callback
+/// that handles both cost evaluation and realization:
+/// - `SpatialSearchAction::EvalCost(theta)` → return `Ok(cost)`
+/// - `SpatialSearchAction::OnImprove(theta, cost)` → realize the best point, return `Ok(0.0)`
+fn coordinate_search_spatial(
+    initial_theta: &Array1<f64>,
+    initial_cost: f64,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    options: &SpatialLengthScaleOptimizationOptions,
+    callback: &mut dyn FnMut(SpatialSearchAction<'_>) -> Result<f64, String>,
+) -> Result<(), String> {
+    let mut current_theta = initial_theta.clone();
+    let mut current_cost = initial_cost;
+    let mut any_improved = false;
+
+    for _ in 0..options.max_outer_iter {
+        let mut pass_improved = false;
+        for coord in 0..current_theta.len() {
+            let basevalue = current_theta[coord];
+            let basecost = current_cost;
+            let leftvalue = (basevalue - options.log_step).max(lower[coord]);
+            let rightvalue = (basevalue + options.log_step).min(upper[coord]);
+
+            let left_probe = coordinate_probe(&current_theta, coord, leftvalue);
+            let right_probe = coordinate_probe(&current_theta, coord, rightvalue);
+            let leftcost = if approx_same_point(&left_probe, &current_theta) {
+                f64::INFINITY
+            } else {
+                callback(SpatialSearchAction::EvalCost(&left_probe))?
+            };
+            let rightcost = if approx_same_point(&right_probe, &current_theta) {
+                f64::INFINITY
+            } else {
+                callback(SpatialSearchAction::EvalCost(&right_probe))?
+            };
+
+            // Quadratic interpolation attempt.
+            if leftcost.is_finite() && rightcost.is_finite() {
+                if let Some(interiorvalue) = quadratic_coordinate_minimizer(
+                    leftvalue, leftcost, basevalue, basecost, rightvalue, rightcost,
+                ) {
+                    let interiorvalue = interiorvalue.clamp(lower[coord], upper[coord]);
+                    if interiorvalue > leftvalue.min(rightvalue) + 1e-12
+                        && interiorvalue < leftvalue.max(rightvalue) - 1e-12
+                    {
+                        let interior_theta =
+                            coordinate_probe(&current_theta, coord, interiorvalue);
+                        let interiorcost = callback(SpatialSearchAction::EvalCost(&interior_theta))?;
+                        if spatial_score_improves(interiorcost, current_cost, options.rel_tol) {
+                            current_theta = interior_theta;
+                            current_cost = interiorcost;
+                            callback(SpatialSearchAction::OnImprove(&current_theta, current_cost))?;
+                            pass_improved = true;
+                            any_improved = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Greedy extension in the improving direction.
+            let (mut candidate_theta, mut candidatecost, direction) =
+                if spatial_score_improves(leftcost, basecost, options.rel_tol)
+                    && leftcost <= rightcost
+                {
+                    (left_probe, leftcost, -1.0_f64)
+                } else if spatial_score_improves(rightcost, basecost, options.rel_tol) {
+                    (right_probe, rightcost, 1.0_f64)
+                } else {
+                    continue;
+                };
+
+            loop {
+                let nextvalue = (candidate_theta[coord] + direction * options.log_step)
+                    .clamp(lower[coord], upper[coord]);
+                if (nextvalue - candidate_theta[coord]).abs() <= 1e-12 {
+                    break;
+                }
+                let next_theta = coordinate_probe(&candidate_theta, coord, nextvalue);
+                if approx_same_point(&next_theta, &candidate_theta) {
+                    break;
+                }
+                let nextcost = callback(SpatialSearchAction::EvalCost(&next_theta))?;
+                if !spatial_score_improves(nextcost, candidatecost, options.rel_tol) {
+                    break;
+                }
+                candidate_theta = next_theta;
+                candidatecost = nextcost;
+            }
+
+            if spatial_score_improves(candidatecost, current_cost, options.rel_tol) {
+                current_theta = candidate_theta;
+                current_cost = candidatecost;
+                callback(SpatialSearchAction::OnImprove(&current_theta, current_cost))?;
+                pass_improved = true;
+                any_improved = true;
+            }
+        }
+        if !pass_improved {
+            break;
+        }
+    }
+
+    let _ = (current_theta, current_cost, any_improved);
+    Ok(())
+}
+
 fn coordinate_probe(theta: &Array1<f64>, index: usize, value: f64) -> Array1<f64> {
     let mut probe = theta.clone();
     probe[index] = value;
@@ -6674,153 +6793,56 @@ where
     }
 
     let mut hyper_state = SpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
-    hyper_state.remember_realized(SpatialHyperEval {
-        theta: theta0.clone(),
-        cost: if baseline_score.is_finite() {
-            baseline_score
-        } else {
-            f64::INFINITY
-        },
-        spec: resolvedspec.clone(),
-        design: baseline_design.clone(),
-        fit: baseline_fit.clone(),
-    });
-
-    let mut current_theta = theta0.clone();
-    let mut current_cost = if baseline_score.is_finite() {
+    let initial_cost = if baseline_score.is_finite() {
         baseline_score
     } else {
         f64::INFINITY
     };
+    hyper_state.remember_realized(SpatialHyperEval {
+        theta: theta0.clone(),
+        cost: initial_cost,
+        spec: resolvedspec.clone(),
+        design: baseline_design.clone(),
+        fit: baseline_fit.clone(),
+    });
     let mut best_eval = hyper_state
         .realized(&theta0)
         .expect("baseline spatial evaluation must be realized");
+    let hyper_state = std::cell::RefCell::new(hyper_state);
+    let fit_fn = std::cell::RefCell::new(fit_fn);
 
-    for _ in 0..kappa_options.max_outer_iter {
-        let mut pass_improved = false;
-        for coord in 0..current_theta.len() {
-            let basevalue = current_theta[coord];
-            let basecost = current_cost;
-            let leftvalue = (basevalue - kappa_options.log_step).max(lower[coord]);
-            let rightvalue = (basevalue + kappa_options.log_step).min(upper[coord]);
-
-            let left_probe = coordinate_probe(&current_theta, coord, leftvalue);
-            let right_probe = coordinate_probe(&current_theta, coord, rightvalue);
-            let leftcost = if approx_same_point(&left_probe, &current_theta) {
-                f64::INFINITY
-            } else {
-                eval_single_block_spatial_cost(
-                    &mut hyper_state,
-                    resolvedspec,
-                    spatial_terms,
-                    &left_probe,
-                    &mut fit_fn,
-                    &score_fn,
-                )?
-            };
-            let rightcost = if approx_same_point(&right_probe, &current_theta) {
-                f64::INFINITY
-            } else {
-                eval_single_block_spatial_cost(
-                    &mut hyper_state,
-                    resolvedspec,
-                    spatial_terms,
-                    &right_probe,
-                    &mut fit_fn,
-                    &score_fn,
-                )?
-            };
-
-            if leftcost.is_finite() && rightcost.is_finite() {
-                if let Some(interiorvalue) = quadratic_coordinate_minimizer(
-                    leftvalue, leftcost, basevalue, basecost, rightvalue, rightcost,
-                ) {
-                    let interiorvalue = interiorvalue.clamp(lower[coord], upper[coord]);
-                    if interiorvalue > leftvalue.min(rightvalue) + 1e-12
-                        && interiorvalue < leftvalue.max(rightvalue) - 1e-12
-                    {
-                        let interior_theta = coordinate_probe(&current_theta, coord, interiorvalue);
-                        let interiorcost = eval_single_block_spatial_cost(
-                            &mut hyper_state,
-                            resolvedspec,
-                            spatial_terms,
-                            &interior_theta,
-                            &mut fit_fn,
-                            &score_fn,
-                        )?;
-                        if spatial_score_improves(interiorcost, current_cost, kappa_options.rel_tol)
-                        {
-                            current_theta = interior_theta;
-                            current_cost = interiorcost;
-                            best_eval = realize_single_block_spatial_eval(
-                                &mut hyper_state,
-                                resolvedspec,
-                                spatial_terms,
-                                &current_theta,
-                                &mut fit_fn,
-                                &score_fn,
-                            )?;
-                            pass_improved = true;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            let (mut candidate_theta, mut candidatecost, direction) =
-                if spatial_score_improves(leftcost, basecost, kappa_options.rel_tol)
-                    && leftcost <= rightcost
-                {
-                    (left_probe, leftcost, -1.0_f64)
-                } else if spatial_score_improves(rightcost, basecost, kappa_options.rel_tol) {
-                    (right_probe, rightcost, 1.0_f64)
-                } else {
-                    continue;
-                };
-
-            loop {
-                let nextvalue = (candidate_theta[coord] + direction * kappa_options.log_step)
-                    .clamp(lower[coord], upper[coord]);
-                if (nextvalue - candidate_theta[coord]).abs() <= 1e-12 {
-                    break;
-                }
-                let next_theta = coordinate_probe(&candidate_theta, coord, nextvalue);
-                if approx_same_point(&next_theta, &candidate_theta) {
-                    break;
-                }
-                let nextcost = eval_single_block_spatial_cost(
-                    &mut hyper_state,
-                    resolvedspec,
-                    spatial_terms,
-                    &next_theta,
-                    &mut fit_fn,
-                    &score_fn,
-                )?;
-                if !spatial_score_improves(nextcost, candidatecost, kappa_options.rel_tol) {
-                    break;
-                }
-                candidate_theta = next_theta;
-                candidatecost = nextcost;
-            }
-
-            if spatial_score_improves(candidatecost, current_cost, kappa_options.rel_tol) {
-                current_theta = candidate_theta;
-                current_cost = candidatecost;
+    coordinate_search_spatial(
+        &theta0,
+        initial_cost,
+        &lower,
+        &upper,
+        kappa_options,
+        &mut |action| match action {
+            SpatialSearchAction::EvalCost(theta) => eval_single_block_spatial_cost(
+                &mut *hyper_state.borrow_mut(),
+                resolvedspec,
+                spatial_terms,
+                theta,
+                &mut *fit_fn.borrow_mut(),
+                &score_fn,
+            )
+            .map_err(|e| e.to_string()),
+            SpatialSearchAction::OnImprove(theta, cost) => {
+                let _ = cost;
                 best_eval = realize_single_block_spatial_eval(
-                    &mut hyper_state,
+                    &mut *hyper_state.borrow_mut(),
                     resolvedspec,
                     spatial_terms,
-                    &current_theta,
-                    &mut fit_fn,
+                    theta,
+                    &mut *fit_fn.borrow_mut(),
                     &score_fn,
-                )?;
-                pass_improved = true;
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(0.0)
             }
-        }
-        if !pass_improved {
-            break;
-        }
-    }
+        },
+    )
+    .map_err(|e| EstimationError::InvalidInput(e))?;
 
     Ok(SingleBlockSpatialLengthScaleOptimizationResult {
         resolvedspec: best_eval.spec,
@@ -7054,8 +7076,7 @@ where
             fit: best_fit.clone(),
         });
 
-        let mut current_theta = theta0.clone();
-        let mut current_cost = if initial_score.is_finite() {
+        let initial_cost = if initial_score.is_finite() {
             initial_score
         } else {
             f64::INFINITY
@@ -7064,160 +7085,46 @@ where
             .realized(&theta0)
             .expect("baseline two-block spatial evaluation must be realized");
 
-        for _ in 0..kappa_options.max_outer_iter {
-            let mut pass_improved = false;
-            for coord in 0..current_theta.len() {
-                let basevalue = current_theta[coord];
-                let basecost = current_cost;
-                let leftvalue = (basevalue - kappa_options.log_step).max(lower[coord]);
-                let rightvalue = (basevalue + kappa_options.log_step).min(upper[coord]);
+        let hyper_state = std::cell::RefCell::new(hyper_state);
+        let fit_fn = std::cell::RefCell::new(fit_fn);
 
-                let left_probe = coordinate_probe(&current_theta, coord, leftvalue);
-                let right_probe = coordinate_probe(&current_theta, coord, rightvalue);
-                let leftcost = if approx_same_point(&left_probe, &current_theta) {
-                    f64::INFINITY
-                } else {
-                    eval_two_block_spatial_cost(
-                        &mut hyper_state,
-                        &best_meanspec,
-                        &best_noisespec,
-                        &mean_terms,
-                        &noise_terms,
-                        &left_probe,
-                        &build_pair,
-                        &mut fit_fn,
-                        &score_fn,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-                let rightcost = if approx_same_point(&right_probe, &current_theta) {
-                    f64::INFINITY
-                } else {
-                    eval_two_block_spatial_cost(
-                        &mut hyper_state,
-                        &best_meanspec,
-                        &best_noisespec,
-                        &mean_terms,
-                        &noise_terms,
-                        &right_probe,
-                        &build_pair,
-                        &mut fit_fn,
-                        &score_fn,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-
-                if leftcost.is_finite() && rightcost.is_finite() {
-                    if let Some(interiorvalue) = quadratic_coordinate_minimizer(
-                        leftvalue, leftcost, basevalue, basecost, rightvalue, rightcost,
-                    ) {
-                        let interiorvalue = interiorvalue.clamp(lower[coord], upper[coord]);
-                        if interiorvalue > leftvalue.min(rightvalue) + 1e-12
-                            && interiorvalue < leftvalue.max(rightvalue) - 1e-12
-                        {
-                            let interior_theta =
-                                coordinate_probe(&current_theta, coord, interiorvalue);
-                            let interiorcost = eval_two_block_spatial_cost(
-                                &mut hyper_state,
-                                &best_meanspec,
-                                &best_noisespec,
-                                &mean_terms,
-                                &noise_terms,
-                                &interior_theta,
-                                &build_pair,
-                                &mut fit_fn,
-                                &score_fn,
-                            )
-                            .map_err(|e| e.to_string())?;
-                            if spatial_score_improves(
-                                interiorcost,
-                                current_cost,
-                                kappa_options.rel_tol,
-                            ) {
-                                current_theta = interior_theta;
-                                current_cost = interiorcost;
-                                best_eval = realize_two_block_spatial_eval(
-                                    &mut hyper_state,
-                                    &best_meanspec,
-                                    &best_noisespec,
-                                    &mean_terms,
-                                    &noise_terms,
-                                    &current_theta,
-                                    &build_pair,
-                                    &mut fit_fn,
-                                    &score_fn,
-                                )
-                                .map_err(|e| e.to_string())?;
-                                pass_improved = true;
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                let (mut candidate_theta, mut candidatecost, direction) =
-                    if spatial_score_improves(leftcost, basecost, kappa_options.rel_tol)
-                        && leftcost <= rightcost
-                    {
-                        (left_probe, leftcost, -1.0_f64)
-                    } else if spatial_score_improves(rightcost, basecost, kappa_options.rel_tol) {
-                        (right_probe, rightcost, 1.0_f64)
-                    } else {
-                        continue;
-                    };
-
-                loop {
-                    let nextvalue = (candidate_theta[coord] + direction * kappa_options.log_step)
-                        .clamp(lower[coord], upper[coord]);
-                    if (nextvalue - candidate_theta[coord]).abs() <= 1e-12 {
-                        break;
-                    }
-                    let next_theta = coordinate_probe(&candidate_theta, coord, nextvalue);
-                    if approx_same_point(&next_theta, &candidate_theta) {
-                        break;
-                    }
-                    let nextcost = eval_two_block_spatial_cost(
-                        &mut hyper_state,
-                        &best_meanspec,
-                        &best_noisespec,
-                        &mean_terms,
-                        &noise_terms,
-                        &next_theta,
-                        &build_pair,
-                        &mut fit_fn,
-                        &score_fn,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if !spatial_score_improves(nextcost, candidatecost, kappa_options.rel_tol) {
-                        break;
-                    }
-                    candidate_theta = next_theta;
-                    candidatecost = nextcost;
-                }
-
-                if spatial_score_improves(candidatecost, current_cost, kappa_options.rel_tol) {
-                    current_theta = candidate_theta;
-                    current_cost = candidatecost;
+        coordinate_search_spatial(
+            &theta0,
+            initial_cost,
+            &lower,
+            &upper,
+            kappa_options,
+            &mut |action| match action {
+                SpatialSearchAction::EvalCost(theta) => eval_two_block_spatial_cost(
+                    &mut *hyper_state.borrow_mut(),
+                    &best_meanspec,
+                    &best_noisespec,
+                    &mean_terms,
+                    &noise_terms,
+                    theta,
+                    &build_pair,
+                    &mut *fit_fn.borrow_mut(),
+                    &score_fn,
+                )
+                .map_err(|e| e.to_string()),
+                SpatialSearchAction::OnImprove(theta, cost) => {
+                    let _ = cost;
                     best_eval = realize_two_block_spatial_eval(
-                        &mut hyper_state,
+                        &mut *hyper_state.borrow_mut(),
                         &best_meanspec,
                         &best_noisespec,
                         &mean_terms,
                         &noise_terms,
-                        &current_theta,
+                        theta,
                         &build_pair,
-                        &mut fit_fn,
+                        &mut *fit_fn.borrow_mut(),
                         &score_fn,
                     )
                     .map_err(|e| e.to_string())?;
-                    pass_improved = true;
+                    Ok(0.0)
                 }
-            }
-
-            if !pass_improved {
-                break;
-            }
-        }
+            },
+        )?;
 
         best_meanspec = best_eval.meanspec;
         best_noisespec = best_eval.noisespec;
