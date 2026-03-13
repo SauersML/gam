@@ -3,7 +3,8 @@ use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{
     StableSolver, boundary_hit_step_fraction, default_slq_parameters, stochastic_lanczos_logdet_spd,
 };
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
+use crate::solver::estimate::FitGeometry;
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::reml::unified::{
     DenseSpectralOperator, DispersionHandling, EvalMode, InnerSolutionBuilder,
@@ -663,6 +664,7 @@ pub struct BlockwiseFitResult {
     pub outer_final_gradient_norm: f64,
     pub inner_cycles: usize,
     pub converged: bool,
+    pub geometry: Option<crate::solver::estimate::FitGeometry>,
 }
 
 fn finite_penalizedobjective(log_likelihood: f64, penalty_value: f64, reml_term: f64) -> f64 {
@@ -4757,6 +4759,51 @@ fn compute_joint_covariance_required<F: CustomFamily>(
         })
 }
 
+/// Compute joint working-set geometry at convergence for ALO diagnostics.
+fn compute_joint_geometry<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    per_block_log_lambdas: &[Array1<f64>],
+) -> Option<FitGeometry> {
+    let eval = family.evaluate(states).ok()?;
+    let mut all_working_weights = Vec::new();
+    let mut all_working_responses = Vec::new();
+    for ws in &eval.blockworking_sets {
+        match ws {
+            BlockWorkingSet::Diagonal { working_response, working_weights } => {
+                all_working_weights.push(working_weights.clone());
+                all_working_responses.push(working_response.clone());
+            }
+            BlockWorkingSet::ExactNewton { .. } => return None,
+        }
+    }
+    if all_working_weights.is_empty() { return None; }
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total == 0 { return None; }
+    let mut h = Array2::<f64>::zeros((total, total));
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let w = &all_working_weights[b];
+        let xtw = spec.design.diag_xtw_x(w).ok()?;
+        h.slice_mut(ndarray::s![start..end, start..end]).assign(&xtw);
+        let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
+        for (k, s) in spec.penalties.iter().enumerate() {
+            h.slice_mut(ndarray::s![start..end, start..end]).scaled_add(lambdas[k], s);
+        }
+    }
+    let n = all_working_weights[0].len();
+    let n_blocks = all_working_weights.len();
+    let mut joint_w = Array1::<f64>::zeros(n * n_blocks);
+    let mut joint_z = Array1::<f64>::zeros(n * n_blocks);
+    for (b, (w, z)) in all_working_weights.iter().zip(all_working_responses.iter()).enumerate() {
+        joint_w.slice_mut(ndarray::s![b * n..(b + 1) * n]).assign(w);
+        joint_z.slice_mut(ndarray::s![b * n..(b + 1) * n]).assign(z);
+    }
+    Some(FitGeometry { penalized_hessian: h, working_weights: joint_w, working_response: joint_z })
+}
+
 pub fn fit_custom_family<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -4786,6 +4833,8 @@ pub fn fit_custom_family<F: CustomFamily>(
         } else {
             0.0
         };
+        let no_pen = vec![Array1::zeros(0); specs.len()];
+        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen);
         return Ok(BlockwiseFitResult {
             block_states: inner.block_states,
             log_likelihood: inner.log_likelihood,
@@ -4801,6 +4850,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             outer_final_gradient_norm: 0.0,
             inner_cycles: inner.cycles,
             converged: inner.converged,
+            geometry,
         });
     }
 
@@ -4867,6 +4917,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         } else {
             0.0
         };
+        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
         return Ok(BlockwiseFitResult {
             block_states: inner.block_states,
             log_likelihood: inner.log_likelihood,
@@ -4882,6 +4933,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             outer_final_gradient_norm: 0.0,
             inner_cycles: inner.cycles,
             converged: inner.converged,
+            geometry,
         });
     }
 
@@ -5107,6 +5159,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                     } else {
                         0.0
                     };
+                    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
                     return Ok(BlockwiseFitResult {
                         block_states: inner.block_states,
                         log_likelihood: inner.log_likelihood,
@@ -5122,6 +5175,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                         outer_final_gradient_norm: 0.0,
                         inner_cycles: inner.cycles,
                         converged: inner.converged,
+                        geometry,
                     });
                 }
                 Err(inner_err) => {
@@ -5153,6 +5207,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
     Ok(BlockwiseFitResult {
         block_states: inner.block_states,
         log_likelihood: inner.log_likelihood,
@@ -5180,6 +5235,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         },
         inner_cycles: inner.cycles,
         converged: inner.converged,
+        geometry,
     })
 }
 

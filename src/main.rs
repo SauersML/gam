@@ -17,9 +17,8 @@ use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FittedLinkParameters,
-    ModelSummary, ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order,
-    fit_gam, optimize_external_design, predict_gam, predict_gam_posterior_meanwith_fit,
-    predict_gamwith_uncertainty,
+    ModelSummary, ParametricTermSummary, PredictInput, SmoothTermSummary,
+    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -1463,6 +1462,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("predict", "building prediction matrices");
+    // The Standard branch delegates to PredictableModel internally.
+    // Survival and location-scale branches need SurvivalPredictor /
+    // LocationScalePredictor implementations to collapse this dispatch.
     let result = match model.predict_model_class() {
         PredictModelClass::Survival => run_predict_survival(
             &mut progress,
@@ -1686,6 +1688,7 @@ fn run_predict_survival(
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let pred = predict_survival_location_scale(&pred_input, &fit_stub)
             .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
@@ -2426,6 +2429,16 @@ fn run_predict_standard_or_flexible(
         return Ok(());
     }
 
+    // Standard (no-wiggle, no-joint) path: delegate to PredictableModel trait.
+    let predictor = model
+        .predictor()
+        .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
+    let pred_input = PredictInput {
+        design: DesignMatrix::Dense(design.design.clone()),
+        offset: offset.clone(),
+        design_noise: None,
+        offset_noise: None,
+    };
     let nonlinear = matches!(
         family,
         LikelihoodFamily::BinomialLogit
@@ -2443,15 +2456,9 @@ fn run_predict_standard_or_flexible(
             mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
         };
-        let pred = predict_gamwith_uncertainty(
-            design.design.view(),
-            beta.view(),
-            offset.view(),
-            family,
-            &fit_for_predict,
-            &options,
-        )
-        .map_err(|e| format!("predict_gamwith_uncertainty failed: {e}"))?;
+        let pred = predictor
+            .predict_full_uncertainty(&pred_input, &fit_for_predict, &options)
+            .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
         (
             pred.eta,
             pred.mean,
@@ -2460,20 +2467,14 @@ fn run_predict_standard_or_flexible(
             Some(pred.mean_upper),
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
-        let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-        let pm = predict_gam_posterior_meanwith_fit(
-            design.design.view(),
-            beta.view(),
-            offset.view(),
-            family,
-            cov_mat.view(),
-            &fit_for_predict,
-        )
-        .map_err(|e| format!("predict_gam_posterior_meanwith_fit failed: {e}"))?;
+        let pm = predictor
+            .predict_posterior_mean(&pred_input, &fit_for_predict)
+            .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
         (pm.eta, pm.mean, Some(pm.eta_standard_error), None, None)
     } else {
-        let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
-            .map_err(|e| format!("predict_gam failed: {e}"))?;
+        let pred = predictor
+            .predict_response(&pred_input)
+            .map_err(|e| format!("predict_response failed: {e}"))?;
         (pred.eta, pred.mean, None, None, None)
     };
 
@@ -2597,14 +2598,8 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         progress.set_stage("diagnose", "computing alo from saved geometry");
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         let eta = design.design.dot(&fit_saved.beta);
-        let input = gam::alo::AloInput::from_geometry(
-            geom,
-            &design.design,
-            &eta,
-            &offset,
-            link,
-            1.0,
-        );
+        let input =
+            gam::alo::AloInput::from_geometry(geom, &design.design, &eta, &offset, link, 1.0);
         progress.advance_workflow(4);
         gam::alo::compute_alo_from_input(&input)
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
@@ -5007,6 +5002,8 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 
     progress.set_stage("sample", "running posterior sampling");
     progress.teardown();
+    // Collapsing this dispatch requires SurvivalPredictor and
+    // LocationScalePredictor implementations of PredictableModel.
     let nuts = match model.predict_model_class() {
         PredictModelClass::Survival => {
             run_sample_survival(
@@ -5598,6 +5595,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("generate", "building predictive state");
+    // The Standard branch delegates to PredictableModel for the basic path.
+    // LocationScalePredictor would collapse the remaining branches.
     let spec = match model.predict_model_class() {
         PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
             &mut progress,
@@ -5866,6 +5865,10 @@ fn run_generate_standard_or_flexible(
             noise: gam::generative::NoiseModel::Bernoulli,
         })
     } else {
+        // Standard (no-wiggle, no-joint) path: delegate to PredictableModel.
+        let predictor = model
+            .predictor()
+            .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
         let beta = fit_saved.beta.clone();
         if beta.len() != design.design.ncols() {
             return Err(format!(
@@ -5875,8 +5878,15 @@ fn run_generate_standard_or_flexible(
             ));
         }
         let offset = Array1::zeros(design.design.nrows());
-        let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
-            .map_err(|e| format!("predict_gam failed: {e}"))?;
+        let pred_input = PredictInput {
+            design: DesignMatrix::Dense(design.design.clone()),
+            offset,
+            design_noise: None,
+            offset_noise: None,
+        };
+        let pred = predictor
+            .predict_response(&pred_input)
+            .map_err(|e| format!("predict_response failed: {e}"))?;
         generativespec_from_predict(pred, family, Some(fit_saved.standard_deviation))
             .map_err(|e| format!("failed to build generative spec: {e}"))
     }
@@ -6099,23 +6109,22 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     .ok()
                     .and_then(|r| r.map(|lk| lk.link_function()))
                 {
-                    let alo_result = if let Some(geom) =
-                        model.unified().and_then(|u| u.geometry.as_ref())
-                    {
-                        let eta = design.design.dot(&fit.beta);
-                        let report_offset = Array1::<f64>::zeros(design.design.nrows());
-                        let input = gam::alo::AloInput::from_geometry(
-                            geom,
-                            &design.design,
-                            &eta,
-                            &report_offset,
-                            link,
-                            1.0,
-                        );
-                        gam::alo::compute_alo_from_input(&input)
-                    } else {
-                        compute_alo_diagnostics_from_fit(&fit, y.view(), link)
-                    };
+                    let alo_result =
+                        if let Some(geom) = model.unified().and_then(|u| u.geometry.as_ref()) {
+                            let eta = design.design.dot(&fit.beta);
+                            let report_offset = Array1::<f64>::zeros(design.design.nrows());
+                            let input = gam::alo::AloInput::from_geometry(
+                                geom,
+                                &design.design,
+                                &eta,
+                                &report_offset,
+                                link,
+                                1.0,
+                            );
+                            gam::alo::compute_alo_from_input(&input)
+                        } else {
+                            compute_alo_diagnostics_from_fit(&fit, y.view(), link)
+                        };
                     match alo_result {
                         Ok(alo) => {
                             alo_data = Some(report::AloData {

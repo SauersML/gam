@@ -3,6 +3,7 @@ use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
+use crate::solver::estimate::FitGeometry;
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
@@ -278,6 +279,7 @@ pub struct SurvivalLocationScaleFitResult {
     pub finalgrad_norm: f64,
     pub converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
+    pub geometry: Option<FitGeometry>,
 }
 
 #[derive(Clone)]
@@ -3169,6 +3171,7 @@ pub fn fit_survival_location_scale(
         finalgrad_norm: fit.outer_final_gradient_norm,
         converged: fit.converged,
         covariance_conditional,
+        geometry: fit.geometry.clone(),
     })
 }
 
@@ -4900,6 +4903,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let deterministic = predict_survival_location_scale(&input, &fit).expect("predict");
         let expected =
@@ -4992,6 +4996,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
@@ -5035,6 +5040,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let x_threshold_dense = array![[1.0, -0.2], [0.0, 0.6]];
         let x_log_sigma_dense = array![[1.0, 0.3], [0.0, -0.4]];
@@ -5148,6 +5154,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0],
@@ -5237,6 +5244,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0],
@@ -5286,6 +5294,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0],
@@ -5381,6 +5390,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
@@ -5416,6 +5426,7 @@ mod tests {
             finalgrad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
+            geometry: None,
         };
         let base = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],

@@ -135,6 +135,27 @@ pub trait PredictableModel {
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError>;
 
+    /// Full prediction with confidence/observation intervals.
+    ///
+    /// Delegates to `predict_gamwith_uncertainty` for standard models.
+    /// Survival and location-scale models will override with domain-specific
+    /// interval construction.
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+        options: &PredictUncertaintyOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError>;
+
+    /// Posterior-mean prediction with coefficient uncertainty propagation.
+    ///
+    /// For nonlinear links, returns E[g^{-1}(eta_tilde)] where eta_tilde ~ N(eta_hat, se^2).
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError>;
+
     /// Number of coefficient blocks in the model.
     fn n_blocks(&self) -> usize;
 
@@ -179,6 +200,42 @@ impl PredictableModel for StandardPredictor {
             eta_se,
             mean_se,
         })
+    }
+
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+        options: &PredictUncertaintyOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError> {
+        predict_gamwith_uncertainty(
+            input.design.clone(),
+            self.beta.view(),
+            input.offset.view(),
+            self.family,
+            fit,
+            options,
+        )
+    }
+
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        let cov = fit.beta_covariance().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "posterior-mean prediction requires beta covariance in fit result".to_string(),
+            )
+        })?;
+        predict_gam_posterior_meanwith_fit(
+            input.design.clone(),
+            self.beta.view(),
+            input.offset.view(),
+            self.family,
+            cov.view(),
+            fit,
+        )
     }
 
     fn n_blocks(&self) -> usize {
