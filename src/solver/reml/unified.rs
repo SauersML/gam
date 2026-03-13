@@ -481,27 +481,6 @@ pub struct InnerSolution {
     /// How the dispersion parameter is handled.
     pub dispersion: DispersionHandling,
 
-    // === Precomputed corrections (for custom family paths) ===
-    /// Precomputed third-derivative corrections Hₖ − Aₖ for each smoothing parameter.
-    ///
-    /// When present, the gradient loop uses these instead of calling the
-    /// `deriv_provider`. This allows custom families to pre-compute corrections
-    /// using family-specific directional derivative methods (which need access
-    /// to the family object and block states that can't be stored in the provider).
-    ///
-    /// Each entry is `Some(correction_k)` where correction_k = D_β H_L[vₖ],
-    /// or `None` if the correction is zero (Gaussian-like penalty).
-    pub precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
-
-    // === Precomputed outer Hessian data (for complex models) ===
-    /// Precomputed scalar traces tr(H⁻¹ Ḧ_{jk}) for all (j,k) smoothing parameter pairs.
-    ///
-    /// When present, `compute_outer_hessian` uses these directly instead of
-    /// computing second-derivative corrections via the `deriv_provider`.
-    /// This allows complex models (joint link wiggles) to pre-compute the
-    /// full 6-term Ḧ_{jk} decomposition in the builder where all model-specific
-    /// state is available.
-    pub precomputed_h_ddot_traces: Option<Array2<f64>>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -522,8 +501,6 @@ pub struct InnerSolutionBuilder {
     tk_gradient: Option<Array1<f64>>,
     firth_logdet: f64,
     firth_gradient: Option<Array1<f64>>,
-    precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
-    precomputed_h_ddot_traces: Option<Array2<f64>>,
     nullspace_dim_override: Option<f64>,
 }
 
@@ -553,8 +530,6 @@ impl InnerSolutionBuilder {
             tk_gradient: None,
             firth_logdet: 0.0,
             firth_gradient: None,
-            precomputed_h_k_corrections: None,
-            precomputed_h_ddot_traces: None,
             nullspace_dim_override: None,
         }
     }
@@ -573,16 +548,6 @@ impl InnerSolutionBuilder {
     pub fn firth(mut self, logdet: f64, gradient: Option<Array1<f64>>) -> Self {
         self.firth_logdet = logdet;
         self.firth_gradient = gradient;
-        self
-    }
-
-    pub fn precomputed_corrections(mut self, c: Vec<Option<Array2<f64>>>) -> Self {
-        self.precomputed_h_k_corrections = Some(c);
-        self
-    }
-
-    pub fn precomputed_h_ddot_traces(mut self, t: Array2<f64>) -> Self {
-        self.precomputed_h_ddot_traces = Some(t);
         self
     }
 
@@ -619,8 +584,6 @@ impl InnerSolutionBuilder {
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,
-            precomputed_h_k_corrections: self.precomputed_h_k_corrections,
-            precomputed_h_ddot_traces: self.precomputed_h_ddot_traces,
         }
     }
 }
@@ -819,11 +782,7 @@ pub fn reml_laml_evaluate(
                 m
             };
 
-            // Check for precomputed corrections first (custom family path),
-            // then fall back to deriv_provider (PIRLS/joint path).
-            let correction = if let Some(ref precomputed) = solution.precomputed_h_k_corrections {
-                precomputed[idx].clone()
-            } else if solution.deriv_provider.has_corrections() {
+            let correction = if solution.deriv_provider.has_corrections() {
                 let v_k = hop.solve(&a_k_beta);
                 solution.deriv_provider.hessian_derivative_correction(&v_k)
             } else {
@@ -933,9 +892,7 @@ fn compute_outer_hessian(
         a_k *= lambdas[idx];
         a_k_matrices.push(a_k.clone());
 
-        let correction = if let Some(ref precomputed) = solution.precomputed_h_k_corrections {
-            precomputed[idx].clone()
-        } else if solution.deriv_provider.has_corrections() {
+        let correction = if solution.deriv_provider.has_corrections() {
             solution
                 .deriv_provider
                 .hessian_derivative_correction(&v_ks[idx])
@@ -968,8 +925,7 @@ fn compute_outer_hessian(
             // Cross-trace: tr(H⁻¹ Hₗ H⁻¹ Hₖ) = tr(Yₗ Yₖ) = ⟨Yₗᵀ, Yₖ⟩_F
             let cross_trace = (&y_ks[ll].t() * &y_ks[kk]).sum();
 
-            // tr(H⁻¹ Ḧ_{kl}): check precomputed traces first (joint/complex models),
-            // then fall back to second-derivative provider (single-predictor).
+            // tr(H⁻¹ Ḧ_{kl}): computed via the deriv_provider.
             //
             // Ḧ_{kl} = δ_{kl} Aₖ + X' diag(c ⊙ X β_{kl} + d ⊙ (X β_k)(X β_l)) X
             //
@@ -977,9 +933,7 @@ fn compute_outer_hessian(
             //   β_{kl} = H⁻¹(Ḣₗ vₖ + Aₖ vₗ − δ_{kl} Aₖ β̂)
             //
             // (derived from differentiating H β_k + Aₖ β̂ = 0 w.r.t. ρₗ).
-            let h_kl_trace = if let Some(ref traces) = solution.precomputed_h_ddot_traces {
-                traces[[kk, ll]]
-            } else if kk == ll {
+            let h_kl_trace = if kk == ll {
                 // Diagonal: Ḧ_{kk} = Aₖ + correction(β_{kk}, vₖ, vₖ)
                 // Base is tr(H⁻¹ Aₖ), NOT tr(H⁻¹ Ḣₖ).
                 let base = hop.trace_hinv_product(&a_k_matrices[kk]);
@@ -1271,9 +1225,10 @@ impl HessianOperator for SparseCholeskyOperator {
 }
 
 // BlockCoupledDerivativeProvider was removed — its functionality is now handled
-// by precomputed_h_k_corrections in InnerSolution, which captures the full
-// correction including Jacobian sensitivity, weight sensitivity, and basis
-// sensitivity (not just the weight-only third-derivative correction).
+// by the `deriv_provider` trait (HessianDerivativeProvider), with concrete
+// implementations like JointModelDerivProvider and SurvivalDerivProvider
+// capturing the full correction including Jacobian sensitivity, weight
+// sensitivity, and basis sensitivity.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Block-coupled HessianOperator for joint multi-block models
@@ -1696,8 +1651,6 @@ mod tests {
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
-            precomputed_h_k_corrections: None,
-            precomputed_h_ddot_traces: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -1821,8 +1774,6 @@ mod tests {
             n_observations: n,
             nullspace_dim: (p - penalty_rank) as f64,
             dispersion: DispersionHandling::ProfiledGaussian,
-            precomputed_h_k_corrections: None,
-            precomputed_h_ddot_traces: None,
         }
     }
 
