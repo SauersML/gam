@@ -1808,6 +1808,7 @@ impl<'a> RemlState<'a> {
             nullspace_dim,
             dispersion,
             precomputed_h_k_corrections: None,
+            precomputed_h_ddot_traces: None,
         };
 
         // Prior cost/gradient.
@@ -1841,9 +1842,9 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DispersionHandling, GaussianDerivatives, InnerSolution, PenaltyLogdetDerivs,
-            SinglePredictorGlmDerivatives, SparseCholeskyOperator, penalty_matrix_root,
-            reml_laml_evaluate,
+            DispersionHandling, GaussianDerivatives, HessianOperator, InnerSolution,
+            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives, SparseCholeskyOperator,
+            penalty_matrix_root, reml_laml_evaluate,
         };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -1880,9 +1881,8 @@ impl<'a> RemlState<'a> {
             .s_full_list
             .iter()
             .map(|s_k| {
-                penalty_matrix_root(s_k).unwrap_or_else(|_| {
-                    Array2::zeros((s_k.nrows(), s_k.ncols()))
-                })
+                penalty_matrix_root(s_k)
+                    .unwrap_or_else(|_| Array2::zeros((s_k.nrows(), s_k.ncols())))
             })
             .collect();
 
@@ -1974,6 +1974,7 @@ impl<'a> RemlState<'a> {
             nullspace_dim: mp,
             dispersion,
             precomputed_h_k_corrections: None,
+            precomputed_h_ddot_traces: None,
         };
 
         // Prior cost/gradient.
