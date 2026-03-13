@@ -329,6 +329,59 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
     }
 }
 
+/// Derivative provider for joint/coupled models (GAMLSS, link wiggles, survival).
+///
+/// Wraps closures that compute the directional derivatives of the joint
+/// likelihood Hessian D_β H_L[v] and D²_β H_L[u, v].
+///
+/// # Sign convention
+///
+/// `reml_laml_evaluate` passes v_k = H⁻¹(A_k β̂) to `hessian_derivative_correction`.
+/// By the implicit function theorem, dβ̂/dρ_k = −v_k. The stored `compute_dh`
+/// expects the actual perturbation direction δβ, so we negate v_k before calling it.
+pub struct JointModelDerivProvider {
+    compute_dh: Box<dyn Fn(&Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
+    compute_d2h: Option<Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>>,
+}
+
+impl JointModelDerivProvider {
+    /// Create a new joint model derivative provider from closures.
+    ///
+    /// `compute_dh`: given direction δβ, returns D_β H_L[δβ]
+    /// `compute_d2h`: given (u, v), returns D²_β H_L[u, v] (optional)
+    pub fn new(
+        compute_dh: Box<dyn Fn(&Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
+        compute_d2h: Option<Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>>,
+    ) -> Self {
+        Self { compute_dh, compute_d2h }
+    }
+}
+
+impl HessianDerivativeProvider for JointModelDerivProvider {
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+        let neg_v = -v_k;
+        (self.compute_dh)(&neg_v)
+    }
+
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        let d2h = self.compute_d2h.as_ref()?;
+        let term1 = (self.compute_dh)(u_kl)?;
+        let neg_v_k = -v_k;
+        let neg_v_l = -v_l;
+        let term2 = d2h(&neg_v_l, &neg_v_k)?;
+        Some(term1 + &term2)
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════

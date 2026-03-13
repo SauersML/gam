@@ -4793,7 +4793,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             elapsed,
         );
     };
-    let (summary, beta, state, constraint_mode) =
+    let (summary, beta, state, constraint_mode, surv_model) =
         if learn_timewiggle || likelihood_mode == SurvivalLikelihoodMode::Weibull {
             let mut plain_model = model;
             let summary = gam::pirls::runworking_model_pirls(
@@ -4807,7 +4807,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let state = plain_model.update_state(&beta).map_err(|e| {
                 format!("failed to evaluate survival optimum in coefficient coordinates: {e}")
             })?;
-            (summary, beta, state, "baseline-timewiggle".to_string())
+            (summary, beta, state, "baseline-timewiggle".to_string(), plain_model)
         } else {
             let mut constrained_model = model;
             let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
@@ -4830,6 +4830,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 beta,
                 state,
                 "constrained-structural-time".to_string(),
+                constrained_model,
             )
         };
     log::info!(
@@ -4839,6 +4840,31 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         state.deviance,
         pirls_start.elapsed().as_secs_f64(),
     );
+    // Evaluate LAML objective via unified evaluator for diagnostic logging.
+    // Move surv_model into block so it is dropped at block end.
+    {
+        let surv_model = surv_model;
+        let rho = ndarray::Array1::from_iter(
+            penalty_blocks
+                .iter()
+                .filter(|b| b.lambda > 0.0)
+                .map(|b| b.lambda.ln()),
+        );
+        if !rho.is_empty() {
+            match surv_model.unified_lamlobjective_and_rhogradient(&beta, &state, &rho) {
+                Ok((laml_obj, laml_grad)) => {
+                    log::info!(
+                        "[LAML] unified objective={:.6e}, |grad|={:.3e}",
+                        laml_obj,
+                        laml_grad.dot(&laml_grad).sqrt(),
+                    );
+                }
+                Err(e) => {
+                    log::debug!("[LAML] unified evaluation skipped: {e}");
+                }
+            }
+        }
+    }
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {

@@ -10369,7 +10369,9 @@ mod tests {
     };
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
     use ndarray::{Axis, array};
-    use num_dual::{DualNum, second_derivative};
+    use num_dual::{
+        DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
+    };
     use std::time::Instant;
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
@@ -10472,6 +10474,190 @@ mod tests {
                 * (D::from(y[i]) * mu.ln() + D::from(1.0 - y[i]) * one_minusmu.ln());
         }
         out
+    }
+
+    fn gaussian_negloglik_log_sigma_psi_numdual<D: DualNum<f64> + Copy>(
+        beta_mu: D,
+        beta_ls: D,
+        psi: D,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        x_mu0: &Array1<f64>,
+        x_ls0: &Array1<f64>,
+        x_ls_psi: &Array1<f64>,
+        x_ls_psi_psi: &Array1<f64>,
+    ) -> D {
+        let half = D::from(0.5);
+        let mut out = D::zero();
+        for i in 0..y.len() {
+            let eta_mu = D::from(x_mu0[i]) * beta_mu;
+            let x_ls = D::from(x_ls0[i])
+                + psi * D::from(x_ls_psi[i])
+                + half * psi * psi * D::from(x_ls_psi_psi[i]);
+            let eta_ls = x_ls * beta_ls;
+            let sigma = eta_ls.exp();
+            let resid = D::from(y[i]) - eta_mu;
+            out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + eta_ls);
+        }
+        out
+    }
+
+    fn gaussian_negloglik_log_sigma_psi_only_numdual<D: DualNum<f64> + Copy>(
+        psi: D,
+        beta_mu: f64,
+        beta_ls: f64,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        x_mu0: &Array1<f64>,
+        x_ls0: &Array1<f64>,
+        x_ls_psi: &Array1<f64>,
+        x_ls_psi_psi: &Array1<f64>,
+    ) -> D {
+        gaussian_negloglik_log_sigma_psi_numdual(
+            D::from(beta_mu),
+            D::from(beta_ls),
+            psi,
+            y,
+            weights,
+            x_mu0,
+            x_ls0,
+            x_ls_psi,
+            x_ls_psi_psi,
+        )
+    }
+
+    fn gaussian_negloglik_log_sigma_mu_psi_numdual<D: DualNum<f64> + Copy>(
+        beta_mu: D,
+        psi: D,
+        beta_ls: f64,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        x_mu0: &Array1<f64>,
+        x_ls0: &Array1<f64>,
+        x_ls_psi: &Array1<f64>,
+        x_ls_psi_psi: &Array1<f64>,
+    ) -> D {
+        gaussian_negloglik_log_sigma_psi_numdual(
+            beta_mu,
+            D::from(beta_ls),
+            psi,
+            y,
+            weights,
+            x_mu0,
+            x_ls0,
+            x_ls_psi,
+            x_ls_psi_psi,
+        )
+    }
+
+    fn gaussian_negloglik_log_sigma_ls_psi_numdual<D: DualNum<f64> + Copy>(
+        beta_ls: D,
+        psi: D,
+        beta_mu: f64,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        x_mu0: &Array1<f64>,
+        x_ls0: &Array1<f64>,
+        x_ls_psi: &Array1<f64>,
+        x_ls_psi_psi: &Array1<f64>,
+    ) -> D {
+        gaussian_negloglik_log_sigma_psi_numdual(
+            D::from(beta_mu),
+            beta_ls,
+            psi,
+            y,
+            weights,
+            x_mu0,
+            x_ls0,
+            x_ls_psi,
+            x_ls_psi_psi,
+        )
+    }
+
+    fn gaussian_negloglik_log_sigma_beta_vec_numdual<D: DualNum<f64> + Copy>(
+        v: &[D],
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        x_mu0: &Array1<f64>,
+        x_ls0: &Array1<f64>,
+        x_ls_psi: &Array1<f64>,
+        x_ls_psi_psi: &Array1<f64>,
+    ) -> D {
+        gaussian_negloglik_log_sigma_psi_numdual(
+            v[0],
+            v[1],
+            v[2],
+            y,
+            weights,
+            x_mu0,
+            x_ls0,
+            x_ls_psi,
+            x_ls_psi_psi,
+        )
+    }
+
+    fn gaussian_psi_test_spec(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
+        let n = design.nrows();
+        ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(design),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        }
+    }
+
+    #[test]
+    fn gaussian_joint_psi_firstweights_should_use_observation_weight_in_log_sigma_score() {
+        let y = array![1.1];
+        let etamu = array![0.3];
+        let eta_ls = array![-0.2];
+        let weights = array![2.5];
+        let rows =
+            gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        let firstweights = gaussian_joint_psi_firstweights(&rows, &array![0.0], &array![1.0]);
+        let expected_score_ls = weights[0] - rows.n[0];
+
+        assert!(
+            (firstweights.score_ls[0] - expected_score_ls).abs() <= 1e-12,
+            "For one Gaussian row, d/deta_ls [ weight * (eta_ls + 0.5 * (y-mu)^2 * exp(-2 eta_ls)) ] = weight - n_i. The helper coded {} but the implemented scalar objective differentiates to {}.",
+            firstweights.score_ls[0],
+            expected_score_ls
+        );
+        assert!(
+            (firstweights.objective_psirow[0] - expected_score_ls).abs() <= 1e-12,
+            "With mu_psi=0 and eta_psi=1, the exact psi objective derivative must equal weight - n_i. The helper coded {} but the scalar objective differentiates to {}.",
+            firstweights.objective_psirow[0],
+            expected_score_ls
+        );
+    }
+
+    #[test]
+    fn gaussian_joint_psisecondweights_should_use_observation_weight_in_log_sigma_eab_term() {
+        let y = array![1.1];
+        let etamu = array![0.3];
+        let eta_ls = array![-0.2];
+        let weights = array![2.5];
+        let rows =
+            gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        let secondweights = gaussian_joint_psisecondweights(
+            &rows,
+            &array![0.0],
+            &array![0.0],
+            &array![0.0],
+            &array![0.0],
+            &array![0.0],
+            &array![1.0],
+        );
+        let expected_objective_psi_psi = weights[0] - rows.n[0];
+
+        assert!(
+            (secondweights.objective_psi_psirow[0] - expected_objective_psi_psi).abs() <= 1e-12,
+            "With only eta_psi_psi=1 active, the Gaussian second psi objective must contribute weight - n_i from the linear eta_ls term. The helper coded {} but the scalar objective differentiates to {}.",
+            secondweights.objective_psi_psirow[0],
+            expected_objective_psi_psi
+        );
     }
 
     #[test]
@@ -12867,6 +13053,323 @@ mod tests {
             "wiggle threshold exact hessian mismatch: evaluate()={} autodiff={}",
             blockhessian[[0, 0]],
             hess_ad
+        );
+    }
+
+    #[test]
+    fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
+        let y = array![0.25, -0.4, 1.1];
+        let weights = array![1.0, 0.7, 1.3];
+        let x_mu0 = array![1.0, -0.35, 0.6];
+        let x_ls0 = array![0.8, -0.25, 0.45];
+        let x_ls_psi = array![0.2, -0.15, 0.1];
+        let x_ls_psi_psi = array![0.05, -0.03, 0.04];
+        let beta_mu0 = 0.35_f64;
+        let beta_ls0 = -0.2_f64;
+
+        let x_mu0_mat = x_mu0.clone().insert_axis(Axis(1));
+        let x_ls0_mat = x_ls0.clone().insert_axis(Axis(1));
+        let family = GaussianLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            mu_design: Some(DesignMatrix::Dense(x_mu0_mat.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls0_mat.clone())),
+            cached_row_scalars: std::cell::RefCell::new(None),
+        };
+        let specs = vec![
+            gaussian_psi_test_spec("mu", x_mu0_mat.clone()),
+            gaussian_psi_test_spec("log_sigma", x_ls0_mat.clone()),
+        ];
+        let states = vec![
+            ParameterBlockState {
+                beta: array![beta_mu0],
+                eta: x_mu0_mat.column(0).to_owned() * beta_mu0,
+            },
+            ParameterBlockState {
+                beta: array![beta_ls0],
+                eta: x_ls0_mat.column(0).to_owned() * beta_ls0,
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![CustomFamilyBlockPsiDerivative {
+                penalty_index: None,
+                x_psi: x_ls_psi.clone().insert_axis(Axis(1)),
+                s_psi: Array2::zeros((1, 1)),
+                s_psi_components: None,
+                x_psi_psi: Some(vec![x_ls_psi_psi.clone().insert_axis(Axis(1))]),
+                s_psi_psi: Some(vec![Array2::zeros((1, 1))]),
+                s_psi_psi_components: None,
+            }],
+        ];
+
+        let psi_terms = family
+            .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+            .expect("joint psi terms")
+            .expect("expected gaussian psi terms");
+
+        let vars = [beta_mu0, beta_ls0, 0.0_f64];
+        let (_, dpsi, _) = second_derivative(
+            |psi| {
+                gaussian_negloglik_log_sigma_psi_only_numdual(
+                    psi,
+                    beta_mu0,
+                    beta_ls0,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            0.0,
+        );
+        let (_, _, _, score_mu_psi) = second_partial_derivative(
+            |(beta_mu, psi)| {
+                gaussian_negloglik_log_sigma_mu_psi_numdual(
+                    beta_mu,
+                    psi,
+                    beta_ls0,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            (beta_mu0, 0.0),
+        );
+        let (_, _, _, score_ls_psi) = second_partial_derivative(
+            |(beta_ls, psi)| {
+                gaussian_negloglik_log_sigma_ls_psi_numdual(
+                    beta_ls,
+                    psi,
+                    beta_mu0,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            (beta_ls0, 0.0),
+        );
+        let (_, _, _, _, _, _, _, h_mu_mu_psi) = third_partial_derivative_vec(
+            |v| {
+                gaussian_negloglik_log_sigma_beta_vec_numdual(
+                    v,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            &vars,
+            0,
+            0,
+            2,
+        );
+        let (_, _, _, _, _, _, _, h_mu_ls_psi) = third_partial_derivative_vec(
+            |v| {
+                gaussian_negloglik_log_sigma_beta_vec_numdual(
+                    v,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            &vars,
+            0,
+            1,
+            2,
+        );
+        let (_, _, _, _, _, _, _, h_ls_ls_psi) = third_partial_derivative_vec(
+            |v| {
+                gaussian_negloglik_log_sigma_beta_vec_numdual(
+                    v,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            &vars,
+            1,
+            1,
+            2,
+        );
+
+        assert!(
+            (psi_terms.objective_psi - dpsi).abs() <= 1e-10,
+            "Gaussian log-sigma psi objective derivative mismatch: analytic={} autodiff={}",
+            psi_terms.objective_psi,
+            dpsi
+        );
+        assert!(
+            (psi_terms.score_psi[0] - score_mu_psi).abs() <= 1e-10,
+            "Gaussian log-sigma psi score_mu mismatch: analytic={} autodiff={}",
+            psi_terms.score_psi[0],
+            score_mu_psi
+        );
+        assert!(
+            (psi_terms.score_psi[1] - score_ls_psi).abs() <= 1e-10,
+            "Gaussian log-sigma psi score_ls mismatch: analytic={} autodiff={}",
+            psi_terms.score_psi[1],
+            score_ls_psi
+        );
+        assert!(
+            (psi_terms.hessian_psi[[0, 0]] - h_mu_mu_psi).abs() <= 1e-9,
+            "Gaussian log-sigma psi hessian(mu,mu) mismatch: analytic={} autodiff={}",
+            psi_terms.hessian_psi[[0, 0]],
+            h_mu_mu_psi
+        );
+        assert!(
+            (psi_terms.hessian_psi[[0, 1]] - h_mu_ls_psi).abs() <= 1e-9,
+            "Gaussian log-sigma psi hessian(mu,ls) mismatch: analytic={} autodiff={}",
+            psi_terms.hessian_psi[[0, 1]],
+            h_mu_ls_psi
+        );
+        assert!(
+            (psi_terms.hessian_psi[[1, 1]] - h_ls_ls_psi).abs() <= 1e-9,
+            "Gaussian log-sigma psi hessian(ls,ls) mismatch: analytic={} autodiff={}",
+            psi_terms.hessian_psi[[1, 1]],
+            h_ls_ls_psi
+        );
+    }
+
+    #[test]
+    fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_objective() {
+        let y = array![0.25, -0.4, 1.1];
+        let weights = array![1.0, 0.7, 1.3];
+        let x_mu0 = array![1.0, -0.35, 0.6];
+        let x_ls0 = array![0.8, -0.25, 0.45];
+        let x_ls_psi = array![0.2, -0.15, 0.1];
+        let x_ls_psi_psi = array![0.05, -0.03, 0.04];
+        let beta_mu0 = 0.35_f64;
+        let beta_ls0 = -0.2_f64;
+
+        let x_mu0_mat = x_mu0.clone().insert_axis(Axis(1));
+        let x_ls0_mat = x_ls0.clone().insert_axis(Axis(1));
+        let family = GaussianLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            mu_design: Some(DesignMatrix::Dense(x_mu0_mat.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls0_mat.clone())),
+            cached_row_scalars: std::cell::RefCell::new(None),
+        };
+        let specs = vec![
+            gaussian_psi_test_spec("mu", x_mu0_mat.clone()),
+            gaussian_psi_test_spec("log_sigma", x_ls0_mat.clone()),
+        ];
+        let states = vec![
+            ParameterBlockState {
+                beta: array![beta_mu0],
+                eta: x_mu0_mat.column(0).to_owned() * beta_mu0,
+            },
+            ParameterBlockState {
+                beta: array![beta_ls0],
+                eta: x_ls0_mat.column(0).to_owned() * beta_ls0,
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![CustomFamilyBlockPsiDerivative {
+                penalty_index: None,
+                x_psi: x_ls_psi.clone().insert_axis(Axis(1)),
+                s_psi: Array2::zeros((1, 1)),
+                s_psi_components: None,
+                x_psi_psi: Some(vec![x_ls_psi_psi.clone().insert_axis(Axis(1))]),
+                s_psi_psi: Some(vec![Array2::zeros((1, 1))]),
+                s_psi_psi_components: None,
+            }],
+        ];
+
+        let psi2_terms = family
+            .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
+            .expect("joint psi psi terms")
+            .expect("expected gaussian psi psi terms");
+
+        let vars = [beta_mu0, beta_ls0, 0.0_f64];
+        let (_, _, d2psi) = second_derivative(
+            |psi| {
+                gaussian_negloglik_log_sigma_psi_only_numdual(
+                    psi,
+                    beta_mu0,
+                    beta_ls0,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            0.0,
+        );
+        let (_, _, _, _, _, _, _, score_mu_psi_psi) =
+            third_partial_derivative_vec(
+                |v| {
+                    gaussian_negloglik_log_sigma_beta_vec_numdual(
+                        v,
+                        &y,
+                        &weights,
+                        &x_mu0,
+                        &x_ls0,
+                        &x_ls_psi,
+                        &x_ls_psi_psi,
+                    )
+                },
+                &vars,
+                0,
+                2,
+                2,
+            );
+        let (_, _, _, _, _, _, _, score_ls_psi_psi) =
+            third_partial_derivative_vec(
+                |v| {
+                    gaussian_negloglik_log_sigma_beta_vec_numdual(
+                        v,
+                        &y,
+                        &weights,
+                        &x_mu0,
+                        &x_ls0,
+                        &x_ls_psi,
+                        &x_ls_psi_psi,
+                    )
+                },
+                &vars,
+                1,
+                2,
+                2,
+            );
+
+        assert!(
+            (psi2_terms.objective_psi_psi - d2psi).abs() <= 1e-10,
+            "Gaussian log-sigma psi second objective mismatch: analytic={} autodiff={}",
+            psi2_terms.objective_psi_psi,
+            d2psi
+        );
+        assert!(
+            (psi2_terms.score_psi_psi[0] - score_mu_psi_psi).abs() <= 1e-9,
+            "Gaussian log-sigma psi second score_mu mismatch: analytic={} autodiff={}",
+            psi2_terms.score_psi_psi[0],
+            score_mu_psi_psi
+        );
+        assert!(
+            (psi2_terms.score_psi_psi[1] - score_ls_psi_psi).abs() <= 1e-9,
+            "Gaussian log-sigma psi second score_ls mismatch: analytic={} autodiff={}",
+            psi2_terms.score_psi_psi[1],
+            score_ls_psi_psi
         );
     }
 
