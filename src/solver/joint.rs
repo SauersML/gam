@@ -2121,7 +2121,8 @@ impl<'a> JointRemlState<'a> {
                             };
                             if is_link_k {
                                 if p_link > 0 && link_penalty.nrows() == p_link {
-                                    let c_j_link: Array1<f64> = c_k_vecs[jj].slice(s![p_base..p_total]).to_owned();
+                                    let c_j_link: Array1<f64> =
+                                        c_k_vecs[jj].slice(s![p_base..p_total]).to_owned();
                                     let sc = link_penalty.dot(&c_j_link);
                                     for i in 0..p_link {
                                         rhs_jk[p_base + i] += lambda_kk * sc[i];
