@@ -334,8 +334,8 @@ pub fn run_outer(
 ) -> Result<OuterResult, EstimationError> {
     use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
     use opt::{
-        Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations,
-        NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
+        Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion,
+        NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
     };
 
     let cap = obj.capability();
@@ -362,9 +362,9 @@ pub fn run_outer(
             &config.seed_config,
         );
         if generated.is_empty() {
-            return Err(EstimationError::RemlOptimizationFailed(
-                format!("no seeds generated for outer optimization ({context})"),
-            ));
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "no seeds generated for outer optimization ({context})"
+            )));
         }
         generated
     };
@@ -380,7 +380,14 @@ pub fn run_outer(
             .map(|(i, rho)| {
                 obj.reset();
                 let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
-                (i, if cost.is_finite() { cost } else { f64::INFINITY })
+                (
+                    i,
+                    if cost.is_finite() {
+                        cost
+                    } else {
+                        f64::INFINITY
+                    },
+                )
             })
             .collect();
         scored.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -404,13 +411,9 @@ pub fn run_outer(
                 let objective = CachedSecondOrderObjective::new(
                     |rho: &Array1<f64>| {
                         let eval = obj.eval(rho).map_err(|e| {
-                            ObjectiveEvalError::recoverable(
-                                format!("outer eval failed: {e}"),
-                            )
+                            ObjectiveEvalError::recoverable(format!("outer eval failed: {e}"))
                         })?;
-                        if !eval.cost.is_finite()
-                            || eval.gradient.iter().any(|v| !v.is_finite())
-                        {
+                        if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
                             return Err(ObjectiveEvalError::recoverable(
                                 "outer objective returned non-finite cost/gradient",
                             ));
@@ -454,10 +457,9 @@ pub fn run_outer(
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let tol = Tolerance::new(config.tolerance)
-                    .expect("outer tolerance must be valid");
-                let max_iter = MaxIterations::new(config.max_iter)
-                    .expect("outer max_iter must be valid");
+                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                let max_iter =
+                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
                 if the_plan.solver == Solver::Arc {
                     let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
@@ -472,25 +474,24 @@ pub fn run_outer(
                             final_grad_norm: f64::NAN,
                             converged: true,
                         }),
-                        Err(ArcError::MaxIterationsReached {
-                            last_solution, ..
-                        }) => Ok(OuterResult {
-                            rho: last_solution.final_point.clone(),
-                            final_value: last_solution.final_value,
-                            iterations: last_solution.iterations,
-                            final_grad_norm: f64::NAN,
-                            converged: false,
-                        }),
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(
-                            format!("Arc solver failed: {e:?}"),
-                        )),
+                        Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
+                            Ok(OuterResult {
+                                rho: last_solution.final_point.clone(),
+                                final_value: last_solution.final_value,
+                                iterations: last_solution.iterations,
+                                final_grad_norm: f64::NAN,
+                                converged: false,
+                            })
+                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "Arc solver failed: {e:?}"
+                        ))),
                     }
                 } else {
-                    let mut optimizer =
-                        NewtonTrustRegion::new(seed.clone(), objective)
-                            .with_bounds(bounds)
-                            .with_tolerance(tol)
-                            .with_max_iterations(max_iter);
+                    let mut optimizer = NewtonTrustRegion::new(seed.clone(), objective)
+                        .with_bounds(bounds)
+                        .with_tolerance(tol)
+                        .with_max_iterations(max_iter);
                     match optimizer.run() {
                         Ok(sol) => Ok(OuterResult {
                             rho: sol.final_point.clone(),
@@ -499,39 +500,73 @@ pub fn run_outer(
                             final_grad_norm: f64::NAN,
                             converged: true,
                         }),
-                        Err(NewtonTrustRegionError::MaxIterationsReached {
-                            last_solution,
-                        }) => Ok(OuterResult {
-                            rho: last_solution.final_point.clone(),
-                            final_value: last_solution.final_value,
-                            iterations: last_solution.iterations,
-                            final_grad_norm: f64::NAN,
-                            converged: false,
-                        }),
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(
-                            format!("Newton trust-region solver failed: {e:?}"),
-                        )),
+                        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+                            Ok(OuterResult {
+                                rho: last_solution.final_point.clone(),
+                                final_value: last_solution.final_value,
+                                iterations: last_solution.iterations,
+                                final_grad_norm: f64::NAN,
+                                converged: false,
+                            })
+                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "Newton trust-region solver failed: {e:?}"
+                        ))),
                     }
                 }
             }
             Solver::Bfgs => {
-                let objective = CachedFirstOrderObjective::new(
-                    |rho: &Array1<f64>| {
+                let gradient_available = cap.gradient == Derivative::Analytic;
+                let fd_step = config.fd_step;
+                let n_params = cap.n_params;
+                let objective = CachedFirstOrderObjective::new(|rho: &Array1<f64>| {
+                    if gradient_available {
                         let eval = obj.eval(rho).map_err(|e| {
-                            ObjectiveEvalError::recoverable(
-                                format!("outer eval failed: {e}"),
-                            )
+                            ObjectiveEvalError::recoverable(format!("outer eval failed: {e}"))
                         })?;
-                        if !eval.cost.is_finite()
-                            || eval.gradient.iter().any(|v| !v.is_finite())
-                        {
+                        if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
                             return Err(ObjectiveEvalError::recoverable(
                                 "outer objective returned non-finite cost/gradient",
                             ));
                         }
                         Ok((eval.cost, eval.gradient))
-                    },
-                );
+                    } else {
+                        // No analytic gradient: construct FD gradient from
+                        // eval_cost. Central differences: 2*n_params evals.
+                        let cost = obj.eval_cost(rho).map_err(|e| {
+                            ObjectiveEvalError::recoverable(format!("outer eval_cost failed: {e}"))
+                        })?;
+                        if !cost.is_finite() {
+                            return Err(ObjectiveEvalError::recoverable(
+                                "outer objective returned non-finite cost",
+                            ));
+                        }
+                        let mut grad = Array1::zeros(n_params);
+                        for i in 0..n_params {
+                            let h = fd_step * (1.0 + rho[i].abs());
+                            let mut rp = rho.clone();
+                            let mut rm = rho.clone();
+                            rp[i] += h;
+                            rm[i] -= h;
+                            let fp = obj.eval_cost(&rp).map_err(|e| {
+                                ObjectiveEvalError::recoverable(format!(
+                                    "outer FD eval_cost failed: {e}"
+                                ))
+                            })?;
+                            let fm = obj.eval_cost(&rm).map_err(|e| {
+                                ObjectiveEvalError::recoverable(format!(
+                                    "outer FD eval_cost failed: {e}"
+                                ))
+                            })?;
+                            grad[i] = if fp.is_finite() && fm.is_finite() {
+                                (fp - fm) / (2.0 * h)
+                            } else {
+                                0.0
+                            };
+                        }
+                        Ok((cost, grad))
+                    }
+                });
                 let (lo, hi) = &bounds_template;
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_bounds(
@@ -539,12 +574,10 @@ pub fn run_outer(
                             .expect("outer rho bounds must be valid"),
                     )
                     .with_tolerance(
-                        Tolerance::new(config.tolerance)
-                            .expect("outer tolerance must be valid"),
+                        Tolerance::new(config.tolerance).expect("outer tolerance must be valid"),
                     )
                     .with_max_iterations(
-                        MaxIterations::new(config.max_iter)
-                            .expect("outer max_iter must be valid"),
+                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid"),
                     );
                 match optimizer.run() {
                     Ok(sol) => Ok(OuterResult {
@@ -554,27 +587,23 @@ pub fn run_outer(
                         final_grad_norm: f64::NAN,
                         converged: true,
                     }),
-                    Err(BfgsError::MaxIterationsReached {
-                        last_solution,
-                    }) => Ok(OuterResult {
+                    Err(BfgsError::MaxIterationsReached { last_solution }) => Ok(OuterResult {
                         rho: last_solution.final_point.clone(),
                         final_value: last_solution.final_value,
                         iterations: last_solution.iterations,
                         final_grad_norm: f64::NAN,
                         converged: false,
                     }),
-                    Err(BfgsError::LineSearchFailed {
-                        last_solution, ..
-                    }) => Ok(OuterResult {
+                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => Ok(OuterResult {
                         rho: last_solution.final_point.clone(),
                         final_value: last_solution.final_value,
                         iterations: last_solution.iterations,
                         final_grad_norm: f64::NAN,
                         converged: false,
                     }),
-                    Err(e) => Err(EstimationError::RemlOptimizationFailed(
-                        format!("BFGS solver failed: {e:?}"),
-                    )),
+                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                        "BFGS solver failed: {e:?}"
+                    ))),
                 }
             }
         };
@@ -582,9 +611,7 @@ pub fn run_outer(
         match result {
             Ok(candidate) => {
                 let dominated = best.as_ref().is_some_and(|b| {
-                    b.converged
-                        && (!candidate.converged
-                            || b.final_value <= candidate.final_value)
+                    b.converged && (!candidate.converged || b.final_value <= candidate.final_value)
                 });
                 if !dominated {
                     best = Some(candidate);

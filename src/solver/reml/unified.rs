@@ -282,14 +282,21 @@ pub struct PenaltyLogdetDerivs {
 pub enum DispersionHandling {
     /// Gaussian REML: φ̂ = D_p / (n − M_p), profiled out of the objective.
     /// The cost includes (n−M_p)/2 · log(2πφ̂) and the gradient includes
-    /// the profiled scale derivative.
+    /// the profiled scale derivative. Always includes both logdet terms.
     ProfiledGaussian,
-    /// Non-Gaussian LAML: dispersion is fixed (typically φ=1 for binomial).
-    Fixed { phi: f64 },
-    /// Maximum penalized likelihood: V = −ℓ + ½ β̂ᵀSβ̂.
-    /// No logdet terms (neither log|H| nor log|S|). Used by custom family
-    /// paths where include_logdet_h = false.
-    MaxPenalizedLikelihood,
+    /// Non-Gaussian LAML or maximum penalized likelihood.
+    ///
+    /// `include_logdet_h` controls whether ½ log|H| is included (true for full
+    /// LAML, false for MPL/PQL).
+    /// `include_logdet_s` controls whether −½ log|S|₊ is included.
+    ///
+    /// Standard LAML: `Fixed { phi: 1.0, include_logdet_h: true, include_logdet_s: true }`
+    /// MaxPenalizedLikelihood: `Fixed { phi: 1.0, include_logdet_h: false, include_logdet_s: false }`
+    Fixed {
+        phi: f64,
+        include_logdet_h: bool,
+        include_logdet_s: bool,
+    },
 }
 
 /// The unified inner solution produced by any inner solver.
@@ -354,6 +361,18 @@ pub struct InnerSolution {
 
     /// How the dispersion parameter is handled.
     pub dispersion: DispersionHandling,
+
+    // === Precomputed corrections (for custom family paths) ===
+    /// Precomputed third-derivative corrections Hₖ − Aₖ for each smoothing parameter.
+    ///
+    /// When present, the gradient loop uses these instead of calling the
+    /// `deriv_provider`. This allows custom families to pre-compute corrections
+    /// using family-specific directional derivative methods (which need access
+    /// to the family object and block states that can't be stored in the provider).
+    ///
+    /// Each entry is `Some(correction_k)` where correction_k = D_β H_L[vₖ],
+    /// or `None` if the correction is zero (Gaussian-like penalty).
+    pub precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
 }
 
 /// Evaluation mode for the unified evaluator.
@@ -461,25 +480,26 @@ pub fn reml_laml_evaluate(
 
             (cost, phi, dp_cgrad)
         }
-        DispersionHandling::Fixed { phi } => {
-            // Non-Gaussian LAML:
-            //   V(ρ) = −ℓ(β̂) + ½ β̂ᵀSβ̂ + ½ log|H| − ½ log|S|₊
-            //         + (M_p/2) log(2πφ) + TK + Firth
-            let cost = -solution.log_likelihood
-                + 0.5 * solution.penalty_quadratic
-                + 0.5 * (log_det_h - log_det_s)
-                + (solution.nullspace_dim / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
-                + solution.tk_correction
-                + solution.firth_logdet;
-
+        DispersionHandling::Fixed {
+            phi,
+            include_logdet_h,
+            include_logdet_s,
+        } => {
+            // Non-Gaussian LAML / maximum penalized likelihood:
+            //   V(ρ) = −ℓ(β̂) + ½ β̂ᵀSβ̂
+            //         + [½ log|H| + (M_p/2) log(2πφ) + TK + Firth]  if include_logdet_h
+            //         − [½ log|S|₊]                                   if include_logdet_s
+            let mut cost = -solution.log_likelihood + 0.5 * solution.penalty_quadratic;
+            if *include_logdet_h {
+                cost += 0.5 * log_det_h
+                    + (solution.nullspace_dim / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
+                    + solution.tk_correction
+                    + solution.firth_logdet;
+            }
+            if *include_logdet_s {
+                cost -= 0.5 * log_det_s;
+            }
             (cost, *phi, 0.0)
-        }
-        DispersionHandling::MaxPenalizedLikelihood => {
-            // Maximum penalized likelihood: V = −ℓ + ½ β̂ᵀSβ̂.
-            // No logdet terms — used when the outer objective is just MPL
-            // (e.g., custom families with include_logdet_h = false).
-            let cost = -solution.log_likelihood + 0.5 * solution.penalty_quadratic;
-            (cost, 1.0, 0.0)
         }
     };
 
@@ -515,45 +535,51 @@ pub fn reml_laml_evaluate(
         // For Gaussian (profiled): dp_cgrad × D_k / (2φ̂) where D_k = β̂ᵀAₖβ̂.
         // For non-Gaussian: 0.5 × β̂ᵀAₖβ̂ (direct from LAML formula).
         let d_k = lambdas[idx] * solution.beta.dot(&s_k_beta);
+        // Extract logdet flags for this dispersion type.
+        let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
+            DispersionHandling::ProfiledGaussian => (true, true),
+            DispersionHandling::Fixed {
+                include_logdet_h,
+                include_logdet_s,
+                ..
+            } => (*include_logdet_h, *include_logdet_s),
+        };
+
         let penalty_term = match &solution.dispersion {
             DispersionHandling::ProfiledGaussian => dp_cgrad * (d_k / (2.0 * profiled_scale)),
             DispersionHandling::Fixed { .. } => 0.5 * d_k,
-            DispersionHandling::MaxPenalizedLikelihood => 0.5 * d_k,
         };
 
-        // Term 2: ½ tr(H⁻¹ Hₖ).
+        // Term 2: ½ tr(H⁻¹ Hₖ) — derivative of ½ log|H|.
         // Hₖ = Aₖ + (third-derivative correction).
-        // For Gaussian: correction is zero. For GLMs/coupled: correction is non-trivial.
-        // For MaxPenalizedLikelihood: no logdet terms, so trace_term = 0.
-        let trace_term = if matches!(solution.dispersion, DispersionHandling::MaxPenalizedLikelihood) {
+        // Zero when include_logdet_h is false (MPL/PQL).
+        let trace_term = if !incl_logdet_h {
             0.0
-        } else if solution.deriv_provider.has_corrections() {
-            // Compute mode response vₖ = H⁻¹(Aₖβ̂)
-            let v_k = hop.solve(&a_k_beta);
-            let correction = solution.deriv_provider.hessian_derivative_correction(&v_k);
-
-            // Build Aₖ = λₖ RₖᵀRₖ for the base trace
+        } else {
+            // Build Aₖ = λₖ RₖᵀRₖ
             let a_k_matrix = {
                 let mut m = r_k.t().dot(r_k);
                 m *= lambdas[idx];
                 m
+            };
+
+            // Check for precomputed corrections first (custom family path),
+            // then fall back to deriv_provider (PIRLS/joint path).
+            let correction = if let Some(ref precomputed) = solution.precomputed_h_k_corrections {
+                precomputed[idx].clone()
+            } else if solution.deriv_provider.has_corrections() {
+                let v_k = hop.solve(&a_k_beta);
+                solution.deriv_provider.hessian_derivative_correction(&v_k)
+            } else {
+                None
             };
 
             0.5 * hop.trace_hinv_h_k(&a_k_matrix, correction.as_ref())
-        } else {
-            // Gaussian: Hₖ = Aₖ = λₖSₖ, use efficient root form.
-            // tr(H⁻¹ Aₖ) = λₖ tr(H⁻¹ RₖᵀRₖ) = λₖ ‖Rₖ W‖²_F
-            // where W is the pseudo-inverse factor (inside the operator).
-            let a_k_matrix = {
-                let mut m = r_k.t().dot(r_k);
-                m *= lambdas[idx];
-                m
-            };
-            0.5 * hop.trace_hinv_product(&a_k_matrix)
         };
 
-        // Term 3: −½ ∂/∂ρₖ log|S|₊ (zero for MaxPenalizedLikelihood)
-        let det_term = if matches!(solution.dispersion, DispersionHandling::MaxPenalizedLikelihood) {
+        // Term 3: −½ ∂/∂ρₖ log|S|₊
+        // Zero when include_logdet_s is false (MPL/PQL).
+        let det_term = if !incl_logdet_s {
             0.0
         } else {
             0.5 * solution.penalty_logdet.first[idx]
@@ -1020,6 +1046,8 @@ pub fn pirls_result_to_inner_solution(
     } else {
         DispersionHandling::Fixed {
             phi: config.fixed_dispersion,
+            include_logdet_h: true,
+            include_logdet_s: true,
         }
     };
 
@@ -1049,6 +1077,7 @@ pub fn pirls_result_to_inner_solution(
         n_observations: config.n_observations,
         nullspace_dim,
         dispersion,
+        precomputed_h_k_corrections: None,
     })
 }
 
@@ -1056,9 +1085,7 @@ pub fn pirls_result_to_inner_solution(
 ///
 /// Configuration for the block-coupled conversion.
 ///
-/// Currently gated behind cfg(test) because the blockwise path is not yet wired
-/// to use the unified evaluator. Remove the gate when the custom_family.rs
-/// migration is complete.
+/// Configuration for converting a BlockwiseInnerResult into an InnerSolution.
 pub struct BlockwiseConversionConfig {
     /// Number of observations.
     pub n_observations: usize,
@@ -1082,6 +1109,12 @@ pub struct BlockwiseConversionConfig {
     pub tk_correction: f64,
     /// TK gradient.
     pub tk_gradient: Option<Array1<f64>>,
+    /// Whether to include ½ log|H| in the objective.
+    pub include_logdet_h: bool,
+    /// Whether to include −½ log|S|₊ in the objective.
+    pub include_logdet_s: bool,
+    /// Precomputed gradient corrections (from family-specific directional derivatives).
+    pub precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
 }
 
 /// Convert a BlockwiseInnerResult into an InnerSolution.
@@ -1111,7 +1144,10 @@ pub fn blockwise_result_to_inner_solution(
         nullspace_dim: config.nullspace_dim,
         dispersion: DispersionHandling::Fixed {
             phi: config.fixed_dispersion,
+            include_logdet_h: config.include_logdet_h,
+            include_logdet_s: config.include_logdet_s,
         },
+        precomputed_h_k_corrections: config.precomputed_h_k_corrections,
     })
 }
 
@@ -1140,10 +1176,7 @@ pub struct BlockCoupledDerivativeProvider {
 }
 
 impl HessianDerivativeProvider for BlockCoupledDerivativeProvider {
-    fn hessian_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
         // D_β H_L[vₖ] = Jᵀ diag(c ⊙ J vₖ) J
         // where c is the third-derivative weight vector.
         let j = &self.joint_design;
@@ -1281,6 +1314,8 @@ pub fn joint_result_to_inner_solution(
     } else {
         DispersionHandling::Fixed {
             phi: config.fixed_dispersion,
+            include_logdet_h: true,
+            include_logdet_s: true,
         }
     };
 
@@ -1300,6 +1335,7 @@ pub fn joint_result_to_inner_solution(
         n_observations: config.n_observations,
         nullspace_dim: config.nullspace_dim,
         dispersion,
+        precomputed_h_k_corrections: None,
     })
 }
 
@@ -1323,6 +1359,159 @@ pub struct RemlBundleConversionConfig {
     pub tk_correction: f64,
     /// TK gradient.
     pub tk_gradient: Option<Array1<f64>>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Helpers for custom family → InnerSolution conversion
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Compute the square root of a symmetric positive semidefinite penalty matrix.
+///
+/// Returns R such that S = RᵀR, with R having `rank(S)` rows.
+/// Uses eigendecomposition: S = U Λ U^T → R = Λ_+^{1/2} U_+^T.
+pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
+    use faer::Side;
+    let n = s.nrows();
+    if n != s.ncols() {
+        return Err(format!(
+            "penalty_matrix_root: expected square matrix, got {}×{}",
+            n,
+            s.ncols()
+        ));
+    }
+    if n == 0 {
+        return Ok(Array2::zeros((0, 0)));
+    }
+
+    let (eigenvalues, eigenvectors) = s
+        .eigh(Side::Lower)
+        .map_err(|e| format!("penalty_matrix_root eigendecomposition failed: {e}"))?;
+
+    let max_ev = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    let tol = (n.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
+
+    let active: Vec<usize> = eigenvalues
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v > tol)
+        .map(|(i, _)| i)
+        .collect();
+    let rank = active.len();
+
+    let mut r = Array2::zeros((rank, n));
+    for (out_row, &idx) in active.iter().enumerate() {
+        let scale = eigenvalues[idx].sqrt();
+        for col in 0..n {
+            r[[out_row, col]] = scale * eigenvectors[[col, idx]];
+        }
+    }
+    Ok(r)
+}
+
+/// Compute penalty logdet derivatives for a block-diagonal penalty structure.
+///
+/// Given per-block penalty matrices and current log-lambdas, computes:
+/// - log|S(ρ)|₊ (the pseudo-logdeterminant)
+/// - ∂/∂ρₖ log|S|₊ = tr(S₊⁻¹ Aₖ) for each smoothing parameter k
+///
+/// `per_block_rho[b]` contains the log-lambdas for block b.
+/// `per_block_penalties[b]` contains the penalty matrices for block b.
+/// `ridge` is the ridge to add for logdet stability (0 if not applicable).
+pub fn compute_block_penalty_logdet_derivs(
+    per_block_rho: &[Array1<f64>],
+    per_block_penalties: &[&[Array2<f64>]],
+    ridge: f64,
+) -> Result<PenaltyLogdetDerivs, String> {
+    use faer::Side;
+
+    let total_k: usize = per_block_rho.iter().map(|r| r.len()).sum();
+    let mut log_det_total = 0.0;
+    let mut first = Array1::zeros(total_k);
+    let mut at = 0usize;
+
+    for (b, block_rho) in per_block_rho.iter().enumerate() {
+        let penalties = per_block_penalties[b];
+        let p = penalties[0].nrows();
+        let lambdas = block_rho.mapv(f64::exp);
+
+        // S_b = Σ λ_k S_k
+        let mut s_block = Array2::zeros((p, p));
+        for (k, s_k) in penalties.iter().enumerate() {
+            s_block.scaled_add(lambdas[k], s_k);
+        }
+
+        // Add ridge for logdet stability.
+        if ridge > 0.0 {
+            for d in 0..p {
+                s_block[[d, d]] += ridge;
+            }
+        }
+
+        // Eigendecomposition for logdet and pseudo-inverse.
+        let (eigs, vecs) = s_block
+            .eigh(Side::Lower)
+            .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
+
+        let max_ev = eigs.iter().copied().fold(0.0_f64, f64::max);
+        let tol = (p.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
+
+        // log|S_b|₊
+        let block_logdet: f64 = eigs.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum();
+        log_det_total += block_logdet;
+
+        // S₊⁻¹ for trace derivatives: pseudo-inverse using active eigenvalues.
+        let n_active = eigs.iter().filter(|&&v| v > tol).count();
+        let mut w_factor = Array2::zeros((p, n_active));
+        let mut w_col = 0;
+        for (idx, &ev) in eigs.iter().enumerate() {
+            if ev > tol {
+                let scale = 1.0 / ev.sqrt();
+                for row in 0..p {
+                    w_factor[[row, w_col]] = vecs[[row, idx]] * scale;
+                }
+                w_col += 1;
+            }
+        }
+
+        // For each smoothing parameter in this block:
+        // ∂/∂ρ_k log|S|₊ = tr(S₊⁻¹ A_k) = tr(S₊⁻¹ λ_k S_k)
+        for (k, s_k) in penalties.iter().enumerate() {
+            let a_k = s_k.mapv(|v| lambdas[k] * v);
+            // tr(S₊⁻¹ A_k) = tr(W Wᵀ A_k) = ‖A_k W‖²_F / ... no, use W Wᵀ form:
+            // tr(S₊⁻¹ A_k) = Σ_{i,j} S₊⁻¹[i,j] * A_k[j,i]
+            // = Σ_{i,j} (W Wᵀ)[i,j] * A_k[j,i]
+            // = tr(Wᵀ A_k W) since A_k is symmetric.
+            let aw = a_k.dot(&w_factor);
+            let trace: f64 = aw.iter().zip(w_factor.iter()).map(|(&a, &w)| a * w).sum();
+            first[at + k] = trace;
+        }
+        at += block_rho.len();
+    }
+
+    Ok(PenaltyLogdetDerivs {
+        value: log_det_total,
+        first,
+        second: None,
+    })
+}
+
+/// Embed a per-block penalty root into the joint parameter space.
+///
+/// Given a root R of shape (rank, p_block), returns a root of shape (rank, total)
+/// with R placed at columns [start..end] and zeros elsewhere.
+pub fn embed_penalty_root(
+    root: &Array2<f64>,
+    start: usize,
+    _end: usize,
+    total: usize,
+) -> Array2<f64> {
+    let rank = root.nrows();
+    let p_block = root.ncols();
+    let mut embedded = Array2::zeros((rank, total));
+    embedded
+        .slice_mut(ndarray::s![.., start..start + p_block])
+        .assign(root);
+    embedded
 }
 
 #[cfg(test)]
@@ -1429,6 +1618,7 @@ mod tests {
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
+            precomputed_h_k_corrections: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -1559,6 +1749,7 @@ mod tests {
             n_observations: n,
             nullspace_dim: (p - penalty_rank) as f64,
             dispersion: DispersionHandling::ProfiledGaussian,
+            precomputed_h_k_corrections: None,
         }
     }
 

@@ -2614,24 +2614,11 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     //       - 0.5*tr(P_trace,+^{-1} A_k),
     // with A_k=dS_lambda/drho_k and u_k=d beta^/drho_k.
     //
-    // Unified REML/LAML cost: uses the same formula as all other paths.
-    // The objective is computed from the inner result's pre-computed logdet
-    // values. For families with include_logdet_h = false, the objective
-    // reduces to MaxPenalizedLikelihood (no logdet terms).
-    let objective = {
-        let base_cost = -inner.log_likelihood + inner.penalty_value;
-        match (include_logdet_h, include_logdet_s) {
-            (true, true) => base_cost + 0.5 * inner.block_logdet_h - 0.5 * inner.block_logdet_s,
-            (true, false) => base_cost + 0.5 * inner.block_logdet_h,
-            (false, true) => base_cost - 0.5 * inner.block_logdet_s,
-            (false, false) => base_cost,
-        }
-    };
-    let mut grad = Array1::<f64>::zeros(rho.len());
-    let mut outer_hessian: Option<Array2<f64>> = None;
-
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let eval = family.evaluate(&inner.block_states)?;
+    let objective = finite_penalizedobjective(eval.log_likelihood, inner.penalty_value, 0.0);
+    let mut grad = Array1::<f64>::zeros(rho.len());
+    let mut outer_hessian: Option<Array2<f64>> = None;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     // Joint exact-Hessian path for the current realized family/spec state.
@@ -5348,7 +5335,13 @@ pub fn fit_custom_family<F: CustomFamily>(
                 outer.warm_cache.as_ref()
             };
             match outerobjectivegradienthessian(
-                family, specs, options, &penalty_counts, rho, warm_ref, false,
+                family,
+                specs,
+                options,
+                &penalty_counts,
+                rho,
+                warm_ref,
+                false,
             ) {
                 Ok((cost, _, _, warm)) => {
                     outer.warm_cache = Some(warm);
@@ -5365,7 +5358,13 @@ pub fn fit_custom_family<F: CustomFamily>(
                 cached.as_ref()
             };
             let (cost, grad, hess_opt) = match outerobjectivegradienthessian(
-                family, specs, options, &penalty_counts, rho, warm_ref, true,
+                family,
+                specs,
+                options,
+                &penalty_counts,
+                rho,
+                warm_ref,
+                true,
             ) {
                 Ok((cost, grad, hess_opt, warm))
                     if cost.is_finite()
@@ -5458,11 +5457,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         },
     };
 
-    let outer_result = crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "custom family",
-    );
+    let outer_result = crate::solver::strategy::run_outer(&mut obj, &outer_config, "custom family");
 
     let last_error_detail = obj
         .state
@@ -5534,14 +5529,13 @@ pub fn fit_custom_family<F: CustomFamily>(
 
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
     let final_seed = obj.state.warm_cache.clone();
-    let mut inner =
-        inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
-            .map_err(|e| {
-                format!(
-                    "outer smoothing optimization failed during final inner refit: \
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
+        .map_err(|e| {
+            format!(
+                "outer smoothing optimization failed during final inner refit: \
                      {e}.{last_error_detail}"
-                )
-            })?;
+            )
+        })?;
     refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
         format!(
             "outer smoothing optimization failed during final eta refresh: \
