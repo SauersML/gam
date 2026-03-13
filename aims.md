@@ -708,18 +708,3 @@ The LAML value at its optimum, $V(\hat\theta)$, approximates $-\log p(y|\mathcal
 
 (c) The LAML includes a $-\frac{1}{2}\log|S|_+$ term that depends on the penalty normalization convention. If two models have different penalty scales, the LAML values are not directly comparable. What is the correct normalization to make LAML values comparable across models?
 
-### N5: GPU-friendly reformulation of the LAML gradient
-
-The LAML gradient requires:
-1. $K$ linear solves $v_k = H^{-1}(A_k\hat\beta)$ — $O(Kp^2)$ or $O(Kp)$ with CG
-2. $K$ correction evaluations $D_\beta H_L[-v_k]$ — each is $O(np^2)$ (forming a $p \times p$ matrix)
-3. $K$ traces $\text{tr}(H^{-1}\dot{H}_k)$ — $O(p^2)$ each if $H^{-1}$ is precomputed
-
-For GPU execution, the bottleneck is the sequential loop over $k = 1,\ldots,K$.
-
-**Request**:
-(a) Can the $K$ corrections be **batched**? Since $D_\beta H_L[-v_k] = X^\top\text{diag}(c \odot X v_k)\,X$, and the $v_k$ are known, the $K$ weight vectors $c \odot X v_k$ can be assembled as a $n \times K$ matrix. Then all $K$ corrections can be computed as a single batched matrix triple product. Write out this batched formulation.
-
-(b) Can the $K$ traces be computed as a single matrix product? Note that $\text{tr}(H^{-1}\dot{H}_k) = \text{tr}(H^{-1}A_k) + \text{tr}(H^{-1}D_\beta H_L[-v_k])$. The first term is $\lambda_k\text{tr}(H^{-1}S_k)$. If we stack the corrections into one operation, can the entire gradient be a single $O(Kp^2 + np^2)$ computation?
-
-(c) For the Hessian, the double-trace $\text{tr}(H^{-1}\dot{H}_j H^{-1}\dot{H}_i)$ requires materializing or implicitly applying $K^2$ pairs. Is there a low-rank or batched formulation that avoids the $K^2$ scaling?
