@@ -1784,11 +1784,9 @@ impl<'a> JointRemlState<'a> {
             }
 
             // Eigendecompose for pseudo-inverse W W^T where W = V diag(1/sqrt(eig)).
-            let (eigs, vecs) = s_lambda
-                .eigh(Side::Lower)
-                .map_err(|e| EstimationError::InvalidInput(
-                    format!("det2 eigendecomposition failed: {e}"),
-                ))?;
+            let (eigs, vecs) = s_lambda.eigh(Side::Lower).map_err(|e| {
+                EstimationError::InvalidInput(format!("det2 eigendecomposition failed: {e}"))
+            })?;
             let max_ev = eigs.iter().copied().fold(0.0_f64, f64::max);
             let tol = (p_r.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
             let n_active = eigs.iter().filter(|&&v| v > tol).count();

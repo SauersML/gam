@@ -313,11 +313,8 @@ impl<'a> RemlState<'a> {
             });
         }
         // Route through the unified evaluator.
-        let result = self.evaluate_unified(
-            rho,
-            &bundle,
-            super::unified::EvalMode::ValueGradientHessian,
-        )?;
+        let result =
+            self.evaluate_unified(rho, &bundle, super::unified::EvalMode::ValueGradientHessian)?;
         if let Some(h) = result.hessian {
             return Ok(h);
         }

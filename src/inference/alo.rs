@@ -215,9 +215,8 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
             0.0
         } else {
             let target = idx.min(percentiles_data.len() - 1);
-            let (_, nth, _) = percentiles_data.select_nth_unstable_by(target, |a, b| {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            });
+            let (_, nth, _) = percentiles_data
+                .select_nth_unstable_by(target, |a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             *nth
         }
     };
@@ -322,10 +321,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let phi = input.phi;
     let ridge = input.ridge;
 
-    let e_rank = input
-        .penalty_null_space
-        .map(|e| e.nrows())
-        .unwrap_or(0);
+    let e_rank = input.penalty_null_space.map(|e| e.nrows()).unwrap_or(0);
 
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_bayes = Array1::<f64>::zeros(n);
@@ -479,25 +475,6 @@ pub fn compute_alo_diagnostics_from_pirls(
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
     compute_alo_diagnostics_from_pirls_impl(base, y, link)
-}
-
-/// Compute ALO diagnostics from a `FitGeometry` and dense design matrix.
-///
-/// This is the entry point for models that expose `FitGeometry` (GAMLSS,
-/// survival, joint models) without requiring a full PIRLS result. Sandwich
-/// SE is not available through this path (it requires the penalty null-space
-/// projector E); Bayesian SE is returned for both `se_bayes` and
-/// `se_sandwich`.
-pub fn compute_alo_diagnostics_from_geometry(
-    geom: &FitGeometry,
-    design: &Array2<f64>,
-    eta: &Array1<f64>,
-    offset: &Array1<f64>,
-    link: LinkFunction,
-    phi: f64,
-) -> Result<AloDiagnostics, EstimationError> {
-    let input = AloInput::from_geometry(geom, design, eta, offset, link, phi);
-    compute_alo_from_input(&input)
 }
 
 #[cfg(test)]

@@ -419,7 +419,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-
     pub(crate) fn lastridge_used(&self) -> Option<f64> {
         self.cache_manager
             .current_eval_bundle

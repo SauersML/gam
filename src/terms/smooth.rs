@@ -6643,9 +6643,9 @@ fn coordinate_search_spatial(
                     if interiorvalue > leftvalue.min(rightvalue) + 1e-12
                         && interiorvalue < leftvalue.max(rightvalue) - 1e-12
                     {
-                        let interior_theta =
-                            coordinate_probe(&current_theta, coord, interiorvalue);
-                        let interiorcost = callback(SpatialSearchAction::EvalCost(&interior_theta))?;
+                        let interior_theta = coordinate_probe(&current_theta, coord, interiorvalue);
+                        let interiorcost =
+                            callback(SpatialSearchAction::EvalCost(&interior_theta))?;
                         if spatial_score_improves(interiorcost, current_cost, options.rel_tol) {
                             current_theta = interior_theta;
                             current_cost = interiorcost;

@@ -295,7 +295,9 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         u_kl: &Array1<f64>,
     ) -> Option<Array2<f64>> {
         // Base GLM second correction: Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ)(X vₗ)) X
-        let base_corr = self.base.hessian_second_derivative_correction(v_k, v_l, u_kl);
+        let base_corr = self
+            .base
+            .hessian_second_derivative_correction(v_k, v_l, u_kl);
 
         // Firth D(Hφ)[B_{kl}]: B_{kl} direction is u_kl in β-space.
         let deta_kl: Array1<f64> = self.firth_op.x_dense.dot(u_kl);
@@ -309,7 +311,9 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         let dir_l = self.firth_op.direction_from_deta(deta_l);
         let p = v_k.len();
         let eye = Array2::<f64>::eye(p);
-        let firth_second = self.firth_op.hphisecond_direction_apply(&dir_k, &dir_l, &eye);
+        let firth_second = self
+            .firth_op
+            .hphisecond_direction_apply(&dir_k, &dir_l, &eye);
 
         let mut result = match base_corr {
             Some(bc) => bc,
@@ -935,11 +939,7 @@ fn compute_outer_hessian(
 
                     if let Some(correction) = solution
                         .deriv_provider
-                        .hessian_second_derivative_correction(
-                            &v_ks[kk],
-                            &v_ks[kk],
-                            &u_kk,
-                        )
+                        .hessian_second_derivative_correction(&v_ks[kk], &v_ks[kk], &u_kk)
                     {
                         base + hop.trace_hinv_product(&correction)
                     } else {

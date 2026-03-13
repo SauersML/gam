@@ -4663,6 +4663,63 @@ mod tests {
     }
 
     #[test]
+    fn joint_exact_newton_log_sigma_block_should_be_flat_on_safe_exp_plateau() {
+        let family = survival_exact_newton_test_family();
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.1 * crate::families::sigma_link::safe_exp(700.0)];
+        let beta_log_sigma0 = 701.0_f64;
+        let beta_log_sigma = array![beta_log_sigma0];
+
+        let states =
+            survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+        let eval = family.evaluate(&states).expect("evaluate");
+        let (analytic_score, analytic_info) =
+            match &eval.blockworking_sets[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                    (gradient[0], hessian.to_dense()[[0, 0]])
+                }
+                _ => panic!("expected exact newton log-sigma block"),
+            };
+
+        let objective = |beta_ls: &Array1<f64>| -> f64 {
+            family
+                .evaluate(&survival_exact_newton_rebuild_states(
+                    &beta_time,
+                    &beta_threshold,
+                    beta_ls,
+                ))
+                .expect("eval objective")
+                .log_likelihood
+        };
+        let h = 1e-4;
+        let ll_plus = objective(&array![beta_log_sigma0 + h]);
+        let ll0 = objective(&array![beta_log_sigma0]);
+        let ll_minus = objective(&array![beta_log_sigma0 - h]);
+        let score_fd = (ll_plus - ll_minus) / (2.0 * h);
+        let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
+        assert_eq!(
+            score_fd, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood is locally flat in the log-sigma coefficient on that plateau"
+        );
+        assert_eq!(
+            info_fd, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood has zero second derivative in the log-sigma coefficient on that plateau"
+        );
+        assert!(
+            (analytic_score - score_fd).abs() < 1e-30,
+            "the exact-newton survival log-sigma score should be the derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
+            analytic_score,
+            score_fd
+        );
+        assert!(
+            (analytic_info - info_fd).abs() < 1e-20,
+            "the exact-newton survival log-sigma information should be the negative second derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
+            analytic_info,
+            info_fd
+        );
+    }
+
+    #[test]
     fn joint_exact_newton_score_matches_loglikelihoodfd_near_fitted_non_probit_points() {
         let eps = 1e-6;
         let cases = vec![
@@ -5837,7 +5894,8 @@ mod tests {
         let eta = 10.0_f64;
         let stable_survival = 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2);
         assert!(stable_survival > 0.0);
-        let helper = inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::Probit), eta);
+        let helper =
+            inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::Probit), eta);
         assert!(
             (helper - stable_survival).abs() < 1e-30,
             "probit survival helper should use the upper-tail erfc form at eta={eta}; got {} vs {}",
@@ -5850,7 +5908,8 @@ mod tests {
     fn cloglog_survival_helper_changes_the_negative_tail_function() {
         let eta = -100.0_f64;
         let stable_survival = (-(eta.exp())).exp();
-        let helper = inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::CLogLog), eta);
+        let helper =
+            inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::CLogLog), eta);
         assert_eq!(stable_survival, 1.0);
         assert!(
             (helper - stable_survival).abs() < 1e-30,

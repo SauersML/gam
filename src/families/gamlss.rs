@@ -10760,6 +10760,48 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_sigma_helper_uses_a_different_function_than_the_coded_sigma_link() {
+        let eta0 = 701.0_f64;
+        let eta = array![eta0];
+        let (sigma, d1, d2, d3, d4) = gaussian_sigma_derivs_up_to_fourth(eta.view());
+        let coded_sigma = |x: f64| safe_exp(x).max(1e-12);
+        let h = 1e-6;
+        let fd1 = (coded_sigma(eta0 + h) - coded_sigma(eta0 - h)) / (2.0 * h);
+        let fd2 = (coded_sigma(eta0 + h) - 2.0 * coded_sigma(eta0) + coded_sigma(eta0 - h))
+            / (h * h);
+        assert_eq!(fd1, 0.0);
+        assert_eq!(fd2, 0.0);
+        assert!(
+            (sigma[0] - coded_sigma(eta0)).abs() < 1e-30,
+            "Gaussian sigma helper should evaluate the same coded sigma link as GaussianLocationScaleFamily at eta={eta0}; got {} vs {}",
+            sigma[0],
+            coded_sigma(eta0)
+        );
+        assert!(
+            (d1[0] - fd1).abs() < 1e-30,
+            "Gaussian sigma helper first derivative should match the coded sigma link at eta={eta0}; got {} vs {}",
+            d1[0],
+            fd1
+        );
+        assert!(
+            (d2[0] - fd2).abs() < 1e-30,
+            "Gaussian sigma helper second derivative should match the coded sigma link at eta={eta0}; got {} vs {}",
+            d2[0],
+            fd2
+        );
+        assert!(
+            (d3[0] - 0.0).abs() < 1e-30,
+            "Gaussian sigma helper third derivative should be 0 on the coded safe_exp plateau at eta={eta0}; got {}",
+            d3[0]
+        );
+        assert!(
+            (d4[0] - 0.0).abs() < 1e-30,
+            "Gaussian sigma helper fourth derivative should be 0 on the coded safe_exp plateau at eta={eta0}; got {}",
+            d4[0]
+        );
+    }
+
+    #[test]
     fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_faster_locally() {
         let n = 4096usize;
         let rounds = 250usize;
@@ -12108,7 +12150,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(design.clone()),
             log_sigma_design: Some(design),
         };
@@ -12168,6 +12210,101 @@ mod tests {
         assert!(
             (analytic_info - info_fd).abs() < 1e-20,
             "the exact-newton log-sigma information should be the negative second derivative of the coded plateau log-likelihood at eta_ls={eta_ls0}; got {} vs {}",
+            analytic_info,
+            info_fd
+        );
+    }
+
+    #[test]
+    fn binomial_location_scalewiggle_exact_log_sigma_block_should_be_flat_on_safe_exp_plateau() {
+        let n = 4usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_block = intercept_block(n);
+        let log_sigma_block = intercept_block(n);
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let threshold_design = threshold_block.design.clone();
+        let log_sigma_design = log_sigma_block.design.clone();
+        let family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+        };
+
+        let beta_t0 = 0.1 * safe_exp(700.0);
+        let beta_ls0 = 701.0_f64;
+        let betaw = Array1::zeros(wiggle_block.design.ncols());
+        let rebuild_states = |beta_ls: f64| -> Vec<ParameterBlockState> {
+            let beta_t = array![beta_t0];
+            let beta_ls_arr = array![beta_ls];
+            vec![
+                ParameterBlockState {
+                    beta: beta_t.clone(),
+                    eta: threshold_design.matrixvectormultiply(&beta_t),
+                },
+                ParameterBlockState {
+                    beta: beta_ls_arr.clone(),
+                    eta: log_sigma_design.matrixvectormultiply(&beta_ls_arr),
+                },
+                ParameterBlockState {
+                    beta: betaw.clone(),
+                    eta: Array1::zeros(n),
+                },
+            ]
+        };
+
+        let eval = family
+            .evaluate(&rebuild_states(beta_ls0))
+            .expect("evaluate");
+        let (analytic_score, analytic_info) =
+            match &eval.blockworking_sets[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                    (gradient[0], hessian.to_dense()[[0, 0]])
+                }
+                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton log-sigma block"),
+            };
+
+        let objective = |beta_ls: f64| -> f64 {
+            family
+                .evaluate(&rebuild_states(beta_ls))
+                .expect("eval objective")
+                .log_likelihood
+        };
+        let h = 1e-4;
+        let ll_plus = objective(beta_ls0 + h);
+        let ll0 = objective(beta_ls0);
+        let ll_minus = objective(beta_ls0 - h);
+        let score_fd = (ll_plus - ll_minus) / (2.0 * h);
+        let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
+        assert_eq!(
+            score_fd, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded wiggle-family log-likelihood is locally flat in beta_log_sigma on that plateau"
+        );
+        assert_eq!(
+            info_fd, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded wiggle-family log-likelihood has zero second derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic_score - score_fd).abs() < 1e-30,
+            "the exact-newton wiggle-family log-sigma score should be the derivative of the coded plateau log-likelihood at beta_log_sigma={beta_ls0}; got {} vs {}",
+            analytic_score,
+            score_fd
+        );
+        assert!(
+            (analytic_info - info_fd).abs() < 1e-20,
+            "the exact-newton wiggle-family log-sigma information should be the negative second derivative of the coded plateau log-likelihood at beta_log_sigma={beta_ls0}; got {} vs {}",
             analytic_info,
             info_fd
         );

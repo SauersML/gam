@@ -4,6 +4,16 @@ This file records only defects that are provably wrong from the code itself.
 No proposed fixes are included here. Each item has a direct counterexample and
 at least one intentionally failing test that makes the defect visible.
 
+The strongest findings are derivation-level mismatches:
+
+- the code differentiates through active floors or plateaus even though the
+  coded scalar function is locally constant there
+- or the code injects `exp(eta)` derivatives into exact-Newton paths even
+  though the actual sigma link is `safe_exp(eta) = exp(clamp(eta, -700, 700))`
+
+Those are mathematical errors in the implemented derivatives themselves, not
+just floating-point tail accuracy problems.
+
 ## 1. `safe_exp` derivatives are not derivatives of `safe_exp`
 
 Code:
@@ -184,3 +194,165 @@ Counterexample:
 Failing test:
 
 - `matern_closed_form_should_decay_to_zero_not_nan_at_huge_distance`
+
+## 5. `BinomialLocationScaleFamily` builds a nonzero log-sigma working weight on a branch where the coded mean is exactly constant
+
+Code:
+
+- `src/families/gamlss.rs:3236`
+- `src/families/gamlss.rs:3253`
+
+Diagonal working-set logic:
+
+- `q0(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12)`
+- `chain_ls = -q0 * dsigma/deta_ls / max(sigma, 1e-12)`
+- `dmu_ls = dmu/dq * chain_ls`
+- `w_ls = weight * dmu_ls^2 / var`
+
+But once `sigma(eta_ls) < 1e-12`, the actual coded predictor `q0` is frozen:
+
+- `q0(eta_ls) = -eta_t / 1e-12`
+
+So the coded mean `mu(eta_ls)` is locally constant in `eta_ls`, and therefore:
+
+- `dmu/deta_ls = 0`
+- the log-sigma working weight must be `0`
+
+Counterexample:
+
+- Take `eta_t = 1e-13` and `eta_ls = -30`.
+- Then `sigma = exp(-30) < 1e-12`, so `q0 = -0.1` is exactly constant under
+  small perturbations of `eta_ls`.
+- A central finite difference of the coded mean gives `dmu/deta_ls = 0`.
+- The implementation still produces a positive log-sigma working weight:
+  `0.000055543424612589786`.
+
+Failing test:
+
+- `binomial_location_scale_log_sigma_working_weight_should_vanish_on_sigma_floor_branch`
+
+## 6. `BinomialLocationScaleFamily` exact-Newton log-sigma curvature differentiates `exp(eta_ls)` instead of the coded `safe_exp(eta_ls)`
+
+Code:
+
+- `src/families/gamlss.rs:6792`
+- `src/families/gamlss.rs:6793`
+
+The exact-Newton non-wiggle path injects:
+
+`d2sigma_deta2 = exp(eta_ls)`
+
+But the actual sigma link used throughout the family is:
+
+`sigma(eta_ls) = safe_exp(eta_ls) = exp(clamp(eta_ls, -700, 700))`
+
+So for every `eta_ls > 700`, the coded sigma is constant and the coded
+log-likelihood is locally flat in `eta_ls`. On that plateau:
+
+- `d/deta_ls log L = 0`
+- `d²/deta_ls² log L = 0`
+
+Counterexample:
+
+- Let `eta_ls = 701` and `eta_t = 0.1 * exp(700)`, so the coded quotient `q0`
+  stays moderate while `safe_exp` is already on its upper plateau.
+- The coded scalar log-likelihood at `701 - 1e-4`, `701`, and `701 + 1e-4` is
+  exactly the same, so finite-difference score and curvature are both `0`.
+- The exact-Newton log-sigma information returned by the code is `NaN`.
+
+Failing test:
+
+- `binomial_location_scale_exact_log_sigma_block_should_be_flat_on_safe_exp_plateau`
+
+## 7. The same exact-Newton plateau derivation error is duplicated in `BinomialLocationScaleWiggleFamily`
+
+Code:
+
+- `src/families/gamlss.rs:9335`
+- `src/families/gamlss.rs:9355`
+
+The wiggle exact-Newton path independently injects:
+
+`d2sigma_deta2 = exp(eta_ls)`
+
+even though its sigma link is the same clamped `safe_exp`.
+
+Counterexample:
+
+- Use the wiggle family with `betaw = 0`, `beta_log_sigma = 701`, and
+  `beta_t = 0.1 * exp(700)`.
+- Because `safe_exp(701 ± 1e-4) = exp(700)`, both `q0` and the coded
+  log-likelihood are locally constant in `beta_log_sigma`.
+- Finite-difference score and curvature are both `0`.
+- The exact-Newton log-sigma information returned by the code is `NaN`.
+
+Failing test:
+
+- `binomial_location_scalewiggle_exact_log_sigma_block_should_be_flat_on_safe_exp_plateau`
+
+## 8. `SurvivalLocationScaleFamily` exact-Newton log-sigma curvature differentiates through the `safe_exp` plateau
+
+Code:
+
+- `src/families/survival_location_scale.rs:551`
+- `src/families/survival_location_scale.rs:553`
+
+The exact joint-Hessian path takes `(sigma, ds, d2s, d3s)` from
+`exp_sigma_derivs_up_to_third(eta_ls_exit)`. But those helpers treat the clamped
+`safe_exp` link as if all derivatives still equaled `sigma`, even when
+`eta_ls_exit > 700` and the coded sigma is constant.
+
+Therefore on the plateau the coded survival log-likelihood is locally flat in
+the log-sigma coefficient, so its exact-Newton log-sigma score and information
+must both be zero.
+
+Counterexample:
+
+- Let `beta_log_sigma = 701` and choose `beta_threshold = 0.1 * exp(700)` so
+  the coded transformed predictor remains moderate while `safe_exp` is already
+  constant.
+- The coded scalar survival log-likelihood at `701 - 1e-4`, `701`, and
+  `701 + 1e-4` is identical, so finite-difference score and curvature are `0`.
+- The exact-Newton log-sigma information returned by the code is `NaN`.
+
+Failing test:
+
+- `joint_exact_newton_log_sigma_block_should_be_flat_on_safe_exp_plateau`
+
+## 9. `GaussianLocationScaleFamily` has a separate sigma helper that does not even evaluate the same sigma function as the family itself
+
+Code:
+
+- `src/families/gamlss.rs:3761`
+- `src/families/gamlss.rs:3770`
+
+The helper
+
+`gaussian_sigma_derivs_up_to_fourth(eta)`
+
+returns
+
+- `sigma = exp(eta)`
+- `d1 = exp(eta)`
+- `d2 = exp(eta)`
+- `d3 = exp(eta)`
+- `d4 = exp(eta)`
+
+But the Gaussian family evaluation code uses the coded sigma link
+
+`sigma(eta) = max(safe_exp(eta), 1e-12) = max(exp(clamp(eta, -700, 700)), 1e-12)`.
+
+So the helper is not merely giving the wrong derivatives on the plateau; it is
+evaluating a different scalar function altogether.
+
+Counterexample:
+
+- At `eta = 701`, the coded family sigma is `exp(700)`.
+- `gaussian_sigma_derivs_up_to_fourth` instead returns `exp(701)`.
+- Because the coded sigma link is already constant on that plateau, all
+  finite-difference derivatives of the coded sigma are `0`.
+- The helper still returns nonzero first through fourth derivatives.
+
+Failing test:
+
+- `gaussian_sigma_helper_uses_a_different_function_than_the_coded_sigma_link`

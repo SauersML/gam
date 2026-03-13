@@ -11829,8 +11829,8 @@ mod tests {
         let triplet = matern_operator_psi_triplet(r, 1.0, MaternNu::NineHalves, 3)
             .expect("operator psi triplet");
         for (idx, value) in [
-            triplet.0, triplet.1, triplet.2, triplet.3, triplet.4, triplet.5, triplet.6,
-            triplet.7, triplet.8,
+            triplet.0, triplet.1, triplet.2, triplet.3, triplet.4, triplet.5, triplet.6, triplet.7,
+            triplet.8,
         ]
         .into_iter()
         .enumerate()
