@@ -869,37 +869,8 @@ impl Sink for ViolationCollector {
     type Error = std::io::Error;
 
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
-        // Get the line number and the content of the matched line.
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        // Skip matches in comments and string literals to avoid false positives
-        // But make sure we don't miss underscore variables in code
-
-        // Check if this line is purely a comment
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        // Check if the match is in a string literal and not part of code
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            // More careful string detection logic
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            // If the underscore variable is between quotes, it's in a string
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    // Inside quotes
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true); // Skip this match and continue searching
-        }
 
         let mut hasviolation = false;
         let mut token = String::new();
@@ -955,26 +926,6 @@ impl Sink for DisallowedLetCollector {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
 
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true);
-        }
-
         let trimmed = line_text.trim();
         if matches!(trimmed, "break;" | "continue;" | "return;") {
             return Ok(true);
@@ -1009,26 +960,6 @@ impl Sink for TupleWildcardCollector {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
 
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true);
-        }
-
         if tuple_pattern_is_fully_ignored(line_text) {
             self.violations.push(format!("{line_number}:{line_text}"));
         }
@@ -1043,27 +974,6 @@ impl Sink for NoopTouchCollector {
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            let part_count = parts.len();
-            for i in 0..part_count {
-                if i % 2 == 1 {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true);
-        }
 
         let trimmed = line_text.trim();
         if matches!(trimmed, "break;" | "continue;" | "return;") {
@@ -1081,6 +991,16 @@ impl Sink for NoopTouchCollector {
             .is_some_and(|c| !c.is_ascii_alphabetic() && c != '_')
         {
             return Ok(true);
+        }
+        // Skip stripped string literals: after string stripping, string
+        // contents become sequences of 'x' characters.  A line like
+        //   "some long string";
+        // becomes  xxxxxxxxxxxxxxxx;  which the regex falsely matches.
+        {
+            let sans_semi = trimmed.trim_end_matches(';').trim();
+            if !sans_semi.is_empty() && sans_semi.chars().all(|c| c == 'x') {
+                return Ok(true);
+            }
         }
 
         self.violations.push(format!("{line_number}:{line_text}"));
@@ -1406,27 +1326,11 @@ impl Sink for DropUsageCollector {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
 
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("drop(") {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
         let is_drop_definition = line_text.contains("fn drop")
             || line_text.contains("impl Drop")
             || line_text.contains("trait Drop");
 
-        if is_pure_comment || is_in_string || is_drop_definition {
+        if is_drop_definition {
             return Ok(true);
         }
 
@@ -1442,26 +1346,6 @@ impl Sink for DebugAssertCollector {
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        let is_pure_comment = line_text.trim_start().starts_with("//")
-            || (line_text.contains("/*")
-                && !line_text.contains("*/match")
-                && !line_text.contains("*/let"));
-
-        let mut is_in_string = false;
-        if line_text.contains("\"") {
-            let parts: Vec<&str> = line_text.split('\"').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("debug_assert!") {
-                    is_in_string = true;
-                    break;
-                }
-            }
-        }
-
-        if is_pure_comment || is_in_string {
-            return Ok(true);
-        }
 
         self.violations.push(format!("{line_number}:{line_text}"));
 
@@ -2178,31 +2062,18 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
             {
                 let path = entry.path();
 
-                // Check if we can read the file
-                match std::fs::read_to_string(path) {
-                    Ok(_) => {}         // File exists and can be read
-                    Err(_) => continue, // Skip files we can't read
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
                 };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
-                // Add debug info for estimate.rs to help diagnose the underscore variable detection
-                let is_estimate_rs = path
-                    .to_str()
-                    .is_some_and(|p| p.ends_with("calibrate/estimate.rs"));
-                if is_estimate_rs && warnings_enabled() {
-                    println!(
-                        "cargo:warning=Analyzing estimate.rs for underscore-prefixed variables"
-                    );
-                }
-
-                // Create a new collector for each file.
                 let mut collector = ViolationCollector::new(path);
 
-                // Search the file using our regex matcher and collector sink.
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
-                    // Handle search errors gracefully
                     continue;
                 }
 
@@ -2242,14 +2113,16 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = DisallowedLetCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2287,14 +2160,16 @@ fn scan_for_noop_touch_patterns() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = NoopTouchCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2332,14 +2207,16 @@ fn scan_for_tuplewildcard_patterns() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = TupleWildcardCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2366,13 +2243,10 @@ fn is_doc_comment(line: &str) -> bool {
 }
 
 fn scan_for_forbidden_comment_patterns() -> Vec<String> {
-    // Regex patterns to find forbidden comment patterns
-    // Note: We specifically target comments by looking for // or /* */ patterns
-    // This ensures we don't flag these terms in actual code
+    // Strip string literals first (via strip_strings_only) so that patterns
+    // like `"// DEPRECATED"` inside strings never produce false positives.
     let mut allviolations = Vec::new();
 
-    // Split into separate patterns for clarity and reliability
-    // 1. Pattern to catch forbidden words in comments
     let forbiddenwords_pattern = r"(//|/\*|///).*(?:DEPRECATED|CRITICAL|FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
@@ -2381,137 +2255,75 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     // 4. Pattern to catch comments that might be composed primarily of dashes
     let dash_heavy_pattern = r"(//|/\*|///).*";
 
-    // Check for forbidden words
-    match RegexMatcher::new_line_matcher(forbiddenwords_pattern) {
-        Ok(forbidden_matcher) => {
-            let mut searcher = Searcher::new();
+    let forbidden_matcher = RegexMatcher::new_line_matcher(forbiddenwords_pattern);
+    let stars_matcher = RegexMatcher::new_line_matcher(stars_pattern);
+    let all_caps_matcher = RegexMatcher::new_line_matcher(all_caps_pattern);
+    let dash_matcher = RegexMatcher::new_line_matcher(dash_heavy_pattern);
 
-            for entry in WalkDir::new(".")
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+    // Single file walk — strip once per file, run all 4 sub-scans.
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+        .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+        .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+        .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Strip only strings — comments are preserved for pattern matching.
+        let stripped = strip_strings_only(&content);
+
+        let mut searcher = Searcher::new();
+
+        if let Ok(ref m) = forbidden_matcher {
+            let mut collector = ForbiddenCommentCollector::new(path, true);
+            if searcher
+                .search_reader(m, Cursor::new(&stripped), &mut collector)
+                .is_ok()
             {
-                let path = entry.path();
-
-                // Use a collector that doesn't filter out doc comments for forbidden words
-                let mut collector = ForbiddenCommentCollector::new(path, true);
-                if searcher
-                    .search_path(&forbidden_matcher, path, &mut collector)
-                    .is_err()
-                {
-                    continue;
-                }
-
-                if let Some(error_message) = collector.check_and_get_error_message() {
-                    allviolations.push(error_message);
+                if let Some(msg) = collector.check_and_get_error_message() {
+                    allviolations.push(msg);
                 }
             }
         }
-        Err(e) => {
-            // Record the error but continue checking other patterns
-            allviolations.push(format!("Error creating forbidden words regex: {}", e));
-        }
-    }
 
-    // Check for stars in non-doc comments
-    match RegexMatcher::new_line_matcher(stars_pattern) {
-        Ok(stars_matcher) => {
-            let mut searcher = Searcher::new();
-
-            for entry in WalkDir::new(".")
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+        if let Ok(ref m) = stars_matcher {
+            let mut collector = ForbiddenCommentCollector::new(path, false);
+            if searcher
+                .search_reader(m, Cursor::new(&stripped), &mut collector)
+                .is_ok()
             {
-                let path = entry.path();
-
-                // Use a single collector with custom filtering logic
-                // false means don't check for ** in doc comments
-                let mut collector = ForbiddenCommentCollector::new(path, false);
-                if searcher
-                    .search_path(&stars_matcher, path, &mut collector)
-                    .is_err()
-                {
-                    continue;
-                }
-
-                if let Some(error_message) = collector.check_and_get_error_message() {
-                    allviolations.push(error_message);
+                if let Some(msg) = collector.check_and_get_error_message() {
+                    allviolations.push(msg);
                 }
             }
         }
-        Err(e) => {
-            // Record the error but continue checking other patterns
-            allviolations.push(format!("Error creating stars pattern regex: {}", e));
-        }
-    }
 
-    // Check for comments where the uppercase ratio exceeds the threshold
-    match RegexMatcher::new_line_matcher(all_caps_pattern) {
-        Ok(all_caps_matcher) => {
-            let mut searcher = Searcher::new();
-
-            for entry in WalkDir::new(".")
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+        if let Ok(ref m) = all_caps_matcher {
+            let mut collector = CustomUppercaseCollector::new(path);
+            if searcher
+                .search_reader(m, Cursor::new(&stripped), &mut collector)
+                .is_ok()
             {
-                let path = entry.path();
-
-                let mut custom_collector = CustomUppercaseCollector::new(path);
-                if searcher
-                    .search_path(&all_caps_matcher, path, &mut custom_collector)
-                    .is_err()
-                {
-                    continue;
-                }
-
-                if let Some(error_message) = custom_collector.check_and_get_error_message() {
-                    allviolations.push(error_message);
+                if let Some(msg) = collector.check_and_get_error_message() {
+                    allviolations.push(msg);
                 }
             }
         }
-        Err(e) => {
-            // Record the error but don't return early
-            allviolations.push(format!("Error creating uppercase pattern regex: {}", e));
-        }
-    }
 
-    // Check for comments composed primarily of dashes
-    match RegexMatcher::new_line_matcher(dash_heavy_pattern) {
-        Ok(dash_matcher) => {
-            let mut searcher = Searcher::new();
-
-            for entry in WalkDir::new(".")
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+        if let Ok(ref m) = dash_matcher {
+            let mut collector = DashHeavyCommentCollector::new(path);
+            if searcher
+                .search_reader(m, Cursor::new(&stripped), &mut collector)
+                .is_ok()
             {
-                let path = entry.path();
-
-                let mut dash_collector = DashHeavyCommentCollector::new(path);
-                if searcher
-                    .search_path(&dash_matcher, path, &mut dash_collector)
-                    .is_err()
-                {
-                    continue;
-                }
-
-                if let Some(error_message) = dash_collector.check_and_get_error_message() {
-                    allviolations.push(error_message);
+                if let Some(msg) = collector.check_and_get_error_message() {
+                    allviolations.push(msg);
                 }
             }
-        }
-        Err(e) => {
-            allviolations.push(format!("Error creating dash-heavy pattern regex: {}", e));
         }
     }
 
@@ -2542,18 +2354,16 @@ fn scan_for_allow_dead_code() -> Vec<String> {
             {
                 let path = entry.path();
 
-                // Check if we can read the file
-                match std::fs::read_to_string(path) {
-                    Ok(_) => {}         // File exists and can be read
-                    Err(_) => continue, // Skip files we can't read
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
                 };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
-                // Create a collector for each file
                 let mut collector = DeadCodeCollector::new(path);
 
-                // Search the file using our regex matcher and collector sink
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     // Handle search errors gracefully
@@ -2600,18 +2410,16 @@ fn scan_for_ignored_tests() -> Vec<String> {
             {
                 let path = entry.path();
 
-                // Check if we can read the file
-                match std::fs::read_to_string(path) {
-                    Ok(_) => {}         // File exists and can be read
-                    Err(_) => continue, // Skip files we can't read
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
                 };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
-                // Create a collector for each file
                 let mut collector = IgnoredTestCollector::new(path);
 
-                // Search the file using our regex matcher and collector sink
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     // Handle search errors gracefully
@@ -2654,15 +2462,16 @@ fn scan_for_todo_comments() -> Vec<String> {
             {
                 let path = entry.path();
 
-                match std::fs::read_to_string(path) {
-                    Ok(_) => {}
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
                     Err(_) => continue,
                 };
+                let stripped = strip_strings_only(&content);
 
                 let mut collector = TodoCommentCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2701,14 +2510,16 @@ fn scan_for_drop_in_build_scripts() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = DropUsageCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2746,14 +2557,16 @@ fn scan_for_drop_usage() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = DropUsageCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2815,14 +2628,16 @@ fn scan_for_debug_assert_usage() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = DebugAssertCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2859,14 +2674,16 @@ fn scan_for_meaningless_conditionals() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = MeaninglessConditionalCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2905,14 +2722,16 @@ fn scan_for_no_effect_allow() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = NoEffectCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2953,14 +2772,16 @@ fn scan_for_omitted_for_brevity() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_strings_only(&content);
 
                 let mut collector = OmittedForBrevityCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -2999,14 +2820,16 @@ fn scan_for_deprecated() -> Vec<String> {
             {
                 let path = entry.path();
 
-                if std::fs::read_to_string(path).is_err() {
-                    continue;
-                }
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
 
                 let mut collector = DeprecatedCollector::new(path);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -3052,11 +2875,12 @@ fn scan_for_placeholder_stubs() -> Vec<String> {
                     Err(_) => continue,
                 };
 
-                // Find all Ok(Self { matches
+                let stripped = strip_comments_and_strings_for_content(&content);
+
                 let mut collector = PlaceholderStubCollector::new(path, &content);
 
                 if searcher
-                    .search_path(&matcher, path, &mut collector)
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
                     .is_err()
                 {
                     continue;
@@ -3500,6 +3324,112 @@ fn strip_comments_and_strings_for_content(source: &str) -> Vec<u8> {
     }
 
     out
+}
+
+#[allow(dead_code)]
+fn strip_strings_only(source: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        StringLiteral,
+        CharLiteral,
+        RawString(usize),
+    }
+
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut state = State::Normal;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => {
+                if let Some((hashes, consumed)) = raw_string_start(bytes, i) {
+                    out.extend(std::iter::repeat_n(b'x', consumed));
+                    i += consumed;
+                    state = State::RawString(hashes);
+                    continue;
+                }
+                if b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push(b'x');
+                    out.push(b'x');
+                    i += 2;
+                    state = State::StringLiteral;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::StringLiteral;
+                    continue;
+                }
+                if b == b'\'' {
+                    let is_char_lit = if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        bytes[i + 2..std::cmp::min(i + 12, bytes.len())]
+                            .iter()
+                            .any(|&c| c == b'\'')
+                    } else {
+                        i + 2 < bytes.len() && bytes[i + 2] == b'\''
+                    };
+                    if is_char_lit {
+                        out.push(b'x');
+                        i += 1;
+                        state = State::CharLiteral;
+                        continue;
+                    }
+                }
+                out.push(b);
+                i += 1;
+            }
+            State::StringLiteral => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b'x');
+                    out.push(b'x');
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::Normal;
+                    continue;
+                }
+                out.push(if b == b'\n' { b'\n' } else { b'x' });
+                i += 1;
+            }
+            State::CharLiteral => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b'x');
+                    out.push(b'x');
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::Normal;
+                    continue;
+                }
+                out.push(if b == b'\n' { b'\n' } else { b'x' });
+                i += 1;
+            }
+            State::RawString(hashes) => {
+                if b == b'"' && raw_string_end(bytes, i, hashes) {
+                    out.push(b'x');
+                    i += 1;
+                    out.extend(std::iter::repeat_n(b'x', hashes));
+                    i += hashes;
+                    state = State::Normal;
+                    continue;
+                }
+                out.push(if b == b'\n' { b'\n' } else { b'x' });
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).expect("sanitized Rust source should remain UTF-8")
 }
 
 fn raw_string_start(bytes: &[u8], idx: usize) -> Option<(usize, usize)> {

@@ -232,63 +232,6 @@ impl<'a> RemlState<'a> {
             && (eval_idx == 1 || eval_idx % 200 == 0)
     }
 
-    pub(super) fn log_gamcost(
-        &self,
-        rho: &Array1<f64>,
-        lambdas: &[f64],
-        laml: f64,
-        stab_cond: f64,
-        raw_cond: f64,
-        edf: f64,
-        trace_h_inv_s_lambda: f64,
-    ) {
-        if !log::log_enabled!(log::Level::Info) {
-            return;
-        }
-        const GAM_REPEAT_EMIT: u64 = 50;
-        const GAM_MIN_EMIT_GAP: u64 = 200;
-        let rho_q = quantizevec(rho.as_slice().unwrap_or_default(), 5e-3, 1e-6);
-        let smooth_q = quantizevec(lambdas, 5e-3, 1e-6);
-        let stab_q = quantizevalue(stab_cond, 5e-3, 1e-6);
-        let raw_q = quantizevalue(raw_cond, 5e-3, 1e-6);
-        let key = CostKey::new(&rho_q, &smooth_q, stab_q, raw_q);
-
-        let mut last_opt = self.arena.cost_last.write().unwrap();
-        let mut repeat = self.arena.cost_repeat.write().unwrap();
-        let mut last_emit = self.arena.cost_last_emit.write().unwrap();
-        let eval_idx = *self.arena.cost_eval_count.read().unwrap();
-
-        if let Some(last) = last_opt.as_mut() {
-            if last.key.approx_eq(&key) {
-                last.update(laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
-                *repeat += 1;
-                if *repeat >= GAM_REPEAT_EMIT
-                    && eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP
-                {
-                    log::debug!("[GAM COST] {}", last.format_summary());
-                    *repeat = 0;
-                    *last_emit = eval_idx;
-                }
-                return;
-            }
-
-            let emit_prev =
-                last.count > 1 && eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP;
-            if emit_prev {
-                log::debug!("[GAM COST] {}", last.format_summary());
-                *last_emit = eval_idx;
-            }
-        }
-
-        let new_agg = CostAgg::new(key, laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
-        if eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP {
-            log::debug!("[GAM COST] {}", new_agg.format_summary());
-            *last_emit = eval_idx;
-        }
-        *last_opt = Some(new_agg);
-        *repeat = 0;
-    }
-
     fn invalidate_link_dependent_state(&self) {
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
@@ -574,62 +517,6 @@ impl<'a> RemlState<'a> {
     ) -> Result<(Arc<crate::pirls::PirlsResult>, Arc<Array2<f64>>), EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         Ok((bundle.pirls_result.clone(), bundle.h_pos_factorw.clone()))
-    }
-
-    pub(super) fn edf_from_h_and_e(
-        &self,
-        e_transformed: &Array2<f64>, // rank x p_eff
-        lambdas: ArrayView1<'_, f64>,
-        h_eff: &Array2<f64>, // p_eff x p_eff
-    ) -> Result<f64, EstimationError> {
-        // Why caching by ρ is sound:
-        // The effective degrees of freedom (EDF) calculation is one of only two places where
-        // we ask for a Faer factorization through `get_faer_factor`.  The cache inside that
-        // helper uses only the vector of log smoothing parameters (ρ) as the key.  At first
-        // glance that can look risky—two different Hessians with the same ρ might appear to be
-        // conflated.  The surrounding call graph prevents that situation:
-        //   • Identity / Gaussian models call `edf_from_h_and_rk` with the stabilized Hessian
-        //     `pirls_result.stabilizedhessian_transformed`.
-        //   • Non-Gaussian (logit / LAML) models call it with the effective / ridged Hessian
-        //     returned by `effectivehessian(pr)`.
-        // Within a given `RemlState` we never switch between those two flavours—the state is
-        // constructed for a single link function, so the cost/gradient pathways stay aligned.
-        // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
-        // practice, and the cache cannot hand back a factorization of an unintended matrix.
-
-        // Prefer an un-ridged factorization when the stabilized Hessian is already PD.
-        // Only fall back to the RidgePlanner path if direct factorization fails.
-        let rho_like = lambdas.mapv(|lam| lam.ln());
-        let stable_solver = StableSolver::new("reml edf hessian");
-        let factor = stable_solver
-            .factorize(h_eff)
-            .map(|f| {
-                Arc::new(match f {
-                    crate::faer_ndarray::FaerSymmetricFactor::Llt(inner) => FaerFactor::Llt(inner),
-                    crate::faer_ndarray::FaerSymmetricFactor::Ldlt(inner) => {
-                        FaerFactor::Ldlt(inner)
-                    }
-                    crate::faer_ndarray::FaerSymmetricFactor::Lblt(inner) => {
-                        FaerFactor::Lblt(inner)
-                    }
-                })
-            })
-            .unwrap_or_else(|_| self.get_faer_factor(&rho_like, h_eff));
-
-        // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
-        // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly.
-        let e_t = e_transformed.t().to_owned(); // (p_eff × rank_total)
-        let eview = FaerArrayView::new(&e_t);
-        let x = factor.solve(eview.as_ref());
-        let trace_h_inv_s_lambda = faer_frob_inner(x.as_ref(), eview.as_ref());
-
-        // Calculate EDF as p - trace, clamped to the penalty nullspace dimension
-        let p = h_eff.ncols() as f64;
-        let rank_s = e_transformed.nrows() as f64;
-        let mp = (p - rank_s).max(0.0);
-        let edf = (p - trace_h_inv_s_lambda).clamp(mp, p);
-
-        Ok(edf)
     }
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
@@ -1006,10 +893,6 @@ impl<'a> RemlState<'a> {
         &self.balanced_penalty_root
     }
 
-    pub(crate) fn weights(&self) -> ArrayView1<'a, f64> {
-        self.weights
-    }
-
     pub(super) fn sparse_penalty_logdet_runtime(
         &self,
         rho: &Array1<f64>,
@@ -1172,7 +1055,6 @@ impl<'a> RemlState<'a> {
             h_eff: Arc::new(h_eff),
             h_total: Arc::new(h_total),
             h_pos_factorw: Arc::new(w),
-            h_total_log_det,
             active_subspace_rel_gap,
             active_subspace_unstable,
             sparse_exact: None,
@@ -1252,7 +1134,6 @@ impl<'a> RemlState<'a> {
             h_eff: Arc::new(Array2::zeros((0, 0))),
             h_total: Arc::new(Array2::zeros((0, 0))),
             h_pos_factorw: Arc::new(Array2::zeros((0, 0))),
-            h_total_log_det: 0.0,
             active_subspace_rel_gap: None,
             active_subspace_unstable: false,
             sparse_exact: Some(Arc::new(SparseExactEvalData {
@@ -1559,10 +1440,9 @@ impl<'a> RemlState<'a> {
                     );
                 }
                 if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
-                    let condition_number =
-                        calculate_condition_number(&pirls_result.penalized_hessian_transformed)
-                            .ok()
-                            .unwrap_or(f64::INFINITY);
+                    let condition_number = symmetric_spectrum_condition_number(
+                        &pirls_result.penalized_hessian_transformed,
+                    );
                     log::warn!(
                         "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
                         condition_number
@@ -1572,276 +1452,8 @@ impl<'a> RemlState<'a> {
         }
         // Delegate to the unified evaluator for the actual formula computation.
         // This ensures cost and gradient share the exact same formula.
-        let result = self.evaluate_unified(
-            p,
-            &bundle,
-            super::unified::EvalMode::ValueOnly,
-        )?;
-        return Ok(result.cost);
-
-        // ─── Legacy formula code (kept for reference, unreachable) ───
-        #[allow(unreachable_code)]
-        match self.config.link_function() {
-            LinkFunction::Identity => {
-                let ridge_passport = pirls_result.ridge_passport;
-                // From Wood (2017), Chapter 6, Eq. 6.24:
-                // V_r(λ) = D_p/(2φ) + (r/2φ) + ½log|X'X/φ + S_λ/φ| - ½log|S_λ/φ|_+
-                // where D_p = ||y - Xβ̂||² + β̂'S_λβ̂ is the PENALIZED deviance
-                //
-                // With profiled dispersion φ̂ = D_p/(n-M_p), this becomes:
-                //   V_REML(ρ) =
-                //     D_p/(2φ̂)
-                //   + 0.5 log|H|
-                //   - 0.5 log|S|_+
-                //   + ((n-M_p)/2) log(2πφ̂),
-                // where H = XᵀW0X + S(ρ), S(ρ)=Σ_k exp(ρ_k) S_k + δI.
-                //
-                // Because Gaussian identity has c=d=0, there is no third/fourth derivative
-                // correction in H_k: ∂H/∂ρ_k = S_k^ρ exactly.
-
-                // Check condition number with improved thresholds per Wood (2011)
-                const MAX_CONDITION_NUMBER: f64 = 1e12;
-                if want_hot_diag {
-                    let cond = pirls_result
-                        .penalized_hessian_transformed
-                        .eigh(Side::Lower)
-                        .ok()
-                        .map(|(evals, _)| {
-                            let max_ev = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            let min_ev = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            if min_ev <= 1e-12 {
-                                f64::INFINITY
-                            } else {
-                                max_ev / min_ev
-                            }
-                        })
-                        .unwrap_or(f64::NAN);
-                    *self.arena.gaussian_cond_snapshot.write().unwrap() = cond;
-                }
-                let condition_number = *self.arena.gaussian_cond_snapshot.read().unwrap();
-                if condition_number.is_finite() {
-                    if condition_number > MAX_CONDITION_NUMBER {
-                        log::warn!(
-                            "Penalized Hessian very ill-conditioned (cond={:.2e}); proceeding despite poor conditioning.",
-                            condition_number
-                        );
-                    } else if condition_number > 1e8 {
-                        log::warn!(
-                            "Penalized Hessian is ill-conditioned but proceeding: condition number = {condition_number:.2e}"
-                        );
-                    }
-                }
-
-                // STRATEGIC DESIGN DECISION: Use unweighted sample count for mgcv parity
-                // In standard WLS theory, one might use sum(weights) as effective sample size.
-                // However, mgcv deliberately uses the unweighted count 'n.true' in gam.fit3.
-                let n = self.y.len() as f64;
-                // Number of coefficients (transformed basis)
-
-                // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
-                let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
-                // Use stable penalty term calculated in P-IRLS
-                let penalty = pirls_result.stable_penalty_term;
-
-                let dp = rss + penalty;
-
-                // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
-                // Work directly in the transformed basis for efficiency and numerical stability
-                // This avoids transforming matrices back to the original basis unnecessarily
-                // Penalty roots are available in reparam_result if needed
-
-                // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
-                // following the standard REML identity φ = D_p / (n - M_p).
-                let (penalty_rank, log_det_s_plus) =
-                    self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
-                let p_eff_dim = h_eff.ncols();
-                let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
-
-                // EDF diagnostics are expensive; compute only when diagnostics are enabled.
-                if want_hot_diag {
-                    let edf = self.edf_from_h_and_e(&e_eval, lambdas.view(), h_eff)?;
-                    log::debug!("[Diag] EDF total={:.3}", edf);
-                    if n - edf < 1.0 {
-                        log::warn!("Effective DoF exceeds samples; model may be overfit.");
-                    }
-                }
-
-                let denom = (n - mp).max(LAML_RIDGE);
-                let (dp_c, _) = smooth_floor_dp(dp);
-                if dp < DP_FLOOR {
-                    log::warn!(
-                        "Penalized deviance {:.3e} fell below DP_FLOOR; clamping to maintain REML stability.",
-                        dp
-                    );
-                }
-                let phi = dp_c / denom;
-
-                // log |H|_+ via eigenvalue-thresholded decomposition from the
-                // eval bundle.  The gradient computes tr(H_+^{-1} A_k) using
-                // the same positive-part factor (h_pos_factorw), so using the
-                // matching log-determinant here keeps cost and gradient on the
-                // same spectral truncation surface.  The previous Cholesky-based
-                // log|H| included ALL eigenvalues (even near-zero ones below the
-                // gradient's threshold), causing a cost/gradient mismatch that
-                // made BFGS stall on multi-penalty problems.
-                let log_det_h = if free_basis_opt.is_some() {
-                    // Constrained path: recompute from projected h_eff
-                    let (eigvals, _) = h_eff
-                        .eigh(Side::Lower)
-                        .map_err(EstimationError::EigendecompositionFailed)?;
-                    let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
-                    let threshold = (max_eig * 1e-10).max(1e-14);
-                    eigvals
-                        .iter()
-                        .filter(|&&v| v > threshold)
-                        .map(|&v| v.ln())
-                        .sum()
-                } else {
-                    bundle.h_total_log_det
-                };
-
-                // log |S_λ + ridge I|_+ (pseudo-determinant) to match the
-                // stabilized penalty used by PIRLS.
-                //
-                // Fixed-rank rule: unpenalized/null directions do not contribute to the
-                // pseudo-logdet. This keeps the objective continuous in ρ when S is singular
-                // (or near-singular before ridge augmentation).
-                // Standard REML expression from Wood (2017), 6.5.1
-                // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
-                // Simplifying: V = D_p/(2φ) + ½log|H| - ½log|S_λ|_+ + ((n-M_p)/2) log(2πφ)
-                let reml = dp_c / (2.0 * phi)
-                    + 0.5 * (log_det_h - log_det_s_plus)
-                    + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
-
-                let priorcost = self.compute_soft_priorcost(p);
-
-                Ok(reml + priorcost)
-            }
-            _ => {
-                // For non-Gaussian GLMs, use the LAML approximation
-                // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
-                // Use stable penalty term calculated in P-IRLS
-                let mut penalised_ll =
-                    -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
-
-                let ridge_passport = pirls_result.ridge_passport;
-                // Include Firth log-det term in LAML for consistency with inner PIRLS
-                if self.config.firth_bias_reduction
-                    && matches!(self.config.link_function(), LinkFunction::Logit)
-                {
-                    if let Some(firth_log_det) = pirls_result.firth_log_det() {
-                        penalised_ll += firth_log_det; // Jeffreys prior contribution
-                    }
-                }
-
-                // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
-                let (_, log_det_s) =
-                    self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
-
-                // Log-determinant of the effective Hessian.
-                // HESSIAN PASSPORT: Use the pre-computed h_total and its factorization
-                // from the bundle to ensure exact consistency with gradient computation.
-                // For Firth: h_total = h_eff - hphi (computed in prepare_eval_bundle)
-                // For non-Firth: h_total = h_eff
-                //
-                // LAML objective:
-                //   V_LAML(ρ) =
-                //      -ℓ(β̂) + 0.5 β̂ᵀSβ̂
-                //    - 0.5 log|S|_+
-                //    + 0.5 log|H|
-                //    + const.
-                //
-                // For non-Gaussian families, H depends on ρ both directly through S and
-                // indirectly through β̂(ρ), which induces the dH/dρ_k third-derivative term in
-                // the exact gradient path (documented in compute_gradient).
-                let log_det_h = if free_basis_opt.is_some() {
-                    if h_total_eval.nrows() == 0 {
-                        0.0
-                    } else {
-                        let (evals, _) = h_total_eval
-                            .eigh(Side::Lower)
-                            .map_err(EstimationError::EigendecompositionFailed)?;
-                        let floor = 1e-10;
-                        evals.iter().filter(|&&v| v > floor).map(|&v| v.ln()).sum()
-                    }
-                } else {
-                    bundle.h_total_log_det
-                };
-
-                // Mp is null space dimension (number of unpenalized coefficients)
-                // For logit, scale parameter is typically fixed at 1.0, but include for completeness
-                let phi = 1.0; // Logit family typically has dispersion parameter = 1
-
-                // Compute null space dimension using the TRANSFORMED, STABLE basis
-                // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
-                // to determine M_p with the transformed penalty basis.
-                let (penalty_rank, _) =
-                    self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
-                let p_eff_dim = h_eff.ncols();
-                let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
-
-                let tk_correction = self.tierney_kadane_laml_correction(
-                    pirls_result,
-                    &h_eff_eval,
-                    free_basis_opt.as_ref(),
-                )?;
-                let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
-                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
-                    + tk_correction;
-
-                // Diagnostics below are expensive and not needed for objective value.
-                let (edf, trace_h_inv_s_lambda, stab_cond) = if want_hot_diag {
-                    let p_eff = h_eff.ncols() as f64;
-                    let edf = self.edf_from_h_and_e(&e_eval, lambdas.view(), h_eff)?;
-                    let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
-                    let stab_cond = symmetric_spectrum_condition_number(
-                        &pirls_result.penalized_hessian_transformed,
-                    );
-                    (edf, trace_h_inv_s_lambda, stab_cond)
-                } else {
-                    (f64::NAN, f64::NAN, f64::NAN)
-                };
-
-                // Raw-condition diagnostics are rate-limited in this loop.
-                // We only refresh occasionally, and keep the last snapshot otherwise.
-                let raw_cond = if self.x().as_sparse().is_none() && want_hot_diag {
-                    let x_orig = self
-                        .x()
-                        .as_dense()
-                        .expect("non-sparse original design should expose dense storage");
-                    let w_orig = self.weights();
-                    let sqrtw = w_orig.mapv(|w| w.max(0.0).sqrt());
-                    let wx = x_orig * &sqrtw.insert_axis(Axis(1));
-                    let mut h_raw = fast_ata(&wx);
-                    for (k, &lambda) in lambdas.iter().enumerate() {
-                        let s_k = &self.s_full_list[k];
-                        if lambda != 0.0 {
-                            h_raw.scaled_add(lambda, s_k);
-                        }
-                    }
-                    let raw = symmetric_spectrum_condition_number(&h_raw);
-                    *self.arena.raw_cond_snapshot.write().unwrap() = raw;
-                    raw
-                } else {
-                    *self.arena.raw_cond_snapshot.read().unwrap()
-                };
-                if want_hot_diag {
-                    self.log_gamcost(
-                        &p,
-                        lambdas.as_slice().unwrap_or(&[]),
-                        laml,
-                        stab_cond,
-                        raw_cond,
-                        edf,
-                        trace_h_inv_s_lambda,
-                    );
-                }
-
-                let priorcost = self.compute_soft_priorcost(p);
-
-                Ok(-laml + priorcost)
-            }
-        }
+        let result = self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+        Ok(result.cost)
     }
 
     ///
@@ -2083,12 +1695,11 @@ impl<'a> RemlState<'a> {
 
         // Build HessianOperator from the (possibly projected) penalized Hessian.
         let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_for_operator)
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "DenseSpectralOperator from PIRLS Hessian: {e}"
-                    ))
-                })?,
+            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from PIRLS Hessian: {e}"
+                ))
+            })?,
         );
 
         // Penalty logdet derivatives from the reparameterization result.
@@ -2097,7 +1708,6 @@ impl<'a> RemlState<'a> {
         let penalty_logdet = PenaltyLogdetDerivs {
             value: log_det_s,
             first: pirls_result.reparam_result.det1.clone(),
-            second: None,
         };
 
         // Penalty roots (possibly projected).
@@ -2114,7 +1724,8 @@ impl<'a> RemlState<'a> {
 
         // Beta in the operator's basis.
         let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t().dot(&pirls_result.beta_transformed)
+            z.t()
+                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
@@ -2132,22 +1743,17 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                let c_array = if let Some(z) = free_basis_opt.as_ref() {
-                    // c/d arrays don't change with projection — they're observation-level.
-                    pirls_result.solve_c_array.clone()
-                } else {
-                    pirls_result.solve_c_array.clone()
-                };
+                // c/d arrays don't change with projection — they're observation-level.
+                let c_array = pirls_result.solve_c_array.clone();
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
-                    crate::linalg::matrix::DesignMatrix::Dense(std::sync::Arc::new(x_dense.dot(z)))
+                    crate::linalg::matrix::DesignMatrix::Dense(x_dense.dot(z))
                 } else {
                     pirls_result.x_transformed.clone()
                 };
                 Box::new(SinglePredictorGlmDerivatives {
                     c_array,
-                    d_array: Some(pirls_result.solve_d_array.clone()),
                     x_transformed,
                 })
             };
@@ -2170,11 +1776,7 @@ impl<'a> RemlState<'a> {
             } else {
                 bundle.h_eff.as_ref().clone()
             };
-            self.tierney_kadane_laml_correction(
-                pirls_result,
-                &h_eff_eval,
-                free_basis_opt.as_ref(),
-            )?
+            self.tierney_kadane_laml_correction(pirls_result, &h_eff_eval, free_basis_opt.as_ref())?
         } else {
             0.0
         };
@@ -2194,7 +1796,6 @@ impl<'a> RemlState<'a> {
         let inner_solution = InnerSolution {
             log_likelihood,
             penalty_quadratic: pirls_result.stable_penalty_term,
-            ridge_passport,
             hessian_op,
             beta,
             penalty_roots,
@@ -2220,7 +1821,7 @@ impl<'a> RemlState<'a> {
             }
         } else {
             let pc = self.compute_soft_priorcost(rho);
-            let pg = self.compute_soft_priorgradient(rho);
+            let pg = self.compute_soft_priorgrad(rho);
             if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
                 Some((pc, pg))
             } else {
@@ -2250,11 +1851,8 @@ impl<'a> RemlState<'a> {
         if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_gradient_sparse_exact(p, &bundle);
         }
-        let result = self.evaluate_unified(
-            p,
-            &bundle,
-            super::unified::EvalMode::ValueAndGradient,
-        )?;
+        let result =
+            self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
         Ok(result.gradient.unwrap())
     }
 }
