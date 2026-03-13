@@ -1880,11 +1880,15 @@ impl<'a> RemlState<'a> {
         let penalty_roots: Vec<Array2<f64>> = self
             .s_full_list
             .iter()
-            .map(|s_k| {
-                penalty_matrix_root(s_k)
-                    .unwrap_or_else(|_| Array2::zeros((s_k.nrows(), s_k.ncols())))
+            .enumerate()
+            .map(|(idx, s_k)| {
+                penalty_matrix_root(s_k).map_err(|e| {
+                    EstimationError::RemlOptimizationFailed(format!(
+                        "penalty root for S_{idx} failed: {e}"
+                    ))
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Nullspace dimension.
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
