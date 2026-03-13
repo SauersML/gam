@@ -356,3 +356,75 @@ Before fitting, the design matrix $X$ may be column-conditioned: $\tilde{X} = X 
 (b) The penalty $\log|S|_+$ transforms as $\log|\tilde{S}|_+ = \log|S|_+ - 2\sum_{j\in\text{range}}\log d_j$. Does this constant offset matter for optimization (it shouldn't affect $\nabla_\theta V$), or are there subtle issues with the nullspace dimension $M_p$?
 
 (c) For the profiled Gaussian case, the dispersion $\hat\phi = D_p/(n-M_p)$ involves the penalized deviance $D_p = \|y - X\hat\beta\|^2 + \hat\beta^\top S\hat\beta$. Is $D_p$ invariant under column conditioning? (The residuals $y - X\hat\beta = y - \tilde{X}\tilde\beta$ are invariant, and $\hat\beta^\top S\hat\beta = \tilde\beta^\top\tilde{S}\tilde\beta$, so yes — but confirm.)
+
+### Q13: The dual-inverse paradox for indefinite Hessians
+
+In non-Gaussian, highly flexible models, the penalized likelihood Hessian $H$ can become indefinite (have negative eigenvalues). This happens when the model is flexible enough that the likelihood curvature $H_L$ overwhelms the penalty $S$ in some directions.
+
+The LAML objective needs two things from $H$:
+1. **Log-determinant**: $\frac{1}{2}\log|H|_+$ uses only positive eigenvalues (the pseudo-determinant)
+2. **Mode response**: $\beta_k = -H^{-1}g_k$ uses the inverse for the implicit function theorem
+
+When $H$ is indefinite, we currently use **two different operators**:
+- For the log-determinant and trace terms: the **positive-part pseudo-inverse** $H_+^\dagger = \sum_{\sigma_i > 0} \sigma_i^{-1} u_i u_i^\top$
+- For the IFT mode response: the **ridged inverse** $(H + \delta I)^{-1}$ where $\delta$ is the PIRLS stabilization ridge
+
+**The problem**: The cost function lives on the surface defined by $H_+^\dagger$, but the gradient is computed using $(H+\delta I)^{-1}$. These are different surfaces. The envelope theorem assumes a single consistent $H$.
+
+**Questions**:
+(a) Is there a single spectral regularization operator $\mathcal{R}(H)$ such that both $\log|\mathcal{R}(H)|$ and $\mathcal{R}(H)^{-1}$ are consistent (i.e., the gradient of $\log|\mathcal{R}(H)|$ w.r.t. $\rho$ uses the same operator as the IFT)?
+
+(b) Options to consider:
+  - **Soft clamping**: Replace $\sigma_i \to \max(\sigma_i, \epsilon)$ everywhere (both logdet and inverse). This makes $\mathcal{R}(H) = U\,\text{diag}(\max(\sigma_i, \epsilon))\,U^\top$. Is this smooth? Does it bias REML?
+  - **Absolute value**: $\mathcal{R}(H) = U\,\text{diag}(|\sigma_i|)\,U^\top$. This is positive definite but discontinuous at $\sigma_i = 0$.
+  - **Squared form**: Use $H^\top H$ instead of $H$ for the logdet. Then $\log|H^\top H|_+ = 2\log|H|_+$ when $H$ is PD, but is smooth through indefiniteness.
+
+(c) In practice, how often does $H$ actually become indefinite? Is this only a problem for specific families (e.g., Gamma with log link near zero), or does it occur broadly?
+
+### Q14: LAML under active inequality constraints
+
+The LAML objective and its gradient assume **stationarity**: $\nabla_\beta F(\hat\beta, \theta) = 0$. This is the condition that makes the envelope theorem work and eliminates the $g_i^\top \beta_i$ cross-term from the profiled gradient.
+
+When **inequality constraints** are active (e.g., monotonicity constraints forcing $\beta_j \geq 0$, or shape constraints), the KKT conditions replace stationarity:
+$$\nabla_\beta F = A^\top\mu, \quad \mu \geq 0, \quad A\hat\beta \geq b, \quad \mu^\top(A\hat\beta - b) = 0$$
+
+where $A$ is the constraint matrix, $b$ the bound vector, and $\mu$ the KKT multipliers.
+
+**Consequences**:
+- The mode $\hat\beta(\theta)$ is only **piecewise differentiable** in $\theta$ (it has kinks when constraints activate/deactivate)
+- The envelope theorem no longer applies directly because $\nabla_\beta F \neq 0$
+- The profiled gradient picks up an extra term: $\frac{\partial V}{\partial\theta_i}\bigg|_{\text{constrained}} = \frac{\partial V}{\partial\theta_i}\bigg|_{\text{unconstrained}} + \mu^\top A\beta_i$ (where $\beta_i$ is the mode response projected into the free subspace)
+
+We currently handle this by **projecting** into the free subspace (the null space of active constraints), effectively ignoring the active directions. This gives a gradient that is correct within the active face but ignores the boundary effects.
+
+**Questions**:
+(a) Is the free-subspace projection a valid approximation for the LAML gradient? Under what conditions does it introduce bias? Specifically: if the true unconstrained optimum has $\hat\beta_j < 0$ but the constraint forces $\hat\beta_j = 0$, does the projected LAML gradient still point toward the correct smoothing parameters?
+
+(b) A cleaner approach might be a **log-barrier LAML**: replace the hard constraint $\beta_j \geq 0$ with a barrier $-\mu\sum_j\log\beta_j$, profile out $\mu$ (or set it to a small constant), and compute LAML on the smooth barrier-augmented objective. Is there theory for the Laplace approximation under log-barrier penalization? Does the barrier term affect the $\log|H|$ correction?
+
+(c) For **structural monotonicity** (I-spline constraints where coefficients must be non-negative to ensure monotonicity of the fitted function), the active set can change with $\theta$. The LAML surface has **ridges** at the $\theta$ values where a constraint activates. Does this cause convergence problems for Newton/BFGS, and is there a standard remedy?
+
+### Q15: Exact Gaussian convolutions for non-logit link functions
+
+When modeling binary outcomes with covariate measurement error, the inner loop must evaluate:
+$$E_{\eta\sim N(\mu,\sigma^2)}\bigl[g^{-1}(\eta)\bigr] = \int_{-\infty}^{\infty} g^{-1}(\eta)\,\phi\bigl(\tfrac{\eta-\mu}{\sigma}\bigr)\,\frac{d\eta}{\sigma}$$
+
+where $g^{-1}$ is the inverse link function and $\phi$ is the standard normal density.
+
+For the **logit** link, $g^{-1}(\eta) = \text{sigmoid}(\eta)$, and the integral admits an exact, numerically stable representation via the Faddeeva function / erfcx series. We have implemented this and it gives smooth, kink-free derivatives to all orders.
+
+For other link functions, we currently use **Gauss-Hermite quadrature** (7-21 points). This introduces:
+- Numerical noise (piecewise-polynomial approximation of a smooth integral)
+- Kinks in the outer LAML objective (because the GHQ nodes/weights don't move smoothly with $\mu$, $\sigma$)
+- Difficulty computing higher-order derivatives (needed for $D_\beta H_L$ and $D^2_\beta H_L$)
+
+**Questions**:
+(a) For the **complementary log-log** (CLogLog) link, $g^{-1}(\eta) = 1 - \exp(-\exp(\eta))$, does the Gaussian convolution $\int (1 - e^{-e^\eta})\phi((\eta-\mu)/\sigma)\,d\eta/\sigma$ admit a closed-form series? The integrand involves a double exponential composed with a Gaussian — can this be expressed via Mellin-Barnes integrals, and if so, is the resulting series numerically stable and absolutely convergent?
+
+(b) For the **probit** link, $g^{-1}(\eta) = \Phi(\eta)$, the Gaussian convolution is:
+$$\int \Phi(\eta)\,\phi\bigl(\tfrac{\eta-\mu}{\sigma}\bigr)\,\frac{d\eta}{\sigma} = \Phi\Bigl(\frac{\mu}{\sqrt{1+\sigma^2}}\Bigr)$$
+This is exact and trivial. But the **derivatives** with respect to $\mu$ and $\sigma$ — up to 4th order (needed for $D^2_\beta H_L$) — do they remain tractable? Write them out.
+
+(c) For the **SAS (sinh-arcsinh)** link, $g^{-1}(\eta) = \Phi(\sinh(\epsilon^{-1}\sinh^{-1}(\eta) + \delta))$, the Gaussian convolution seems intractable analytically. Is there a practical middle ground between exact series and GHQ — e.g., adaptive quadrature with error bounds that guarantee smoothness of the outer objective?
+
+(d) More generally: is there a **sufficient condition** on $g^{-1}$ that guarantees its Gaussian convolution admits a convergent series representation? (E.g., entire function of exponential type, or membership in a specific Hilbert space.)
