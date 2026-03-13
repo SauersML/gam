@@ -6110,18 +6110,17 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     .and_then(|r| r.map(|lk| lk.link_function()))
                 {
                     let alo_result =
-                        if let Some(geom) = model.unified().and_then(|u| u.geometry.as_ref()) {
+                        if let Some(unified) = model.unified() {
                             let eta = design.design.dot(&fit.beta);
                             let report_offset = Array1::<f64>::zeros(design.design.nrows());
-                            let input = gam::alo::AloInput::from_geometry(
-                                geom,
+                            gam::alo::compute_alo_diagnostics_from_unified(
+                                unified,
                                 &design.design,
                                 &eta,
                                 &report_offset,
                                 link,
                                 1.0,
-                            );
-                            gam::alo::compute_alo_from_input(&input)
+                            )
                         } else {
                             compute_alo_diagnostics_from_fit(&fit, y.view(), link)
                         };

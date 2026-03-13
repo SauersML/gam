@@ -56,7 +56,8 @@ pub use families::survival_location_scale::{
 };
 pub use inference::alo::{
     AloDiagnostics, AloInput, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
-    compute_alo_diagnostics_from_pirls, compute_alo_from_input,
+    compute_alo_diagnostics_from_pirls, compute_alo_diagnostics_from_unified,
+    compute_alo_from_input,
 };
 pub use inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,

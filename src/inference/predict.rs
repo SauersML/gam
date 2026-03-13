@@ -1,4 +1,4 @@
-use crate::estimate::{EstimationError, FitResult, FittedLinkState};
+use crate::estimate::{EstimationError, FitResult, FittedLinkState, UnifiedFitResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
@@ -169,6 +169,29 @@ pub struct StandardPredictor {
     pub family: crate::types::LikelihoodFamily,
     pub link_kind: Option<InverseLink>,
     pub covariance: Option<Array2<f64>>,
+}
+
+impl StandardPredictor {
+    /// Build a `StandardPredictor` from a `UnifiedFitResult`, extracting beta
+    /// from the first block and covariance from the unified result.
+    pub(crate) fn from_unified(
+        unified: &UnifiedFitResult,
+        family: crate::types::LikelihoodFamily,
+        link_kind: Option<InverseLink>,
+    ) -> Self {
+        let beta = unified
+            .blocks
+            .first()
+            .map(|b| b.beta.clone())
+            .unwrap_or_default();
+        let covariance = unified.covariance_conditional.clone();
+        Self {
+            beta,
+            family,
+            link_kind,
+            covariance,
+        }
+    }
 }
 
 impl PredictableModel for StandardPredictor {

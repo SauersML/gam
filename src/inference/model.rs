@@ -531,13 +531,27 @@ impl FittedModel {
     ///
     /// Returns `None` for location-scale or survival models which require
     /// specialised predictors not yet wired through this trait.
+    ///
+    /// When a `UnifiedFitResult` is available, the predictor is built from
+    /// the unified representation (extracting beta from the first block and
+    /// covariance from the unified result). Otherwise falls back to the
+    /// legacy `FitResult` path.
     pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
         if !matches!(self, FittedModel::Standard { .. }) {
             return None;
         }
-        let fit = self.fit_result.as_ref()?;
         let family = self.family_state.likelihood();
         let link_kind = self.resolved_inverse_link().ok().flatten();
+
+        // Prefer unified path when available.
+        if let Some(unified) = self.unified() {
+            return Some(Box::new(StandardPredictor::from_unified(
+                unified, family, link_kind,
+            )));
+        }
+
+        // Legacy path: extract from FitResult.
+        let fit = self.fit_result.as_ref()?;
         let covariance = fit.beta_covariance().cloned();
         Some(Box::new(StandardPredictor {
             beta: fit.beta.clone(),
