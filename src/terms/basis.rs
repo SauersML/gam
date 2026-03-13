@@ -11053,6 +11053,114 @@ mod tests {
         }
     }
 
+
+
+    #[test]
+    fn test_gram_and_psi_derivatives_from_operator_matchesfd() {
+        // Build D(psi) = D0 + psi D1 + 0.5 psi^2 D2 with nontrivial shape.
+        let d0 = array![
+            [0.9, -0.2, 0.3],
+            [0.4, 0.8, -0.6],
+            [0.1, 0.7, 0.5],
+            [-0.3, 0.2, 0.4]
+        ];
+        let d1 = array![
+            [0.2, -0.1, 0.05],
+            [0.3, 0.07, -0.2],
+            [-0.15, 0.06, 0.1],
+            [0.04, -0.09, 0.12]
+        ];
+        let d2 = array![
+            [0.08, -0.02, 0.01],
+            [0.03, 0.04, -0.05],
+            [0.02, -0.01, 0.06],
+            [-0.07, 0.03, 0.02]
+        ];
+
+        let psi0 = 0.35;
+        let d = &d0 + &(d1.mapv(|v| psi0 * v)) + &(d2.mapv(|v| 0.5 * psi0 * psi0 * v));
+        let d_psi = &d1 + &(d2.mapv(|v| psi0 * v));
+        let d_psi_psi = d2.clone();
+
+        let (s, s_psi, s_psi_psi) = gram_and_psi_derivatives_from_operator(&d, &d_psi, &d_psi_psi);
+
+        let h = 1e-6;
+        let eval_s = |psi: f64| {
+            let d_eval = &d0 + &(d1.mapv(|v| psi * v)) + &(d2.mapv(|v| 0.5 * psi * psi * v));
+            symmetrize(&fast_ata(&d_eval))
+        };
+        let s_plus = eval_s(psi0 + h);
+        let s_minus = eval_s(psi0 - h);
+        let sfd = (&s_plus - &s_minus) / (2.0 * h);
+        let s2fd = (&s_plus - &(s.mapv(|v| 2.0 * v)) + &s_minus) / (h * h);
+
+        let err1 = (&s_psi - &sfd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&s_psi_psi - &s2fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        for i in 0..s_psi.nrows() {
+            for j in 0..s_psi.ncols() {
+                assert_eq!(s_psi[[i, j]].signum(), sfd[[i, j]].signum());
+                assert_eq!(s_psi_psi[[i, j]].signum(), s2fd[[i, j]].signum());
+            }
+        }
+
+        assert!(err1 < 2e-6, "S' mismatch too large: {err1}");
+        assert!(err2 < 5e-4, "S'' mismatch too large: {err2}");
+    }
+
+    #[test]
+    fn test_normalize_penaltywith_psi_derivatives_matchesfd() {
+        // Build S(psi) = S0 + psi S1 + 0.5 psi^2 S2 and validate exact
+        // normalization derivatives against finite differences of S/||S||_F.
+        let s0 = array![[2.0, 0.3, -0.2], [0.3, 1.7, 0.4], [-0.2, 0.4, 1.4]];
+        let s1 = array![[0.2, -0.05, 0.1], [-0.05, 0.12, 0.03], [0.1, 0.03, -0.08]];
+        let s2 = array![
+            [0.04, 0.02, -0.01],
+            [0.02, -0.03, 0.015],
+            [-0.01, 0.015, 0.02]
+        ];
+
+        let psi0 = -0.4;
+        let s = &s0 + &(s1.mapv(|v| psi0 * v)) + &(s2.mapv(|v| 0.5 * psi0 * psi0 * v));
+        let s_psi = &s1 + &(s2.mapv(|v| psi0 * v));
+        let s_psi_psi = s2.clone();
+
+        let (sn, sn_psi, sn_psi_psi, c) =
+            normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
+        let _ = sn;
+        let _ = c;
+
+        let h = 1e-6;
+        let eval_snorm = |psi: f64| {
+            let s_eval = &s0 + &(s1.mapv(|v| psi * v)) + &(s2.mapv(|v| 0.5 * psi * psi * v));
+            let c = trace_of_product(&s_eval, &s_eval).sqrt();
+            s_eval.mapv(|v| v / c)
+        };
+        let sn = eval_snorm(psi0);
+        let sn_plus = eval_snorm(psi0 + h);
+        let sn_minus = eval_snorm(psi0 - h);
+        let snfd = (&sn_plus - &sn_minus) / (2.0 * h);
+        let sn2fd = (&sn_plus - &(sn.mapv(|v| 2.0 * v)) + &sn_minus) / (h * h);
+
+        let err1 = (&sn_psi - &snfd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&sn_psi_psi - &sn2fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        for i in 0..sn_psi.nrows() {
+            for j in 0..sn_psi.ncols() {
+                assert_eq!(sn_psi[[i, j]].signum(), snfd[[i, j]].signum());
+                assert_eq!(sn_psi_psi[[i, j]].signum(), sn2fd[[i, j]].signum());
+            }
+        }
+
+        assert!(err1 < 2e-6, "normalized S' mismatch too large: {err1}");
+        assert!(err2 < 5e-4, "normalized S'' mismatch too large: {err2}");
+    }
     #[test]
     fn test_log_kappa_scaling_identities_match_autodiff() {
         let psi0 = -0.23;
