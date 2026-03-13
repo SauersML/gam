@@ -1,0 +1,75 @@
+name: Fuzz vs mgcv
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GAM_SKIP_LINT_CHECKS: "1"
+
+jobs:
+  fuzz:
+    name: Fuzz vs mgcv
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin gam
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install numpy pandas scikit-learn
+
+      - name: Set up R
+        uses: ./.github/actions/setup-bench-r
+        with:
+          r-version: "4.4.3"
+
+      - name: Run fuzzer
+        run: |
+          python bench/fuzz_vs_mgcv.py --trials 100 --top 30 2>&1 | tee fuzz_output.txt
+
+      - name: Upload fuzz results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-results
+          path: |
+            bench/fuzz_results.jsonl
+            fuzz_output.txt
+          if-no-files-found: warn
