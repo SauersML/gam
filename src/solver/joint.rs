@@ -3505,4 +3505,18 @@ mod tests {
             "full joint leverage should differ from blockwise approximation when X'WB != 0"
         );
     }
+
+    #[test]
+    fn joint_cloglog_inverse_link_loses_negative_tail_mass() {
+        let eta = -50.0_f64;
+        let stable = -(-(eta.exp())).exp_m1();
+        assert!(stable > 0.0);
+        let got = joint_point_inverse_link(LinkFunction::CLogLog, eta);
+        assert!(
+            (got - stable).abs() < 1e-30,
+            "joint cloglog inverse-link should equal -expm1(-exp(eta)) in the negative tail at eta={eta}; got {} vs {}",
+            got,
+            stable
+        );
+    }
 }

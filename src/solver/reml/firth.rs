@@ -1351,4 +1351,19 @@ mod tests {
             "gphi_tau mismatch: analytic={analytic:?}, fd={fd:?}, err={err:e}"
         );
     }
+
+    #[test]
+    fn logisticweight_loses_positive_tail_mass() {
+        let eta = 50.0_f64;
+        let z = (-eta).exp();
+        let stable = z / (1.0_f64 + z).powi(2);
+        assert!(stable > 0.0);
+        let got = logisticweight(eta);
+        assert!(
+            (got - stable).abs() < 1e-30,
+            "Firth logisticweight should equal the stable tail formula z/(1+z)^2 at eta={eta}; got {} vs {}",
+            got,
+            stable
+        );
+    }
 }

@@ -1856,4 +1856,68 @@ mod tests {
             "even a nearly pure loglog mixture should not produce NaN fourth derivatives at eta={eta}; got d4={d4}"
         );
     }
+
+    #[test]
+    fn logit_tail_derivatives_should_match_stable_closed_forms() {
+        let eta = 50.0_f64;
+        let z = (-eta).exp();
+        let denom = 1.0_f64 + z;
+        let stable_d1 = z / denom.powi(2);
+        let stable_d2 = z * (z - 1.0) / denom.powi(3);
+        let stable_d3 = z * (z * z - 4.0 * z + 1.0) / denom.powi(4);
+        let stable_d4 = z * (z * z * z - 11.0 * z * z + 11.0 * z - 1.0) / denom.powi(5);
+
+        assert!(stable_d1 > 0.0);
+        assert!(stable_d2 < 0.0);
+        assert!(stable_d3 > 0.0);
+        assert!(stable_d4 < 0.0);
+
+        let jet = component_inverse_link_jet(LinkComponent::Logit, eta);
+        assert!(
+            (jet.d1 - stable_d1).abs() < 1e-30,
+            "logit d1 should equal the stable tail formula z/(1+z)^2 at eta={eta}; got {} vs {}",
+            jet.d1,
+            stable_d1
+        );
+        assert!(
+            (jet.d2 - stable_d2).abs() < 1e-30,
+            "logit d2 should equal the stable tail formula z(z-1)/(1+z)^3 at eta={eta}; got {} vs {}",
+            jet.d2,
+            stable_d2
+        );
+        assert!(
+            (jet.d3 - stable_d3).abs() < 1e-30,
+            "logit d3 should equal the stable tail formula z(z^2-4z+1)/(1+z)^4 at eta={eta}; got {} vs {}",
+            jet.d3,
+            stable_d3
+        );
+
+        let d4 = inverse_link_pdfthird_derivative_for_inverse_link(
+            &InverseLink::Standard(LinkFunction::Logit),
+            eta,
+        )
+        .expect("logit d4");
+        assert!(
+            (d4 - stable_d4).abs() < 1e-30,
+            "logit d4 should equal the stable tail formula z(z^3-11z^2+11z-1)/(1+z)^5 at eta={eta}; got {} vs {}",
+            d4,
+            stable_d4
+        );
+    }
+
+    #[test]
+    fn cloglog_negative_tail_value_should_match_expm1_form() {
+        let eta = -50.0_f64;
+        let t = eta.exp();
+        let stable_mu = -(-t).exp_m1();
+        assert!(stable_mu > 0.0);
+
+        let jet = component_inverse_link_jet(LinkComponent::CLogLog, eta);
+        assert!(
+            (jet.mu - stable_mu).abs() < 1e-30,
+            "cloglog mu should equal -expm1(-exp(eta)) in the negative tail at eta={eta}; got {} vs {}",
+            jet.mu,
+            stable_mu
+        );
+    }
 }
