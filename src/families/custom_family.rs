@@ -1056,7 +1056,7 @@ fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn solve_blockweighted_system(
     x: &DesignMatrix,
     y_star: &Array1<f64>,
@@ -1889,9 +1889,14 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
     Ok(2.0 * chol.diag().mapv(f64::ln).sum())
 }
 
-fn strict_psd_positive_part_inverse_and_logdet(
+struct PsdPositivePartGeometry {
+    pinv: Array2<f64>,
+    logdet: f64,
+}
+
+fn strict_psd_positive_part_geometry(
     matrix: &Array2<f64>,
-) -> Result<(Array2<f64>, f64), String> {
+) -> Result<PsdPositivePartGeometry, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower)
@@ -1917,18 +1922,17 @@ fn strict_psd_positive_part_inverse_and_logdet(
             }
         }
     }
-    Ok((pinv, logdet))
+    Ok(PsdPositivePartGeometry { pinv, logdet })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn strict_solve_spdwith_semidefinite_option(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
     allow_semidefinite: bool,
 ) -> Result<Array1<f64>, String> {
     if allow_semidefinite {
-        let (pinv, _) = strict_psd_positive_part_inverse_and_logdet(matrix)?;
-        return Ok(pinv.dot(rhs));
+        return Ok(strict_psd_positive_part_geometry(matrix)?.pinv.dot(rhs));
     }
     strict_solve_spd(matrix, rhs)
 }
@@ -1938,8 +1942,7 @@ fn strict_inverse_spdwith_semidefinite_option(
     allow_semidefinite: bool,
 ) -> Result<Array2<f64>, String> {
     if allow_semidefinite {
-        let (pinv, _) = strict_psd_positive_part_inverse_and_logdet(matrix)?;
-        return Ok(pinv);
+        return Ok(strict_psd_positive_part_geometry(matrix)?.pinv);
     }
     strict_inverse_spd(matrix)
 }
@@ -1949,8 +1952,7 @@ fn strict_logdet_spd_with_semidefinite_option(
     allow_semidefinite: bool,
 ) -> Result<f64, String> {
     if allow_semidefinite {
-        let (_, logdet) = strict_psd_positive_part_inverse_and_logdet(matrix)?;
-        return Ok(logdet);
+        return Ok(strict_psd_positive_part_geometry(matrix)?.logdet);
     }
     strict_logdet_spd(matrix)
 }
@@ -2567,12 +2569,7 @@ fn unified_joint_cost_gradient(
         EvalMode::ValueAndGradient
     };
 
-    let result = reml_laml_evaluate(
-        &inner_solution,
-        rho.as_slice().unwrap(),
-        eval_mode,
-        None,
-    )?;
+    let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), eval_mode, None)?;
 
     let cost = result.cost;
     let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
@@ -2846,11 +2843,7 @@ fn joint_outer_evaluate(
                 traces[[l, k]] = trsecond;
             }
         }
-        if traces_available {
-            Some(traces)
-        } else {
-            None
-        }
+        if traces_available { Some(traces) } else { None }
     } else {
         None
     };
@@ -3030,13 +3023,12 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         };
         let compute_d2h =
             |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-                match family
-                    .exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                        &synced_joint_states,
-                        specs,
-                        u,
-                        v,
-                    )? {
+                match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                    &synced_joint_states,
+                    specs,
+                    u,
+                    v,
+                )? {
                     Some(m) => Ok(Some(symmetrized_square_matrix(
                         m,
                         total,

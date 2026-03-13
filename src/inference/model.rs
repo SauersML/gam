@@ -1,5 +1,5 @@
 use crate::estimate::{BlockRole, FitResult, FittedLinkParameters, UnifiedFitResult};
-use crate::inference::predict::{PredictInput, PredictableModel, PredictionWithSE, StandardPredictor};
+use crate::inference::predict::{PredictableModel, StandardPredictor};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, BoundedCoefficientPriorSpec, LinearCoefficientGeometry,
@@ -554,21 +554,9 @@ impl FittedModel {
         self.predictor().map(|p| p.block_roles())
     }
 
-    /// Convenience: predict with uncertainty through the `PredictableModel` trait.
-    ///
-    /// For standard models, this delegates to `StandardPredictor`. Returns `Err`
-    /// for model types where the trait predictor is not yet implemented.
-    pub fn predict_via_trait(
-        &self,
-        input: &PredictInput,
-    ) -> Result<PredictionWithSE, crate::estimate::EstimationError> {
-        let predictor = self.predictor().ok_or_else(|| {
-            crate::estimate::EstimationError::InvalidInput(
-                "predict_via_trait is not yet supported for location-scale or survival models"
-                    .to_string(),
-            )
-        })?;
-        predictor.predict_with_uncertainty(input)
+    /// Access the unified fit result, if stored.
+    pub fn unified(&self) -> Option<&UnifiedFitResult> {
+        self.payload().unified.as_ref()
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, String> {

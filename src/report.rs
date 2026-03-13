@@ -16,12 +16,18 @@ pub struct ReportInput {
     pub edf_total: f64,
     pub r_squared: Option<f64>,
     pub coefficients: Vec<CoefficientRow>,
-    pub edf_blocks: Vec<(usize, f64)>,
+    pub edf_blocks: Vec<EdfBlockRow>,
     pub continuous_order: Vec<ContinuousOrderRow>,
     pub diagnostics: Option<DiagnosticsInput>,
     pub smooth_plots: Vec<SmoothPlotData>,
     pub alo: Option<AloData>,
     pub notes: Vec<String>,
+}
+
+pub struct EdfBlockRow {
+    pub index: usize,
+    pub edf: f64,
+    pub role: Option<String>,
 }
 
 pub struct CoefficientRow {
@@ -331,14 +337,43 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     };
 
     // EDF blocks
+    let has_roles = input.edf_blocks.iter().any(|b| b.role.is_some());
     let edf_rows = input
         .edf_blocks
         .iter()
-        .map(|(i, edf)| {
-            format!("<tr><td class=\"mono\">{i}</td><td class=\"num\">{edf:.4}</td></tr>")
+        .map(|b| {
+            if has_roles {
+                let role_label = b
+                    .role
+                    .as_deref()
+                    .unwrap_or("\u{2014}");
+                format!(
+                    "<tr><td class=\"mono\">{}</td><td>{}</td><td class=\"num\">{:.4}</td></tr>",
+                    b.index, esc(role_label), b.edf
+                )
+            } else {
+                format!(
+                    "<tr><td class=\"mono\">{}</td><td class=\"num\">{:.4}</td></tr>",
+                    b.index, b.edf
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let edf_header = if has_roles {
+        "<thead><tr><th>Block</th><th>Role</th><th>EDF</th></tr></thead>"
+    } else {
+        "<thead><tr><th>Block</th><th>EDF</th></tr></thead>"
+    };
+    let edf_section = format!(
+        "<section class=\"card\" id=\"sec-edf\">\n\
+         <h2>EDF by Penalty Block</h2>\n\
+         <div class=\"table-wrap\"><table>\n\
+         {edf_header}\n\
+         <tbody>{edf_rows}</tbody>\n\
+         </table></div>\n\
+         </section>"
+    );
 
     // Continuous smoothness order (only if present)
     let continuous_section = if input.continuous_order.is_empty() {
@@ -634,13 +669,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
 {coef_body}
 </section>
 
-<section class="card" id="sec-edf">
-<h2>EDF by Penalty Block</h2>
-<div class="table-wrap"><table>
-<thead><tr><th>Block</th><th>EDF</th></tr></thead>
-<tbody>{edf_rows}</tbody>
-</table></div>
-</section>
+{edf_section}
 
 {continuous_section}
 {diagnostics_section}
@@ -661,7 +690,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
         formula = formula_html,
         summary_items = summary_items,
         coef_body = coef_body,
-        edf_rows = edf_rows,
+        edf_section = edf_section,
         continuous_section = continuous_section,
         diagnostics_section = diagnostics_section,
         smooth_section = smooth_section,

@@ -289,9 +289,8 @@ mod tests {
             let f = |x: f64| exp_sigma_from_eta_scalar(x);
             let d1fd = (f(eta + h) - f(eta - h)) / (2.0 * h);
             let d2fd = (f(eta + h) - 2.0 * f(eta) + f(eta - h)) / (h * h);
-            let d3fd =
-                (f(eta + 2.0 * h) - 2.0 * f(eta + h) + 2.0 * f(eta - h) - f(eta - 2.0 * h))
-                    / (2.0 * h * h * h);
+            let d3fd = (f(eta + 2.0 * h) - 2.0 * f(eta + h) + 2.0 * f(eta - h) - f(eta - 2.0 * h))
+                / (2.0 * h * h * h);
             let d4fd = (f(eta + 2.0 * h) - 4.0 * f(eta + h) + 6.0 * f(eta) - 4.0 * f(eta - h)
                 + f(eta - 2.0 * h))
                 / h.powi(4);

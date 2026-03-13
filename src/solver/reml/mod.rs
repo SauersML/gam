@@ -46,9 +46,7 @@ mod tests {
         DirectionalHyperParam, EvalShared, FirthDenseOperator, LinkFunction, RemlConfig, RemlState,
     };
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
-    use crate::linalg::sparse_exact::{
-        dense_to_sparse_symmetric_upper, factorize_sparse_spd,
-    };
+    use crate::linalg::sparse_exact::{dense_to_sparse_symmetric_upper, factorize_sparse_spd};
     use crate::pirls::{PirlsCoordinateFrame, directionalworking_curvature_from_eta};
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};

@@ -1790,10 +1790,7 @@ impl<'a> RemlState<'a> {
                 };
                 if firth_active_for_derivs {
                     if let Some(firth_op) = bundle.firth_dense_operator.clone() {
-                        Box::new(super::unified::FirthAwareGlmDerivatives {
-                            base,
-                            firth_op,
-                        })
+                        Box::new(super::unified::FirthAwareGlmDerivatives { base, firth_op })
                     } else {
                         Box::new(base)
                     }
@@ -1901,9 +1898,8 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DispersionHandling, GaussianDerivatives, HessianOperator,
-            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives, SparseCholeskyOperator,
-            penalty_matrix_root,
+            DispersionHandling, GaussianDerivatives, HessianOperator, PenaltyLogdetDerivs,
+            SinglePredictorGlmDerivatives, SparseCholeskyOperator, penalty_matrix_root,
         };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -2040,9 +2036,7 @@ impl<'a> RemlState<'a> {
         // The sparse bundle caches a FirthDenseOperator built from the original
         // (non-reparameterized) design matrix in `firth_dense_operator_original`.
         // We reuse that cached operator here instead of rebuilding it each call.
-        let firth_gradient = if firth_logdet != 0.0
-            && mode != super::unified::EvalMode::ValueOnly
-        {
+        let firth_gradient = if firth_logdet != 0.0 && mode != super::unified::EvalMode::ValueOnly {
             if let Some(firth_op) = bundle.firth_dense_operator_original.as_ref() {
                 let x_dense_orig = self.x().to_dense();
                 let k = penalty_roots.len();
