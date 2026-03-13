@@ -1590,30 +1590,12 @@ where
                 n_params: k,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
-                use self::reml::unified::EvalMode;
-                let result = state.evaluate_via_unified(rho, EvalMode::ValueOnly)?;
-                Ok(result.cost)
+                state.compute_cost(rho)
             },
             eval_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                // Unified REML/LAML evaluator: cost and gradient are computed
-                // from the SAME HessianOperator in a single function call,
-                // guaranteeing spectral consistency between cost and gradient.
-                use self::reml::unified::EvalMode;
-                let result = state.evaluate_via_unified(
-                    rho,
-                    EvalMode::ValueAndGradient,
-                )?;
-                let cost = result.cost;
-                let grad = result.gradient.ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "unified evaluator returned no gradient".to_string(),
-                    )
-                })?;
-                // Hessian: use existing specialized strategies (sparse exact,
-                // analytic fallback) which have their own complex logic. The
-                // unified evaluator handles cost+gradient coherency; the Hessian
-                // is a separate concern with different accuracy trade-offs.
+                let cost = state.compute_cost(rho)?;
+                let grad = state.compute_gradient(rho)?;
                 let hessian = state.compute_lamlhessian_consistent(rho).ok();
                 Ok(OuterEval {
                     cost,
@@ -1631,11 +1613,8 @@ where
             },
         };
 
-        let strategy_result = crate::solver::strategy::run_outer(
-            &mut obj,
-            &outer_config,
-            "standard REML",
-        )?;
+        let strategy_result =
+            crate::solver::strategy::run_outer(&mut obj, &outer_config, "standard REML")?;
         let outer_result = strategy_result.into_smoothing_result();
         (
             outer_result.rho.clone(),
@@ -1688,55 +1667,104 @@ where
         smoothing_options_mix.fdhessian_max_dim = 0;
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         smoothing_options_mix.seed_config.num_auxiliary_trailing = aux_dim_outer;
-        let mut rho_buf = Array1::<f64>::zeros(k);
-        let mut mix_rho_buf = if use_mixture {
-            Some(Array1::<f64>::zeros(mixture_dim))
-        } else {
-            None
+        use crate::solver::strategy::{
+            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
         };
-        let mut leverage_buf = Array1::<f64>::zeros(y_o.len());
-        let mut score_beta_jacobian_diag_buf = Array1::<f64>::zeros(y_o.len());
-        let mut direct_ll_buf = vec![0.0_f64; aux_dim_outer];
-        let mut du_by_j_buf: Vec<Array1<f64>> = (0..aux_dim_outer)
-            .map(|_| Array1::<f64>::zeros(y_o.len()))
-            .collect();
-        let mut dw_explicit_by_j_buf: Vec<Array1<f64>> = (0..aux_dim_outer)
-            .map(|_| Array1::<f64>::zeros(y_o.len()))
-            .collect();
-        let mut mix_partials_buf_reuse = if use_mixture {
-            vec![
-                crate::mixture_link::InverseLinkJet {
-                    mu: 0.0,
-                    d1: 0.0,
-                    d2: 0.0,
-                    d3: 0.0,
+        let initial_link_kind = cfg.link_kind.clone();
+        let outer_config = OuterConfig {
+            tolerance: smoothing_options_mix.tol,
+            max_iter: smoothing_options_mix.max_iter,
+            fd_step: smoothing_options_mix.finite_diff_step,
+            seed_config: smoothing_options_mix.seed_config.clone(),
+            rho_bound: crate::estimate::RHO_BOUND,
+            heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
+            initial_rho: None,
+        };
+        let mut obj = ClosureObjective {
+            state: &mut reml_state,
+            cap: OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+            },
+            cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+                let rho = theta.slice(s![..k]).to_owned();
+                let mut cfg_eval = cfg.clone();
+                if use_mixture {
+                    let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
+                    cfg_eval.link_kind =
+                        InverseLink::Mixture(state_fromspec(&MixtureLinkSpec {
+                            components: mixspec.components.clone(),
+                            initial_rho: mix_rho,
+                        }).map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "invalid blended inverse link: {e}"
+                            ))
+                        })?);
+                }
+                if use_sas {
+                    let epsilon = if use_beta_logistic {
+                        theta[k]
+                    } else {
+                        let (v, _) = sas_effective_epsilon(theta[k]);
+                        v
+                    };
+                    let delta_like = theta[k + 1];
+                    cfg_eval.link_kind = if use_beta_logistic {
+                        InverseLink::BetaLogistic(
+                            state_from_beta_logisticspec(SasLinkSpec {
+                                initial_epsilon: epsilon,
+                                initial_log_delta: delta_like,
+                            })
+                            .map_err(|e| {
+                                EstimationError::InvalidInput(format!(
+                                    "invalid Beta-Logistic link: {e}"
+                                ))
+                            })?,
+                        )
+                    } else {
+                        InverseLink::Sas(
+                            state_from_sasspec(SasLinkSpec {
+                                initial_epsilon: epsilon,
+                                initial_log_delta: delta_like,
+                            })
+                            .map_err(|e| {
+                                EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                            })?,
+                        )
+                    };
+                }
+                state.set_link_states(
+                    cfg_eval.link_kind.mixture_state().cloned(),
+                    cfg_eval.link_kind.sas_state().copied(),
+                );
+                let mut cost = state.compute_cost(&rho)?;
+                let sasridge = if use_sas && !use_beta_logistic {
+                    sasridgeweight
+                } else {
+                    0.0
                 };
-                aux_dim_outer
-            ]
-        } else {
-            Vec::new()
-        };
-        let outer_result =
-            crate::solver::smoothing::optimize_log_smoothingwithmultistartwithgradient_andhessian(
-                theta_dim,
-                heuristic_theta_ref,
-                |theta: &Array1<f64>| {
+                if use_sas && sasridge > 0.0 {
+                    let log_delta = theta[k + 1];
+                    cost += 0.5 * sasridge * log_delta * log_delta;
+                    if !use_beta_logistic {
+                        let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+                        cost += barriercost;
+                    }
+                }
+                Ok(cost)
+            },
+            eval_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                     let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
-                    rho_buf.assign(&theta.slice(s![..k]));
+                    let rho = theta.slice(s![..k]).to_owned();
                     let mut cfg_eval = cfg.clone();
                     if use_mixture {
-                        let mix_rho_arr = mix_rho_buf.as_mut().ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "missing reusable mixture rho buffer".to_string(),
-                            )
-                        })?;
-                        mix_rho_arr.assign(&theta.slice(s![k..(k + mixture_dim)]));
-                        let spec_eval = MixtureLinkSpec {
-                            components: mixspec.components.clone(),
-                            initial_rho: mix_rho_arr.clone(),
-                        };
+                        let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
                         cfg_eval.link_kind =
-                            InverseLink::Mixture(state_fromspec(&spec_eval).map_err(|e| {
+                            InverseLink::Mixture(state_fromspec(&MixtureLinkSpec {
+                                components: mixspec.components.clone(),
+                                initial_rho: mix_rho,
+                            }).map_err(|e| {
                                 EstimationError::InvalidInput(format!(
                                     "invalid blended inverse link: {e}"
                                 ))
@@ -1775,11 +1803,11 @@ where
                         };
                     }
                     let tcost = Instant::now();
-                    reml_state.set_link_states(
+                    state.set_link_states(
                         cfg_eval.link_kind.mixture_state().cloned(),
                         cfg_eval.link_kind.sas_state().copied(),
                     );
-                    let mut cost = reml_state.compute_cost(&rho_buf)?;
+                    let mut cost = state.compute_cost(&rho)?;
                     let sasridge = if use_sas && !use_beta_logistic {
                         sasridgeweight
                     } else {
@@ -1797,9 +1825,9 @@ where
 
                     let tgrad = Instant::now();
                     let mut grad = Array1::<f64>::zeros(theta_dim);
-                    let grad_rho = reml_state.compute_gradient(&rho_buf)?;
+                    let grad_rho = state.compute_gradient(&rho)?;
                     grad.slice_mut(s![..k]).assign(&grad_rho);
-                    let (pirls_mix, h_posw) = reml_state.pirls_result_and_hpos_for_rho(&rho_buf)?;
+                    let (pirls_mix, h_posw) = state.pirls_result_and_hpos_for_rho(&rho)?;
                     if cfg_eval.firth_bias_reduction {
                         return Err(EstimationError::InvalidInput(
                         "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
@@ -1810,9 +1838,28 @@ where
                     let x_t = &pirls_mix.x_transformed;
                     let nobs = eta.len();
                     let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                    debug_assert_eq!(nobs, leverage_buf.len());
-                    score_beta_jacobian_diag_buf.fill(0.0);
-                    leverage_buf.fill(0.0);
+                    let mut leverage_buf = Array1::<f64>::zeros(nobs);
+                    let mut score_beta_jacobian_diag_buf = Array1::<f64>::zeros(nobs);
+                    let mut direct_ll_buf = vec![0.0_f64; aux_dim];
+                    let mut du_by_j_buf: Vec<Array1<f64>> = (0..aux_dim)
+                        .map(|_| Array1::<f64>::zeros(nobs))
+                        .collect();
+                    let mut dw_explicit_by_j_buf: Vec<Array1<f64>> = (0..aux_dim)
+                        .map(|_| Array1::<f64>::zeros(nobs))
+                        .collect();
+                    let mut mix_partials_buf_reuse = if use_mixture {
+                        vec![
+                            crate::mixture_link::InverseLinkJet {
+                                mu: 0.0,
+                                d1: 0.0,
+                                d2: 0.0,
+                                d3: 0.0,
+                            };
+                            aux_dim
+                        ]
+                    } else {
+                        Vec::new()
+                    };
                     if h_posw.ncols() > 0 {
                         match x_t {
                             DesignMatrix::Dense(x_dense) => {
@@ -1948,7 +1995,7 @@ where
                             let c_clean = Array1::from_shape_fn(c_arr.len(), |i| {
                                 if c_arr[i].is_finite() { c_arr[i] } else { 0.0 }
                             });
-                            let third_deriv = reml_state
+                            let third_deriv = state
                                 .third_derivative_projection_from_design(x_t, &c_clean)?;
                             let s_cubed = h_inv_diag.mapv(|s| s * s * s);
                             let tk_value: f64 = s_cubed
@@ -2047,10 +2094,26 @@ where
                         cost_sec,
                         grad_sec
                     );
-                    Ok((cost, grad, None))
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: HessianResult::Unavailable,
+                    })
                 },
-                &smoothing_options_mix,
-            )?;
+            reset_fn: |state: &mut &mut self::reml::RemlState<'_>| {
+                state.set_link_states(
+                    initial_link_kind.mixture_state().cloned(),
+                    initial_link_kind.sas_state().copied(),
+                );
+                let _ = state.x();
+            },
+        };
+        let strategy_result = crate::solver::strategy::run_outer(
+            &mut obj,
+            &outer_config,
+            "mixture/SAS flexible link",
+        )?;
+        let outer_result = strategy_result.into_smoothing_result();
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();

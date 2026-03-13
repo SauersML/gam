@@ -63,7 +63,7 @@ use gam::smooth::{
     TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use gam::smoothing::{SmoothingBfgsOptions, optimize_log_smoothingwithmultistart};
+use gam::solver::strategy::{ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval, HessianResult};
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
@@ -4357,7 +4357,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
 
         let mut fitted_inverse_link = survival_inverse_link.clone();
-        // Optimize link parameters via BFGS for parametric inverse-link families.
+        // Optimize link parameters via run_outer for parametric inverse-link families.
         let optimize_link_bfgs = |init: Array1<f64>,
                                   name: &str,
                                   mut objective: Box<
@@ -4366,29 +4366,45 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                                   recover: Box<dyn Fn(&Array1<f64>) -> Option<InverseLink>>|
          -> Option<InverseLink> {
             let dim = init.len();
-            let mut opt = SmoothingBfgsOptions {
+            let mut seed_config = gam::seeding::SeedConfig::default();
+            seed_config.max_seeds = 8;
+            seed_config.screening_budget = 3;
+            seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
+            let outer_config = OuterConfig {
+                tolerance: 1e-4,
                 max_iter: 30,
-                tol: 1e-4,
-                finite_diff_step: 1e-3,
-                ..SmoothingBfgsOptions::default()
+                fd_step: 1e-3,
+                seed_config,
+                rho_bound: 30.0,
+                heuristic_lambdas: Some(init.to_vec()),
+                initial_rho: None,
             };
-            opt.seed_config.max_seeds = 8;
-            opt.seed_config.screening_budget = 3;
-            opt.seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
-            match optimize_log_smoothingwithmultistart(
-                dim,
-                init.as_slice().map(|s| s as &[f64]),
-                &mut *objective,
-                &opt,
-            ) {
-                Ok(opt_res) => {
-                    if let Some(link) = recover(&opt_res.rho) {
+            let mut obj = ClosureObjective {
+                state: (),
+                cap: OuterCapability {
+                    gradient: Derivative::Unavailable,
+                    hessian: Derivative::Unavailable,
+                    n_params: dim,
+                },
+                cost_fn: |_state: &mut (), rho: &Array1<f64>| {
+                    objective(rho)
+                },
+                eval_fn: |_state: &mut (), _rho: &Array1<f64>| -> Result<OuterEval, EstimationError> {
+                    Err(EstimationError::InvalidInput(
+                        "eval not available for cost-only survival link optimization".to_string(),
+                    ))
+                },
+                reset_fn: |_state: &mut ()| {},
+            };
+            match gam::solver::strategy::run_outer(&mut obj, &outer_config, name) {
+                Ok(result) => {
+                    if let Some(link) = recover(&result.rho) {
                         eprintln!(
-                            "[survival link opt] optimized {name} params: dim={} iters={} stationary={} finalobj={:.6e}",
-                            opt_res.rho.len(),
-                            opt_res.iterations,
-                            opt_res.stationary,
-                            opt_res.final_value
+                            "[survival link opt] optimized {name} params: dim={} iters={} converged={} finalobj={:.6e}",
+                            result.rho.len(),
+                            result.iterations,
+                            result.converged,
+                            result.final_value
                         );
                         Some(link)
                     } else {
