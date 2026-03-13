@@ -869,6 +869,87 @@ impl HessianOperator for DenseSpectralOperator {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Sparse Cholesky HessianOperator implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Sparse Cholesky Hessian operator.
+///
+/// Wraps an existing `SparseExactFactor` and provides logdet, trace, and solve
+/// from the same Cholesky factorization.
+pub struct SparseCholeskyOperator {
+    /// The sparse Cholesky factorization.
+    factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
+    /// Precomputed log-determinant from the Cholesky diagonal.
+    cached_logdet: f64,
+    /// Dimension of H.
+    n_dim: usize,
+}
+
+impl SparseCholeskyOperator {
+    /// Create from an existing sparse factorization and its precomputed logdet.
+    pub fn new(
+        factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
+        logdet_h: f64,
+        dim: usize,
+    ) -> Self {
+        Self {
+            factor,
+            cached_logdet: logdet_h,
+            n_dim: dim,
+        }
+    }
+}
+
+impl HessianOperator for SparseCholeskyOperator {
+    fn logdet(&self) -> f64 {
+        self.cached_logdet
+    }
+
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        let mut trace = 0.0;
+        for j in 0..a.ncols() {
+            let col = a.column(j).to_owned();
+            match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, &col) {
+                Ok(sol) => trace += sol[j],
+                Err(e) => {
+                    log::warn!("SparseCholeskyOperator::trace_hinv_product solve failed: {e}");
+                    return f64::NAN;
+                }
+            }
+        }
+        trace
+    }
+
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!("SparseCholeskyOperator::solve failed: {e}");
+                Array1::zeros(self.n_dim)
+            }
+        }
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!("SparseCholeskyOperator::solve_multi failed: {e}");
+                Array2::zeros((self.n_dim, rhs.ncols()))
+            }
+        }
+    }
+
+    fn active_rank(&self) -> usize {
+        self.n_dim
+    }
+
+    fn dim(&self) -> usize {
+        self.n_dim
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Block-coupled derivative provider (GAMLSS, survival, link wiggles)
 // ═══════════════════════════════════════════════════════════════════════════
 
