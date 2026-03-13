@@ -3936,9 +3936,9 @@ impl fmt::Display for ModelSummary {
 }
 
 pub use crate::inference::predict::{
-    CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
+    CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod, PredictInput,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
-    coefficient_uncertainty, coefficient_uncertaintywith_mode, predict_gam,
+    PredictableModel, coefficient_uncertainty, coefficient_uncertaintywith_mode, predict_gam,
     predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use crate::solver::smoothing::{
