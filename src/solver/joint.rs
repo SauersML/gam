@@ -1624,6 +1624,10 @@ impl<'a> JointRemlState<'a> {
         let mut mu = Array1::<f64>::zeros(n);
         let mut weights = Array1::<f64>::zeros(n);
         let mut third_deriv_weights = Array1::<f64>::zeros(n);
+        // Integrated GHQ derivatives: d1 = dE[h(η+ε)]/dη, d2 = d²E[h(η+ε)]/dη².
+        // Stored per observation for use in w_prime when covariate_se is active.
+        let mut integrated_d1 = Array1::<f64>::zeros(n);
+        let mut integrated_d2 = Array1::<f64>::zeros(n);
         let is_gaussian = matches!(state.link, LinkFunction::Identity);
 
         match state.link {
@@ -1654,6 +1658,12 @@ impl<'a> JointRemlState<'a> {
                     mu[i] = moments.mean;
                     let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
                     weights[i] = state.weights[i] * w;
+                    integrated_d1[i] = moments.d1;
+                    integrated_d2[i] = if moments.d2.is_finite() {
+                        moments.d2
+                    } else {
+                        0.0
+                    };
                     // Third derivative for GLM gradient correction.
                     // For binomial logit: d³(-ℓ)/dη³ = μ(1-μ)(1-2μ)
                     if matches!(state.link, LinkFunction::Logit) {
@@ -1851,13 +1861,33 @@ impl<'a> JointRemlState<'a> {
         let (precomputed_h_k_corrections, firth_gradient, precomputed_h_ddot_traces) =
             if !is_gaussian && p_link > 0 {
                 // w_prime = dW/dη for each observation.
+                //
+                // For integrated logit (covariate_se active), the IRLS weight is
+                //   W = obsw · d1² / var,  var = μ(1−μ), d1 = dE[sigmoid(η+ε)]/dη.
+                // Its η-derivative uses GHQ derivatives d1, d2:
+                //   dW/dη = obsw · [2·d1·d2/var − d1²·var'/(var²)]
+                // where var' = d1·(1−2μ).
+                //
+                // For standard logit (no integration): d1 = μ(1−μ), d2 = d1·(1−2μ),
+                // and the formula reduces to obsw · μ(1−μ)(1−2μ).
                 let mut w_prime = Array1::<f64>::zeros(n);
                 let mut w_double_prime = Array1::<f64>::zeros(n);
                 if matches!(state.link, LinkFunction::Logit) {
+                    let use_integrated = state.covariate_se.is_some();
                     for i in 0..n {
                         let p_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
                         let w_base = p_i * (1.0 - p_i);
-                        w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * p_i);
+                        if use_integrated {
+                            let d1 = integrated_d1[i].abs().max(1e-8);
+                            let d2 = integrated_d2[i];
+                            let var = w_base.max(1e-12);
+                            let var_prime = d1 * (1.0 - 2.0 * p_i);
+                            let dw_deta =
+                                (2.0 * d1 * d2) / var - (d1 * d1) * (var_prime / (var * var));
+                            w_prime[i] = state.weights[i] * dw_deta;
+                        } else {
+                            w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * p_i);
+                        }
                         w_double_prime[i] =
                             state.weights[i] * w_base * ((1.0 - 2.0 * p_i).powi(2) - 2.0 * w_base);
                         if !w_prime[i].is_finite() {
