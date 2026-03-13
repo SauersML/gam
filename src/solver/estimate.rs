@@ -51,7 +51,7 @@ use crate::types::{
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_ata,
@@ -3938,13 +3938,6 @@ where
     fit_gamwith_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
 }
 
-const GRAD_DIAG_FD_WARMUP_EVALS: u64 = 5;
-const GRAD_DIAG_FD_INTERVAL: u64 = 25;
-const GRAD_DIAG_SEVERE_KKT_NORM: f64 = 1e-2;
-const GRAD_DIAG_SEVERE_RIDGE_MISMATCH: f64 = 1e-6;
-const GRAD_DIAG_SEVERE_BLEED_ENERGY: f64 = 1e-2;
-const GRAD_DIAG_SEVERE_RIDGE_IMPACT: f64 = 1e-2;
-const GRAD_DIAG_SEVERE_PHANTOM_PENALTY: f64 = 1e-3;
 const FIRTH_BASE_MINORITY_SUPPORT: f64 = 20.0;
 const FIRTH_MINORITY_PER_PARAMETER: f64 = 2.0;
 
@@ -4024,12 +4017,6 @@ fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms 
         variance: mu * one_minusmu,
         variancemu_scale: 1.0 - 2.0 * mu,
     }
-}
-
-#[inline]
-fn should_samplegradient_diagfd(eval_idx: u64) -> bool {
-    eval_idx <= GRAD_DIAG_FD_WARMUP_EVALS
-        || (GRAD_DIAG_FD_INTERVAL > 0 && eval_idx % GRAD_DIAG_FD_INTERVAL == 0)
 }
 
 #[inline]
