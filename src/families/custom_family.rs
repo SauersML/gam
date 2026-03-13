@@ -2181,6 +2181,7 @@ impl BlockEtaCheckpoint {
         alpha: f64,
         direction: &Array1<f64>,
     ) {
+        // In-place: eta = eta_backup + alpha * xd (zero allocations).
         state.eta.assign(&self.saved);
         state.eta.scaled_add(alpha, direction);
     }
@@ -2324,6 +2325,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
             // Damped update: require non-increasing penalized objective under dynamic geometry.
             // Precompute X * delta once so line-search eta updates are O(n) not O(np).
+            // Swap eta into backup buffer instead of cloning to avoid O(n) allocation.
             let eta_checkpoint = BlockEtaCheckpoint::capture(&states[b]);
             let x_delta = if !is_dynamic {
                 Some(spec.design.matrixvectormultiply(&delta))
@@ -2507,7 +2509,8 @@ fn unified_joint_cost_gradient(
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
     precomputed_corrections: Vec<Option<Array2<f64>>>,
-) -> Result<(f64, Array1<f64>), String> {
+    precomputed_h_ddot_traces: Option<Array2<f64>>,
+) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
     // Build DenseSpectralOperator from the trace Hessian.
     let hop = DenseSpectralOperator::from_symmetric(j_for_traces)
         .map_err(|e| format!("DenseSpectralOperator from joint Hessian: {e}"))?;
@@ -2565,20 +2568,26 @@ fn unified_joint_cost_gradient(
             include_logdet_s,
         },
         precomputed_h_k_corrections: Some(precomputed_corrections),
-        precomputed_h_ddot_traces: None,
+        precomputed_h_ddot_traces: precomputed_h_ddot_traces.clone(),
+    };
+
+    let eval_mode = if precomputed_h_ddot_traces.is_some() {
+        EvalMode::ValueGradientHessian
+    } else {
+        EvalMode::ValueAndGradient
     };
 
     let result = reml_laml_evaluate(
         &inner_solution,
         rho.as_slice().unwrap(),
-        EvalMode::ValueAndGradient,
+        eval_mode,
         None,
     )?;
 
     let cost = result.cost;
     let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
 
-    Ok((cost, gradient))
+    Ok((cost, gradient, result.hessian))
 }
 
 /// Pre-compute third-derivative corrections for each smoothing parameter.
@@ -2948,7 +2957,70 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 need_hessian,
                 &compute_dh_exact,
             )?;
-        let (objective, grad) = unified_joint_cost_gradient(
+        // Pre-compute tr(H⁻¹ Ḧ_{kl}) for the outer Hessian when needed.
+        let h_ddot_traces = if need_hessian && include_logdet_h {
+            let k_count = rho.len();
+            let mut traces = Array2::<f64>::zeros((k_count, k_count));
+            let mut traces_available = true;
+            'outer_loop: for k in 0..k_count {
+                for l in k..k_count {
+                    let delta_kl = if k == l { 1.0 } else { 0.0 };
+                    let rhs_kl = -(a_terms[k].dot(&u_terms[l])
+                        + j_terms[l].dot(&u_terms[k])
+                        + delta_kl * a_beta_terms[k].clone());
+                    let u_kl = j_mode_inv_ref.dot(&rhs_kl);
+                    let dh_u_kl = match family
+                        .exact_newton_joint_hessian_directional_derivative_with_specs(
+                            &synced_joint_states,
+                            specs,
+                            &u_kl,
+                        )? {
+                        Some(v) => symmetrized_square_matrix(
+                            v,
+                            total,
+                            "joint exact-newton second-order dH shape mismatch",
+                        )?,
+                        None => {
+                            traces_available = false;
+                            break 'outer_loop;
+                        }
+                    };
+                    let d2h_ul_uk = match family
+                        .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                            &synced_joint_states,
+                            specs,
+                            &u_terms[l],
+                            &u_terms[k],
+                        )? {
+                        Some(v) => symmetrized_square_matrix(
+                            v,
+                            total,
+                            "joint exact-newton d2H shape mismatch",
+                        )?,
+                        None => {
+                            traces_available = false;
+                            break 'outer_loop;
+                        }
+                    };
+                    let mut j_kl = dh_u_kl;
+                    j_kl += &d2h_ul_uk;
+                    if delta_kl > 0.0 {
+                        j_kl += &a_terms[k];
+                    }
+                    let trsecond = trace_product(&h_inv, &j_kl);
+                    traces[[k, l]] = trsecond;
+                    traces[[l, k]] = trsecond;
+                }
+            }
+            if traces_available {
+                Some(traces)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
             &inner,
             specs,
             &per_block,
@@ -2962,146 +3034,8 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             include_logdet_s,
             options,
             precomputed_corrections,
+            h_ddot_traces,
         )?;
-        let mut outer_hessian: Option<Array2<f64>> = None;
-        if need_hessian {
-            // Precompute h_inv @ j_terms[k] for all k: tr(H^{-1} A H^{-1} B)
-            // becomes trace_product(C_A, C_B) at O(p²) instead of 2×O(p³).
-            let hinv_jterms: Vec<Array2<f64>> = if include_logdet_h {
-                j_terms.iter().map(|jt| h_inv.dot(jt)).collect()
-            } else {
-                Vec::new()
-            };
-            let spinv_aterms: Vec<Array2<f64>> = if include_logdet_s {
-                let sp = s_pinv_joint
-                    .as_ref()
-                    .ok_or_else(|| "missing joint S^+ for REML Hessian".to_string())?;
-                a_terms.iter().map(|at| sp.dot(at)).collect()
-            } else {
-                Vec::new()
-            };
-            let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
-            let mut hess_available = true;
-            for k in 0..rho.len() {
-                for l in k..rho.len() {
-                    // Exact profiled/Laplace Hessian entry for rho = log lambda:
-                    //
-                    //   d^2J / (drho_k drho_l)
-                    //   = u_l^T A_k beta
-                    //     + 0.5 beta^T B_{k,l} beta
-                    //     + 0.5 tr(H^{-1} ddot H_{k,l})
-                    //     - 0.5 tr(H^{-1} dot H_l H^{-1} dot H_k)
-                    //     - 0.5 d^2/drho_k drho_l log|S|_+.
-                    //
-                    // For simple log-scaled penalties, B_{k,l} = delta_{k,l} A_k.
-                    // The code stores
-                    //
-                    //   dot H_k = A_k + D_beta H_L[u_k]
-                    //
-                    // in `j_terms[k]`, then forms
-                    //
-                    //   ddot H_{k,l}
-                    //   = D_beta H_L[u_{k,l}]
-                    //     + D_beta^2 H_L[u_l, u_k]
-                    //     + delta_{k,l} A_k.
-                    //
-                    // The second mode response is solved from
-                    //
-                    //   H u_{k,l}
-                    //   = -(A_k u_l + dot H_l u_k + delta_{k,l} A_k beta),
-                    //
-                    // which is the log-scaled specialization of
-                    //
-                    //   H u_{k,l}
-                    //   = -(A_k u_l + A_l u_k + B_{k,l} beta + D_beta H_L[u_l] u_k).
-                    //
-                    // The positive-part penalty term below is the corresponding
-                    // second derivative of -0.5 log|S|_+.
-                    let delta_kl = if k == l { 1.0 } else { 0.0 };
-                    let mut v_kl = a_beta_terms[k].dot(&u_terms[l])
-                        + 0.5 * delta_kl * beta_flat.dot(&a_beta_terms[k]);
-                    if include_logdet_h || include_logdet_s {
-                        // Use precomputed h_inv @ j_terms products: O(p²) trace
-                        // instead of 2×O(p³) matmul per pair.
-                        let tr_prod = trace_product(&hinv_jterms[l], &hinv_jterms[k]);
-                        // Second-order sensitivity:
-                        //   J u_{k,l} = -(J_l u_k + A_k u_l + delta_{k,l} A_k beta).
-                        let rhs_kl = -(a_terms[k].dot(&u_terms[l])
-                            + j_terms[l].dot(&u_terms[k])
-                            + delta_kl * a_beta_terms[k].clone());
-                        let u_kl = j_mode_inv_ref.dot(&rhs_kl);
-                        let dh_u_kl = match family
-                            .exact_newton_joint_hessian_directional_derivative_with_specs(
-                                &synced_joint_states,
-                                specs,
-                                &u_kl,
-                            )? {
-                            Some(v) => symmetrized_square_matrix(
-                                v,
-                                total,
-                                "joint exact-newton second-order dH shape mismatch",
-                            )?,
-                            None => {
-                                hess_available = false;
-                                break;
-                            }
-                        };
-                        let d2h_ul_uk = match family
-                            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                                &synced_joint_states,
-                                specs,
-                                &u_terms[l],
-                                &u_terms[k],
-                            )? {
-                            Some(v) => symmetrized_square_matrix(
-                                v,
-                                total,
-                                "joint exact-newton d2H shape mismatch",
-                            )?,
-                            None => {
-                                hess_available = false;
-                                break;
-                            }
-                        };
-                        // J_{k,l} chain rule with log-lambda correction:
-                        //   J_{k,l} = dH[u_{k,l}] + d^2H[u_l,u_k] + delta_{k,l} A_k.
-                        let mut j_kl = dh_u_kl;
-                        j_kl += &d2h_ul_uk;
-                        if delta_kl > 0.0 {
-                            j_kl += &a_terms[k];
-                        }
-                        let trsecond = trace_product(&h_inv, &j_kl);
-                        let tr_h = if include_logdet_h {
-                            0.5 * (-tr_prod + trsecond)
-                        } else {
-                            0.0
-                        };
-                        let tr_p = if include_logdet_s {
-                            0.5 * trace_product(&spinv_aterms[l], &spinv_aterms[k])
-                                - 0.5
-                                    * delta_kl
-                                    * trace_product(
-                                        s_pinv_joint.as_ref().ok_or_else(|| {
-                                            "missing joint S^+ for REML Hessian".to_string()
-                                        })?,
-                                        &a_terms[k],
-                                    )
-                        } else {
-                            0.0
-                        };
-                        v_kl += tr_h + tr_p;
-                    }
-                    hess[[k, l]] = v_kl;
-                    hess[[l, k]] = v_kl;
-                }
-                if !hess_available {
-                    break;
-                }
-            }
-            if hess_available {
-                outer_hessian = Some(hess);
-            }
-        }
         let warm = ConstrainedWarmStart {
             rho: rho.clone(),
             block_beta: inner
@@ -3237,7 +3171,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 need_hessian,
                 &compute_dh_surrogate,
             )?;
-        let (objective, grad) = unified_joint_cost_gradient(
+        let (objective, grad, _) = unified_joint_cost_gradient(
             &inner,
             specs,
             &per_block,
@@ -3251,6 +3185,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             include_logdet_s,
             options,
             precomputed_corrections,
+            None,
         )?;
         let mut outer_hessian: Option<Array2<f64>> = None;
         if need_hessian {
@@ -3533,6 +3468,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                     )?;
                     let mut correction_mat = Array2::<f64>::zeros((p, p));
 
+                    // Exploit block-diagonal structure: A_k is zero except in [start..end, start..end].
                     // Geometry drift: (DX)' W X + X' W (DX).
                     if let Some(geom_dir) = geom {
                         d_eta += &geom_dir.d_offset;
@@ -3591,7 +3527,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     }
 
     // Route through unified evaluator: build InnerSolution for this single block.
-    let (objective, grad) = {
+    let (objective, grad, _) = {
         let per_block_single = vec![per_block[b].clone()];
         let ranges_single = vec![(0usize, p)];
         unified_joint_cost_gradient(
@@ -3608,6 +3544,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             include_logdet_s,
             options,
             corrections,
+            None,
         )?
     };
 
@@ -3871,6 +3808,7 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
     // Precompute h_mode inverse once for all mode sensitivity solves.
     let h_mode_inv = {
         let h_inv_raw = if strict_spd || extra_logdet_ridge == 0.0 {
+            // h_for_logdet == h_mode, reuse h_inv
             std::borrow::Cow::Borrowed(&h_inv)
         } else {
             std::borrow::Cow::Owned(logdet_trace_inverse_with_ridge_policy(

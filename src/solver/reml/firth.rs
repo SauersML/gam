@@ -1,5 +1,4 @@
 use super::*;
-use crate::utils::KahanSum;
 use ndarray::ShapeBuilder;
 
 impl<'a> RemlState<'a> {
@@ -147,26 +146,6 @@ impl<'a> RemlState<'a> {
         acc
     }
 
-    pub(crate) fn bilinear_form(
-        mat: &Array2<f64>,
-        left: ndarray::ArrayView1<'_, f64>,
-        right: ndarray::ArrayView1<'_, f64>,
-    ) -> f64 {
-        let n = mat.nrows();
-        debug_assert_eq!(mat.ncols(), n);
-        debug_assert_eq!(left.len(), n);
-        debug_assert_eq!(right.len(), n);
-        let mut acc = KahanSum::default();
-        for i in 0..n {
-            let mut row_dot = 0.0_f64;
-            for j in 0..n {
-                row_dot += mat[[i, j]] * right[j];
-            }
-            acc.add(left[i] * row_dot);
-        }
-        acc.sum()
-    }
-
     pub(crate) fn reducedweighted_gram(z: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
         // Returns Zᵀ diag(weights) Z (exact).
         //
@@ -252,13 +231,6 @@ impl<'a> RemlState<'a> {
 
     pub(super) fn firth_direction(op: &FirthDenseOperator, u: &Array1<f64>) -> FirthDirection {
         op.direction(u)
-    }
-
-    pub(super) fn firth_direction_from_deta(
-        op: &FirthDenseOperator,
-        deta: Array1<f64>,
-    ) -> FirthDirection {
-        op.direction_from_deta(deta)
     }
 
     pub(super) fn firth_hphi_direction(

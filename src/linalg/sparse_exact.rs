@@ -208,26 +208,6 @@ pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>)
     dense
 }
 
-fn sparse_matvec<S: Data<Elem = f64>>(
-    matrix: &SparseColMat<usize, f64>,
-    vector: &ArrayBase<S, Ix1>,
-) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(matrix.nrows());
-    let (symbolic, values) = matrix.parts();
-    let col_ptr = symbolic.col_ptr();
-    let row_idx = symbolic.row_idx();
-    for col in 0..matrix.ncols() {
-        let x = vector[col];
-        if x == 0.0 {
-            continue;
-        }
-        for idx in col_ptr[col]..col_ptr[col + 1] {
-            out[row_idx[idx]] += values[idx] * x;
-        }
-    }
-    out
-}
-
 pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     matrix: &SparseColMat<usize, f64>,
     vector: &ArrayBase<S, Ix1>,
@@ -704,13 +684,6 @@ pub fn build_sparse_penalty_blocks(
         });
     }
     Ok(Some(blocks))
-}
-
-pub fn sparse_matvec_public<S: Data<Elem = f64>>(
-    matrix: &SparseColMat<usize, f64>,
-    vector: &ArrayBase<S, Ix1>,
-) -> Array1<f64> {
-    sparse_matvec(matrix, vector)
 }
 
 #[cfg(test)]
