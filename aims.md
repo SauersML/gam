@@ -257,3 +257,102 @@ The REML optimization is over $\rho = (\log\lambda_1, \ldots, \log\lambda_K, \lo
 - Both use the same directional derivative machinery for $D_\beta H_L$?
 
 What mathematical conditions distinguish "inner" from "outer" hyperparameters?
+
+---
+
+## 7. Additional Questions (from external review)
+
+### Q7: Firth bias reduction in multi-block / joint space
+
+Firth bias reduction adds a penalty $\frac{1}{2}\log|I(\beta)|$ to the log-likelihood, where $I(\beta)$ is the Fisher information matrix. For a single-predictor GLM, $I = X^\top W X$ and the Firth-corrected score is well-known (Firth 1993).
+
+**For multi-block models** (e.g., GAMLSS with location $\mu$ and scale $\sigma$ jointly estimated), the Fisher information is the **full joint** information matrix coupling all predictors:
+$$I(\alpha) = J^\top W J$$
+where $\alpha = (\beta_\mu, \beta_\sigma, \ldots)$ and $J$ is the joint Jacobian.
+
+The Firth-corrected REML objective would be:
+$$V_{\text{Firth}}(\theta) = V(\theta) + \tfrac{1}{2}\log|I(\hat\alpha(\theta))|$$
+
+**Questions**:
+(a) What is $\frac{\partial}{\partial\rho_k}\bigl[\tfrac{1}{2}\log|I(\hat\alpha(\rho))|\bigr]$? The chain rule through $\hat\alpha(\rho)$ introduces the mode response, so this involves $D_\alpha\log|I|[\alpha_k]$ where $\alpha_k = -H^{-1}g_k$.
+
+(b) For block-diagonal $I$ (uncoupled predictors), does the Firth gradient decompose block-locally? i.e., can each block compute its own Firth correction independently?
+
+(c) For coupled blocks (e.g., location-scale with shared observations), how does the cross-block coupling in $I$ affect the Firth gradient? Is there a tractable formula, or does one need a full $p_{\text{total}} \times p_{\text{total}}$ sensitivity solve?
+
+### Q8: Smoothness of the pseudo-determinant $\log|S(\theta)|_+$
+
+The REML objective uses $\log|S(\theta)|_+$, the log-product of positive eigenvalues of $S(\theta)$. The rank of $S$ is assumed structurally fixed (determined by the null space of the penalty, e.g., polynomials for spline penalties).
+
+**Problem**: As $\theta$ varies (especially $\psi$ directions that change penalty structure), eigenvalues of $S$ can cross zero, causing:
+- $\log|S|_+$ to have a discontinuous gradient (the rank changes)
+- Newton/ARC steps to become unreliable near the rank-transition boundary
+
+**Questions**:
+(a) Under what conditions on $S(\theta)$ is $\log|S(\theta)|_+$ smooth (i.e., $C^2$) over the entire optimization domain? Is it sufficient that each $S_k$ has a fixed null space?
+
+(b) When smoothness fails, what is the correct remedy? Options:
+  - **Soft rank**: Replace $\log|S|_+ = \sum_{\sigma_i > 0}\log\sigma_i$ with a smooth approximation like $\sum_i \log(\sigma_i + \epsilon)$ or $\sum_i \log\max(\sigma_i, \epsilon)$. Does this bias the REML estimate?
+  - **Analytic continuation**: Is there a formula for $\log|S|_+$ that remains analytic even through rank transitions?
+  - **Constraint**: Should the optimizer be constrained to the manifold where $\text{rank}(S)$ is constant?
+
+(c) For the specific case $S(\rho,\psi) = \sum_k \lambda_k S_k(\psi)$, if each $S_k(\psi)$ has constant rank but the combined $S$ does not, does this cause problems in practice?
+
+### Q9: Cross-predictor curvature in location-scale models
+
+In a GAMLSS (location-scale) model with two predictors $\eta_\mu = X_\mu\beta_\mu$ and $\eta_\sigma = X_\sigma\beta_\sigma$, the joint negative log-likelihood Hessian has the block structure:
+$$H_L = \begin{pmatrix} H_{\mu\mu} & H_{\mu\sigma} \\ H_{\sigma\mu} & H_{\sigma\sigma} \end{pmatrix}$$
+
+where the off-diagonal blocks $H_{\mu\sigma}$ represent the curvature coupling between location and scale.
+
+For a Gaussian location-scale model with $y_i \sim N(\mu_i, \sigma_i^2)$:
+$$H_{\mu\mu} = X_\mu^\top\text{diag}(1/\sigma_i^2)\,X_\mu, \quad H_{\mu\sigma} = X_\mu^\top\text{diag}(2r_i/\sigma_i^2)\,X_\sigma$$
+where $r_i = (y_i - \mu_i)/\sigma_i$.
+
+**Questions**:
+(a) The directional derivative $D_\beta H_L[u]$ for the joint system must account for how perturbing $\beta_\mu$ affects $H_{\sigma\sigma}$ (through $r_i$) and vice versa. Write out $D_\beta H_L[u]$ explicitly for the Gaussian location-scale case, showing all cross-block terms.
+
+(b) Can the $D_\beta H_L[u]$ for coupled blocks be decomposed as a sum of "within-block" terms (expressible as $X_b^\top\text{diag}(\cdot)X_b$) and "cross-block" terms (expressible as $X_a^\top\text{diag}(\cdot)X_b$)? If so, what are the weight vectors for each term?
+
+(c) For the second directional derivative $D^2_\beta H_L[u, v]$, how many independent "weight-like" vectors are needed? The single-predictor case needs $W'$ and $W''$. The coupled case presumably needs partial derivatives of each block of $H_L$ w.r.t. each linear predictor.
+
+### Q10: Corrected covariance $V_\beta^*$ under $\psi$
+
+Wood (2016) defines the corrected covariance for smoothing parameter uncertainty:
+$$V_\beta^* = V_\beta + V_\beta\,\nabla_\beta^2 V \cdot (\nabla_\theta^2 V)^{-1}\cdot \nabla_\beta^2 V\, V_\beta$$
+
+(simplified; the actual formula involves mixed $\beta$-$\theta$ derivatives of the LAML objective).
+
+**Questions**:
+(a) When $\theta = (\rho, \psi)$, does the $V_\beta^*$ correction require new mathematical objects beyond those needed for $\nabla^2_\theta V$? Or is it purely a function of the outer Hessian and the $\beta$-$\theta$ coupling that's already computed?
+
+(b) For the psi directions, the $\beta$-$\theta$ coupling involves $\frac{\partial\hat\beta}{\partial\psi_j} = -H^{-1}g_j$ where $g_j$ includes family-specific terms. Does this coupling affect the corrected covariance qualitatively differently from the $\rho$ coupling?
+
+### Q11: Non-polynomial hyperparameters (Matérn $\kappa$, SAS $\epsilon$)
+
+The $\psi$ framework in Section 1.1 assumes a second-order Taylor expansion:
+$$X(\psi) = X_0 + \sum_j\psi_j X_{\tau_j} + \tfrac{1}{2}\sum_{i,j}\psi_i\psi_j X_{ij}$$
+
+This is exact when $X$ depends on $\psi$ polynomially (e.g., anisotropy ratios that linearly scale coordinates).
+
+**But** some hyperparameters enter non-polynomially:
+- **Matérn length scale $\kappa$**: The Matérn covariance $C(r) = \frac{2^{1-\nu}}{\Gamma(\nu)}(\kappa r)^\nu K_\nu(\kappa r)$ depends on $\kappa$ through a Bessel function. The penalty $S(\kappa) = C(\kappa)^{-1}$ and the basis $X(\kappa)$ (if using a finite-element representation) are non-polynomial in $\kappa$.
+- **SAS link shape $\epsilon$**: The sinh-arcsinh link $g(u; \epsilon) = \sinh(\epsilon^{-1}\sinh^{-1}(u) + \delta)$ depends non-polynomially on $\epsilon$.
+
+**Questions**:
+(a) Can the profiled calculus from Section 2 be applied to non-polynomial hyperparameters by simply computing $X_\tau = \frac{\partial X}{\partial\kappa}$ and $X_{\tau\tau} = \frac{\partial^2 X}{\partial\kappa^2}$ numerically at the current $\kappa$, and treating the optimization as a sequence of local quadratic models?
+
+(b) If so, is the truncation error (ignoring $O(\Delta\kappa^3)$ terms) acceptable for Newton steps, or does it cause convergence issues? Does the outer optimizer need to be aware that the model is only locally quadratic?
+
+(c) Is there a better approach for non-polynomial hyperparameters — e.g., embedding them as separate coordinates in $\theta$ with their own "hyper-gradient" computed by automatic differentiation, rather than the Taylor expansion framework?
+
+### Q12: Reparameterization invariance
+
+Before fitting, the design matrix $X$ may be column-conditioned: $\tilde{X} = X D^{-1}$ where $D$ is a diagonal scaling matrix (e.g., column standard deviations). The fitted coefficients are $\tilde\beta = D\beta$, and the Hessian transforms as $\tilde{H} = D^{-1}HD^{-1}$.
+
+**Questions**:
+(a) Is the REML/LAML objective $V(\theta)$ invariant under this reparameterization? i.e., does $V(\theta; X, S) = V(\theta; \tilde{X}, \tilde{S})$ where $\tilde{S} = D^{-1}SD^{-1}$? If so, prove it. If not, identify which terms break invariance.
+
+(b) The penalty $\log|S|_+$ transforms as $\log|\tilde{S}|_+ = \log|S|_+ - 2\sum_{j\in\text{range}}\log d_j$. Does this constant offset matter for optimization (it shouldn't affect $\nabla_\theta V$), or are there subtle issues with the nullspace dimension $M_p$?
+
+(c) For the profiled Gaussian case, the dispersion $\hat\phi = D_p/(n-M_p)$ involves the penalized deviance $D_p = \|y - X\hat\beta\|^2 + \hat\beta^\top S\hat\beta$. Is $D_p$ invariant under column conditioning? (The residuals $y - X\hat\beta = y - \tilde{X}\tilde\beta$ are invariant, and $\hat\beta^\top S\hat\beta = \tilde\beta^\top\tilde{S}\tilde\beta$, so yes — but confirm.)
