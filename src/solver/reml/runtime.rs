@@ -1514,85 +1514,73 @@ impl<'a> RemlState<'a> {
         if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_cost_sparse_exact(p, &bundle);
         }
-        let pirls_result = bundle.pirls_result.as_ref();
-        let ridge_used = bundle.ridge_passport.delta;
-
-        let lambdas = p.mapv(f64::exp);
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let (h_eff_eval, h_total_eval, e_eval) = if let Some(z) = free_basis_opt.as_ref() {
-            (
-                Self::projectwith_basis(bundle.h_eff.as_ref(), z),
-                Self::projectwith_basis(bundle.h_total.as_ref(), z),
-                pirls_result.reparam_result.e_transformed.dot(z),
-            )
-        } else {
-            (
-                bundle.h_eff.as_ref().clone(),
-                bundle.h_total.as_ref().clone(),
-                pirls_result.reparam_result.e_transformed.clone(),
-            )
-        };
-        let h_eff = &h_eff_eval;
-
-        // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
-        if !p.is_empty() {
-            let k_lambda = p.len();
-            let k_r = pirls_result.reparam_result.rs_transformed.len();
-            let k_d = pirls_result.reparam_result.det1.len();
-            if !(k_lambda == k_r && k_r == k_d) {
-                return Err(EstimationError::LayoutError(format!(
-                    "Penalty dimension mismatch: lambdas={}, R={}, det1={}",
-                    k_lambda, k_r, k_d
-                )));
-            }
-            if self.nullspace_dims.len() != k_lambda {
-                return Err(EstimationError::LayoutError(format!(
-                    "Nullspace dimension mismatch: expected {} entries, got {}",
-                    k_lambda,
-                    self.nullspace_dims.len()
-                )));
-            }
-        }
-
-        // Don't barrier on non-PD; we'll stabilize and continue like mgcv
-        // Only check eigenvalues if we needed to add a ridge
-        const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
-        let want_hot_diag = self.should_compute_hot_diagnostics(cost_call_idx);
-        if ridge_used > 0.0
-            && want_hot_diag
-            && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
-            && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
         {
-            if should_emit_h_min_eig_diag(min_eig) {
-                log::debug!(
-                    "[Diag] H min_eig={:.3e} (ridge={:.3e})",
-                    min_eig,
-                    ridge_used
-                );
+            // Validation and diagnostics (before delegating to unified evaluator).
+            let pirls_result = bundle.pirls_result.as_ref();
+            let ridge_used = bundle.ridge_passport.delta;
+
+            if !p.is_empty() {
+                let k_lambda = p.len();
+                let k_r = pirls_result.reparam_result.rs_transformed.len();
+                let k_d = pirls_result.reparam_result.det1.len();
+                if !(k_lambda == k_r && k_r == k_d) {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Penalty dimension mismatch: lambdas={}, R={}, det1={}",
+                        k_lambda, k_r, k_d
+                    )));
+                }
+                if self.nullspace_dims.len() != k_lambda {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Nullspace dimension mismatch: expected {} entries, got {}",
+                        k_lambda,
+                        self.nullspace_dims.len()
+                    )));
+                }
             }
 
-            if min_eig <= 0.0 {
-                log::warn!(
-                    "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
-                    ridge_used
-                );
-            }
-
-            if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
-                let condition_number =
-                    calculate_condition_number(&pirls_result.penalized_hessian_transformed)
-                        .ok()
-                        .unwrap_or(f64::INFINITY);
-
-                log::warn!(
-                    "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
-                    condition_number
-                );
+            const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
+            let want_hot_diag = self.should_compute_hot_diagnostics(cost_call_idx);
+            if ridge_used > 0.0
+                && want_hot_diag
+                && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
+                && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
+            {
+                if should_emit_h_min_eig_diag(min_eig) {
+                    log::debug!(
+                        "[Diag] H min_eig={:.3e} (ridge={:.3e})",
+                        min_eig,
+                        ridge_used
+                    );
+                }
+                if min_eig <= 0.0 {
+                    log::warn!(
+                        "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
+                        ridge_used
+                    );
+                }
+                if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                    let condition_number =
+                        calculate_condition_number(&pirls_result.penalized_hessian_transformed)
+                            .ok()
+                            .unwrap_or(f64::INFINITY);
+                    log::warn!(
+                        "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
+                        condition_number
+                    );
+                }
             }
         }
-        // Use stable penalty calculation - no need to reconstruct matrices
-        // The penalty term is already calculated stably in the P-IRLS loop
+        // Delegate to the unified evaluator for the actual formula computation.
+        // This ensures cost and gradient share the exact same formula.
+        let result = self.evaluate_unified(
+            p,
+            &bundle,
+            super::unified::EvalMode::ValueOnly,
+        )?;
+        return Ok(result.cost);
 
+        // ─── Legacy formula code (kept for reference, unreachable) ───
+        #[allow(unreachable_code)]
         match self.config.link_function() {
             LinkFunction::Identity => {
                 let ridge_passport = pirls_result.ridge_passport;
@@ -2057,11 +2045,197 @@ impl<'a> RemlState<'a> {
     // Stage: Remember that the sign of ∂β̂/∂λₖ matters; from the implicit-function theorem the linear solve reads
     //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
     //     direct quadratic pieces are exact negatives, which is what the algebra requires.
+    /// Evaluate the REML/LAML objective (and optionally gradient) through the
+    /// unified evaluator, using a pre-obtained eval bundle.
+    ///
+    /// This is the single bridge from the existing PIRLS infrastructure to the
+    /// unified `reml_laml_evaluate` function. Both `compute_cost` and
+    /// `compute_gradient` ultimately delegate here, ensuring that cost and
+    /// gradient share the exact same formula.
+    pub fn evaluate_unified(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, InnerSolution,
+            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives, reml_laml_evaluate,
+        };
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+
+        // Constraint projection: if active constraints reduce the effective
+        // dimension, project the Hessian and penalty roots into the free subspace.
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
+            (
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                pirls_result.reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_total.as_ref().clone(),
+                pirls_result.reparam_result.e_transformed.clone(),
+            )
+        };
+
+        // Build HessianOperator from the (possibly projected) penalized Hessian.
+        let hessian_op = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_for_operator)
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "DenseSpectralOperator from PIRLS Hessian: {e}"
+                    ))
+                })?,
+        );
+
+        // Penalty logdet derivatives from the reparameterization result.
+        let (penalty_rank, log_det_s) =
+            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: log_det_s,
+            first: pirls_result.reparam_result.det1.clone(),
+            second: None,
+        };
+
+        // Penalty roots (possibly projected).
+        let penalty_roots = if let Some(z) = free_basis_opt.as_ref() {
+            pirls_result
+                .reparam_result
+                .rs_transformed
+                .iter()
+                .map(|r| r.dot(z))
+                .collect()
+        } else {
+            pirls_result.reparam_result.rs_transformed.clone()
+        };
+
+        // Beta in the operator's basis.
+        let beta = if let Some(z) = free_basis_opt.as_ref() {
+            z.t().dot(&pirls_result.beta_transformed)
+        } else {
+            pirls_result.beta_transformed.as_ref().clone()
+        };
+
+        // Nullspace dimension.
+        let p_eff_dim = h_for_operator.ncols();
+        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
+
+        // Number of observations.
+        let n_observations = self.y.len();
+
+        // Derivative provider.
+        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
+            if is_gaussian_identity {
+                Box::new(GaussianDerivatives)
+            } else {
+                let c_array = if let Some(z) = free_basis_opt.as_ref() {
+                    // c/d arrays don't change with projection — they're observation-level.
+                    pirls_result.solve_c_array.clone()
+                } else {
+                    pirls_result.solve_c_array.clone()
+                };
+                let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
+                    // Project the design: X_proj = X Z
+                    let x_dense = pirls_result.x_transformed.to_dense();
+                    crate::linalg::matrix::DesignMatrix::Dense(std::sync::Arc::new(x_dense.dot(z)))
+                } else {
+                    pirls_result.x_transformed.clone()
+                };
+                Box::new(SinglePredictorGlmDerivatives {
+                    c_array,
+                    d_array: Some(pirls_result.solve_d_array.clone()),
+                    x_transformed,
+                })
+            };
+
+        // Dispersion handling.
+        let dispersion = if is_gaussian_identity {
+            DispersionHandling::ProfiledGaussian
+        } else {
+            DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            }
+        };
+
+        // TK correction (non-Gaussian only).
+        let tk_correction = if !is_gaussian_identity {
+            let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
+                Self::projectwith_basis(bundle.h_eff.as_ref(), z)
+            } else {
+                bundle.h_eff.as_ref().clone()
+            };
+            self.tierney_kadane_laml_correction(
+                pirls_result,
+                &h_eff_eval,
+                free_basis_opt.as_ref(),
+            )?
+        } else {
+            0.0
+        };
+
+        // Firth log-det.
+        let firth_logdet = if self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+        {
+            pirls_result.firth_log_det().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        // Log-likelihood: for both Gaussian and GLM, deviance = -2 * log_likelihood.
+        let log_likelihood = -0.5 * pirls_result.deviance;
+
+        let inner_solution = InnerSolution {
+            log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            ridge_passport,
+            hessian_op,
+            beta,
+            penalty_roots,
+            penalty_logdet,
+            deriv_provider,
+            tk_correction,
+            tk_gradient: None,
+            firth_logdet,
+            firth_gradient: None,
+            n_observations,
+            nullspace_dim,
+            dispersion,
+            precomputed_h_k_corrections: None,
+        };
+
+        // Prior cost/gradient.
+        let prior = if mode == super::unified::EvalMode::ValueOnly {
+            let pc = self.compute_soft_priorcost(rho);
+            if pc.abs() > 0.0 {
+                Some((pc, Array1::zeros(rho.len())))
+            } else {
+                None
+            }
+        } else {
+            let pc = self.compute_soft_priorcost(rho);
+            let pg = self.compute_soft_priorgradient(rho);
+            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
+                Some((pc, pg))
+            } else {
+                None
+            }
+        };
+
+        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))
+    }
+
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
-        // Get the converged P-IRLS result for the current rho (`p`)
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2073,7 +2247,14 @@ impl<'a> RemlState<'a> {
                 return Err(e);
             }
         };
-        let analytic = self.compute_gradient_with_bundle(p, &bundle)?;
-        Ok(analytic)
+        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
+            return self.compute_gradient_sparse_exact(p, &bundle);
+        }
+        let result = self.evaluate_unified(
+            p,
+            &bundle,
+            super::unified::EvalMode::ValueAndGradient,
+        )?;
+        Ok(result.gradient.unwrap())
     }
 }

@@ -22,13 +22,16 @@ Usage:
 
 from __future__ import annotations
 
+# Force unbuffered stdout so per-trial output appears in real time
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+
 import argparse
 import inspect
 import json
 import math
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import traceback
@@ -186,7 +189,8 @@ def _f_linear_wiggle(x, rng):
 def _f_sinc(x, rng):
     s = rng.uniform(2, 8)
     u = s * x
-    return np.where(np.abs(u) < 1e-8, 1.0, np.sin(u) / u) * rng.uniform(1, 5)
+    safe_u = np.where(np.abs(u) < 1e-8, 1.0, u)
+    return np.where(np.abs(u) < 1e-8, 1.0, np.sin(safe_u) / safe_u) * rng.uniform(1, 5)
 
 def _f_wavelet(x, rng):
     s = rng.uniform(0.1, 0.5) * np.ptp(x)
@@ -722,16 +726,16 @@ def run_rust(sc, train_df, test_df, cols, tmpdir):
 
         r = subprocess.run(fit_cmd, capture_output=True, text=True, timeout=RUST_TIMEOUT)
         if r.returncode != 0:
-            return {"error": f"fit rc={r.returncode}", "stderr": r.stderr[:1000],
-                    "stdout": r.stdout[:500], "cmd": " ".join(fit_cmd), "time": time.time()-t0}
+            return {"error": f"fit rc={r.returncode}", "stderr": r.stderr,
+                    "stdout": r.stdout, "cmd": " ".join(fit_cmd), "time": time.time()-t0}
 
         r = subprocess.run(
             [str(RUST_BINARY), "predict", model_json, test_csv, "--out", pred_csv],
             capture_output=True, text=True, timeout=RUST_TIMEOUT,
         )
         if r.returncode != 0:
-            return {"error": f"predict rc={r.returncode}", "stderr": r.stderr[:1000],
-                    "stdout": r.stdout[:500], "time": time.time()-t0}
+            return {"error": f"predict rc={r.returncode}", "stderr": r.stderr,
+                    "stdout": r.stdout, "time": time.time()-t0}
 
         pred_df = pd.read_csv(pred_csv)
         preds = pred_df["mean"].to_numpy(float)
@@ -755,7 +759,7 @@ def run_rust(sc, train_df, test_df, cols, tmpdir):
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "time": RUST_TIMEOUT}
     except Exception as e:
-        return {"error": str(e)[:500], "traceback": traceback.format_exc()[:1000], "time": time.time()-t0}
+        return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
 
 def run_mgcv(sc, train_df, test_df, cols, tmpdir):
@@ -773,9 +777,17 @@ def run_mgcv(sc, train_df, test_df, cols, tmpdir):
         sigma_f = mgcv_sigma_formula(cols, sc)
         fit_line = f"fit <- gam(list({mu_formula}, {sigma_f}), family=gaulss(), data=train_df, method='REML', select={select_str})"
         pred_line = """
-pred_mat <- predict(fit, newdata=test_df, type='response')
-p <- as.numeric(pred_mat[,1])
-inv_sigma <- as.numeric(pred_mat[,2])
+pred_raw <- predict(fit, newdata=test_df, type='response')
+if (is.list(pred_raw)) {
+    p <- as.numeric(pred_raw[[1]])
+    inv_sigma <- as.numeric(pred_raw[[2]])
+} else if (is.matrix(pred_raw)) {
+    p <- as.numeric(pred_raw[,1])
+    inv_sigma <- as.numeric(pred_raw[,2])
+} else {
+    p <- as.numeric(pred_raw)
+    inv_sigma <- rep(1.0, length(p))
+}
 sigma_hat <- 1.0 / pmax(inv_sigma, 1e-12)
 """
         gaussian_metrics = """
@@ -851,14 +863,14 @@ tryCatch({{
         elapsed = time.time() - t0
 
         if not os.path.exists(out_json):
-            return {"error": f"no R output rc={r.returncode}", "stderr": r.stderr[:1000],
-                    "stdout": r.stdout[:500], "time": elapsed}
+            return {"error": f"no R output rc={r.returncode}", "stderr": r.stderr,
+                    "stdout": r.stdout, "time": elapsed}
 
         with open(out_json) as f:
             out = json.load(f)
 
         if out.get("status") != "ok":
-            return {"error": out.get("message", "R error")[:500], "stderr": r.stderr[:500], "time": elapsed}
+            return {"error": out.get("message", "R error"), "stderr": r.stderr, "time": elapsed}
 
         result = {"time": elapsed}
         for key in ["r2", "rmse", "mae", "logloss", "auc", "brier", "nagelkerke_r2"]:
@@ -869,7 +881,7 @@ tryCatch({{
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "time": R_TIMEOUT}
     except Exception as e:
-        return {"error": str(e)[:500], "traceback": traceback.format_exc()[:1000], "time": time.time()-t0}
+        return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
 
 def _compute_metrics(family, y_test, y_train, preds):
@@ -1048,17 +1060,23 @@ def main():
     print(f"  Filters: family={args.family or 'all'} model={args.model_type or 'all'} basis={args.basis or 'all'}")
     print(f"  Results: {RESULTS_FILE}\n")
 
+    # Pre-generate all scenarios so we can sort by estimated cost
+    # (smallest/cheapest first) while keeping the randomized generation
+    scenarios = []
+    for seed in seeds:
+        sc = generate_scenario(seed, family_filter=args.family, model_type_filter=args.model_type)
+        if args.basis:
+            sc.basis_type = args.basis
+            if args.basis == "duchon" and sc.n_smooths < 2:
+                sc.n_smooths = 2
+                sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
+        scenarios.append(sc)
+    scenarios.sort(key=lambda s: (s.n_obs * s.n_smooths * s.knots))
+
     with open(RESULTS_FILE, "a") as out_f:
-        for i, seed in enumerate(seeds):
-            sc = generate_scenario(seed, family_filter=args.family, model_type_filter=args.model_type)
-            if args.basis:
-                sc.basis_type = args.basis
-                if args.basis == "duchon" and sc.n_smooths < 2:
-                    sc.n_smooths = 2
-                    sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
-            t0 = time.time()
+        for i, sc in enumerate(scenarios):
+            seed = sc.seed
             result = run_trial(sc)
-            elapsed = time.time() - t0
 
             results.append(result)
             out_f.write(json.dumps({"scenario": result.scenario, "rust": result.rust,
@@ -1066,21 +1084,40 @@ def main():
                                      "primary_metric": result.primary_metric}, default=str) + "\n")
             out_f.flush()
 
-            gap_s = f"{result.primary_gap:+.4f}" if result.primary_gap is not None else " N/A "
             m = result.primary_metric or "?"
+            gap_s = f"{result.primary_gap:+.4f}" if result.primary_gap is not None else " N/A "
             rv = result.rust.get(m); mv = result.mgcv.get(m)
-            rs = f"{rv:.3f}" if rv is not None else "FAIL"
-            ms = f"{mv:.3f}" if mv is not None else "FAIL"
+            rs = f"{rv:.4f}" if rv is not None else " FAIL"
+            ms = f"{mv:.4f}" if mv is not None else " FAIL"
             err_r = " [R:ERR]" if result.rust.get("error") else ""
             err_m = " [M:ERR]" if result.mgcv.get("error") else ""
             flag = " !!!" if (result.primary_gap or 0) > 0.1 else (" !!" if (result.primary_gap or 0) > 0.05 else "")
+            t_rust = result.rust.get("time", 0) or 0
+            t_mgcv = result.mgcv.get("time", 0) or 0
+            time_s = f"  rust={t_rust:.1f}s mgcv={t_mgcv:.1f}s" if max(t_rust, t_mgcv) > 0.5 else ""
             print(
-                f"  [{i+1:3d}/{len(seeds)}] seed={seed:4d} {sc.family[:4]}/{sc.model_type[:5]}/{sc.basis_type[:5]:5s} "
-                f"gap={gap_s} rust={rs:>6} mgcv={ms:>6} "
+                f"  [{i+1:3d}/{len(scenarios)}] seed={seed:4d} {sc.family[:4]}/{sc.model_type[:5]}/{sc.basis_type[:5]:5s} "
+                f"{m}:rust={rs} {m}:mgcv={ms} gap={gap_s} "
                 f"n={sc.n_obs:4d} k={sc.n_smooths:2d} kn={sc.knots:2d} "
-                f"sig={sc.signal_structure[:8]:8s} noise={sc.noise_kind[:7]:7s} "
-                f"{elapsed:.1f}s{err_r}{err_m}{flag}"
+                f"sig={sc.signal_structure[:8]:8s} noise={sc.noise_kind[:7]:7s}"
+                f"{err_r}{err_m}{flag}{time_s}",
+                flush=True
             )
+
+            # Print full error details immediately on failure
+            for label, out in [("RUST", result.rust), ("MGCV", result.mgcv)]:
+                if out.get("error"):
+                    print(f"    ┌── {label} FAILURE ──", flush=True)
+                    print(f"    │ error: {out['error']}", flush=True)
+                    if out.get("stderr"):
+                        print(f"    │ stderr: {out['stderr']}", flush=True)
+                    if out.get("stdout"):
+                        print(f"    │ stdout: {out['stdout']}", flush=True)
+                    if out.get("cmd"):
+                        print(f"    │ cmd: {out['cmd']}", flush=True)
+                    if out.get("traceback"):
+                        print(f"    │ traceback: {out['traceback']}", flush=True)
+                    print(f"    └──────────────────────", flush=True)
 
     print_leaderboard(results, top_n=args.top)
 
