@@ -7,7 +7,7 @@ use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::solver::estimate::FitGeometry;
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::reml::unified::{
-    DenseSpectralOperator, DispersionHandling, EvalMode, InnerSolutionBuilder,
+    BlockCoupledOperator, DispersionHandling, EvalMode, InnerSolutionBuilder,
     compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
     reml_laml_evaluate,
 };
@@ -2495,7 +2495,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
 ///
 /// This is the bridge between the custom family's joint Hessian infrastructure
 /// and the unified REML/LAML evaluator. It:
-/// 1. Wraps `j_for_traces` in a `DenseSpectralOperator`
+/// 1. Wraps `j_for_traces` in a [`BlockCoupledOperator`] (joint multi-block Hessian)
 /// 2. Builds penalty roots in the joint parameter space
 /// 3. Computes penalty logdet derivatives
 /// 4. Assembles an `InnerSolution` and calls `reml_laml_evaluate`
@@ -2515,14 +2515,14 @@ fn unified_joint_cost_gradient(
     precomputed_corrections: Vec<Option<Array2<f64>>>,
     precomputed_h_ddot_traces: Option<Array2<f64>>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    // Build DenseSpectralOperator from the trace Hessian.
-    let hop = DenseSpectralOperator::from_symmetric(j_for_traces)
-        .map_err(|e| format!("DenseSpectralOperator from joint Hessian: {e}"))?;
+    // Build BlockCoupledOperator from the joint Hessian with block structure.
+    let hop = BlockCoupledOperator::from_joint_hessian(j_for_traces, ranges.to_vec())
+        .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?;
 
-    // Build penalty roots in joint basis.
+    // Build penalty roots in joint basis, using the operator's block ranges.
     let mut penalty_roots_joint = Vec::new();
     for (b, spec) in specs.iter().enumerate() {
-        let (start, end) = ranges[b];
+        let (start, end) = hop.block_ranges()[b];
         for s_k in spec.penalties.iter() {
             let root = penalty_matrix_root(s_k)?;
             let embedded = embed_penalty_root(&root, start, end, total);

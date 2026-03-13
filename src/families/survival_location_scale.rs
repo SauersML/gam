@@ -4723,6 +4723,138 @@ mod tests {
     }
 
     #[test]
+    fn survival_q_chain_derivatives_vanish_on_safe_exp_upper_plateau() {
+        let eta_t = 2.0;
+        let eta_ls = 701.0_f64;
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third_scalar(eta_ls);
+        let q = |ls: f64| -eta_t / exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
+        let h = 1e-6;
+        let q_left = q(eta_ls - h);
+        let q_mid = q(eta_ls);
+        let q_right = q(eta_ls + h);
+        assert_eq!(
+            q_left, q_mid,
+            "safe_exp is constant beyond the upper clamp, so q should be locally constant in eta_ls on that plateau"
+        );
+        assert_eq!(
+            q_right, q_mid,
+            "safe_exp is constant beyond the upper clamp, so q should be locally constant in eta_ls on that plateau"
+        );
+
+        let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
+            q_chain_derivs_scalar(eta_t, sigma, ds, d2s, d3s);
+        assert_eq!(q_t, -1.0 / sigma.max(1e-12));
+        assert!(
+            q_ls == 0.0,
+            "q = -eta_t / max(safe_exp(eta_ls), 1e-12) is constant in eta_ls on the upper safe_exp plateau, so dq/deta_ls must be 0; got {q_ls}"
+        );
+        assert!(
+            q_tl == 0.0,
+            "q_t is constant in eta_ls on the upper safe_exp plateau, so d2q/(deta_t deta_ls) must be 0; got {q_tl}"
+        );
+        assert!(
+            q_ll == 0.0,
+            "q is constant in eta_ls on the upper safe_exp plateau, so d2q/deta_ls2 must be 0; got {q_ll}"
+        );
+        assert!(
+            q_tl_ls == 0.0,
+            "q_t is constant in eta_ls on the upper safe_exp plateau, so d3q/(deta_t deta_ls2) must be 0; got {q_tl_ls}"
+        );
+        assert!(
+            q_ll_ls == 0.0,
+            "q is constant in eta_ls on the upper safe_exp plateau, so d3q/deta_ls3 must be 0; got {q_ll_ls}"
+        );
+    }
+
+    #[test]
+    fn survival_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau() {
+        let family = survival_exact_newton_test_family();
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.1 * crate::families::sigma_link::safe_exp(700.0)];
+        let beta_log_sigma0 = 701.0_f64;
+        let beta_log_sigma = array![beta_log_sigma0];
+        let states =
+            survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+
+        let analytic = family
+            .exact_newton_hessian_directional_derivative(
+                &states,
+                SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA,
+                &array![1.0],
+            )
+            .expect("analytic dH")
+            .expect("expected exact dH");
+
+        let objective = |beta_ls: f64| -> f64 {
+            family
+                .evaluate(&survival_exact_newton_rebuild_states(
+                    &beta_time,
+                    &beta_threshold,
+                    &array![beta_ls],
+                ))
+                .expect("eval objective")
+                .log_likelihood
+        };
+        let h = 1e-4_f64;
+        let fd3 = (objective(beta_log_sigma0 + 2.0 * h) - 2.0 * objective(beta_log_sigma0 + h)
+            + 2.0 * objective(beta_log_sigma0 - h)
+            - objective(beta_log_sigma0 - 2.0 * h))
+            / (2.0 * h.powi(3));
+        assert_eq!(
+            fd3, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood has zero third derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic[[0, 0]] + fd3).abs() < 1e-20,
+            "the exact-newton survival log-sigma dH entry should equal the negative third derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
+            analytic[[0, 0]],
+            -fd3
+        );
+    }
+
+    #[test]
+    fn survival_joint_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau() {
+        let family = survival_exact_newton_test_family();
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.1 * crate::families::sigma_link::safe_exp(700.0)];
+        let beta_log_sigma0 = 701.0_f64;
+        let beta_log_sigma = array![beta_log_sigma0];
+        let states =
+            survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+
+        let analytic = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &array![0.0, 0.0, 1.0])
+            .expect("analytic joint dH")
+            .expect("expected exact joint dH");
+
+        let objective = |beta_ls: f64| -> f64 {
+            family
+                .evaluate(&survival_exact_newton_rebuild_states(
+                    &beta_time,
+                    &beta_threshold,
+                    &array![beta_ls],
+                ))
+                .expect("eval objective")
+                .log_likelihood
+        };
+        let h = 1e-4_f64;
+        let fd3 = (objective(beta_log_sigma0 + 2.0 * h) - 2.0 * objective(beta_log_sigma0 + h)
+            + 2.0 * objective(beta_log_sigma0 - h)
+            - objective(beta_log_sigma0 - 2.0 * h))
+            / (2.0 * h.powi(3));
+        assert_eq!(
+            fd3, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood has zero third derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic[[2, 2]] + fd3).abs() < 1e-20,
+            "the exact joint survival dH log-sigma/log-sigma entry should equal the negative third derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
+            analytic[[2, 2]],
+            -fd3
+        );
+    }
+
+    #[test]
     fn joint_exact_newton_score_matches_loglikelihoodfd_near_fitted_non_probit_points() {
         let eps = 1e-6;
         let cases = vec![

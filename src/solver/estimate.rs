@@ -3943,8 +3943,6 @@ pub use crate::inference::predict::{
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, SmoothingOptimizerKind,
-    optimize_log_smoothingwithmultistart, optimize_log_smoothingwithmultistart_parallelfd,
-    optimize_log_smoothingwithmultistartwithgradient,
 };
 
 /// Canonical engine entrypoint for external designs on supported GLM-style

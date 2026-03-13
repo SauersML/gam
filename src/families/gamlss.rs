@@ -12311,6 +12311,289 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau() {
+        let y = array![1.0];
+        let weights = array![1.0];
+        let design = DesignMatrix::Dense(array![[1.0]]);
+        let family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(design.clone()),
+            log_sigma_design: Some(design),
+        };
+        let beta_t0 = 0.1 * safe_exp(700.0);
+        let beta_ls0 = 701.0_f64;
+        let states = vec![
+            ParameterBlockState {
+                beta: array![beta_t0],
+                eta: array![beta_t0],
+            },
+            ParameterBlockState {
+                beta: array![beta_ls0],
+                eta: array![beta_ls0],
+            },
+        ];
+        let analytic = family
+            .exact_newton_hessian_directional_derivative(
+                &states,
+                BinomialLocationScaleFamily::BLOCK_LOG_SIGMA,
+                &array![1.0],
+            )
+            .expect("analytic dH")
+            .expect("expected exact dH");
+        let loglik = |beta_ls: f64| {
+            binomial_location_scale_ll_only(
+                &y,
+                &weights,
+                &array![beta_t0],
+                &array![beta_ls],
+                None,
+                &family.link_kind,
+            )
+            .expect("log-likelihood")
+        };
+        let h = 1e-4_f64;
+        let fd3 = (loglik(beta_ls0 + 2.0 * h) - 2.0 * loglik(beta_ls0 + h)
+            + 2.0 * loglik(beta_ls0 - h)
+            - loglik(beta_ls0 - 2.0 * h))
+            / (2.0 * h.powi(3));
+        assert_eq!(
+            fd3, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded log-likelihood has zero third derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic[[0, 0]] + fd3).abs() < 1e-20,
+            "the exact-newton log-sigma dH entry should equal the negative third derivative of the coded plateau log-likelihood at beta_log_sigma={beta_ls0}; got analytic {} vs expected {}",
+            analytic[[0, 0]],
+            -fd3
+        );
+    }
+
+    #[test]
+    fn binomial_location_scale_exact_log_sigma_d2h_should_match_zero_fourth_derivative_on_plateau()
+    {
+        let y = array![1.0];
+        let weights = array![1.0];
+        let design = DesignMatrix::Dense(array![[1.0]]);
+        let family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(design.clone()),
+            log_sigma_design: Some(design),
+        };
+        let beta_t0 = 0.1 * safe_exp(700.0);
+        let beta_ls0 = 701.0_f64;
+        let states = vec![
+            ParameterBlockState {
+                beta: array![beta_t0],
+                eta: array![beta_t0],
+            },
+            ParameterBlockState {
+                beta: array![beta_ls0],
+                eta: array![beta_ls0],
+            },
+        ];
+        let analytic = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &states,
+                &array![0.0, 1.0],
+                &array![0.0, 1.0],
+            )
+            .expect("analytic d2H")
+            .expect("expected exact d2H");
+        let loglik = |beta_ls: f64| {
+            binomial_location_scale_ll_only(
+                &y,
+                &weights,
+                &array![beta_t0],
+                &array![beta_ls],
+                None,
+                &family.link_kind,
+            )
+            .expect("log-likelihood")
+        };
+        let h = 1e-4_f64;
+        let fd4 = (loglik(beta_ls0 - 2.0 * h) - 4.0 * loglik(beta_ls0 - h)
+            + 6.0 * loglik(beta_ls0)
+            - 4.0 * loglik(beta_ls0 + h)
+            + loglik(beta_ls0 + 2.0 * h))
+            / h.powi(4);
+        assert_eq!(
+            fd4, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded log-likelihood has zero fourth derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic[[1, 1]] + fd4).abs() < 1e-8,
+            "the exact-newton log-sigma d2H entry should equal the negative fourth derivative of the coded plateau log-likelihood at beta_log_sigma={beta_ls0}; got analytic {} vs expected {}",
+            analytic[[1, 1]],
+            -fd4
+        );
+    }
+
+    #[test]
+    fn binomial_location_scalewiggle_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau()
+    {
+        let n = 4usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_block = intercept_block(n);
+        let log_sigma_block = intercept_block(n);
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let threshold_design = threshold_block.design.clone();
+        let log_sigma_design = log_sigma_block.design.clone();
+        let family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+        };
+        let beta_t0 = 0.1 * safe_exp(700.0);
+        let beta_ls0 = 701.0_f64;
+        let betaw = Array1::zeros(wiggle_block.design.ncols());
+        let rebuild_states = |beta_ls: f64| -> Vec<ParameterBlockState> {
+            let beta_t = array![beta_t0];
+            let beta_ls_arr = array![beta_ls];
+            vec![
+                ParameterBlockState {
+                    beta: beta_t.clone(),
+                    eta: threshold_design.matrixvectormultiply(&beta_t),
+                },
+                ParameterBlockState {
+                    beta: beta_ls_arr.clone(),
+                    eta: log_sigma_design.matrixvectormultiply(&beta_ls_arr),
+                },
+                ParameterBlockState {
+                    beta: betaw.clone(),
+                    eta: Array1::zeros(n),
+                },
+            ]
+        };
+        let analytic = family
+            .exact_newton_hessian_directional_derivative(
+                &rebuild_states(beta_ls0),
+                BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA,
+                &array![1.0],
+            )
+            .expect("analytic dH")
+            .expect("expected exact dH");
+        let objective = |beta_ls: f64| -> f64 {
+            family
+                .evaluate(&rebuild_states(beta_ls))
+                .expect("eval objective")
+                .log_likelihood
+        };
+        let h = 1e-4_f64;
+        let fd3 = (objective(beta_ls0 + 2.0 * h) - 2.0 * objective(beta_ls0 + h)
+            + 2.0 * objective(beta_ls0 - h)
+            - objective(beta_ls0 - 2.0 * h))
+            / (2.0 * h.powi(3));
+        assert_eq!(
+            fd3, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded wiggle-family log-likelihood has zero third derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic[[0, 0]] + fd3).abs() < 1e-20,
+            "the exact-newton wiggle-family log-sigma dH entry should equal the negative third derivative of the coded plateau log-likelihood at beta_log_sigma={beta_ls0}; got analytic {} vs expected {}",
+            analytic[[0, 0]],
+            -fd3
+        );
+    }
+
+    #[test]
+    fn binomial_location_scalewiggle_exact_log_sigma_d2h_should_match_zero_fourth_derivative_on_plateau()
+    {
+        let n = 4usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_block = intercept_block(n);
+        let log_sigma_block = intercept_block(n);
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let threshold_design = threshold_block.design.clone();
+        let log_sigma_design = log_sigma_block.design.clone();
+        let family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+        };
+        let beta_t0 = 0.1 * safe_exp(700.0);
+        let beta_ls0 = 701.0_f64;
+        let betaw = Array1::zeros(wiggle_block.design.ncols());
+        let rebuild_states = |beta_ls: f64| -> Vec<ParameterBlockState> {
+            let beta_t = array![beta_t0];
+            let beta_ls_arr = array![beta_ls];
+            vec![
+                ParameterBlockState {
+                    beta: beta_t.clone(),
+                    eta: threshold_design.matrixvectormultiply(&beta_t),
+                },
+                ParameterBlockState {
+                    beta: beta_ls_arr.clone(),
+                    eta: log_sigma_design.matrixvectormultiply(&beta_ls_arr),
+                },
+                ParameterBlockState {
+                    beta: betaw.clone(),
+                    eta: Array1::zeros(n),
+                },
+            ]
+        };
+        let analytic = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &rebuild_states(beta_ls0),
+                &array![0.0, 1.0, 0.0],
+                &array![0.0, 1.0, 0.0],
+            )
+            .expect("analytic d2H")
+            .expect("expected exact d2H");
+        let objective = |beta_ls: f64| -> f64 {
+            family
+                .evaluate(&rebuild_states(beta_ls))
+                .expect("eval objective")
+                .log_likelihood
+        };
+        let h = 1e-4_f64;
+        let fd4 = (objective(beta_ls0 - 2.0 * h) - 4.0 * objective(beta_ls0 - h)
+            + 6.0 * objective(beta_ls0)
+            - 4.0 * objective(beta_ls0 + h)
+            + objective(beta_ls0 + 2.0 * h))
+            / h.powi(4);
+        assert_eq!(
+            fd4, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded wiggle-family log-likelihood has zero fourth derivative in beta_log_sigma on that plateau"
+        );
+        assert!(
+            (analytic[[1, 1]] + fd4).abs() < 1e-8,
+            "the exact-newton wiggle-family log-sigma d2H entry should equal the negative fourth derivative of the coded plateau log-likelihood at beta_log_sigma={beta_ls0}; got analytic {} vs expected {}",
+            analytic[[1, 1]],
+            -fd4
+        );
+    }
+
+    #[test]
     fn wiggle_family_evaluate_returns_exact_newton_blocks() {
         let n = 6usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
