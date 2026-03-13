@@ -428,3 +428,73 @@ This is exact and trivial. But the **derivatives** with respect to $\mu$ and $\s
 (c) For the **SAS (sinh-arcsinh)** link, $g^{-1}(\eta) = \Phi(\sinh(\epsilon^{-1}\sinh^{-1}(\eta) + \delta))$, the Gaussian convolution seems intractable analytically. Is there a practical middle ground between exact series and GHQ — e.g., adaptive quadrature with error bounds that guarantee smoothness of the outer objective?
 
 (d) More generally: is there a **sufficient condition** on $g^{-1}$ that guarantees its Gaussian convolution admits a convergent series representation? (E.g., entire function of exponential type, or membership in a specific Hilbert space.)
+
+### Q16: Envelope theorem under MM surrogate penalties (Charbonnier)
+
+For adaptive spatial regularization, we use a non-quadratic Charbonnier penalty:
+$$\psi(t) = \epsilon\bigl(\sqrt{t^2 + \epsilon^2} - \epsilon\bigr)$$
+
+The inner loop solves this via Majorize-Minimize (MM): at each iteration, we replace $\psi$ with a quadratic upper bound $\frac{1}{2}t^\top W_{MM} t$ where $W_{MM}$ is a diagonal weight matrix depending on the current iterate. The inner loop converges to the fixed point of the MM mapping, not the Newton root of the true objective.
+
+The LAML gradient derivation relies on the **envelope theorem**: $\nabla_\beta \mathcal{L}(\hat\beta, \theta) = 0$ at the mode. But if the inner solver converges to the MM fixed point rather than the exact stationary point of the true penalized likelihood, we have $\nabla_\beta \mathcal{L}_{\text{true}}(\hat\beta_{MM}) \neq 0$ in general. The residual $r = \nabla_\beta \mathcal{L}_{\text{true}}(\hat\beta_{MM})$ breaks the envelope theorem.
+
+**Questions**:
+(a) Under what conditions on $\psi$ does the MM fixed point coincide with the true stationary point? (For strictly convex $\psi$, the MM algorithm converges to the unique minimizer, so the envelope theorem holds in the limit. But does it hold at *finite convergence tolerance*?)
+
+(b) If the inner loop terminates at tolerance $\|r\| < \delta$, what is the bias in the LAML gradient? Specifically, the profiled gradient picks up a correction term $r^\top \frac{\partial \hat\beta}{\partial \theta}$. Can this be bounded as $O(\delta)$, and is the constant small enough to ignore in practice?
+
+(c) An alternative: differentiate the MM fixed-point mapping itself. If $\hat\beta = T(\hat\beta; \theta)$ is the MM update, then by the implicit function theorem on the fixed-point equation $\beta - T(\beta; \theta) = 0$, we get $\frac{d\hat\beta}{d\theta} = (I - \nabla_\beta T)^{-1} \nabla_\theta T$. Is this more stable than using the true Hessian $D^2\psi$ (which has a pole at $t=0$ for Charbonnier)?
+
+(d) For the LAML log-determinant term $\frac{1}{2}\log|H|_+$: should $H$ use the true Hessian $D^2\psi$ or the surrogate Hessian $W_{MM}$? If the true Hessian, the Laplace approximation is around the true mode (which we haven't found exactly). If the surrogate, the approximation is self-consistent but measures curvature of the wrong function.
+
+### Q17: Stable reparameterization vs. sparse trace operators
+
+Wood's (2011) stable reparameterization rotates the design matrix into a well-conditioned orthogonal basis: $\tilde{X} = X Q_s$ where $Q_s$ comes from a QR/SVD of the penalty range space. This is essential for dense spectral stability (condition number of the working Hessian).
+
+For large-scale models ($p > 10{,}000$), we need sparse selected-inversion (Takahashi equations) to compute trace contractions $\text{tr}(H^{-1} A_k)$ in $O(p \cdot b^2)$ time (where $b$ is the bandwidth of the banded Cholesky factor). However, $Q_s$ is a dense $p \times p$ rotation. Applying it to a sparse banded design $X$ produces a dense $\tilde{X}$, destroying the sparsity that makes selected-inversion efficient.
+
+**Questions**:
+(a) Is there a **block-diagonal** or **band-preserving** variant of the stable reparameterization? For instance, if each smooth term has its own penalty, can $Q_s$ be applied per-block (preserving the block-banded structure of $X^\top W X$)?
+
+(b) Alternatively, can the trace contractions be computed **without** the reparameterization? The traces $\text{tr}(H^{-1} A_k)$ are invariant under orthogonal transforms: $\text{tr}(\tilde{H}^{-1} \tilde{A}_k) = \text{tr}(H^{-1} A_k)$ when $\tilde{H} = Q_s^\top H Q_s$, $\tilde{A}_k = Q_s^\top A_k Q_s$. So if we compute the Cholesky factor of the *unreparameterized* $H$ (which is sparse), can we use selected-inversion on that factor to get the traces we need, while using the reparameterized $\tilde{H}$ only for eigenvalue stability in the inner solve?
+
+(c) A hybrid approach: use the reparameterization only for the inner PIRLS solve (where conditioning matters), but compute LAML gradients in the original parameterization (where sparsity matters). The only coupling is the mode $\hat\beta = Q_s \tilde\beta$. Does this introduce any subtle inconsistencies in the gradient (e.g., from the chain rule through $Q_s$)?
+
+### Q18: Tierney-Kadane correction derivatives under design-moving hyperparameters
+
+The Tierney-Kadane (TK) skewness correction to the Laplace approximation is:
+$$T(\hat\beta) = -\frac{1}{6} \sum_m s_m^3 \cdot \nabla^3 \ell_m$$
+
+where $s_m$ are leverages (diagonal of the hat matrix $\text{diag}(X(X^\top W X + S)^{-1} X^\top W)$) and $\nabla^3 \ell_m$ is the third derivative of the log-likelihood at observation $m$.
+
+For penalty-only hyperparameters $\rho$, differentiating $T$ with respect to $\rho_k$ requires $\frac{\partial s_m}{\partial \rho_k}$ (which involves $H^{-1} A_k H^{-1}$ — a 2nd-order contraction) composed with the 3rd-order $\nabla^3 \ell_m$.
+
+For **design-moving** hyperparameters $\tau$ (where $X = X(\tau)$), differentiating $T$ requires:
+$$\frac{\partial T}{\partial \tau_j} = -\frac{1}{6}\sum_m \Bigl[3 s_m^2 \frac{\partial s_m}{\partial \tau_j} \cdot \nabla^3\ell_m + s_m^3 \cdot \frac{\partial}{\partial \tau_j}\nabla^3\ell_m\Bigr]$$
+
+The second term $\frac{\partial}{\partial \tau_j}\nabla^3\ell_m$ involves differentiating the third derivative of the likelihood with respect to a parameter that moves the design matrix. Since $\eta = X(\tau)\beta$, and the likelihood derivatives are functions of $\eta$, this requires the **4th derivative** of the likelihood: $\nabla^4 \ell_m \cdot \frac{\partial \eta_m}{\partial \tau_j}$.
+
+Furthermore, $\frac{\partial s_m}{\partial \tau_j}$ involves differentiating the hat matrix with respect to $\tau$, which requires $\frac{\partial X}{\partial \tau_j}$ and $\frac{\partial H^{-1}}{\partial \tau_j}$ — a 4th-order tensor contraction when combined with $\nabla^3 \ell$.
+
+**Questions**:
+(a) Is the TK correction even worth differentiating with respect to $\tau$? The TK correction itself is $O(n^{-1})$ relative to the Laplace approximation. Its $\tau$-derivative is $O(n^{-1})$ relative to the LAML gradient. For large $n$ (biobank scale, $n > 100{,}000$), is this term negligible?
+
+(b) If we do need it: can the 4th-order contraction be avoided by differentiating $T$ numerically with respect to $\tau$ (central differences), while keeping the $\rho$-derivatives analytic? The $\tau$ dimension is typically small (1-5 parameters), so $O(\dim(\tau))$ extra function evaluations is cheap.
+
+(c) Is there a matrix-free formula for $\frac{\partial s_m}{\partial \tau_j}$ that avoids materializing $O(p^2)$ intermediate matrices? For instance, using the identity $\frac{\partial}{\partial \tau}(H^{-1}) = -H^{-1}\dot{H}H^{-1}$ where $\dot{H} = \dot{X}^\top W X + X^\top W \dot{X}$ (with $\dot{X} = \partial X/\partial \tau_j$), the leverage derivative is:
+$$\frac{\partial s_m}{\partial \tau_j} = 2\dot{x}_m^\top H^{-1} w_m x_m - x_m^\top H^{-1}\dot{H} H^{-1} w_m x_m$$
+Can this be computed in $O(p)$ per observation using cached $H^{-1} x_m$ vectors?
+
+### Q14 addendum: Firth bias reduction under active inequality constraints
+
+The Firth/Jeffreys prior adds $\Phi(\beta) = \frac{1}{2}\log|X^\top W(\beta) X + S|_+$ to the log-likelihood, where $W(\beta)$ depends on $\beta$ through the working weights.
+
+When inequality constraints are active (e.g., monotonicity via I-splines forcing $\beta_j \geq 0$), the active tangent space drops in dimension. The Firth penalty $\Phi(\beta)$ is defined on the full $p$-dimensional space, but the constrained mode $\hat\beta$ lives on a face of a polytope.
+
+**Additional questions**:
+(d) How should the Firth log-determinant be defined on the constrained face? Options:
+  - **Project**: Compute $\log|P_{\mathcal{F}}^\top (X^\top W X + S) P_{\mathcal{F}}|$ where $P_{\mathcal{F}}$ projects onto the free (unconstrained) subspace. This changes dimension discontinuously when constraints activate.
+  - **Barrier**: Replace hard constraints with log-barriers (as in Q14b) so the space is always full-dimensional. The Firth penalty then smoothly adjusts as $\beta_j \to 0$.
+  - **Ignore**: Keep the full-space Firth penalty but project its gradient into the free subspace. This is what we currently do for the LAML gradient (Q14a). Is it valid for the Firth *prior*?
+
+(e) The Firth gradient $\nabla_\beta \Phi = \frac{1}{2}\text{tr}\bigl((X^\top W X + S)^{-1} \frac{\partial}{\partial \beta_j}(X^\top W X)\bigr)$ involves the derivative of working weights $\frac{\partial W}{\partial \beta_j}$. At a constraint boundary $\beta_j = 0$, the working weight derivative may be discontinuous (if the link function has a kink at the boundary). Does this cause numerical issues, and is the barrier approach from Q14(b) sufficient to regularize it?
