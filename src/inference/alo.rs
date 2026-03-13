@@ -66,21 +66,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
 
-    let w = &base.finalweights;
-
-    // Use the exact stabilized Hessian from PIRLS. This keeps ALO linearization
-    // consistent with the curvature used in fitting and avoids adding a second,
-    // ad-hoc ridge term in diagnostics.
-    let k = base.stabilizedhessian_transformed.clone();
-    let p = k.nrows();
-    let factor = StableSolver::new("alo stabilized hessian")
-        .factorize(&k)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
-
-    let xt = x_dense.t();
-
+    // Compute dispersion parameter.
     let phi = match link {
         LinkFunction::Logit
         | LinkFunction::Probit
@@ -101,20 +87,66 @@ fn compute_alo_diagnostics_from_pirls_impl(
     };
 
     let e = &base.reparam_result.e_transformed;
-    let e_rank = e.nrows();
-    let eview = FaerArrayView::new(e);
     let ridge = base.ridge_passport.laplacehessianridge().max(0.0);
-    let mut aii = Array1::<f64>::zeros(n);
-    let mut se_bayes = Array1::<f64>::zeros(n);
-    let mut se_sandwich = Array1::<f64>::zeros(n);
-    let eta_hat = base.final_eta.clone();
-    let offset = &base.final_offset;
-    let z = &base.solveworking_response;
 
-    let mut diag_counter = 0;
-    let max_diag_samples = 5;
+    // Build model-agnostic AloInput from PIRLS geometry, then delegate.
+    let input = AloInput {
+        design: x_dense,
+        penalized_hessian: &base.stabilizedhessian_transformed,
+        working_weights: &base.finalweights,
+        working_response: &base.solveworking_response,
+        eta: &base.final_eta,
+        offset: &base.final_offset,
+        link,
+        phi,
+        penalty_null_space: if e.nrows() > 0 { Some(e) } else { None },
+        ridge,
+    };
 
-    let mut percentiles_data = Vec::with_capacity(n);
+    let result = compute_alo_from_input(&input)?;
+
+    // PIRLS-specific post-hoc leverage diagnostics logging.
+    log_leverage_diagnostics(&result.leverage, phi);
+
+    // Final NaN guard with detailed error reporting.
+    let has_nan_pred = result.eta_tilde.iter().any(|&x| x.is_nan());
+    let has_nan_se_bayes = result.se_bayes.iter().any(|&x| x.is_nan());
+    let has_nan_se_sandwich = result.se_sandwich.iter().any(|&x| x.is_nan());
+    let has_nan_leverage = result.leverage.iter().any(|&x| x.is_nan());
+
+    if has_nan_pred || has_nan_se_bayes || has_nan_se_sandwich || has_nan_leverage {
+        log::error!("[GAM ALO] NaN values found in ALO diagnostics:");
+        log::error!(
+            "[GAM ALO] eta_tilde: {} NaN values",
+            result.eta_tilde.iter().filter(|&&x| x.is_nan()).count()
+        );
+        log::error!(
+            "[GAM ALO] se_bayes: {} NaN values",
+            result.se_bayes.iter().filter(|&&x| x.is_nan()).count()
+        );
+        log::error!(
+            "[GAM ALO] se_sandwich: {} NaN values",
+            result.se_sandwich.iter().filter(|&&x| x.is_nan()).count()
+        );
+        log::error!(
+            "[GAM ALO] leverage: {} NaN values",
+            result.leverage.iter().filter(|&&x| x.is_nan()).count()
+        );
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Log detailed leverage percentile diagnostics for a completed ALO computation.
+fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
+    let n = leverage.len();
+    if n == 0 {
+        return;
+    }
+
     let mut sum_aii = 0.0_f64;
     let mut max_aii = f64::NEG_INFINITY;
     let mut invalid_count = 0usize;
@@ -123,136 +155,32 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let mut a_hi_95 = 0usize;
     let mut a_hi_99 = 0usize;
 
-    let block_cols = 8192usize;
-
-    let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
-
-    for chunk_start in (0..n).step_by(block_cols) {
-        let chunk_end = (chunk_start + block_cols).min(n);
-        let width = chunk_end - chunk_start;
-
-        rhs_chunk_buf
-            .slice_mut(s![.., ..width])
-            .assign(&xt.slice(s![.., chunk_start..chunk_end]));
-
-        let rhs_chunkview = rhs_chunk_buf.slice(s![.., ..width]);
-        let rhs_chunk = FaerArrayView::new(&rhs_chunkview);
-        let s_chunk = factor.solve(rhs_chunk.as_ref());
-        let mut es_chunk_storage = FaerMat::<f64>::zeros(e_rank, width);
-        if e_rank > 0 {
-            matmul(
-                es_chunk_storage.as_mut(),
-                Accum::Replace,
-                eview.as_ref(),
-                s_chunk.as_ref(),
-                1.0,
-                Par::Seq,
-            );
+    for (obs, &ai) in leverage.iter().enumerate() {
+        if ai.is_finite() {
+            sum_aii += ai;
+            max_aii = max_aii.max(ai);
+        } else {
+            sum_aii = f64::NAN;
         }
 
-        for local_col in 0..width {
-            let obs = chunk_start + local_col;
-            let xrow = x_dense.row(obs);
-            let mut x_hinv_x = 0.0f64;
-            let mut s_norm2 = 0.0f64;
-            for row in 0..p {
-                let sval = s_chunk[(row, local_col)];
-                let xval = xrow[row];
-                x_hinv_x = sval.mul_add(xval, x_hinv_x);
-                s_norm2 = sval.mul_add(sval, s_norm2);
+        if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
+            invalid_count += 1;
+            log::warn!("[GAM ALO] invalid leverage at i={}, a_ii={:.6e}", obs, ai);
+        } else if ai > 0.99 {
+            high_leverage_count += 1;
+            if ai > 0.999 {
+                log::warn!("[GAM ALO] very high leverage at i={}, a_ii={:.6e}", obs, ai);
             }
-            let ai = w[obs].max(0.0) * x_hinv_x;
-            let mut es_norm2 = 0.0f64;
-            if e_rank > 0 {
-                for r in 0..e_rank {
-                    let v = es_chunk_storage[(r, local_col)];
-                    es_norm2 = v.mul_add(v, es_norm2);
-                }
-            }
-            aii[obs] = ai;
-            percentiles_data.push(ai);
+        }
 
-            if ai.is_finite() {
-                sum_aii += ai;
-            } else {
-                sum_aii = f64::NAN;
-            }
-
-            if ai.is_finite() {
-                max_aii = max_aii.max(ai);
-            }
-
-            if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
-                invalid_count += 1;
-                log::warn!("[GAM ALO] invalid leverage at i={}, a_ii={:.6e}", obs, ai);
-            } else if ai > 0.99 {
-                high_leverage_count += 1;
-                if ai > 0.999 {
-                    log::warn!("[GAM ALO] very high leverage at i={}, a_ii={:.6e}", obs, ai);
-                }
-            }
-
-            if ai > 0.90 {
-                a_hi_90 += 1;
-            }
-            if ai > 0.95 {
-                a_hi_95 += 1;
-            }
-            if ai > 0.99 {
-                a_hi_99 += 1;
-            }
-
-            let var_bayes = bayesvar_eta(phi, x_hinv_x);
-            let var_sandwich = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
-            if var_sandwich == 0.0 && base.finalweights[obs] < 1e-10 {
-                log::warn!(
-                    "[GAM ALO] obs {} has near-zero weight ({:.2e}) resulting in SE=0",
-                    obs,
-                    base.finalweights[obs]
-                );
-            }
-            let var_sandwich_stable = var_sandwich.is_finite() && var_sandwich >= 0.0;
-            if !var_sandwich_stable {
-                log::warn!(
-                    "[GAM ALO] unstable sandwich variance at i={}, var={:.6e}",
-                    obs,
-                    var_sandwich
-                );
-            }
-            if !var_bayes.is_finite() || !var_sandwich.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO variance is not finite at row {obs}: bayes={var_bayes:.6e}, sandwich={var_sandwich:.6e}"
-                )));
-            }
-            let bayes_tol = variance_negative_tolerance(phi * x_hinv_x.abs());
-            if var_bayes < -bayes_tol {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO Bayesian variance is materially negative at row {obs}: var={var_bayes:.6e}, tol={bayes_tol:.6e}"
-                )));
-            }
-            let sandwich_scale = phi * (x_hinv_x.abs() + es_norm2.abs() + (ridge * s_norm2).abs());
-            let sandwich_tol = variance_negative_tolerance(sandwich_scale);
-            if var_sandwich < -sandwich_tol {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
-                )));
-            }
-            let se_bayes_i = var_bayes.max(0.0).sqrt();
-            let se_sandwich_i = var_sandwich.max(0.0).sqrt();
-            se_bayes[obs] = se_bayes_i;
-            se_sandwich[obs] = se_sandwich_i;
-
-            if diag_counter < max_diag_samples {
-                log::debug!("[GAM ALO] SE formula (obs {}):", obs);
-                log::debug!("  - w_i: {:.6e}", base.finalweights[obs]);
-                log::debug!("  - a_ii: {:.6e}", ai);
-                log::debug!("  - x_i'H^-1 x_i: {:.6e}", x_hinv_x);
-                log::debug!("  - var_bayes: {:.6e}", var_bayes);
-                log::debug!("  - var_sandwich: {:.6e}", var_sandwich);
-                log::debug!("  - SE_bayes: {:.6e}", se_bayes_i);
-                log::debug!("  - SE_sandwich: {:.6e}", se_sandwich_i);
-                diag_counter += 1;
-            }
+        if ai > 0.90 {
+            a_hi_90 += 1;
+        }
+        if ai > 0.95 {
+            a_hi_95 += 1;
+        }
+        if ai > 0.99 {
+            a_hi_99 += 1;
         }
     }
 
@@ -264,40 +192,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
         );
     }
 
-    let mut eta_tilde = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let denom_raw = 1.0 - aii[i];
-        if !denom_raw.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO denominator is not finite at row {i}: 1-a_ii={denom_raw}"
-            )));
-        }
-        if denom_raw <= 0.0 {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
-                aii[i], denom_raw
-            )));
-        }
-
-        if denom_raw <= 1e-4 {
-            log::warn!(
-                "[GAM ALO] ALO 1-a_ii very small at i={}, a_ii={:.6e}",
-                i,
-                aii[i]
-            );
-        }
-
-        eta_tilde[i] = alo_eta_updatewith_offset(eta_hat[i], z[i], offset[i], aii[i]);
-
-        if !eta_tilde[i].is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO eta_tilde is not finite at row {i}: eta_tilde={}",
-                eta_tilde[i]
-            )));
-        }
-    }
-
-    let mut percentiles = percentiles_data;
+    let mut percentiles_data: Vec<f64> = leverage.to_vec();
 
     let p50_idx = if n > 1 {
         ((0.50_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
@@ -316,17 +211,18 @@ fn compute_alo_diagnostics_from_pirls_impl(
     };
 
     let mut percentilevalue = |idx: usize| -> f64 {
-        if percentiles.is_empty() {
+        if percentiles_data.is_empty() {
             0.0
         } else {
-            let target = idx.min(percentiles.len() - 1);
-            let (_, nth, _) = percentiles
-                .select_nth_unstable_by(target, |a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+            let target = idx.min(percentiles_data.len() - 1);
+            let (_, nth, _) = percentiles_data.select_nth_unstable_by(target, |a, b| {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            });
             *nth
         }
     };
 
-    let a_mean: f64 = if n == 0 { 0.0 } else { sum_aii / (n as f64) };
+    let a_mean: f64 = sum_aii / (n as f64);
     let a_median = percentilevalue(p50_idx);
     let a_p95 = percentilevalue(p95_idx);
     let a_p99 = percentilevalue(p99_idx);
@@ -348,52 +244,6 @@ fn compute_alo_diagnostics_from_pirls_impl(
         100.0 * (a_hi_99 as f64) / (n as f64).max(1.0),
         phi
     );
-
-    let eta_tilde = match link {
-        LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic
-        | LinkFunction::Identity => eta_tilde,
-    };
-
-    let has_nan_pred = eta_tilde.iter().any(|&x| x.is_nan());
-    let has_nan_se_bayes = se_bayes.iter().any(|&x| x.is_nan());
-    let has_nan_se_sandwich = se_sandwich.iter().any(|&x| x.is_nan());
-    let has_nan_leverage = aii.iter().any(|&x| x.is_nan());
-
-    if has_nan_pred || has_nan_se_bayes || has_nan_se_sandwich || has_nan_leverage {
-        log::error!("[GAM ALO] NaN values found in ALO diagnostics:");
-        log::error!(
-            "[GAM ALO] eta_tilde: {} NaN values",
-            eta_tilde.iter().filter(|&&x| x.is_nan()).count()
-        );
-        log::error!(
-            "[GAM ALO] se_bayes: {} NaN values",
-            se_bayes.iter().filter(|&&x| x.is_nan()).count()
-        );
-        log::error!(
-            "[GAM ALO] se_sandwich: {} NaN values",
-            se_sandwich.iter().filter(|&&x| x.is_nan()).count()
-        );
-        log::error!(
-            "[GAM ALO] leverage: {} NaN values",
-            aii.iter().filter(|&&x| x.is_nan()).count()
-        );
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-
-    Ok(AloDiagnostics {
-        eta_tilde,
-        se_bayes,
-        se_sandwich,
-        pred_identity: eta_hat,
-        leverage: aii,
-        fisherweights: base.finalweights.clone(),
-    })
 }
 
 /// Model-agnostic input for ALO diagnostics.
@@ -538,6 +388,29 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
             } else {
                 var_bayes
             };
+
+            if !var_bayes.is_finite() || !var_sandwich.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO variance is not finite at row {obs}: bayes={var_bayes:.6e}, sandwich={var_sandwich:.6e}"
+                )));
+            }
+            let bayes_tol = variance_negative_tolerance(phi * x_hinv_x.abs());
+            if var_bayes < -bayes_tol {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO Bayesian variance is materially negative at row {obs}: var={var_bayes:.6e}, tol={bayes_tol:.6e}"
+                )));
+            }
+            if e_rank > 0 {
+                let sandwich_scale =
+                    phi * (x_hinv_x.abs() + es_norm2.abs() + (ridge * s_norm2).abs());
+                let sandwich_tol = variance_negative_tolerance(sandwich_scale);
+                if var_sandwich < -sandwich_tol {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
+                    )));
+                }
+            }
+
             se_bayes[obs] = var_bayes.max(0.0).sqrt();
             se_sandwich[obs] = var_sandwich.max(0.0).sqrt();
         }
@@ -606,6 +479,25 @@ pub fn compute_alo_diagnostics_from_pirls(
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
     compute_alo_diagnostics_from_pirls_impl(base, y, link)
+}
+
+/// Compute ALO diagnostics from a `FitGeometry` and dense design matrix.
+///
+/// This is the entry point for models that expose `FitGeometry` (GAMLSS,
+/// survival, joint models) without requiring a full PIRLS result. Sandwich
+/// SE is not available through this path (it requires the penalty null-space
+/// projector E); Bayesian SE is returned for both `se_bayes` and
+/// `se_sandwich`.
+pub fn compute_alo_diagnostics_from_geometry(
+    geom: &FitGeometry,
+    design: &Array2<f64>,
+    eta: &Array1<f64>,
+    offset: &Array1<f64>,
+    link: LinkFunction,
+    phi: f64,
+) -> Result<AloDiagnostics, EstimationError> {
+    let input = AloInput::from_geometry(geom, design, eta, offset, link, phi);
+    compute_alo_from_input(&input)
 }
 
 #[cfg(test)]

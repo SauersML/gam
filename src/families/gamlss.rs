@@ -12046,6 +12046,134 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_log_sigma_working_weight_should_vanish_on_sigma_floor_branch() {
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_vec(vec![0.0]),
+            weights: Array1::from_vec(vec![1.0]),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+        };
+        let eta_t = Array1::from_vec(vec![1.0e-13]);
+        let eta_ls0 = -30.0_f64;
+        let eta_ls = Array1::from_vec(vec![eta_ls0]);
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta_ls,
+            },
+        ];
+
+        let mu_of_eta_ls = |ls: f64| {
+            let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(ls);
+            let q0 = binomial_location_scale_q0(eta_t[0], sigma);
+            let jet =
+                inverse_link_jet_for_inverse_link(&family.link_kind, q0).expect("inverse-link jet");
+            clamped_binomial_probability(jet.mu).0
+        };
+        let h = 1e-6;
+        let dmu_fd = (mu_of_eta_ls(eta_ls0 + h) - mu_of_eta_ls(eta_ls0 - h)) / (2.0 * h);
+        assert_eq!(
+            dmu_fd, 0.0,
+            "with q0(eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12), the active sigma floor makes mu locally constant in eta_ls"
+        );
+
+        let eval = family.evaluate(&states).expect("evaluate");
+        match &eval.blockworking_sets[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA] {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => {
+                assert!(
+                    (working_weights[0] - 0.0).abs() < 1e-30,
+                    "the log-sigma working weight should be 0 when the coded mu(eta_ls) is locally constant on the active sigma floor; got {}",
+                    working_weights[0]
+                );
+            }
+            BlockWorkingSet::ExactNewton { .. } => {
+                panic!("expected diagonal log-sigma block")
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_exact_log_sigma_block_should_be_flat_on_safe_exp_plateau() {
+        let y = array![1.0];
+        let weights = array![1.0];
+        let design = DesignMatrix::Dense(array![[1.0]]);
+        let family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            threshold_design: Some(design.clone()),
+            log_sigma_design: Some(design),
+        };
+        let eta_t0 = 0.1 * safe_exp(700.0);
+        let eta_ls0 = 701.0_f64;
+        let states = vec![
+            ParameterBlockState {
+                beta: array![eta_t0],
+                eta: array![eta_t0],
+            },
+            ParameterBlockState {
+                beta: array![eta_ls0],
+                eta: array![eta_ls0],
+            },
+        ];
+
+        let eval = family.evaluate(&states).expect("evaluate");
+        let (analytic_score, analytic_info) =
+            match &eval.blockworking_sets[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                    (gradient[0], hessian.to_dense()[[0, 0]])
+                }
+                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton log-sigma block"),
+            };
+
+        let loglik = |eta_ls: f64| {
+            binomial_location_scale_ll_only(
+                &y,
+                &weights,
+                &array![eta_t0],
+                &array![eta_ls],
+                None,
+                &family.link_kind,
+            )
+            .expect("log-likelihood")
+        };
+        let h = 1e-4;
+        let ll_plus = loglik(eta_ls0 + h);
+        let ll0 = loglik(eta_ls0);
+        let ll_minus = loglik(eta_ls0 - h);
+        let score_fd = (ll_plus - ll_minus) / (2.0 * h);
+        let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
+        assert_eq!(
+            score_fd, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded log-likelihood is locally flat in eta_ls on that plateau"
+        );
+        assert_eq!(
+            info_fd, 0.0,
+            "safe_exp is constant for eta_ls > 700, so the coded log-likelihood has zero second derivative in eta_ls on that plateau"
+        );
+        assert!(
+            (analytic_score - score_fd).abs() < 1e-30,
+            "the exact-newton log-sigma score should be the derivative of the coded plateau log-likelihood at eta_ls={eta_ls0}; got {} vs {}",
+            analytic_score,
+            score_fd
+        );
+        assert!(
+            (analytic_info - info_fd).abs() < 1e-20,
+            "the exact-newton log-sigma information should be the negative second derivative of the coded plateau log-likelihood at eta_ls={eta_ls0}; got {} vs {}",
+            analytic_info,
+            info_fd
+        );
+    }
+
+    #[test]
     fn wiggle_family_evaluate_returns_exact_newton_blocks() {
         let n = 6usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
