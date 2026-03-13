@@ -1755,6 +1755,84 @@ impl<'a> JointRemlState<'a> {
             det1[n_base_penalties] = link_rank as f64;
         }
 
+        // Penalty logdet second derivatives.
+        //
+        // det2[k,l] = delta_{kl} det1[k] - lambda_k lambda_l tr(S⁺ S_k S⁺ S_l)
+        //
+        // Base penalties share a block; link penalty is a separate single-parameter
+        // block with disjoint support. Cross terms between base and link are zero
+        // because the penalty matrices have disjoint column support. The link
+        // diagonal entry is also zero: for a single penalty S = lambda * S_link,
+        // the trace term equals det1[link] exactly, cancelling the diagonal term.
+        let mut det2 = Array2::<f64>::zeros((k, k));
+        if n_base_penalties > 0 {
+            let rs_t = &base_reparam.rs_transformed;
+            let p_r = rs_t[0].ncols();
+
+            // Build S_lambda in the transformed coordinate frame.
+            let mut s_lambda = Array2::<f64>::zeros((p_r, p_r));
+            let mut s_k_mats = Vec::with_capacity(n_base_penalties);
+            for (idx, r_k) in rs_t.iter().enumerate() {
+                let s_k = r_k.t().dot(r_k);
+                s_lambda.scaled_add(lambda_base[idx], &s_k);
+                s_k_mats.push(s_k);
+            }
+            if state.ridge_base_used > 0.0 {
+                for d in 0..p_r {
+                    s_lambda[[d, d]] += state.ridge_base_used;
+                }
+            }
+
+            // Eigendecompose for pseudo-inverse W W^T where W = V diag(1/sqrt(eig)).
+            let (eigs, vecs) = s_lambda
+                .eigh(Side::Lower)
+                .map_err(|e| EstimationError::InvalidInput(
+                    format!("det2 eigendecomposition failed: {e}"),
+                ))?;
+            let max_ev = eigs.iter().copied().fold(0.0_f64, f64::max);
+            let tol = (p_r.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
+            let n_active = eigs.iter().filter(|&&v| v > tol).count();
+
+            let mut w_factor = Array2::zeros((p_r, n_active));
+            let mut w_col = 0;
+            for (idx, &ev) in eigs.iter().enumerate() {
+                if ev > tol {
+                    let scale = 1.0 / ev.sqrt();
+                    for row in 0..p_r {
+                        w_factor[[row, w_col]] = vecs[[row, idx]] * scale;
+                    }
+                    w_col += 1;
+                }
+            }
+
+            // M_k = W^T A_k W = lambda_k * W^T S_k W (n_active x n_active, symmetric).
+            // det2[k,l] = delta_{kl} det1[k] - tr(M_k M_l).
+            // tr(M_k M_l) = Frobenius inner product since M_k, M_l are symmetric.
+            let mut m_mats = Vec::with_capacity(n_base_penalties);
+            for (idx, s_k) in s_k_mats.iter().enumerate() {
+                let s_k_w = s_k.dot(&w_factor);
+                let mut m_k = w_factor.t().dot(&s_k_w);
+                m_k *= lambda_base[idx];
+                m_mats.push(m_k);
+            }
+
+            for kk in 0..n_base_penalties {
+                for ll in 0..=kk {
+                    let frob: f64 = m_mats[kk]
+                        .iter()
+                        .zip(m_mats[ll].iter())
+                        .map(|(&a, &b)| a * b)
+                        .sum();
+                    let mut val = -frob;
+                    if kk == ll {
+                        val += det1[kk];
+                    }
+                    det2[[kk, ll]] = val;
+                    det2[[ll, kk]] = val;
+                }
+            }
+        }
+
         // Penalty quadratic + ridge (same as compute_laml_at_convergence).
         let mut penalty_quadratic = 0.0;
         for (idx, s_k) in state.s_base.iter().enumerate() {
@@ -2324,7 +2402,7 @@ impl<'a> JointRemlState<'a> {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
-                second: Some(Array2::zeros((k, k))),
+                second: Some(det2),
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,

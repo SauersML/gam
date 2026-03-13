@@ -54,8 +54,7 @@ use crate::types::{MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_ata,
-    fast_atb,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_atb,
 };
 use faer::{MatRef, Side};
 
@@ -2534,6 +2533,8 @@ where
 
     let lambdas = final_rho.mapv(f64::exp);
     let p_dim = pirls_res.beta_transformed.len();
+    let penalty_rank_total = pirls_res.reparam_result.e_transformed.nrows();
+    let mp = (p_dim as f64 - penalty_rank_total as f64).max(0.0);
     let mut edf_by_block = vec![0.0; k];
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
@@ -2585,8 +2586,6 @@ where
             let frob = faer_frob_inner(x_sol.as_ref(), ektview.as_ref());
             traces[kk] = lambdas[kk] * frob;
         }
-        let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
-        let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
         for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
             let p_k = rs_k.nrows() as f64;
@@ -2600,7 +2599,7 @@ where
     let standard_deviation = match cfg.link_function() {
         LinkFunction::Identity => {
             let denom = if opts.compute_inference {
-                (n - edf_total).max(1.0)
+                (n - mp).max(1.0)
             } else {
                 n.max(1.0)
             };

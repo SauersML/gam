@@ -327,6 +327,24 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Compute the soft prior Hessian as a standalone matrix.
+    ///
+    /// This is the diagonal matrix of second derivatives of the soft prior penalty.
+    /// Returns `None` when the prior contributes zero curvature (empty ρ or zero weight).
+    pub(super) fn compute_soft_priorhess(&self, rho: &Array1<f64>) -> Option<Array2<f64>> {
+        let len = rho.len();
+        if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+            return None;
+        }
+        let mut hess = Array2::<f64>::zeros((len, len));
+        self.add_soft_priorhessian_in_place(rho, &mut hess);
+        if hess.iter().any(|&v| v != 0.0) {
+            Some(hess)
+        } else {
+            None
+        }
+    }
+
     /// Returns the effective Hessian and the ridge value used (if any).
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
@@ -1054,6 +1072,7 @@ impl<'a> RemlState<'a> {
             active_subspace_unstable,
             sparse_exact: None,
             firth_dense_operator,
+            firth_dense_operator_original: None,
         })
     }
 
@@ -1104,7 +1123,7 @@ impl<'a> RemlState<'a> {
         )?;
         let (logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
-        let firth_dense_operator = if self.config.firth_bias_reduction
+        let firth_dense_operator_original = if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
             let x_dense = self
@@ -1133,13 +1152,13 @@ impl<'a> RemlState<'a> {
             active_subspace_unstable: false,
             sparse_exact: Some(Arc::new(SparseExactEvalData {
                 factor: Arc::new(sparse_system.factor),
-                penalty_blocks,
                 logdet_h: sparse_system.logdet_h,
                 logdet_s_pos,
                 det1_values: Arc::new(det1_values),
                 traceworkspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
             })),
-            firth_dense_operator,
+            firth_dense_operator: None,
+            firth_dense_operator_original,
         })
     }
 
@@ -1668,8 +1687,8 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, InnerSolution,
-            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives, reml_laml_evaluate,
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, HessianOperator,
+            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives,
         };
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -1702,14 +1721,9 @@ impl<'a> RemlState<'a> {
         // Penalty logdet derivatives from the reparameterization result.
         let (penalty_rank, log_det_s) =
             self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: log_det_s,
-            first: pirls_result.reparam_result.det1.clone(),
-            second: None,
-        };
 
         // Penalty roots (possibly projected).
-        let penalty_roots = if let Some(z) = free_basis_opt.as_ref() {
+        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
             pirls_result
                 .reparam_result
                 .rs_transformed
@@ -1718,6 +1732,25 @@ impl<'a> RemlState<'a> {
                 .collect()
         } else {
             pirls_result.reparam_result.rs_transformed.clone()
+        };
+
+        // Penalty logdet second derivatives (for outer Hessian).
+        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+            let lambdas = rho.mapv(f64::exp);
+            let (_, det2) = self.structural_penalty_logdet_derivatives(
+                &penalty_roots,
+                &lambdas,
+                penalty_rank,
+                ridge_passport.penalty_logdet_ridge(),
+            )?;
+            Some(det2)
+        } else {
+            None
+        };
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: log_det_s,
+            first: pirls_result.reparam_result.det1.clone(),
+            second: det2,
         };
 
         // Beta in the operator's basis.
@@ -1732,11 +1765,11 @@ impl<'a> RemlState<'a> {
         let p_eff_dim = h_for_operator.ncols();
         let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
-        // Number of observations.
-        let n_observations = self.y.len();
-
         // Derivative provider.
         let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let firth_active_for_derivs = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+            && free_basis_opt.is_none();
         let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
@@ -1750,11 +1783,23 @@ impl<'a> RemlState<'a> {
                 } else {
                     pirls_result.x_transformed.clone()
                 };
-                Box::new(SinglePredictorGlmDerivatives {
+                let base = SinglePredictorGlmDerivatives {
                     c_array,
                     d_array: Some(pirls_result.solve_d_array.clone()),
                     x_transformed,
-                })
+                };
+                if firth_active_for_derivs {
+                    if let Some(firth_op) = bundle.firth_dense_operator.clone() {
+                        Box::new(super::unified::FirthAwareGlmDerivatives {
+                            base,
+                            firth_op,
+                        })
+                    } else {
+                        Box::new(base)
+                    }
+                } else {
+                    Box::new(base)
+                }
             };
 
         // Dispersion handling.
@@ -1792,45 +1837,59 @@ impl<'a> RemlState<'a> {
         // Log-likelihood: for both Gaussian and GLM, deviance = -2 * log_likelihood.
         let log_likelihood = -0.5 * pirls_result.deviance;
 
-        let inner_solution = InnerSolution {
-            log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
+        // Firth gradient: ∂Φ/∂ρ_k = −0.5 tr(H⁻¹ D(Hφ)[B_k]).
+        //
+        // The Firth/Jeffreys penalty Φ = 0.5 log|I(β)|₊ depends on ρ through β̂(ρ).
+        // Its ρ-derivative uses the implicit function theorem:
+        //   B_k = dβ̂/dρ_k = −H⁻¹ A_k β̂,
+        //   ∂Φ/∂ρ_k = 0.5 tr(I⁻¹ dI/dβ · B_k) = −0.5 tr(H⁻¹ D(Hφ)[B_k]).
+        //
+        // Only computed when Firth is active AND no constraint projection
+        // (the FirthDenseOperator is built in the unprojected reparameterized basis).
+        let firth_gradient = if firth_logdet != 0.0
+            && free_basis_opt.is_none()
+            && mode != super::unified::EvalMode::ValueOnly
+        {
+            if let Some(firth_op) = bundle.firth_dense_operator.as_ref() {
+                let k = penalty_roots.len();
+                let mut fg = Array1::<f64>::zeros(k);
+                for idx in 0..k {
+                    let r_k = &penalty_roots[idx];
+                    let lam_k = rho[idx].exp();
+                    let r_beta = r_k.dot(&beta);
+                    let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
+                    // v_k = H⁻¹ A_k β̂;  B_k = −v_k.
+                    let v_k = hessian_op.solve(&a_k_beta);
+                    // δη_k = X B_k = −X v_k.
+                    let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_k).mapv(|v| -v);
+                    let dir_k = firth_op.direction_from_deta(deta_k);
+                    let dhphi_k = firth_op.hphi_direction(&dir_k);
+                    fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
+                }
+                Some(fg)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.evaluate_unified_tail(
+            rho,
+            mode,
             hessian_op,
             beta,
             penalty_roots,
             penalty_logdet,
             deriv_provider,
             tk_correction,
-            tk_gradient: None,
             firth_logdet,
-            firth_gradient: None,
-            n_observations,
+            firth_gradient,
             nullspace_dim,
             dispersion,
-            precomputed_h_k_corrections: None,
-            precomputed_h_ddot_traces: None,
-        };
-
-        // Prior cost/gradient.
-        let prior = if mode == super::unified::EvalMode::ValueOnly {
-            let pc = self.compute_soft_priorcost(rho);
-            if pc.abs() > 0.0 {
-                Some((pc, Array1::zeros(rho.len())))
-            } else {
-                None
-            }
-        } else {
-            let pc = self.compute_soft_priorcost(rho);
-            let pg = self.compute_soft_priorgrad(rho);
-            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
-                Some((pc, pg))
-            } else {
-                None
-            }
-        };
-
-        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
-            .map_err(|e| EstimationError::InvalidInput(e))
+            log_likelihood,
+            pirls_result.stable_penalty_term,
+        )
     }
 
     /// Sparse-exact bridge: builds a `SparseCholeskyOperator` from the pre-computed
@@ -1842,9 +1901,9 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DispersionHandling, GaussianDerivatives, HessianOperator, InnerSolution,
+            DispersionHandling, GaussianDerivatives, HessianOperator,
             PenaltyLogdetDerivs, SinglePredictorGlmDerivatives, SparseCholeskyOperator,
-            penalty_matrix_root, reml_laml_evaluate,
+            penalty_matrix_root,
         };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -1869,13 +1928,6 @@ impl<'a> RemlState<'a> {
             hessian_op.active_rank()
         );
 
-        // Penalty log-determinant derivatives from sparse data.
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: sparse.logdet_s_pos,
-            first: sparse.det1_values.as_ref().clone(),
-            second: None,
-        };
-
         // Penalty roots from s_full_list via eigendecomposition.
         let penalty_roots: Vec<Array2<f64>> = self
             .s_full_list
@@ -1892,6 +1944,28 @@ impl<'a> RemlState<'a> {
 
         // Nullspace dimension.
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+
+        // Penalty logdet second derivatives (for outer Hessian).
+        let structural_rank = (p_dim as f64 - mp) as usize;
+        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+            let lambdas = rho.mapv(f64::exp);
+            let (_, det2) = self.structural_penalty_logdet_derivatives(
+                &penalty_roots,
+                &lambdas,
+                structural_rank,
+                bundle.ridge_passport.penalty_logdet_ridge(),
+            )?;
+            Some(det2)
+        } else {
+            None
+        };
+
+        // Penalty log-determinant derivatives from sparse data.
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: sparse.logdet_s_pos,
+            first: sparse.det1_values.as_ref().clone(),
+            second: det2,
+        };
 
         // Dispersion and derivative provider depend on family.
         let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
@@ -1960,11 +2034,81 @@ impl<'a> RemlState<'a> {
         };
 
         let log_likelihood = -0.5 * pirls_result.deviance;
-        let n_observations = self.y.len();
 
+        // Firth gradient for sparse path.
+        //
+        // The sparse bundle caches a FirthDenseOperator built from the original
+        // (non-reparameterized) design matrix in `firth_dense_operator_original`.
+        // We reuse that cached operator here instead of rebuilding it each call.
+        let firth_gradient = if firth_logdet != 0.0
+            && mode != super::unified::EvalMode::ValueOnly
+        {
+            if let Some(firth_op) = bundle.firth_dense_operator_original.as_ref() {
+                let x_dense_orig = self.x().to_dense();
+                let k = penalty_roots.len();
+                let mut fg = Array1::<f64>::zeros(k);
+                for idx in 0..k {
+                    let r_k = &penalty_roots[idx];
+                    let lam_k = rho[idx].exp();
+                    let r_beta = r_k.dot(&beta);
+                    let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
+                    let v_k = hessian_op.solve(&a_k_beta);
+                    let deta_k: Array1<f64> = x_dense_orig.dot(&v_k).mapv(|v| -v);
+                    let dir_k = firth_op.direction_from_deta(deta_k);
+                    let dhphi_k = firth_op.hphi_direction(&dir_k);
+                    fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
+                }
+                Some(fg)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.evaluate_unified_tail(
+            rho,
+            mode,
+            hessian_op,
+            beta,
+            penalty_roots,
+            penalty_logdet,
+            deriv_provider,
+            tk_correction,
+            firth_logdet,
+            firth_gradient,
+            mp,
+            dispersion,
+            log_likelihood,
+            pirls_result.stable_penalty_term,
+        )
+    }
+
+    /// Shared tail for `evaluate_unified` and `evaluate_unified_sparse`:
+    /// assembles the `InnerSolution`, computes prior, and calls `reml_laml_evaluate`.
+    fn evaluate_unified_tail(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+        hessian_op: Box<dyn super::unified::HessianOperator>,
+        beta: Array1<f64>,
+        penalty_roots: Vec<Array2<f64>>,
+        penalty_logdet: super::unified::PenaltyLogdetDerivs,
+        deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
+        tk_correction: f64,
+        firth_logdet: f64,
+        firth_gradient: Option<Array1<f64>>,
+        nullspace_dim: f64,
+        dispersion: super::unified::DispersionHandling,
+        log_likelihood: f64,
+        penalty_quadratic: f64,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{InnerSolution, reml_laml_evaluate};
+
+        let n_observations = self.y.len();
         let inner_solution = InnerSolution {
             log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
+            penalty_quadratic,
             hessian_op,
             beta,
             penalty_roots,
@@ -1973,27 +2117,31 @@ impl<'a> RemlState<'a> {
             tk_correction,
             tk_gradient: None,
             firth_logdet,
-            firth_gradient: None,
+            firth_gradient,
             n_observations,
-            nullspace_dim: mp,
+            nullspace_dim,
             dispersion,
             precomputed_h_k_corrections: None,
             precomputed_h_ddot_traces: None,
         };
 
-        // Prior cost/gradient.
         let prior = if mode == super::unified::EvalMode::ValueOnly {
             let pc = self.compute_soft_priorcost(rho);
             if pc.abs() > 0.0 {
-                Some((pc, Array1::zeros(rho.len())))
+                Some((pc, Array1::zeros(rho.len()), None))
             } else {
                 None
             }
         } else {
             let pc = self.compute_soft_priorcost(rho);
             let pg = self.compute_soft_priorgrad(rho);
+            let ph = if mode == super::unified::EvalMode::ValueGradientHessian {
+                self.compute_soft_priorhess(rho)
+            } else {
+                None
+            };
             if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
-                Some((pc, pg))
+                Some((pc, pg, ph))
             } else {
                 None
             }

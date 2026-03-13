@@ -5,8 +5,7 @@ use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
     assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
-    leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti, sparse_matvec_public,
-    trace_hinv_sk,
+    leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti,
 };
 use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
 use crate::types::SasLinkState;
@@ -46,79 +45,15 @@ mod tests {
     use super::{
         DirectionalHyperParam, EvalShared, FirthDenseOperator, LinkFunction, RemlConfig, RemlState,
     };
-    use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_atb};
+    use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::linalg::sparse_exact::{
-        SparsePenaltyBlock, dense_to_sparse_symmetric_upper, factorize_sparse_spd,
+        dense_to_sparse_symmetric_upper, factorize_sparse_spd,
     };
     use crate::pirls::{PirlsCoordinateFrame, directionalworking_curvature_from_eta};
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
-
-    #[test]
-    fn dense_projected_tk_matches_directwt_hkw() {
-        let w_pos = array![[1.0, 0.0], [0.5, 1.0], [0.0, 1.0],];
-        let x = array![[1.0, 2.0, 0.0], [0.0, 1.0, 1.0], [2.0, 0.0, 1.0],];
-        let r_k = array![[1.0, -1.0, 0.0], [0.0, 1.0, -1.0],];
-        let lambda_k = 1.7;
-        let cweighted_u_k = array![0.2, -0.1, 0.4];
-
-        let z_mat = fast_ab(&x, &w_pos);
-        let actual = RemlState::dense_projected_tk(&z_mat, &w_pos, &r_k, lambda_k, &cweighted_u_k);
-
-        let s_k = r_k.t().dot(&r_k);
-        let mut h_k = s_k.mapv(|v| lambda_k * v);
-        let xweighted = RemlState::row_scale(&x, &cweighted_u_k);
-        h_k += &fast_atb(&x, &xweighted);
-        let expected = w_pos.t().dot(&h_k).dot(&w_pos);
-
-        let diff = &actual - &expected;
-        let err = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(err < 1e-10, "projected T_k mismatch: {err}");
-    }
-
-    #[test]
-    fn dense_projected_trace_hinv_hkl_matches_direct_dense_trace() {
-        let w_pos = array![[1.0, 0.0], [0.5, 1.0], [0.0, 1.0],];
-        let x = array![[1.0, 2.0, 0.0], [0.0, 1.0, 1.0], [2.0, 0.0, 1.0],];
-        let r_k = array![[1.0, -1.0, 0.0], [0.0, 1.0, -1.0],];
-        let lambda_k = 0.9;
-        let diag_kl = array![0.25, -0.2, 0.1];
-
-        let z_mat = fast_ab(&x, &w_pos);
-        let actual = RemlState::dense_projected_trace_hinv_hkl(
-            &z_mat,
-            &w_pos,
-            Some(&r_k),
-            lambda_k,
-            &diag_kl,
-        );
-
-        let s_k = r_k.t().dot(&r_k);
-        let mut h_kl = s_k.mapv(|v| lambda_k * v);
-        let xweighted = RemlState::row_scale(&x, &diag_kl);
-        h_kl += &fast_atb(&x, &xweighted);
-        let expected = RemlState::trace_product(&w_pos.dot(&w_pos.t()), &h_kl);
-
-        assert!((actual - expected).abs() < 1e-10);
-    }
-
-    #[test]
-    fn dense_projected_trace_quadratic_matches_direct_dense_trace() {
-        let t_k = array![[2.0, 0.5], [0.5, 1.0],];
-        let t_l = array![[1.5, -0.25], [-0.25, 0.75],];
-        let actual = RemlState::dense_projected_trace_quadratic(&t_k, &t_l);
-        let expected = RemlState::trace_product(&t_k, &t_l);
-        assert!((actual - expected).abs() < 1e-12);
-    }
-
-    #[test]
-    fn dense_projected_exactcost_gate_behaves_as_expected() {
-        assert!(RemlState::dense_projected_exact_eligible(5_000, 100, 10));
-        assert!(!RemlState::dense_projected_exact_eligible(50_000, 1025, 10));
-        assert!(!RemlState::dense_projected_exact_eligible(200_000, 200, 20));
-    }
 
     fn build_logit_state<'a>(
         y: &'a Array1<f64>,
@@ -670,7 +605,7 @@ mod tests {
         let sparse_factor = factorize_sparse_spd(&h_sparse).expect("sparse factor");
         let sparse_payload = Arc::new(super::SparseExactEvalData {
             factor: Arc::new(sparse_factor),
-            penalty_blocks: Arc::new(Vec::<SparsePenaltyBlock>::new()),
+
             logdet_h: 0.0,
             logdet_s_pos: 0.0,
             det1_values: Arc::new(Array1::<f64>::zeros(rho.len())),
@@ -688,6 +623,7 @@ mod tests {
             active_subspace_unstable: dense_bundle.active_subspace_unstable,
             sparse_exact: Some(sparse_payload),
             firth_dense_operator: dense_bundle.firth_dense_operator.clone(),
+            firth_dense_operator_original: dense_bundle.firth_dense_operator.clone(),
         };
         let g_sparse_branch = dense_state
             .compute_directional_hypergradient_sparse_exact(&rho, &sparse_bundle, &hyper)
@@ -1139,7 +1075,7 @@ mod tests {
         let sparse_factor = factorize_sparse_spd(&h_sparse).expect("factor");
         let sparse_payload = Arc::new(super::SparseExactEvalData {
             factor: Arc::new(sparse_factor),
-            penalty_blocks: Arc::new(Vec::<SparsePenaltyBlock>::new()),
+
             logdet_h: 0.0,
             logdet_s_pos: 0.0,
             det1_values: Arc::new(Array1::<f64>::zeros(rho.len())),
@@ -1157,6 +1093,7 @@ mod tests {
             active_subspace_unstable: bundle_dense.active_subspace_unstable,
             sparse_exact: Some(sparse_payload),
             firth_dense_operator: bundle_dense.firth_dense_operator.clone(),
+            firth_dense_operator_original: bundle_dense.firth_dense_operator.clone(),
         };
         let t1 = Instant::now();
         let g_sparse = state
@@ -1729,7 +1666,6 @@ struct SparseRemlDecision {
 #[derive(Clone)]
 struct SparseExactEvalData {
     factor: Arc<SparseExactFactor>,
-    penalty_blocks: Arc<Vec<SparsePenaltyBlock>>,
     logdet_h: f64,
     logdet_s_pos: f64,
     det1_values: Arc<Array1<f64>>,
@@ -1906,6 +1842,9 @@ pub(crate) struct EvalShared {
     active_subspace_unstable: bool,
     sparse_exact: Option<Arc<SparseExactEvalData>>,
     firth_dense_operator: Option<Arc<FirthDenseOperator>>,
+    /// Cached FirthDenseOperator built from the original (non-reparameterized)
+    /// design matrix, for use by the sparse evaluation path.
+    firth_dense_operator_original: Option<Arc<FirthDenseOperator>>,
 }
 
 impl EvalShared {
