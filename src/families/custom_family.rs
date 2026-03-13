@@ -2565,6 +2565,7 @@ fn unified_joint_cost_gradient(
             include_logdet_s,
         },
         precomputed_h_k_corrections: Some(precomputed_corrections),
+        precomputed_h_ddot_traces: None,
     };
 
     let result = reml_laml_evaluate(
@@ -6416,7 +6417,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
         let n = 8usize;
@@ -6777,7 +6777,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn outer_lamlhessian_joint_exact_binomial_location_scale_hard_case_matchesfd() {

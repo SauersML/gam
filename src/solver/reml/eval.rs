@@ -305,6 +305,14 @@ impl<'a> RemlState<'a> {
         if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_lamlhessian_sparse_exact(rho, &bundle);
         }
+        // Try the unified evaluator's outer Hessian first.
+        if let Ok(result) =
+            self.evaluate_unified(rho, &bundle, super::unified::EvalMode::ValueGradientHessian)
+        {
+            if let Some(h) = result.hessian {
+                return Ok(h);
+            }
+        }
         // Full derivation for the dense transformed exact outer Hessian.
         //
         // Definitions:

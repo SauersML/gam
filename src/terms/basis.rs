@@ -11053,8 +11053,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn test_gram_and_psi_derivatives_from_operator_matchesfd() {
         // Build D(psi) = D0 + psi D1 + 0.5 psi^2 D2 with nontrivial shape.

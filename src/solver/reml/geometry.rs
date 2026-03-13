@@ -101,7 +101,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-
     pub(super) fn trace_hinv_operator_sparse_exact<F>(
         &self,
         factor: &SparseExactFactor,

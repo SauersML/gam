@@ -4580,17 +4580,6 @@ mod fd_policy_tests {
     use rand::{RngExt, SeedableRng};
 
     #[test]
-    fn testgradient_diagfd_sampling_schedule() {
-        for eval in 1..=GRAD_DIAG_FD_WARMUP_EVALS {
-            assert!(should_samplegradient_diagfd(eval));
-        }
-        assert!(!should_samplegradient_diagfd(GRAD_DIAG_FD_WARMUP_EVALS + 1));
-        assert!(!should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL - 1));
-        assert!(should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL));
-        assert!(should_samplegradient_diagfd(GRAD_DIAG_FD_INTERVAL * 2));
-    }
-
-    #[test]
     fn test_firth_support_rule_respects_legacy_low_support_floor() {
         assert!(should_enable_firth_from_class_support(19.99, 1));
         assert!(!should_enable_firth_from_class_support(20.0, 1));

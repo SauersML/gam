@@ -975,14 +975,8 @@ mod tests {
             let state_minus = state
                 .build_joint_perturbed_state(&psi_minus, &hyper_dirs)
                 .expect("state-");
-            let bundle_plus = state_plus.obtain_eval_bundle(&rho).expect("bundle+");
-            let bundle_minus = state_minus.obtain_eval_bundle(&rho).expect("bundle-");
-            let g_plus = state_plus
-                .compute_gradient_with_bundle(&rho, &bundle_plus)
-                .expect("g+");
-            let g_minus = state_minus
-                .compute_gradient_with_bundle(&rho, &bundle_minus)
-                .expect("g-");
+            let g_plus = state_plus.compute_gradient(&rho).expect("g+");
+            let g_minus = state_minus.compute_gradient(&rho).expect("g-");
             let col = (&g_plus - &g_minus) / (2.0 * h);
             mixedfd.column_mut(j).assign(&col);
         }
@@ -2078,4 +2072,3 @@ pub(crate) struct RemlState<'a> {
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
 }
-

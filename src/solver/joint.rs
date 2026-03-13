@@ -19,16 +19,14 @@
 use crate::basis::{
     BasisOptions, Dense, KnotSource, apply_linear_extension_from_first_derivative,
     baseline_lambda_seed, compute_geometric_constraint_transform, create_basis,
-    create_difference_penalty_matrix, penalty_greville_abscissae_for_knots,
 };
 use crate::construction::{
-    EngineDims, ReparamInvariant, ReparamResult, compute_penalty_square_roots,
-    precompute_reparam_invariant, stable_reparameterization_engine,
-    stable_reparameterizationwith_invariant_engine,
+    EngineDims, ReparamInvariant, compute_penalty_square_roots, precompute_reparam_invariant,
+    stable_reparameterization_engine, stable_reparameterizationwith_invariant_engine,
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
-    FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv, fast_atv_into, fast_xt_diag_x, fast_xt_diag_y,
+    FaerEigh, fast_ata, fast_atb, fast_atv_into, fast_xt_diag_x, fast_xt_diag_y,
 };
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::probability::normal_cdf;
@@ -54,14 +52,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 /// This is a SOLVER detail, not an objective function modification.
 /// With spectral log-det (Wood 2011), the objective is smooth regardless of ridge.
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
-// FD audit policy for analytic gradient checks.
-// Keep this in test builds only. Enabling it in ordinary debug binaries makes
-// flexible-link fits dramatically slower while providing no behavioral benefit,
-// because the runtime path already keeps the analytic gradient either way.
-const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.90;
-const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
-const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
-const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(test);
+// FD audit constants removed — gradient now computed through unified evaluator.
 
 #[inline]
 fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<GlmLikelihoodFamily> {
@@ -118,12 +109,6 @@ fn seed_risk_profile_for_joint_link(link: LinkFunction) -> SeedRiskProfile {
     }
 }
 
-#[inline]
-fn should_sample_jointfdaudit(eval_num: usize) -> bool {
-    eval_num <= JOINT_GRAD_AUDIT_WARMUP_EVALS
-        || (JOINT_GRAD_AUDIT_INTERVAL > 0 && eval_num % JOINT_GRAD_AUDIT_INTERVAL == 0)
-}
-
 #[derive(Clone, Copy)]
 struct JointPenaltyLayout {
     n_base: usize,
@@ -172,22 +157,6 @@ impl JointCoefLayout {
 
     fn p_total(self) -> usize {
         self.p_base + self.p_link
-    }
-
-    fn split(self, flat: &Array1<f64>) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
-        if flat.len() != self.p_total() {
-            return Err(EstimationError::LayoutError(format!(
-                "joint coefficient split length mismatch: got {}, expected {} (base {} + link {})",
-                flat.len(),
-                self.p_total(),
-                self.p_base,
-                self.p_link
-            )));
-        }
-        Ok((
-            flat.slice(s![..self.p_base]).to_owned(),
-            flat.slice(s![self.p_base..]).to_owned(),
-        ))
     }
 }
 
@@ -1284,7 +1253,6 @@ pub struct JointEvalContext {
     cached_edf_terms: Vec<(String, f64, f64)>,
     last_backfit_iterations: usize,
     last_converged: bool,
-    eval_count: usize,
     lasthessian_condition: Option<f64>,
     last_outer_step_norm: Option<f64>,
     last_eval_rho: Option<Array1<f64>>,
@@ -1369,18 +1337,6 @@ impl JointRemlSnapshot {
 }
 
 impl<'a> JointRemlState<'a> {
-    #[inline]
-    fn cachedcost_matches_rho(&self, rho: &Array1<f64>) -> bool {
-        self.eval.cached_laml.is_some()
-            && self.eval.cached_rho.len() == rho.len()
-            && self
-                .eval
-                .cached_rho
-                .iter()
-                .zip(rho.iter())
-                .all(|(a, b)| a == b)
-    }
-
     /// Create new REML state
     pub(crate) fn new(
         y: ArrayView1<'a, f64>,
@@ -1434,7 +1390,6 @@ impl<'a> JointRemlState<'a> {
                 cached_edf_terms: Vec::new(),
                 last_backfit_iterations: 0,
                 last_converged: false,
-                eval_count: 0,
                 lasthessian_condition: None,
                 last_outer_step_norm: None,
                 last_eval_rho: None,
@@ -1546,6 +1501,48 @@ impl<'a> JointRemlState<'a> {
         Ok(-laml)
     }
 
+    /// Compute cost, gradient, and outer Hessian through the unified evaluator.
+    ///
+    /// This method runs the inner solver (via compute_cost), builds the enriched
+    /// InnerSolution with full gradient corrections and Hessian traces, and
+    /// evaluates everything through `reml_laml_evaluate(ValueGradientHessian)`.
+    pub fn compute_unified_eval(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<OuterEval, EstimationError> {
+        use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
+
+        // Step 1: Run inner solver (caches converged state).
+        let cost = self.compute_cost(rho)?;
+
+        // Step 2: Build enriched InnerSolution from converged state.
+        let penalty_layout = JointPenaltyLayout::for_state(&self.core.state);
+        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
+        let (inner_solution, ..) = Self::build_inner_solution_at_convergence(
+            &self.core.state,
+            rho.as_slice().unwrap(),
+            &lambda_base,
+            lambda_link,
+            self.core.base_reparam_invariant.as_ref(),
+            &self.core.base_rs_list,
+        )?;
+
+        // Step 3: Evaluate cost + gradient + Hessian through unified path.
+        let result = reml_laml_evaluate(
+            &inner_solution,
+            rho.as_slice().unwrap(),
+            EvalMode::ValueGradientHessian,
+            None,
+        )
+        .map_err(|e| EstimationError::InvalidInput(e))?;
+
+        Ok(OuterEval {
+            cost,
+            gradient: result.gradient.unwrap(),
+            hessian: HessianResult::Analytic(result.hessian.unwrap()),
+        })
+    }
+
     fn fixed_subspace_logdet_for_penalty(
         s_lambda: &Array2<f64>,
         structural_rank: usize,
@@ -1601,7 +1598,7 @@ impl<'a> JointRemlState<'a> {
 
     /// Build an InnerSolution from the converged joint state for the unified
     /// REML/LAML evaluator. This replaces compute_laml_at_convergence for cost
-    /// and compute_gradient_analytic for gradient — both are now computed by
+    /// and gradient/Hessian — all are now computed by
     /// the single reml_laml_evaluate function.
     fn build_inner_solution_at_convergence(
         state: &JointModelState,
@@ -1612,8 +1609,8 @@ impl<'a> JointRemlState<'a> {
         base_rs_list: &[Array2<f64>],
     ) -> Result<(crate::estimate::reml::unified::InnerSolution, Option<f64>), EstimationError> {
         use crate::estimate::reml::unified::{
-            BlockCoupledDerivativeProvider, DenseSpectralOperator, DispersionHandling,
-            GaussianDerivatives, InnerSolution, PenaltyLogdetDerivs,
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, HessianOperator,
+            InnerSolution, PenaltyLogdetDerivs,
         };
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
@@ -1674,7 +1671,7 @@ impl<'a> JointRemlState<'a> {
         let coef_layout = JointCoefLayout::new(p_base, p_link);
         let p_total = coef_layout.p_total();
 
-        let (g_prime, _, _) = compute_link_derivative_terms_from_state(state, &u);
+        let (g_prime, gsecond, b_prime_u) = compute_link_derivative_terms_from_state(state, &u);
         let j_mat = state.build_joint_jacobian(&bwiggle, &g_prime);
         let penalty_full = state.build_joint_penalty(lambda_base, lambda_link, p_link);
         let link_penalty = state.build_link_penalty();
@@ -1689,10 +1686,10 @@ impl<'a> JointRemlState<'a> {
             h_full += &penalty_full;
         }
 
-        // Build HessianOperator from joint Hessian.
-        let hessian_op = Box::new(DenseSpectralOperator::from_symmetric(&h_full).map_err(|e| {
+        // Build HessianOperator from joint Hessian (delay boxing for enrichment).
+        let hop = DenseSpectralOperator::from_symmetric(&h_full).map_err(|e| {
             EstimationError::InvalidInput(format!("Joint HessianOperator failed: {e}"))
-        })?);
+        })?;
 
         // Penalty logdet via reparameterization (base) + eigendecomposition (link).
         let base_reparam = if let Some(invariant) = base_reparam_invariant {
@@ -1824,17 +1821,6 @@ impl<'a> JointRemlState<'a> {
         // Log-likelihood: for GLM, ll = -0.5 * deviance. For Gaussian, same.
         let log_likelihood = -0.5 * deviance;
 
-        // Derivative provider.
-        let deriv_provider: Box<dyn crate::estimate::reml::unified::HessianDerivativeProvider> =
-            if is_gaussian {
-                Box::new(GaussianDerivatives)
-            } else {
-                Box::new(BlockCoupledDerivativeProvider {
-                    joint_design: j_mat,
-                    third_deriv_weights,
-                })
-            };
-
         let dispersion = if is_gaussian {
             DispersionHandling::ProfiledGaussian
         } else {
@@ -1845,10 +1831,465 @@ impl<'a> JointRemlState<'a> {
             }
         };
 
+        // ═══════════════════════════════════════════════════════════════════
+        //  Enrichment: precompute full gradient corrections + Hessian traces
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // For non-Gaussian joint models, the Hessian derivative Ḣₖ = dH/dρₖ has
+        // THREE components beyond Aₖ = λₖSₖ:
+        //   1. Jacobian sensitivity: Ṫₖ'WJ + J'WṪₖ  (from β-dependent g')
+        //   2. Weight sensitivity:   J'diag(ẇₖ)J     (from β-dependent W)
+        //   3. Basis sensitivity:    (via dot_B in Ṫₖ)
+        //
+        // For Gaussian (identity link), all three are zero.
+        // We precompute the full correction for each k so the unified evaluator
+        // handles everything without model-specific knowledge.
+
+        let firth_active =
+            !is_gaussian && state.firth_bias_reduction && matches!(state.link, LinkFunction::Logit);
+
+        let (precomputed_h_k_corrections, firth_gradient, precomputed_h_ddot_traces) =
+            if !is_gaussian && p_link > 0 {
+                // w_prime = dW/dη for each observation.
+                let mut w_prime = Array1::<f64>::zeros(n);
+                let mut w_double_prime = Array1::<f64>::zeros(n);
+                if matches!(state.link, LinkFunction::Logit) {
+                    for i in 0..n {
+                        let p_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                        let w_base = p_i * (1.0 - p_i);
+                        w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * p_i);
+                        w_double_prime[i] =
+                            state.weights[i] * w_base * ((1.0 - 2.0 * p_i).powi(2) - 2.0 * w_base);
+                        if !w_prime[i].is_finite() {
+                            w_prime[i] = 0.0;
+                        }
+                        if !w_double_prime[i].is_finite() {
+                            w_double_prime[i] = 0.0;
+                        }
+                    }
+                }
+
+                // Basis derivatives for Jacobian sensitivity.
+                let Some(knot_vector) = state.knot_vector.as_ref() else {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "missing knot vector for joint builder enrichment".to_string(),
+                    ));
+                };
+                let Some(link_transform) = state.link_transform.as_ref() else {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "missing link transform for joint builder enrichment".to_string(),
+                    ));
+                };
+                let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
+                let (_, _, rangewidth) = state.standardized_z(&u);
+                let invrw = 1.0 / rangewidth;
+                let z_c = {
+                    let (_, zc, _) = state.standardized_z(&u);
+                    zc
+                };
+
+                let (b_prime_arc, _) = create_basis::<Dense>(
+                    z_c.view(),
+                    KnotSource::Provided(knot_vector.view()),
+                    state.degree,
+                    BasisOptions::first_derivative(),
+                )
+                .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
+                let b_prime = b_prime_arc.as_ref();
+
+                // Lambdas for indexing.
+                let n_base_penalties = lambda_base.len();
+                // ─── Per-k: compute mode response, Jacobian sensitivity, corrections ───
+
+                // Stored per-k data for Hessian computation.
+                let mut corrections: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
+                let mut c_k_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
+                let mut dot_eta_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
+                let mut dot_j_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
+                let mut h_dot_k_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
+                let mut a_k_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
+
+                for kk in 0..k {
+                    let is_link = kk == n_base_penalties;
+                    let lambda_k = if is_link {
+                        lambda_link
+                    } else {
+                        lambda_base[kk]
+                    };
+
+                    // a_k = λ_k S_k β̂ (embedded in joint space).
+                    let mut a_k_beta = Array1::<f64>::zeros(p_total);
+                    if is_link {
+                        if p_link > 0
+                            && link_penalty.nrows() == p_link
+                            && link_penalty.ncols() == p_link
+                        {
+                            let sb = link_penalty.dot(&state.beta_link);
+                            for i in 0..p_link {
+                                a_k_beta[p_base + i] = lambda_k * sb[i];
+                            }
+                        }
+                    } else if let Some(s_k) = state.s_base.get(kk) {
+                        if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                            let sb = s_k.dot(&state.beta_base);
+                            for i in 0..p_base {
+                                a_k_beta[i] = lambda_k * sb[i];
+                            }
+                        }
+                    }
+
+                    // v_k = H⁻¹(a_k_beta); mode response delta = -v_k = dβ̂/dρ_k.
+                    let v_k = hop.solve(&a_k_beta);
+                    let delta_beta = v_k.slice(s![..p_base]).mapv(|v| -v);
+                    let delta_theta = v_k.slice(s![p_base..p_total]).mapv(|v| -v);
+
+                    // dot_u = X · delta_beta (change in base linear predictor).
+                    let dot_u_k = state.x_base.dot(&delta_beta);
+
+                    // dot_eta = J · delta (change in full linear predictor).
+                    let neg_v_k = v_k.mapv(|v| -v);
+                    let dot_eta_k: Array1<f64> = j_mat.dot(&neg_v_k);
+
+                    // dot_g_prime = gsecond · dot_u + b_prime_u · delta_theta
+                    // (full formula including BOTH terms).
+                    let mut dot_g_prime_k = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        dot_g_prime_k[i] = gsecond[i] * dot_u_k[i];
+                    }
+                    dot_g_prime_k += &b_prime_u.dot(&delta_theta);
+
+                    // dot_J = [diag(dot_g_prime) X | B_dot · link_transform]
+                    let mut dot_j_k = Array2::<f64>::zeros((n, p_total));
+                    for i in 0..n {
+                        let scale = dot_g_prime_k[i];
+                        for j in 0..p_base {
+                            dot_j_k[[i, j]] = scale * state.x_base[[i, j]];
+                        }
+                        let dz = dot_u_k[i] * invrw;
+                        if dz.abs() > 1e-30 {
+                            for c in 0..p_link {
+                                let mut val = 0.0;
+                                for r in 0..n_raw {
+                                    val += b_prime[[i, r]] * link_transform[[r, c]];
+                                }
+                                dot_j_k[[i, p_base + c]] = val * dz;
+                            }
+                        }
+                    }
+
+                    // w_dot_k = w_prime ⊙ dot_eta_k (weight sensitivity).
+                    let w_dot_k: Array1<f64> = &w_prime * &dot_eta_k;
+
+                    // ═══ Build full correction: Ṫₖ'WJ + J'WṪₖ + J'diag(ẇₖ)J ═══
+
+                    // Jacobian pair: √W·Ṫₖ and √W·J (reuse jweighted).
+                    let mut w_dot_j_k = dot_j_k.clone();
+                    ndarray::Zip::from(w_dot_j_k.rows_mut())
+                        .and(sqrtw.view())
+                        .for_each(|mut row, &wi| row *= wi);
+                    let atb = fast_atb(&w_dot_j_k, &jweighted);
+                    let jacobian_sym = &atb + &atb.t();
+
+                    // Weight correction: J'diag(ẇₖ)J.
+                    let mut weight_corr = Array2::<f64>::zeros((p_total, p_total));
+                    for i in 0..n {
+                        let wd = w_dot_k[i];
+                        if wd.abs() < 1e-30 {
+                            continue;
+                        }
+                        let ji = j_mat.row(i);
+                        for a in 0..p_total {
+                            let wa = wd * ji[a];
+                            for b in a..p_total {
+                                let val = wa * ji[b];
+                                weight_corr[[a, b]] += val;
+                                if a != b {
+                                    weight_corr[[b, a]] += val;
+                                }
+                            }
+                        }
+                    }
+
+                    let correction_k = jacobian_sym + weight_corr;
+
+                    // Build full Ḣ_k = A_k + correction for Hessian computation.
+                    let mut a_k_mat = Array2::<f64>::zeros((p_total, p_total));
+                    if is_link {
+                        if p_link > 0 && link_penalty.nrows() == p_link {
+                            for i in 0..p_link {
+                                for j in 0..p_link {
+                                    a_k_mat[[p_base + i, p_base + j]] =
+                                        lambda_k * link_penalty[[i, j]];
+                                }
+                            }
+                        }
+                    } else if let Some(s_k) = state.s_base.get(kk) {
+                        if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                            for i in 0..p_base {
+                                for j in 0..p_base {
+                                    a_k_mat[[i, j]] = lambda_k * s_k[[i, j]];
+                                }
+                            }
+                        }
+                    }
+                    let h_dot_k = &a_k_mat + &correction_k;
+
+                    a_k_vecs.push(a_k_beta);
+                    c_k_vecs.push(neg_v_k);
+                    dot_eta_vecs.push(dot_eta_k);
+                    dot_j_mats.push(dot_j_k);
+                    h_dot_k_mats.push(h_dot_k);
+                    corrections.push(Some(correction_k));
+                }
+
+                // ─── Firth gradient ───
+                let firth_grad = if firth_active {
+                    // Q = H⁻¹ V H⁻¹ where V = J' diag(0.5 - μ) J.
+                    let nu = mu.mapv(|mui| 0.5 - mui);
+                    let mut j_nu = j_mat.clone();
+                    ndarray::Zip::from(j_nu.rows_mut())
+                        .and(nu.view())
+                        .for_each(|mut row, &nui| row *= nui);
+                    let v_mat = fast_atb(&j_mat, &j_nu);
+
+                    // Q via spectral decomposition: Q = U D⁻¹ (U' V U) D⁻¹ U'.
+                    // Use hop.solve_multi for H⁻¹ V and then H⁻¹ (H⁻¹ V)'.
+                    let hinv_v = hop.solve_multi(&v_mat);
+                    let q_mat = hop.solve_multi(&hinv_v.t().to_owned());
+
+                    // Symmetrize Q.
+                    let mut q_sym = Array2::<f64>::zeros((p_total, p_total));
+                    for i in 0..p_total {
+                        for j in 0..p_total {
+                            q_sym[[i, j]] = 0.5 * (q_mat[[i, j]] + q_mat[[j, i]]);
+                        }
+                    }
+
+                    // firth_gradient[k] = 0.5 * tr(Q * correction_k)
+                    let mut fg = Array1::<f64>::zeros(k);
+                    for kk in 0..k {
+                        if let Some(ref corr) = corrections[kk] {
+                            fg[kk] = 0.5 * (&q_sym * corr).sum();
+                        }
+                    }
+                    Some(fg)
+                } else {
+                    None
+                };
+
+                // ─── Outer Hessian: tr(H⁻¹ Ḧ_{jk}) for all (j,k) ───
+                //
+                // Ḧ_{jk} = T_{jk}'WJ + J'WT_{jk}             (1)
+                //         + T_j'WT_k + T_k'WT_j                (2)
+                //         + T_j'Ẇ_kJ + J'Ẇ_kT_j              (3)
+                //         + T_k'Ẇ_jJ + J'Ẇ_jT_k              (4)
+                //         + J'Ẅ_{jk}J                           (5)
+                //         + δ_{jk}A_k                            (6)
+
+                // Precompute leverages h_i = (J H⁻¹ J')_{ii} for term (5).
+                let h_inv_j = hop.solve_multi(&j_mat.t().to_owned());
+                let mut leverages = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let mut acc = 0.0;
+                    for j in 0..p_total {
+                        acc += j_mat[[i, j]] * h_inv_j[[j, i]];
+                    }
+                    leverages[i] = acc;
+                }
+
+                // Precompute eigenspace projections for efficient trace computation.
+                // M_k = Λ^{-½} U_r' Ḣ_k U_r Λ^{-½} for cross-trace.
+                // We use hop.solve and hop.trace_hinv_product for all trace computations.
+                // For cross-trace: tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_k) = ⟨Y_j, Ḣ_k⟩_F where Y_j = H⁻¹ Ḣ_j.
+                let mut y_k_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
+                for kk in 0..k {
+                    y_k_mats.push(hop.solve_multi(&h_dot_k_mats[kk]));
+                }
+
+                let mut h_ddot_traces = Array2::<f64>::zeros((k, k));
+
+                for jj in 0..k {
+                    for kk in jj..k {
+                        // Second mode response: b_{jk} = -H⁻¹(Ḣ_j c_k + A_k c_j + δ_{jk} a_k).
+                        let mut rhs_jk = h_dot_k_mats[jj].dot(&c_k_vecs[kk]);
+                        {
+                            let is_link_k = kk == n_base_penalties;
+                            let lambda_kk = if is_link_k {
+                                lambda_link
+                            } else {
+                                lambda_base[kk]
+                            };
+                            if is_link_k {
+                                if p_link > 0 && link_penalty.nrows() == p_link {
+                                    let c_j_link: Array1<f64> = c_k_vecs[jj].slice(s![p_base..p_total]).to_owned();
+                                    let sc = link_penalty.dot(&c_j_link);
+                                    for i in 0..p_link {
+                                        rhs_jk[p_base + i] += lambda_kk * sc[i];
+                                    }
+                                }
+                            } else if let Some(s_k) = state.s_base.get(kk) {
+                                if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                                    let c_j_beta = c_k_vecs[jj].slice(s![..p_base]).to_owned();
+                                    let sc = s_k.dot(&c_j_beta);
+                                    for i in 0..p_base {
+                                        rhs_jk[i] += lambda_kk * sc[i];
+                                    }
+                                }
+                            }
+                        }
+                        if jj == kk {
+                            rhs_jk += &a_k_vecs[kk];
+                        }
+                        let b_jk = hop.solve(&rhs_jk.mapv(|v| -v));
+
+                        // η̈_{jk} = T_j c_k + J b_{jk}.
+                        let dot_eta_jk: Array1<f64> =
+                            dot_j_mats[jj].dot(&c_k_vecs[kk]) + j_mat.dot(&b_jk);
+
+                        // Ẅ_{jk} = diag(w″ η̇_j η̇_k + w′ η̈_{jk}).
+                        let mut w_ddot_jk = Array1::<f64>::zeros(n);
+                        for i in 0..n {
+                            w_ddot_jk[i] =
+                                w_double_prime[i] * dot_eta_vecs[jj][i] * dot_eta_vecs[kk][i]
+                                    + w_prime[i] * dot_eta_jk[i];
+                        }
+
+                        // T_{jk} = second-order Jacobian sensitivity.
+                        let c_jk_theta = b_jk.slice(s![p_base..p_total]).to_owned();
+                        let c_jk_beta = b_jk.slice(s![..p_base]).to_owned();
+                        let dot2_g_prime =
+                            &gsecond * &state.x_base.dot(&c_jk_beta) + &b_prime_u.dot(&c_jk_theta);
+
+                        // === Compute tr(H⁻¹ Ḧ_{jk}) term by term ===
+                        let mut trace_h_ddot = 0.0;
+
+                        // (1) T_{jk}'WJ + J'WT_{jk}: 2·tr(H⁻¹ J'W T_{jk})
+                        //     = 2·Σᵢ W_i · Σⱼ (H⁻¹J')_{j,i} · (T_{jk})_{i,j}
+                        {
+                            let mut t_jk_weighted = Array2::<f64>::zeros((n, p_total));
+                            for i in 0..n {
+                                let scale = dot2_g_prime[i];
+                                for j in 0..p_base {
+                                    t_jk_weighted[[i, j]] = sqrtw[i] * scale * state.x_base[[i, j]];
+                                }
+                                let ddot_u_i: f64 = state.x_base.row(i).dot(&c_jk_beta);
+                                let ddot_z = ddot_u_i * invrw;
+                                if ddot_z.abs() > 1e-30 {
+                                    for c in 0..p_link {
+                                        let mut bp_lt = 0.0;
+                                        for r in 0..n_raw {
+                                            bp_lt += b_prime[[i, r]] * link_transform[[r, c]];
+                                        }
+                                        t_jk_weighted[[i, p_base + c]] = sqrtw[i] * bp_lt * ddot_z;
+                                    }
+                                }
+                            }
+                            // tr = 2 · ⟨(√W T_{jk})' (√W J), H⁻¹⟩ via solve_multi
+                            let atb_1 = fast_atb(&t_jk_weighted, &jweighted);
+                            let sym_1 = &atb_1 + &atb_1.t();
+                            trace_h_ddot += hop.trace_hinv_product(&sym_1);
+                        }
+
+                        // (2) T_j'WT_k + T_k'WT_j: symmetric pair of first-order sensitivities.
+                        {
+                            let mut w_dot_j_j = dot_j_mats[jj].clone();
+                            ndarray::Zip::from(w_dot_j_j.rows_mut())
+                                .and(sqrtw.view())
+                                .for_each(|mut row, &wi| row *= wi);
+                            let mut w_dot_j_k = dot_j_mats[kk].clone();
+                            ndarray::Zip::from(w_dot_j_k.rows_mut())
+                                .and(sqrtw.view())
+                                .for_each(|mut row, &wi| row *= wi);
+                            let atb_2 = fast_atb(&w_dot_j_j, &w_dot_j_k);
+                            let sym_2 = &atb_2 + &atb_2.t();
+                            trace_h_ddot += hop.trace_hinv_product(&sym_2);
+                        }
+
+                        // (3) T_j'Ẇ_kJ + J'Ẇ_kT_j
+                        {
+                            let w_dot_kk: Array1<f64> = &w_prime * &dot_eta_vecs[kk];
+                            let mut wk_t_j = dot_j_mats[jj].clone();
+                            for i in 0..n {
+                                let scale = w_dot_kk[i];
+                                for j in 0..p_total {
+                                    wk_t_j[[i, j]] *= scale;
+                                }
+                            }
+                            let atb_3 = fast_atb(&wk_t_j, &j_mat);
+                            let sym_3 = &atb_3 + &atb_3.t();
+                            trace_h_ddot += hop.trace_hinv_product(&sym_3);
+                        }
+
+                        // (4) T_k'Ẇ_jJ + J'Ẇ_jT_k
+                        {
+                            let w_dot_jj: Array1<f64> = &w_prime * &dot_eta_vecs[jj];
+                            let mut wj_t_k = dot_j_mats[kk].clone();
+                            for i in 0..n {
+                                let scale = w_dot_jj[i];
+                                for j in 0..p_total {
+                                    wj_t_k[[i, j]] *= scale;
+                                }
+                            }
+                            let atb_4 = fast_atb(&wj_t_k, &j_mat);
+                            let sym_4 = &atb_4 + &atb_4.t();
+                            trace_h_ddot += hop.trace_hinv_product(&sym_4);
+                        }
+
+                        // (5) J'Ẅ_{jk}J: tr(H⁻¹ J' diag(w̃) J) = Σᵢ w̃ᵢ hᵢ
+                        {
+                            let mut tr5 = 0.0;
+                            for i in 0..n {
+                                tr5 += w_ddot_jk[i] * leverages[i];
+                            }
+                            trace_h_ddot += tr5;
+                        }
+
+                        // (6) δ_{jk} A_k: tr(H⁻¹ A_k)
+                        if jj == kk {
+                            let is_link = kk == n_base_penalties;
+                            let lambda_kk = if is_link {
+                                lambda_link
+                            } else {
+                                lambda_base[kk]
+                            };
+                            let mut a_k_mat = Array2::<f64>::zeros((p_total, p_total));
+                            if is_link {
+                                if p_link > 0 && link_penalty.nrows() == p_link {
+                                    for i in 0..p_link {
+                                        for j in 0..p_link {
+                                            a_k_mat[[p_base + i, p_base + j]] =
+                                                lambda_kk * link_penalty[[i, j]];
+                                        }
+                                    }
+                                }
+                            } else if let Some(s_k) = state.s_base.get(kk) {
+                                if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                                    for i in 0..p_base {
+                                        for j in 0..p_base {
+                                            a_k_mat[[i, j]] = lambda_kk * s_k[[i, j]];
+                                        }
+                                    }
+                                }
+                            }
+                            trace_h_ddot += hop.trace_hinv_product(&a_k_mat);
+                        }
+
+                        h_ddot_traces[[jj, kk]] = trace_h_ddot;
+                        if jj != kk {
+                            h_ddot_traces[[kk, jj]] = trace_h_ddot;
+                        }
+                    }
+                }
+
+                (Some(corrections), firth_grad, Some(h_ddot_traces))
+            } else {
+                (None, None, None)
+            };
+
         let inner_solution = InnerSolution {
             log_likelihood,
             penalty_quadratic,
-            hessian_op,
+            hessian_op: Box::new(hop),
             beta,
             penalty_roots,
             penalty_logdet: PenaltyLogdetDerivs {
@@ -1856,15 +2297,16 @@ impl<'a> JointRemlState<'a> {
                 first: det1,
                 second: Some(Array2::zeros((k, k))),
             },
-            deriv_provider,
+            deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
             tk_gradient: None,
             firth_logdet: 0.0,
-            firth_gradient: None,
+            firth_gradient,
             n_observations: n,
             nullspace_dim: mp,
             dispersion,
-            precomputed_h_k_corrections: None,
+            precomputed_h_k_corrections,
+            precomputed_h_ddot_traces,
         };
 
         // Compute EDF for diagnostics.
@@ -1966,1506 +2408,6 @@ impl<'a> JointRemlState<'a> {
         }
 
         Some(p_total as f64 - trace)
-    }
-
-    /// Compute numerical gradient of LAML w.r.t. ρ using central differences
-    fn compute_gradient_fd(&mut self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        let h = 1e-4; // Step size for numerical differentiation
-        let n_rho = rho.len();
-        let mut grad = Array1::<f64>::zeros(n_rho);
-        let snapshot = JointRemlSnapshot::new(self);
-
-        for k in 0..n_rho {
-            snapshot.restore(self);
-            // Forward step
-            let mut rho_plus = rho.clone();
-            rho_plus[k] += h;
-            let cost_plus = self.compute_cost(&rho_plus)?;
-            if !cost_plus.is_finite() {
-                snapshot.restore(self);
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "Non-finite LAML in +h finite-difference step.".to_string(),
-                ));
-            }
-
-            snapshot.restore(self);
-            // Backward step
-            let mut rho_minus = rho.clone();
-            rho_minus[k] -= h;
-            let cost_minus = self.compute_cost(&rho_minus)?;
-            if !cost_minus.is_finite() {
-                snapshot.restore(self);
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "Non-finite LAML in -h finite-difference step.".to_string(),
-                ));
-            }
-
-            // Central difference
-            grad[k] = (cost_plus - cost_minus) / (2.0 * h);
-        }
-
-        snapshot.restore(self);
-
-        if grad.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "Non-finite gradient from finite-difference LAML.".to_string(),
-            ));
-        }
-        Ok(grad)
-    }
-
-    /// Compute analytic gradient of LAML w.r.t. ρ using a Gauss-Newton Hessian
-    /// and explicit differentiation of weights and constrained basis.
-    fn compute_gradient_analytic(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Result<(Array1<f64>, bool), EstimationError> {
-        let penalty_layout = JointPenaltyLayout::for_state(&self.core.state);
-
-        penalty_layout.validate_rho(rho)?;
-
-        let firth_active = self.core.state.firth_bias_reduction
-            && matches!(self.core.state.link, LinkFunction::Logit);
-
-        let n_base = penalty_layout.n_base;
-        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
-        let cache_hit = self.cachedcost_matches_rho(rho);
-        let mut converged = self.eval.last_converged;
-
-        // Set ρ and warm-start from cached coefficients.
-        let state = &mut self.core.state;
-        state.set_rho(rho.clone());
-        state.beta_base = self.eval.cached_beta_base.clone();
-        state.beta_link = self.eval.cached_beta_link.clone();
-
-        if !cache_hit {
-            // No matching cached cost for this rho: run inner alternating to convergence.
-            let mut prev_deviance = f64::INFINITY;
-            converged = false;
-            let mut iter_count = 0usize;
-            for i in 0..self.core.config.max_backfit_iter {
-                let progress = (i as f64) / (self.core.config.max_backfit_iter as f64);
-                let damping = 0.5 + progress * 0.5;
-
-                let u = state.base_linear_predictor();
-                let bwiggle = state
-                    .build_link_basis(&u)
-                    .map_err(|e| EstimationError::InvalidSpecification(e))?;
-                let g_prime_link = compute_link_derivative_from_state(&state, &u, &bwiggle);
-                let (weights_link, zworking_link) = state.jointworking_response_for_block(
-                    &u,
-                    &bwiggle,
-                    &g_prime_link,
-                    &lambda_base,
-                    lambda_link,
-                )?;
-                state.irls_link_step(&bwiggle, &u, lambda_link, &weights_link, &zworking_link);
-
-                let g_prime_base = compute_link_derivative_from_state(&state, &u, &bwiggle);
-                let (weights_base, zworking_base) = state.jointworking_response_for_block(
-                    &u,
-                    &bwiggle,
-                    &g_prime_base,
-                    &lambda_base,
-                    lambda_link,
-                )?;
-                let deviance = state.irls_base_step(
-                    &bwiggle,
-                    &g_prime_base,
-                    &lambda_base,
-                    damping,
-                    &zworking_base,
-                    &weights_base,
-                );
-
-                let delta = (prev_deviance - deviance).abs() / (deviance.abs() + 1.0);
-                iter_count = i + 1;
-                if delta < self.core.config.backfit_tol {
-                    converged = true;
-                    break;
-                }
-                prev_deviance = deviance;
-            }
-
-            // Cache converged coefficients for warm-start.
-            self.eval.cached_beta_base = state.beta_base.clone();
-            self.eval.cached_beta_link = state.beta_link.clone();
-            self.eval.last_backfit_iterations = iter_count;
-            self.eval.last_converged = converged;
-            self.eval.cached_rho = rho.clone();
-        }
-
-        let n = state.nobs();
-        let u = state.base_linear_predictor();
-        let bwiggle = state.build_link_basis_from_state(&u);
-        let eta = state.compute_eta_full(&u, &bwiggle);
-
-        let mut mu = Array1::<f64>::zeros(n);
-        let mut weights = Array1::<f64>::zeros(n);
-        let mut residual = Array1::<f64>::zeros(n);
-        // For integrated logit we need higher derivatives of E[sigmoid(η+ε)] to
-        // differentiate IRLS curvature exactly in rho directions.
-        let mut integrated_d1 = Array1::<f64>::zeros(n);
-        let mut integrated_d2 = Array1::<f64>::zeros(n);
-        match state.link {
-            LinkFunction::Identity => {
-                for i in 0..n {
-                    mu[i] = eta[i];
-                    weights[i] = state.weights[i];
-                    residual[i] = weights[i] * (mu[i] - state.y[i]);
-                }
-            }
-            LinkFunction::Logit
-            | LinkFunction::Probit
-            | LinkFunction::CLogLog
-            | LinkFunction::Sas
-            | LinkFunction::BetaLogistic => {
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                let family = match state.link {
-                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
-                    LinkFunction::Identity => unreachable!("identity handled above"),
-                };
-                let strategy = strategy_for_family(family, None);
-                for i in 0..n {
-                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
-                    let moments = strategy.integrated_moments(&state.quadctx, eta[i], se_i)?;
-                    let d1 = moments.d1.abs().max(MIN_DMU);
-                    let d2 = if moments.d2.is_finite() {
-                        moments.d2
-                    } else {
-                        0.0
-                    };
-                    mu[i] = moments.mean;
-                    integrated_d1[i] = d1;
-                    integrated_d2[i] = d2;
-                    let w = (d1 * d1 / moments.variance.max(1e-12)).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
-                    residual[i] = weights[i] * (mu[i] - state.y[i]) / d1;
-                }
-            }
-        }
-
-        let p_base = state.x_base.ncols();
-        let p_link = bwiggle.ncols();
-        let coef_layout = JointCoefLayout::new(p_base, p_link);
-        let p_total = coef_layout.p_total();
-
-        let (g_prime, gsecond, b_prime_u) = compute_link_derivative_terms_from_state(&state, &u);
-
-        // Build exact full joint penalized Hessian with explicit cross-block terms:
-        //   H = J' W J + S_lambda
-        // where J = [diag(g') X | Bwiggle].
-        //
-        // In block form this is:
-        //   H = [[H_ββ, H_βθ],
-        //        [H_θβ, H_θθ]]
-        // with H_βθ = J_β' W J_θ and H_θβ = J_θ' W J_β.
-        // This is the same coupled object used for inner Firth correction.
-        let j_mat = state.build_joint_jacobian(&bwiggle, &g_prime);
-        let link_penalty = state.build_link_penalty();
-        let penalty_full = state.build_joint_penalty(&lambda_base, lambda_link, p_link);
-        let mut jweighted = j_mat.clone();
-        let sqrtw = weights.mapv(|wi| wi.max(0.0).sqrt());
-        ndarray::Zip::from(jweighted.rows_mut())
-            .and(sqrtw.view())
-            .for_each(|mut row, wi| row *= *wi);
-        let mut h_mat = crate::faer_ndarray::fast_ata(&jweighted);
-        if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
-            h_mat += &penalty_full;
-        }
-
-        // Eigendecomposition of Hessian for pseudo-inverse (Wood 2011)
-        // The spectral approach handles non-PD matrices gracefully by zeroing
-        // out small/negative eigenvalues in the pseudo-inverse.
-        use crate::faer_ndarray::FaerEigh;
-        use faer::Side;
-        let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) =
-            h_mat
-                .eigh(Side::Lower)
-                .map_err(|_| EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                })?;
-        let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
-        let h_tol = (h_max_eig * 1e-12).max(1e-100);
-        let mut h_min_pos = f64::INFINITY;
-        for &ev in &h_eigs {
-            if ev > h_tol {
-                h_min_pos = h_min_pos.min(ev);
-            }
-        }
-        if h_min_pos.is_finite() && h_min_pos > 0.0 {
-            self.eval.lasthessian_condition = Some((h_max_eig / h_min_pos).max(1.0));
-        } else {
-            self.eval.lasthessian_condition = None;
-        }
-
-        // Check for severely ill-conditioned Hessian (too many negative eigenvalues)
-        let n_positive = h_eigs.iter().filter(|&&ev| ev > h_tol).count();
-        if n_positive < p_total / 2 {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-
-        // Precompute K = H† J^T using pseudo-inverse for spectral consistency (Wood 2011)
-        // H† = U diag(1/λ_i) U' where 1/λ_i = 0 for small eigenvalues
-        // K = H† J' = U diag(1/λ_i) U' J' = U diag(1/λ_i) (J U)'
-        // Compute J @ U (n x p_total)
-        let j_u = fast_ab(&j_mat, &hvecs);
-
-        // Compute H† J' = U @ diag(1/λ) @ (J U)'
-        // This is (p_total x n) matrix
-        let mut k_mat = Array2::<f64>::zeros((p_total, n));
-        for i in 0..p_total {
-            let eig_i = h_eigs[i];
-            if eig_i > h_tol {
-                let inv_eig = 1.0 / eig_i;
-                // k_mat += (1/λ_i) * u_i @ (J u_i)'
-                for row in 0..p_total {
-                    for col in 0..n {
-                        k_mat[[row, col]] += inv_eig * hvecs[[row, i]] * j_u[[col, i]];
-                    }
-                }
-            }
-        }
-
-        let mut diag_proj = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let mut acc = 0.0;
-            for j in 0..p_total {
-                acc += j_mat[[i, j]] * k_mat[[j, i]];
-            }
-            diag_proj[i] = acc;
-        }
-
-        // Block-level EDF split for live visualization: base predictor vs link wiggle.
-        let mut edf_base = 0.0_f64;
-        let mut edf_link = 0.0_f64;
-        for i in 0..n {
-            for j in 0..p_base {
-                edf_base += j_mat[[i, j]] * k_mat[[j, i]];
-            }
-            for j in 0..p_link {
-                let col = p_base + j;
-                edf_link += j_mat[[i, col]] * k_mat[[col, i]];
-            }
-        }
-        self.eval.cached_edf_terms = vec![
-            (
-                "Base Predictor".to_string(),
-                edf_base.max(0.0),
-                p_base as f64,
-            ),
-            (
-                "Link Wiggle".to_string(),
-                edf_link.max(0.0),
-                p_link.max(1) as f64,
-            ),
-        ];
-        ndarray::Zip::from(k_mat.columns_mut())
-            .and(weights.view())
-            .for_each(|mut col, w| col *= *w);
-
-        // Precompute H†_{theta,theta} for penalty sensitivity trace using pseudo-inverse
-        let mut h_inv_theta = Array2::<f64>::zeros((p_link, p_link));
-        if p_link > 0 {
-            // H†_{theta,theta} = (U_{theta,:} diag(1/λ) U_{theta,:}')
-            // where U_{theta,:} is the (p_base:p_total, :) block of U
-            for i in 0..p_total {
-                let eig_i = h_eigs[i];
-                if eig_i > h_tol {
-                    let inv_eig = 1.0 / eig_i;
-                    for row in 0..p_link {
-                        for col in 0..p_link {
-                            h_inv_theta[[row, col]] +=
-                                inv_eig * hvecs[[p_base + row, i]] * hvecs[[p_base + col, i]];
-                        }
-                    }
-                }
-            }
-        }
-
-        // Firth adjoint matrix Q = H^{-1} V H^{-1}.
-        //
-        // Proof-style derivation (fixed-point, logit Firth on the joint penalized curvature):
-        //   Let H = J^T W J + S_lambda be the coupled penalized Hessian and define:
-        //     Phi = 0.5 * log|H|.
-        //   The Firth-adjusted objective adds Phi to the log-likelihood, so the
-        //   REML/LAML gradient gains an extra contribution from d/d rho_k Phi.
-        //
-        //   Using Jacobi's identity:
-        //     d Phi = 0.5 * tr(H^{-1} dH).
-        //   The implicit dependence of H on the parameters introduces the adjoint
-        //   (a "sandwich") term in the trace of dH/d rho_k. We encode this by
-        //   augmenting H^{-1} with Q so that:
-        //     tr(H^{-1} dotH_std)  ->  tr((H^{-1} + Q) dotH_std),
-        //   where:
-        //     Q = H^{-1} V H^{-1}.
-        //
-        //   For logit Jeffreys prior, V is the sensitivity of the Firth penalty
-        //   to hat values and reduces to:
-        //     V = J^T diag(0.5 - mu) J.
-        //
-        //   This choice yields:
-        //     tr(Q * dotH_std) = tr(H^{-1} V H^{-1} dotH_std),
-        //   which is the exact adjoint correction for the Firth term, matching
-        //   the fixed-point objective defined by the Gauss-Newton Hessian H.
-        let mut q_firth = Array2::<f64>::zeros((p_total, p_total));
-        if firth_active {
-            let mut jweighted = j_mat.clone();
-            let nu = mu.mapv(|mui| 0.5 - mui);
-            ndarray::Zip::from(jweighted.rows_mut())
-                .and(nu.view())
-                .for_each(|mut row, nui| row *= *nui);
-            // V = J^T diag(0.5 - mu) J (implemented as J^T * (diag(nu) J)).
-            let v_mat = crate::faer_ndarray::fast_atb(&j_mat, &jweighted);
-
-            // Q = H† V H† using pseudo-inverse for spectral consistency
-            // H† V H† = U diag(1/λ) U' V U diag(1/λ) U'
-            // Let W = U' V U, then Q = U diag(1/λ) W diag(1/λ) U'
-            let u_tv = fast_atb(&hvecs, &v_mat); // U' V
-            let w_mat = fast_ab(&u_tv, &hvecs); // U' V U
-
-            // Apply pseudo-inverse eigenvalue scaling and reconstruct via matmuls:
-            //   Q = U (D^{-1} W D^{-1}) U^T,  D^{-1}_{ii}=1/λ_i for λ_i>tol else 0.
-            // This is algebraically identical to the previous 4-deep summation but
-            // reduces reconstruction from O(p^4) scalar updates to O(p^3) BLAS-style ops.
-            let mut inv_diag = Array1::<f64>::zeros(p_total);
-            for i in 0..p_total {
-                let eig = h_eigs[i];
-                if eig > h_tol {
-                    inv_diag[i] = 1.0 / eig;
-                }
-            }
-            let mut m_mat = w_mat;
-            let inv_col = inv_diag.view().insert_axis(ndarray::Axis(1));
-            let invrow = inv_diag.view().insert_axis(ndarray::Axis(0));
-            m_mat *= &(inv_col.to_owned() * invrow);
-            let um = fast_ab(&hvecs, &m_mat); // U M
-            q_firth = fast_ab(&um, &hvecs.t().to_owned()); // U M U^T
-        }
-        let mut q_firth_sym = Array2::<f64>::zeros((p_total, p_total));
-        let mut jq_firth = Array2::<f64>::zeros((n, p_total));
-        let mut jq_quad = Array1::<f64>::zeros(n);
-        if firth_active {
-            // dotH_std is symmetric, so only the symmetric part of Q contributes to tr(Q * dotH_std).
-            for i in 0..p_total {
-                for j in 0..p_total {
-                    q_firth_sym[[i, j]] = 0.5 * (q_firth[[i, j]] + q_firth[[j, i]]);
-                }
-            }
-            jq_firth = fast_ab(&j_mat, &q_firth_sym);
-            for i in 0..n {
-                let mut acc = 0.0;
-                for j in 0..p_total {
-                    acc += j_mat[[i, j]] * jq_firth[[i, j]];
-                }
-                jq_quad[i] = acc;
-            }
-        }
-
-        // Prepare basis derivatives for constraint sensitivity.
-        let Some(knot_vector) = state.knot_vector.as_ref() else {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "missing knot vector for joint analytic gradient".to_string(),
-            ));
-        };
-        let Some(link_transform) = state.link_transform.as_ref() else {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "missing link transform for joint analytic gradient".to_string(),
-            ));
-        };
-        if link_transform.ncols() != p_link {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "link transform dimension mismatch".to_string(),
-            ));
-        }
-
-        let (z_raw, z_c, rangewidth) = state.standardized_z(&u);
-        let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
-        if n_raw == 0 {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "insufficient basis size for analytic gradient".to_string(),
-            ));
-        }
-
-        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
-        let (b_raw_arc, _) = create_basis::<Dense>(
-            z_c.view(),
-            KnotSource::Provided(knot_vector.view()),
-            state.degree,
-            BasisOptions::value(),
-        )
-        .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-        let (b_prime_arc, _) = create_basis::<Dense>(
-            z_c.view(),
-            KnotSource::Provided(knot_vector.view()),
-            state.degree,
-            BasisOptions::first_derivative(),
-        )
-        .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-
-        // Apply the same C^1 linear extension used in build_link_basis:
-        //   B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
-        let mut b_raw = b_raw_arc.as_ref().clone();
-        let b_prime = b_prime_arc.as_ref();
-        let mut needs_ext = false;
-        for i in 0..z_raw.len() {
-            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
-                needs_ext = true;
-                break;
-            }
-        }
-        if needs_ext {
-            for i in 0..z_raw.len() {
-                let dz = z_raw[i] - z_c[i];
-                if dz.abs() <= 1e-12 {
-                    continue;
-                }
-                for j in 0..b_raw.ncols() {
-                    b_raw[[i, j]] += dz * b_prime[[i, j]];
-                }
-            }
-        }
-
-        // NOTE: With geometric constraints (Greville abscissae), Z is constant w.r.t. β,
-        // so dZ/dβ = 0 exactly. The constraint matrix M and its pseudoinverse are no longer
-        // needed for the gradient computation.
-
-        // Raw penalty for link block and its projection (constant for this rho).
-        let s_raw = if p_link > 0 {
-            let greville_for_penalty =
-                penalty_greville_abscissae_for_knots(knot_vector, state.degree).map_err(|e| {
-                    EstimationError::InvalidSpecification(format!(
-                        "invalid joint link-basis penalty geometry: {e}"
-                    ))
-                })?;
-            create_difference_penalty_matrix(
-                n_raw,
-                2,
-                greville_for_penalty.as_ref().map(|g| g.view()),
-            )
-            .map_err(|e| {
-                EstimationError::InvalidSpecification(format!(
-                    "failed to construct joint link-basis penalty: {e}"
-                ))
-            })?
-        } else {
-            Array2::zeros((0, 0))
-        };
-        let v_pen = if p_link > 0 && s_raw.nrows() == n_raw {
-            crate::faer_ndarray::fast_ab(&s_raw, link_transform)
-        } else {
-            Array2::zeros((n_raw, p_link))
-        };
-
-        let mut grad = Array1::<f64>::zeros(rho.len());
-        let mut clampz_count = 0usize;
-        let mut clampmu_count = 0usize;
-        for i in 0..n {
-            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
-                clampz_count += 1;
-            }
-            if matches!(state.link, LinkFunction::Logit) && (mu[i] <= 1e-8 || mu[i] >= 1.0 - 1e-8) {
-                clampmu_count += 1;
-            }
-        }
-        let clampz_frac = clampz_count as f64 / n.max(1) as f64;
-        let clampmu_frac = clampmu_count as f64 / n.max(1) as f64;
-        // Trigger the expensive FD audit only when clamping is substantial.
-        // Mild boundary contact is common in expressive link/spline fits and
-        // does not warrant a full gradient replacement on every outer step.
-        let audit_needed = !converged
-            || clampz_frac > JOINT_GRAD_AUDIT_CLAMP_FRAC
-            || clampmu_frac > JOINT_GRAD_AUDIT_CLAMP_FRAC;
-        // Penalty det derivative for base penalties.
-        let base_reparam = if let Some(invariant) = self.core.base_reparam_invariant.as_ref() {
-            stable_reparameterizationwith_invariant_engine(
-                &self.core.base_rs_list,
-                &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, self.core.base_rs_list.len()),
-                invariant,
-            )
-        } else {
-            stable_reparameterization_engine(
-                &self.core.base_rs_list,
-                &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, self.core.base_rs_list.len()),
-            )
-        }
-        .unwrap_or_else(|_| ReparamResult {
-            s_transformed: Array2::zeros((p_base, p_base)),
-            log_det: 0.0,
-            det1: Array1::zeros(lambda_base.len()),
-            qs: Array2::eye(p_base),
-            rs_transformed: vec![],
-            rs_transposed: vec![],
-            e_transformed: Array2::zeros((0, p_base)),
-            u_truncated: Array2::zeros((p_base, p_base)),
-        });
-
-        // Rank of link penalty for det_term (spectral rank)
-        let linkdet1_noridge = if p_link > 0 && link_penalty.nrows() == p_link {
-            use crate::faer_ndarray::FaerEigh;
-            let (eigs, _): (Array1<f64>, Array2<f64>) = link_penalty
-                .clone()
-                .eigh(Side::Lower)
-                .unwrap_or_else(|_| (Array1::zeros(p_link), Array2::eye(p_link)));
-            let max_eig = eigs.iter().cloned().fold(0.0_f64, f64::max);
-            let tol = if max_eig > 0.0 {
-                max_eig * 1e-12
-            } else {
-                1e-12
-            };
-            eigs.iter().filter(|&&ev| ev > tol).count() as f64
-        } else {
-            0.0
-        };
-
-        let mut dot_u = Array1::<f64>::zeros(n);
-        let mut dotz = Array1::<f64>::zeros(n);
-        let mut dot_eta = Array1::<f64>::zeros(n);
-        let mut w_prime = Array1::<f64>::zeros(n);
-        let mut w_dot = Array1::<f64>::zeros(n);
-        let mut b_dot = Array2::<f64>::zeros((n, n_raw));
-        // c_dot, weighted_c_dot, weighted_b_dot removed: no longer needed since
-        // Z is now computed from Greville abscissae (geometric constraint) and dZ/dβ = 0
-        let mut dot_j_theta = Array2::<f64>::zeros((n, p_link));
-        let mut dot_j_beta = Array2::<f64>::zeros((n, p_base));
-        let mut dot_j = Array2::<f64>::zeros((n, p_total));
-        let coef_layout = JointCoefLayout::new(p_base, p_link);
-
-        for k in 0..rho.len() {
-            let is_link = k == n_base;
-            let lambda_k = if is_link { lambda_link } else { lambda_base[k] };
-
-            // Compute rhs for the implicit function theorem (IFT).
-            // For inner minimization of -L = -log p(y|β) + 0.5*β'S_λβ:
-            //   Stationarity: ∇(-L) = -∇log p + S_λ β = 0
-            //   Hessian: H = X'WX + S_λ
-            // Differentiating stationarity w.r.t. ρ_k:
-            //   H · ∂β/∂ρ_k + λ_k S_k β = 0
-            //   ∂β/∂ρ_k = -H^{-1}(λ_k S_k β)
-            // So rhs = -λ_k S_k β gives delta = H^{-1}(rhs) = -H^{-1}(λ_k S_k β) = ∂β/∂ρ_k
-            let mut rhs = Array1::<f64>::zeros(p_total);
-            if is_link {
-                if p_link > 0 && link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
-                    let sb = link_penalty.dot(&state.beta_link);
-                    for i in 0..p_link {
-                        rhs[p_base + i] = -lambda_k * sb[i];
-                    }
-                }
-            } else if let Some(s_k) = state.s_base.get(k) {
-                if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                    let sb = s_k.dot(&state.beta_base);
-                    for i in 0..p_base {
-                        rhs[i] = -lambda_k * sb[i];
-                    }
-                }
-            }
-
-            // Compute delta = H† rhs using pseudo-inverse for spectral consistency
-            // delta = ∂β/∂ρ_k represents how the coefficients move when smoothing changes
-            // H† rhs = U diag(1/λ) U' rhs = U diag(1/λ) c where c = U' rhs
-            let c = fast_atv(&hvecs, &rhs);
-            let mut delta = Array1::<f64>::zeros(p_total);
-            for i in 0..p_total {
-                let eig_i = h_eigs[i];
-                if eig_i > h_tol {
-                    let scaled = c[i] / eig_i;
-                    for j in 0..p_total {
-                        delta[j] += scaled * hvecs[[j, i]];
-                    }
-                }
-            }
-            let (delta_beta, delta_theta) = coef_layout.split(&delta)?;
-
-            dot_u.assign(
-                &fast_ab(
-                    &state.x_base,
-                    &delta_beta.clone().insert_axis(ndarray::Axis(1)),
-                )
-                .column(0)
-                .to_owned(),
-            );
-
-            // dotz_raw = d/ dρ_k [ (u - min_u) / rangewidth ]
-            //          = (1 / rangewidth) * dot_u.
-            // For the linearly-extended basis, dB_ext/dz_raw = B'(z_c) everywhere.
-            let invrw = 1.0 / rangewidth;
-            for i in 0..n {
-                dotz[i] = dot_u[i] * invrw;
-            }
-
-            dot_eta.assign(
-                &fast_ab(&j_mat, &delta.clone().insert_axis(ndarray::Axis(1)))
-                    .column(0)
-                    .to_owned(),
-            );
-
-            // w' for logit (clamped)
-            if matches!(state.link, LinkFunction::Logit) {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_WEIGHT: f64 = 1e-12;
-                match &state.covariate_se {
-                    Some(_) => {
-                        // Integrated-logit curvature:
-                        //   W = obsw * (d1^2 / var),  var = mu(1-mu), d1 = dE[sigmoid]/dη.
-                        // So
-                        //   dW/dη = obsw * [2 d1 d2 / var - d1^2 * (d1 (1-2mu)) / var^2].
-                        for i in 0..n {
-                            let mu_i = mu[i];
-                            let d1 = integrated_d1[i].max(1e-8);
-                            let d2 = integrated_d2[i];
-                            let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
-                            let var_prime = d1 * (1.0 - 2.0 * mu_i);
-                            let dw_deta =
-                                (2.0 * d1 * d2) / var - (d1 * d1) * (var_prime / (var * var));
-                            w_prime[i] = state.weights[i] * dw_deta;
-                            if !w_prime[i].is_finite() {
-                                w_prime[i] = 0.0;
-                            }
-                        }
-                    }
-                    None => {
-                        for i in 0..n {
-                            let mu_i = mu[i];
-                            let w_base = mu_i * (1.0 - mu_i);
-                            if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_base < MIN_WEIGHT {
-                                w_prime[i] = 0.0;
-                            } else {
-                                w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * mu_i);
-                            }
-                        }
-                    }
-                }
-            } else {
-                w_prime.fill(0.0);
-            }
-
-            for i in 0..n {
-                w_dot[i] = w_prime[i] * dot_eta[i];
-            }
-
-            // dB_ext/dρ = (dB_ext/dz_raw) * dz_raw/dρ with dB_ext/dz_raw = B'(z_c).
-            b_dot.fill(0.0);
-            for i in 0..n {
-                let dz = dotz[i];
-                if dz == 0.0 {
-                    continue;
-                }
-                for j in 0..n_raw {
-                    b_dot[[i, j]] = b_prime[[i, j]] * dz;
-                }
-            }
-
-            // Z is now computed from Greville abscissae (geometric constraint) and is
-            // constant w.r.t. β. Therefore dZ/dβ = 0 exactly, and z_dot = 0.
-            // This eliminates the entire M_dot computation and constraint sensitivity terms.
-            let z_dot = Array2::<f64>::zeros((n_raw, p_link));
-
-            dot_j_theta.assign(&crate::faer_ndarray::fast_ab(&b_dot, link_transform));
-            dot_j_theta += &crate::faer_ndarray::fast_ab(&b_raw, &z_dot);
-
-            // dot_g_prime
-            let mut dot_g_prime = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                dot_g_prime[i] = gsecond[i] * dot_u[i];
-            }
-            let b_prime_delta = b_prime_u.dot(&delta_theta);
-            dot_g_prime += &b_prime_delta;
-
-            let z_dot_theta = z_dot.dot(&state.beta_link);
-            if z_dot_theta.len() == n_raw {
-                let mut z_term = b_prime.dot(&z_dot_theta);
-                for i in 0..n {
-                    z_term[i] *= invrw;
-                }
-                dot_g_prime += &z_term;
-            }
-
-            // dot_J_beta = diag(dot_g_prime) X
-            dot_j_beta.fill(0.0);
-            for i in 0..n {
-                let scale = dot_g_prime[i];
-                for j in 0..p_base {
-                    dot_j_beta[[i, j]] = scale * state.x_base[[i, j]];
-                }
-            }
-
-            // dot_J = [dot_J_beta | dot_J_theta]
-            dot_j.fill(0.0);
-            dot_j.slice_mut(s![.., ..p_base]).assign(&dot_j_beta);
-            dot_j.slice_mut(s![.., p_base..]).assign(&dot_j_theta);
-            // Trace for likelihood curvature: 2 tr(Kw * dot_J) + tr(diag(J H^{-1} J^T) * W_dot)
-            let mut trace = 0.0;
-            let mut trace_k = 0.0;
-            for i in 0..n {
-                let mut acc = 0.0;
-                for j in 0..p_total {
-                    acc += k_mat[[j, i]] * dot_j[[i, j]];
-                }
-                trace_k += acc;
-                trace += diag_proj[i] * w_dot[i];
-            }
-            trace += 2.0 * trace_k;
-
-            // Trace for lambda_k * S_k using pseudo-inverse (Wood 2011)
-            // tr(H† S_k) = Σ (u_i^T S_k u_i) / λ_i for positive eigenvalues
-            let mut s_k_full = Array2::<f64>::zeros((p_total, p_total));
-            if is_link {
-                s_k_full
-                    .slice_mut(s![p_base.., p_base..])
-                    .assign(&link_penalty);
-            } else if let Some(s_k) = state.s_base.get(k) {
-                if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                    s_k_full.slice_mut(s![..p_base, ..p_base]).assign(s_k);
-                }
-            }
-            if p_total > 0 {
-                // Pseudo-inverse trace: Σ (u_i^T S_k u_i) / λ_i for positive eigenvalues
-                let mut trace_lambda = 0.0;
-                for i in 0..p_total {
-                    let eig_i = h_eigs[i];
-                    if eig_i > h_tol {
-                        // Extract eigenvector u_i as owned array
-                        let u_i: Array1<f64> = hvecs.column(i).to_owned();
-                        // Compute u_i^T S_k u_i
-                        let s_k_u = s_k_full.dot(&u_i);
-                        let quadratic = u_i.dot(&s_k_u);
-                        trace_lambda += quadratic / eig_i;
-                    }
-                    // For small/negative eigenvalues, contribution is 0 (pseudo-inverse)
-                }
-                trace += lambda_k * trace_lambda;
-            }
-
-            // Penalty manifold sensitivity for the link block: dot(S_link) = Z_dot^T S_raw Z + Z^T S_raw Z_dot.
-            if p_link > 0 && v_pen.nrows() == n_raw {
-                let left = crate::faer_ndarray::fast_atb(&z_dot, &v_pen);
-                let right = crate::faer_ndarray::fast_atb(&v_pen, &z_dot);
-                let dot_s_link = left + right;
-                let mut trace_penalty = 0.0;
-                for i in 0..p_link {
-                    for j in 0..p_link {
-                        trace_penalty += h_inv_theta[[i, j]] * dot_s_link[[j, i]];
-                    }
-                }
-                trace += lambda_link * trace_penalty;
-            }
-
-            // Firth adjoint correction: add tr(Q * dotH_std) for logit Firth.
-            //
-            // dotH_std is the directional derivative of the standard Hessian:
-            //   dotH_std = dotJ^T W J + J^T W dotJ + J^T W_dot J + dotS_lambda
-            // where dotS_lambda includes the penalty manifold sensitivity of the link block.
-            if firth_active {
-                // dotH_std is symmetric:
-                //   dotJ^T W J + J^T W dotJ + J^T W_dot J + dotS_lambda.
-                // For symmetric S, tr(Q S) = tr(sym(Q) S). Precompute J sym(Q) once,
-                // then accumulate the exact trace row-wise without any N x P clones.
-                let mut trace_q = 0.0;
-                for i in 0..n {
-                    let mut dotrow_qj = 0.0;
-                    for j in 0..p_total {
-                        dotrow_qj += dot_j[[i, j]] * jq_firth[[i, j]];
-                    }
-                    trace_q += 2.0 * weights[i] * dotrow_qj;
-                    trace_q += w_dot[i] * jq_quad[i];
-                }
-
-                if p_link > 0 && v_pen.nrows() == n_raw {
-                    let left = crate::faer_ndarray::fast_atb(&z_dot, &v_pen);
-                    let right = crate::faer_ndarray::fast_atb(&v_pen, &z_dot);
-                    let dot_s_link = left + right;
-                    let mut trace_q_penalty = 0.0;
-                    for i in 0..p_link {
-                        for j in 0..p_link {
-                            trace_q_penalty +=
-                                q_firth_sym[[p_base + i, p_base + j]] * dot_s_link[[j, i]];
-                        }
-                    }
-                    trace_q += lambda_link * trace_q_penalty;
-                }
-
-                trace += trace_q;
-            }
-
-            let penalty_term = if is_link {
-                if p_link > 0 && link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
-                    let sb = link_penalty.dot(&state.beta_link);
-                    0.5 * lambda_k * state.beta_link.dot(&sb)
-                } else {
-                    0.0
-                }
-            } else if let Some(s_k) = state.s_base.get(k) {
-                if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                    let sb = s_k.dot(&state.beta_base);
-                    0.5 * lambda_k * state.beta_base.dot(&sb)
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
-
-            // Spectral det_term (Wood 2011): d/dλ_k[log|S_λ|_+] = rank(S_k)
-            // With spectral log-det, no ridge adjustment is needed.
-            let det_term = if is_link {
-                0.5 * linkdet1_noridge
-            } else if k < base_reparam.det1.len() {
-                0.5 * base_reparam.det1[k]
-            } else {
-                0.0
-            };
-
-            let grad_laml = penalty_term - det_term + 0.5 * trace;
-            grad[k] = grad_laml;
-        }
-
-        Ok((grad, audit_needed))
-    }
-
-    /// Compute the exact analytic outer Hessian ∂²V/∂ρⱼ∂ρₖ for the joint
-    /// flexible-link model.
-    ///
-    /// Implements the full second-derivative formula:
-    ///
-    ///   V_{jk} = Q_{jk} + L_{jk}^(H) + L_{jk}^(S)
-    ///
-    /// where:
-    ///   Q_{jk} = −b̂ᵀAⱼ H⁺ Aₖb̂  +  ½ δ_{jk} b̂ᵀAₖb̂
-    ///   L_{jk}^(H) = ½ [tr(H⁺ Ḧ_{jk}) − tr(H⁺ Ḣⱼ H⁺ Ḣₖ)]
-    ///   L_{jk}^(S) = 0  (disjoint penalty blocks)
-    ///
-    /// Under the fixed-Greville simplification g'(u) = 1 + C·θ:
-    ///   - T_k  = [diag(C c_k^(θ)) X | Ḃ_k]
-    ///   - T_{jk} = [diag(C c_{jk}^(θ)) X | Ḃ_{jk}]
-    ///   - No g‴ terms; basis drift through z(u) only.
-    ///
-    /// Requires a prior call to `compute_cost(rho)` to populate cached state.
-    fn compute_outer_hessian_analytic(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        let penalty_layout = JointPenaltyLayout::for_state(&self.core.state);
-        penalty_layout.validate_rho(rho)?;
-
-        let n_base = penalty_layout.n_base;
-        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
-        let k = rho.len();
-
-        // Ensure cached state is current.
-        if !self.cachedcost_matches_rho(rho) {
-            self.compute_cost(rho)?;
-        }
-        let state = &self.core.state;
-
-        let n = state.nobs();
-        let u = state.base_linear_predictor();
-        let bwiggle = state.build_link_basis_from_state(&u);
-        let eta = state.compute_eta_full(&u, &bwiggle);
-
-        // ═══════════════════════════════════════════════════════════════════
-        //  Converged quantities: μ, W, w', w''
-        // ═══════════════════════════════════════════════════════════════════
-
-        let mut mu = Array1::<f64>::zeros(n);
-        let mut weights = Array1::<f64>::zeros(n);
-        let mut w_prime = Array1::<f64>::zeros(n);
-        let mut w_double_prime = Array1::<f64>::zeros(n);
-
-        match state.link {
-            LinkFunction::Identity => {
-                for i in 0..n {
-                    mu[i] = eta[i];
-                    weights[i] = state.weights[i];
-                }
-            }
-            _ => {
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                let family = match state.link {
-                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
-                    LinkFunction::Identity => unreachable!(),
-                };
-                let strategy = strategy_for_family(family, None);
-                let use_integrated = state.covariate_se.is_some();
-
-                for i in 0..n {
-                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
-                    let moments = strategy
-                        .integrated_moments(&state.quadctx, eta[i], se_i)
-                        .expect("binomial family moments must be available");
-                    let dmu = moments.d1.abs().max(MIN_DMU);
-                    mu[i] = moments.mean;
-                    let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
-
-                    if matches!(state.link, LinkFunction::Logit) {
-                        let p_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
-                        let w_base = p_i * (1.0 - p_i);
-
-                        if use_integrated {
-                            let d1 = moments.d1.abs().max(1e-8);
-                            let d2 = if moments.d2.is_finite() {
-                                moments.d2
-                            } else {
-                                0.0
-                            };
-                            let var = w_base.max(1e-12);
-                            let var_prime = d1 * (1.0 - 2.0 * p_i);
-                            let dw_deta =
-                                (2.0 * d1 * d2) / var - (d1 * d1) * (var_prime / (var * var));
-                            w_prime[i] = state.weights[i] * dw_deta;
-                            w_double_prime[i] = state.weights[i]
-                                * w_base
-                                * ((1.0 - 2.0 * p_i).powi(2) - 2.0 * w_base);
-                        } else {
-                            // Exact for canonical logit:
-                            //   w = μ(1−μ), w' = w(1−2μ), w'' = w[(1−2μ)² − 2w]
-                            w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * p_i);
-                            w_double_prime[i] = state.weights[i]
-                                * w_base
-                                * ((1.0 - 2.0 * p_i).powi(2) - 2.0 * w_base);
-                        }
-
-                        if !w_prime[i].is_finite() {
-                            w_prime[i] = 0.0;
-                        }
-                        if !w_double_prime[i].is_finite() {
-                            w_double_prime[i] = 0.0;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        //  Build J, H, eigendecomposition
-        // ═══════════════════════════════════════════════════════════════════
-
-        let p_base = state.x_base.ncols();
-        let p_link = bwiggle.ncols();
-        let coef_layout = JointCoefLayout::new(p_base, p_link);
-        let p_total = coef_layout.p_total();
-
-        let (g_prime, .., b_prime_u) = compute_link_derivative_terms_from_state(state, &u);
-        let j_mat = state.build_joint_jacobian(&bwiggle, &g_prime);
-        let link_penalty = state.build_link_penalty();
-        let penalty_full = state.build_joint_penalty(&lambda_base, lambda_link, p_link);
-
-        let sqrtw = weights.mapv(|wi| wi.max(0.0).sqrt());
-        let mut jweighted = j_mat.clone();
-        ndarray::Zip::from(jweighted.rows_mut())
-            .and(sqrtw.view())
-            .for_each(|mut row, wi| row *= *wi);
-        let mut h_mat = fast_ata(&jweighted);
-        if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
-            h_mat += &penalty_full;
-        }
-
-        use faer::Side;
-        let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) =
-            h_mat
-                .eigh(Side::Lower)
-                .map_err(|_| EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                })?;
-        let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
-        let h_tol = (h_max_eig * 1e-12).max(1e-100);
-
-        // Pseudo-inverse solve: H⁺ v.
-        let h_pseudo_solve = |rhs: &Array1<f64>| -> Array1<f64> {
-            let c = fast_atv(&hvecs, rhs);
-            let mut result = Array1::zeros(p_total);
-            for i in 0..p_total {
-                if h_eigs[i] > h_tol {
-                    let scaled = c[i] / h_eigs[i];
-                    for j in 0..p_total {
-                        result[j] += scaled * hvecs[[j, i]];
-                    }
-                }
-            }
-            result
-        };
-
-        // Concatenated β.
-        let mut beta = Array1::zeros(p_total);
-        beta.slice_mut(s![..p_base]).assign(&state.beta_base);
-        if p_link > 0 {
-            beta.slice_mut(s![p_base..p_total]).assign(&state.beta_link);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        //  Per-k first-order quantities
-        // ═══════════════════════════════════════════════════════════════════
-
-        let (_, z_c, rangewidth) = state.standardized_z(&u);
-        let invrw = 1.0 / rangewidth;
-
-        let Some(knot_vector) = state.knot_vector.as_ref() else {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "missing knot vector for joint Hessian".to_string(),
-            ));
-        };
-        let Some(link_transform) = state.link_transform.as_ref() else {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "missing link transform for joint Hessian".to_string(),
-            ));
-        };
-        let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
-
-        let (b_prime_arc, _) = create_basis::<Dense>(
-            z_c.view(),
-            KnotSource::Provided(knot_vector.view()),
-            state.degree,
-            BasisOptions::first_derivative(),
-        )
-        .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-        let b_prime = b_prime_arc.as_ref();
-
-        let mut a_k_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
-        let mut c_k_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
-        let mut dot_eta_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
-        let mut dot_j_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
-        let mut h_dot_k_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
-
-        for kk in 0..k {
-            let is_link = kk == n_base;
-            let lambda_k = if is_link {
-                lambda_link
-            } else {
-                lambda_base[kk]
-            };
-
-            // a_k = A_k b = λ_k S_k b (embedded in joint space).
-            let mut a_k = Array1::<f64>::zeros(p_total);
-            if is_link {
-                if p_link > 0 && link_penalty.nrows() == p_link {
-                    let sb = link_penalty.dot(&state.beta_link);
-                    for i in 0..p_link {
-                        a_k[p_base + i] = lambda_k * sb[i];
-                    }
-                }
-            } else if let Some(s_k) = state.s_base.get(kk) {
-                if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                    let sb = s_k.dot(&state.beta_base);
-                    for i in 0..p_base {
-                        a_k[i] = lambda_k * sb[i];
-                    }
-                }
-            }
-
-            // c_k = −H⁺ a_k (mode response ∂b̂/∂ρ_k).
-            let neg_a_k = a_k.mapv(|v| -v);
-            let c_k = h_pseudo_solve(&neg_a_k);
-
-            // η̇_k = J c_k.
-            let dot_eta_k: Array1<f64> = j_mat.dot(&c_k);
-
-            // T_k = [diag(∂g'/∂ρ_k) X | Ḃ_k].
-            // ∂g'/∂ρ_k = C · c_k^(θ)  (C = b_prime_u, the derivative basis).
-            let c_k_theta = c_k.slice(s![p_base..p_total]).to_owned();
-            let dot_g_prime_k = b_prime_u.dot(&c_k_theta);
-
-            let c_k_beta = c_k.slice(s![..p_base]).to_owned();
-            let dot_u_k = state.x_base.dot(&c_k_beta);
-
-            let mut dot_j_k = Array2::<f64>::zeros((n, p_total));
-            for i in 0..n {
-                let scale = dot_g_prime_k[i];
-                for j in 0..p_base {
-                    dot_j_k[[i, j]] = scale * state.x_base[[i, j]];
-                }
-            }
-            for i in 0..n {
-                let dz = dot_u_k[i] * invrw;
-                if dz.abs() < 1e-30 {
-                    continue;
-                }
-                for c in 0..p_link {
-                    let mut val = 0.0;
-                    for r in 0..n_raw {
-                        val += b_prime[[i, r]] * link_transform[[r, c]];
-                    }
-                    dot_j_k[[i, p_base + c]] = val * dz;
-                }
-            }
-
-            // ═══ Build Ḣ_k = A_k + T_k^T W J + J^T W T_k + J^T Ẇ_k J ═══
-            let mut a_k_mat = Array2::<f64>::zeros((p_total, p_total));
-            if is_link {
-                if p_link > 0 && link_penalty.nrows() == p_link {
-                    for i in 0..p_link {
-                        for j in 0..p_link {
-                            a_k_mat[[p_base + i, p_base + j]] = lambda_k * link_penalty[[i, j]];
-                        }
-                    }
-                }
-            } else if let Some(s_k) = state.s_base.get(kk) {
-                if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                    for i in 0..p_base {
-                        for j in 0..p_base {
-                            a_k_mat[[i, j]] = lambda_k * s_k[[i, j]];
-                        }
-                    }
-                }
-            }
-
-            // T_k^T W J + J^T W T_k (symmetric).
-            let mut w_t_k = dot_j_k.clone();
-            ndarray::Zip::from(w_t_k.rows_mut())
-                .and(sqrtw.view())
-                .for_each(|mut row, &wi| row *= wi);
-            let t_k_t_w_j = fast_atb(&w_t_k, &jweighted);
-            let sym_t_w_j = &t_k_t_w_j + &t_k_t_w_j.t();
-
-            // J^T Ẇ_k J where Ẇ_k = diag(w' ⊙ η̇_k).
-            let w_dot_k: Array1<f64> = &w_prime * &dot_eta_k;
-            let mut j_t_wdot_j = Array2::<f64>::zeros((p_total, p_total));
-            for i in 0..n {
-                let wd = w_dot_k[i];
-                if wd.abs() < 1e-30 {
-                    continue;
-                }
-                let ji = j_mat.row(i);
-                for a in 0..p_total {
-                    let wa = wd * ji[a];
-                    for b in a..p_total {
-                        let val = wa * ji[b];
-                        j_t_wdot_j[[a, b]] += val;
-                        if a != b {
-                            j_t_wdot_j[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-
-            let h_dot_k = a_k_mat + sym_t_w_j + j_t_wdot_j;
-
-            a_k_vecs.push(a_k);
-            c_k_vecs.push(c_k);
-            dot_eta_vecs.push(dot_eta_k);
-            dot_j_mats.push(dot_j_k);
-            h_dot_k_mats.push(h_dot_k);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        //  Projected Hessian drifts for cross-trace
-        // ═══════════════════════════════════════════════════════════════════
-        //
-        // M_k = Λ^{−½} U_r^T Ḣ_k U_r Λ^{−½}   (r × r symmetric)
-        // tr(H⁺ Ḣ_j H⁺ Ḣ_k) = ⟨M_j, M_k⟩_F
-
-        let active_indices: Vec<usize> = (0..p_total).filter(|&i| h_eigs[i] > h_tol).collect();
-        let n_active = active_indices.len();
-
-        let mut u_r = Array2::<f64>::zeros((p_total, n_active));
-        let mut inv_sqrt_lambda = Array1::<f64>::zeros(n_active);
-        for (col, &idx) in active_indices.iter().enumerate() {
-            u_r.column_mut(col).assign(&hvecs.column(idx));
-            inv_sqrt_lambda[col] = 1.0 / h_eigs[idx].sqrt();
-        }
-
-        let mut m_k_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
-        for kk in 0..k {
-            let u_t_h = fast_atb(&u_r, &h_dot_k_mats[kk]);
-            let d_k = fast_ab(&u_t_h, &u_r);
-            let mut m_k = d_k;
-            for a in 0..n_active {
-                for b in 0..n_active {
-                    m_k[[a, b]] *= inv_sqrt_lambda[a] * inv_sqrt_lambda[b];
-                }
-            }
-            m_k_mats.push(m_k);
-        }
-
-        // Precompute leverages h_i = (J H⁺ J^T)_{ii} for the Ẅ trace term.
-        let mut leverages = Array1::<f64>::zeros(n);
-        for &eig_idx in &active_indices {
-            let u_a = hvecs.column(eig_idx);
-            let j_ua = j_mat.dot(&u_a.to_owned());
-            let inv_eig = 1.0 / h_eigs[eig_idx];
-            for i in 0..n {
-                leverages[i] += inv_eig * j_ua[i] * j_ua[i];
-            }
-        }
-
-        // Precompute J u_a and T_k u_a for all active eigenvectors.
-        let mut j_ua_cache: Vec<Array1<f64>> = Vec::with_capacity(n_active);
-        for &eig_idx in &active_indices {
-            j_ua_cache.push(j_mat.dot(&hvecs.column(eig_idx).to_owned()));
-        }
-        let mut t_k_ua_caches: Vec<Vec<Array1<f64>>> = Vec::with_capacity(k);
-        for kk in 0..k {
-            let mut cache = Vec::with_capacity(n_active);
-            for &eig_idx in &active_indices {
-                cache.push(dot_j_mats[kk].dot(&hvecs.column(eig_idx).to_owned()));
-            }
-            t_k_ua_caches.push(cache);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        //  Assemble Hessian V_{jk}
-        // ═══════════════════════════════════════════════════════════════════
-
-        let mut hess = Array2::<f64>::zeros((k, k));
-
-        for jj in 0..k {
-            for kk in jj..k {
-                // ─── Q_{jk} = −a_j^T H⁺ a_k + ½δ_{jk} b̂^T A_k b̂ ───
-                let h_inv_a_k = h_pseudo_solve(&a_k_vecs[kk]);
-                let q_jk = -a_k_vecs[jj].dot(&h_inv_a_k)
-                    + if jj == kk {
-                        0.5 * beta.dot(&a_k_vecs[kk])
-                    } else {
-                        0.0
-                    };
-
-                // ─── Cross-trace: tr(H⁺ Ḣ_j H⁺ Ḣ_k) = ⟨M_j, M_k⟩_F ───
-                let cross_trace: f64 = (&m_k_mats[jj] * &m_k_mats[kk]).sum();
-
-                // ─── Second mode response b_{jk} = −H⁺(Ḣ_j c_k + A_k c_j + δ_{jk} a_k) ───
-                let mut rhs_jk = h_dot_k_mats[jj].dot(&c_k_vecs[kk]);
-                {
-                    let is_link_k = kk == n_base;
-                    let lambda_kk = if is_link_k {
-                        lambda_link
-                    } else {
-                        lambda_base[kk]
-                    };
-                    if is_link_k {
-                        if p_link > 0 && link_penalty.nrows() == p_link {
-                            let c_j_theta = c_k_vecs[jj].slice(s![p_base..p_total]).to_owned();
-                            let sc = link_penalty.dot(&c_j_theta);
-                            for i in 0..p_link {
-                                rhs_jk[p_base + i] += lambda_kk * sc[i];
-                            }
-                        }
-                    } else if let Some(s_k) = state.s_base.get(kk) {
-                        if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                            let c_j_beta = c_k_vecs[jj].slice(s![..p_base]).to_owned();
-                            let sc = s_k.dot(&c_j_beta);
-                            for i in 0..p_base {
-                                rhs_jk[i] += lambda_kk * sc[i];
-                            }
-                        }
-                    }
-                }
-                if jj == kk {
-                    rhs_jk += &a_k_vecs[kk];
-                }
-                let neg_rhs_jk = rhs_jk.mapv(|v| -v);
-                let b_jk = h_pseudo_solve(&neg_rhs_jk);
-
-                // ─── T_{jk} quantities for trace ───
-                // c_{jk}^(θ) and c_{jk}^(β) for building T_{jk} on the fly.
-                let c_jk_theta = b_jk.slice(s![p_base..p_total]).to_owned();
-                let dot2_g_prime = b_prime_u.dot(&c_jk_theta);
-                let c_jk_beta = b_jk.slice(s![..p_base]).to_owned();
-
-                // ─── η̈_{jk} = T_j c_k + J b_{jk} ───
-                let dot_eta_jk: Array1<f64> = dot_j_mats[jj].dot(&c_k_vecs[kk]) + j_mat.dot(&b_jk);
-
-                // ─── Ẅ_{jk} = diag(w″ ⊙ η̇_j ⊙ η̇_k + w′ ⊙ η̈_{jk}) ───
-                let mut w_ddot_jk = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    w_ddot_jk[i] = w_double_prime[i] * dot_eta_vecs[jj][i] * dot_eta_vecs[kk][i]
-                        + w_prime[i] * dot_eta_jk[i];
-                }
-
-                // ─── tr(H⁺ Ḧ_{jk}) via term-by-term eigenspace projection ───
-                //
-                // Ḧ_{jk} = T_{jk}^T W J + J^T W T_{jk}           (1)
-                //         + T_j^T W T_k + T_k^T W T_j              (2)
-                //         + T_j^T Ẇ_k J + J^T Ẇ_k T_j            (3)
-                //         + T_k^T Ẇ_j J + J^T Ẇ_j T_k            (4)
-                //         + J^T Ẅ_{jk} J                           (5)
-                //         + δ_{jk} A_k                              (6)
-                //
-                // For symmetric pairs M^T N + N^T M with diagonal weight D:
-                //   tr(H⁺ (M^T D N + N^T D M)) = 2 Σ_a (1/λ_a) (D^½ M u_a)·(D^½ N u_a)
-                //   or equivalently 2 Σ_a (1/λ_a) Σ_i d_i (M u_a)_i (N u_a)_i
-
-                let mut trace_h_ddot = 0.0;
-
-                // (1) T_{jk}^T W J + J^T W T_{jk}
-                for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
-                    let u_a = hvecs.column(eig_idx);
-                    // T_{jk} u_a on the fly: [diag(dot2_g_prime) X | Ḃ_{jk}] u_a
-                    let mut t_jk_ua_i: f64;
-                    let mut dot = 0.0;
-                    for i in 0..n {
-                        // Base block.
-                        t_jk_ua_i =
-                            dot2_g_prime[i] * state.x_base.row(i).dot(&u_a.slice(s![..p_base]));
-                        // Link block: B' diag(ddot_z) link_transform u_a[p_base..].
-                        let ddot_u_i: f64 = state.x_base.row(i).dot(&c_jk_beta);
-                        let ddot_z = ddot_u_i * invrw;
-                        if ddot_z.abs() > 1e-30 {
-                            for cc in 0..p_link {
-                                let mut bp_lt = 0.0;
-                                for r in 0..n_raw {
-                                    bp_lt += b_prime[[i, r]] * link_transform[[r, cc]];
-                                }
-                                t_jk_ua_i += bp_lt * ddot_z * u_a[p_base + cc];
-                            }
-                        }
-                        dot += weights[i] * t_jk_ua_i * j_ua_cache[a_idx][i];
-                    }
-                    trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
-                }
-
-                // (2) T_j^T W T_k + T_k^T W T_j
-                for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
-                    let mut dot = 0.0;
-                    for i in 0..n {
-                        dot +=
-                            weights[i] * t_k_ua_caches[jj][a_idx][i] * t_k_ua_caches[kk][a_idx][i];
-                    }
-                    trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
-                }
-
-                // (3) T_j^T Ẇ_k J + J^T Ẇ_k T_j
-                {
-                    let w_dot_kk: Array1<f64> = &w_prime * &dot_eta_vecs[kk];
-                    for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
-                        let mut dot = 0.0;
-                        for i in 0..n {
-                            dot += w_dot_kk[i] * t_k_ua_caches[jj][a_idx][i] * j_ua_cache[a_idx][i];
-                        }
-                        trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
-                    }
-                }
-
-                // (4) T_k^T Ẇ_j J + J^T Ẇ_j T_k
-                {
-                    let w_dot_jj: Array1<f64> = &w_prime * &dot_eta_vecs[jj];
-                    for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
-                        let mut dot = 0.0;
-                        for i in 0..n {
-                            dot += w_dot_jj[i] * t_k_ua_caches[kk][a_idx][i] * j_ua_cache[a_idx][i];
-                        }
-                        trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
-                    }
-                }
-
-                // (5) J^T Ẅ_{jk} J: tr(H⁺ J^T diag(w̃) J) = Σ_i w̃_i h_i
-                {
-                    let mut tr5 = 0.0;
-                    for i in 0..n {
-                        tr5 += w_ddot_jk[i] * leverages[i];
-                    }
-                    trace_h_ddot += tr5;
-                }
-
-                // (6) δ_{jk} A_k: tr(H⁺ A_k)
-                if jj == kk {
-                    let is_link = kk == n_base;
-                    let lambda_kk = if is_link {
-                        lambda_link
-                    } else {
-                        lambda_base[kk]
-                    };
-                    let mut tr6 = 0.0;
-                    for &eig_idx in &active_indices {
-                        let u_a = hvecs.column(eig_idx);
-                        let q = if is_link {
-                            if p_link > 0 && link_penalty.nrows() == p_link {
-                                let u_theta = Array1::from_iter(
-                                    u_a.iter().skip(p_base).take(p_total - p_base).copied(),
-                                );
-                                let su = link_penalty.dot(&u_theta);
-                                lambda_kk * u_theta.dot(&su)
-                            } else {
-                                0.0
-                            }
-                        } else if let Some(s_k) = state.s_base.get(kk) {
-                            if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                                let u_beta: Array1<f64> = u_a.slice(s![..p_base]).to_owned();
-                                let su = s_k.dot(&u_beta);
-                                lambda_kk * u_beta.dot(&su)
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        };
-                        tr6 += q / h_eigs[eig_idx];
-                    }
-                    trace_h_ddot += tr6;
-                }
-
-                // ─── L_{jk}^(H) = ½ [tr(H⁺ Ḧ_{jk}) − tr(H⁺ Ḣ_j H⁺ Ḣ_k)] ───
-                let l_jk = 0.5 * (trace_h_ddot - cross_trace);
-
-                // ─── V_{jk} = Q_{jk} + L_{jk}  (L^(S) = 0 for disjoint blocks) ───
-                let v_jk = q_jk + l_jk;
-                hess[[jj, kk]] = v_jk;
-                if jj != kk {
-                    hess[[kk, jj]] = v_jk;
-                }
-            }
-        }
-
-        Ok(hess)
-    }
-
-    /// Compute gradient of LAML w.r.t. ρ using analytic path.
-    ///
-    /// Runtime policy:
-    /// - Production path: analytic only (no FD fallback).
-    /// - Optional FD audit: sampled guardrail in debug/test builds only; audit mismatch
-    ///   is reported as warning and does not replace analytic gradients.
-    pub fn compute_gradient(&mut self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        match self.compute_gradient_analytic(rho) {
-            Ok((grad, audit_needed)) => {
-                const GRAD_FD_REL_TOL: f64 = 1e-2;
-                let eval_num = self.eval.eval_count;
-                let audit_slot = should_sample_jointfdaudit(eval_num);
-                if JOINT_ENABLE_RUNTIME_FD_AUDIT && audit_needed && audit_slot {
-                    match self.compute_gradient_fd(rho) {
-                        Ok(fdgrad) => {
-                            let mut diff_norm = 0.0;
-                            let mut fd_norm = 0.0;
-                            for i in 0..fdgrad.len() {
-                                let d = grad[i] - fdgrad[i];
-                                diff_norm += d * d;
-                                fd_norm += fdgrad[i] * fdgrad[i];
-                            }
-                            let rel = diff_norm.sqrt() / (fd_norm.sqrt() + 1.0);
-                            if rel > GRAD_FD_REL_TOL {
-                                log::warn!(
-                                    "[JOINT][REML] analytic/FD gradient audit mismatch (rel {:.3e}); keeping analytic gradient.",
-                                    rel
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("[JOINT][REML] FD audit failed: {err}");
-                        }
-                    }
-                } else if audit_needed && eval_num > JOINT_GRAD_AUDIT_WARMUP_EVALS {
-                    log::debug!(
-                        "[JOINT][REML] Skipping FD audit at eval {} (periodic audit every {} evals).",
-                        eval_num,
-                        JOINT_GRAD_AUDIT_INTERVAL
-                    );
-                }
-                Ok(grad)
-            }
-            Err(err) => Err(err),
-        }
     }
 
     /// Extract final result after optimization
@@ -3671,21 +2613,9 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
-            // compute_cost runs the inner solver and caches the converged state.
-            let cost = state.compute_cost(rho)?;
-
-            // Analytic gradient (handles Jacobian drift T_k terms correctly).
-            let grad = state.compute_gradient(rho)?;
-
-            // Exact analytic Hessian (full second-derivative formula with all
-            // Jacobian drift, weight drift, and second mode response terms).
-            let hess = state.compute_outer_hessian_analytic(rho)?;
-
-            Ok(OuterEval {
-                cost,
-                gradient: grad,
-                hessian: HessianResult::Analytic(hess),
-            })
+            // Unified path: inner solve + enriched InnerSolution + cost/gradient/Hessian
+            // all through the single reml_laml_evaluate function.
+            state.compute_unified_eval(rho)
         },
         reset_fn: {
             let snap = snapshot;
@@ -4280,11 +3210,10 @@ mod tests {
         }
 
         let rho = Array1::from_vec(vec![0.0, 4.0]);
-        let (grad, audit) = reml_state
-            .compute_gradient_analytic(&rho)
-            .expect("integrated logit analytic gradient");
-        let _ = audit;
-        assert!(grad.iter().all(|v| v.is_finite()));
+        let eval = reml_state
+            .compute_unified_eval(&rho)
+            .expect("integrated logit unified eval");
+        assert!(eval.gradient.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -4351,21 +3280,6 @@ mod tests {
                 SeedRiskProfile::GeneralizedLinear
             );
         }
-    }
-
-    #[test]
-    fn test_jointfdaudit_sampling_schedule() {
-        // Warmup phase samples every eval.
-        for eval in 1..=JOINT_GRAD_AUDIT_WARMUP_EVALS {
-            assert!(should_sample_jointfdaudit(eval));
-        }
-        // After warmup, only periodic checkpoints are sampled.
-        assert!(!should_sample_jointfdaudit(
-            JOINT_GRAD_AUDIT_WARMUP_EVALS + 1
-        ));
-        assert!(!should_sample_jointfdaudit(JOINT_GRAD_AUDIT_INTERVAL - 1));
-        assert!(should_sample_jointfdaudit(JOINT_GRAD_AUDIT_INTERVAL));
-        assert!(should_sample_jointfdaudit(JOINT_GRAD_AUDIT_INTERVAL * 2));
     }
 
     #[test]

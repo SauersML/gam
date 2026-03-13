@@ -156,25 +156,28 @@ pub struct SinglePredictorGlmDerivatives {
 
 impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
-        // Cₖ = Xᵀ diag(c ⊙ X vₖ) X
-        // where vₖ is the mode response H⁻¹(Aₖβ̂).
-        // Note: vₖ here is already −dβ̂/dρₖ (the sign convention from the solve).
+        // The Hessian derivative is dH/dρₖ = Aₖ + D_β(X'WX)[−vₖ].
+        // Since vₖ = H⁻¹(Aₖβ̂) = −dβ̂/dρₖ, the β-direction is −vₖ, giving:
+        //   D_β(X'WX)[−vₖ] = X' diag(c · X(−vₖ)) X = −X' diag(c ⊙ Xvₖ) X
+        // where c = dW/dη (the third-derivative weight array).
+        //
+        // This method returns the correction (dH/dρₖ − Aₖ), which is NEGATIVE.
         let x = self.x_transformed.to_dense_arc();
         let x_v = x.dot(v_k); // X vₖ: n-vector
 
-        // Elementwise: c ⊙ (X vₖ)
-        let mut c_xv = x_v;
-        Zip::from(&mut c_xv)
+        // Elementwise: −c ⊙ (X vₖ)
+        let mut neg_c_xv = x_v;
+        Zip::from(&mut neg_c_xv)
             .and(&self.c_array)
-            .for_each(|xv_i, &c_i| *xv_i *= c_i);
+            .for_each(|xv_i, &c_i| *xv_i *= -c_i);
 
-        // Xᵀ diag(c_xv) X
+        // −Xᵀ diag(c ⊙ Xvₖ) X
         let x_ref = x.as_ref();
         let n = x_ref.nrows();
         let p = x_ref.ncols();
         let mut result = Array2::zeros((p, p));
         for i in 0..n {
-            let w = c_xv[i];
+            let w = neg_c_xv[i];
             if w.abs() > 0.0 {
                 let xi = x_ref.row(i);
                 for a in 0..p {
@@ -364,6 +367,16 @@ pub struct InnerSolution {
     /// Each entry is `Some(correction_k)` where correction_k = D_β H_L[vₖ],
     /// or `None` if the correction is zero (Gaussian-like penalty).
     pub precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
+
+    // === Precomputed outer Hessian data (for complex models) ===
+    /// Precomputed scalar traces tr(H⁻¹ Ḧ_{jk}) for all (j,k) smoothing parameter pairs.
+    ///
+    /// When present, `compute_outer_hessian` uses these directly instead of
+    /// computing second-derivative corrections via the `deriv_provider`.
+    /// This allows complex models (joint link wiggles) to pre-compute the
+    /// full 6-term Ḧ_{jk} decomposition in the builder where all model-specific
+    /// state is available.
+    pub precomputed_h_ddot_traces: Option<Array2<f64>>,
 }
 
 /// Evaluation mode for the unified evaluator.
@@ -636,20 +649,26 @@ fn compute_outer_hessian(
         v_ks.push(v_k);
     }
 
-    // Build Hₖ matrices (Aₖ + third-derivative correction) for all k.
+    // Build Ḣₖ matrices (Aₖ + correction) for all k.
+    // Check precomputed corrections first (joint/custom family path),
+    // then fall back to deriv_provider (single-predictor path).
     let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
         let r_k = &solution.penalty_roots[idx];
         let mut a_k = r_k.t().dot(r_k);
         a_k *= lambdas[idx];
 
-        if solution.deriv_provider.has_corrections() {
-            if let Some(correction) = solution
+        let correction = if let Some(ref precomputed) = solution.precomputed_h_k_corrections {
+            precomputed[idx].clone()
+        } else if solution.deriv_provider.has_corrections() {
+            solution
                 .deriv_provider
                 .hessian_derivative_correction(&v_ks[idx])
-            {
-                a_k += &correction;
-            }
+        } else {
+            None
+        };
+        if let Some(corr) = correction {
+            a_k += &corr;
         }
         h_k_matrices.push(a_k);
     }
@@ -674,8 +693,11 @@ fn compute_outer_hessian(
             // Cross-trace: tr(H⁻¹ Hₗ H⁻¹ Hₖ) = tr(Yₗ Hₖ) = ⟨Yₗ, Hₖ⟩_F
             let cross_trace = (&y_ks[ll] * &h_k_matrices[kk]).sum();
 
-            // For H_{kl}: δ_{kl} Aₖ + second-derivative corrections
-            let h_kl_trace = if kk == ll {
+            // tr(H⁻¹ Ḧ_{jk}): check precomputed traces first (joint/complex models),
+            // then fall back to second-derivative provider (single-predictor).
+            let h_kl_trace = if let Some(ref traces) = solution.precomputed_h_ddot_traces {
+                traces[[kk, ll]]
+            } else if kk == ll {
                 let base = hop.trace_hinv_product(&h_k_matrices[kk]);
                 if solution.deriv_provider.has_corrections() {
                     if let Some(correction) = solution
@@ -694,7 +716,7 @@ fn compute_outer_hessian(
                     base
                 }
             } else {
-                // Off-diagonal: H_{kl} corrections from second-derivative provider
+                // Off-diagonal: Ḧ_{kl} corrections from second-derivative provider
                 if solution.deriv_provider.has_corrections() {
                     let mut rhs = h_k_matrices[kk].dot(&v_ks[ll]);
                     rhs += &h_k_matrices[ll].dot(&v_ks[kk]);
@@ -949,68 +971,10 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Block-coupled derivative provider (GAMLSS, survival, link wiggles)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Derivative provider for block-coupled families.
-///
-/// For GAMLSS, survival, and joint link wiggle models, the working Hessian
-/// couples multiple parameter blocks. The third-derivative correction is:
-///   D_β H_L[−vₖ] — the directional derivative of the joint likelihood
-///   Hessian in the mode response direction.
-///
-/// This struct holds the precomputed joint likelihood Hessian derivatives
-/// and design matrices needed to form these corrections.
-pub struct BlockCoupledDerivativeProvider {
-    /// The joint design matrix J (or its blocks) for computing H_L derivatives.
-    /// For a single-predictor + link wiggle: J = [diag(g')X | B_wiggle].
-    pub joint_design: Array2<f64>,
-    /// Third derivatives of the negative log-likelihood w.r.t. η for each block.
-    /// These are the ∂³(-ℓ)/∂ηᵢ³ values used in the directional derivative.
-    pub third_deriv_weights: Array1<f64>,
-}
-
-impl HessianDerivativeProvider for BlockCoupledDerivativeProvider {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
-        // D_β H_L[vₖ] = Jᵀ diag(c ⊙ J vₖ) J
-        // where c is the third-derivative weight vector.
-        let j = &self.joint_design;
-        let j_v = j.dot(v_k);
-
-        let n = j.nrows();
-        let p = j.ncols();
-        let mut c_jv = j_v;
-        Zip::from(&mut c_jv)
-            .and(&self.third_deriv_weights)
-            .for_each(|jv_i, &c_i| *jv_i *= c_i);
-
-        // Jᵀ diag(c_jv) J
-        let mut result = Array2::zeros((p, p));
-        for i in 0..n {
-            let w = c_jv[i];
-            if w.abs() > 0.0 {
-                let ji = j.row(i);
-                for a in 0..p {
-                    let wa = w * ji[a];
-                    for b in a..p {
-                        let val = wa * ji[b];
-                        result[[a, b]] += val;
-                        if a != b {
-                            result[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(result)
-    }
-
-    fn has_corrections(&self) -> bool {
-        true
-    }
-}
+// BlockCoupledDerivativeProvider was removed — its functionality is now handled
+// by precomputed_h_k_corrections in InnerSolution, which captures the full
+// correction including Jacobian sensitivity, weight sensitivity, and basis
+// sensitivity (not just the weight-only third-derivative correction).
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers for custom family → InnerSolution conversion
@@ -1082,6 +1046,9 @@ pub fn compute_block_penalty_logdet_derivs(
 
     for (b, block_rho) in per_block_rho.iter().enumerate() {
         let penalties = per_block_penalties[b];
+        if penalties.is_empty() || block_rho.is_empty() {
+            continue;
+        }
         let p = penalties[0].nrows();
         let lambdas = block_rho.mapv(f64::exp);
 
@@ -1260,6 +1227,7 @@ mod tests {
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             precomputed_h_k_corrections: None,
+            precomputed_h_ddot_traces: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -1384,6 +1352,7 @@ mod tests {
             nullspace_dim: (p - penalty_rank) as f64,
             dispersion: DispersionHandling::ProfiledGaussian,
             precomputed_h_k_corrections: None,
+            precomputed_h_ddot_traces: None,
         }
     }
 
