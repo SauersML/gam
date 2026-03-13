@@ -79,6 +79,15 @@ pub trait HessianOperator: Send + Sync {
 
     /// H⁻¹ v — linear solve using the active decomposition.
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64>;
+
+    /// H⁻¹ M — multi-column solve.
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64>;
+
+    /// Number of active dimensions (rank of pseudo-inverse).
+    fn active_rank(&self) -> usize;
+
+    /// Full dimension of H.
+    fn dim(&self) -> usize;
 }
 
 /// Provider of family-specific Hessian derivative information.
@@ -98,6 +107,19 @@ pub trait HessianDerivativeProvider: Send + Sync {
     ///
     /// Returns `None` for Gaussian (c=d=0, no correction needed).
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>>;
+
+    /// Compute the second-order correction to H_{k,l} for the outer Hessian.
+    ///
+    /// Returns `None` if not needed or not implemented.
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        let _ = (v_k, v_l, u_kl);
+        None
+    }
 
     /// Whether this provider has non-trivial corrections.
     /// False for Gaussian, true for GLMs and coupled families.
@@ -126,6 +148,8 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 pub struct SinglePredictorGlmDerivatives {
     /// c_array: −∂³ℓᵢ/∂ηᵢ³, the third-derivative of the negative log-likelihood.
     pub c_array: Array1<f64>,
+    /// d_array: fourth-derivative (for second-order Hessian corrections).
+    pub d_array: Option<Array1<f64>>,
     /// Design matrix X in the transformed basis.
     pub x_transformed: DesignMatrix,
 }
@@ -169,6 +193,62 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         Some(result)
     }
 
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        // Second-order correction for the outer Hessian.
+        // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
+        //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
+        let x = self.x_transformed.to_dense_arc();
+        let x_vk = x.dot(v_k);
+        let x_vl = x.dot(v_l);
+        let x_ukl = x.dot(u_kl);
+
+        let n = x.nrows();
+        let p = x.ncols();
+        let mut weights = Array1::zeros(n);
+
+        // c ⊙ X u_{kl}
+        Zip::from(&mut weights)
+            .and(&self.c_array)
+            .and(&x_ukl)
+            .for_each(|w, &c, &xu| *w = c * xu);
+
+        // + d ⊙ (X vₖ) ⊙ (X vₗ)
+        if let Some(ref d_array) = self.d_array {
+            Zip::from(&mut weights)
+                .and(d_array)
+                .and(&x_vk)
+                .and(&x_vl)
+                .for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
+        }
+
+        // Xᵀ diag(weights) X
+        let x_ref = x.as_ref();
+        let mut result = Array2::zeros((p, p));
+        for i in 0..n {
+            let wi = weights[i];
+            if wi.abs() > 0.0 {
+                let xi = x_ref.row(i);
+                for a in 0..p {
+                    let wa = wi * xi[a];
+                    for b in a..p {
+                        let val = wa * xi[b];
+                        result[[a, b]] += val;
+                        if a != b {
+                            result[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(result)
+    }
+
     fn has_corrections(&self) -> bool {
         true
     }
@@ -188,6 +268,8 @@ pub struct PenaltyLogdetDerivs {
     pub value: f64,
     /// ∂/∂ρₖ log|S|₊ — first derivatives (one per smoothing parameter).
     pub first: Array1<f64>,
+    /// ∂²/(∂ρₖ∂ρₗ) log|S|₊ — second derivatives (for outer Hessian).
+    pub second: Option<Array2<f64>>,
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -291,6 +373,8 @@ pub enum EvalMode {
     ValueOnly,
     /// Compute cost and gradient (the common case).
     ValueAndGradient,
+    /// Compute cost, gradient, and outer Hessian.
+    ValueGradientHessian,
 }
 
 /// Result of the unified REML/LAML evaluation.
@@ -299,6 +383,8 @@ pub struct RemlLamlResult {
     pub cost: f64,
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
+    /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
+    pub hessian: Option<Array2<f64>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -418,6 +504,7 @@ pub fn reml_laml_evaluate(
         return Ok(RemlLamlResult {
             cost,
             gradient: None,
+            hessian: None,
         });
     }
 
@@ -505,10 +592,141 @@ pub fn reml_laml_evaluate(
         grad += pg;
     }
 
+    // Outer Hessian (if requested).
+    let hessian = if mode == EvalMode::ValueGradientHessian {
+        Some(compute_outer_hessian(solution, rho, &lambdas, hop)?)
+    } else {
+        None
+    };
+
     Ok(RemlLamlResult {
         cost,
         gradient: Some(grad),
+        hessian,
     })
+}
+
+/// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
+///
+/// Uses the precomputed HessianOperator for all linear algebra.
+fn compute_outer_hessian(
+    solution: &InnerSolution,
+    rho: &[f64],
+    lambdas: &[f64],
+    hop: &dyn HessianOperator,
+) -> Result<Array2<f64>, String> {
+    let k = rho.len();
+    let mut hess = Array2::zeros((k, k));
+
+    let det2 = solution.penalty_logdet.second.as_ref().ok_or_else(|| {
+        "Outer Hessian requested but penalty second derivatives not provided".to_string()
+    })?;
+
+    // Precompute vₖ = H⁻¹(Aₖβ̂) and Aₖβ̂ for all k.
+    let mut a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
+    let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
+
+    for idx in 0..k {
+        let r_k = &solution.penalty_roots[idx];
+        let r_beta = r_k.dot(&solution.beta);
+        let s_k_beta = r_k.t().dot(&r_beta);
+        let a_k_beta = &s_k_beta * lambdas[idx];
+        let v_k = hop.solve(&a_k_beta);
+        a_k_betas.push(a_k_beta);
+        v_ks.push(v_k);
+    }
+
+    // Build Hₖ matrices (Aₖ + third-derivative correction) for all k.
+    let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for idx in 0..k {
+        let r_k = &solution.penalty_roots[idx];
+        let mut a_k = r_k.t().dot(r_k);
+        a_k *= lambdas[idx];
+
+        if solution.deriv_provider.has_corrections() {
+            if let Some(correction) = solution
+                .deriv_provider
+                .hessian_derivative_correction(&v_ks[idx])
+            {
+                a_k += &correction;
+            }
+        }
+        h_k_matrices.push(a_k);
+    }
+
+    // Precompute Yₖ = H⁻¹ Hₖ for cross-trace terms.
+    let mut y_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for idx in 0..k {
+        y_ks.push(hop.solve_multi(&h_k_matrices[idx]));
+    }
+
+    for kk in 0..k {
+        for ll in kk..k {
+            // Q_{kl}: coefficient curvature
+            let q_kl = a_k_betas[ll].dot(&v_ks[kk])
+                + if kk == ll {
+                    0.5 * solution.beta.dot(&a_k_betas[kk])
+                } else {
+                    0.0
+                };
+
+            // L_{kl}: trace curvature = 0.5 * [−tr(Yₗ Yₖᵀ) + tr(H⁻¹ H_{kl})]
+            // Cross-trace: tr(H⁻¹ Hₗ H⁻¹ Hₖ) = tr(Yₗ Hₖ) = ⟨Yₗ, Hₖ⟩_F
+            let cross_trace = (&y_ks[ll] * &h_k_matrices[kk]).sum();
+
+            // For H_{kl}: δ_{kl} Aₖ + second-derivative corrections
+            let h_kl_trace = if kk == ll {
+                let base = hop.trace_hinv_product(&h_k_matrices[kk]);
+                if solution.deriv_provider.has_corrections() {
+                    if let Some(correction) = solution
+                        .deriv_provider
+                        .hessian_second_derivative_correction(
+                            &v_ks[kk],
+                            &v_ks[ll],
+                            &Array1::zeros(solution.beta.len()),
+                        )
+                    {
+                        base + hop.trace_hinv_product(&correction)
+                    } else {
+                        base
+                    }
+                } else {
+                    base
+                }
+            } else {
+                // Off-diagonal: H_{kl} corrections from second-derivative provider
+                if solution.deriv_provider.has_corrections() {
+                    let mut rhs = h_k_matrices[kk].dot(&v_ks[ll]);
+                    rhs += &h_k_matrices[ll].dot(&v_ks[kk]);
+                    let u_kl = hop.solve(&rhs);
+
+                    if let Some(correction) = solution
+                        .deriv_provider
+                        .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)
+                    {
+                        hop.trace_hinv_product(&correction)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            };
+
+            let l_kl = 0.5 * (-cross_trace + h_kl_trace);
+
+            // P_{kl}: penalty logdet second derivative
+            let p_kl = -0.5 * det2[[kk, ll]];
+
+            let h_val = q_kl + l_kl + p_kl;
+            hess[[kk, ll]] = h_val;
+            if kk != ll {
+                hess[[ll, kk]] = h_val;
+            }
+        }
+    }
+
+    Ok(hess)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -628,6 +846,25 @@ impl HessianOperator for DenseSpectralOperator {
             }
         }
         result
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        let ncols = rhs.ncols();
+        let mut result = Array2::zeros((self.n_dim, ncols));
+        for col in 0..ncols {
+            let rhs_col = rhs.column(col).to_owned();
+            let sol = self.solve(&rhs_col);
+            result.column_mut(col).assign(&sol);
+        }
+        result
+    }
+
+    fn active_rank(&self) -> usize {
+        self.n_active
+    }
+
+    fn dim(&self) -> usize {
+        self.n_dim
     }
 }
 
@@ -824,6 +1061,7 @@ pub fn compute_block_penalty_logdet_derivs(
     Ok(PenaltyLogdetDerivs {
         value: log_det_total,
         first,
+        second: None,
     })
 }
 
@@ -930,6 +1168,7 @@ mod tests {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: 0.0,
                 first: array![1.0],
+                second: None,
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
@@ -1049,6 +1288,7 @@ mod tests {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
+                second: None,
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,

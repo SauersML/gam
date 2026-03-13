@@ -1854,6 +1854,7 @@ impl<'a> JointRemlState<'a> {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
+                second: Some(Array2::zeros((k, k))),
             },
             deriv_provider,
             tk_correction: 0.0,
