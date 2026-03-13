@@ -89,6 +89,133 @@ pub struct PredictResult {
     pub mean: Array1<f64>,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  PredictableModel trait — uniform prediction interface for all model types
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::estimate::BlockRole;
+
+/// Input to the prediction trait. Contains the design matrix and metadata
+/// needed for point prediction + uncertainty quantification.
+pub struct PredictInput {
+    /// Design matrix for the primary (mean/location) block.
+    pub design: DesignMatrix,
+    /// Offset vector for the primary block.
+    pub offset: Array1<f64>,
+    /// Optional design matrix for the noise/scale block (GAMLSS/survival).
+    pub design_noise: Option<DesignMatrix>,
+    /// Optional offset vector for the noise/scale block.
+    pub offset_noise: Option<Array1<f64>>,
+}
+
+/// Point prediction with optional standard errors on the linear predictor.
+pub struct PredictionWithSE {
+    /// Linear predictor η = Xβ + offset.
+    pub eta: Array1<f64>,
+    /// Response-scale prediction g⁻¹(η).
+    pub mean: Array1<f64>,
+    /// Standard error of η (if covariance available).
+    pub eta_se: Option<Array1<f64>>,
+    /// Standard error of the mean (delta-method, if covariance available).
+    pub mean_se: Option<Array1<f64>>,
+}
+
+/// Trait for models that can produce predictions from new data.
+///
+/// Implemented by each model class (standard, GAMLSS, survival) to provide
+/// a uniform prediction interface. Eliminates the match-dispatch pattern in
+/// main.rs for predict, NUTS, and summary commands.
+pub trait PredictableModel {
+    /// Point prediction on the response scale.
+    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError>;
+
+    /// Prediction with uncertainty quantification (SE on eta and mean scales).
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError>;
+
+    /// Number of coefficient blocks in the model.
+    fn n_blocks(&self) -> usize;
+
+    /// Roles of each block.
+    fn block_roles(&self) -> Vec<BlockRole>;
+}
+
+/// Standard (single-block) GAM predictor.
+pub struct StandardPredictor {
+    pub beta: Array1<f64>,
+    pub family: crate::types::LikelihoodFamily,
+    pub link_kind: Option<InverseLink>,
+    pub covariance: Option<Array2<f64>>,
+}
+
+impl PredictableModel for StandardPredictor {
+    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
+        predict_gam(
+            input.design.clone(),
+            self.beta.view(),
+            input.offset.view(),
+            self.family,
+        )
+    }
+
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError> {
+        let result = self.predict_response(input)?;
+        let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
+            let se = eta_standard_errors_from_design(&input.design, cov)?;
+            let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+            let mean_se = delta_method_mean_se(&result.eta, &se, &strategy)?;
+            (Some(se), Some(mean_se))
+        } else {
+            (None, None)
+        };
+        Ok(PredictionWithSE {
+            eta: result.eta,
+            mean: result.mean,
+            eta_se,
+            mean_se,
+        })
+    }
+
+    fn n_blocks(&self) -> usize {
+        1
+    }
+
+    fn block_roles(&self) -> Vec<BlockRole> {
+        vec![BlockRole::Mean]
+    }
+}
+
+/// Compute eta standard errors from design matrix and coefficient covariance.
+fn eta_standard_errors_from_design(
+    x: &DesignMatrix,
+    cov: &Array2<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    let vars = x.quadratic_form_diag(cov).map_err(|e| {
+        EstimationError::InvalidInput(format!("failed to compute linear predictor variance: {e}"))
+    })?;
+    Ok(vars.mapv(|v| v.max(0.0).sqrt()))
+}
+
+/// Delta-method standard errors on the mean scale.
+fn delta_method_mean_se(
+    eta: &Array1<f64>,
+    eta_se: &Array1<f64>,
+    strategy: &dyn FamilyStrategy,
+) -> Result<Array1<f64>, EstimationError> {
+    let n = eta.len();
+    let mut mean_se = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let jet = strategy.inverse_link_jet(eta[i])?;
+        mean_se[i] = (jet.d1 * eta_se[i]).abs();
+    }
+    Ok(mean_se)
+}
+
 pub struct PredictPosteriorMeanResult {
     pub eta: Array1<f64>,
     pub eta_standard_error: Array1<f64>,
