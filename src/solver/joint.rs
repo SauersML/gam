@@ -1616,7 +1616,6 @@ impl<'a> JointRemlState<'a> {
             GaussianDerivatives, InnerSolution, PenaltyLogdetDerivs,
         };
         use crate::faer_ndarray::FaerEigh;
-        use crate::types::{RidgeDeterminantMode, RidgeMatrixForm, RidgePassport, RidgePolicy};
         use faer::Side;
 
         let n = state.nobs();
@@ -1833,23 +1832,8 @@ impl<'a> JointRemlState<'a> {
                 Box::new(BlockCoupledDerivativeProvider {
                     joint_design: j_mat,
                     third_deriv_weights,
-                    fourth_deriv_weights: None,
                 })
             };
-
-        // Ridge passport.
-        let ridge_delta = state.ridge_base_used.max(state.ridge_link_used);
-        let ridge_passport = RidgePassport {
-            delta: ridge_delta,
-            matrix_form: RidgeMatrixForm::ScaledIdentity,
-            policy: RidgePolicy {
-                rho_independent: true,
-                include_quadratic_penalty: ridge_delta > 0.0,
-                include_penalty_logdet: false,
-                include_laplacehessian: false,
-                determinant_mode: RidgeDeterminantMode::Auto,
-            },
-        };
 
         let dispersion = if is_gaussian {
             DispersionHandling::ProfiledGaussian
@@ -1864,14 +1848,12 @@ impl<'a> JointRemlState<'a> {
         let inner_solution = InnerSolution {
             log_likelihood,
             penalty_quadratic,
-            ridge_passport,
             hessian_op,
             beta,
             penalty_roots,
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
-                second: None,
             },
             deriv_provider,
             tk_correction: 0.0,
@@ -2848,6 +2830,596 @@ impl<'a> JointRemlState<'a> {
         Ok((grad, audit_needed))
     }
 
+    /// Compute the exact analytic outer Hessian ∂²V/∂ρⱼ∂ρₖ for the joint
+    /// flexible-link model.
+    ///
+    /// Implements the full second-derivative formula:
+    ///
+    ///   V_{jk} = Q_{jk} + L_{jk}^(H) + L_{jk}^(S)
+    ///
+    /// where:
+    ///   Q_{jk} = −b̂ᵀAⱼ H⁺ Aₖb̂  +  ½ δ_{jk} b̂ᵀAₖb̂
+    ///   L_{jk}^(H) = ½ [tr(H⁺ Ḧ_{jk}) − tr(H⁺ Ḣⱼ H⁺ Ḣₖ)]
+    ///   L_{jk}^(S) = 0  (disjoint penalty blocks)
+    ///
+    /// Under the fixed-Greville simplification g'(u) = 1 + C·θ:
+    ///   - T_k  = [diag(C c_k^(θ)) X | Ḃ_k]
+    ///   - T_{jk} = [diag(C c_{jk}^(θ)) X | Ḃ_{jk}]
+    ///   - No g‴ terms; basis drift through z(u) only.
+    ///
+    /// Requires a prior call to `compute_cost(rho)` to populate cached state.
+    fn compute_outer_hessian_analytic(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let penalty_layout = JointPenaltyLayout::for_state(&self.core.state);
+        penalty_layout.validate_rho(rho)?;
+
+        let n_base = penalty_layout.n_base;
+        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
+        let k = rho.len();
+
+        // Ensure cached state is current.
+        if !self.cachedcost_matches_rho(rho) {
+            self.compute_cost(rho)?;
+        }
+        let state = &self.core.state;
+
+        let n = state.nobs();
+        let u = state.base_linear_predictor();
+        let bwiggle = state.build_link_basis_from_state(&u);
+        let eta = state.compute_eta_full(&u, &bwiggle);
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  Converged quantities: μ, W, w', w''
+        // ═══════════════════════════════════════════════════════════════════
+
+        let mut mu = Array1::<f64>::zeros(n);
+        let mut weights = Array1::<f64>::zeros(n);
+        let mut w_prime = Array1::<f64>::zeros(n);
+        let mut w_double_prime = Array1::<f64>::zeros(n);
+
+        match state.link {
+            LinkFunction::Identity => {
+                for i in 0..n {
+                    mu[i] = eta[i];
+                    weights[i] = state.weights[i];
+                }
+            }
+            _ => {
+                const MIN_WEIGHT: f64 = 1e-12;
+                const MIN_DMU: f64 = 1e-6;
+                let family = match state.link {
+                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+                    LinkFunction::Identity => unreachable!(),
+                };
+                let strategy = strategy_for_family(family, None);
+                let use_integrated = state.covariate_se.is_some();
+
+                for i in 0..n {
+                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
+                    let moments = strategy
+                        .integrated_moments(&state.quadctx, eta[i], se_i)
+                        .expect("binomial family moments must be available");
+                    let dmu = moments.d1.abs().max(MIN_DMU);
+                    mu[i] = moments.mean;
+                    let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
+                    weights[i] = state.weights[i] * w;
+
+                    if matches!(state.link, LinkFunction::Logit) {
+                        let p_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                        let w_base = p_i * (1.0 - p_i);
+
+                        if use_integrated {
+                            let d1 = moments.d1.abs().max(1e-8);
+                            let d2 = if moments.d2.is_finite() {
+                                moments.d2
+                            } else {
+                                0.0
+                            };
+                            let var = w_base.max(1e-12);
+                            let var_prime = d1 * (1.0 - 2.0 * p_i);
+                            let dw_deta =
+                                (2.0 * d1 * d2) / var - (d1 * d1) * (var_prime / (var * var));
+                            w_prime[i] = state.weights[i] * dw_deta;
+                            w_double_prime[i] = state.weights[i]
+                                * w_base
+                                * ((1.0 - 2.0 * p_i).powi(2) - 2.0 * w_base);
+                        } else {
+                            // Exact for canonical logit:
+                            //   w = μ(1−μ), w' = w(1−2μ), w'' = w[(1−2μ)² − 2w]
+                            w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * p_i);
+                            w_double_prime[i] = state.weights[i]
+                                * w_base
+                                * ((1.0 - 2.0 * p_i).powi(2) - 2.0 * w_base);
+                        }
+
+                        if !w_prime[i].is_finite() {
+                            w_prime[i] = 0.0;
+                        }
+                        if !w_double_prime[i].is_finite() {
+                            w_double_prime[i] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  Build J, H, eigendecomposition
+        // ═══════════════════════════════════════════════════════════════════
+
+        let p_base = state.x_base.ncols();
+        let p_link = bwiggle.ncols();
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let p_total = coef_layout.p_total();
+
+        let (g_prime, .., b_prime_u) = compute_link_derivative_terms_from_state(state, &u);
+        let j_mat = state.build_joint_jacobian(&bwiggle, &g_prime);
+        let link_penalty = state.build_link_penalty();
+        let penalty_full = state.build_joint_penalty(&lambda_base, lambda_link, p_link);
+
+        let sqrtw = weights.mapv(|wi| wi.max(0.0).sqrt());
+        let mut jweighted = j_mat.clone();
+        ndarray::Zip::from(jweighted.rows_mut())
+            .and(sqrtw.view())
+            .for_each(|mut row, wi| row *= *wi);
+        let mut h_mat = fast_ata(&jweighted);
+        if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
+            h_mat += &penalty_full;
+        }
+
+        use faer::Side;
+        let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) =
+            h_mat
+                .eigh(Side::Lower)
+                .map_err(|_| EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                })?;
+        let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
+        let h_tol = (h_max_eig * 1e-12).max(1e-100);
+
+        // Pseudo-inverse solve: H⁺ v.
+        let h_pseudo_solve = |rhs: &Array1<f64>| -> Array1<f64> {
+            let c = fast_atv(&hvecs, rhs);
+            let mut result = Array1::zeros(p_total);
+            for i in 0..p_total {
+                if h_eigs[i] > h_tol {
+                    let scaled = c[i] / h_eigs[i];
+                    for j in 0..p_total {
+                        result[j] += scaled * hvecs[[j, i]];
+                    }
+                }
+            }
+            result
+        };
+
+        // Concatenated β.
+        let mut beta = Array1::zeros(p_total);
+        beta.slice_mut(s![..p_base]).assign(&state.beta_base);
+        if p_link > 0 {
+            beta.slice_mut(s![p_base..p_total]).assign(&state.beta_link);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  Per-k first-order quantities
+        // ═══════════════════════════════════════════════════════════════════
+
+        let (_, z_c, rangewidth) = state.standardized_z(&u);
+        let invrw = 1.0 / rangewidth;
+
+        let Some(knot_vector) = state.knot_vector.as_ref() else {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "missing knot vector for joint Hessian".to_string(),
+            ));
+        };
+        let Some(link_transform) = state.link_transform.as_ref() else {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "missing link transform for joint Hessian".to_string(),
+            ));
+        };
+        let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
+
+        let (b_prime_arc, _) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(knot_vector.view()),
+            state.degree,
+            BasisOptions::first_derivative(),
+        )
+        .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
+        let b_prime = b_prime_arc.as_ref();
+
+        let mut a_k_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
+        let mut c_k_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
+        let mut dot_eta_vecs: Vec<Array1<f64>> = Vec::with_capacity(k);
+        let mut dot_j_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
+        let mut h_dot_k_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
+
+        for kk in 0..k {
+            let is_link = kk == n_base;
+            let lambda_k = if is_link {
+                lambda_link
+            } else {
+                lambda_base[kk]
+            };
+
+            // a_k = A_k b = λ_k S_k b (embedded in joint space).
+            let mut a_k = Array1::<f64>::zeros(p_total);
+            if is_link {
+                if p_link > 0 && link_penalty.nrows() == p_link {
+                    let sb = link_penalty.dot(&state.beta_link);
+                    for i in 0..p_link {
+                        a_k[p_base + i] = lambda_k * sb[i];
+                    }
+                }
+            } else if let Some(s_k) = state.s_base.get(kk) {
+                if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                    let sb = s_k.dot(&state.beta_base);
+                    for i in 0..p_base {
+                        a_k[i] = lambda_k * sb[i];
+                    }
+                }
+            }
+
+            // c_k = −H⁺ a_k (mode response ∂b̂/∂ρ_k).
+            let neg_a_k = a_k.mapv(|v| -v);
+            let c_k = h_pseudo_solve(&neg_a_k);
+
+            // η̇_k = J c_k.
+            let dot_eta_k: Array1<f64> = j_mat.dot(&c_k);
+
+            // T_k = [diag(∂g'/∂ρ_k) X | Ḃ_k].
+            // ∂g'/∂ρ_k = C · c_k^(θ)  (C = b_prime_u, the derivative basis).
+            let c_k_theta = c_k.slice(s![p_base..p_total]).to_owned();
+            let dot_g_prime_k = b_prime_u.dot(&c_k_theta);
+
+            let c_k_beta = c_k.slice(s![..p_base]).to_owned();
+            let dot_u_k = state.x_base.dot(&c_k_beta);
+
+            let mut dot_j_k = Array2::<f64>::zeros((n, p_total));
+            for i in 0..n {
+                let scale = dot_g_prime_k[i];
+                for j in 0..p_base {
+                    dot_j_k[[i, j]] = scale * state.x_base[[i, j]];
+                }
+            }
+            for i in 0..n {
+                let dz = dot_u_k[i] * invrw;
+                if dz.abs() < 1e-30 {
+                    continue;
+                }
+                for c in 0..p_link {
+                    let mut val = 0.0;
+                    for r in 0..n_raw {
+                        val += b_prime[[i, r]] * link_transform[[r, c]];
+                    }
+                    dot_j_k[[i, p_base + c]] = val * dz;
+                }
+            }
+
+            // ═══ Build Ḣ_k = A_k + T_k^T W J + J^T W T_k + J^T Ẇ_k J ═══
+            let mut a_k_mat = Array2::<f64>::zeros((p_total, p_total));
+            if is_link {
+                if p_link > 0 && link_penalty.nrows() == p_link {
+                    for i in 0..p_link {
+                        for j in 0..p_link {
+                            a_k_mat[[p_base + i, p_base + j]] = lambda_k * link_penalty[[i, j]];
+                        }
+                    }
+                }
+            } else if let Some(s_k) = state.s_base.get(kk) {
+                if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                    for i in 0..p_base {
+                        for j in 0..p_base {
+                            a_k_mat[[i, j]] = lambda_k * s_k[[i, j]];
+                        }
+                    }
+                }
+            }
+
+            // T_k^T W J + J^T W T_k (symmetric).
+            let mut w_t_k = dot_j_k.clone();
+            ndarray::Zip::from(w_t_k.rows_mut())
+                .and(sqrtw.view())
+                .for_each(|mut row, &wi| row *= wi);
+            let t_k_t_w_j = fast_atb(&w_t_k, &jweighted);
+            let sym_t_w_j = &t_k_t_w_j + &t_k_t_w_j.t();
+
+            // J^T Ẇ_k J where Ẇ_k = diag(w' ⊙ η̇_k).
+            let w_dot_k: Array1<f64> = &w_prime * &dot_eta_k;
+            let mut j_t_wdot_j = Array2::<f64>::zeros((p_total, p_total));
+            for i in 0..n {
+                let wd = w_dot_k[i];
+                if wd.abs() < 1e-30 {
+                    continue;
+                }
+                let ji = j_mat.row(i);
+                for a in 0..p_total {
+                    let wa = wd * ji[a];
+                    for b in a..p_total {
+                        let val = wa * ji[b];
+                        j_t_wdot_j[[a, b]] += val;
+                        if a != b {
+                            j_t_wdot_j[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+
+            let h_dot_k = a_k_mat + sym_t_w_j + j_t_wdot_j;
+
+            a_k_vecs.push(a_k);
+            c_k_vecs.push(c_k);
+            dot_eta_vecs.push(dot_eta_k);
+            dot_j_mats.push(dot_j_k);
+            h_dot_k_mats.push(h_dot_k);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  Projected Hessian drifts for cross-trace
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // M_k = Λ^{−½} U_r^T Ḣ_k U_r Λ^{−½}   (r × r symmetric)
+        // tr(H⁺ Ḣ_j H⁺ Ḣ_k) = ⟨M_j, M_k⟩_F
+
+        let active_indices: Vec<usize> = (0..p_total).filter(|&i| h_eigs[i] > h_tol).collect();
+        let n_active = active_indices.len();
+
+        let mut u_r = Array2::<f64>::zeros((p_total, n_active));
+        let mut inv_sqrt_lambda = Array1::<f64>::zeros(n_active);
+        for (col, &idx) in active_indices.iter().enumerate() {
+            u_r.column_mut(col).assign(&hvecs.column(idx));
+            inv_sqrt_lambda[col] = 1.0 / h_eigs[idx].sqrt();
+        }
+
+        let mut m_k_mats: Vec<Array2<f64>> = Vec::with_capacity(k);
+        for kk in 0..k {
+            let u_t_h = fast_atb(&u_r, &h_dot_k_mats[kk]);
+            let d_k = fast_ab(&u_t_h, &u_r);
+            let mut m_k = d_k;
+            for a in 0..n_active {
+                for b in 0..n_active {
+                    m_k[[a, b]] *= inv_sqrt_lambda[a] * inv_sqrt_lambda[b];
+                }
+            }
+            m_k_mats.push(m_k);
+        }
+
+        // Precompute leverages h_i = (J H⁺ J^T)_{ii} for the Ẅ trace term.
+        let mut leverages = Array1::<f64>::zeros(n);
+        for &eig_idx in &active_indices {
+            let u_a = hvecs.column(eig_idx);
+            let j_ua = j_mat.dot(&u_a.to_owned());
+            let inv_eig = 1.0 / h_eigs[eig_idx];
+            for i in 0..n {
+                leverages[i] += inv_eig * j_ua[i] * j_ua[i];
+            }
+        }
+
+        // Precompute J u_a and T_k u_a for all active eigenvectors.
+        let mut j_ua_cache: Vec<Array1<f64>> = Vec::with_capacity(n_active);
+        for &eig_idx in &active_indices {
+            j_ua_cache.push(j_mat.dot(&hvecs.column(eig_idx).to_owned()));
+        }
+        let mut t_k_ua_caches: Vec<Vec<Array1<f64>>> = Vec::with_capacity(k);
+        for kk in 0..k {
+            let mut cache = Vec::with_capacity(n_active);
+            for &eig_idx in &active_indices {
+                cache.push(dot_j_mats[kk].dot(&hvecs.column(eig_idx).to_owned()));
+            }
+            t_k_ua_caches.push(cache);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  Assemble Hessian V_{jk}
+        // ═══════════════════════════════════════════════════════════════════
+
+        let mut hess = Array2::<f64>::zeros((k, k));
+
+        for jj in 0..k {
+            for kk in jj..k {
+                // ─── Q_{jk} = −a_j^T H⁺ a_k + ½δ_{jk} b̂^T A_k b̂ ───
+                let h_inv_a_k = h_pseudo_solve(&a_k_vecs[kk]);
+                let q_jk = -a_k_vecs[jj].dot(&h_inv_a_k)
+                    + if jj == kk {
+                        0.5 * beta.dot(&a_k_vecs[kk])
+                    } else {
+                        0.0
+                    };
+
+                // ─── Cross-trace: tr(H⁺ Ḣ_j H⁺ Ḣ_k) = ⟨M_j, M_k⟩_F ───
+                let cross_trace: f64 = (&m_k_mats[jj] * &m_k_mats[kk]).sum();
+
+                // ─── Second mode response b_{jk} = −H⁺(Ḣ_j c_k + A_k c_j + δ_{jk} a_k) ───
+                let mut rhs_jk = h_dot_k_mats[jj].dot(&c_k_vecs[kk]);
+                {
+                    let is_link_k = kk == n_base;
+                    let lambda_kk = if is_link_k {
+                        lambda_link
+                    } else {
+                        lambda_base[kk]
+                    };
+                    if is_link_k {
+                        if p_link > 0 && link_penalty.nrows() == p_link {
+                            let c_j_theta = c_k_vecs[jj].slice(s![p_base..p_total]).to_owned();
+                            let sc = link_penalty.dot(&c_j_theta);
+                            for i in 0..p_link {
+                                rhs_jk[p_base + i] += lambda_kk * sc[i];
+                            }
+                        }
+                    } else if let Some(s_k) = state.s_base.get(kk) {
+                        if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                            let c_j_beta = c_k_vecs[jj].slice(s![..p_base]).to_owned();
+                            let sc = s_k.dot(&c_j_beta);
+                            for i in 0..p_base {
+                                rhs_jk[i] += lambda_kk * sc[i];
+                            }
+                        }
+                    }
+                }
+                if jj == kk {
+                    rhs_jk += &a_k_vecs[kk];
+                }
+                let neg_rhs_jk = rhs_jk.mapv(|v| -v);
+                let b_jk = h_pseudo_solve(&neg_rhs_jk);
+
+                // ─── T_{jk} quantities for trace ───
+                // c_{jk}^(θ) and c_{jk}^(β) for building T_{jk} on the fly.
+                let c_jk_theta = b_jk.slice(s![p_base..p_total]).to_owned();
+                let dot2_g_prime = b_prime_u.dot(&c_jk_theta);
+                let c_jk_beta = b_jk.slice(s![..p_base]).to_owned();
+
+                // ─── η̈_{jk} = T_j c_k + J b_{jk} ───
+                let dot_eta_jk: Array1<f64> = dot_j_mats[jj].dot(&c_k_vecs[kk]) + j_mat.dot(&b_jk);
+
+                // ─── Ẅ_{jk} = diag(w″ ⊙ η̇_j ⊙ η̇_k + w′ ⊙ η̈_{jk}) ───
+                let mut w_ddot_jk = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    w_ddot_jk[i] = w_double_prime[i] * dot_eta_vecs[jj][i] * dot_eta_vecs[kk][i]
+                        + w_prime[i] * dot_eta_jk[i];
+                }
+
+                // ─── tr(H⁺ Ḧ_{jk}) via term-by-term eigenspace projection ───
+                //
+                // Ḧ_{jk} = T_{jk}^T W J + J^T W T_{jk}           (1)
+                //         + T_j^T W T_k + T_k^T W T_j              (2)
+                //         + T_j^T Ẇ_k J + J^T Ẇ_k T_j            (3)
+                //         + T_k^T Ẇ_j J + J^T Ẇ_j T_k            (4)
+                //         + J^T Ẅ_{jk} J                           (5)
+                //         + δ_{jk} A_k                              (6)
+                //
+                // For symmetric pairs M^T N + N^T M with diagonal weight D:
+                //   tr(H⁺ (M^T D N + N^T D M)) = 2 Σ_a (1/λ_a) (D^½ M u_a)·(D^½ N u_a)
+                //   or equivalently 2 Σ_a (1/λ_a) Σ_i d_i (M u_a)_i (N u_a)_i
+
+                let mut trace_h_ddot = 0.0;
+
+                // (1) T_{jk}^T W J + J^T W T_{jk}
+                for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
+                    let u_a = hvecs.column(eig_idx);
+                    // T_{jk} u_a on the fly: [diag(dot2_g_prime) X | Ḃ_{jk}] u_a
+                    let mut t_jk_ua_i: f64;
+                    let mut dot = 0.0;
+                    for i in 0..n {
+                        // Base block.
+                        t_jk_ua_i =
+                            dot2_g_prime[i] * state.x_base.row(i).dot(&u_a.slice(s![..p_base]));
+                        // Link block: B' diag(ddot_z) link_transform u_a[p_base..].
+                        let ddot_u_i: f64 = state.x_base.row(i).dot(&c_jk_beta);
+                        let ddot_z = ddot_u_i * invrw;
+                        if ddot_z.abs() > 1e-30 {
+                            for cc in 0..p_link {
+                                let mut bp_lt = 0.0;
+                                for r in 0..n_raw {
+                                    bp_lt += b_prime[[i, r]] * link_transform[[r, cc]];
+                                }
+                                t_jk_ua_i += bp_lt * ddot_z * u_a[p_base + cc];
+                            }
+                        }
+                        dot += weights[i] * t_jk_ua_i * j_ua_cache[a_idx][i];
+                    }
+                    trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
+                }
+
+                // (2) T_j^T W T_k + T_k^T W T_j
+                for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
+                    let mut dot = 0.0;
+                    for i in 0..n {
+                        dot +=
+                            weights[i] * t_k_ua_caches[jj][a_idx][i] * t_k_ua_caches[kk][a_idx][i];
+                    }
+                    trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
+                }
+
+                // (3) T_j^T Ẇ_k J + J^T Ẇ_k T_j
+                {
+                    let w_dot_kk: Array1<f64> = &w_prime * &dot_eta_vecs[kk];
+                    for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
+                        let mut dot = 0.0;
+                        for i in 0..n {
+                            dot += w_dot_kk[i] * t_k_ua_caches[jj][a_idx][i] * j_ua_cache[a_idx][i];
+                        }
+                        trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
+                    }
+                }
+
+                // (4) T_k^T Ẇ_j J + J^T Ẇ_j T_k
+                {
+                    let w_dot_jj: Array1<f64> = &w_prime * &dot_eta_vecs[jj];
+                    for (a_idx, &eig_idx) in active_indices.iter().enumerate() {
+                        let mut dot = 0.0;
+                        for i in 0..n {
+                            dot += w_dot_jj[i] * t_k_ua_caches[kk][a_idx][i] * j_ua_cache[a_idx][i];
+                        }
+                        trace_h_ddot += 2.0 * dot / h_eigs[eig_idx];
+                    }
+                }
+
+                // (5) J^T Ẅ_{jk} J: tr(H⁺ J^T diag(w̃) J) = Σ_i w̃_i h_i
+                {
+                    let mut tr5 = 0.0;
+                    for i in 0..n {
+                        tr5 += w_ddot_jk[i] * leverages[i];
+                    }
+                    trace_h_ddot += tr5;
+                }
+
+                // (6) δ_{jk} A_k: tr(H⁺ A_k)
+                if jj == kk {
+                    let is_link = kk == n_base;
+                    let lambda_kk = if is_link {
+                        lambda_link
+                    } else {
+                        lambda_base[kk]
+                    };
+                    let mut tr6 = 0.0;
+                    for &eig_idx in &active_indices {
+                        let u_a = hvecs.column(eig_idx);
+                        let q = if is_link {
+                            if p_link > 0 && link_penalty.nrows() == p_link {
+                                let u_theta = Array1::from_iter(
+                                    u_a.iter().skip(p_base).take(p_total - p_base).copied(),
+                                );
+                                let su = link_penalty.dot(&u_theta);
+                                lambda_kk * u_theta.dot(&su)
+                            } else {
+                                0.0
+                            }
+                        } else if let Some(s_k) = state.s_base.get(kk) {
+                            if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                                let u_beta: Array1<f64> = u_a.slice(s![..p_base]).to_owned();
+                                let su = s_k.dot(&u_beta);
+                                lambda_kk * u_beta.dot(&su)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+                        tr6 += q / h_eigs[eig_idx];
+                    }
+                    trace_h_ddot += tr6;
+                }
+
+                // ─── L_{jk}^(H) = ½ [tr(H⁺ Ḧ_{jk}) − tr(H⁺ Ḣ_j H⁺ Ḣ_k)] ───
+                let l_jk = 0.5 * (trace_h_ddot - cross_trace);
+
+                // ─── V_{jk} = Q_{jk} + L_{jk}  (L^(S) = 0 for disjoint blocks) ───
+                let v_jk = q_jk + l_jk;
+                hess[[jj, kk]] = v_jk;
+                if jj != kk {
+                    hess[[kk, jj]] = v_jk;
+                }
+            }
+        }
+
+        Ok(hess)
+    }
+
     /// Compute gradient of LAML w.r.t. ρ using analytic path.
     ///
     /// Runtime policy:
@@ -3093,44 +3665,25 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         state: reml_state,
         cap: OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: Derivative::Analytic,
             n_params,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
-            // Unified REML/LAML: cost and gradient from the SAME InnerSolution.
             // compute_cost runs the inner solver and caches the converged state.
-            // Then we rebuild the InnerSolution to get the gradient.
             let cost = state.compute_cost(rho)?;
 
-            // Build InnerSolution for the gradient.
-            use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
-            let jstate = &state.core.state;
-            let penalty_layout = JointPenaltyLayout::for_state(jstate);
-            let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
-            let (inner_sol, ..) = JointRemlState::build_inner_solution_at_convergence(
-                jstate,
-                rho.as_slice().unwrap(),
-                &lambda_base,
-                lambda_link,
-                state.core.base_reparam_invariant.as_ref(),
-                &state.core.base_rs_list,
-            )?;
-            let result = reml_laml_evaluate(
-                &inner_sol,
-                rho.as_slice().unwrap(),
-                EvalMode::ValueAndGradient,
-                None,
-            )
-            .map_err(|e| EstimationError::InvalidInput(e))?;
-            let grad = result.gradient.ok_or_else(|| {
-                EstimationError::InvalidInput("unified evaluator returned no gradient".to_string())
-            })?;
+            // Analytic gradient (handles Jacobian drift T_k terms correctly).
+            let grad = state.compute_gradient(rho)?;
+
+            // Exact analytic Hessian (full second-derivative formula with all
+            // Jacobian drift, weight drift, and second mode response terms).
+            let hess = state.compute_outer_hessian_analytic(rho)?;
 
             Ok(OuterEval {
                 cost,
                 gradient: grad,
-                hessian: HessianResult::Unavailable,
+                hessian: HessianResult::Analytic(hess),
             })
         },
         reset_fn: {

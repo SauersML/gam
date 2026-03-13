@@ -63,7 +63,9 @@ use gam::smooth::{
     TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use gam::solver::strategy::{ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval, HessianResult};
+use gam::solver::strategy::{
+    ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval,
+};
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
@@ -4386,15 +4388,22 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     hessian: Derivative::Unavailable,
                     n_params: dim,
                 },
-                cost_fn: |_state: &mut (), rho: &Array1<f64>| {
+                cost_fn: |state: &mut (), rho: &Array1<f64>| {
+                    let _ = state;
                     objective(rho)
                 },
-                eval_fn: |_state: &mut (), _rho: &Array1<f64>| -> Result<OuterEval, EstimationError> {
+                eval_fn: |state: &mut (),
+                          rho: &Array1<f64>|
+                 -> Result<OuterEval, EstimationError> {
+                    let _ = state;
+                    let _ = rho;
                     Err(EstimationError::InvalidInput(
                         "eval not available for cost-only survival link optimization".to_string(),
                     ))
                 },
-                reset_fn: |_state: &mut ()| {},
+                reset_fn: |state: &mut ()| {
+                    let _ = state;
+                },
             };
             match gam::solver::strategy::run_outer(&mut obj, &outer_config, name) {
                 Ok(result) => {

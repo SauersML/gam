@@ -5,16 +5,16 @@ use crate::linalg::utils::{
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::reml::unified::{
-    compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
+use crate::solver::estimate::reml::unified::{
     DenseSpectralOperator, DispersionHandling, EvalMode, GaussianDerivatives, InnerSolution,
+    compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
     reml_laml_evaluate,
 };
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2};
 use thiserror::Error;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
@@ -1797,89 +1797,6 @@ fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     t
 }
 
-/// Compute tr(A * B) when B is block-diagonal — only the sub-block [start..end, start..end]
-/// is non-zero. This is O(block^2) instead of O(total^2).
-fn trace_product_block(a: &Array2<f64>, b_block: &Array2<f64>, start: usize, end: usize) -> f64 {
-    let block_size = end - start;
-    debug_assert_eq!(b_block.nrows(), block_size);
-    debug_assert_eq!(b_block.ncols(), block_size);
-    let mut t = 0.0;
-    for i in 0..block_size {
-        for j in 0..block_size {
-            t += a[[start + i, start + j]] * b_block[[j, i]];
-        }
-    }
-    t
-}
-
-fn leverage_quadratic_forms(x: &DesignMatrix, h_inv: &Array2<f64>) -> Array1<f64> {
-    let n = x.nrows();
-    let p = x.ncols();
-    match x {
-        DesignMatrix::Dense(x_dense) => {
-            // Dense path: form X H^{-1} (n×p) then row-wise dot with X.
-            // Process in chunks to bound peak memory for very large n.
-            let chunk_rows = (256 * 1024 * 1024 / (p * 8)).max(1024).min(n);
-            let mut out = Array1::<f64>::zeros(n);
-            for start in (0..n).step_by(chunk_rows) {
-                let end = (start + chunk_rows).min(n);
-                let x_chunk = x_dense.slice(s![start..end, ..]);
-                let xh_chunk = x_chunk.dot(h_inv);
-                for i in 0..xh_chunk.nrows() {
-                    out[start + i] = xh_chunk.row(i).dot(&x_chunk.row(i));
-                }
-            }
-            out
-        }
-        DesignMatrix::Sparse(sp) => {
-            // Sparse path: scatter sparse rows into dense chunk, BLAS matmul,
-            // then row-wise dot. Avoids full n×p dense materialization.
-            let chunk_rows = (256 * 1024 * 1024 / (p * 8)).max(1024).min(n);
-            let mut out = Array1::<f64>::zeros(n);
-            if let Some(csr) = sp.to_csr_arc() {
-                let sym = csr.symbolic();
-                let row_ptrs = sym.row_ptr();
-                let col_indices = sym.col_idx();
-                let values = csr.val();
-                let mut x_chunk = Array2::<f64>::zeros((chunk_rows, p));
-                for start in (0..n).step_by(chunk_rows) {
-                    let end = (start + chunk_rows).min(n);
-                    let rows = end - start;
-                    let mut chunk_view = x_chunk.slice_mut(s![0..rows, ..]);
-                    chunk_view.fill(0.0);
-                    for i in 0..rows {
-                        let rs = row_ptrs[start + i];
-                        let re = row_ptrs[start + i + 1];
-                        for idx in rs..re {
-                            chunk_view[[i, col_indices[idx]]] = values[idx];
-                        }
-                    }
-                    let xh_chunk = chunk_view.dot(h_inv);
-                    for i in 0..rows {
-                        out[start + i] = xh_chunk.row(i).dot(&chunk_view.row(i));
-                    }
-                }
-            } else {
-                // Fallback: no CSR available, use dense with chunking.
-                let x_dense_arc = sp
-                    .try_to_dense_arc("leverage_quadratic_forms sparse fallback")
-                    .unwrap_or_else(|_| std::sync::Arc::new(Array2::zeros((n, p))));
-                let x_dense = x_dense_arc.as_ref();
-                let chunk_rows_fb = (256 * 1024 * 1024 / (p * 8)).max(1024).min(n);
-                for start in (0..n).step_by(chunk_rows_fb) {
-                    let end = (start + chunk_rows_fb).min(n);
-                    let x_chunk = x_dense.slice(s![start..end, ..]);
-                    let xh_chunk = x_chunk.dot(h_inv);
-                    for i in 0..xh_chunk.nrows() {
-                        out[start + i] = xh_chunk.row(i).dot(&x_chunk.row(i));
-                    }
-                }
-            }
-            out
-        }
-    }
-}
-
 fn inverse_spdwith_retry(
     matrix: &Array2<f64>,
     baseridge: f64,
@@ -2583,7 +2500,6 @@ fn unified_joint_cost_gradient(
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
     j_for_traces: &Array2<f64>,
-    _j_mode_inv: &Array2<f64>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -2592,8 +2508,6 @@ fn unified_joint_cost_gradient(
     options: &BlockwiseFitOptions,
     precomputed_corrections: Vec<Option<Array2<f64>>>,
 ) -> Result<(f64, Array1<f64>), String> {
-    use crate::types::RidgePassport;
-
     // Build DenseSpectralOperator from the trace Hessian.
     let hop = DenseSpectralOperator::from_symmetric(j_for_traces)
         .map_err(|e| format!("DenseSpectralOperator from joint Hessian: {e}"))?;
@@ -2621,24 +2535,19 @@ fn unified_joint_cost_gradient(
         compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?;
 
     // Compute nullspace dimension.
-    let penalty_rank: usize = penalty_roots_joint.iter().map(|r| r.nrows()).sum();
+    let penalty_rank: usize = penalty_roots_joint
+        .iter()
+        .map(|r: &Array2<f64>| r.nrows())
+        .sum();
     let nullspace_dim = total.saturating_sub(penalty_rank) as f64;
 
     // Number of observations.
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
-    // Ridge passport.
-    let ridge_passport = RidgePassport {
-        delta: ridge,
-        matrix_form: crate::types::RidgeMatrixForm::ScaledIdentity,
-        policy: options.ridge_policy,
-    };
-
     // Build InnerSolution and call unified evaluator.
     let inner_solution = InnerSolution {
         log_likelihood: inner.log_likelihood,
         penalty_quadratic: inner.penalty_value,
-        ridge_passport,
         hessian_op: Box::new(hop),
         beta: beta_flat.clone(),
         penalty_roots: penalty_roots_joint,
@@ -3000,15 +2909,15 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             None
         };
         // Compute cost+gradient via the unified evaluator.
-        let j_mode_inv_ref = j_mode_inv.as_ref()
+        let j_mode_inv_ref = j_mode_inv
+            .as_ref()
             .ok_or_else(|| "missing j_mode_inv for exact Newton path".to_string())?;
         let compute_dh_exact = |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-            let h_rho = family
-                .exact_newton_joint_hessian_directional_derivative_with_specs(
-                    &synced_joint_states,
-                    specs,
-                    v_k,
-                )?;
+            let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                &synced_joint_states,
+                specs,
+                v_k,
+            )?;
             match h_rho {
                 Some(h) => {
                     if h.iter().all(|v| v.is_finite()) {
@@ -3021,9 +2930,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                         Ok(Some(Array2::<f64>::zeros((total, total))))
                     }
                 }
-                None => Err(
-                    "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
-                ),
+                None => {
+                    Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
+                }
             }
         };
         let (precomputed_corrections, a_terms, a_beta_terms, u_terms, j_terms) =
@@ -3045,7 +2954,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             rho,
             &beta_flat,
             &j_for_traces,
-            j_mode_inv_ref,
             &ranges,
             total,
             ridge,
@@ -3311,9 +3219,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                     total,
                     "joint surrogate dH shape mismatch",
                 )?)),
-                None => Err(
-                    "joint surrogate dH unavailable for analytic outer gradient".to_string(),
-                ),
+                None => {
+                    Err("joint surrogate dH unavailable for analytic outer gradient".to_string())
+                }
             }
         };
         let (precomputed_corrections, a_terms, a_beta_terms, u_terms, j_terms) =
@@ -3335,7 +3243,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             rho,
             &beta_flat,
             &j_for_traces,
-            &j_mode_inv,
             &ranges,
             total,
             ridge,
@@ -3609,12 +3516,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                     // Build the full correction matrix D H_L[u_k]:
                     //   C_k = (DX[u])' W X + X' W (DX[u]) + X' diag(dw) X
                     let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
-                        format!(
-                            "missing dynamic design for block {b} diagonal correction"
-                        )
+                        format!("missing dynamic design for block {b} diagonal correction")
                     })?;
-                    let wwork =
-                        floor_positiveworking_weights(working_weights, options.minweight);
+                    let wwork = floor_positiveworking_weights(working_weights, options.minweight);
                     let x_dense = x_dyn.to_dense();
                     let n = x_dense.nrows();
 
@@ -3696,7 +3600,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             rho,
             beta,
             &h_for_logdet,
-            &h_mode_inv,
             &ranges_single,
             p,
             ridge,
@@ -4258,91 +4161,6 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
     }
 
     Ok((gradient, outer_hessian))
-}
-
-fn apply_geometry_direction_to_eta_and_trace(
-    x_dense: &Array2<f64>,
-    beta: &Array1<f64>,
-    w: &Array1<f64>,
-    h_inv: &Array2<f64>,
-    base_d_eta: &mut Array1<f64>,
-    geom_dir: Option<BlockGeometryDirectionalDerivative>,
-) -> Result<f64, String> {
-    // Geometry drift helper for diagonal REML derivatives.
-    //
-    // For dynamic block geometry,
-    //
-    //   eta(beta) = X(beta) beta + o(beta),
-    //
-    // so along a coefficient-space direction `u`
-    //
-    //   D eta[u] = X u + (D X[u]) beta + D o[u].
-    //
-    // The diagonal Hessian used by the REML trace algebra is
-    //
-    //   H(beta) = X(beta)^T W(beta) X(beta) + S.
-    //
-    // Differentiating that composite object along `u` gives
-    //
-    //   D H[u]
-    //   = (D X[u])^T W X
-    //   + X^T W (D X[u])
-    //   + X^T diag(D w[D eta[u]]) X.
-    //
-    // The first two terms are explicit geometry-curvature drift. The third is
-    // the usual weight-direction term, but its argument is the *full*
-    // predictor derivative D eta[u], not just X u.
-    //
-    // This helper therefore does two jobs:
-    //
-    //   1. augment `base_d_eta` by
-    //        (D X[u]) beta + D o[u],
-    //      so the family's dW callback sees the correct predictor direction;
-    //
-    //   2. return the explicit trace contribution
-    //        0.5 tr(H^{-1}[(D X[u])^T W X + X^T W (D X[u])]).
-    //
-    // Without both pieces, a dynamic `block_geometry` family would be
-    // differentiating the wrong Hessian even if its dW callback were exact.
-    let Some(geom) = geom_dir else {
-        return Ok(0.0);
-    };
-    if geom.d_offset.len() != x_dense.nrows() {
-        return Err(format!(
-            "geometry directional offset length mismatch: got {}, expected {}",
-            geom.d_offset.len(),
-            x_dense.nrows()
-        ));
-    }
-    *base_d_eta += &geom.d_offset;
-    let mut trace_term = 0.0;
-    if let Some(dx) = geom.d_design {
-        if dx.nrows() != x_dense.nrows() || dx.ncols() != x_dense.ncols() {
-            return Err(format!(
-                "geometry directional design shape mismatch: got {}x{}, expected {}x{}",
-                dx.nrows(),
-                dx.ncols(),
-                x_dense.nrows(),
-                x_dense.ncols()
-            ));
-        }
-        *base_d_eta += &dx.dot(beta);
-        let mut wx = x_dense.clone();
-        let mut wdx = dx.clone();
-        for i in 0..x_dense.nrows() {
-            let wi = w[i];
-            if wi != 1.0 {
-                let mut wxrow = wx.row_mut(i);
-                wxrow *= wi;
-                let mut wdxrow = wdx.row_mut(i);
-                wdxrow *= wi;
-            }
-        }
-        let mut d_h_geom = dx.t().dot(&wx);
-        d_h_geom += &x_dense.t().dot(&wdx);
-        trace_term = 0.5 * trace_product(h_inv, &d_h_geom);
-    }
-    Ok(trace_term)
 }
 
 /// Evaluate the joint outer hyper surface for the *currently realized* custom-family state.

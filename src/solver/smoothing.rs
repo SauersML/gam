@@ -1135,60 +1135,6 @@ where
 ///
 /// When the caller does not provide an analytic Hessian, the shared objective
 /// adapter builds a symmetric finite-difference Hessian from exact gradients.
-/// That keeps the outer solver on the same `opt` path instead of maintaining a
-/// duplicate fallback optimizer API locally.
-pub(crate) fn optimize_log_smoothingwithmultistartwithgradient_andhessian<F>(
-    num_penalties: usize,
-    heuristic_lambdas: Option<&[f64]>,
-    mut objectivewithgradienthessian: F,
-    options: &SmoothingBfgsOptions,
-) -> Result<SmoothingBfgsResult, EstimationError>
-where
-    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
-{
-    if num_penalties == 0 {
-        let rho = Array1::<f64>::zeros(0);
-        let (value, grad, _) = objectivewithgradienthessian(&rho)?;
-        let grad_norm = grad.dot(&grad).sqrt();
-        return Ok(SmoothingBfgsResult {
-            rho,
-            final_value: value,
-            iterations: 0,
-            finalgrad_norm: grad_norm,
-            final_stationarity_residual: grad_norm,
-            final_boundviolation: 0.0,
-            stationary: grad_norm <= options.tol.max(1e-6),
-        });
-    }
-
-    match options.optimizer_kind {
-        SmoothingOptimizerKind::Bfgs => optimize_log_smoothingwithmultistartwithgradient(
-            num_penalties,
-            heuristic_lambdas,
-            |rho| {
-                let (cost, grad, _) = objectivewithgradienthessian(rho)?;
-                Ok((cost, grad))
-            },
-            options,
-        ),
-        SmoothingOptimizerKind::Arc => {
-            let mut resetobjective = |_: &mut F| {};
-            let mut evalcost_rho =
-                |objective: &mut F, rho: &Array1<f64>| objective(rho).map(|(cost, _, _)| cost);
-            let mut evalcostgradhess_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-            runmultistart_newton(
-                num_penalties,
-                heuristic_lambdas,
-                &mut objectivewithgradienthessian,
-                &mut resetobjective,
-                &mut evalcost_rho,
-                &mut evalcostgradhess_rho,
-                options,
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

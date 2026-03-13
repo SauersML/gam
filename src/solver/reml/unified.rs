@@ -1,6 +1,3 @@
-// Allow dead code: this module is under active development by a concurrent
-// contributor. Items are defined ahead of their call-site wiring.
-#![allow(dead_code)]
 //! Unified REML/LAML evaluator.
 //!
 //! This module provides a single implementation of the outer REML/LAML objective,
@@ -39,7 +36,6 @@ use ndarray::{Array1, Array2, Zip};
 
 use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
-use crate::types::RidgePassport;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core traits
@@ -52,7 +48,7 @@ use crate::types::RidgePassport;
 ///
 /// Implementors:
 /// - `DenseSpectralOperator`: eigendecomposition of dense H
-/// - `SparseCholeskyOperator`: sparse Cholesky of H
+/// - Sparse Cholesky operators (external implementations)
 /// - `BlockCoupledOperator`: eigendecomposition of joint multi-block H
 pub trait HessianOperator: Send + Sync {
     /// log|H|₊ — pseudo-logdet using only active eigenvalues/pivots.
@@ -83,15 +79,6 @@ pub trait HessianOperator: Send + Sync {
 
     /// H⁻¹ v — linear solve using the active decomposition.
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64>;
-
-    /// H⁻¹ M — multi-column solve.
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64>;
-
-    /// Number of active dimensions (rank of pseudo-inverse).
-    fn active_rank(&self) -> usize;
-
-    /// Full dimension of H.
-    fn dim(&self) -> usize;
 }
 
 /// Provider of family-specific Hessian derivative information.
@@ -111,19 +98,6 @@ pub trait HessianDerivativeProvider: Send + Sync {
     ///
     /// Returns `None` for Gaussian (c=d=0, no correction needed).
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>>;
-
-    /// Compute the second-order correction to H_{k,l} for the outer Hessian.
-    ///
-    /// Returns `None` if not needed or not implemented.
-    fn hessian_second_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        let _ = (v_k, v_l, u_kl);
-        None
-    }
 
     /// Whether this provider has non-trivial corrections.
     /// False for Gaussian, true for GLMs and coupled families.
@@ -152,8 +126,6 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 pub struct SinglePredictorGlmDerivatives {
     /// c_array: −∂³ℓᵢ/∂ηᵢ³, the third-derivative of the negative log-likelihood.
     pub c_array: Array1<f64>,
-    /// d_array: fourth-derivative (for second-order Hessian corrections).
-    pub d_array: Option<Array1<f64>>,
     /// Design matrix X in the transformed basis.
     pub x_transformed: DesignMatrix,
 }
@@ -197,62 +169,6 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         Some(result)
     }
 
-    fn hessian_second_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        // Second-order correction for the outer Hessian.
-        // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
-        //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
-        let x = self.x_transformed.to_dense_arc();
-        let x_vk = x.dot(v_k);
-        let x_vl = x.dot(v_l);
-        let x_ukl = x.dot(u_kl);
-
-        let n = x.nrows();
-        let p = x.ncols();
-        let mut weights = Array1::zeros(n);
-
-        // c ⊙ X u_{kl}
-        Zip::from(&mut weights)
-            .and(&self.c_array)
-            .and(&x_ukl)
-            .for_each(|w, &c, &xu| *w = c * xu);
-
-        // + d ⊙ (X vₖ) ⊙ (X vₗ)
-        if let Some(ref d_array) = self.d_array {
-            Zip::from(&mut weights)
-                .and(d_array)
-                .and(&x_vk)
-                .and(&x_vl)
-                .for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
-        }
-
-        // Xᵀ diag(weights) X
-        let x_ref = x.as_ref();
-        let mut result = Array2::zeros((p, p));
-        for i in 0..n {
-            let wi = weights[i];
-            if wi.abs() > 0.0 {
-                let xi = x_ref.row(i);
-                for a in 0..p {
-                    let wa = wi * xi[a];
-                    for b in a..p {
-                        let val = wa * xi[b];
-                        result[[a, b]] += val;
-                        if a != b {
-                            result[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(result)
-    }
-
     fn has_corrections(&self) -> bool {
         true
     }
@@ -272,8 +188,6 @@ pub struct PenaltyLogdetDerivs {
     pub value: f64,
     /// ∂/∂ρₖ log|S|₊ — first derivatives (one per smoothing parameter).
     pub first: Array1<f64>,
-    /// ∂²/(∂ρₖ∂ρₗ) log|S|₊ — second derivatives (for outer Hessian).
-    pub second: Option<Array2<f64>>,
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -312,12 +226,7 @@ pub struct InnerSolution {
     pub log_likelihood: f64,
 
     /// β̂ᵀS(ρ)β̂ — penalty quadratic form at the mode.
-    /// Includes ridge contribution (δ‖β̂‖²) if `ridge_passport` says so.
     pub penalty_quadratic: f64,
-
-    /// Ridge metadata: the exact δ used by the inner solver and how it
-    /// participates in each term of the objective.
-    pub ridge_passport: RidgePassport,
 
     // === The factorization (single source of truth for all linear algebra) ===
     /// The Hessian operator providing logdet, trace, and solve.
@@ -382,8 +291,6 @@ pub enum EvalMode {
     ValueOnly,
     /// Compute cost and gradient (the common case).
     ValueAndGradient,
-    /// Compute cost, gradient, and outer Hessian.
-    ValueGradientHessian,
 }
 
 /// Result of the unified REML/LAML evaluation.
@@ -392,8 +299,6 @@ pub struct RemlLamlResult {
     pub cost: f64,
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
-    /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
-    pub hessian: Option<Array2<f64>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -513,7 +418,6 @@ pub fn reml_laml_evaluate(
         return Ok(RemlLamlResult {
             cost,
             gradient: None,
-            hessian: None,
         });
     }
 
@@ -601,154 +505,10 @@ pub fn reml_laml_evaluate(
         grad += pg;
     }
 
-    if mode == EvalMode::ValueAndGradient {
-        return Ok(RemlLamlResult {
-            cost,
-            gradient: Some(grad),
-            hessian: None,
-        });
-    }
-
-    // ─── Hessian (uses SAME hop, SAME intermediates) ───
-
-    let hessian = compute_outer_hessian(solution, rho, &lambdas, hop)?;
-
     Ok(RemlLamlResult {
         cost,
         gradient: Some(grad),
-        hessian: Some(hessian),
     })
-}
-
-/// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
-///
-/// Follows the exact second-order formula:
-///   H_{kl} = Q_{kl} + L_{kl} + P_{kl}
-/// where:
-///   Q_{kl} = β̂ᵀAₖ H⁻¹ Aₗβ̂ + ½ δ_{kl} β̂ᵀAₖβ̂
-///   L_{kl} = ½ [−tr(H⁻¹ Hₗ H⁻¹ Hₖ) + tr(H⁻¹ H_{kl})]
-///   P_{kl} = −½ ∂²log|S|₊ / (∂ρₖ∂ρₗ)
-fn compute_outer_hessian(
-    solution: &InnerSolution,
-    rho: &[f64],
-    lambdas: &[f64],
-    hop: &dyn HessianOperator,
-) -> Result<Array2<f64>, String> {
-    let k = rho.len();
-    let mut hess = Array2::zeros((k, k));
-
-    let det2 = solution.penalty_logdet.second.as_ref().ok_or_else(|| {
-        "Outer Hessian requested but penalty second derivatives not provided".to_string()
-    })?;
-
-    // Precompute vₖ = H⁻¹(Aₖβ̂) and Aₖβ̂ for all k.
-    let mut a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
-    let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
-
-    for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
-        let r_beta = r_k.dot(&solution.beta);
-        let s_k_beta = r_k.t().dot(&r_beta);
-        let a_k_beta = &s_k_beta * lambdas[idx];
-        let v_k = hop.solve(&a_k_beta);
-        a_k_betas.push(a_k_beta);
-        v_ks.push(v_k);
-    }
-
-    // Build Hₖ matrices (Aₖ + third-derivative correction) for all k.
-    let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
-    for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
-        let mut a_k = r_k.t().dot(r_k);
-        a_k *= lambdas[idx];
-
-        if solution.deriv_provider.has_corrections() {
-            if let Some(correction) = solution
-                .deriv_provider
-                .hessian_derivative_correction(&v_ks[idx])
-            {
-                a_k += &correction;
-            }
-        }
-        h_k_matrices.push(a_k);
-    }
-
-    // Precompute Yₖ = H⁻¹ Hₖ for cross-trace terms.
-    let mut y_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
-    for idx in 0..k {
-        y_ks.push(hop.solve_multi(&h_k_matrices[idx]));
-    }
-
-    for kk in 0..k {
-        for ll in kk..k {
-            // Q_{kl}: coefficient curvature
-            let q_kl = a_k_betas[ll].dot(&v_ks[kk])
-                + if kk == ll {
-                    0.5 * solution.beta.dot(&a_k_betas[kk])
-                } else {
-                    0.0
-                };
-
-            // L_{kl}: trace curvature = 0.5 * [−tr(Yₗ Yₖᵀ) + tr(H⁻¹ H_{kl})]
-            // For the cross-trace: tr(H⁻¹ Hₗ H⁻¹ Hₖ) = tr(Yₗ Hₖ) (since Yₗ = H⁻¹ Hₗ)
-            // = Σᵢⱼ Yₗ[i,j] Hₖ[j,i] (Frobenius inner product)
-            let cross_trace = (&y_ks[ll] * &h_k_matrices[kk]).sum();
-
-            // For H_{kl}: δ_{kl} Aₖ + second-derivative corrections
-            let h_kl_trace = if kk == ll {
-                // H_{kk} = Aₖ + (second-derivative correction if non-Gaussian)
-                let base = hop.trace_hinv_product(&h_k_matrices[kk]);
-                if solution.deriv_provider.has_corrections() {
-                    if let Some(correction) = solution
-                        .deriv_provider
-                        .hessian_second_derivative_correction(
-                            &v_ks[kk],
-                            &v_ks[ll],
-                            &Array1::zeros(solution.beta.len()),
-                        )
-                    {
-                        base + hop.trace_hinv_product(&correction)
-                    } else {
-                        base
-                    }
-                } else {
-                    base
-                }
-            } else {
-                // Off-diagonal: H_{kl} corrections from second-derivative provider
-                if solution.deriv_provider.has_corrections() {
-                    // Mode second response: u_{kl} = −H⁻¹(Aₖvₗ + Ḣₗvₖ + δ_{kl}Aₖβ̂)
-                    let mut rhs = h_k_matrices[kk].dot(&v_ks[ll]);
-                    rhs += &h_k_matrices[ll].dot(&v_ks[kk]);
-                    let u_kl = hop.solve(&rhs);
-
-                    if let Some(correction) = solution
-                        .deriv_provider
-                        .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)
-                    {
-                        hop.trace_hinv_product(&correction)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
-            };
-
-            let l_kl = 0.5 * (-cross_trace + h_kl_trace);
-
-            // P_{kl}: penalty logdet second derivative
-            let p_kl = -0.5 * det2[[kk, ll]];
-
-            let h_val = q_kl + l_kl + p_kl;
-            hess[[kk, ll]] = h_val;
-            if kk != ll {
-                hess[[ll, kk]] = h_val;
-            }
-        }
-    }
-
-    Ok(hess)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -771,8 +531,6 @@ pub struct DenseSpectralOperator {
     w_factor: Array2<f64>,
     /// Precomputed log-determinant.
     cached_logdet: f64,
-    /// Number of active eigenvalues.
-    n_active: usize,
     /// Full dimension.
     n_dim: usize,
 }
@@ -835,7 +593,6 @@ impl DenseSpectralOperator {
             active_mask,
             w_factor,
             cached_logdet,
-            n_active,
             n_dim: n,
         })
     }
@@ -869,286 +626,6 @@ impl HessianOperator for DenseSpectralOperator {
         }
         result
     }
-
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        let ncols = rhs.ncols();
-        let mut result = Array2::zeros((self.n_dim, ncols));
-        for col in 0..ncols {
-            let rhs_col = rhs.column(col).to_owned();
-            let sol = self.solve(&rhs_col);
-            result.column_mut(col).assign(&sol);
-        }
-        result
-    }
-
-    fn active_rank(&self) -> usize {
-        self.n_active
-    }
-
-    fn dim(&self) -> usize {
-        self.n_dim
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Sparse Cholesky HessianOperator implementation
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Sparse Cholesky Hessian operator.
-///
-/// Wraps an existing `SparseExactFactor` and provides logdet, trace, and solve
-/// from the same Cholesky factorization.
-///
-/// Spectral consistency: logdet uses `2 Σ log(L_ii)` and trace uses the
-/// selected-inverse diagonal, both derived from the same sparse factor.
-pub struct SparseCholeskyOperator {
-    /// The sparse Cholesky factorization.
-    factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
-    /// Precomputed log-determinant from the Cholesky diagonal.
-    cached_logdet: f64,
-    /// Dimension of H.
-    n_dim: usize,
-}
-
-impl SparseCholeskyOperator {
-    /// Create from an existing sparse factorization and its precomputed logdet.
-    pub fn new(
-        factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
-        logdet_h: f64,
-        dim: usize,
-    ) -> Self {
-        Self {
-            factor,
-            cached_logdet: logdet_h,
-            n_dim: dim,
-        }
-    }
-}
-
-impl HessianOperator for SparseCholeskyOperator {
-    fn logdet(&self) -> f64 {
-        self.cached_logdet
-    }
-
-    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
-        // For sparse: tr(H⁻¹ A) = tr(L⁻ᵀ L⁻¹ A) using the selected inverse.
-        // Delegate to the sparse trace infrastructure.
-        // Current implementation solves each column of A and accumulates the trace.
-        let mut trace = 0.0;
-        for j in 0..a.ncols() {
-            let col = a.column(j).to_owned();
-            match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, &col) {
-                Ok(sol) => trace += sol[j],
-                Err(e) => {
-                    log::warn!("SparseCholeskyOperator::trace_hinv_product solve failed: {e}");
-                    return f64::NAN;
-                }
-            }
-        }
-        trace
-    }
-
-    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!("SparseCholeskyOperator::solve failed: {e}");
-                Array1::zeros(self.n_dim)
-            }
-        }
-    }
-
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!("SparseCholeskyOperator::solve_multi failed: {e}");
-                Array2::zeros((self.n_dim, rhs.ncols()))
-            }
-        }
-    }
-
-    fn active_rank(&self) -> usize {
-        self.n_dim
-    }
-
-    fn dim(&self) -> usize {
-        self.n_dim
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Conversions: existing solver outputs → InnerSolution
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Configuration for converting a PirlsResult into an InnerSolution.
-pub struct PirlsConversionConfig {
-    /// Number of observations.
-    pub n_observations: usize,
-    /// Whether this is a Gaussian identity-link model (profiled scale) or GLM (fixed φ).
-    pub is_gaussian_identity: bool,
-    /// Dispersion parameter for non-Gaussian families (typically 1.0).
-    pub fixed_dispersion: f64,
-    /// Precomputed Tierney-Kadane correction (0.0 if not applicable).
-    pub tk_correction: f64,
-    /// Gradient of TK correction w.r.t. ρ (None if not applicable).
-    pub tk_gradient: Option<Array1<f64>>,
-    /// Nullspace dimensions per penalty block.
-    pub nullspace_dims: Vec<usize>,
-    /// Ridge to include in penalty logdet computation.
-    pub penalty_logdet_ridge: f64,
-}
-
-/// Convert a PirlsResult (from the existing single-predictor inner solver)
-/// into an InnerSolution for the unified evaluator.
-///
-/// This is the bridge between the legacy PIRLS path and the unified REML/LAML
-/// evaluator. It extracts all relevant quantities from PirlsResult and
-/// packages them into the InnerSolution format.
-pub fn pirls_result_to_inner_solution(
-    pirls: &crate::pirls::PirlsResult,
-    config: &PirlsConversionConfig,
-) -> Result<InnerSolution, String> {
-    let reparam = &pirls.reparam_result;
-
-    // Build the HessianOperator from the stabilized Hessian.
-    let hessian_op = Box::new(
-        DenseSpectralOperator::from_symmetric(&pirls.stabilizedhessian_transformed)
-            .map_err(|e| format!("Failed to build HessianOperator from PIRLS Hessian: {e}"))?,
-    );
-
-    // Compute penalty logdet derivatives from the reparameterization result.
-    let penalty_logdet = PenaltyLogdetDerivs {
-        value: reparam.log_det,
-        first: reparam.det1.clone(),
-        second: None, // Will be computed on demand for outer Hessian.
-    };
-
-    // Determine nullspace dimension.
-    let penalty_rank = reparam.e_transformed.nrows();
-    let p_dim = pirls.stabilizedhessian_transformed.ncols();
-    let nullspace_dim = p_dim.saturating_sub(penalty_rank) as f64;
-
-    // Build derivative provider based on family type.
-    let deriv_provider: Box<dyn HessianDerivativeProvider> = if config.is_gaussian_identity {
-        Box::new(GaussianDerivatives)
-    } else {
-        Box::new(SinglePredictorGlmDerivatives {
-            c_array: pirls.solve_c_array.clone(),
-            d_array: Some(pirls.solve_d_array.clone()),
-            x_transformed: pirls.x_transformed.clone(),
-        })
-    };
-
-    // Dispersion handling.
-    let dispersion = if config.is_gaussian_identity {
-        DispersionHandling::ProfiledGaussian
-    } else {
-        DispersionHandling::Fixed {
-            phi: config.fixed_dispersion,
-            include_logdet_h: true,
-            include_logdet_s: true,
-        }
-    };
-
-    // Firth log-det contribution.
-    let firth_logdet = match &pirls.firth {
-        crate::pirls::FirthDiagnostics::Active { log_det, .. } => *log_det,
-        crate::pirls::FirthDiagnostics::Inactive => 0.0,
-    };
-
-    // For Gaussian, log_likelihood = -0.5 * deviance (so that -2*ll = deviance).
-    // For GLMs, deviance = -2 * log_likelihood, so log_likelihood = -0.5 * deviance.
-    let log_likelihood = -0.5 * pirls.deviance;
-
-    Ok(InnerSolution {
-        log_likelihood,
-        penalty_quadratic: pirls.stable_penalty_term,
-        ridge_passport: pirls.ridge_passport,
-        hessian_op,
-        beta: pirls.beta_transformed.as_ref().clone(),
-        penalty_roots: reparam.rs_transformed.clone(),
-        penalty_logdet,
-        deriv_provider,
-        tk_correction: config.tk_correction,
-        tk_gradient: config.tk_gradient.clone(),
-        firth_logdet,
-        firth_gradient: None, // Firth gradient is provided by the outer Firth path.
-        n_observations: config.n_observations,
-        nullspace_dim,
-        dispersion,
-        precomputed_h_k_corrections: None,
-    })
-}
-
-/// Convert a BlockwiseInnerResult (from the custom family engine) into an InnerSolution.
-///
-/// Configuration for the block-coupled conversion.
-///
-/// Configuration for converting a BlockwiseInnerResult into an InnerSolution.
-pub struct BlockwiseConversionConfig {
-    /// Number of observations.
-    pub n_observations: usize,
-    /// Joint Hessian (including off-diagonal coupling blocks).
-    pub joint_hessian: Array2<f64>,
-    /// Joint coefficients (concatenated across all blocks).
-    pub joint_beta: Array1<f64>,
-    /// Penalty roots for each smoothing parameter.
-    pub penalty_roots: Vec<Array2<f64>>,
-    /// Penalty logdet derivatives.
-    pub penalty_logdet: PenaltyLogdetDerivs,
-    /// Nullspace dimension (unpenalized coefficients).
-    pub nullspace_dim: f64,
-    /// Dispersion parameter (typically 1.0 for non-Gaussian).
-    pub fixed_dispersion: f64,
-    /// Ridge passport.
-    pub ridge_passport: RidgePassport,
-    /// Family-specific derivative provider.
-    pub deriv_provider: Box<dyn HessianDerivativeProvider>,
-    /// Tierney-Kadane correction.
-    pub tk_correction: f64,
-    /// TK gradient.
-    pub tk_gradient: Option<Array1<f64>>,
-    /// Whether to include ½ log|H| in the objective.
-    pub include_logdet_h: bool,
-    /// Whether to include −½ log|S|₊ in the objective.
-    pub include_logdet_s: bool,
-    /// Precomputed gradient corrections (from family-specific directional derivatives).
-    pub precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
-}
-
-/// Convert a BlockwiseInnerResult into an InnerSolution.
-pub fn blockwise_result_to_inner_solution(
-    inner: &crate::families::custom_family::BlockwiseInnerResult,
-    config: BlockwiseConversionConfig,
-) -> Result<InnerSolution, String> {
-    let hessian_op = Box::new(
-        DenseSpectralOperator::from_symmetric(&config.joint_hessian)
-            .map_err(|e| format!("Failed to build HessianOperator from joint Hessian: {e}"))?,
-    );
-
-    Ok(InnerSolution {
-        log_likelihood: inner.log_likelihood,
-        penalty_quadratic: inner.penalty_value,
-        ridge_passport: config.ridge_passport,
-        hessian_op,
-        beta: config.joint_beta,
-        penalty_roots: config.penalty_roots,
-        penalty_logdet: config.penalty_logdet,
-        deriv_provider: config.deriv_provider,
-        tk_correction: config.tk_correction,
-        tk_gradient: config.tk_gradient,
-        firth_logdet: 0.0,
-        firth_gradient: None,
-        n_observations: config.n_observations,
-        nullspace_dim: config.nullspace_dim,
-        dispersion: DispersionHandling::Fixed {
-            phi: config.fixed_dispersion,
-            include_logdet_h: config.include_logdet_h,
-            include_logdet_s: config.include_logdet_s,
-        },
-        precomputed_h_k_corrections: config.precomputed_h_k_corrections,
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1171,8 +648,6 @@ pub struct BlockCoupledDerivativeProvider {
     /// Third derivatives of the negative log-likelihood w.r.t. η for each block.
     /// These are the ∂³(-ℓ)/∂ηᵢ³ values used in the directional derivative.
     pub third_deriv_weights: Array1<f64>,
-    /// Fourth derivatives (for second-order Hessian corrections).
-    pub fourth_deriv_weights: Option<Array1<f64>>,
 }
 
 impl HessianDerivativeProvider for BlockCoupledDerivativeProvider {
@@ -1211,154 +686,9 @@ impl HessianDerivativeProvider for BlockCoupledDerivativeProvider {
         Some(result)
     }
 
-    fn hessian_second_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        let j = &self.joint_design;
-        let j_vk = j.dot(v_k);
-        let j_vl = j.dot(v_l);
-        let j_ukl = j.dot(u_kl);
-
-        let n = j.nrows();
-        let p = j.ncols();
-        let mut weights = Array1::zeros(n);
-
-        // c ⊙ J u_{kl}
-        Zip::from(&mut weights)
-            .and(&self.third_deriv_weights)
-            .and(&j_ukl)
-            .for_each(|w, &c, &ju| *w = c * ju);
-
-        // + d ⊙ (J vₖ) ⊙ (J vₗ)
-        if let Some(ref d) = self.fourth_deriv_weights {
-            Zip::from(&mut weights)
-                .and(d)
-                .and(&j_vk)
-                .and(&j_vl)
-                .for_each(|w, &d_i, &jvk, &jvl| *w += d_i * jvk * jvl);
-        }
-
-        // Jᵀ diag(weights) J
-        let mut result = Array2::zeros((p, p));
-        for i in 0..n {
-            let wi = weights[i];
-            if wi.abs() > 0.0 {
-                let ji = j.row(i);
-                for a in 0..p {
-                    let wa = wi * ji[a];
-                    for b in a..p {
-                        let val = wa * ji[b];
-                        result[[a, b]] += val;
-                        if a != b {
-                            result[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(result)
-    }
-
     fn has_corrections(&self) -> bool {
         true
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Joint link wiggle conversion
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Configuration for converting a JointModelState result into an InnerSolution.
-pub struct JointConversionConfig {
-    /// Number of observations.
-    pub n_observations: usize,
-    /// Whether this is a Gaussian identity-link model (profiled scale).
-    pub is_gaussian: bool,
-    /// Dispersion parameter for non-Gaussian families.
-    pub fixed_dispersion: f64,
-    /// Full joint penalized Hessian H = J'WJ + S(λ).
-    pub joint_hessian: Array2<f64>,
-    /// Concatenated coefficients [β_base; β_link].
-    pub joint_beta: Array1<f64>,
-    /// Penalty roots for each smoothing parameter (in the joint basis).
-    pub penalty_roots: Vec<Array2<f64>>,
-    /// Penalty logdet derivatives.
-    pub penalty_logdet: PenaltyLogdetDerivs,
-    /// Nullspace dimension (unpenalized coefficients).
-    pub nullspace_dim: f64,
-    /// Ridge passport.
-    pub ridge_passport: RidgePassport,
-    /// Log-likelihood at the mode.
-    pub log_likelihood: f64,
-    /// Penalty quadratic form.
-    pub penalty_quadratic: f64,
-    /// Family-specific derivative provider.
-    pub deriv_provider: Box<dyn HessianDerivativeProvider>,
-}
-
-/// Convert a joint link-wiggle model result into an InnerSolution.
-pub fn joint_result_to_inner_solution(
-    config: JointConversionConfig,
-) -> Result<InnerSolution, String> {
-    let hessian_op = Box::new(
-        DenseSpectralOperator::from_symmetric(&config.joint_hessian)
-            .map_err(|e| format!("Failed to build HessianOperator from joint Hessian: {e}"))?,
-    );
-
-    let dispersion = if config.is_gaussian {
-        DispersionHandling::ProfiledGaussian
-    } else {
-        DispersionHandling::Fixed {
-            phi: config.fixed_dispersion,
-            include_logdet_h: true,
-            include_logdet_s: true,
-        }
-    };
-
-    Ok(InnerSolution {
-        log_likelihood: config.log_likelihood,
-        penalty_quadratic: config.penalty_quadratic,
-        ridge_passport: config.ridge_passport,
-        hessian_op,
-        beta: config.joint_beta,
-        penalty_roots: config.penalty_roots,
-        penalty_logdet: config.penalty_logdet,
-        deriv_provider: config.deriv_provider,
-        tk_correction: 0.0,
-        tk_gradient: None,
-        firth_logdet: 0.0,
-        firth_gradient: None,
-        n_observations: config.n_observations,
-        nullspace_dim: config.nullspace_dim,
-        dispersion,
-        precomputed_h_k_corrections: None,
-    })
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  RemlState bridge: evaluate_via_unified
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Configuration for converting a RemlState evaluation bundle into an InnerSolution.
-///
-/// This bridges the existing PIRLS-based RemlState machinery to the unified
-/// evaluator, providing a migration path where the unified evaluator can be
-/// called alongside (or instead of) the legacy compute_cost/compute_gradient.
-pub struct RemlBundleConversionConfig {
-    /// Number of observations.
-    pub n_observations: usize,
-    /// Whether this is Gaussian identity-link (profiled scale).
-    pub is_gaussian_identity: bool,
-    /// Dispersion parameter for non-Gaussian (typically 1.0).
-    pub fixed_dispersion: f64,
-    /// Tierney-Kadane correction.
-    pub tk_correction: f64,
-    /// TK gradient.
-    pub tk_gradient: Option<Array1<f64>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1491,7 +821,6 @@ pub fn compute_block_penalty_logdet_derivs(
     Ok(PenaltyLogdetDerivs {
         value: log_det_total,
         first,
-        second: None,
     })
 }
 
@@ -1502,11 +831,12 @@ pub fn compute_block_penalty_logdet_derivs(
 pub fn embed_penalty_root(
     root: &Array2<f64>,
     start: usize,
-    _end: usize,
+    end: usize,
     total: usize,
 ) -> Array2<f64> {
     let rank = root.nrows();
     let p_block = root.ncols();
+    debug_assert_eq!(end - start, p_block);
     let mut embedded = Array2::zeros((rank, total));
     embedded
         .slice_mut(ndarray::s![.., start..start + p_block])
@@ -1540,8 +870,7 @@ mod tests {
         assert!((sol[0] - 0.5).abs() < 1e-12);
         assert!((sol[1] - 0.2).abs() < 1e-12);
 
-        assert_eq!(op.active_rank(), 2);
-        assert_eq!(op.dim(), 2);
+        assert_eq!(sol.len(), 2);
     }
 
     #[test]
@@ -1552,7 +881,8 @@ mod tests {
 
         // logdet should be ln(2) (only the active eigenvalue)
         assert!((op.logdet() - 2.0_f64.ln()).abs() < 1e-10);
-        assert_eq!(op.active_rank(), 1);
+        let trace = op.trace_hinv_product(&Array2::eye(2));
+        assert!(trace.is_finite());
     }
 
     #[test]
@@ -1589,17 +919,6 @@ mod tests {
         let solution = InnerSolution {
             log_likelihood: -5.0, // −0.5 × deviance = −0.5 × 10
             penalty_quadratic: 2.0,
-            ridge_passport: RidgePassport {
-                delta: 0.0,
-                matrix_form: crate::types::RidgeMatrixForm::ScaledIdentity,
-                policy: crate::types::RidgePolicy {
-                    rho_independent: true,
-                    include_quadratic_penalty: false,
-                    include_penalty_logdet: false,
-                    include_laplacehessian: false,
-                    determinant_mode: crate::types::RidgeDeterminantMode::Auto,
-                },
-            },
             hessian_op: Box::new(op),
             beta: array![1.0, 0.5],
             penalty_roots: vec![
@@ -1608,7 +927,6 @@ mod tests {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: 0.0,
                 first: array![1.0],
-                second: None,
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
@@ -1722,24 +1040,12 @@ mod tests {
         InnerSolution {
             log_likelihood,
             penalty_quadratic: penalty_quad,
-            ridge_passport: RidgePassport {
-                delta: 0.0,
-                matrix_form: crate::types::RidgeMatrixForm::ScaledIdentity,
-                policy: crate::types::RidgePolicy {
-                    rho_independent: true,
-                    include_quadratic_penalty: false,
-                    include_penalty_logdet: false,
-                    include_laplacehessian: false,
-                    determinant_mode: crate::types::RidgeDeterminantMode::Auto,
-                },
-            },
             hessian_op: Box::new(op),
             beta,
             penalty_roots: vec![r1, r2],
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
-                second: None,
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,

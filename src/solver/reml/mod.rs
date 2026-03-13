@@ -10,7 +10,6 @@ use crate::linalg::sparse_exact::{
 };
 use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
 use crate::types::SasLinkState;
-use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::s;
@@ -30,6 +29,16 @@ enum FaerFactor {
     Llt(FaerLlt<f64>),
     Lblt(FaerLblt<f64>),
     Ldlt(FaerLdlt<f64>),
+}
+
+impl FaerFactor {
+    fn solve_in_place(&self, rhs: faer::MatMut<'_, f64>) {
+        match self {
+            Self::Llt(factor) => factor.solve_in_place(rhs),
+            Self::Lblt(factor) => factor.solve_in_place(rhs),
+            Self::Ldlt(factor) => factor.solve_in_place(rhs),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -675,7 +684,6 @@ mod tests {
             h_eff: dense_bundle.h_eff.clone(),
             h_total: dense_bundle.h_total.clone(),
             h_pos_factorw: dense_bundle.h_pos_factorw.clone(),
-            h_total_log_det: dense_bundle.h_total_log_det,
             active_subspace_rel_gap: dense_bundle.active_subspace_rel_gap,
             active_subspace_unstable: dense_bundle.active_subspace_unstable,
             sparse_exact: Some(sparse_payload),
@@ -1151,7 +1159,6 @@ mod tests {
             h_eff: bundle_dense.h_eff.clone(),
             h_total: bundle_dense.h_total.clone(),
             h_pos_factorw: bundle_dense.h_pos_factorw.clone(),
-            h_total_log_det: bundle_dense.h_total_log_det,
             active_subspace_rel_gap: bundle_dense.active_subspace_rel_gap,
             active_subspace_unstable: bundle_dense.active_subspace_unstable,
             sparse_exact: Some(sparse_payload),
@@ -1168,24 +1175,6 @@ mod tests {
             dt_dense, dt_sparse, g_dense, g_sparse
         );
         assert!(g_dense.is_finite() && g_sparse.is_finite());
-    }
-}
-
-impl FaerFactor {
-    fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-        match self {
-            FaerFactor::Llt(f) => f.solve(rhs),
-            FaerFactor::Lblt(f) => f.solve(rhs),
-            FaerFactor::Ldlt(f) => f.solve(rhs),
-        }
-    }
-
-    fn solve_in_place(&self, rhs: faer::MatMut<'_, f64>) {
-        match self {
-            FaerFactor::Llt(f) => f.solve_in_place(rhs),
-            FaerFactor::Lblt(f) => f.solve_in_place(rhs),
-            FaerFactor::Ldlt(f) => f.solve_in_place(rhs),
-        }
     }
 }
 
@@ -1842,7 +1831,7 @@ struct FirthTauExactKernel {
 /// making this optimization possible while adhering to the optimizer's API.
 
 #[derive(Clone)]
-struct EvalShared {
+pub(crate) struct EvalShared {
     key: Option<Vec<u64>>,
     pirls_result: Arc<PirlsResult>,
     ridge_passport: RidgePassport,
@@ -1910,8 +1899,6 @@ struct EvalShared {
     /// dense eigenbasis rather than a sparse factorization.
     h_pos_factorw: Arc<Array2<f64>>,
 
-    /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
-    h_total_log_det: f64,
     /// Relative eigengap between kept and dropped spectra around the H_+
     /// threshold used for pseudo-logdet derivatives (if available).
     active_subspace_rel_gap: Option<f64>,
@@ -2134,12 +2121,7 @@ impl EvalCacheManager {
 /// state invariants.
 struct RemlArena {
     workspace: Mutex<RemlWorkspace>,
-    cost_last: RwLock<Option<CostAgg>>,
-    cost_repeat: RwLock<u64>,
-    cost_last_emit: RwLock<u64>,
     cost_eval_count: RwLock<u64>,
-    raw_cond_snapshot: RwLock<f64>,
-    gaussian_cond_snapshot: RwLock<f64>,
     lastgradient_used_stochastic_fallback: AtomicBool,
 }
 
@@ -2147,12 +2129,7 @@ impl RemlArena {
     fn new(workspace: RemlWorkspace) -> Self {
         Self {
             workspace: Mutex::new(workspace),
-            cost_last: RwLock::new(None),
-            cost_repeat: RwLock::new(0),
-            cost_last_emit: RwLock::new(0),
             cost_eval_count: RwLock::new(0),
-            raw_cond_snapshot: RwLock::new(f64::NAN),
-            gaussian_cond_snapshot: RwLock::new(f64::NAN),
             lastgradient_used_stochastic_fallback: AtomicBool::new(false),
         }
     }
@@ -2181,166 +2158,6 @@ pub(crate) struct RemlState<'a> {
     arena: RemlArena,
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
-}
-
-#[derive(Clone)]
-struct CostKey {
-    compact: String,
-}
-
-#[derive(Clone)]
-struct CostAgg {
-    key: CostKey,
-    count: u64,
-    stab_cond_min: f64,
-    stab_cond_max: f64,
-    stab_cond_last: f64,
-    raw_cond_min: f64,
-    raw_cond_max: f64,
-    raw_cond_last: f64,
-    laml_min: f64,
-    laml_max: f64,
-    laml_last: f64,
-    edf_min: f64,
-    edf_max: f64,
-    edf_last: f64,
-    trace_min: f64,
-    trace_max: f64,
-    trace_last: f64,
-}
-
-impl CostKey {
-    fn new(rho: &[f64], smooth: &[f64], stab_cond: f64, raw_cond: f64) -> Self {
-        let rho_compact = format_compact_series(rho, |v| format!("{:.3}", v));
-        let smooth_compact = format_compact_series(smooth, |v| format!("{:.2e}", v));
-        let compact = format!(
-            "rho={} | smooth={} | κ(stable/raw)={:.3e}/{:.3e}",
-            rho_compact, smooth_compact, stab_cond, raw_cond
-        );
-        let compact = compact.replace("-0.000", "0.000");
-        Self { compact }
-    }
-
-    fn approx_eq(&self, other: &Self) -> bool {
-        self.compact == other.compact
-    }
-
-    fn format_compact(&self) -> String {
-        self.compact.clone()
-    }
-}
-
-impl CostAgg {
-    fn new(key: CostKey, laml: f64, edf: f64, trace: f64, stab_cond: f64, raw_cond: f64) -> Self {
-        Self {
-            key,
-            count: 1,
-            stab_cond_min: stab_cond,
-            stab_cond_max: stab_cond,
-            stab_cond_last: stab_cond,
-            raw_cond_min: raw_cond,
-            raw_cond_max: raw_cond,
-            raw_cond_last: raw_cond,
-            laml_min: laml,
-            laml_max: laml,
-            laml_last: laml,
-            edf_min: edf,
-            edf_max: edf,
-            edf_last: edf,
-            trace_min: trace,
-            trace_max: trace,
-            trace_last: trace,
-        }
-    }
-
-    fn update(&mut self, laml: f64, edf: f64, trace: f64, stab_cond: f64, raw_cond: f64) {
-        self.count += 1;
-        self.laml_last = laml;
-        self.edf_last = edf;
-        self.trace_last = trace;
-        self.stab_cond_last = stab_cond;
-        self.raw_cond_last = raw_cond;
-        if stab_cond < self.stab_cond_min {
-            self.stab_cond_min = stab_cond;
-        }
-        if stab_cond > self.stab_cond_max {
-            self.stab_cond_max = stab_cond;
-        }
-        if raw_cond < self.raw_cond_min {
-            self.raw_cond_min = raw_cond;
-        }
-        if raw_cond > self.raw_cond_max {
-            self.raw_cond_max = raw_cond;
-        }
-        if laml < self.laml_min {
-            self.laml_min = laml;
-        }
-        if laml > self.laml_max {
-            self.laml_max = laml;
-        }
-        if edf < self.edf_min {
-            self.edf_min = edf;
-        }
-        if edf > self.edf_max {
-            self.edf_max = edf;
-        }
-        if trace < self.trace_min {
-            self.trace_min = trace;
-        }
-        if trace > self.trace_max {
-            self.trace_max = trace;
-        }
-    }
-
-    fn format_summary(&self) -> String {
-        let key = self.key.format_compact();
-        let metric = |label: &str, min: f64, max: f64, last: f64, fmt: &dyn Fn(f64) -> String| {
-            if approx_f64(min, max, 1e-6, 1e-9) && approx_f64(min, last, 1e-6, 1e-9) {
-                format!("{label}={}", fmt(min))
-            } else {
-                let range = format_range(min, max, |v| fmt(v));
-                format!("{label}={range} last={}", fmt(last))
-            }
-        };
-        let kappa = if approx_f64(self.stab_cond_min, self.stab_cond_max, 1e-6, 1e-9)
-            && approx_f64(self.raw_cond_min, self.raw_cond_max, 1e-6, 1e-9)
-            && approx_f64(self.stab_cond_min, self.stab_cond_last, 1e-6, 1e-9)
-            && approx_f64(self.raw_cond_min, self.raw_cond_last, 1e-6, 1e-9)
-        {
-            format!(
-                "κ(stable/raw)={}/{}",
-                format_cond(self.stab_cond_min),
-                format_cond(self.raw_cond_min)
-            )
-        } else {
-            let stable = format_range(self.stab_cond_min, self.stab_cond_max, format_cond);
-            let raw = format_range(self.raw_cond_min, self.raw_cond_max, format_cond);
-            format!(
-                "κ(stable/raw)={stable}/{raw} last={}/{}",
-                format_cond(self.stab_cond_last),
-                format_cond(self.raw_cond_last)
-            )
-        };
-        let laml = metric("LAML", self.laml_min, self.laml_max, self.laml_last, &|v| {
-            format!("{:.6e}", v)
-        });
-        let edf = metric("EDF", self.edf_min, self.edf_max, self.edf_last, &|v| {
-            format!("{:.6}", v)
-        });
-        let trace = metric(
-            "tr(H^-1 Sλ)",
-            self.trace_min,
-            self.trace_max,
-            self.trace_last,
-            &|v| format!("{:.6}", v),
-        );
-        let count = if self.count > 1 {
-            format!(" | count={}", self.count)
-        } else {
-            String::new()
-        };
-        format!("{key}{count} | {kappa} | {laml} | {edf} | {trace}",)
-    }
 }
 
 // Formatting utilities moved to crate::diagnostics
