@@ -1786,4 +1786,74 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn cloglog_large_finite_eta_should_saturate_without_nan_derivatives() {
+        let eta = 800.0;
+        let jet = component_inverse_link_jet(LinkComponent::CLogLog, eta);
+        assert_eq!(jet.mu, 1.0);
+        assert!(
+            jet.d1 == 0.0,
+            "for mu(eta)=1-exp(-exp(eta)), dmu/deta = exp(eta-exp(eta)) and should underflow to 0 at eta={eta}; got d1={}",
+            jet.d1
+        );
+        assert!(
+            jet.d2 == 0.0,
+            "the saturated cloglog second derivative should also be 0 at eta={eta}; got d2={}",
+            jet.d2
+        );
+        assert!(
+            jet.d3 == 0.0,
+            "the saturated cloglog third derivative should also be 0 at eta={eta}; got d3={}",
+            jet.d3
+        );
+
+        let d4 = inverse_link_pdfthird_derivative_for_inverse_link(
+            &InverseLink::Standard(LinkFunction::CLogLog),
+            eta,
+        )
+        .expect("cloglog d4");
+        assert!(
+            d4 == 0.0,
+            "the saturated cloglog fourth derivative should also be 0 at eta={eta}; got d4={d4}"
+        );
+    }
+
+    #[test]
+    fn loglog_large_negative_finite_eta_should_saturate_without_nan_derivatives() {
+        let eta = -800.0;
+        let jet = component_inverse_link_jet(LinkComponent::LogLog, eta);
+        assert_eq!(jet.mu, 0.0);
+        assert!(
+            jet.d1 == 0.0,
+            "for mu(eta)=exp(-exp(-eta)), dmu/deta = exp(-eta-exp(-eta)) and should underflow to 0 at eta={eta}; got d1={}",
+            jet.d1
+        );
+        assert!(
+            jet.d2 == 0.0,
+            "the saturated loglog second derivative should also be 0 at eta={eta}; got d2={}",
+            jet.d2
+        );
+        assert!(
+            jet.d3 == 0.0,
+            "the saturated loglog third derivative should also be 0 at eta={eta}; got d3={}",
+            jet.d3
+        );
+
+        let d4 = inverse_link_pdfthird_derivative_for_inverse_link(
+            &InverseLink::Mixture(
+                state_fromspec(&MixtureLinkSpec {
+                    components: vec![LinkComponent::LogLog, LinkComponent::Probit],
+                    initial_rho: Array1::from_vec(vec![12.0]),
+                })
+                .expect("mixture state"),
+            ),
+            eta,
+        )
+        .expect("loglog mixture d4");
+        assert!(
+            d4.is_finite(),
+            "even a nearly pure loglog mixture should not produce NaN fourth derivatives at eta={eta}; got d4={d4}"
+        );
+    }
 }

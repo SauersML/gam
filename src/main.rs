@@ -1134,7 +1134,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_fitwith_predict_noise(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &FitArgs,

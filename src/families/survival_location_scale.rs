@@ -452,7 +452,6 @@ impl SurvivalLocationScaleFamily {
     /// For time-varying blocks, the block eta is 2n long: `[exit; entry]`.
     /// The solver's ParameterBlockSpec uses the EXIT design, so exit comes first
     /// in the stacked eta.
-    #[allow(clippy::type_complexity)]
     fn validate_joint_states<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
@@ -5732,5 +5731,52 @@ mod tests {
             .evaluate(&states)
             .expect("non-finite d_eta/dt should be soft-clamped, not fatal");
         assert!(eval.log_likelihood.is_finite());
+    }
+
+    #[test]
+    fn q_chain_derivatives_vanish_when_sigma_floor_is_active() {
+        let eta_t = 2.0;
+        let eta_ls = -30.0;
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third_scalar(eta_ls);
+        assert!(sigma < 1e-12, "test requires the sigma floor branch");
+
+        let q = |ls: f64| -eta_t / exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
+        let h = 1e-6;
+        let q_left = q(eta_ls - h);
+        let q_mid = q(eta_ls);
+        let q_right = q(eta_ls + h);
+        assert_eq!(
+            q_left, q_mid,
+            "the floor branch should make q locally constant in eta_ls"
+        );
+        assert_eq!(
+            q_right, q_mid,
+            "the floor branch should make q locally constant in eta_ls"
+        );
+
+        let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
+            q_chain_derivs_scalar(eta_t, sigma, ds, d2s, d3s);
+
+        assert_eq!(q_t, -1.0 / 1e-12);
+        assert!(
+            q_ls == 0.0,
+            "q = -eta_t / max(sigma, 1e-12) is constant in eta_ls on the active floor branch, so dq/deta_ls must be 0; got {q_ls}"
+        );
+        assert!(
+            q_tl == 0.0,
+            "q_t = -1 / max(sigma, 1e-12) is constant in eta_ls on the active floor branch, so d2q/(deta_t deta_ls) must be 0; got {q_tl}"
+        );
+        assert!(
+            q_ll == 0.0,
+            "q is locally constant in eta_ls on the active floor branch, so d2q/deta_ls2 must be 0; got {q_ll}"
+        );
+        assert!(
+            q_tl_ls == 0.0,
+            "q_t is locally constant in eta_ls on the active floor branch, so d3q/(deta_t deta_ls2) must be 0; got {q_tl_ls}"
+        );
+        assert!(
+            q_ll_ls == 0.0,
+            "q is locally constant in eta_ls on the active floor branch, so d3q/deta_ls3 must be 0; got {q_ll_ls}"
+        );
     }
 }

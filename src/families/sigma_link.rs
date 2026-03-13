@@ -109,7 +109,6 @@ pub fn exp_sigma_derivs_up_to_fourth_scalar(eta: f64) -> (f64, f64, f64, f64, f6
     (jet.sigma, jet.d1, jet.d2, jet.d3, jet.d4)
 }
 
-#[allow(clippy::type_complexity)]
 pub fn exp_sigma_derivs_up_to_fourth(
     eta: ArrayView1<'_, f64>,
 ) -> (
@@ -279,5 +278,40 @@ mod tests {
         // Verify it still matches exp() in the normal range
         assert!((safe_exp(1.0) - 1.0_f64.exp()).abs() < 1e-15);
         assert!((safe_exp(-5.0) - (-5.0_f64).exp()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn exp_sigma_derivatives_follow_the_clamped_safe_exp_definition() {
+        let h = 1e-3;
+
+        for &eta in &[701.0, -701.0] {
+            let (_, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth_scalar(eta);
+            let f = |x: f64| exp_sigma_from_eta_scalar(x);
+            let d1fd = (f(eta + h) - f(eta - h)) / (2.0 * h);
+            let d2fd = (f(eta + h) - 2.0 * f(eta) + f(eta - h)) / (h * h);
+            let d3fd =
+                (f(eta + 2.0 * h) - 2.0 * f(eta + h) + 2.0 * f(eta - h) - f(eta - 2.0 * h))
+                    / (2.0 * h * h * h);
+            let d4fd = (f(eta + 2.0 * h) - 4.0 * f(eta + h) + 6.0 * f(eta) - 4.0 * f(eta - h)
+                + f(eta - 2.0 * h))
+                / h.powi(4);
+
+            assert!(
+                (d1 - d1fd).abs() < 1e-12,
+                "safe_exp is constant beyond the clamp, so d/deta should be zero at eta={eta}; got analytic d1={d1} but FD={d1fd}"
+            );
+            assert!(
+                (d2 - d2fd).abs() < 1e-12,
+                "safe_exp is constant beyond the clamp, so d2/deta2 should be zero at eta={eta}; got analytic d2={d2} but FD={d2fd}"
+            );
+            assert!(
+                (d3 - d3fd).abs() < 1e-12,
+                "safe_exp is constant beyond the clamp, so d3/deta3 should be zero at eta={eta}; got analytic d3={d3} but FD={d3fd}"
+            );
+            assert!(
+                (d4 - d4fd).abs() < 1e-12,
+                "safe_exp is constant beyond the clamp, so d4/deta4 should be zero at eta={eta}; got analytic d4={d4} but FD={d4fd}"
+            );
+        }
     }
 }
