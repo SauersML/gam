@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::estimate::{FitGeometry, FitResult};
+use crate::estimate::{FitGeometry, FitResult, UnifiedFitResult};
 use crate::faer_ndarray::FaerArrayView;
 use crate::linalg::utils::StableSolver;
 use crate::pirls;
@@ -466,6 +466,30 @@ pub fn compute_alo_diagnostics(
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
     compute_alo_diagnostics_from_fit(fit, y, link)
+}
+
+/// Compute ALO diagnostics from a `UnifiedFitResult`.
+///
+/// Extracts `FitGeometry` from `unified.geometry`, builds an `AloInput`
+/// via `from_geometry`, and delegates to `compute_alo_from_input`.
+/// This avoids requiring a full `FitResult` with PIRLS artifacts.
+pub fn compute_alo_diagnostics_from_unified(
+    unified: &UnifiedFitResult,
+    design: &Array2<f64>,
+    eta: &Array1<f64>,
+    offset: &Array1<f64>,
+    link: LinkFunction,
+    phi: f64,
+) -> Result<AloDiagnostics, EstimationError> {
+    let geom = unified.geometry.as_ref().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "UnifiedFitResult does not contain working-set geometry; \
+             ALO diagnostics require geometry at convergence"
+                .to_string(),
+        )
+    })?;
+    let input = AloInput::from_geometry(geom, design, eta, offset, link, phi);
+    compute_alo_from_input(&input)
 }
 
 /// Compute ALO diagnostics from a PIRLS result for lower-level callers.
