@@ -3164,6 +3164,145 @@ impl FitResult {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Unified fit result — single type for all model families
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Role of a coefficient block within a multi-parameter model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockRole {
+    /// Single-parameter GAM (standard GLM/GAM mean model).
+    Mean,
+    /// Location parameter in GAMLSS / survival location-scale.
+    Location,
+    /// Scale (log-sigma) parameter in GAMLSS / survival location-scale.
+    Scale,
+    /// Time/baseline hazard block in survival models.
+    Time,
+    /// Threshold block in survival models.
+    Threshold,
+    /// Link-wiggle correction block.
+    LinkWiggle,
+}
+
+/// Inference quantities for one coefficient block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FittedBlock {
+    /// Coefficients at the converged mode.
+    pub beta: Array1<f64>,
+    /// Role of this block within the model.
+    pub role: BlockRole,
+    /// Effective degrees of freedom (sum of leverages).
+    pub edf: f64,
+    /// Smoothing parameters for this block.
+    pub lambdas: Array1<f64>,
+}
+
+/// Working-set geometry at convergence needed by ALO and other post-fit
+/// diagnostics. Only populated when the inner solver provides the data.
+#[derive(Clone, Debug)]
+pub struct FitGeometry {
+    /// Joint penalized Hessian H = X'WX + S(λ) at convergence.
+    pub penalized_hessian: Array2<f64>,
+    /// IRLS working weights at convergence.
+    pub working_weights: Array1<f64>,
+    /// IRLS working response at convergence.
+    pub working_response: Array1<f64>,
+}
+
+/// Unified fit result for all model types (standard GAM, GAMLSS, survival).
+///
+/// Standard models have a single block; GAMLSS and survival models have
+/// multiple blocks with different roles.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedFitResult {
+    /// Coefficient blocks (1 for standard GAM, N for GAMLSS/survival).
+    pub blocks: Vec<FittedBlock>,
+    /// Log-smoothing parameters (all blocks concatenated in block order).
+    pub log_lambdas: Array1<f64>,
+    /// Log-likelihood at the converged mode.
+    pub log_likelihood: f64,
+    /// Penalized objective value (−ℓ + penalty + REML terms).
+    pub penalized_objective: f64,
+    /// Outer optimization convergence info.
+    pub outer_iterations: usize,
+    pub outer_converged: bool,
+    pub outer_gradient_norm: f64,
+    /// Conditional covariance Var(β | λ) for the joint coefficient vector.
+    pub covariance_conditional: Option<Array2<f64>>,
+    /// Fitted link parameters (SAS, BetaLogistic, Mixture).
+    pub fitted_link: FittedLinkParameters,
+    /// Working-set geometry at convergence (for ALO diagnostics).
+    #[serde(skip)]
+    pub geometry: Option<FitGeometry>,
+}
+
+impl From<&FitResult> for UnifiedFitResult {
+    fn from(fit: &FitResult) -> Self {
+        let edf = fit
+            .inference
+            .as_ref()
+            .map(|inf| inf.edf_total)
+            .unwrap_or(0.0);
+        let geometry = fit.inference.as_ref().map(|inf| FitGeometry {
+            penalized_hessian: inf.penalized_hessian.clone(),
+            working_weights: inf.working_weights.clone(),
+            working_response: inf.working_response.clone(),
+        });
+        UnifiedFitResult {
+            blocks: vec![FittedBlock {
+                beta: fit.beta.clone(),
+                role: BlockRole::Mean,
+                edf,
+                lambdas: fit.lambdas.clone(),
+            }],
+            log_lambdas: fit.lambdas.mapv(f64::ln),
+            log_likelihood: -0.5 * fit.deviance,
+            penalized_objective: -0.5 * fit.deviance + fit.stable_penalty_term + fit.reml_score,
+            outer_iterations: fit.iterations,
+            outer_converged: true, // standard path converges or errors
+            outer_gradient_norm: fit.finalgrad_norm,
+            covariance_conditional: fit
+                .inference
+                .as_ref()
+                .and_then(|inf| inf.beta_covariance.clone()),
+            fitted_link: fit.fitted_link_parameters.clone(),
+            geometry,
+        }
+    }
+}
+
+impl UnifiedFitResult {
+    /// Flat coefficient vector (all blocks concatenated).
+    pub fn beta_flat(&self) -> Array1<f64> {
+        let total: usize = self.blocks.iter().map(|b| b.beta.len()).sum();
+        let mut flat = Array1::zeros(total);
+        let mut offset = 0;
+        for block in &self.blocks {
+            let p = block.beta.len();
+            flat.slice_mut(ndarray::s![offset..offset + p])
+                .assign(&block.beta);
+            offset += p;
+        }
+        flat
+    }
+
+    /// Total effective degrees of freedom.
+    pub fn edf_total(&self) -> f64 {
+        self.blocks.iter().map(|b| b.edf).sum()
+    }
+
+    /// Number of coefficient blocks.
+    pub fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Block roles.
+    pub fn block_roles(&self) -> Vec<BlockRole> {
+        self.blocks.iter().map(|b| b.role.clone()).collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ParametricTermSummary {
     pub name: String,
