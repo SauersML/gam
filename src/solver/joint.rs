@@ -1526,7 +1526,8 @@ impl<'a> JointRemlState<'a> {
             rho.as_slice().unwrap(),
             EvalMode::ValueOnly,
             None,
-        ).map_err(|e| EstimationError::InvalidInput(e))?;
+        )
+        .map_err(|e| EstimationError::InvalidInput(e))?;
         let laml = -unified_result.cost; // unified returns cost to minimize; LAML is negated
 
         // Cache for gradient
@@ -1598,258 +1599,6 @@ impl<'a> JointRemlState<'a> {
         Ok(evals.iter().filter(|&&ev| ev > tol).count())
     }
 
-    /// Compute LAML at the converged solution.
-    /// Note: for nonlinear g(u), this uses a Gauss-Newton Hessian approximation.
-    fn compute_laml_at_convergence(
-        state: &JointModelState,
-        lambda_base: &Array1<f64>,
-        lambda_link: f64,
-        base_reparam_invariant: Option<&ReparamInvariant>,
-        base_rs_list: &[Array2<f64>],
-    ) -> (f64, Option<f64>) {
-        let n = state.nobs();
-        let u = state.base_linear_predictor();
-        let bwiggle = state.build_link_basis_from_state(&u);
-
-        // Compute eta = u + Bwiggle * theta
-        let eta = state.compute_eta_full(&u, &bwiggle);
-
-        // Compute mu/weights/residuals at convergence
-        let mut mu = Array1::<f64>::zeros(n);
-        let mut weights = Array1::<f64>::zeros(n);
-        let mut residual = Array1::<f64>::zeros(n);
-        match state.link {
-            LinkFunction::Identity => {
-                for i in 0..n {
-                    mu[i] = eta[i];
-                    weights[i] = state.weights[i];
-                    residual[i] = weights[i] * (mu[i] - state.y[i]);
-                }
-            }
-            LinkFunction::Logit
-            | LinkFunction::Probit
-            | LinkFunction::CLogLog
-            | LinkFunction::Sas
-            | LinkFunction::BetaLogistic => {
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                let family = match state.link {
-                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
-                    LinkFunction::Identity => unreachable!("identity handled above"),
-                };
-                let strategy = strategy_for_family(family, None);
-                for i in 0..n {
-                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
-                    let moments = strategy
-                        .integrated_moments(&state.quadctx, eta[i], se_i)
-                        .expect("binomial family moments must be available");
-                    let dmu = moments.d1.abs().max(MIN_DMU);
-                    mu[i] = moments.mean;
-                    let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
-                    residual[i] = weights[i] * (mu[i] - state.y[i]) / dmu;
-                }
-            }
-        }
-        let deviance = state.compute_deviance(&mu);
-
-        // Build exact joint penalized Hessian for the current local model:
-        //   H = J' W J + S_lambda
-        // with J = [diag(g') X | Bwiggle].
-        //
-        // Expanded block form (common split-predictor case):
-        //   H_ββ = J_β' W J_β + S_β
-        //   H_βθ = J_β' W J_θ
-        //   H_θβ = J_θ' W J_β
-        //   H_θθ = J_θ' W J_θ + S_θ
-        // so cross-block terms are explicit and retained (not dropped).
-        let p_base = state.x_base.ncols();
-        let p_link = bwiggle.ncols();
-        let coef_layout = JointCoefLayout::new(p_base, p_link);
-        let p_total = coef_layout.p_total();
-
-        let (g_prime, _, _) = compute_link_derivative_terms_from_state(state, &u);
-        let j_mat = state.build_joint_jacobian(&bwiggle, &g_prime);
-        let penalty_full = state.build_joint_penalty(lambda_base, lambda_link, p_link);
-        let link_penalty = state.build_link_penalty();
-        let mut jweighted = j_mat.clone();
-        let sqrtw = weights.mapv(|wi| wi.max(0.0).sqrt());
-        ndarray::Zip::from(jweighted.rows_mut())
-            .and(sqrtw.view())
-            .for_each(|mut row, wi| row *= *wi);
-        let mut h_full = crate::faer_ndarray::fast_ata(&jweighted);
-        if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
-            h_full += &penalty_full;
-        }
-
-        // Spectral log|H|_+ via eigendecomposition (Wood 2011)
-        // This approach:
-        // 1. Keeps the objective function smooth as eigenvalues cross zero
-        // 2. Avoids discontinuity from conditional ridge
-        // 3. Uses log|H|_+ = Σ log(λ_i) for positive eigenvalues only
-        use crate::faer_ndarray::FaerEigh;
-        use faer::Side;
-
-        // h_full already contains the full coupled penalized Hessian J'WJ + S_lambda.
-
-        let log_det_a = match h_full.eigh(Side::Lower) {
-            Ok((eigs, _)) => {
-                // Spectral log-det: sum of log of positive eigenvalues
-                let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-                let tol = (max_eig * 1e-12).max(1e-100);
-                let log_det: f64 = eigs.iter().filter(|&&ev| ev > tol).map(|&ev| ev.ln()).sum();
-                log_det
-            }
-            Err(_) => {
-                // Eigendecomposition failed - severe numerical issues
-                eprintln!("[LAML] Joint Hessian eigendecomposition failed");
-                return (f64::INFINITY, None);
-            }
-        };
-
-        // log|Sλ|_+ from stable reparameterization (base) and eigenvalues (link)
-        let base_reparam = if let Some(invariant) = base_reparam_invariant {
-            stable_reparameterizationwith_invariant_engine(
-                base_rs_list,
-                &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, base_rs_list.len()),
-                invariant,
-            )
-        } else {
-            stable_reparameterization_engine(
-                base_rs_list,
-                &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, base_rs_list.len()),
-            )
-        }
-        .unwrap_or_else(|_| ReparamResult {
-            s_transformed: Array2::zeros((p_base, p_base)),
-            log_det: 0.0,
-            det1: Array1::zeros(lambda_base.len()),
-            qs: Array2::eye(p_base),
-            rs_transformed: vec![],
-            rs_transposed: vec![],
-            e_transformed: Array2::zeros((0, p_base)),
-            u_truncated: Array2::zeros((p_base, p_base)), // All modes truncated in fallback
-        });
-        // Spectral log|S_λ|_+ for penalty matrix (Wood 2011)
-        // Uses pure spectral log-det without ridge adjustment
-        // Math note:
-        //   The stabilized inner solves use (S_λ + δI) as the effective prior precision.
-        //   For objective/gradient consistency, the LAML normalization term must match:
-        //     log|S_λ + δI| = log|S_λ|_+ + M_p * log(δ)   (when S_λ is rank-deficient).
-        //   Using log|S_λ|_+ while also adding 0.5*δ||β||² in the quadratic term defines
-        //   an incoherent objective and breaks the envelope-theorem simplification.
-        let base_rank_usize = base_reparam.e_transformed.nrows();
-        let base_rank = base_rank_usize as f64;
-        let base_log_det_s = match Self::fixed_subspace_logdet_for_penalty(
-            &base_reparam.s_transformed,
-            base_rank_usize,
-            state.ridge_base_used,
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("[LAML] Base penalty eigendecomposition failed");
-                return (f64::INFINITY, None);
-            }
-        };
-
-        let (link_log_det_s, link_rank) = if p_link > 0 {
-            let rank = match Self::structural_rank_from_penalty(&link_penalty) {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!("[LAML] Link penalty eigendecomposition failed");
-                    return (f64::INFINITY, None);
-                }
-            };
-            let s_link_lambda = link_penalty.mapv(|v| v * lambda_link);
-            let log_det = match Self::fixed_subspace_logdet_for_penalty(
-                &s_link_lambda,
-                rank,
-                state.ridge_link_used,
-            ) {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!("[LAML] Link penalty eigendecomposition failed");
-                    return (f64::INFINITY, None);
-                }
-            };
-            (log_det, rank as f64)
-        } else {
-            (0.0, 0.0)
-        };
-
-        let log_det_s = base_log_det_s + link_log_det_s;
-
-        // Null space dimension
-        let mp = (p_base as f64 - base_rank) + (p_link as f64 - link_rank);
-
-        // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'*S_λ*beta
-        // Include stabilization ridge to satisfy Envelope Theorem consistency:
-        // inner solver minimizes L_inner = -ℓ + 0.5 βᵀS_λβ + 0.5 δ||β||².
-        // If cost omits δ||β||², then ∇_β V = -δ β̂ ≠ 0 and dV/dρ picks up a bias
-        // via (∇_β V)ᵀ dβ/dρ. Adding the ridge restores ∇_β V ≈ 0 at β̂.
-        let mut penalty_term = 0.0;
-        for (idx, s_k) in state.s_base.iter().enumerate() {
-            let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
-            if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
-                let sb = s_k.dot(&state.beta_base);
-                penalty_term += lambda_k * state.beta_base.dot(&sb);
-            }
-        }
-        if p_link > 0 && link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
-            if state.beta_link.len() == p_link {
-                let sb = link_penalty.dot(&state.beta_link);
-                penalty_term += lambda_link * state.beta_link.dot(&sb);
-            }
-        }
-        if state.ridge_base_used > 0.0 {
-            // 0.5 * δ ||β_base||² with δ tracked from the actual PWLS solve.
-            penalty_term += state.ridge_base_used * state.beta_base.dot(&state.beta_base);
-        }
-        if p_link > 0 && state.beta_link.len() == p_link && state.ridge_link_used > 0.0 {
-            // Same ridge term for the link block to keep cost/gradient surfaces aligned.
-            penalty_term += state.ridge_link_used * state.beta_link.dot(&state.beta_link);
-        }
-
-        let laml = match state.link {
-            LinkFunction::Logit
-            | LinkFunction::Probit
-            | LinkFunction::CLogLog
-            | LinkFunction::Sas
-            | LinkFunction::BetaLogistic => {
-                let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
-                let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
-                    + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
-                laml
-            }
-            LinkFunction::Identity => {
-                let dp = (deviance + penalty_term).max(1e-12);
-                let denom = (n as f64 - mp).max(1.0);
-                let phi = dp / denom;
-                let remlcost = dp / (2.0 * phi)
-                    + 0.5 * (log_det_a - log_det_s)
-                    + ((n as f64 - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
-                -remlcost
-            }
-        };
-
-        let edf = Self::compute_joint_edf(
-            state,
-            &bwiggle,
-            &g_prime,
-            &weights,
-            lambda_base,
-            lambda_link,
-        );
-
-        (laml, edf)
-    }
-
     /// Build an InnerSolution from the converged joint state for the unified
     /// REML/LAML evaluator. This replaces compute_laml_at_convergence for cost
     /// and compute_gradient_analytic for gradient — both are now computed by
@@ -1861,19 +1610,13 @@ impl<'a> JointRemlState<'a> {
         lambda_link: f64,
         base_reparam_invariant: Option<&ReparamInvariant>,
         base_rs_list: &[Array2<f64>],
-    ) -> Result<
-        (
-            crate::estimate::reml::unified::InnerSolution,
-            Option<f64>,
-        ),
-        EstimationError,
-    > {
-        use crate::faer_ndarray::FaerEigh;
+    ) -> Result<(crate::estimate::reml::unified::InnerSolution, Option<f64>), EstimationError> {
         use crate::estimate::reml::unified::{
-            DenseSpectralOperator, DispersionHandling, GaussianDerivatives,
-            BlockCoupledDerivativeProvider, InnerSolution, PenaltyLogdetDerivs,
+            BlockCoupledDerivativeProvider, DenseSpectralOperator, DispersionHandling,
+            GaussianDerivatives, InnerSolution, PenaltyLogdetDerivs,
         };
-        use crate::types::{RidgePassport, RidgePolicy, RidgeMatrixForm, RidgeDeterminantMode};
+        use crate::faer_ndarray::FaerEigh;
+        use crate::types::{RidgeDeterminantMode, RidgeMatrixForm, RidgePassport, RidgePolicy};
         use faer::Side;
 
         let n = state.nobs();
@@ -1948,12 +1691,9 @@ impl<'a> JointRemlState<'a> {
         }
 
         // Build HessianOperator from joint Hessian.
-        let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_full)
-                .map_err(|e| EstimationError::InvalidInput(
-                    format!("Joint HessianOperator failed: {e}"),
-                ))?,
-        );
+        let hessian_op = Box::new(DenseSpectralOperator::from_symmetric(&h_full).map_err(|e| {
+            EstimationError::InvalidInput(format!("Joint HessianOperator failed: {e}"))
+        })?);
 
         // Penalty logdet via reparameterization (base) + eigendecomposition (link).
         let base_reparam = if let Some(invariant) = base_reparam_invariant {
@@ -2037,9 +1777,7 @@ impl<'a> JointRemlState<'a> {
             // Embed base penalty root into joint space: [R_k | 0]
             let rank_k = rs.nrows();
             let mut joint_root = Array2::zeros((rank_k, p_total));
-            joint_root
-                .slice_mut(ndarray::s![.., ..p_base])
-                .assign(rs);
+            joint_root.slice_mut(ndarray::s![.., ..p_base]).assign(rs);
             penalty_roots.push(joint_root);
         }
         // Link penalty root (if present).
@@ -2116,7 +1854,11 @@ impl<'a> JointRemlState<'a> {
         let dispersion = if is_gaussian {
             DispersionHandling::ProfiledGaussian
         } else {
-            DispersionHandling::Fixed { phi: 1.0 }
+            DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            }
         };
 
         let inner_solution = InnerSolution {
@@ -2139,6 +1881,7 @@ impl<'a> JointRemlState<'a> {
             n_observations: n,
             nullspace_dim: mp,
             dispersion,
+            precomputed_h_k_corrections: None,
         };
 
         // Compute EDF for diagnostics.
@@ -3353,9 +3096,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             hessian: Derivative::Unavailable,
             n_params,
         },
-        cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
-            state.compute_cost(rho)
-        },
+        cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
             // Unified REML/LAML: cost and gradient from the SAME InnerSolution.
             // compute_cost runs the inner solver and caches the converged state.
@@ -3380,11 +3121,10 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
                 rho.as_slice().unwrap(),
                 EvalMode::ValueAndGradient,
                 None,
-            ).map_err(|e| EstimationError::InvalidInput(e))?;
+            )
+            .map_err(|e| EstimationError::InvalidInput(e))?;
             let grad = result.gradient.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "unified evaluator returned no gradient".to_string(),
-                )
+                EstimationError::InvalidInput("unified evaluator returned no gradient".to_string())
             })?;
 
             Ok(OuterEval {
@@ -3401,11 +3141,8 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         },
     };
 
-    let result = crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "joint flexible link",
-    )?;
+    let result =
+        crate::solver::strategy::run_outer(&mut obj, &outer_config, "joint flexible link")?;
 
     // Extract state from the objective wrapper to finalize.
     let ClosureObjective { mut state, .. } = obj;
