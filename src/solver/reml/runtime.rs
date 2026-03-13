@@ -2103,27 +2103,25 @@ impl<'a> RemlState<'a> {
         log_likelihood: f64,
         penalty_quadratic: f64,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::{InnerSolution, reml_laml_evaluate};
+        use super::unified::{InnerSolutionBuilder, reml_laml_evaluate};
 
         let n_observations = self.y.len();
-        let inner_solution = InnerSolution {
+        let _ = nullspace_dim;
+        let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
-            hessian_op,
             beta,
+            n_observations,
+            hessian_op,
             penalty_roots,
             penalty_logdet,
-            deriv_provider,
-            tk_correction,
-            tk_gradient: None,
-            firth_logdet,
-            firth_gradient,
-            n_observations,
-            nullspace_dim,
             dispersion,
-            precomputed_h_k_corrections: None,
-            precomputed_h_ddot_traces: None,
-        };
+        )
+        .deriv_provider(deriv_provider)
+        .tk(tk_correction, None)
+        .firth(firth_logdet, firth_gradient)
+        .nullspace_dim_override(nullspace_dim)
+        .build();
 
         let prior = if mode == super::unified::EvalMode::ValueOnly {
             let pc = self.compute_soft_priorcost(rho);

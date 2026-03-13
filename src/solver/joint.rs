@@ -1609,8 +1609,8 @@ impl<'a> JointRemlState<'a> {
         base_rs_list: &[Array2<f64>],
     ) -> Result<(crate::estimate::reml::unified::InnerSolution, Option<f64>), EstimationError> {
         use crate::estimate::reml::unified::{
-            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, HessianOperator,
-            InnerSolution, PenaltyLogdetDerivs,
+            DenseSpectralOperator, DispersionHandling, HessianOperator, InnerSolutionBuilder,
+            PenaltyLogdetDerivs,
         };
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
@@ -2393,28 +2393,31 @@ impl<'a> JointRemlState<'a> {
             (None, None, None)
         };
 
-        let inner_solution = InnerSolution {
+        let mut builder = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
-            hessian_op: Box::new(hop),
             beta,
+            n,
+            Box::new(hop),
             penalty_roots,
-            penalty_logdet: PenaltyLogdetDerivs {
+            PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
                 second: Some(det2),
             },
-            deriv_provider: Box::new(GaussianDerivatives),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth_logdet: 0.0,
-            firth_gradient,
-            n_observations: n,
-            nullspace_dim: mp,
             dispersion,
-            precomputed_h_k_corrections,
-            precomputed_h_ddot_traces,
-        };
+        )
+        .nullspace_dim_override(mp);
+        if let Some(corrections) = precomputed_h_k_corrections {
+            builder = builder.precomputed_corrections(corrections);
+        }
+        if let Some(traces) = precomputed_h_ddot_traces {
+            builder = builder.precomputed_h_ddot_traces(traces);
+        }
+        if let Some(fg) = firth_gradient {
+            builder = builder.firth(0.0, Some(fg));
+        }
+        let inner_solution = builder.build();
 
         // Compute EDF for diagnostics.
         let edf = Self::compute_joint_edf(
