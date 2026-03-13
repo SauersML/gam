@@ -860,7 +860,7 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn active_rank(&self) -> usize {
-        self.n_active
+        self.active_mask.iter().filter(|&&b| b).count()
     }
 
     fn dim(&self) -> usize {
@@ -1305,17 +1305,21 @@ mod tests {
         let xty = array![5.0, 3.0, 2.0];
         let beta = op.solve(&xty);
 
-        // Penalty roots (Cholesky-like square roots of Sₖ).
-        // For testing, use eigendecomposition: Sₖ = Rₖᵀ Rₖ.
-        let r1 = array![[1.0, 0.2, 0.0], [0.0, 0.9798, 0.0], [0.0, 0.0, 0.0],];
-        let r2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0],];
+        // Penalty roots via eigendecomposition: Sₖ = Rₖᵀ Rₖ (exact).
+        let r1 = penalty_matrix_root(&s1).unwrap();
+        let r2 = penalty_matrix_root(&s2).unwrap();
 
         // Penalty quadratic: Σ λₖ β'Sₖβ
         let penalty_quad =
             lambdas[0] * beta.dot(&s1.dot(&beta)) + lambdas[1] * beta.dot(&s2.dot(&beta));
 
-        // RSS: ||y - Xβ||² (simulated)
-        let deviance = 10.0; // fixed for this test
+        // Deviance at β̂: ||y − Xβ̂||² = y'y − 2β̂'X'y + β̂'X'Xβ̂.
+        // y'y is a ρ-independent constant (the actual value doesn't matter).
+        // Computing deviance at the mode is essential: the analytic gradient
+        // relies on the envelope theorem (∂D_p/∂β = 0 at the mode), which
+        // is violated if deviance is held constant as β̂ varies with ρ.
+        let yty = 20.0;
+        let deviance = yty - 2.0 * beta.dot(&xty) + beta.dot(&xtx.dot(&beta));
         let log_likelihood = -0.5 * deviance;
 
         // Penalty logdet: log|Σ λₖ Sₖ|₊
