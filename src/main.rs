@@ -17,9 +17,9 @@ use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FittedLinkParameters,
-    ModelSummary, ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order,
-    fit_gam, optimize_external_design, predict_gam, predict_gam_posterior_meanwith_fit,
-    predict_gamwith_uncertainty,
+    ModelSummary, ParametricTermSummary, SmoothTermSummary,
+    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
+    predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -913,6 +913,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     },
                     family_to_string(family).to_string(),
                 );
+                payload.unified = Some(fit_result.to_unified());
                 payload.fit_result = Some(fit_result);
                 payload.data_schema = Some(ds.schema.clone());
                 payload.link = Some(link_choice_to_string(choice));
@@ -1103,6 +1104,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             },
             family_to_string(family).to_string(),
         );
+        payload.unified = Some(saved_fit.to_unified());
         payload.fit_result = Some(saved_fit.clone());
         payload.data_schema = Some(ds.schema.clone());
         payload.link = link_choice.as_ref().map(link_choice_to_string);
@@ -4593,6 +4595,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
+            payload.unified = Some(fit_result.to_unified());
             payload.fit_result = Some(fit_result);
             payload.data_schema = Some(ds.schema.clone());
             payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
@@ -4906,6 +4909,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
             family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
         );
+        payload.unified = Some(fit_result.to_unified());
         payload.fit_result = Some(fit_result);
         payload.data_schema = Some(ds.schema.clone());
         payload.survival_entry = Some(args.entry);
@@ -5891,6 +5895,20 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let edf_blocks: Vec<(usize, f64)> = fit.edf_by_block().iter().copied().enumerate().collect();
 
     let mut notes = Vec::new();
+    if let Some(roles) = model.block_roles() {
+        let role_labels: Vec<&str> = roles
+            .iter()
+            .map(|r| match r {
+                gam::estimate::BlockRole::Mean => "mean",
+                gam::estimate::BlockRole::Location => "location",
+                gam::estimate::BlockRole::Scale => "scale",
+                gam::estimate::BlockRole::Time => "time",
+                gam::estimate::BlockRole::Threshold => "threshold",
+                gam::estimate::BlockRole::LinkWiggle => "link-wiggle",
+            })
+            .collect();
+        notes.push(format!("Block roles: {}", role_labels.join(", ")));
+    }
     let mut diagnostics = None;
     let mut smooth_plots = Vec::new();
     let mut continuous_order = Vec::new();
@@ -6631,6 +6649,7 @@ fn build_location_scale_saved_model(
         },
         family,
     );
+    payload.unified = Some(fit_result.to_unified());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
     payload.link = link;

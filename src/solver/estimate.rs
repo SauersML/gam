@@ -22,6 +22,8 @@
 
 use self::reml::{DirectionalHyperParam, RemlState};
 use crate::basis::analyze_penalty_block;
+use crate::families::custom_family::BlockwiseFitResult;
+use crate::families::survival_location_scale::SurvivalLocationScaleFitResult;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::fmt;
 use std::time::Instant;
@@ -3269,6 +3271,108 @@ impl From<&FitResult> for UnifiedFitResult {
             fitted_link: fit.fitted_link_parameters.clone(),
             geometry,
         }
+    }
+}
+
+impl From<&BlockwiseFitResult> for UnifiedFitResult {
+    fn from(fit: &BlockwiseFitResult) -> Self {
+        let blocks: Vec<FittedBlock> = fit
+            .block_states
+            .iter()
+            .enumerate()
+            .map(|(i, bs)| {
+                let role = if fit.block_states.len() == 1 {
+                    BlockRole::Mean
+                } else if i == 0 {
+                    BlockRole::Location
+                } else {
+                    BlockRole::Scale
+                };
+                FittedBlock {
+                    beta: bs.beta.clone(),
+                    role,
+                    edf: 0.0, // BlockwiseFitResult does not track per-block EDF
+                    lambdas: Array1::zeros(0),
+                }
+            })
+            .collect();
+        UnifiedFitResult {
+            blocks,
+            log_lambdas: fit.log_lambdas.clone(),
+            log_likelihood: fit.log_likelihood,
+            penalized_objective: fit.penalizedobjective,
+            outer_iterations: fit.outer_iterations,
+            outer_converged: fit.converged,
+            outer_gradient_norm: fit.outer_final_gradient_norm,
+            covariance_conditional: fit.covariance_conditional.clone(),
+            fitted_link: FittedLinkParameters::Standard,
+            geometry: None,
+        }
+    }
+}
+
+impl From<&SurvivalLocationScaleFitResult> for UnifiedFitResult {
+    fn from(fit: &SurvivalLocationScaleFitResult) -> Self {
+        let mut blocks = vec![
+            FittedBlock {
+                beta: fit.beta_time.clone(),
+                role: BlockRole::Time,
+                edf: 0.0,
+                lambdas: fit.lambdas_time.clone(),
+            },
+            FittedBlock {
+                beta: fit.beta_threshold.clone(),
+                role: BlockRole::Threshold,
+                edf: 0.0,
+                lambdas: fit.lambdas_threshold.clone(),
+            },
+            FittedBlock {
+                beta: fit.beta_log_sigma.clone(),
+                role: BlockRole::Scale,
+                edf: 0.0,
+                lambdas: fit.lambdas_log_sigma.clone(),
+            },
+        ];
+        if let Some(ref bw) = fit.beta_link_wiggle {
+            blocks.push(FittedBlock {
+                beta: bw.clone(),
+                role: BlockRole::LinkWiggle,
+                edf: 0.0,
+                lambdas: fit
+                    .lambdas_linkwiggle
+                    .clone()
+                    .unwrap_or_else(|| Array1::zeros(0)),
+            });
+        }
+        let all_lambdas: Vec<f64> = blocks
+            .iter()
+            .flat_map(|b| b.lambdas.iter().copied())
+            .collect();
+        let log_lambdas = Array1::from_vec(
+            all_lambdas
+                .iter()
+                .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
+                .collect(),
+        );
+        UnifiedFitResult {
+            blocks,
+            log_lambdas,
+            log_likelihood: fit.log_likelihood,
+            penalized_objective: fit.penalizedobjective,
+            outer_iterations: fit.iterations,
+            outer_converged: fit.converged,
+            outer_gradient_norm: fit.finalgrad_norm,
+            covariance_conditional: fit.covariance_conditional.clone(),
+            fitted_link: FittedLinkParameters::Standard,
+            geometry: None,
+        }
+    }
+}
+
+impl FitResult {
+    /// Convert to the unified fit result representation.
+    pub fn to_unified(&self) -> UnifiedFitResult {
+        UnifiedFitResult::from(self)
     }
 }
 

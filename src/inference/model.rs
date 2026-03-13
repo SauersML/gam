@@ -1,4 +1,5 @@
-use crate::estimate::{FitResult, FittedLinkParameters};
+use crate::estimate::{BlockRole, FitResult, FittedLinkParameters, UnifiedFitResult};
+use crate::inference::predict::{PredictInput, PredictableModel, PredictionWithSE, StandardPredictor};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, BoundedCoefficientPriorSpec, LinearCoefficientGeometry,
@@ -43,6 +44,9 @@ pub struct FittedModelPayload {
     pub family: String,
     #[serde(default)]
     pub fit_result: Option<FitResult>,
+    /// Unified (family-agnostic) representation of the fit result.
+    #[serde(default)]
+    pub unified: Option<UnifiedFitResult>,
     #[serde(default)]
     pub data_schema: Option<DataSchema>,
     pub link: Option<String>,
@@ -165,6 +169,7 @@ impl FittedModelPayload {
             family_state,
             family,
             fit_result: None,
+            unified: None,
             data_schema: None,
             link: None,
             mixture_link_param_covariance: None,
@@ -520,6 +525,50 @@ impl FittedModel {
             }
             FittedFamily::Survival { .. } => Ok(None),
         }
+    }
+
+    /// Build a `PredictableModel` for the standard (single-block) case.
+    ///
+    /// Returns `None` for location-scale or survival models which require
+    /// specialised predictors not yet wired through this trait.
+    pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
+        if !matches!(self, FittedModel::Standard { .. }) {
+            return None;
+        }
+        let fit = self.fit_result.as_ref()?;
+        let family = self.family_state.likelihood();
+        let link_kind = self.resolved_inverse_link().ok().flatten();
+        let covariance = fit.beta_covariance().cloned();
+        Some(Box::new(StandardPredictor {
+            beta: fit.beta.clone(),
+            family,
+            link_kind,
+            covariance,
+        }))
+    }
+
+    /// Returns the block roles for this model via the `PredictableModel` trait.
+    ///
+    /// For standard models this is `[BlockRole::Mean]`.
+    pub fn block_roles(&self) -> Option<Vec<BlockRole>> {
+        self.predictor().map(|p| p.block_roles())
+    }
+
+    /// Convenience: predict with uncertainty through the `PredictableModel` trait.
+    ///
+    /// For standard models, this delegates to `StandardPredictor`. Returns `Err`
+    /// for model types where the trait predictor is not yet implemented.
+    pub fn predict_via_trait(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, crate::estimate::EstimationError> {
+        let predictor = self.predictor().ok_or_else(|| {
+            crate::estimate::EstimationError::InvalidInput(
+                "predict_via_trait is not yet supported for location-scale or survival models"
+                    .to_string(),
+            )
+        })?;
+        predictor.predict_with_uncertainty(input)
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
