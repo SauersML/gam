@@ -6,7 +6,7 @@ use crate::linalg::utils::{
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::reml::unified::{
-    DenseSpectralOperator, DispersionHandling, EvalMode, GaussianDerivatives, InnerSolution,
+    DenseSpectralOperator, DispersionHandling, EvalMode, InnerSolutionBuilder,
     compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
     reml_laml_evaluate,
 };
@@ -2537,39 +2537,29 @@ fn unified_joint_cost_gradient(
     let penalty_logdet =
         compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?;
 
-    // Compute nullspace dimension.
-    let penalty_rank: usize = penalty_roots_joint
-        .iter()
-        .map(|r: &Array2<f64>| r.nrows())
-        .sum();
-    let nullspace_dim = total.saturating_sub(penalty_rank) as f64;
-
     // Number of observations.
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
-    // Build InnerSolution and call unified evaluator.
-    let inner_solution = InnerSolution {
-        log_likelihood: inner.log_likelihood,
-        penalty_quadratic: inner.penalty_value,
-        hessian_op: Box::new(hop),
-        beta: beta_flat.clone(),
-        penalty_roots: penalty_roots_joint,
-        penalty_logdet,
-        deriv_provider: Box::new(GaussianDerivatives), // corrections are precomputed
-        tk_correction: 0.0,
-        tk_gradient: None,
-        firth_logdet: 0.0,
-        firth_gradient: None,
+    // Build InnerSolution via builder and call unified evaluator.
+    let mut builder = InnerSolutionBuilder::new(
+        inner.log_likelihood,
+        inner.penalty_value,
+        beta_flat.clone(),
         n_observations,
-        nullspace_dim,
-        dispersion: DispersionHandling::Fixed {
+        Box::new(hop),
+        penalty_roots_joint,
+        penalty_logdet,
+        DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h,
             include_logdet_s,
         },
-        precomputed_h_k_corrections: Some(precomputed_corrections),
-        precomputed_h_ddot_traces: precomputed_h_ddot_traces.clone(),
-    };
+    )
+    .precomputed_corrections(precomputed_corrections);
+    if let Some(traces) = precomputed_h_ddot_traces.clone() {
+        builder = builder.precomputed_h_ddot_traces(traces);
+    }
+    let inner_solution = builder.build();
 
     let eval_mode = if precomputed_h_ddot_traces.is_some() {
         EvalMode::ValueGradientHessian

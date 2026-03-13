@@ -447,6 +447,127 @@ pub struct InnerSolution {
     pub precomputed_h_ddot_traces: Option<Array2<f64>>,
 }
 
+/// Builder for `InnerSolution` that provides sensible defaults and
+/// auto-computes derived quantities (nullspace_dim).
+pub struct InnerSolutionBuilder {
+    // Required fields
+    log_likelihood: f64,
+    penalty_quadratic: f64,
+    hessian_op: Box<dyn HessianOperator>,
+    beta: Array1<f64>,
+    penalty_roots: Vec<Array2<f64>>,
+    penalty_logdet: PenaltyLogdetDerivs,
+    n_observations: usize,
+    dispersion: DispersionHandling,
+    // Optional fields with defaults
+    deriv_provider: Box<dyn HessianDerivativeProvider>,
+    tk_correction: f64,
+    tk_gradient: Option<Array1<f64>>,
+    firth_logdet: f64,
+    firth_gradient: Option<Array1<f64>>,
+    precomputed_h_k_corrections: Option<Vec<Option<Array2<f64>>>>,
+    precomputed_h_ddot_traces: Option<Array2<f64>>,
+    nullspace_dim_override: Option<f64>,
+}
+
+impl InnerSolutionBuilder {
+    /// Create a builder with the required core fields.
+    pub fn new(
+        log_likelihood: f64,
+        penalty_quadratic: f64,
+        beta: Array1<f64>,
+        n_observations: usize,
+        hessian_op: Box<dyn HessianOperator>,
+        penalty_roots: Vec<Array2<f64>>,
+        penalty_logdet: PenaltyLogdetDerivs,
+        dispersion: DispersionHandling,
+    ) -> Self {
+        Self {
+            log_likelihood,
+            penalty_quadratic,
+            hessian_op,
+            beta,
+            penalty_roots,
+            penalty_logdet,
+            n_observations,
+            dispersion,
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth_logdet: 0.0,
+            firth_gradient: None,
+            precomputed_h_k_corrections: None,
+            precomputed_h_ddot_traces: None,
+            nullspace_dim_override: None,
+        }
+    }
+
+    pub fn deriv_provider(mut self, p: Box<dyn HessianDerivativeProvider>) -> Self {
+        self.deriv_provider = p;
+        self
+    }
+
+    pub fn tk(mut self, correction: f64, gradient: Option<Array1<f64>>) -> Self {
+        self.tk_correction = correction;
+        self.tk_gradient = gradient;
+        self
+    }
+
+    pub fn firth(mut self, logdet: f64, gradient: Option<Array1<f64>>) -> Self {
+        self.firth_logdet = logdet;
+        self.firth_gradient = gradient;
+        self
+    }
+
+    pub fn precomputed_corrections(mut self, c: Vec<Option<Array2<f64>>>) -> Self {
+        self.precomputed_h_k_corrections = Some(c);
+        self
+    }
+
+    pub fn precomputed_h_ddot_traces(mut self, t: Array2<f64>) -> Self {
+        self.precomputed_h_ddot_traces = Some(t);
+        self
+    }
+
+    /// Override the auto-computed nullspace dimension.
+    ///
+    /// By default, `build()` computes nullspace_dim as
+    /// `beta.len() - sum(penalty_root.nrows())`. Use this when the caller
+    /// has a different authoritative value (e.g. from stored per-penalty dims).
+    pub fn nullspace_dim_override(mut self, dim: f64) -> Self {
+        self.nullspace_dim_override = Some(dim);
+        self
+    }
+
+    /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty roots.
+    pub fn build(self) -> InnerSolution {
+        let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
+            let total_p = self.beta.len();
+            let penalty_rank: usize = self.penalty_roots.iter().map(|r| r.nrows()).sum();
+            total_p.saturating_sub(penalty_rank) as f64
+        });
+
+        InnerSolution {
+            log_likelihood: self.log_likelihood,
+            penalty_quadratic: self.penalty_quadratic,
+            hessian_op: self.hessian_op,
+            beta: self.beta,
+            penalty_roots: self.penalty_roots,
+            penalty_logdet: self.penalty_logdet,
+            deriv_provider: self.deriv_provider,
+            tk_correction: self.tk_correction,
+            tk_gradient: self.tk_gradient,
+            firth_logdet: self.firth_logdet,
+            firth_gradient: self.firth_gradient,
+            n_observations: self.n_observations,
+            nullspace_dim,
+            dispersion: self.dispersion,
+            precomputed_h_k_corrections: self.precomputed_h_k_corrections,
+            precomputed_h_ddot_traces: self.precomputed_h_ddot_traces,
+        }
+    }
+}
+
 /// Evaluation mode for the unified evaluator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvalMode {
