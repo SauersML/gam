@@ -27,11 +27,11 @@ use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
+use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use opt::{
-    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion,
+    Arc as ArcOptimizer, ArcError, Bounds, MaxIterations, NewtonTrustRegion,
     NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
 use serde::{Deserialize, Serialize};
@@ -3827,19 +3827,18 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         hyperspecs: shared_hyperspecs.clone(),
     };
 
-    let mut warm_cache = None::<CustomFamilyWarmStart>;
     let rho_dim = retained_penalties.len();
     const EPSILON_LOG_WINDOW: f64 = 6.0;
-    let lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
+    let eps_lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
         if idx < rho_dim + runtime_caches.len() * 3 {
-            -30.0
+            -30.0_f64
         } else {
             (initial_theta[idx] - EPSILON_LOG_WINDOW).max(adaptive_opts.min_epsilon.max(1e-12).ln())
         }
     }));
-    let upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
+    let eps_upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
         if idx < rho_dim + runtime_caches.len() * 3 {
-            30.0
+            30.0_f64
         } else {
             initial_theta[idx] + EPSILON_LOG_WINDOW
         }
@@ -3860,83 +3859,173 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         compute_covariance: false,
         ..BlockwiseFitOptions::default()
     };
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, CustomFamilyWarmStart)> = None;
-    let objective = CachedFirstOrderObjective::new(|theta: &Array1<f64>| {
-        if let Some((cached_theta, cachedcost, cachedgrad, cachedwarm)) = &last_eval
-            && cached_theta.len() == theta.len()
-            && cached_theta
-                .iter()
-                .zip(theta.iter())
-                .all(|(&a, &b)| (a - b).abs() <= 1e-12)
-        {
-            warm_cache = Some(cachedwarm.clone());
-            return Ok((*cachedcost, cachedgrad.clone()));
-        }
 
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        let adaptive_lambda_start = rho_dim;
-        let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
-        let eps = [
-            theta[adaptive_lambda_end].exp(),
-            theta[adaptive_lambda_end + 1].exp(),
-            theta[adaptive_lambda_end + 2].exp(),
-        ];
-        let adaptive_params = runtime_caches
-            .iter()
-            .enumerate()
-            .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
-                lambda: [
-                    theta[adaptive_lambda_start + cache_idx * 3].exp(),
-                    theta[adaptive_lambda_start + cache_idx * 3 + 1].exp(),
-                    theta[adaptive_lambda_start + cache_idx * 3 + 2].exp(),
-                ],
-                epsilon: eps,
-            })
-            .collect::<Vec<_>>();
-        let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-        let result = evaluate_custom_family_joint_hyper(
-            &family_eval,
-            std::slice::from_ref(&blockspec),
-            &outer_opts,
-            &rho,
-            &derivative_blocks,
-            warm_cache.as_ref(),
-            false,
-        )
-        .map_err(|err| ObjectiveEvalError::recoverable(err.to_string()))?;
-        if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
-            return Err(ObjectiveEvalError::recoverable(
-                "exact spatial adaptive objective returned non-finite values",
-            ));
-        }
-        warm_cache = Some(result.warm_start.clone());
-        last_eval = Some((
-            theta.clone(),
-            result.objective,
-            result.gradient.clone(),
-            result.warm_start,
-        ));
-        Ok((result.objective, result.gradient))
-    });
-    let mut solver = Bfgs::new(initial_theta.clone(), objective)
-        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("adaptive theta bounds must be valid"))
-        .with_tolerance(Tolerance::new(options.tol).expect("adaptive tolerance must be valid"))
-        .with_profile(opt::Profile::Aggressive)
-        .with_max_iterations(
-            MaxIterations::new(options.max_iter).expect("adaptive max_iter must be valid"),
-        );
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+    };
 
-    let solution = match solver.run() {
-        Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-        Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-        Err(e) => {
-            return Err(EstimationError::InvalidInput(format!(
-                "exact spatial adaptive outer optimization failed: {e}"
-            )));
+    struct SpatialAdaptiveOuterState {
+        warm_cache: Option<CustomFamilyWarmStart>,
+        last_eval: Option<(Array1<f64>, f64, Array1<f64>, CustomFamilyWarmStart)>,
+    }
+
+    let n_theta = initial_theta.len();
+
+    // Clamp theta to the asymmetric epsilon bounds that run_outer's symmetric
+    // rho_bound cannot express directly.
+    let clamp_theta = {
+        let lo = eps_lower;
+        let hi = eps_upper;
+        move |theta: &Array1<f64>| -> Array1<f64> {
+            let mut clamped = theta.clone();
+            for i in 0..clamped.len() {
+                clamped[i] = clamped[i].clamp(lo[i], hi[i]);
+            }
+            clamped
         }
     };
-    let theta_star = solution.final_point.clone();
+
+    let decode_theta =
+        |theta: &Array1<f64>| -> (Array1<f64>, Vec<SpatialAdaptiveTermHyperParams>) {
+            let rho = theta.slice(s![..rho_dim]).to_owned();
+            let adaptive_lambda_start = rho_dim;
+            let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
+            let eps = [
+                theta[adaptive_lambda_end].exp(),
+                theta[adaptive_lambda_end + 1].exp(),
+                theta[adaptive_lambda_end + 2].exp(),
+            ];
+            let adaptive_params = runtime_caches
+                .iter()
+                .enumerate()
+                .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
+                    lambda: [
+                        theta[adaptive_lambda_start + cache_idx * 3].exp(),
+                        theta[adaptive_lambda_start + cache_idx * 3 + 1].exp(),
+                        theta[adaptive_lambda_start + cache_idx * 3 + 2].exp(),
+                    ],
+                    epsilon: eps,
+                })
+                .collect::<Vec<_>>();
+            (rho, adaptive_params)
+        };
+
+    let outer_config = OuterConfig {
+        tolerance: options.tol,
+        max_iter: options.max_iter,
+        fd_step: 1e-4,
+        seed_config: crate::seeding::SeedConfig::default(),
+        rho_bound: 30.0,
+        heuristic_lambdas: None,
+        initial_rho: Some(initial_theta.clone()),
+    };
+
+    let mut obj = ClosureObjective {
+        state: SpatialAdaptiveOuterState {
+            warm_cache: None,
+            last_eval: None,
+        },
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: n_theta,
+        },
+        cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
+            let theta = clamp_theta(theta);
+            let (rho, adaptive_params) = decode_theta(&theta);
+            let family_eval =
+                base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+            let result = evaluate_custom_family_joint_hyper(
+                &family_eval,
+                std::slice::from_ref(&blockspec),
+                &outer_opts,
+                &rho,
+                &derivative_blocks,
+                st.warm_cache.as_ref(),
+                false,
+            )
+            .map_err(|e| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "spatial adaptive cost eval failed: {e}"
+                ))
+            })?;
+            st.warm_cache = Some(result.warm_start);
+            Ok(result.objective)
+        },
+        eval_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
+            let theta = clamp_theta(theta);
+
+            // Return cached result if theta has not moved.
+            if let Some((cached_theta, cached_cost, cached_grad, cached_warm)) = &st.last_eval {
+                if cached_theta.len() == theta.len()
+                    && cached_theta
+                        .iter()
+                        .zip(theta.iter())
+                        .all(|(&a, &b)| (a - b).abs() <= 1e-12)
+                {
+                    st.warm_cache = Some(cached_warm.clone());
+                    return Ok(OuterEval {
+                        cost: *cached_cost,
+                        gradient: cached_grad.clone(),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            }
+
+            let (rho, adaptive_params) = decode_theta(&theta);
+            let family_eval =
+                base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+            let result = evaluate_custom_family_joint_hyper(
+                &family_eval,
+                std::slice::from_ref(&blockspec),
+                &outer_opts,
+                &rho,
+                &derivative_blocks,
+                st.warm_cache.as_ref(),
+                false,
+            )
+            .map_err(|e| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "spatial adaptive eval failed: {e}"
+                ))
+            })?;
+            if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "exact spatial adaptive objective returned non-finite values".to_string(),
+                ));
+            }
+            st.warm_cache = Some(result.warm_start.clone());
+            st.last_eval = Some((
+                theta.clone(),
+                result.objective,
+                result.gradient.clone(),
+                result.warm_start,
+            ));
+            Ok(OuterEval {
+                cost: result.objective,
+                gradient: result.gradient,
+                hessian: HessianResult::Unavailable,
+            })
+        },
+        reset_fn: |st: &mut SpatialAdaptiveOuterState| {
+            st.warm_cache = None;
+            st.last_eval = None;
+        },
+    };
+
+    let outer_result = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "exact spatial adaptive regularization",
+    )
+    .map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "exact spatial adaptive outer optimization failed: {e}"
+        ))
+    })?;
+    let outer_iterations = outer_result.iterations;
+    let outer_grad_norm = outer_result.final_grad_norm;
+    let theta_star = outer_result.rho;
     let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
     let adaptive_lambda_start = rho_dim;
     let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
@@ -4135,8 +4224,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             beta,
             lambdas: full_lambdas,
             standard_deviation,
-            iterations: solution.iterations,
-            finalgrad_norm: solution.final_gradient_norm,
+            iterations: outer_iterations,
+            finalgrad_norm: outer_grad_norm,
             pirls_status: if final_fit.converged {
                 crate::pirls::PirlsStatus::Converged
             } else {
@@ -4181,7 +4270,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             epsilon_0: eps_star[0],
             epsilon_g: eps_star[1],
             epsilon_c: eps_star[2],
-            epsilon_outer_iterations: solution.iterations,
+            epsilon_outer_iterations: outer_iterations,
             mm_iterations: 0,
             converged: final_fit.converged,
             maps,

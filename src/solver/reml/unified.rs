@@ -1223,6 +1223,108 @@ impl HessianOperator for SparseCholeskyOperator {
 // sensitivity (not just the weight-only third-derivative correction).
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Block-coupled HessianOperator for joint multi-block models
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Block-coupled Hessian operator for joint multi-block models (GAMLSS, survival).
+///
+/// Wraps a [`DenseSpectralOperator`] over the full assembled joint Hessian while
+/// retaining block-structure metadata. All [`HessianOperator`] trait methods
+/// delegate to the inner spectral decomposition, ensuring a single
+/// eigendecomposition governs logdet, trace, and solve.
+///
+/// # Block structure
+///
+/// A joint model with B parameter blocks has a joint Hessian of dimension
+/// `p_total = sum_b p_b`. Each block occupies rows/columns
+/// `block_ranges[b] = (start, end)`. Smoothing parameters are mapped to blocks
+/// via these ranges when embedding per-block penalties into the joint space.
+///
+/// # When to use
+///
+/// Use `BlockCoupledOperator` whenever building an [`InnerSolution`] for a joint
+/// multi-block model. It replaces the pattern of constructing a raw
+/// `DenseSpectralOperator` and manually tracking block ranges separately.
+pub struct BlockCoupledOperator {
+    /// Inner spectral operator over the full joint Hessian.
+    inner: DenseSpectralOperator,
+    /// Block ranges: `block_ranges[b] = (start, end)` in the joint parameter space.
+    block_ranges: Vec<(usize, usize)>,
+}
+
+impl BlockCoupledOperator {
+    /// Create from an assembled joint Hessian and block ranges.
+    ///
+    /// `joint_hessian` is the full `p_total x p_total` penalized Hessian.
+    /// `block_ranges` maps each block index to `(start, end)` column ranges.
+    ///
+    /// Internally performs a single eigendecomposition of `joint_hessian`.
+    pub fn from_joint_hessian(
+        joint_hessian: &Array2<f64>,
+        block_ranges: Vec<(usize, usize)>,
+    ) -> Result<Self, String> {
+        let total_dim = joint_hessian.nrows();
+
+        // Validate block ranges do not exceed the matrix dimension.
+        if let Some(&(_, end)) = block_ranges.last() {
+            if end > total_dim {
+                return Err(format!(
+                    "BlockCoupledOperator: last block end ({end}) exceeds \
+                     matrix dimension ({total_dim})"
+                ));
+            }
+        }
+
+        let inner = DenseSpectralOperator::from_symmetric(joint_hessian)
+            .map_err(|e| format!("BlockCoupledOperator eigendecomposition: {e}"))?;
+
+        Ok(Self {
+            inner,
+            block_ranges,
+        })
+    }
+
+    /// Return the block ranges for embedding per-block penalties.
+    pub fn block_ranges(&self) -> &[(usize, usize)] {
+        &self.block_ranges
+    }
+}
+
+impl HessianOperator for BlockCoupledOperator {
+    fn logdet(&self) -> f64 {
+        self.inner.logdet()
+    }
+
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        self.inner.trace_hinv_product(a)
+    }
+
+    fn trace_hinv_h_k(
+        &self,
+        a_k: &Array2<f64>,
+        third_deriv_correction: Option<&Array2<f64>>,
+    ) -> f64 {
+        self.inner.trace_hinv_h_k(a_k, third_deriv_correction)
+    }
+
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        self.inner.solve(rhs)
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        self.inner.solve_multi(rhs)
+    }
+
+    fn active_rank(&self) -> usize {
+        self.inner.active_rank()
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Helpers for custom family → InnerSolution conversion
 // ═══════════════════════════════════════════════════════════════════════════
 

@@ -1761,29 +1761,6 @@ impl WorkingModelSurvival {
         Ok(solution)
     }
 
-    /// Evaluate the survival outer objective and gradient via the unified REML/LAML
-    /// evaluator.
-    ///
-    /// This is the unified replacement for [`Self::lamlobjective_and_rhogradient`],
-    /// using the shared `reml_laml_evaluate` infrastructure. It produces numerically
-    /// equivalent results.
-    pub fn unified_lamlobjective_and_rhogradient(
-        &self,
-        beta: &Array1<f64>,
-        state: &WorkingState,
-        rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
-        use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
-
-        let solution = self.build_inner_solution(beta, state, rho)?;
-        let rho_slice = rho.as_slice().expect("rho must be contiguous");
-
-        let result = reml_laml_evaluate(&solution, rho_slice, EvalMode::ValueAndGradient, None)
-            .map_err(EstimationError::InvalidInput)?;
-
-        let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
-        Ok((result.cost, gradient))
-    }
 }
 
 #[derive(Debug, Clone)]
