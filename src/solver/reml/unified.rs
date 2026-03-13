@@ -620,8 +620,11 @@ impl HessianOperator for DenseSpectralOperator {
         let mut result = Array1::zeros(self.n_dim);
         for (idx, &is_active) in self.active_mask.iter().enumerate() {
             if is_active {
-                let coeff = self.eigenvectors.column(idx).dot(rhs) / self.eigenvalues[idx];
-                result.scaled_add(coeff, &self.eigenvectors.column(idx).to_owned());
+                let u = self.eigenvectors.column(idx);
+                let coeff = u.dot(rhs) / self.eigenvalues[idx];
+                for row in 0..self.n_dim {
+                    result[row] += coeff * u[row];
+                }
             }
         }
         result
