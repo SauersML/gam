@@ -15,7 +15,7 @@
 //! 4. Dual-Ridge Consistency Check: Verifies that the ridge used by the inner
 //!    solver (PIRLS) matches what the outer gradient calculation assumes.
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::Array1;
 use std::fmt;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
@@ -178,14 +178,6 @@ impl GradientDiagnosticReport {
         Self::default()
     }
 
-    /// Check if any diagnostics detected issues
-    pub fn has_issues(&self) -> bool {
-        let envelope_issue = self.envelopeaudit.as_ref().is_some_and(|a| a.isviolated);
-        let bleed_issue = self.spectral_bleed.iter().any(|s| s.has_bleed);
-        let ridge_issue = self.dualridge.as_ref().is_some_and(|r| r.has_mismatch);
-        envelope_issue || bleed_issue || ridge_issue
-    }
-
     /// Generate a summary string of all issues found
     pub fn summary(&self) -> String {
         let mut lines = Vec::new();
@@ -280,131 +272,6 @@ pub fn compute_envelopeaudit(
         innerridge: ridge_used,
         outerridge: ridge_assumed,
         isviolated,
-        message,
-    }
-}
-
-// =============================================================================
-// Strategy 3: Spectral Bleed Trace
-// =============================================================================
-
-/// Compute the spectral bleed diagnostic for truncation consistency.
-///
-/// When eigenvalues are truncated in the penalty matrix (to compute log|S|_+),
-/// the gradient must include a correction term for the truncated-subspace
-/// H-weighted trace contribution. This diagnostic checks if the correction is adequate.
-///
-/// Coordinate/path requirement:
-/// - `r_k`, `u_truncated`, and `h_inv_u_truncated` must all be represented in
-///   the same coefficient frame.
-/// - If any of these are mixed between original and transformed bases, the
-///   expected-vs-applied correction comparison here will show large systematic
-///   mismatch even when algebra is otherwise correct.
-///
-/// # Arguments
-/// * `r_k` - Penalty root matrix for penalty k (R_k where S_k = R_k' R_k)
-/// * `u_truncated` - Eigenvectors of the truncated (null) subspace
-/// * `h_inv_u_truncated` - H⁻¹ U_⊥ (pre-solved for efficiency)
-/// * `lambda_k` - Current lambda for penalty k
-/// * `applied_correction` - The correction term currently applied in the gradient
-/// * `rel_threshold` - Relative threshold for flagging issues
-pub fn computespectral_bleed(
-    penalty_k: usize,
-    r_k: ArrayView2<f64>,
-    u_truncated: ArrayView2<f64>,
-    h_inv_u_truncated: ArrayView2<f64>,
-    lambda_k: f64,
-    applied_correction: f64,
-    rel_threshold: f64,
-) -> SpectralBleedResult {
-    let truncated_count = u_truncated.ncols();
-    let rank_k = r_k.nrows();
-
-    if truncated_count == 0 || rank_k == 0 {
-        return SpectralBleedResult {
-            penalty_k,
-            truncated_energy: 0.0,
-            applied_correction,
-            has_bleed: false,
-            message: format!(
-                "Penalty {} has no truncated modes, no bleed possible.",
-                penalty_k
-            ),
-        };
-    }
-
-    // Compute W_k = R_k U_⊥ (rank_k × truncated_count)
-    let r_k_cols = r_k.ncols().min(u_truncated.nrows());
-    let mut w_k = Array2::<f64>::zeros((rank_k, truncated_count));
-    for i in 0..rank_k {
-        for j in 0..truncated_count {
-            let mut sum = 0.0;
-            for l in 0..r_k_cols {
-                sum += r_k[(i, l)] * u_truncated[(l, j)];
-            }
-            w_k[(i, j)] = sum;
-        }
-    }
-
-    // Compute M_⊥ = U_⊥' H⁻¹ U_⊥ (truncated_count × truncated_count)
-    let urows = u_truncated.nrows().min(h_inv_u_truncated.nrows());
-    let mut m_perp = Array2::<f64>::zeros((truncated_count, truncated_count));
-    for i in 0..truncated_count {
-        for j in 0..truncated_count {
-            let mut sum = 0.0;
-            for r in 0..urows {
-                sum += u_truncated[(r, i)] * h_inv_u_truncated[(r, j)];
-            }
-            m_perp[(i, j)] = sum;
-        }
-    }
-
-    // Error = tr(M_⊥ * W_k' W_k) = λ_k * tr(U_⊥' H⁻¹ U_⊥ * U_⊥' S_k U_⊥)
-    let mut trace_error = 0.0;
-    for i in 0..truncated_count {
-        for j in 0..truncated_count {
-            let mut wtw_ij = 0.0;
-            for l in 0..rank_k {
-                wtw_ij += w_k[(l, i)] * w_k[(l, j)];
-            }
-            trace_error += m_perp[(i, j)] * wtw_ij;
-        }
-    }
-
-    let expected_correction = 0.5 * lambda_k * trace_error;
-    let truncated_energy = trace_error;
-
-    // Check if correction matches expected
-    let denom = expected_correction
-        .abs()
-        .max(applied_correction.abs())
-        .max(1e-8);
-    let rel_diff = (expected_correction - applied_correction).abs() / denom;
-    let has_bleed = rel_diff > rel_threshold && truncated_energy.abs() > 1e-6;
-
-    let message = if has_bleed {
-        format!(
-            "Spectral Bleed at k={}: Penalty S_{} has H-weighted trace term {:.2e} in truncated subspace. \
-             Expected correction {:.2e}, but applied {:.2e} (rel diff = {:.1}%)",
-            penalty_k,
-            penalty_k,
-            truncated_energy,
-            expected_correction,
-            applied_correction,
-            rel_diff * 100.0
-        )
-    } else {
-        format!(
-            "Spectral OK at k={}: Truncated H-weighted trace term = {:.2e}, correction matches.",
-            penalty_k, truncated_energy
-        )
-    };
-
-    SpectralBleedResult {
-        penalty_k,
-        truncated_energy,
-        applied_correction,
-        has_bleed,
         message,
     }
 }

@@ -413,9 +413,6 @@ impl<'a> RemlState<'a> {
             None => vec![0; expected_len],
         };
 
-        let penalty_count = rs_list.len();
-        let workspace = RemlWorkspace::new(penalty_count);
-
         let balanced_penalty_root = create_balanced_penalty_root(&s_list, p)?;
         let reparam_invariant = precompute_reparam_invariant(&rs_list, p)?;
         let sparse_penalty_blocks = build_sparse_penalty_blocks(&s_list, &rs_list)?.map(Arc::new);
@@ -438,7 +435,7 @@ impl<'a> RemlState<'a> {
             coefficient_lower_bounds,
             linear_constraints,
             cache_manager: EvalCacheManager::new(),
-            arena: RemlArena::new(workspace),
+            arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
         })
@@ -881,8 +878,6 @@ impl<'a> RemlState<'a> {
         }
         fact
     }
-
-    pub(super) const MIN_DMU_DETA: f64 = 1e-6;
 
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
@@ -1393,7 +1388,9 @@ impl<'a> RemlState<'a> {
             }
         };
         if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
-            return self.compute_cost_sparse_exact(p, &bundle);
+            let result =
+                self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+            return Ok(result.cost);
         }
         {
             // Validation and diagnostics (before delegating to unified evaluator).
@@ -1835,6 +1832,172 @@ impl<'a> RemlState<'a> {
             .map_err(|e| EstimationError::InvalidInput(e))
     }
 
+    /// Sparse-exact bridge: builds a `SparseCholeskyOperator` from the pre-computed
+    /// sparse Cholesky factor and delegates to the unified evaluator.
+    pub fn evaluate_unified_sparse(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{
+            DispersionHandling, GaussianDerivatives, InnerSolution, PenaltyLogdetDerivs,
+            SinglePredictorGlmDerivatives, SparseCholeskyOperator, penalty_matrix_root,
+            reml_laml_evaluate,
+        };
+
+        let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
+        })?;
+        let pirls_result = bundle.pirls_result.as_ref();
+
+        // Beta in original coordinates (sparse native).
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let p_dim = beta.len();
+
+        // Build HessianOperator from the sparse Cholesky factor.
+        let hessian_op = Box::new(SparseCholeskyOperator::new(
+            sparse.factor.clone(),
+            sparse.logdet_h,
+            p_dim,
+        ));
+
+        log::trace!(
+            "SparseCholeskyOperator: dim={}, active_rank={}",
+            hessian_op.dim(),
+            hessian_op.active_rank()
+        );
+
+        // Penalty log-determinant derivatives from sparse data.
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: sparse.logdet_s_pos,
+            first: sparse.det1_values.as_ref().clone(),
+            second: None,
+        };
+
+        // Penalty roots from s_full_list via eigendecomposition.
+        let penalty_roots: Vec<Array2<f64>> = self
+            .s_full_list
+            .iter()
+            .map(|s_k| {
+                penalty_matrix_root(s_k).unwrap_or_else(|_| {
+                    Array2::zeros((s_k.nrows(), s_k.ncols()))
+                })
+            })
+            .collect();
+
+        // Nullspace dimension.
+        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+
+        // Dispersion and derivative provider depend on family.
+        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let (dispersion, deriv_provider): (_, Box<dyn super::unified::HessianDerivativeProvider>) =
+            if is_gaussian_identity {
+                (
+                    DispersionHandling::ProfiledGaussian,
+                    Box::new(GaussianDerivatives),
+                )
+            } else {
+                (
+                    DispersionHandling::Fixed {
+                        phi: 1.0,
+                        include_logdet_h: true,
+                        include_logdet_s: true,
+                    },
+                    Box::new(SinglePredictorGlmDerivatives {
+                        c_array: pirls_result.solve_c_array.clone(),
+                        d_array: Some(pirls_result.solve_d_array.clone()),
+                        x_transformed: self.x().clone(),
+                    }),
+                )
+            };
+
+        // TK correction (non-Gaussian only): use sparse leverages.
+        let tk_correction = if !is_gaussian_identity {
+            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
+            for j in 0..p_dim {
+                let mut e_j = Array1::<f64>::zeros(p_dim);
+                e_j[j] = 1.0;
+                if let Ok(solved) =
+                    crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
+                {
+                    h_inv_diag[j] = solved[j];
+                }
+            }
+            let mut d_vec = pirls_result.solve_c_array.clone();
+            for val in &mut d_vec {
+                if !val.is_finite() {
+                    *val = 0.0;
+                }
+            }
+            let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
+            let correction = -h_inv_diag
+                .iter()
+                .zip(third_deriv.iter())
+                .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
+                .sum::<f64>()
+                / 6.0;
+            if correction.is_finite() {
+                correction
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // Firth log-det.
+        let firth_logdet = if self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+        {
+            pirls_result.firth_log_det().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let log_likelihood = -0.5 * pirls_result.deviance;
+        let n_observations = self.y.len();
+
+        let inner_solution = InnerSolution {
+            log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            hessian_op,
+            beta,
+            penalty_roots,
+            penalty_logdet,
+            deriv_provider,
+            tk_correction,
+            tk_gradient: None,
+            firth_logdet,
+            firth_gradient: None,
+            n_observations,
+            nullspace_dim: mp,
+            dispersion,
+            precomputed_h_k_corrections: None,
+        };
+
+        // Prior cost/gradient.
+        let prior = if mode == super::unified::EvalMode::ValueOnly {
+            let pc = self.compute_soft_priorcost(rho);
+            if pc.abs() > 0.0 {
+                Some((pc, Array1::zeros(rho.len())))
+            } else {
+                None
+            }
+        } else {
+            let pc = self.compute_soft_priorcost(rho);
+            let pg = self.compute_soft_priorgrad(rho);
+            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
+                Some((pc, pg))
+            } else {
+                None
+            }
+        };
+
+        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))
+    }
+
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.arena
             .lastgradient_used_stochastic_fallback
@@ -1851,7 +2014,12 @@ impl<'a> RemlState<'a> {
             }
         };
         if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
-            return self.compute_gradient_sparse_exact(p, &bundle);
+            let result = self.evaluate_unified_sparse(
+                p,
+                &bundle,
+                super::unified::EvalMode::ValueAndGradient,
+            )?;
+            return Ok(result.gradient.unwrap());
         }
         let result =
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;

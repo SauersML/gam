@@ -488,14 +488,13 @@ impl<'a> RemlState<'a> {
             let bundle = pert_state.obtain_eval_bundle(&rho)?;
             (
                 pert_state.compute_cost(&rho)?,
-                pert_state.compute_gradient_with_bundle(&rho, &bundle)?,
+                pert_state.compute_gradient(&rho)?,
                 pert_state.computemulti_psigradientwith_bundle(&rho, &bundle, &eff_dirs)?,
             )
         } else {
-            let bundle = self.obtain_eval_bundle(&rho)?;
             (
                 self.compute_cost(&rho)?,
-                self.compute_gradient_with_bundle(&rho, &bundle)?,
+                self.compute_gradient(&rho)?,
                 Array1::<f64>::zeros(0),
             )
         };
