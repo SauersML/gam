@@ -498,3 +498,228 @@ When inequality constraints are active (e.g., monotonicity via I-splines forcing
   - **Ignore**: Keep the full-space Firth penalty but project its gradient into the free subspace. This is what we currently do for the LAML gradient (Q14a). Is it valid for the Firth *prior*?
 
 (e) The Firth gradient $\nabla_\beta \Phi = \frac{1}{2}\text{tr}\bigl((X^\top W X + S)^{-1} \frac{\partial}{\partial \beta_j}(X^\top W X)\bigr)$ involves the derivative of working weights $\frac{\partial W}{\partial \beta_j}$. At a constraint boundary $\beta_j = 0$, the working weight derivative may be discontinuous (if the link function has a kink at the boundary). Does this cause numerical issues, and is the barrier approach from Q14(b) sufficient to regularize it?
+
+---
+
+## 8. Derivation Requests
+
+These are not questions — they are requests for **complete, explicit formulas** that we will implement directly. Please write out every term; do not leave anything implicit.
+
+### D1: Unified LAML gradient and Hessian for joint $(\rho, \psi)$ — implementable form
+
+We need the **complete, term-by-term** formulas for $\nabla_\theta V$ and $\nabla^2_\theta V$ when $\theta = (\rho_1, \ldots, \rho_K, \psi_1, \ldots, \psi_J)$, written in a form suitable for a single evaluation loop over all coordinates.
+
+**Deliverable**: A unified algorithm (pseudocode acceptable) that, given:
+- $\hat\beta$, $H$ (factorized), $R_k$ (penalty roots), $X$
+- For each $\rho_k$: $A_k = \lambda_k R_k^\top R_k$ (computed internally)
+- For each $\psi_j$: family-provided objects $v_j^{(\text{fix})}$, $g_j$, $\dot{H}_j^{(\text{fix})}$, $(\log|S|_+)'_j$
+- A derivative provider: $\text{correction}(u) \to D_\beta H_L[-u]$, $\text{second\_correction}(u, v, w) \to D_\beta H_L[w] + D^2_\beta H_L[-v, -u]$
+
+produces the full $(K+J) \times 1$ gradient and $(K+J) \times (K+J)$ Hessian.
+
+Specifically, write out:
+1. The gradient entry for $\psi_j$ (analogous to the $\rho_k$ entry in Section 3)
+2. The $(\rho_k, \psi_j)$ cross-Hessian entry
+3. The $(\psi_i, \psi_j)$ Hessian entry
+4. Which terms require the **new** callback $D_\beta\dot{H}_j^{(\text{fix})}[\cdot]$ from Q4, and which use the existing correction interface
+
+### D2: Family derivative reference tables
+
+For each family below, derive the following objects **explicitly** as functions of the linear predictor $\eta$, the response $y$, and prior weight $w$:
+
+- $w_i = -\frac{\partial^2\ell_i}{\partial\eta_i^2}$ (working weight, a.k.a. negative expected/observed Hessian)
+- $c_i = \frac{\partial w_i}{\partial\eta_i}$ (first derivative of working weight — needed for $D_\beta H_L[u]$)
+- $d_i = \frac{\partial^2 w_i}{\partial\eta_i^2}$ (second derivative — needed for $D^2_\beta H_L[u,v]$)
+- $\ell_i, \;\nabla_{\eta_i}\ell_i$ (log-likelihood and score — needed for HMC)
+
+**Families to cover**:
+
+(a) **Poisson** with log link: $y_i \sim \text{Poi}(\mu_i)$, $\mu_i = e^{\eta_i}$
+
+(b) **Poisson** with identity link: $\mu_i = \eta_i$ (boundary issues when $\mu_i \leq 0$)
+
+(c) **Gamma** with log link: $y_i \sim \text{Gamma}(\alpha, \alpha/\mu_i)$, $\mu_i = e^{\eta_i}$, with known or profiled shape $\alpha$
+
+(d) **Gamma** with inverse link: $\mu_i = 1/\eta_i$
+
+(e) **Negative binomial** with log link: $y_i \sim \text{NB}(r, p_i)$ where $\mu_i = e^{\eta_i}$, with known or profiled overdispersion $r$
+
+(f) **Beta** with logit link: $y_i \sim \text{Beta}(\mu_i\phi, (1-\mu_i)\phi)$ where $\mu_i = \text{sigmoid}(\eta_i)$ and $\phi$ is the precision
+
+(g) **Tweedie** with log link: $y_i \sim \text{Tw}_p(\mu_i, \phi)$ where $\mu_i = e^{\eta_i}$ and $p$ is the Tweedie power parameter. (The variance function is $V(\mu) = \mu^p$.)
+
+For each, also state whether Fisher scoring ($w_i = E[-\partial^2\ell/\partial\eta^2]$) equals observed information ($w_i = -\partial^2\ell/\partial\eta^2$), i.e., whether the family is in the canonical exponential family with the given link.
+
+### D3: $D_\beta H_L[u]$ for each family — the "correction" formula
+
+The directional derivative of the likelihood Hessian along direction $u$ is:
+$$D_\beta H_L[u] = X^\top\text{diag}(c \odot (Xu))\,X$$
+
+for a single-predictor GLM (where $c_i = \partial w_i/\partial\eta_i$ and $\eta = X\beta$). This formula is correct when using observed information. For Fisher scoring, there may be additional terms.
+
+**Deliverable**: For each family in D2, confirm or correct this formula. Specifically:
+
+(a) When the working weight uses Fisher (expected) information instead of observed, is the correction formula $D_\beta H_L^{\text{Fisher}}[u] = X^\top\text{diag}(c^{\text{Fisher}} \odot (Xu))\,X$ still valid with a modified $c^{\text{Fisher}}_i$? Write out $c^{\text{Fisher}}_i$ for each family.
+
+(b) For **non-canonical links** (e.g., Poisson with identity link, Gamma with log link), the general formula is:
+$$D_\beta H_L[u] = \frac{d}{d\epsilon}\bigg|_0 \bigl[-\nabla^2_\beta\ell(\beta + \epsilon u)\bigr]$$
+Write this out in terms of $g'^{-1}$, $g''^{-1}$, $g'''^{-1}$ (link function derivatives), $V(\mu)$, $V'(\mu)$ (variance function and its derivative), and the direction $Xu$.
+
+### D4: NUTS posterior gradient for all families
+
+The NUTS sampler needs:
+$$\nabla_\beta\bigl[\ell(y|\beta) - \tfrac{1}{2}\beta^\top S\beta\bigr]$$
+
+For Bernoulli-logit and Gaussian-identity, this is trivial. For other families, write out $\nabla_\beta\ell$ explicitly. This is simpler than the LAML machinery — it's just the score function $X^\top(y - \mu)$ (or its generalization) — but we need it for:
+
+(a) Poisson (log link)
+(b) Gamma (log link)
+(c) Negative binomial (log link)
+(d) Beta (logit link)
+(e) Survival (Royston-Parmar): The log-likelihood is $\ell_i = \delta_i[\eta_{1i} + \log s_i] - e^{\eta_{1i}} + e^{\eta_{0i}}$ where $\eta_1$, $\eta_0$ are exit/entry log-cumulative-hazards and $s = d^\top\beta$ is the log-hazard derivative. Write out $\nabla_\beta\ell$.
+(f) Gaussian location-scale (GAMLSS): Joint gradient $(\nabla_{\beta_\mu}\ell,\; \nabla_{\beta_\sigma}\ell)$
+
+For each, also state whether the gradient can be written as $X^\top r$ for some residual vector $r$ (which enables efficient sparse computation), or requires a more complex form.
+
+### D5: ALO diagnostics for multi-predictor models
+
+For a standard single-predictor GAM, the ALO leave-one-out approximation uses leverages $h_i = x_i^\top H^{-1} w_i x_i$ from the hat matrix.
+
+For a **GAMLSS** with $B$ blocks (predictors $\eta_b = X_b\beta_b$, $b = 1,\ldots,B$), the joint design matrix is $\mathcal{X} = [X_1 \mid X_2 \mid \cdots \mid X_B]$, and the joint working weight matrix $\mathcal{W}$ has off-diagonal blocks (coupling between predictors).
+
+**Deliverable**:
+(a) Write out the joint hat matrix $\mathcal{H} = \mathcal{X}(\mathcal{X}^\top\mathcal{W}\mathcal{X} + S)^{-1}\mathcal{X}^\top\mathcal{W}$ and the resulting leverage $h_i$ for observation $i$. Is $h_i$ a scalar (trace of a block), or a matrix?
+
+(b) The ALO approximation for the leave-one-out linear predictor is:
+$$\tilde\eta_i^{(-i)} \approx \hat\eta_i - \frac{h_i}{1 - h_i}\cdot(\text{something involving residuals})$$
+Write out the multi-predictor version. When there are $B$ predictors, each observation has $B$ linear predictors. Is the ALO correction applied per-predictor, or jointly?
+
+(c) What is the correct formula for the approximate LOO log-likelihood $\sum_i \ell_i(\tilde\eta_i^{(-i)})$ in the multi-predictor case?
+
+### D6: Corrected covariance $V_\beta^*$ for joint models — explicit formula
+
+The Wood et al. (2016) smoothing-parameter-uncertainty correction is:
+$$V_\beta^* \approx V_\beta + J_\beta\, V_\rho\, J_\beta^\top$$
+
+where $J_\beta = \frac{\partial\hat\beta}{\partial\rho}$ (the Jacobian of the mode with respect to smoothing parameters) and $V_\rho = (-\nabla^2_\rho V)^{-1}$ (the inverse outer Hessian).
+
+For a **joint model** with blocks $\alpha = (\beta_1, \ldots, \beta_B)$ and extended hyperparameters $\theta = (\rho, \psi)$:
+
+**Deliverable**:
+(a) Write out $J_\alpha = \frac{\partial\hat\alpha}{\partial\theta}$ for the joint case. The mode response is $\alpha_i = -H^{-1}g_i$ where $H$ is the joint $(p_1 + \cdots + p_B) \times (p_1 + \cdots + p_B)$ Hessian. Does the correction decompose block-by-block, or must it be computed jointly?
+
+(b) For the $\psi$ columns of $J_\alpha$: the mode response $\alpha_j^{(\psi)} = -H^{-1}g_j^{(\psi)}$ involves the family-specific $g_j^{(\psi)}$. Is this already computed as part of the LAML gradient (and thus free), or does it require additional work?
+
+(c) The corrected covariance for a **single block** $\beta_b$ is a submatrix of $V_\alpha^*$. Write out the extraction formula, identifying which cross-block terms contribute.
+
+### D7: Survival location-scale third-derivative correction
+
+For a standard Royston-Parmar survival model, the third-derivative correction $D_\beta H_L[u]$ involves differentiating the Hessian of:
+$$\text{NLL}_i = e^{\eta_{1i}} - e^{\eta_{0i}} - \delta_i[\eta_{1i} + \log(d_i^\top\beta)]$$
+
+This gives terms involving $e^{\eta}\cdot(Xu)$ and $\delta_i/(d^\top\beta)^2\cdot(d^\top u)$ (see survival.rs in our codebase).
+
+**For survival location-scale** (where both the baseline hazard $h_0(t)$ and a scale parameter $\sigma(x)$ are modeled jointly), the joint coefficient vector is $\alpha = (\beta_h, \beta_\sigma)$ and the NLL depends on both linear predictors.
+
+**Deliverable**: Derive $D_\alpha H_L[u]$ for the survival location-scale model, showing all cross-block terms (how perturbing $\beta_h$ affects the $(\sigma, \sigma)$ block, etc.). This would enable unifying survival location-scale through the `HessianDerivativeProvider`.
+
+### D8: Charbonnier penalty derivative provider
+
+The Charbonnier penalty is $P(\beta) = \sum_m \psi(t_m)$ where $t_m = (A\beta)_m$ for a differencing operator $A$, and $\psi(t) = \epsilon(\sqrt{t^2 + \epsilon^2} - \epsilon)$.
+
+The MM surrogate replaces this with $\frac{1}{2}\beta^\top A^\top W_{MM} A\,\beta$ where $W_{MM} = \text{diag}(\epsilon / (2\sqrt{t_m^2 + \epsilon^2}))$.
+
+The `HessianDerivativeProvider` needs $D_\beta S_{\text{eff}}[u]$ — the directional derivative of the effective penalty Hessian along direction $u$. Since $W_{MM}$ depends on $\beta$ (through $t_m = (A\beta)_m$):
+
+$$D_\beta[A^\top W_{MM} A][u] = A^\top\,\text{diag}\Bigl(\frac{\partial w_m}{\partial t_m}\cdot(Au)_m\Bigr)\,A$$
+
+where $\frac{\partial w_m}{\partial t_m} = -\epsilon\,t_m / (2(t_m^2 + \epsilon^2)^{3/2})$.
+
+**Deliverable**:
+(a) Confirm this formula is correct.
+(b) Write out the second directional derivative $D^2_\beta[A^\top W_{MM}A][u, v]$ (needed for the outer Hessian).
+(c) When the "true" penalty Hessian $D^2_\beta P = A^\top\text{diag}(\epsilon^3/(t_m^2+\epsilon^2)^{3/2})\,A$ is used instead of the MM surrogate, the derivative provider needs $D_\beta[D^2_\beta P][u]$. This involves the **fifth** derivative of $\psi$. Write it out.
+
+---
+
+## 9. Novel Method Requests
+
+These are things we believe are **possible but not yet derived** — we want the math team to invent/derive them.
+
+### N1: Stochastic trace estimation for LAML gradients at biobank scale
+
+For $p > 50{,}000$ (biobank models with many smooth terms), even sparse selected-inversion is expensive. The LAML gradient requires $K$ traces $\text{tr}(H^{-1}\dot{H}_k)$.
+
+Hutchinson's stochastic trace estimator uses random vectors $z \sim \mathcal{N}(0, I)$:
+$$\text{tr}(H^{-1}\dot{H}_k) \approx \frac{1}{M}\sum_{m=1}^{M} z_m^\top H^{-1}\dot{H}_k\,z_m$$
+
+Each sample requires one linear solve $H^{-1}z_m$ (which can be done via PCG for sparse $H$).
+
+**Request**: Derive:
+(a) The bias and variance of the stochastic LAML gradient estimator as a function of $M$ (number of probe vectors). How many probes are needed for the outer Newton step to remain reliable?
+
+(b) Can the **same** probe vectors be reused across all $K$ smoothing parameters (solving $H^{-1}z_m$ once, then dotting with each $\dot{H}_k z_m$)? If so, the cost is $O(M)$ solves regardless of $K$.
+
+(c) For the Hessian $\nabla^2_\theta V$, the double-trace term $\text{tr}(H^{-1}\dot{H}_j H^{-1}\dot{H}_i)$ requires a more complex estimator. Derive it: is $\frac{1}{M}\sum_m (z_m^\top H^{-1}\dot{H}_j H^{-1}\dot{H}_i z_m)$ unbiased? What is its variance?
+
+(d) Can probe-vector reuse extend to the Hessian? The cost would be $O(M \cdot K)$ matrix-vector products $\dot{H}_k(H^{-1}z_m)$ (cheap if $\dot{H}_k$ is sparse/structured) plus $O(M)$ solves.
+
+### N2: Natural gradient for the outer optimizer
+
+The outer LAML objective $V(\theta)$ is optimized over $\theta = \log\lambda$ using Newton/BFGS. But the parameterization $\theta = \log\lambda$ is arbitrary — should we use the **natural gradient** (Fisher information metric on the space of penalty matrices)?
+
+The Fisher information for $\theta$ in the marginal model $p(y|\theta)$ is:
+$$\mathcal{I}_{ij}(\theta) = -E\Bigl[\frac{\partial^2\log p(y|\theta)}{\partial\theta_i\partial\theta_j}\Bigr] \approx -\frac{\partial^2 V}{\partial\theta_i\partial\theta_j}$$
+
+So the natural gradient is just the Newton step — which we already compute. But:
+
+**Request**:
+(a) Is the LAML Hessian $\nabla^2_\theta V$ a good approximation to the Fisher information of the marginal model? Under what conditions does this break down?
+
+(b) For the Gaussian REML case, is there a **closed-form** Fisher information for $\theta$ that doesn't require the full Hessian? (E.g., using the REML log-likelihood directly.)
+
+(c) Would a **trust-region** method on the natural-gradient metric (ARC with Fisher metric) have better convergence properties than our current Euclidean ARC? Especially near the boundary where some $\lambda_k \to 0$ or $\lambda_k \to \infty$?
+
+### N3: Exact marginal likelihood via Pólya-Gamma augmentation
+
+For Bernoulli-logit models, the Pólya-Gamma augmentation gives:
+$$p(y|\beta) = \prod_i \frac{e^{\kappa_i\eta_i}}{2\cosh(\eta_i/2)} = \prod_i e^{\kappa_i\eta_i}\int_0^\infty e^{-\omega_i\eta_i^2/2}\,p(\omega_i)\,d\omega_i$$
+
+where $\kappa_i = y_i - 1/2$ and $\omega_i \sim PG(1, 0)$. Marginalizing over $\beta$ (Gaussian prior) and $\omega$ (PG prior) gives:
+$$p(y|\lambda) = \int \mathcal{N}(\beta; 0, S^{-1}) \prod_i p(y_i|\eta_i)\,d\beta$$
+
+This integral can be approximated by Gibbs sampling (alternating $\beta|\omega$ and $\omega|\beta$), or by a deterministic quadrature over $\omega$.
+
+**Request**:
+(a) Is there a deterministic $O(p^3)$ algorithm for $\log p(y|\lambda)$ in the Bernoulli-logit case using Pólya-Gamma? (The conditional $\beta|\omega$ is Gaussian, so $\log p(y|\lambda) = \log\int\prod_i p(\omega_i) \cdot \mathcal{N}(y_\kappa; 0, X S^{-1}X^\top + \Omega^{-1})\,d\omega$.) Can the $\omega$-integral be handled by Gauss-Laguerre quadrature?
+
+(b) If exact marginal likelihood is available, its gradient $\nabla_\rho\log p(y|\lambda)$ replaces LAML entirely. Is the gradient of the PG integral tractable?
+
+(c) Does this extend beyond Bernoulli-logit? For Poisson-log, there are analogous data augmentation schemes (e.g., using gamma augmentation). For probit, the Albert-Chib truncated normal augmentation gives an exact marginal. Which families admit exact (or near-exact) marginal likelihood computation?
+
+### N4: Model comparison via LAML
+
+The LAML value at its optimum, $V(\hat\theta)$, approximates $-\log p(y|\mathcal{M})$ — the negative log marginal likelihood for model $\mathcal{M}$ (choice of smooth terms, family, link).
+
+**Request**:
+(a) What is the quality of this approximation? Under what conditions does LAML give a valid Bayes factor between models? (E.g., comparing a Gaussian GAM to a Gamma GAM, or comparing TPS to B-spline bases.)
+
+(b) For nested models (e.g., dropping a smooth term is equivalent to $\lambda_k \to \infty$), does the LAML ratio reduce to a known test statistic? Is there a connection to the effective degrees of freedom?
+
+(c) The LAML includes a $-\frac{1}{2}\log|S|_+$ term that depends on the penalty normalization convention. If two models have different penalty scales, the LAML values are not directly comparable. What is the correct normalization to make LAML values comparable across models?
+
+### N5: GPU-friendly reformulation of the LAML gradient
+
+The LAML gradient requires:
+1. $K$ linear solves $v_k = H^{-1}(A_k\hat\beta)$ — $O(Kp^2)$ or $O(Kp)$ with CG
+2. $K$ correction evaluations $D_\beta H_L[-v_k]$ — each is $O(np^2)$ (forming a $p \times p$ matrix)
+3. $K$ traces $\text{tr}(H^{-1}\dot{H}_k)$ — $O(p^2)$ each if $H^{-1}$ is precomputed
+
+For GPU execution, the bottleneck is the sequential loop over $k = 1,\ldots,K$.
+
+**Request**:
+(a) Can the $K$ corrections be **batched**? Since $D_\beta H_L[-v_k] = X^\top\text{diag}(c \odot X v_k)\,X$, and the $v_k$ are known, the $K$ weight vectors $c \odot X v_k$ can be assembled as a $n \times K$ matrix. Then all $K$ corrections can be computed as a single batched matrix triple product. Write out this batched formulation.
+
+(b) Can the $K$ traces be computed as a single matrix product? Note that $\text{tr}(H^{-1}\dot{H}_k) = \text{tr}(H^{-1}A_k) + \text{tr}(H^{-1}D_\beta H_L[-v_k])$. The first term is $\lambda_k\text{tr}(H^{-1}S_k)$. If we stack the corrections into one operation, can the entire gradient be a single $O(Kp^2 + np^2)$ computation?
+
+(c) For the Hessian, the double-trace $\text{tr}(H^{-1}\dot{H}_j H^{-1}\dot{H}_i)$ requires materializing or implicitly applying $K^2$ pairs. Is there a low-rank or batched formulation that avoids the $K^2$ scaling?
