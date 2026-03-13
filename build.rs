@@ -2175,6 +2175,29 @@ fn scan_for_noop_touch_patterns() -> Vec<String> {
                     continue;
                 }
 
+                // Post-filter: remove false positives from multi-line let bindings
+                // where cargo fmt splits "let x =\n    expr;" across two lines.
+                if !collector.violations.is_empty() {
+                    let stripped_str = String::from_utf8_lossy(&stripped);
+                    let lines: Vec<&str> = stripped_str.split('\n').collect();
+                    collector.violations.retain(|v| {
+                        if let Some(line_no) =
+                            v.split(':').next().and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if line_no >= 2 {
+                                let prev = lines
+                                    .get(line_no - 2)
+                                    .map(|l: &&str| l.trim())
+                                    .unwrap_or("");
+                                if prev.ends_with('=') {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    });
+                }
+
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     allviolations.push(error_message);
                 }
