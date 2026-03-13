@@ -1501,7 +1501,11 @@ impl WorkingModelSurvival {
     /// This is the directional derivative of the unpenalized NLL Hessian w.r.t.
     /// beta along direction `u_k = -H^{-1} A_k beta_hat`. The returned matrix B
     /// satisfies `dH/drho_k = A_k + B`.
-    fn survival_hessian_derivative_correction(
+    ///
+    /// Called via [`SurvivalDerivProvider`] which adapts the sign convention
+    /// from the unified `HessianDerivativeProvider` trait (positive `v_k`) to
+    /// the negated `u_k` used here.
+    pub(crate) fn survival_hessian_derivative_correction(
         &self,
         beta: &Array1<f64>,
         u_k: &Array1<f64>,
@@ -1634,9 +1638,9 @@ impl WorkingModelSurvival {
     /// Build an [`InnerSolution`](crate::estimate::reml::unified::InnerSolution) from
     /// the survival working state, suitable for the unified REML/LAML evaluator.
     ///
-    /// This is the "Option B" bridge: instead of implementing `HessianDerivativeProvider`
-    /// for the complex survival likelihood, we precompute the third-derivative corrections
-    /// for each penalty block and embed them in the `InnerSolution`.
+    /// Uses a [`SurvivalDerivProvider`] to supply third-derivative Hessian
+    /// corrections through the unified `HessianDerivativeProvider` trait,
+    /// rather than precomputing corrections for each penalty block.
     pub fn build_inner_solution(
         &self,
         beta: &Array1<f64>,
@@ -1700,42 +1704,10 @@ impl WorkingModelSurvival {
         // (penalty_term includes both lambda-weighted penalty and stabilization ridge.)
         let penalty_quadratic = 2.0 * state.penalty_term;
 
-        // --- Precompute third-derivative corrections ---
-        let precomputed_corrections = if k_count > 0 {
-            let factor = state
-                .hessian
-                .factorize()
-                .map_err(EstimationError::InvalidInput)?;
-
-            let mut corrections = Vec::with_capacity(k_count);
-            for block in &self.penalties.blocks {
-                let lambda = block.lambda;
-                let start = block.range.start;
-                let end = block.range.end;
-
-                // A_k beta = lambda_k * S_k * beta_block, embedded in full space.
-                let b_block = beta.slice(ndarray::s![start..end]).to_owned();
-                let a_k_beta_block = block.matrix.dot(&b_block).mapv(|v| lambda * v);
-                let mut a_k_beta = Array1::<f64>::zeros(p);
-                a_k_beta
-                    .slice_mut(ndarray::s![start..end])
-                    .assign(&a_k_beta_block);
-
-                // u_k = -H^{-1} A_k beta (implicit derivative of beta w.r.t. rho_k).
-                let u_k = factor
-                    .solve(&a_k_beta)
-                    .map_err(|e| EstimationError::InvalidInput(e.to_string()))?
-                    .mapv(|v| -v);
-
-                let correction = self.survival_hessian_derivative_correction(beta, &u_k)?;
-                corrections.push(Some(correction));
-            }
-            Some(corrections)
-        } else {
-            None
-        };
-
         let n_observations = self.nrows();
+
+        // --- Derivative provider for third-derivative Hessian corrections ---
+        let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
 
         let builder = InnerSolutionBuilder::new(
             log_likelihood,
@@ -1752,15 +1724,71 @@ impl WorkingModelSurvival {
             },
         );
 
-        let solution = if let Some(corrections) = precomputed_corrections {
-            builder.precomputed_corrections(corrections).build()
-        } else {
-            builder.build()
-        };
+        let solution = builder
+            .deriv_provider(Box::new(provider))
+            .build();
 
         Ok(solution)
     }
 
+    /// Evaluate the survival outer objective and gradient via the unified REML/LAML
+    /// evaluator.
+    ///
+    /// This is the unified replacement for [`Self::lamlobjective_and_rhogradient`],
+    /// using the shared `reml_laml_evaluate` infrastructure. It produces numerically
+    /// equivalent results.
+    pub fn unified_lamlobjective_and_rhogradient(
+        &self,
+        beta: &Array1<f64>,
+        state: &WorkingState,
+        rho: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
+        use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
+
+        let solution = self.build_inner_solution(beta, state, rho)?;
+        let rho_slice = rho.as_slice().expect("rho must be contiguous");
+
+        let result = reml_laml_evaluate(&solution, rho_slice, EvalMode::ValueAndGradient, None)
+            .map_err(EstimationError::InvalidInput)?;
+
+        let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
+        Ok((result.cost, gradient))
+    }
+}
+
+/// Derivative provider that adapts survival third-derivative Hessian corrections
+/// to the unified [`HessianDerivativeProvider`](crate::estimate::reml::unified::HessianDerivativeProvider)
+/// trait.
+///
+/// The unified trait supplies `v_k = H^{-1}(A_k beta_hat)` (positive sign),
+/// whereas the survival engine's
+/// [`survival_hessian_derivative_correction`](WorkingModelSurvival::survival_hessian_derivative_correction)
+/// expects `u_k = -v_k`. This provider handles the sign conversion.
+pub(crate) struct SurvivalDerivProvider {
+    model: WorkingModelSurvival,
+    beta: Array1<f64>,
+}
+
+impl SurvivalDerivProvider {
+    pub(crate) fn new(model: WorkingModelSurvival, beta: Array1<f64>) -> Self {
+        Self { model, beta }
+    }
+}
+
+impl crate::estimate::reml::unified::HessianDerivativeProvider for SurvivalDerivProvider {
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+        // The trait provides v_k = H^{-1}(A_k beta_hat) (positive).
+        // The survival method expects u_k = -H^{-1} A_k beta_hat = -v_k.
+        let u_k = -v_k;
+        match self.model.survival_hessian_derivative_correction(&self.beta, &u_k) {
+            Ok(correction) => Some(correction),
+            Err(_) => None,
+        }
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
