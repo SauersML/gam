@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::estimate::FitResult;
+use crate::estimate::{FitGeometry, FitResult};
 use crate::faer_ndarray::FaerArrayView;
 use crate::linalg::utils::StableSolver;
 use crate::pirls;
@@ -393,6 +393,185 @@ fn compute_alo_diagnostics_from_pirls_impl(
         pred_identity: eta_hat,
         leverage: aii,
         fisherweights: base.finalweights.clone(),
+    })
+}
+
+/// Model-agnostic input for ALO diagnostics.
+///
+/// Any model with a design matrix, penalized Hessian, and IRLS geometry can
+/// compute ALO leverages and leave-one-out predictions. This decouples ALO
+/// from the single-block PIRLS solver and enables diagnostics for GAMLSS,
+/// survival, and joint models.
+pub struct AloInput<'a> {
+    /// Dense design matrix X (n × p).
+    pub design: &'a Array2<f64>,
+    /// Penalized Hessian H = X'WX + S(λ) at convergence (p × p).
+    pub penalized_hessian: &'a Array2<f64>,
+    /// IRLS working weights at convergence (n).
+    pub working_weights: &'a Array1<f64>,
+    /// IRLS working response at convergence (n).
+    pub working_response: &'a Array1<f64>,
+    /// Fitted linear predictor η̂ (n).
+    pub eta: &'a Array1<f64>,
+    /// Offset vector (n). Pass zeros if no offset.
+    pub offset: &'a Array1<f64>,
+    /// Link function (for phi determination).
+    pub link: LinkFunction,
+    /// Dispersion parameter φ. For non-Gaussian families this is 1.0.
+    pub phi: f64,
+    /// Optional null-space projector E (rank × p) for sandwich SE.
+    /// When `None`, sandwich SE is set equal to Bayesian SE.
+    pub penalty_null_space: Option<&'a Array2<f64>>,
+    /// Ridge added to the Hessian for logdet surface.
+    pub ridge: f64,
+}
+
+impl<'a> AloInput<'a> {
+    /// Build an `AloInput` from `FitGeometry` and associated vectors.
+    pub fn from_geometry(
+        geom: &'a FitGeometry,
+        design: &'a Array2<f64>,
+        eta: &'a Array1<f64>,
+        offset: &'a Array1<f64>,
+        link: LinkFunction,
+        phi: f64,
+    ) -> Self {
+        Self {
+            design,
+            penalized_hessian: &geom.penalized_hessian,
+            working_weights: &geom.working_weights,
+            working_response: &geom.working_response,
+            eta,
+            offset,
+            link,
+            phi,
+            penalty_null_space: None,
+            ridge: 0.0,
+        }
+    }
+}
+
+/// Compute ALO diagnostics from model-agnostic inputs.
+///
+/// This is the generalized entry point that works for any model type.
+/// For standard single-block GAMs, prefer `compute_alo_diagnostics_from_fit`
+/// which automatically extracts the PIRLS geometry (including sandwich SE).
+pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, EstimationError> {
+    let x_dense = input.design;
+    let n = x_dense.nrows();
+    let p = x_dense.ncols();
+    let w = input.working_weights;
+
+    let factor = StableSolver::new("alo penalized hessian")
+        .factorize(input.penalized_hessian)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+
+    let xt = x_dense.t();
+    let phi = input.phi;
+    let ridge = input.ridge;
+
+    let e_rank = input
+        .penalty_null_space
+        .map(|e| e.nrows())
+        .unwrap_or(0);
+
+    let mut aii = Array1::<f64>::zeros(n);
+    let mut se_bayes = Array1::<f64>::zeros(n);
+    let mut se_sandwich = Array1::<f64>::zeros(n);
+
+    let block_cols = 8192usize;
+    let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
+
+    for chunk_start in (0..n).step_by(block_cols) {
+        let chunk_end = (chunk_start + block_cols).min(n);
+        let width = chunk_end - chunk_start;
+
+        rhs_chunk_buf
+            .slice_mut(s![.., ..width])
+            .assign(&xt.slice(s![.., chunk_start..chunk_end]));
+
+        let rhs_chunkview = rhs_chunk_buf.slice(s![.., ..width]);
+        let rhs_chunk = FaerArrayView::new(&rhs_chunkview);
+        let s_chunk = factor.solve(rhs_chunk.as_ref());
+
+        let mut es_chunk_storage = FaerMat::<f64>::zeros(e_rank, width);
+        if e_rank > 0 {
+            if let Some(e) = input.penalty_null_space {
+                let eview = FaerArrayView::new(e);
+                matmul(
+                    es_chunk_storage.as_mut(),
+                    Accum::Replace,
+                    eview.as_ref(),
+                    s_chunk.as_ref(),
+                    1.0,
+                    Par::Seq,
+                );
+            }
+        }
+
+        for local_col in 0..width {
+            let obs = chunk_start + local_col;
+            let xrow = x_dense.row(obs);
+            let mut x_hinv_x = 0.0f64;
+            let mut s_norm2 = 0.0f64;
+            for row in 0..p {
+                let sval = s_chunk[(row, local_col)];
+                let xval = xrow[row];
+                x_hinv_x = sval.mul_add(xval, x_hinv_x);
+                s_norm2 = sval.mul_add(sval, s_norm2);
+            }
+            let ai = w[obs].max(0.0) * x_hinv_x;
+            let mut es_norm2 = 0.0f64;
+            if e_rank > 0 {
+                for r in 0..e_rank {
+                    let v = es_chunk_storage[(r, local_col)];
+                    es_norm2 = v.mul_add(v, es_norm2);
+                }
+            }
+            aii[obs] = ai;
+
+            let var_bayes = bayesvar_eta(phi, x_hinv_x);
+            let var_sandwich = if e_rank > 0 {
+                sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2)
+            } else {
+                var_bayes
+            };
+            se_bayes[obs] = var_bayes.max(0.0).sqrt();
+            se_sandwich[obs] = var_sandwich.max(0.0).sqrt();
+        }
+    }
+
+    let eta_hat = input.eta;
+    let z = input.working_response;
+    let offset = input.offset;
+
+    let mut eta_tilde = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let denom_raw = 1.0 - aii[i];
+        if denom_raw <= 0.0 || !denom_raw.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
+                aii[i], denom_raw
+            )));
+        }
+        eta_tilde[i] = alo_eta_updatewith_offset(eta_hat[i], z[i], offset[i], aii[i]);
+        if !eta_tilde[i].is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO eta_tilde is not finite at row {i}: eta_tilde={}",
+                eta_tilde[i]
+            )));
+        }
+    }
+
+    Ok(AloDiagnostics {
+        eta_tilde,
+        se_bayes,
+        se_sandwich,
+        pred_identity: eta_hat.clone(),
+        leverage: aii,
+        fisherweights: w.clone(),
     })
 }
 
