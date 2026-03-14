@@ -6788,7 +6788,7 @@ fn freeze_term_collectionspec(
                     nullspace_order,
                     identifiability_transform,
                     input_scales: meta_scales,
-                    ..
+                    aniso_log_scales: meta_aniso,
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
@@ -6801,6 +6801,7 @@ fn freeze_term_collectionspec(
                     },
                     None => SpatialIdentifiability::None,
                 };
+                s.aniso_log_scales = meta_aniso.clone();
                 *input_scales = meta_scales.clone();
             }
             (
