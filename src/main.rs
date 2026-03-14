@@ -1061,6 +1061,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         )
     };
     progress.advance_workflow(4);
+    print_spatial_aniso_scales(&resolvedspec);
 
     let frozenspec = freeze_term_collectionspec(&resolvedspec, &design)?;
     let mut saved_fit = fit.clone();
@@ -1243,6 +1244,8 @@ fn run_fitwith_predict_noise(
             "model fit complete | family={} | outer_iter={} | converged={}",
             FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
         );
+        print_spatial_aniso_scales(&solved.meanspec_resolved);
+        print_spatial_aniso_scales(&solved.noisespec_resolved);
         if let Some(out) = args.out.as_ref() {
             progress.set_stage("fit", "writing gaussian location-scale model");
             let beta_mean = fit
@@ -1393,6 +1396,8 @@ fn run_fitwith_predict_noise(
         "model fit complete | family={} | outer_iter={} | converged={}",
         FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
     );
+    print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
+    print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
     if let Some(out) = args.out.as_ref() {
         progress.set_stage("fit", "writing binomial location-scale model");
         let beta_threshold = fit
@@ -6628,6 +6633,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         coefficients,
         edf_blocks,
         continuous_order,
+        anisotropic_scales: build_anisotropic_scales_rows(model.resolved_termspec.as_ref()),
         diagnostics,
         smooth_plots,
         alo: alo_data,
@@ -7634,6 +7640,71 @@ fn collect_linear_smooth_overlapwarnings(
 fn emit_spatial_smooth_usagewarnings(stage: &str, warnings: &[String]) {
     for warning in warnings {
         eprintln!("WARNING [{stage}]: {warning}");
+    }
+}
+
+/// Build anisotropic-scale report rows from an optional resolved spec.
+fn build_anisotropic_scales_rows(
+    spec: Option<&TermCollectionSpec>,
+) -> Vec<report::AnisotropicScalesRow> {
+    use gam::smooth::{get_spatial_aniso_log_scales, get_spatial_length_scale};
+    let Some(spec) = spec else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
+        let Some(eta) = get_spatial_aniso_log_scales(spec, term_idx) else {
+            continue;
+        };
+        if eta.is_empty() {
+            continue;
+        }
+        let Some(ls) = get_spatial_length_scale(spec, term_idx) else {
+            continue;
+        };
+        let axes = eta
+            .iter()
+            .enumerate()
+            .map(|(a, &eta_a)| {
+                let length_a = ls * (-eta_a).exp();
+                let kappa_a = (1.0 / ls) * eta_a.exp();
+                (a, eta_a, length_a, kappa_a)
+            })
+            .collect();
+        rows.push(report::AnisotropicScalesRow {
+            term_name: term.name.clone(),
+            global_length_scale: ls,
+            axes,
+        });
+    }
+    rows
+}
+
+/// Print learned per-axis anisotropic length scales for spatial terms to stdout.
+fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
+    use gam::smooth::{get_spatial_aniso_log_scales, get_spatial_length_scale};
+    for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
+        let Some(eta) = get_spatial_aniso_log_scales(spec, term_idx) else {
+            continue;
+        };
+        if eta.is_empty() {
+            continue;
+        }
+        let Some(ls) = get_spatial_length_scale(spec, term_idx) else {
+            continue;
+        };
+        println!(
+            "[spatial-kappa] term {} (\"{}\"): anisotropic length scales (global length_scale={:.4})",
+            term_idx, term.name, ls
+        );
+        for (a, &eta_a) in eta.iter().enumerate() {
+            let length_a = ls * (-eta_a).exp();
+            let kappa_a = (1.0 / ls) * eta_a.exp();
+            println!(
+                "  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
+                a, eta_a, length_a, kappa_a
+            );
+        }
     }
 }
 

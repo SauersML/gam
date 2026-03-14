@@ -18,6 +18,7 @@ pub struct ReportInput {
     pub coefficients: Vec<CoefficientRow>,
     pub edf_blocks: Vec<EdfBlockRow>,
     pub continuous_order: Vec<ContinuousOrderRow>,
+    pub anisotropic_scales: Vec<AnisotropicScalesRow>,
     pub diagnostics: Option<DiagnosticsInput>,
     pub smooth_plots: Vec<SmoothPlotData>,
     pub alo: Option<AloData>,
@@ -45,6 +46,13 @@ pub struct ContinuousOrderRow {
     pub nu: Option<f64>,
     pub kappa2: Option<f64>,
     pub status: String,
+}
+
+pub struct AnisotropicScalesRow {
+    pub term_name: String,
+    pub global_length_scale: f64,
+    /// Per-axis: (axis_index, eta, per_axis_length_scale, per_axis_kappa)
+    pub axes: Vec<(usize, f64, f64, f64)>,
 }
 
 pub struct DiagnosticsInput {
@@ -412,6 +420,41 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
         )
     };
 
+    // Anisotropic spatial length scales section
+    let aniso_section = if input.anisotropic_scales.is_empty() {
+        String::new()
+    } else {
+        let rows = input
+            .anisotropic_scales
+            .iter()
+            .flat_map(|row| {
+                let mut out = vec![format!(
+                    "<tr><td colspan=\"5\" style=\"font-weight:600\">{} (global \u{2113}={:.4})</td></tr>",
+                    esc(&row.term_name),
+                    row.global_length_scale
+                )];
+                for &(axis, eta, length, kappa) in &row.axes {
+                    out.push(format!(
+                        "<tr><td style=\"padding-left:2em\">axis {axis}</td>\
+                         <td class=\"num\">{eta:+.4}</td>\
+                         <td class=\"num\">{length:.4}</td>\
+                         <td class=\"num\">{kappa:.4}</td>\
+                         <td></td></tr>"
+                    ));
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<section class=\"card\" id=\"sec-aniso-scales\">\n\
+             <h2>Anisotropic Spatial Length Scales</h2>\n\
+             <div class=\"table-wrap\"><table>\n\
+             <thead><tr><th>Term / Axis</th><th>&eta;</th><th>\u{2113}</th><th>&kappa;</th><th></th></tr></thead>\n\
+             <tbody>{rows}</tbody>\n</table></div>\n</section>"
+        )
+    };
+
     // Diagnostics plots grid
     let diagnostics_section = if input.diagnostics.is_some() {
         let has_cal = input
@@ -671,6 +714,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
 {edf_section}
 
 {continuous_section}
+{aniso_section}
 {diagnostics_section}
 {smooth_section}
 {alo_section}
@@ -691,6 +735,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
         coef_body = coef_body,
         edf_section = edf_section,
         continuous_section = continuous_section,
+        aniso_section = aniso_section,
         diagnostics_section = diagnostics_section,
         smooth_section = smooth_section,
         alo_section = alo_section,
