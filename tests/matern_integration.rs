@@ -265,7 +265,6 @@ fn simulate_matern_aniso_3d(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>, A
 /// Verifies the fit succeeds, coefficients are finite, and the resolved spec
 /// contains the correct aniso_log_scales dimension with sum-to-zero constraint.
 #[test]
-#[ignore]
 fn matern_3d_aniso_fits_successfully() {
     let n = 700usize;
     let d = 3usize;
