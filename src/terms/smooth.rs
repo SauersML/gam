@@ -1987,11 +1987,11 @@ pub fn build_smooth_design(
                 })?;
                 // Inject input scales into metadata for downstream storage.
                 if let BasisMetadata::ThinPlate {
-                    input_scales: ref mut ms,
+                    input_scales,
                     ..
-                } = result.metadata
+                } = &mut result.metadata
                 {
-                    *ms = scales;
+                    *input_scales = scales;
                 }
                 result
             }
@@ -2023,11 +2023,11 @@ pub fn build_smooth_design(
                 };
                 let mut result = build_matern_basis(x.view(), spec)?;
                 if let BasisMetadata::Matern {
-                    input_scales: ref mut ms,
+                    input_scales,
                     ..
-                } = result.metadata
+                } = &mut result.metadata
                 {
-                    *ms = scales;
+                    *input_scales = scales;
                 }
                 result
             }
@@ -2067,11 +2067,11 @@ pub fn build_smooth_design(
                 }
                 let mut result = build_duchon_basis(x.view(), &spec_local)?;
                 if let BasisMetadata::Duchon {
-                    input_scales: ref mut ms,
+                    input_scales,
                     ..
-                } = result.metadata
+                } = &mut result.metadata
                 {
-                    *ms = scales;
+                    *input_scales = scales;
                 }
                 result
             }
@@ -7675,7 +7675,7 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
     for &term_idx in spatial_terms {
         let aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx);
         let dim = get_spatial_feature_dim(resolvedspec, term_idx);
-        if let (Some(ref eta), Some(d)) = (&aniso, dim) {
+        if let (Some(eta), Some(d)) = (&aniso, dim) {
             if eta.len() == d && d > 1 {
                 if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                     data,
@@ -8287,6 +8287,11 @@ fn coordinate_search_spatial(
     options: &SpatialLengthScaleOptimizationOptions,
     callback: &mut dyn FnMut(SpatialSearchAction<'_>) -> Result<f64, String>,
 ) -> Result<(), String> {
+    log::warn!(
+        "[coordinate_search_spatial] Using derivative-free coordinate search over {} parameters. \
+         This is slow — analytic REML derivatives should be wired through ext_coords instead.",
+        initial_theta.len()
+    );
     let mut current_theta = initial_theta.clone();
     let mut current_cost = initial_cost;
     let mut any_improved = false;
@@ -8586,7 +8591,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
         if let (
             SmoothBasisSpec::Matern {
                 spec: s,
-                ref mut input_scales,
+                input_scales,
                 ..
             },
             BasisMetadata::Matern {
@@ -8610,7 +8615,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
         if let (
             SmoothBasisSpec::Duchon {
                 spec: s,
-                ref mut input_scales,
+                input_scales,
                 ..
             },
             BasisMetadata::Duchon {
@@ -8633,7 +8638,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
         }
         if let (
             SmoothBasisSpec::ThinPlate {
-                ref mut input_scales,
+                input_scales,
                 ..
             },
             BasisMetadata::ThinPlate {

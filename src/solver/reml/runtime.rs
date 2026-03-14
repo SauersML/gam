@@ -2313,6 +2313,328 @@ impl<'a> RemlState<'a> {
             .map_err(|e| EstimationError::InvalidInput(e))
     }
 
+    /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
+    /// injected into the `InnerSolution`.
+    ///
+    /// This is the primary bridge for joint [ρ, ψ] optimization of anisotropic
+    /// spatial smooths. It:
+    /// 1. Obtains the PIRLS bundle at the current ρ (with the design already
+    ///    rebuilt for the current ψ).
+    /// 2. Builds `HyperCoord` ext_coords from the supplied `DirectionalHyperParam`
+    ///    list via `build_tau_unified_objects`.
+    /// 3. Builds the full `InnerSolution` (mirroring `evaluate_unified`), injects
+    ///    the ext_coords, and calls `reml_laml_evaluate`.
+    ///
+    /// The caller is responsible for rebuilding the `RemlState` with the design
+    /// X(ψ) and penalties S(ψ) corresponding to the current ψ values before
+    /// calling this method.
+    pub fn evaluate_unified_with_psi_ext(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let bundle = self.obtain_eval_bundle(rho)?;
+
+        // Build ext_coords from the hyper_dirs using the same machinery as τ.
+        let (ext_coords, ext_pair_fn, rho_ext_pair_fn) = if !hyper_dirs.is_empty() {
+            let (coords, epf, repf) = self.build_tau_unified_objects(rho, hyper_dirs)?;
+            (coords, Some(epf), Some(repf))
+        } else {
+            (Vec::new(), None, None)
+        };
+
+        // Now delegate to the standard evaluate_unified path but inject ext_coords.
+        // We replicate the assembly from evaluate_unified here to be able to pass
+        // ext_coords into the InnerSolution.
+        self.evaluate_unified_with_ext_from_bundle(
+            rho, &bundle, mode, ext_coords, ext_pair_fn, rho_ext_pair_fn,
+        )
+    }
+
+    /// Assemble the full `InnerSolution` from a pre-obtained PIRLS bundle
+    /// (mirroring `evaluate_unified`) and inject ext_coords, then call
+    /// `reml_laml_evaluate`.
+    ///
+    /// This duplicates the assembly logic of `evaluate_unified` so that
+    /// ext_coords can be threaded into the builder. The alternative — making
+    /// `evaluate_unified` generic over an optional ext_coords — would touch
+    /// every existing call site, so this targeted method is preferred.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_unified_with_ext_from_bundle(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        ext_coords: Vec<super::unified::HyperCoord>,
+        ext_coord_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+        rho_ext_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives,
+            HessianOperator, InnerSolutionBuilder, PenaltyLogdetDerivs,
+            SinglePredictorGlmDerivatives, reml_laml_evaluate,
+        };
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+
+        // Constraint projection.
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
+            (
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                pirls_result.reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_total.as_ref().clone(),
+                pirls_result.reparam_result.e_transformed.clone(),
+            )
+        };
+
+        // HessianOperator.
+        let hessian_op: Box<dyn HessianOperator> = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from PIRLS Hessian (psi-ext): {e}"
+                ))
+            })?,
+        );
+
+        // Penalty logdet.
+        let (penalty_rank, log_det_s) =
+            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
+        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
+            pirls_result
+                .reparam_result
+                .rs_transformed
+                .iter()
+                .map(|r| r.dot(z))
+                .collect()
+        } else {
+            pirls_result.reparam_result.rs_transformed.clone()
+        };
+        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+            let lambdas = rho.mapv(f64::exp);
+            let (_, det2) = self.structural_penalty_logdet_derivatives(
+                &penalty_roots,
+                &lambdas,
+                penalty_rank,
+                ridge_passport.penalty_logdet_ridge(),
+            )?;
+            Some(det2)
+        } else {
+            None
+        };
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: log_det_s,
+            first: pirls_result.reparam_result.det1.clone(),
+            second: det2,
+        };
+
+        // Beta.
+        let beta = if let Some(z) = free_basis_opt.as_ref() {
+            z.t()
+                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+        } else {
+            pirls_result.beta_transformed.as_ref().clone()
+        };
+
+        let p_eff_dim = h_for_operator.ncols();
+        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
+
+        // Derivative provider.
+        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let firth_active_for_derivs = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+            && free_basis_opt.is_none();
+        let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
+            if is_gaussian_identity {
+                Box::new(GaussianDerivatives)
+            } else {
+                let c_array = pirls_result.solve_c_array.clone();
+                let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
+                    let x_dense = pirls_result.x_transformed.to_dense();
+                    crate::linalg::matrix::DesignMatrix::Dense(x_dense.dot(z))
+                } else {
+                    pirls_result.x_transformed.clone()
+                };
+                let base = SinglePredictorGlmDerivatives {
+                    c_array,
+                    d_array: Some(pirls_result.solve_d_array.clone()),
+                    x_transformed,
+                };
+                if firth_active_for_derivs {
+                    if let Some(firth_op) = bundle.firth_dense_operator.clone() {
+                        Box::new(super::unified::FirthAwareGlmDerivatives { base, firth_op })
+                    } else {
+                        Box::new(base)
+                    }
+                } else {
+                    Box::new(base)
+                }
+            };
+
+        // Dispersion.
+        let dispersion = if is_gaussian_identity {
+            DispersionHandling::ProfiledGaussian
+        } else {
+            DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            }
+        };
+
+        // TK correction.
+        let tk_correction = if !is_gaussian_identity {
+            let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
+                Self::projectwith_basis(bundle.h_eff.as_ref(), z)
+            } else {
+                bundle.h_eff.as_ref().clone()
+            };
+            self.tierney_kadane_laml_correction(
+                pirls_result,
+                &h_eff_eval,
+                free_basis_opt.as_ref(),
+            )?
+        } else {
+            0.0
+        };
+
+        // Firth log-det.
+        let firth_logdet = if self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+        {
+            pirls_result.firth_log_det().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let log_likelihood = -0.5 * pirls_result.deviance;
+
+        // Firth gradient & Hessian (ρ-only part; ψ-Firth flows through ext_coords).
+        let (firth_gradient, firth_hessian) = if firth_logdet != 0.0
+            && free_basis_opt.is_none()
+            && mode != super::unified::EvalMode::ValueOnly
+        {
+            if let Some(firth_op) = bundle.firth_dense_operator.as_ref() {
+                let k = penalty_roots.len();
+                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+                let mut a_k_betas = Vec::with_capacity(k);
+                let mut v_ks = Vec::with_capacity(k);
+                let mut a_k_matrices = Vec::with_capacity(k);
+                for idx in 0..k {
+                    let r_k = &penalty_roots[idx];
+                    let lam_k = lambdas[idx];
+                    let r_beta = r_k.dot(&beta);
+                    let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
+                    let v_k = hessian_op.solve(&a_k_beta);
+                    let mut a_k = r_k.t().dot(r_k);
+                    a_k *= lam_k;
+                    a_k_betas.push(a_k_beta);
+                    v_ks.push(v_k);
+                    a_k_matrices.push(a_k);
+                }
+                let mut fg = Array1::<f64>::zeros(k);
+                for idx in 0..k {
+                    let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
+                    let dir_k = firth_op.direction_from_deta(deta_k);
+                    let dhphi_k = firth_op.hphi_direction(&dir_k);
+                    fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
+                }
+                let fh = if mode == super::unified::EvalMode::ValueGradientHessian {
+                    Some(super::unified::compute_firth_hessian_contribution(
+                        firth_op,
+                        &*hessian_op,
+                        &beta,
+                        &v_ks,
+                        &a_k_matrices,
+                        &a_k_betas,
+                        &a_k_matrices,
+                    ))
+                } else {
+                    None
+                };
+                (Some(fg), fh)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // Barrier config.
+        let barrier_config = if free_basis_opt.is_none() {
+            pirls_result
+                .linear_constraints_transformed
+                .as_ref()
+                .and_then(Self::barrier_config_from_constraints)
+        } else {
+            None
+        };
+
+        // Build InnerSolution with ext_coords injected.
+        let n_observations = self.y.len();
+        let mut builder = InnerSolutionBuilder::new(
+            log_likelihood,
+            pirls_result.stable_penalty_term,
+            beta,
+            n_observations,
+            hessian_op,
+            penalty_roots,
+            penalty_logdet,
+            dispersion,
+        )
+        .deriv_provider(deriv_provider)
+        .tk(tk_correction, None)
+        .firth(firth_logdet, firth_gradient)
+        .firth_hessian(firth_hessian)
+        .nullspace_dim_override(nullspace_dim)
+        .barrier_config(barrier_config)
+        .ext_coords(ext_coords);
+
+        if let Some(f) = ext_coord_pair_fn {
+            builder = builder.ext_coord_pair_fn(f);
+        }
+        if let Some(f) = rho_ext_pair_fn {
+            builder = builder.rho_ext_pair_fn(f);
+        }
+
+        let inner_solution = builder.build();
+
+        // Prior (ρ-only; ψ coordinates are unconstrained soft-prior-free).
+        let prior = if mode == super::unified::EvalMode::ValueOnly {
+            let pc = self.compute_soft_priorcost(rho);
+            if pc.abs() > 0.0 {
+                Some((pc, Array1::zeros(rho.len()), None))
+            } else {
+                None
+            }
+        } else {
+            let pc = self.compute_soft_priorcost(rho);
+            let pg = self.compute_soft_priorgrad(rho);
+            let ph = if mode == super::unified::EvalMode::ValueGradientHessian {
+                self.compute_soft_priorhess(rho)
+            } else {
+                None
+            };
+            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
+                Some((pc, pg, ph))
+            } else {
+                None
+            }
+        };
+
+        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))
+    }
+
     /// Shared tail for EFS: builds InnerSolution, computes cost (ValueOnly),
     /// and returns EFS step vector via `compute_efs_update`.
     fn evaluate_unified_tail_efs(
