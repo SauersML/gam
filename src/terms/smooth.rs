@@ -408,6 +408,13 @@ pub(crate) struct SpatialPsiDerivative {
     /// matrix per active penalty. Only stored for pairs where this entry's
     /// axis a < b_axis (upper triangle); the symmetric pair is the transpose.
     pub aniso_cross_penalties: Option<Vec<(usize, Vec<Array2<f64>>)>>,
+    /// Optional implicit design-derivative operator (shared across all axes
+    /// in the same aniso group). When present, `x_psi_local` and
+    /// `x_psi_psi_local` may be zero-sized, and design-derivative matvecs
+    /// should go through this operator using `implicit_axis` as the axis index.
+    pub implicit_operator: Option<std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>>,
+    /// Which axis in the implicit operator this entry corresponds to.
+    pub implicit_axis: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -568,6 +575,7 @@ impl SpatialLogKappaCoords {
     }
 
     /// Backward-compatible: reconstruct from theta tail assuming all-isotropic.
+    #[allow(dead_code)]
     fn from_theta_tail(theta: &Array1<f64>, start: usize) -> Self {
         Self::new(theta.slice(s![start..]).to_owned())
     }
@@ -7649,6 +7657,8 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         aniso_group_id: None,
         aniso_cross_designs: None,
         aniso_cross_penalties: None,
+        implicit_operator: None,
+        implicit_axis: 0,
     }))
 }
 
@@ -7733,7 +7743,14 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         }
         _ => return Ok(None),
     };
-    let d = aniso_result.design_first.len();
+    // Get number of axes from either the dense design_first or the implicit operator.
+    let d = if !aniso_result.design_first.is_empty() {
+        aniso_result.design_first.len()
+    } else if let Some(ref op) = aniso_result.implicit_operator {
+        op.n_axes()
+    } else {
+        0
+    };
     if d == 0 {
         return Ok(None);
     }
@@ -7746,18 +7763,39 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         ..(smooth_start + smooth_term.coeff_range.end);
     let num_penalties = aniso_result.penalties_first[0].len();
     let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
+
+    // Check if this result uses implicit operators (design matrices empty).
+    let use_implicit = aniso_result.implicit_operator.is_some();
+    let implicit_op_arc = aniso_result.implicit_operator.as_ref().map(|op| {
+        std::sync::Arc::new(op.clone())
+    });
+
     // Pre-compute cross-derivative design matrices: d2X/(d psi_a d psi_b) = t * s_a * s_b
     // using projected+padded components (element-wise product in design space).
-    let t_proj = &aniso_result.design_cross_t;
-    let s_proj = &aniso_result.s_components_projected;
+    // Only needed for the dense path.
+    let t_proj = if use_implicit { None } else { Some(&aniso_result.design_cross_t) };
+    let s_proj = if use_implicit { None } else { Some(&aniso_result.s_components_projected) };
 
     let mut entries = Vec::with_capacity(d);
     for a in 0..d {
-        let x_psi_local = aniso_result.design_first[a].clone();
-        let x_psi_psi_local = aniso_result.design_second_diag[a].clone();
-        if x_psi_local.ncols() != smooth_term.coeff_range.len() {
-            return Ok(None);
-        }
+        let (x_psi_local, x_psi_psi_local) = if use_implicit {
+            // Implicit path: materialize per-axis design derivatives on the fly
+            // from the implicit operator. We materialize ONE axis at a time
+            // (O(n * p) peak), not all D simultaneously (which would be O(n * p * D)).
+            // This is the memory-efficient middle ground: the implicit operator
+            // stores compact O(n * k * D) radial jets, and we reconstruct each
+            // (n x p) matrix when needed then discard it.
+            let op = implicit_op_arc.as_ref().unwrap();
+            let x_first = op.materialize_first(a);
+            let x_second = op.materialize_second_diag(a);
+        } else {
+            let x_first = aniso_result.design_first[a].clone();
+            let x_second = aniso_result.design_second_diag[a].clone();
+            if x_first.ncols() != smooth_term.coeff_range.len() {
+                return Ok(None);
+            }
+            (x_first, x_second)
+        };
         let s_psi_components = aniso_result.penalties_first[a].clone();
         let s_psi_psi_components = aniso_result.penalties_second_diag[a].clone();
         let p_smooth = smooth_term.coeff_range.len();
@@ -7770,15 +7808,24 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         // Build cross-design entries for other axes b != a in this group.
         // These will be indexed by (b, cross_matrix) where b is the axis
         // offset within the d-entry block.
-        let mut cross_designs = Vec::with_capacity(d - 1);
-        for b in 0..d {
-            if b == a {
-                continue;
+        // For the implicit path, cross designs are computed on the fly, so we
+        // skip pre-materialization.
+        let cross_designs = if use_implicit {
+            Vec::new()
+        } else {
+            let t_proj_ref = t_proj.unwrap();
+            let s_proj_ref = s_proj.unwrap();
+            let mut cd = Vec::with_capacity(d - 1);
+            for b in 0..d {
+                if b == a {
+                    continue;
+                }
+                // d2X/(d psi_a d psi_b) = t * s_a * s_b (element-wise in projected space)
+                let cross = t_proj_ref * &s_proj_ref[a] * &s_proj_ref[b];
+                cd.push((b, cross));
             }
-            // d2X/(d psi_a d psi_b) = t * s_a * s_b (element-wise in projected space)
-            let cross = t_proj * &s_proj[a] * &s_proj[b];
-            cross_designs.push((b, cross));
-        }
+            cd
+        };
         // Build cross-penalty entries for this axis a.
         // For each pair (a, b) with a < b in penalties_cross_pairs, store it
         // under axis a with key b. For pairs (c, a) with c < a, store it
@@ -7810,8 +7857,10 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             s_psi_psi_local,
             s_psi_psi_components_local: s_psi_psi_components,
             aniso_group_id: Some(aniso_group_id),
-            aniso_cross_designs: Some(cross_designs),
+            aniso_cross_designs: if cross_designs.is_empty() { None } else { Some(cross_designs) },
             aniso_cross_penalties: cross_penalties_opt,
+            implicit_operator: implicit_op_arc.clone(),
+            implicit_axis: a,
         });
     }
     Ok(Some(entries))

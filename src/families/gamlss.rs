@@ -27,7 +27,7 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, get_spatial_length_scale,
+    freeze_spatial_length_scale_terms_from_design,
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };

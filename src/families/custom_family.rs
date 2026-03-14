@@ -933,10 +933,10 @@ struct OuterObjectiveEvalResult {
     gradient: Array1<f64>,
     outer_hessian: Option<Array2<f64>>,
     warm_start: ConstrainedWarmStart,
-    inner: BlockwiseInnerResult,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum JointHyperCoord {
     Rho {
         block_idx: usize,
@@ -951,6 +951,7 @@ enum JointHyperCoord {
 }
 
 impl JointHyperCoord {
+    #[allow(dead_code)]
     fn global_idx(&self) -> usize {
         match self {
             Self::Rho { global_idx, .. } | Self::Psi { global_idx, .. } => *global_idx,
@@ -1928,6 +1929,7 @@ fn stable_logdet_with_ridge_policy(
     }
 }
 
+#[allow(dead_code)]
 fn logdet_trace_inverse_with_ridge_policy(
     matrix_on_logdet_surface: &Array2<f64>,
     ridge_floor: f64,
@@ -3182,7 +3184,6 @@ fn joint_outer_evaluate(
         gradient: grad,
         outer_hessian,
         warm_start: warm,
-        inner: inner.clone(),
     })
 }
 
@@ -3534,7 +3535,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         gradient: grad,
         outer_hessian: None,
         warm_start: warm,
-        inner,
     })
 }
 
@@ -3585,6 +3585,7 @@ fn outerobjective_andgradient<F: CustomFamily>(
     Ok((obj, grad, warm))
 }
 
+#[allow(dead_code)]
 fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -4304,6 +4305,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                 a,
                 g,
                 b_mat: b_mat.to_owned(),
+                b_operator: None,
                 ld_s,
                 b_depends_on_beta: !hessian_beta_independent,
                 // ψ coordinates move the design/likelihood, so b_mat need not
@@ -4974,6 +4976,7 @@ fn synchronized_states_from_flat_beta<F: CustomFamily>(
     Ok(synced)
 }
 
+#[allow(dead_code)]
 fn flatten_joint_hyper_coords(
     specs: &[ParameterBlockSpec],
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
@@ -5025,6 +5028,7 @@ fn flatten_joint_hyper_coords(
 //   V_i += 0.5 beta^T S_i beta,
 //   g_i += S_i beta,
 //   H_i += S_i.
+#[allow(dead_code)]
 fn joint_theta_penalty_first_matrix(
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
@@ -5106,6 +5110,7 @@ fn joint_theta_penalty_first_matrix(
 //   V_ij += 0.5 beta^T S_ij beta,
 //   g_ij += S_ij beta,
 //   H_ij += S_ij.
+#[allow(dead_code)]
 fn joint_theta_penaltysecond_matrix(
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
@@ -5243,6 +5248,7 @@ fn joint_theta_penaltysecond_matrix(
     }
 }
 
+#[allow(dead_code)]
 fn post_update_tangent_basis_for_block<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -5311,6 +5317,7 @@ fn post_update_tangent_basis_for_block<F: CustomFamily>(
     Ok(Some(u.slice(ndarray::s![.., 0..rank]).to_owned()))
 }
 
+#[allow(dead_code)]
 fn joint_post_update_tangent_basis<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
