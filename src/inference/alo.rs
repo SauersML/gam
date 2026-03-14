@@ -491,6 +491,490 @@ pub fn compute_alo_diagnostics_from_pirls(
     compute_alo_diagnostics_from_pirls_impl(base, y, link)
 }
 
+// ---------------------------------------------------------------------------
+// Multi-block ALO for multi-predictor models (GAMLSS, survival, joint)
+// ---------------------------------------------------------------------------
+
+/// Diagnostics returned by multi-block ALO.
+#[derive(Debug, Clone)]
+pub struct MultiBlockAloDiagnostics {
+    /// Corrected linear predictors η̃^{(-i)} for each observation.
+    /// Outer length = n_obs, inner length = n_blocks (B).
+    pub eta_tilde: Vec<Array1<f64>>,
+    /// Per-observation leverage tr(H_ii) where H_ii is the B×B hat-matrix block.
+    pub leverage: Array1<f64>,
+}
+
+/// Model-agnostic input for multi-predictor ALO diagnostics.
+///
+/// Generalises [`AloInput`] to models with B > 1 linear predictors per
+/// observation (e.g. location-scale GAMLSS with B=2, or survival models
+/// with time-dependent predictors).
+///
+/// # Mathematical setup
+///
+/// For observation i the per-observation Jacobian is a B × p_tot block matrix
+/// X_i whose b-th row is the i-th row of `block_designs[b]`.  The joint
+/// hat-matrix block is
+///
+///   H_ii = X_i H⁻¹ X_iᵀ W_i     (B × B)
+///
+/// where H = Σ_i X_iᵀ W_i X_i + S is the total penalized Hessian and W_i
+/// is the B × B per-observation weight matrix (negative Hessian of the
+/// log-likelihood w.r.t. the B predictors at observation i).
+///
+/// The ALO leave-one-out correction is
+///
+///   η̃_i^{(-i)} ≈ η̂_i + (I_B − H_ii)⁻¹ H_ii W_i⁻¹ s_i
+///
+/// where s_i = ∇_{η_i} NLL_i(η̂_i) is the B-dimensional score vector.
+/// For B = 1 this reduces to the classical scalar ALO formula.
+pub struct MultiBlockAloInput<'a> {
+    /// Number of observations.
+    pub n_obs: usize,
+    /// Number of predictors per observation (B).
+    pub n_blocks: usize,
+    /// B design matrices, each n_obs × p_b.  The total parameter count is
+    /// p_tot = Σ_b p_b.
+    pub block_designs: &'a [Array2<f64>],
+    /// Inverse of the penalized Hessian, H⁻¹ (p_tot × p_tot).
+    pub penalized_hessian_inv: &'a Array2<f64>,
+    /// Per-observation weight matrices W_i (B × B).  Length = n_obs.
+    pub block_weights: Vec<Array2<f64>>,
+    /// Per-observation score vectors s_i = ∇_{η_i} NLL_i.  Length = n_obs,
+    /// each entry is B-dimensional.
+    pub scores: Vec<Array1<f64>>,
+    /// Fitted linear predictor vectors η̂_i.  Length = n_obs, each entry is
+    /// B-dimensional.
+    pub eta_hat: Vec<Array1<f64>>,
+}
+
+/// Compute multi-block ALO diagnostics: corrected η̃ and leverages.
+///
+/// # Optimisation note
+///
+/// The dominant cost is forming X_i H⁻¹ X_iᵀ for every observation.
+/// Rather than forming the B × p_tot row-block X_i and multiplying naïvely,
+/// we precompute for each block b the matrix
+///
+///   Q_b = H⁻¹ X_bᵀ      (p_tot × n)
+///
+/// Then the (a, b) entry of the B × B matrix X_i H⁻¹ X_iᵀ is simply
+///
+///   (X_i H⁻¹ X_iᵀ)_{a,b} = x_{a,i}ᵀ Q_b[:,i]
+///                           = Σ_k  X_a[i,k] · Q_b[k,i]
+///
+/// where x_{a,i} is the i-th row of block-design a.  This turns the per-
+/// observation work from O(B · p_tot²) into O(B² · p_tot), and the
+/// precomputation is O(B · p_tot² · n) total via a single blocked solve.
+pub fn compute_multiblock_alo(
+    input: &MultiBlockAloInput,
+) -> Result<MultiBlockAloDiagnostics, EstimationError> {
+    let n = input.n_obs;
+    let b = input.n_blocks;
+    let p_tot = input.penalized_hessian_inv.nrows();
+
+    // --- Validate dimensions ---
+    if input.block_designs.len() != b {
+        return Err(EstimationError::InvalidInput(format!(
+            "MultiBlockAloInput: expected {} block designs, got {}",
+            b,
+            input.block_designs.len()
+        )));
+    }
+
+    // Verify total column count matches p_tot.
+    let col_sum: usize = input.block_designs.iter().map(|d| d.ncols()).sum();
+    if col_sum != p_tot {
+        return Err(EstimationError::InvalidInput(format!(
+            "MultiBlockAloInput: total design columns ({}) != penalized_hessian_inv size ({})",
+            col_sum, p_tot
+        )));
+    }
+
+    // --- Precompute Q_b = H⁻¹ X_bᵀ for each block ---
+    // Each Q_b is p_tot × n.
+    let q_blocks: Vec<Array2<f64>> = {
+        let mut blocks = Vec::with_capacity(b);
+        for blk in 0..b {
+            let x_b = &input.block_designs[blk];
+            debug_assert_eq!(x_b.nrows(), n);
+            // Q_b = H⁻¹ X_bᵀ  via direct multiplication (H⁻¹ is already provided).
+            let p_b = x_b.ncols();
+            let mut q = Array2::<f64>::zeros((p_tot, n));
+            // q[:,i] = H⁻¹ · x_b[i,:]ᵀ
+            // Batched: Q = H⁻¹ · X_bᵀ
+            for i in 0..n {
+                for k in 0..p_tot {
+                    let mut acc = 0.0f64;
+                    // Column offset of block b in the joint parameter vector.
+                    let col_offset: usize =
+                        input.block_designs[..blk].iter().map(|d| d.ncols()).sum();
+                    for j in 0..p_b {
+                        acc += input.penalized_hessian_inv[(k, col_offset + j)] * x_b[(i, j)];
+                    }
+                    q[(k, i)] = acc;
+                }
+            }
+            blocks.push(q);
+        }
+        blocks
+    };
+
+    // Precompute column offsets for each block.
+    let col_offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(b);
+        let mut off = 0usize;
+        for blk in 0..b {
+            offsets.push(off);
+            off += input.block_designs[blk].ncols();
+        }
+        offsets
+    };
+
+    let ib = Array2::<f64>::eye(b);
+
+    let mut eta_tilde = Vec::with_capacity(n);
+    let mut leverage = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        // --- Assemble G_i = X_i H⁻¹ X_iᵀ  (B × B) ---
+        // G_i[a, blk_b] = Σ_k X_a[i,k] · Q_{blk_b}[col_offset_a + k, i]
+        // But Q_{blk_b} was computed from H⁻¹ acting on X_{blk_b}, so:
+        // G_i[a, blk_b] = x_{a,i}ᵀ · Q_{blk_b}[:,i]
+        //               = Σ_k X_a[i,k] · Q_{blk_b}[col_offset_a + k, i]
+        //
+        // Actually more simply: G_i[a,b] = row_a_i · Q_b[:,i] where
+        // row_a_i is extracted from the FULL p_tot-length joint row
+        // (only the block-a slice is nonzero, but Q_b[:,i] runs over all p_tot).
+        let mut g_i = Array2::<f64>::zeros((b, b));
+        for a in 0..b {
+            let x_a = &input.block_designs[a];
+            let p_a = x_a.ncols();
+            let off_a = col_offsets[a];
+            for bb in 0..b {
+                let q_bb = &q_blocks[bb];
+                let mut dot = 0.0f64;
+                for k in 0..p_a {
+                    dot += x_a[(i, k)] * q_bb[(off_a + k, i)];
+                }
+                g_i[(a, bb)] = dot;
+            }
+        }
+
+        // H_ii = G_i W_i  (B × B)
+        let w_i = &input.block_weights[i];
+        let mut h_ii = Array2::<f64>::zeros((b, b));
+        for r in 0..b {
+            for c in 0..b {
+                let mut v = 0.0f64;
+                for k in 0..b {
+                    v += g_i[(r, k)] * w_i[(k, c)];
+                }
+                h_ii[(r, c)] = v;
+            }
+        }
+
+        // Leverage = tr(H_ii)
+        let mut tr = 0.0f64;
+        for d in 0..b {
+            tr += h_ii[(d, d)];
+        }
+        leverage[i] = tr;
+
+        // --- ALO correction: δη = (I_B - H_ii)⁻¹ H_ii W_i⁻¹ s_i ---
+        let s_i = &input.scores[i];
+        let eta_i = &input.eta_hat[i];
+
+        // Check if W_i is (near-)singular.  For censored survival observations
+        // or other degenerate cases, W_i may have zero rows/columns.  In that
+        // case we skip the ALO correction (equivalent to assuming the LOO
+        // prediction equals the full-data prediction).
+        let w_det = det_small(w_i, b);
+        if w_det.abs() < 1e-30 {
+            // W_i is singular — skip correction, use full-data η.
+            eta_tilde.push(eta_i.clone());
+            continue;
+        }
+
+        // W_i⁻¹ s_i
+        let w_inv_s = solve_small(w_i, s_i, b);
+
+        // (I_B - H_ii)
+        let mut imh = ib.clone();
+        for r in 0..b {
+            for c in 0..b {
+                imh[(r, c)] -= h_ii[(r, c)];
+            }
+        }
+
+        // Check conditioning of (I_B - H_ii).  If near-singular, regularise.
+        let imh_det = det_small(&imh, b);
+        let imh_to_solve;
+        if imh_det.abs() < 1e-12 {
+            // Regularise: (I_B - H_ii) + εI
+            let eps = 1e-6;
+            let mut reg = imh.clone();
+            for d in 0..b {
+                reg[(d, d)] += eps;
+            }
+            imh_to_solve = reg;
+        } else {
+            imh_to_solve = imh;
+        }
+
+        // H_ii W_i⁻¹ s_i
+        let mut h_w_inv_s = Array1::<f64>::zeros(b);
+        for r in 0..b {
+            let mut v = 0.0f64;
+            for k in 0..b {
+                v += h_ii[(r, k)] * w_inv_s[k];
+            }
+            h_w_inv_s[r] = v;
+        }
+
+        // δη = (I_B - H_ii)⁻¹ (H_ii W_i⁻¹ s_i)
+        let delta_eta = solve_small(&imh_to_solve, &h_w_inv_s, b);
+
+        // η̃_i = η̂_i + δη_i
+        let mut corrected = eta_i.clone();
+        for d in 0..b {
+            corrected[d] += delta_eta[d];
+        }
+        eta_tilde.push(corrected);
+    }
+
+    Ok(MultiBlockAloDiagnostics {
+        eta_tilde,
+        leverage,
+    })
+}
+
+/// Compute only per-observation leverages tr(H_ii) for multi-predictor models.
+///
+/// This is cheaper than the full ALO correction when only EDF or leverage
+/// diagnostics are needed (no scores or W⁻¹ computation required).
+///
+/// Returns an n-length array of leverages.  The total model EDF is the sum
+/// of all leverages.
+pub fn compute_multiblock_alo_leverages(
+    n_obs: usize,
+    n_blocks: usize,
+    block_designs: &[Array2<f64>],
+    penalized_hessian_inv: &Array2<f64>,
+    block_weights: &[Array2<f64>],
+) -> Result<Array1<f64>, EstimationError> {
+    let n = n_obs;
+    let b = n_blocks;
+    let p_tot = penalized_hessian_inv.nrows();
+
+    // Precompute column offsets.
+    let col_offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(b);
+        let mut off = 0usize;
+        for blk in 0..b {
+            offsets.push(off);
+            off += block_designs[blk].ncols();
+        }
+        offsets
+    };
+
+    // Precompute Q_b = H⁻¹ X_bᵀ for each block.
+    let q_blocks: Vec<Array2<f64>> = {
+        let mut blocks = Vec::with_capacity(b);
+        for blk in 0..b {
+            let x_b = &block_designs[blk];
+            let p_b = x_b.ncols();
+            let off_b = col_offsets[blk];
+            let mut q = Array2::<f64>::zeros((p_tot, n));
+            for i in 0..n {
+                for k in 0..p_tot {
+                    let mut acc = 0.0f64;
+                    for j in 0..p_b {
+                        acc += penalized_hessian_inv[(k, off_b + j)] * x_b[(i, j)];
+                    }
+                    q[(k, i)] = acc;
+                }
+            }
+            blocks.push(q);
+        }
+        blocks
+    };
+
+    let mut leverage = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        // Assemble G_i = X_i H⁻¹ X_iᵀ (B × B), then H_ii = G_i W_i.
+        // We only need tr(H_ii) = Σ_d (G_i W_i)_{dd}.
+        let w_i = &block_weights[i];
+
+        // For tr(H_ii) = tr(G_i W_i) = Σ_{a,k} G_i[a,k] W_i[k,a]
+        let mut tr = 0.0f64;
+        for a in 0..b {
+            let x_a = &block_designs[a];
+            let p_a = x_a.ncols();
+            let off_a = col_offsets[a];
+            for k in 0..b {
+                // G_i[a, k]
+                let q_k = &q_blocks[k];
+                let mut g_ak = 0.0f64;
+                for j in 0..p_a {
+                    g_ak += x_a[(i, j)] * q_k[(off_a + j, i)];
+                }
+                // Accumulate G_i[a,k] * W_i[k,a]
+                tr += g_ak * w_i[(k, a)];
+            }
+        }
+        leverage[i] = tr;
+    }
+
+    Ok(leverage)
+}
+
+// ---------------------------------------------------------------------------
+// Small-matrix helpers for B × B systems (B typically 2–4)
+// ---------------------------------------------------------------------------
+
+/// Determinant of a small B × B matrix (B ≤ 4).
+fn det_small(m: &Array2<f64>, b: usize) -> f64 {
+    match b {
+        1 => m[(0, 0)],
+        2 => m[(0, 0)] * m[(1, 1)] - m[(0, 1)] * m[(1, 0)],
+        3 => {
+            m[(0, 0)] * (m[(1, 1)] * m[(2, 2)] - m[(1, 2)] * m[(2, 1)])
+                - m[(0, 1)] * (m[(1, 0)] * m[(2, 2)] - m[(1, 2)] * m[(2, 0)])
+                + m[(0, 2)] * (m[(1, 0)] * m[(2, 1)] - m[(1, 1)] * m[(2, 0)])
+        }
+        _ => {
+            // LU-style determinant for B > 3.  Copy and pivot.
+            let mut a = m.clone();
+            let mut det = 1.0f64;
+            for col in 0..b {
+                // Partial pivot.
+                let mut max_val = a[(col, col)].abs();
+                let mut max_row = col;
+                for row in (col + 1)..b {
+                    let v = a[(row, col)].abs();
+                    if v > max_val {
+                        max_val = v;
+                        max_row = row;
+                    }
+                }
+                if max_val < 1e-50 {
+                    return 0.0;
+                }
+                if max_row != col {
+                    for k in 0..b {
+                        let tmp = a[(col, k)];
+                        a[(col, k)] = a[(max_row, k)];
+                        a[(max_row, k)] = tmp;
+                    }
+                    det = -det;
+                }
+                det *= a[(col, col)];
+                let pivot = a[(col, col)];
+                for row in (col + 1)..b {
+                    let factor = a[(row, col)] / pivot;
+                    for k in (col + 1)..b {
+                        a[(row, k)] -= factor * a[(col, k)];
+                    }
+                }
+            }
+            det
+        }
+    }
+}
+
+/// Solve a small B × B linear system m x = rhs.
+///
+/// For B ≤ 3 uses closed-form inverse; for B > 3 uses LU with partial pivoting.
+fn solve_small(m: &Array2<f64>, rhs: &Array1<f64>, b: usize) -> Array1<f64> {
+    match b {
+        1 => {
+            let mut out = Array1::<f64>::zeros(1);
+            out[0] = rhs[0] / m[(0, 0)];
+            out
+        }
+        2 => {
+            let det = m[(0, 0)] * m[(1, 1)] - m[(0, 1)] * m[(1, 0)];
+            let inv_det = 1.0 / det;
+            let mut out = Array1::<f64>::zeros(2);
+            out[0] = inv_det * (m[(1, 1)] * rhs[0] - m[(0, 1)] * rhs[1]);
+            out[1] = inv_det * (-m[(1, 0)] * rhs[0] + m[(0, 0)] * rhs[1]);
+            out
+        }
+        3 => {
+            let det = det_small(m, 3);
+            let inv_det = 1.0 / det;
+            let mut out = Array1::<f64>::zeros(3);
+            // Cramer's rule for 3×3.
+            out[0] = inv_det
+                * (rhs[0] * (m[(1, 1)] * m[(2, 2)] - m[(1, 2)] * m[(2, 1)])
+                    - m[(0, 1)] * (rhs[1] * m[(2, 2)] - m[(1, 2)] * rhs[2])
+                    + m[(0, 2)] * (rhs[1] * m[(2, 1)] - m[(1, 1)] * rhs[2]));
+            out[1] = inv_det
+                * (m[(0, 0)] * (rhs[1] * m[(2, 2)] - m[(1, 2)] * rhs[2])
+                    - rhs[0] * (m[(1, 0)] * m[(2, 2)] - m[(1, 2)] * m[(2, 0)])
+                    + m[(0, 2)] * (m[(1, 0)] * rhs[2] - rhs[1] * m[(2, 0)]));
+            out[2] = inv_det
+                * (m[(0, 0)] * (m[(1, 1)] * rhs[2] - rhs[1] * m[(2, 1)])
+                    - m[(0, 1)] * (m[(1, 0)] * rhs[2] - rhs[1] * m[(2, 0)])
+                    + rhs[0] * (m[(1, 0)] * m[(2, 1)] - m[(1, 1)] * m[(2, 0)]));
+            out
+        }
+        _ => {
+            // LU with partial pivoting.
+            let mut a = m.clone();
+            let b_vec = rhs.clone();
+            let mut perm: Vec<usize> = (0..b).collect();
+            for col in 0..b {
+                let mut max_val = a[(perm[col], col)].abs();
+                let mut max_idx = col;
+                for row in (col + 1)..b {
+                    let v = a[(perm[row], col)].abs();
+                    if v > max_val {
+                        max_val = v;
+                        max_idx = row;
+                    }
+                }
+                perm.swap(col, max_idx);
+                let pivot = a[(perm[col], col)];
+                if pivot.abs() < 1e-50 {
+                    // Singular: return zero vector.
+                    return Array1::<f64>::zeros(b);
+                }
+                for row in (col + 1)..b {
+                    let factor = a[(perm[row], col)] / pivot;
+                    a[(perm[row], col)] = factor;
+                    for k in (col + 1)..b {
+                        let val = a[(perm[col], k)];
+                        a[(perm[row], k)] -= factor * val;
+                    }
+                }
+            }
+            // Forward substitution (Ly = Pb).
+            let mut y = Array1::<f64>::zeros(b);
+            for row in 0..b {
+                let mut s = b_vec[perm[row]];
+                for k in 0..row {
+                    s -= a[(perm[row], k)] * y[k];
+                }
+                y[row] = s;
+            }
+            // Back substitution (Ux = y).
+            let mut x = Array1::<f64>::zeros(b);
+            for row in (0..b).rev() {
+                let mut s = y[row];
+                for k in (row + 1)..b {
+                    s -= a[(perm[row], k)] * x[k];
+                }
+                x[row] = s / a[(perm[row], row)];
+            }
+            x
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -562,5 +1046,186 @@ mod tests {
         assert_eq!(percentile_from_sorted(&values, 0.50), 3.0);
         assert_eq!(percentile_from_sorted(&values, 0.95), 5.0);
         assert_eq!(percentile_from_sorted(&[], 0.95), 0.0);
+    }
+
+    // --- Multi-block ALO tests ---
+
+    use super::{
+        compute_multiblock_alo, compute_multiblock_alo_leverages, det_small, solve_small,
+        MultiBlockAloInput,
+    };
+    use ndarray::{Array1, Array2};
+
+    #[test]
+    fn det_small_1x1() {
+        let m = Array2::from_elem((1, 1), 3.5);
+        assert!((det_small(&m, 1) - 3.5).abs() < 1e-14);
+    }
+
+    #[test]
+    fn det_small_2x2() {
+        let m = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert!((det_small(&m, 2) - (-2.0)).abs() < 1e-14);
+    }
+
+    #[test]
+    fn det_small_3x3_identity() {
+        let m = Array2::eye(3);
+        assert!((det_small(&m, 3) - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn solve_small_2x2() {
+        let m = Array2::from_shape_vec((2, 2), vec![2.0, 1.0, 0.0, 3.0]).unwrap();
+        let rhs = Array1::from_vec(vec![5.0, 9.0]);
+        let x = solve_small(&m, &rhs, 2);
+        // 2x + y = 5, 3y = 9 => y=3, x=1
+        assert!((x[0] - 1.0).abs() < 1e-12);
+        assert!((x[1] - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn multiblock_b1_matches_scalar_leverage() {
+        // With B=1 the multi-block formula should reduce to the scalar case.
+        // H_ii = x_i^T H^{-1} x_i * w_i  (scalar).
+        let n = 3;
+        let p = 2;
+        let x = Array2::from_shape_vec(
+            (n, p),
+            vec![1.0, 0.5, 0.8, -0.3, 0.2, 1.1],
+        )
+        .unwrap();
+        // H = X'WX + I (simple regularisation).
+        let w = vec![1.0, 2.0, 0.5];
+        let mut h = Array2::<f64>::eye(p);
+        for i in 0..n {
+            for r in 0..p {
+                for c in 0..p {
+                    h[(r, c)] += w[i] * x[(i, r)] * x[(i, c)];
+                }
+            }
+        }
+        // Invert H (2x2).
+        let det = h[(0, 0)] * h[(1, 1)] - h[(0, 1)] * h[(1, 0)];
+        let mut h_inv = Array2::<f64>::zeros((p, p));
+        h_inv[(0, 0)] = h[(1, 1)] / det;
+        h_inv[(1, 1)] = h[(0, 0)] / det;
+        h_inv[(0, 1)] = -h[(0, 1)] / det;
+        h_inv[(1, 0)] = -h[(1, 0)] / det;
+
+        // Scalar leverages: a_ii = w_i * x_i^T H^{-1} x_i
+        let mut scalar_lev = vec![0.0f64; n];
+        for i in 0..n {
+            let mut xhx = 0.0;
+            for r in 0..p {
+                for c in 0..p {
+                    xhx += x[(i, r)] * h_inv[(r, c)] * x[(i, c)];
+                }
+            }
+            scalar_lev[i] = w[i] * xhx;
+        }
+
+        // Multi-block with B=1.
+        let block_designs = vec![x.clone()];
+        let block_weights: Vec<Array2<f64>> = w
+            .iter()
+            .map(|&wi| Array2::from_elem((1, 1), wi))
+            .collect();
+        let scores: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.1])).collect();
+        let eta_hat: Vec<Array1<f64>> = (0..n).map(|i| Array1::from_vec(vec![i as f64])).collect();
+
+        let input = MultiBlockAloInput {
+            n_obs: n,
+            n_blocks: 1,
+            block_designs: &block_designs,
+            penalized_hessian_inv: &h_inv,
+            block_weights,
+            scores,
+            eta_hat,
+        };
+
+        let result = compute_multiblock_alo(&input).unwrap();
+        for i in 0..n {
+            assert!(
+                (result.leverage[i] - scalar_lev[i]).abs() < 1e-10,
+                "leverage mismatch at i={}: got {}, expected {}",
+                i,
+                result.leverage[i],
+                scalar_lev[i]
+            );
+        }
+    }
+
+    #[test]
+    fn multiblock_leverage_only_matches_full() {
+        // Verify that compute_multiblock_alo_leverages returns the same
+        // leverages as compute_multiblock_alo.
+        let n = 4;
+        let p1 = 2;
+        let p2 = 3;
+        let x1 = Array2::from_shape_fn((n, p1), |(i, j)| (i + j + 1) as f64 * 0.3);
+        let x2 = Array2::from_shape_fn((n, p2), |(i, j)| (i * 2 + j) as f64 * 0.2 - 0.1);
+        let p_tot = p1 + p2;
+        let h_inv = Array2::<f64>::eye(p_tot); // Simple identity for test.
+        let block_weights: Vec<Array2<f64>> = (0..n)
+            .map(|i| {
+                let v = (i + 1) as f64;
+                Array2::from_shape_vec((2, 2), vec![v, 0.1, 0.1, v * 0.5]).unwrap()
+            })
+            .collect();
+        let scores: Vec<Array1<f64>> =
+            (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
+        let eta_hat: Vec<Array1<f64>> =
+            (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
+        let block_designs = vec![x1.clone(), x2.clone()];
+
+        let input = MultiBlockAloInput {
+            n_obs: n,
+            n_blocks: 2,
+            block_designs: &block_designs,
+            penalized_hessian_inv: &h_inv,
+            block_weights: block_weights.clone(),
+            scores,
+            eta_hat,
+        };
+        let full = compute_multiblock_alo(&input).unwrap();
+        let lev_only =
+            compute_multiblock_alo_leverages(n, 2, &block_designs, &h_inv, &block_weights)
+                .unwrap();
+
+        for i in 0..n {
+            assert!(
+                (full.leverage[i] - lev_only[i]).abs() < 1e-12,
+                "leverage mismatch at i={}: full={}, lev_only={}",
+                i,
+                full.leverage[i],
+                lev_only[i]
+            );
+        }
+    }
+
+    #[test]
+    fn multiblock_singular_weight_skips_correction() {
+        // When W_i is singular, ALO should return η̂_i unchanged.
+        let n = 1;
+        let p = 2;
+        let x = Array2::from_shape_vec((1, p), vec![1.0, 0.5]).unwrap();
+        let h_inv = Array2::eye(p);
+        let block_designs = vec![x.clone()];
+        let block_weights = vec![Array2::from_elem((1, 1), 0.0)]; // singular
+        let scores = vec![Array1::from_vec(vec![1.0])];
+        let eta_hat = vec![Array1::from_vec(vec![3.14])];
+
+        let input = MultiBlockAloInput {
+            n_obs: n,
+            n_blocks: 1,
+            block_designs: &block_designs,
+            penalized_hessian_inv: &h_inv,
+            block_weights,
+            scores,
+            eta_hat,
+        };
+        let result = compute_multiblock_alo(&input).unwrap();
+        assert!((result.eta_tilde[0][0] - 3.14).abs() < 1e-14);
     }
 }

@@ -2034,4 +2034,735 @@ impl<'a> RemlState<'a> {
             }
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Unified HyperCoord builders for τ (directional) hyperparameters
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Build [`HyperCoord`] objects for τ (directional / design-moving)
+    /// hyperparameters.
+    ///
+    /// This replaces the separate gradient/Hessian computation in
+    /// [`compute_directional_hypergradientwith_bundle`] (first order) and
+    /// the first-order loop inside [`compute_tau_tau_block`] /
+    /// [`compute_mixed_rho_tau_column_analyticwith_bundle`] by producing
+    /// generic `(a_j, g_j, B_j, ld_s_j)` tuples that the unified evaluator
+    /// in `unified.rs` can consume.
+    ///
+    /// # Field derivation
+    ///
+    /// For each τ direction j, holding β fixed at β̂:
+    ///
+    /// | Field   | Formula |
+    /// |---------|---------|
+    /// | `a`     | `−u^T X_{τ_j} β̂ + 0.5 β̂^T S_{τ_j} β̂ [+ Φ_{τ_j}\|_β]` |
+    /// | `g`     | `X_{τ_j}^T u − X^T diag(w) X_{τ_j} β̂ − S_{τ_j} β̂ [− (g_φ)_{τ_j}]` |
+    /// | `B`     | `X_{τ_j}^T W X + X^T W X_{τ_j} + X^T diag(c ⊙ X_{τ_j} β̂) X + S_{τ_j} [− Firth drifts]` |
+    /// | `ld_s`  | `tr(S_+^{−1} S_{τ_j})` |
+    ///
+    /// For Gaussian identity link, `c = 0` and W is constant, so the
+    /// third-derivative correction in B vanishes and `b_depends_on_beta = false`.
+    pub(crate) fn build_tau_hyper_coords(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+        let psi_dim = hyper_dirs.len();
+        if psi_dim == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let reparam_result = &pirls_result.reparam_result;
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+
+        // --- Transformed design, beta, penalty basis ---
+        let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
+        let x_dense_arc = pirls_result
+            .x_transformed
+            .try_to_dense_arc(
+                "build_tau_hyper_coords requires dense transformed design",
+            )
+            .map_err(EstimationError::InvalidInput)?;
+        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_dense_arc.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_dense = x_dense_owned
+            .as_ref()
+            .unwrap_or_else(|| x_dense_arc.as_ref());
+
+        let e_eval;
+        if let Some(z) = free_basis_opt.as_ref() {
+            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+            e_eval = reparam_result.e_transformed.dot(z);
+        } else {
+            e_eval = reparam_result.e_transformed.clone();
+        }
+        let p_dim = beta_eval.len();
+        if p_dim == 0 {
+            return Ok(vec![
+                super::unified::HyperCoord {
+                    a: 0.0,
+                    g: Array1::zeros(0),
+                    b_mat: Array2::zeros((0, 0)),
+                    ld_s: 0.0,
+                    b_depends_on_beta: false,
+                };
+                psi_dim
+            ]);
+        }
+
+        // Working residual u = w ⊙ (z − η̂).
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
+        let w_diag = &pirls_result.solveweights;
+        let c_array = &pirls_result.solve_c_array;
+
+        // Whether third-derivative corrections are needed (non-Gaussian).
+        let is_gaussian_identity =
+            matches!(self.config.link_function(), LinkFunction::Identity);
+        let b_depends_on_beta = !is_gaussian_identity;
+
+        // Firth operator (Firth-logit only).
+        let firth_logit_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let firth_op = if firth_logit_active {
+            if let Some(cached) = bundle.firth_dense_operator.as_ref() {
+                Some(cached.as_ref().clone())
+            } else {
+                Some(Self::build_firth_dense_operator(
+                    x_dense,
+                    &pirls_result.final_eta,
+                )?)
+            }
+        } else {
+            None
+        };
+
+        let mut coords = Vec::with_capacity(psi_dim);
+
+        for j in 0..psi_dim {
+            // --- X_{τ_j} and S_{τ_j} in transformed coordinates ---
+            let x_tau_j =
+                hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
+            let penalty_components_j = Self::transform_penalty_components(
+                hyper_dirs[j].penalty_first_components(),
+                &reparam_result.qs,
+                free_basis_opt.as_ref(),
+            );
+            let s_tau_j = penalty_components_j.iter().try_fold(
+                Array2::<f64>::zeros((p_dim, p_dim)),
+                |mut acc, component| {
+                    if component.penalty_index >= rho.len() {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "penalty_index {} out of bounds for rho dimension {}",
+                            component.penalty_index,
+                            rho.len()
+                        )));
+                    }
+                    component
+                        .matrix
+                        .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                    Ok(acc)
+                },
+            )?;
+
+            // --- a_j: fixed-β cost derivative (envelope term) ---
+            // a_j = −u^T (X_{τ_j} β̂) + 0.5 β̂^T S_{τ_j} β̂  [+ Φ_{τ_j}|_β for Firth]
+            let x_tau_beta_j = x_tau_j.dot(&beta_eval);
+            let mut a_j = -u.dot(&x_tau_beta_j)
+                + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            // Firth partial: Φ_{τ_j}|_β = 0.5 tr(I_r^{-1} I_{r,τ_j}).
+            let mut firth_tau_kernel_j: Option<FirthTauPartialKernel> = None;
+            if let Some(op) = firth_op.as_ref() {
+                let need_kernel = x_tau_j.iter().any(|v| *v != 0.0);
+                let tau_bundle =
+                    Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, need_kernel);
+                a_j += tau_bundle.phi_tau_partial;
+                if need_kernel {
+                    firth_tau_kernel_j = Some(tau_bundle.tau_kernel.expect(
+                        "firth_exact_tau_kernel should return kernel when need_kernel=true",
+                    ));
+                }
+            }
+
+            // --- g_j: fixed-β score (the implicit-function RHS) ---
+            // g_j = X_{τ_j}^T u − X^T diag(w)(X_{τ_j} β̂) − S_{τ_j} β̂  [− (g_φ)_{τ_j}]
+            let weighted_x_tau_beta_j = w_diag * &x_tau_beta_j;
+            let mut g_j = x_tau_j.t().dot(&u)
+                - x_dense.t().dot(&weighted_x_tau_beta_j)
+                - s_tau_j.dot(&beta_eval);
+            if let Some(op) = firth_op.as_ref() {
+                let tau_bundle =
+                    Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, false);
+                g_j -= &tau_bundle.gphi_tau;
+            }
+
+            // --- B_j: fixed-β Hessian drift ---
+            // B_j = X_{τ_j}^T W X + X^T W X_{τ_j} + S_{τ_j}
+            //     [+ X^T diag(c ⊙ X_{τ_j} β̂) X]  (non-Gaussian only)
+            //     [− Firth Hessian drifts]
+            let mut b_j = Self::weighted_cross(&x_tau_j, x_dense, w_diag);
+            b_j += &Self::weighted_cross(x_dense, &x_tau_j, w_diag);
+            b_j += &s_tau_j;
+
+            if !is_gaussian_identity {
+                // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
+                let c_x_tau_beta = c_array * &x_tau_beta_j;
+                let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+                b_j += &Self::xt_diag_x_dense_into(
+                    x_dense,
+                    &c_x_tau_beta,
+                    &mut weighted_scratch,
+                );
+            }
+
+            // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
+            // The D(H_φ)[β_{τ_j}] part is NOT included here because it
+            // depends on β_{τ_j} (the IFT solve result), which the unified
+            // evaluator computes itself. Only the fixed-β partial goes in B_j.
+            if let Some(op) = firth_op.as_ref() {
+                if let Some(kernel) = firth_tau_kernel_j.as_ref() {
+                    let eye = Array2::<f64>::eye(p_dim);
+                    let hphi_tau_partial =
+                        Self::firth_hphi_tau_partial_apply(op, &x_tau_j, kernel, &eye);
+                    b_j -= &hphi_tau_partial;
+                }
+            }
+
+            // --- ld_s_j: penalty pseudo-logdet derivative ---
+            // ld_s_j = tr(S_+^{−1} S_{τ_j}).
+            let ld_s_j = self.fixed_subspace_penalty_trace(
+                &e_eval,
+                &s_tau_j,
+                pirls_result.ridge_passport,
+            )?;
+
+            coords.push(super::unified::HyperCoord {
+                a: a_j,
+                g: g_j,
+                b_mat: b_j,
+                ld_s: ld_s_j,
+                b_depends_on_beta,
+            });
+        }
+
+        Ok(coords)
+    }
+
+    /// Build pair callbacks for τ×τ and ρ×τ second-order [`HyperCoordPair`]
+    /// entries.
+    ///
+    /// The returned closures produce `HyperCoordPair` objects on demand for:
+    /// - `tau_tau_pair_fn(i, j)` : τ_i × τ_j entries
+    /// - `rho_tau_pair_fn(k, j)` : ρ_k × τ_j entries
+    ///
+    /// These replace the inner loops of [`compute_tau_tau_block`] and
+    /// [`compute_mixed_rho_tau_column_analyticwith_bundle`].
+    ///
+    /// # Field derivation (τ_i × τ_j pair)
+    ///
+    /// | Field   | Formula |
+    /// |---------|---------|
+    /// | `a`     | `β̂^T S_{τ_i} β_{τ_j} + 0.5 β̂^T S_{τ_i τ_j} β̂` |
+    /// | `g`     | second score involving X_{τ_i}, X_{τ_j}, X_{τ_i τ_j}, S_{τ_i τ_j}` |
+    /// | `B`     | cross-design + cross-curvature + second-design + S_{τ_i τ_j}` |
+    /// | `ld_s`  | `tr(S_+^{-1} S_{τ_j} S_+^{-1} S_{τ_i}) − tr(S_+^{-1} S_{τ_i τ_j})` |
+    ///
+    /// # Notes
+    ///
+    /// The closures capture transformed design matrices, penalty objects, and
+    /// the PIRLS state. They are `Send + Sync` so that the unified evaluator
+    /// can call them from parallel contexts.
+    ///
+    /// All `a`, `g`, `B` fields are fixed-beta objects: they depend only on
+    /// the current beta-hat and hyperparameters, not on IFT-derived mode
+    /// responses. The IFT solves (beta_i, beta_j, beta_ij) are handled
+    /// entirely by the unified evaluator after receiving these pair objects.
+    pub(crate) fn build_tau_pair_callbacks(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<
+        (
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        ),
+        EstimationError,
+    > {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let reparam_result = &pirls_result.reparam_result;
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+
+        let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
+        if let Some(z) = free_basis_opt.as_ref() {
+            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+        }
+        let p_dim = beta_eval.len();
+        let psi_dim = hyper_dirs.len();
+        let k_count = rho.len();
+        let lambdas = rho.mapv(f64::exp);
+
+        // Pre-transform first-order penalty components for each τ direction.
+        let s_tau_list: Vec<Array2<f64>> = hyper_dirs
+            .iter()
+            .map(|dir| {
+                let components = Self::transform_penalty_components(
+                    dir.penalty_first_components(),
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                );
+                components
+                    .iter()
+                    .fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
+                        c.matrix
+                            .scaled_add_to(&mut acc, rho[c.penalty_index].exp())
+                            .expect("valid penalty component in build_tau_pair_callbacks");
+                        acc
+                    })
+            })
+            .collect();
+
+        // Pre-compute second-order penalty matrices S_{τ_i τ_j} for all pairs.
+        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
+            vec![vec![None; psi_dim]; psi_dim];
+        for i in 0..psi_dim {
+            for j in 0..psi_dim {
+                let second_components =
+                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
+                if second_components.is_empty() {
+                    continue;
+                }
+                let transformed = Self::transform_penalty_components(
+                    &second_components,
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                );
+                let total = transformed.iter().fold(
+                    Array2::<f64>::zeros((p_dim, p_dim)),
+                    |mut acc, c| {
+                        c.matrix
+                            .scaled_add_to(&mut acc, rho[c.penalty_index].exp())
+                            .expect("valid second penalty component");
+                        acc
+                    },
+                );
+                s_tau_tau[i][j] = Some(total);
+            }
+        }
+
+        // Build structural S pseudo-inverse for ld_s pair computations.
+        let rs_eval: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
+            reparam_result
+                .rs_transformed
+                .iter()
+                .map(|r| r.dot(z))
+                .collect()
+        } else {
+            reparam_result.rs_transformed.clone()
+        };
+        let s_eval = rs_eval
+            .iter()
+            .enumerate()
+            .fold(Array2::<f64>::zeros((p_dim, p_dim)), |acc, (k, r)| {
+                acc + r.t().dot(r).mapv(|v| lambdas[k] * v)
+            });
+        let (s_eigs, svecs) = s_eval
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let s_max = s_eigs
+            .iter()
+            .copied()
+            .fold(0.0_f64, |a, b| a.max(b.abs()))
+            .max(1.0);
+        let s_tol = (p_dim.max(1) as f64) * f64::EPSILON * s_max;
+        let mut s_dag = Array2::<f64>::zeros((p_dim, p_dim));
+        for idx in 0..p_dim {
+            let ev = s_eigs[idx];
+            if ev > s_tol {
+                let ucol = svecs.column(idx).to_owned();
+                let outer = ucol
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&ucol.view().insert_axis(Axis(0)));
+                s_dag += &outer.mapv(|v| v / ev);
+            }
+        }
+
+        // Pre-compute S_+^{-1} S_{τ_j} products for the quadratic trace term.
+        let sdag_s_tau: Vec<Array2<f64>> =
+            s_tau_list.iter().map(|s| s_dag.dot(s)).collect();
+
+        // Pre-compute A_k = λ_k R_k^T R_k for ρ-τ pairs.
+        let a_k_mats: Vec<Array2<f64>> = rs_eval
+            .iter()
+            .enumerate()
+            .map(|(k, r)| r.t().dot(r).mapv(|v| lambdas[k] * v))
+            .collect();
+
+        // Precompute S_+^{-1} A_k for ρ-τ pairs.
+        let sdag_a_k: Vec<Array2<f64>> =
+            a_k_mats.iter().map(|a| s_dag.dot(a)).collect();
+
+        // Pre-compute transformed design matrices X_{τ_j} for each τ direction.
+        let x_dense_arc = pirls_result
+            .x_transformed
+            .try_to_dense_arc(
+                "build_tau_pair_callbacks requires dense transformed design",
+            )
+            .map_err(EstimationError::InvalidInput)?;
+        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_dense_arc.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_dense: Array2<f64> = x_dense_owned
+            .as_ref()
+            .unwrap_or_else(|| x_dense_arc.as_ref())
+            .clone();
+
+        let x_tau_list: Vec<Array2<f64>> = hyper_dirs
+            .iter()
+            .map(|dir| {
+                dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())
+                    .expect("valid transformed X_tau in build_tau_pair_callbacks")
+            })
+            .collect();
+
+        // Pre-compute X_{τ_i β̂} for each τ direction.
+        let x_tau_beta_list: Vec<Array1<f64>> = x_tau_list
+            .iter()
+            .map(|x_tau| x_tau.dot(&beta_eval))
+            .collect();
+
+        // Pre-compute second-order design matrices X_{τ_i τ_j} for all pairs.
+        let mut x_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
+            vec![vec![None; psi_dim]; psi_dim];
+        for i in 0..psi_dim {
+            for j in i..psi_dim {
+                let xij = hyper_dirs[i]
+                    .transformed_x_tau_tau_at(j, &reparam_result.qs, free_basis_opt.as_ref())
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        hyper_dirs[j]
+                            .transformed_x_tau_tau_at(i, &reparam_result.qs, free_basis_opt.as_ref())
+                            .ok()
+                            .flatten()
+                    });
+                if xij.is_some() {
+                    x_tau_tau[j][i] = xij.clone();
+                }
+                x_tau_tau[i][j] = xij;
+            }
+        }
+
+        // Working residual u = w ⊙ (z − η̂).
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
+        let w_diag = pirls_result.solveweights.clone();
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
+        let is_gaussian_identity =
+            matches!(self.config.link_function(), LinkFunction::Identity);
+
+        // Pre-compute per-penalty-index components of S_{τ_j} for ρ-τ cross
+        // derivative A_{k,τ_j} = λ_k (dS_k/dτ_j).
+        // For each τ direction j and penalty index k, store the transformed
+        // penalty derivative matrix (unscaled by λ_k).
+        let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
+            .iter()
+            .map(|dir| {
+                Self::transform_penalty_components(
+                    dir.penalty_first_components(),
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )
+            })
+            .collect();
+
+        // Build A_{k,τ_j} = λ_k * (component of S_{τ_j} at penalty k).
+        // Stored as a_k_tau_j[j][k]: Option<Array2<f64>>.
+        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
+            vec![vec![None; k_count]; psi_dim];
+        for j in 0..psi_dim {
+            for component in &penalty_components_per_dir[j] {
+                let k = component.penalty_index;
+                if k < k_count {
+                    let mat = component.matrix.scaled_materialize(lambdas[k]);
+                    a_k_tau_j_mats[j][k] = Some(mat);
+                }
+            }
+        }
+
+        // Capture into Arc for shared ownership in closures.
+        let s_tau_tau = Arc::new(s_tau_tau);
+        let s_dag = Arc::new(s_dag);
+        let sdag_s_tau = Arc::new(sdag_s_tau);
+        let sdag_a_k = Arc::new(sdag_a_k);
+        let beta_eval = Arc::new(beta_eval);
+        let x_dense = Arc::new(x_dense);
+        let x_tau_list = Arc::new(x_tau_list);
+        let x_tau_beta_list = Arc::new(x_tau_beta_list);
+        let x_tau_tau = Arc::new(x_tau_tau);
+        let u = Arc::new(u);
+        let w_diag = Arc::new(w_diag);
+        let c_array = Arc::new(c_array);
+        let d_array = Arc::new(d_array);
+        let a_k_tau_j_mats = Arc::new(a_k_tau_j_mats);
+
+        // ─── τ×τ pair callback ───────────────────────────────────────────
+        let s_tau_tau_tt = Arc::clone(&s_tau_tau);
+        let s_dag_tt = Arc::clone(&s_dag);
+        let sdag_s_tau_tt = Arc::clone(&sdag_s_tau);
+        let beta_tt = Arc::clone(&beta_eval);
+        let x_dense_tt = Arc::clone(&x_dense);
+        let x_tau_list_tt = Arc::clone(&x_tau_list);
+        let x_tau_beta_tt = Arc::clone(&x_tau_beta_list);
+        let x_tau_tau_tt = Arc::clone(&x_tau_tau);
+        let u_tt = Arc::clone(&u);
+        let w_tt = Arc::clone(&w_diag);
+        let c_tt = Arc::clone(&c_array);
+        let d_tt = Arc::clone(&d_array);
+        let p_dim_tt = p_dim;
+        let is_gaussian_tt = is_gaussian_identity;
+
+        let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
+            // ld_s_{ij} = tr(S_+^{-1} S_{τ_j} S_+^{-1} S_{τ_i}) − tr(S_+^{-1} S_{τ_i τ_j})
+            //
+            // First term: tr(sdag_s_tau[j] . sdag_s_tau[i]^T) by trace-product identity.
+            let ld_s_quad = Self::trace_product(&sdag_s_tau_tt[j], &sdag_s_tau_tt[i]);
+            let ld_s_linear = s_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|s_ij| Self::trace_product(&s_dag_tt, s_ij))
+                .unwrap_or(0.0);
+            let ld_s_ij = ld_s_quad - ld_s_linear;
+
+            // a_ij — fixed-β second-order cost derivative.
+            //
+            // ∂²F/∂τ_i ∂τ_j|_β where F = -ℓ + 0.5 β^T S β.
+            //
+            // Likelihood part: (X_{τ_i} β̂)^T W (X_{τ_j} β̂)
+            //   This arises from -ℓ''(η)[η_{τ_i}, η_{τ_j}] at fixed β,
+            //   where ℓ''(η) = -W (working weights).
+            //
+            // Second-design part: -u^T(X_{τ_i τ_j} β̂)
+            //   From -ℓ'(η)^T η_{τ_i τ_j} where ℓ'(η) = u.
+            //
+            // Penalty part: 0.5 β̂^T S_{τ_i τ_j} β̂.
+            let x_tau_i_beta = &x_tau_beta_tt[i];
+            let x_tau_j_beta = &x_tau_beta_tt[j];
+            let w_x_tau_j_beta = w_tt.as_ref() * x_tau_j_beta;
+            let a_ij_likelihood = x_tau_i_beta.dot(&w_x_tau_j_beta);
+            let a_ij_design2 = x_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|xij| -u_tt.dot(&xij.dot(beta_tt.as_ref())))
+                .unwrap_or(0.0);
+            let a_ij_penalty = 0.5
+                * s_tau_tau_tt[i][j]
+                    .as_ref()
+                    .map(|s_ij| beta_tt.dot(&s_ij.dot(beta_tt.as_ref())))
+                    .unwrap_or(0.0);
+            let a_ij = a_ij_likelihood + a_ij_design2 + a_ij_penalty;
+
+            // g_ij — fixed-β second-order score vector.
+            //
+            // ∂²/∂τ_i ∂τ_j [X^T u − S β]|_β (the score ∇_β ℓ_p).
+            //
+            // Derivation by differentiating g_j = X_{τ_j}^T u − X^T W(X_{τ_j} β̂)
+            //   − S_{τ_j} β̂ w.r.t. τ_i at fixed β:
+            //
+            //   term1: X_{τ_i τ_j}^T u  (second design on score)
+            //   term2: -X_{τ_j}^T diag(w)(X_{τ_i} β̂)  (u drift from η_{τ_i})
+            //   term3: -X_{τ_i}^T W(X_{τ_j} β̂)  (design drift from X_{τ_i})
+            //   term4: -X^T diag(c ⊙ X_{τ_i} β̂)(X_{τ_j} β̂)  (weight drift)
+            //   term5: -X^T W(X_{τ_i τ_j} β̂)  (second design on Hessian-score)
+            //   term6: -S_{τ_i τ_j} β̂  (second penalty)
+            let x_tau_i = &x_tau_list_tt[i];
+            let x_tau_j = &x_tau_list_tt[j];
+
+            // term1: X_{τ_i τ_j}^T u
+            let term1 = x_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|xij| xij.t().dot(u_tt.as_ref()))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+
+            // term2: -X_{τ_j}^T diag(w)(X_{τ_i} β̂)
+            let term2 = x_tau_j.t().dot(&(w_tt.as_ref() * x_tau_i_beta));
+
+            // term3: -X_{τ_i}^T W(X_{τ_j} β̂)
+            let term3 = x_tau_i.t().dot(&w_x_tau_j_beta);
+
+            // term4: -X^T diag(c ⊙ X_{τ_i} β̂)(X_{τ_j} β̂)
+            let c_x_tau_i_beta = c_tt.as_ref() * x_tau_i_beta;
+            let term4 = x_dense_tt.t().dot(&(&c_x_tau_i_beta * x_tau_j_beta));
+
+            // term5: -X^T W(X_{τ_i τ_j} β̂)
+            let term5 = x_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|xij| x_dense_tt.t().dot(&(w_tt.as_ref() * &xij.dot(beta_tt.as_ref()))))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+
+            // term6: -S_{τ_i τ_j} β̂
+            let term6 = s_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|s_ij| s_ij.dot(beta_tt.as_ref()))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+
+            let g_ij = term1 - &term2 - &term3 - &term4 - &term5 - &term6;
+
+            // B_ij — fixed-β second-order Hessian drift.
+            //
+            // ∂²H/∂τ_i ∂τ_j|_β where H = X^T W X + S.
+            //
+            // Components (all at fixed β, with η_{τ_i}|_β = X_{τ_i} β̂):
+            //
+            //   (a) X_{τ_i τ_j}^T W X + X^T W X_{τ_i τ_j}   [second-design]
+            //   (b) X_{τ_i}^T W X_{τ_j} + X_{τ_j}^T W X_{τ_i}  [cross-design]
+            //   (c) X_{τ_j}^T diag(c ⊙ X_{τ_i} β̂) X
+            //       + X^T diag(c ⊙ X_{τ_i} β̂) X_{τ_j}  [weight drift × design_j]
+            //   (d) X_{τ_i}^T diag(c ⊙ X_{τ_j} β̂) X
+            //       + X^T diag(c ⊙ X_{τ_j} β̂) X_{τ_i}  [weight drift × design_i]
+            //   (e) X^T diag(d ⊙ (X_{τ_i} β̂) ⊙ (X_{τ_j} β̂)) X  [curvature]
+            //   (f) X^T diag(c ⊙ X_{τ_i τ_j} β̂) X  [second-design weight]
+            //   (g) S_{τ_i τ_j}  [penalty]
+            let mut b_ij = Array2::<f64>::zeros((p_dim_tt, p_dim_tt));
+
+            // (a) second-design terms
+            if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
+                b_ij += &Self::weighted_cross(xij, x_dense_tt.as_ref(), w_tt.as_ref());
+                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), xij, w_tt.as_ref());
+            }
+
+            // (b) cross-design terms
+            b_ij += &Self::weighted_cross(x_tau_i, x_tau_j, w_tt.as_ref());
+            b_ij += &Self::weighted_cross(x_tau_j, x_tau_i, w_tt.as_ref());
+
+            if !is_gaussian_tt {
+                // (c) weight drift × design_j
+                b_ij += &Self::weighted_cross(x_tau_j, x_dense_tt.as_ref(), &c_x_tau_i_beta);
+                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_j, &c_x_tau_i_beta);
+
+                // (d) weight drift × design_i
+                let c_x_tau_j_beta = c_tt.as_ref() * x_tau_j_beta;
+                b_ij += &Self::weighted_cross(x_tau_i, x_dense_tt.as_ref(), &c_x_tau_j_beta);
+                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_i, &c_x_tau_j_beta);
+
+                // (e) curvature: X^T diag(d ⊙ (X_{τ_i} β̂) ⊙ (X_{τ_j} β̂)) X
+                let d_cross = d_tt.as_ref() * &(x_tau_i_beta * x_tau_j_beta);
+                let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+                b_ij += &Self::xt_diag_x_dense_into(
+                    x_dense_tt.as_ref(),
+                    &d_cross,
+                    &mut weighted_scratch,
+                );
+
+                // (f) second-design weight: X^T diag(c ⊙ X_{τ_i τ_j} β̂) X
+                if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
+                    let c_xij_beta = c_tt.as_ref() * &xij.dot(beta_tt.as_ref());
+                    b_ij += &Self::xt_diag_x_dense_into(
+                        x_dense_tt.as_ref(),
+                        &c_xij_beta,
+                        &mut weighted_scratch,
+                    );
+                }
+            }
+
+            // (g) penalty
+            if let Some(s_ij) = s_tau_tau_tt[i][j].as_ref() {
+                b_ij += s_ij;
+            }
+
+            super::unified::HyperCoordPair {
+                a: a_ij,
+                g: g_ij,
+                b_mat: b_ij,
+                ld_s: ld_s_ij,
+            }
+        };
+
+        // ─── ρ×τ pair callback ───────────────────────────────────────────
+        let s_dag_rt = Arc::clone(&s_dag);
+        let sdag_s_tau_rt = Arc::clone(&sdag_s_tau);
+        let sdag_a_k_rt = Arc::clone(&sdag_a_k);
+        let a_k_tau_j_rt = Arc::clone(&a_k_tau_j_mats);
+        let beta_rt = Arc::clone(&beta_eval);
+        let p_dim_rt = p_dim;
+
+        let rho_tau_pair_fn = move |k: usize, j: usize| -> super::unified::HyperCoordPair {
+            // ld_s_{k,τ_j}:
+            //   −tr(S_+^{-1} S_{τ_j} S_+^{-1} A_k) + tr(S_+^{-1} A_{k,τ_j})
+            //
+            // A_{k,τ_j} = λ_k * (dS_k/dτ_j) — the cross derivative. For the
+            // canonical penalty decomposition, this equals λ_k times the
+            // component of S_{τ_j} at penalty index k (if it touches penalty k).
+            //
+            // Quadratic trace term:
+            let ld_s_quad = Self::trace_product(&sdag_s_tau_rt[j], &sdag_a_k_rt[k]);
+            // Linear trace term: tr(S_+^{-1} A_{k,τ_j}).
+            let ld_s_linear = a_k_tau_j_rt[j][k]
+                .as_ref()
+                .map(|a_kt| Self::trace_product(&s_dag_rt, a_kt))
+                .unwrap_or(0.0);
+            let ld_s_kj = ld_s_linear - ld_s_quad;
+
+            // a_kj — fixed-β mixed cost derivative.
+            //
+            // ∂²F/∂ρ_k ∂τ_j|_β = 0.5 β̂^T A_{k,τ_j} β̂.
+            //
+            // The ∂F/∂ρ_k|_β = 0.5 β̂^T A_k β̂ term, when differentiated
+            // w.r.t. τ_j at fixed β, gives 0.5 β̂^T A_{k,τ_j} β̂ from the
+            // penalty change. The likelihood doesn't directly depend on ρ_k
+            // at fixed β, so there is no likelihood cross term.
+            let a_kj = 0.5
+                * a_k_tau_j_rt[j][k]
+                    .as_ref()
+                    .map(|a_kt| beta_rt.dot(&a_kt.dot(beta_rt.as_ref())))
+                    .unwrap_or(0.0);
+
+            // g_kj — fixed-β mixed score vector.
+            //
+            // ∂²/∂ρ_k ∂τ_j [∇_β(ℓ_p)]|_β.
+            //
+            // The first-order ρ score is g_k = -A_k β̂. Differentiating w.r.t.
+            // τ_j at fixed β gives -A_{k,τ_j} β̂ (since A_k doesn't depend on
+            // τ, but A_{k,τ_j} is the cross derivative of the penalty).
+            let g_kj = a_k_tau_j_rt[j][k]
+                .as_ref()
+                .map(|a_kt| -(a_kt.dot(beta_rt.as_ref())))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_rt));
+
+            // B_kj — fixed-β mixed Hessian drift.
+            //
+            // ∂²H/∂ρ_k ∂τ_j|_β.
+            //
+            // The ρ_k Hessian drift is B_k = A_k (β-independent for the
+            // penalty term). For non-Gaussian families, B_k also includes
+            // X^T diag(c ⊙ X B_k^{IFT}) X, but that term depends on the
+            // IFT solve B_k^{IFT} = H^{-1}(-A_k β̂) and is therefore NOT
+            // a fixed-β object — it is handled by the unified evaluator
+            // via the drift derivative callback.
+            //
+            // The fixed-β part is simply A_{k,τ_j} = λ_k (dS_k/dτ_j),
+            // since A_k itself does not depend on τ (the penalty matrices
+            // R_k^T R_k are τ-independent in the canonical decomposition).
+            let b_kj = a_k_tau_j_rt[j][k]
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Array2::<f64>::zeros((p_dim_rt, p_dim_rt)));
+
+            super::unified::HyperCoordPair {
+                a: a_kj,
+                g: g_kj,
+                b_mat: b_kj,
+                ld_s: ld_s_kj,
+            }
+        };
+
+        Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)))
+    }
 }

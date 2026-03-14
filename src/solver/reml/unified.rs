@@ -589,6 +589,32 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    pub fn ext_coords(mut self, coords: Vec<HyperCoord>) -> Self {
+        self.ext_coords = coords;
+        self
+    }
+
+    pub fn ext_coord_pair_fn(
+        mut self,
+        f: Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
+    ) -> Self {
+        self.ext_coord_pair_fn = Some(f);
+        self
+    }
+
+    pub fn rho_ext_pair_fn(
+        mut self,
+        f: Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
+    ) -> Self {
+        self.rho_ext_pair_fn = Some(f);
+        self
+    }
+
+    pub fn fixed_drift_deriv(mut self, f: FixedDriftDerivFn) -> Self {
+        self.fixed_drift_deriv = Some(f);
+        self
+    }
+
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty roots.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
@@ -770,7 +796,18 @@ pub fn reml_laml_evaluate(
 
     // ─── Gradient (uses SAME hop, SAME intermediates) ───
 
-    let mut grad = Array1::zeros(k);
+    // Extract logdet flags once (same for all coordinates).
+    let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => (true, true),
+        DispersionHandling::Fixed {
+            include_logdet_h,
+            include_logdet_s,
+            ..
+        } => (*include_logdet_h, *include_logdet_s),
+    };
+
+    let ext_dim = solution.ext_coords.len();
+    let mut grad = Array1::zeros(k + ext_dim);
 
     for idx in 0..k {
         let r_k = &solution.penalty_roots[idx];
@@ -786,15 +823,6 @@ pub fn reml_laml_evaluate(
         // For Gaussian (profiled): dp_cgrad × D_k / (2φ̂) where D_k = β̂ᵀAₖβ̂.
         // For non-Gaussian: 0.5 × β̂ᵀAₖβ̂ (direct from LAML formula).
         let d_k = lambdas[idx] * solution.beta.dot(&s_k_beta);
-        // Extract logdet flags for this dispersion type.
-        let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
-            DispersionHandling::ProfiledGaussian => (true, true),
-            DispersionHandling::Fixed {
-                include_logdet_h,
-                include_logdet_s,
-                ..
-            } => (*include_logdet_h, *include_logdet_s),
-        };
 
         let penalty_term = match &solution.dispersion {
             DispersionHandling::ProfiledGaussian => dp_cgrad * (d_k / (2.0 * profiled_scale)),
@@ -835,17 +863,61 @@ pub fn reml_laml_evaluate(
         grad[idx] = penalty_term + trace_term - det_term;
     }
 
-    // Add correction gradients.
-    if let Some(tk_grad) = &solution.tk_gradient {
-        grad += tk_grad;
-    }
-    if let Some(firth_grad) = &solution.firth_gradient {
-        grad += firth_grad;
+    // Extended hyperparameter gradient (ψ/τ coordinates).
+    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+        let grad_idx = k + ext_idx;
+
+        // Mode response: β_i = -H⁻¹ g_i
+        let v_i = hop.solve(&coord.g);
+
+        // Trace term: ½ tr(H⁻¹ Ḣ_i) where Ḣ_i = B_i + C[β_i]
+        let trace_term = if incl_logdet_h {
+            let correction = if solution.deriv_provider.has_corrections() {
+                solution.deriv_provider.hessian_derivative_correction(&v_i)
+            } else {
+                None
+            };
+            0.5 * hop.trace_hinv_h_k(&coord.b_mat, correction.as_ref())
+        } else {
+            0.0
+        };
+
+        // Penalty term: a_i (with profiled Gaussian rescaling if applicable)
+        let penalty_term = match &solution.dispersion {
+            DispersionHandling::ProfiledGaussian => dp_cgrad * (coord.a / profiled_scale),
+            DispersionHandling::Fixed { .. } => coord.a,
+        };
+
+        // Logdet S term: -½ ∂_i log|S|₊
+        let det_term = if incl_logdet_s {
+            0.5 * coord.ld_s
+        } else {
+            0.0
+        };
+
+        grad[grad_idx] = penalty_term + trace_term - det_term;
     }
 
-    // Add prior gradient.
+    // Add correction gradients (ρ-only).
+    if let Some(tk_grad) = &solution.tk_gradient {
+        {
+            let mut sl = grad.slice_mut(ndarray::s![..k]);
+            sl += tk_grad;
+        }
+    }
+    if let Some(firth_grad) = &solution.firth_gradient {
+        {
+            let mut sl = grad.slice_mut(ndarray::s![..k]);
+            sl += firth_grad;
+        }
+    }
+
+    // Add prior gradient (ρ-only).
     if let Some((_, ref pg, _)) = prior_cost_gradient {
-        grad += pg;
+        {
+            let mut sl = grad.slice_mut(ndarray::s![..k]);
+            sl += pg;
+        }
     }
 
     if grad.iter().any(|v| !v.is_finite()) {
@@ -855,9 +927,10 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let mut h = compute_outer_hessian(solution, rho, &lambdas, hop)?;
-        // Add prior Hessian (second derivatives of the soft prior on ρ).
+        // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
         if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
-            h += ph;
+            let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+            sl += ph;
         }
         Some(h)
     } else {
@@ -881,7 +954,9 @@ fn compute_outer_hessian(
     hop: &dyn HessianOperator,
 ) -> Result<Array2<f64>, String> {
     let k = rho.len();
-    let mut hess = Array2::zeros((k, k));
+    let ext_dim = solution.ext_coords.len();
+    let total = k + ext_dim;
+    let mut hess = Array2::zeros((total, total));
 
     let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => (true, true),
@@ -895,6 +970,8 @@ fn compute_outer_hessian(
     let det2 = solution.penalty_logdet.second.as_ref().ok_or_else(|| {
         "Outer Hessian requested but penalty second derivatives not provided".to_string()
     })?;
+
+    // ── ρ precomputation ──
 
     // Precompute vₖ = H⁻¹(Aₖβ̂) and Aₖβ̂ for all k.
     let mut a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
@@ -937,16 +1014,44 @@ fn compute_outer_hessian(
         h_k_matrices.push(a_k);
     }
 
-    // Precompute Yₖ = H⁻¹ Hₖ for cross-trace terms.
+    // Precompute Yₖ = H⁻¹ Ḣₖ for cross-trace terms.
     let mut y_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
         y_ks.push(hop.solve_multi(&h_k_matrices[idx]));
     }
 
+    // ── ext precomputation ──
+
+    // Precompute ext mode responses, total Hessian drifts, and Y matrices.
+    let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
+    let mut ext_h_matrices: Vec<Array2<f64>> = Vec::with_capacity(ext_dim);
+    let mut ext_y: Vec<Array2<f64>> = Vec::with_capacity(ext_dim);
+
+    for coord in solution.ext_coords.iter() {
+        let v_i = hop.solve(&coord.g);
+
+        let mut h_i = coord.b_mat.clone();
+        if solution.deriv_provider.has_corrections() {
+            if let Some(corr) = solution.deriv_provider.hessian_derivative_correction(&v_i) {
+                h_i += &corr;
+            }
+        }
+
+        let y_i = hop.solve_multi(&h_i);
+
+        ext_v.push(v_i);
+        ext_h_matrices.push(h_i);
+        ext_y.push(y_i);
+    }
+
+    // ── ρ-ρ block ──
+
     for kk in 0..k {
         for ll in kk..k {
-            // Q_{kl}: coefficient curvature
-            let q_kl = a_k_betas[ll].dot(&v_ks[kk])
+            // Q_{kl}: a_{kl} − gₖᵀ H⁻¹ gₗ
+            // a_{kl} = δ_{kl} · ½ β̂ᵀ Aₖ β̂  (since ∂²S/∂ρₖ² = Aₖ, cross = 0)
+            // gₖᵀ H⁻¹ gₗ = (Aₖβ̂)ᵀ vₗ = (Aₗβ̂)ᵀ vₖ  (by symmetry of H⁻¹)
+            let q_kl = -a_k_betas[ll].dot(&v_ks[kk])
                 + if kk == ll {
                     0.5 * solution.beta.dot(&a_k_betas[kk])
                 } else {
@@ -1029,11 +1134,463 @@ fn compute_outer_hessian(
         }
     }
 
+    // ── ρ-ext cross block ──
+
+    if let Some(ref rho_ext_fn) = solution.rho_ext_pair_fn {
+        for rho_idx in 0..k {
+            for ext_idx in 0..ext_dim {
+                let pair = rho_ext_fn(rho_idx, ext_idx);
+
+                // Q term: a_ij - g_rho^T H^{-1} g_ext
+                let q_term = pair.a - a_k_betas[rho_idx].dot(&ext_v[ext_idx]);
+
+                let l_term = if incl_logdet_h {
+                    // Cross-trace: tr(H⁻¹ Ḣ_ext H⁻¹ Ḣ_rho) = ⟨Y_ext^T, Y_rho⟩_F
+                    let cross_trace = (&ext_y[ext_idx].t() * &y_ks[rho_idx]).sum();
+
+                    // β_{ρ,ext} = H⁻¹(−g_{ρ,ext} + B_ρ v_ext + B_ext v_ρ − C[v_ext] v_ρ)
+                    //           = H⁻¹(−g_{ρ,ext} + A_ρ v_ext + Ḣ_ext v_ρ)
+                    // where Ḣ_ext = B_ext + C[β_ext] already encodes the −C[v_ext] v_ρ.
+                    let mut rhs = ext_h_matrices[ext_idx].dot(&v_ks[rho_idx]);
+                    rhs += &a_k_matrices[rho_idx].dot(&ext_v[ext_idx]);
+                    rhs -= &pair.g;
+
+                    let u_re = hop.solve(&rhs);
+
+                    // Ḧ_{rho,ext}: second Hessian drift.
+                    // Base: pair.b_mat (fixed-β second derivative of H).
+                    // + C[u_re] + Q[v_rho, v_ext] via second_correction.
+                    // + M_ext[v_rho] if ext coord has β-dependent B.
+                    // M_rho ≡ 0 (ρ is β-independent).
+                    let mut h2_trace = hop.trace_hinv_product(&pair.b_mat);
+
+                    // M_ext[v_rho] = D_β B_ext[v_rho]
+                    if solution.ext_coords[ext_idx].b_depends_on_beta {
+                        if let Some(ref drift_fn) = solution.fixed_drift_deriv {
+                            if let Some(m_ext) = drift_fn(ext_idx, &v_ks[rho_idx]) {
+                                h2_trace += hop.trace_hinv_product(&m_ext);
+                            }
+                        }
+                    }
+
+                    // C[u_re] + Q[v_rho, v_ext] via second_correction
+                    if solution.deriv_provider.has_corrections() {
+                        if let Some(correction) = solution
+                            .deriv_provider
+                            .hessian_second_derivative_correction(
+                                &v_ks[rho_idx],
+                                &ext_v[ext_idx],
+                                &u_re,
+                            )
+                        {
+                            h2_trace += hop.trace_hinv_product(&correction);
+                        }
+                    }
+
+                    0.5 * (h2_trace - cross_trace)
+                } else {
+                    0.0
+                };
+
+                let p_term = if incl_logdet_s {
+                    -0.5 * pair.ld_s
+                } else {
+                    0.0
+                };
+
+                let h_val = q_term + l_term + p_term;
+                hess[[rho_idx, k + ext_idx]] = h_val;
+                hess[[k + ext_idx, rho_idx]] = h_val;
+            }
+        }
+    }
+
+    // ── ext-ext block ──
+
+    if let Some(ref ext_pair_fn) = solution.ext_coord_pair_fn {
+        for ii in 0..ext_dim {
+            for jj in ii..ext_dim {
+                let pair = ext_pair_fn(ii, jj);
+                let coord_i = &solution.ext_coords[ii];
+                let coord_j = &solution.ext_coords[jj];
+
+                // Q term: a_ij - g_i^T H^{-1} g_j
+                // For diagonal (ii == jj): a_ii includes the ½ β̂ᵀ ∂²S/∂ψ² β̂ term
+                // which is already in pair.a.
+                let q_term = pair.a - coord_i.g.dot(&ext_v[jj]);
+
+                let l_term = if incl_logdet_h {
+                    // Cross-trace: tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i) = ⟨Y_j^T, Y_i⟩_F
+                    let cross_trace = (&ext_y[jj].t() * &ext_y[ii]).sum();
+
+                    // β_{ij} = H⁻¹(−g_ij + B_i v_j + B_j v_i − C[v_j] v_i)
+                    //        = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
+                    // where Ḣ_j = B_j + C[β_j] already encodes the −C[v_j] v_i term.
+                    let mut rhs = ext_h_matrices[jj].dot(&ext_v[ii]);
+                    rhs += &coord_i.b_mat.dot(&ext_v[jj]);
+                    rhs -= &pair.g;
+
+                    let u_ij = hop.solve(&rhs);
+
+                    // Ḧ_{ij}: second Hessian drift.
+                    let mut h2_trace = hop.trace_hinv_product(&pair.b_mat);
+
+                    // M_i[v_j]: D_β B_i[v_j] if B_i depends on β
+                    if coord_i.b_depends_on_beta {
+                        if let Some(ref drift_fn) = solution.fixed_drift_deriv {
+                            if let Some(m_i) = drift_fn(ii, &ext_v[jj]) {
+                                h2_trace += hop.trace_hinv_product(&m_i);
+                            }
+                        }
+                    }
+
+                    // M_j[v_i]: D_β B_j[v_i] if B_j depends on β
+                    if coord_j.b_depends_on_beta {
+                        if let Some(ref drift_fn) = solution.fixed_drift_deriv {
+                            if let Some(m_j) = drift_fn(jj, &ext_v[ii]) {
+                                h2_trace += hop.trace_hinv_product(&m_j);
+                            }
+                        }
+                    }
+
+                    // C[u_ij] + Q[v_i, v_j] via second_correction
+                    if solution.deriv_provider.has_corrections() {
+                        if let Some(correction) = solution
+                            .deriv_provider
+                            .hessian_second_derivative_correction(
+                                &ext_v[ii],
+                                &ext_v[jj],
+                                &u_ij,
+                            )
+                        {
+                            h2_trace += hop.trace_hinv_product(&correction);
+                        }
+                    }
+
+                    0.5 * (h2_trace - cross_trace)
+                } else {
+                    0.0
+                };
+
+                let p_term = if incl_logdet_s {
+                    -0.5 * pair.ld_s
+                } else {
+                    0.0
+                };
+
+                let h_val = q_term + l_term + p_term;
+                hess[[k + ii, k + jj]] = h_val;
+                if ii != jj {
+                    hess[[k + jj, k + ii]] = h_val;
+                }
+            }
+        }
+    }
+
     if hess.iter().any(|v| !v.is_finite()) {
         return Err("Outer Hessian contains non-finite entries".to_string());
     }
 
     Ok(hess)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Corrected coefficient covariance (smoothing-parameter uncertainty)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Corrected covariance of the coefficient vector, accounting for uncertainty
+/// in the smoothing/hyperparameters theta = (rho, psi).
+///
+/// The standard conditional covariance H^{-1} ignores uncertainty in theta.
+/// The corrected covariance adds the propagation term:
+///
+/// ```text
+///   V*_alpha = H^{-1} + J_alpha V_theta J_alpha^T
+/// ```
+///
+/// where:
+/// - H^{-1} is obtained via `hop.solve` on identity columns
+/// - J_alpha = [-v_1, ..., -v_k, -ext_v_1, ..., -ext_v_m] is the p x q matrix
+///   of negated mode responses (the implicit-function sensitivities d(beta)/d(theta))
+/// - V_theta = outer_hessian^{-1} is the q x q inverse outer Hessian
+///
+/// The mode responses v_k = H^{-1}(A_k beta) and ext_v_i = H^{-1}(g_i) are
+/// already computed in the unified evaluator gradient/Hessian loop, so this
+/// function reuses them directly.
+///
+/// # Arguments
+/// - `v_ks`: mode responses for rho coordinates, v_k = H^{-1}(A_k beta)
+/// - `ext_v`: mode responses for extended (psi) coordinates, v_i = H^{-1}(g_i)
+/// - `outer_hessian`: the q x q outer Hessian (nabla^2_theta V)
+/// - `hop`: the HessianOperator providing H^{-1}
+///
+/// # Returns
+/// The full p x p corrected covariance matrix V*_alpha = H^{-1} + J V_theta J^T.
+///
+/// # Edge cases
+/// - If the outer Hessian is indefinite, eigendecomposition with positive-part
+///   projection is used for V_theta (negative eigenvalues are clamped to zero).
+/// - Returns `Err` only if the eigendecomposition itself fails.
+pub fn compute_corrected_covariance(
+    v_ks: &[Array1<f64>],
+    ext_v: &[Array1<f64>],
+    outer_hessian: &Array2<f64>,
+    hop: &dyn HessianOperator,
+) -> Result<Array2<f64>, String> {
+    let p = hop.dim();
+    let q = v_ks.len() + ext_v.len();
+
+    if q == 0 {
+        // No hyperparameters — corrected covariance equals the conditional H^{-1}.
+        let eye = Array2::eye(p);
+        return Ok(hop.solve_multi(&eye));
+    }
+
+    if outer_hessian.nrows() != q || outer_hessian.ncols() != q {
+        return Err(format!(
+            "compute_corrected_covariance: outer Hessian dimension ({}, {}) does not match \
+             total hyperparameter count q = {} (rho: {}, ext: {})",
+            outer_hessian.nrows(),
+            outer_hessian.ncols(),
+            q,
+            v_ks.len(),
+            ext_v.len(),
+        ));
+    }
+
+    // Step 1: Assemble J_alpha (p x q) with columns = -v_i.
+    let mut j_alpha = Array2::zeros((p, q));
+    for (col, v) in v_ks.iter().enumerate() {
+        for row in 0..p {
+            j_alpha[[row, col]] = -v[row];
+        }
+    }
+    for (i, v) in ext_v.iter().enumerate() {
+        let col = v_ks.len() + i;
+        for row in 0..p {
+            j_alpha[[row, col]] = -v[row];
+        }
+    }
+
+    // Step 2: Compute V_theta = outer_hessian^{-1} via eigendecomposition
+    // with positive-part projection (handles indefinite Hessians gracefully).
+    let v_theta = invert_with_positive_projection(outer_hessian)?;
+
+    // Step 3: Compute the correction term J_alpha V_theta J_alpha^T.
+    // Factored as (J V_theta) J^T to reuse the intermediate (p x q).
+    let j_v_theta = j_alpha.dot(&v_theta); // p x q
+    let correction = j_v_theta.dot(&j_alpha.t()); // p x p
+
+    // Step 4: Compute H^{-1} and add the correction.
+    let eye = Array2::eye(p);
+    let mut h_inv = hop.solve_multi(&eye);
+    h_inv += &correction;
+
+    // Enforce exact symmetry (numerical noise from the matrix products).
+    enforce_symmetry_inplace(&mut h_inv);
+
+    Ok(h_inv)
+}
+
+/// Compute only the diagonal of the corrected covariance V*_alpha.
+///
+/// This is much cheaper than the full p x p matrix: O(p q) instead of O(p^2 q).
+///
+/// ```text
+///   diag(V*_alpha) = diag(H^{-1}) + row_norms(J_alpha L_theta)^2
+/// ```
+///
+/// where L_theta is the Cholesky-like square root of V_theta. When V_theta
+/// is obtained via positive-projected eigendecomposition, L_theta = U sqrt(D+)
+/// where D+ contains the positive-part eigenvalues.
+///
+/// # Arguments
+/// - `v_ks`: mode responses for rho coordinates
+/// - `ext_v`: mode responses for extended (psi) coordinates
+/// - `outer_hessian`: the q x q outer Hessian
+/// - `hop`: the HessianOperator providing H^{-1}
+///
+/// # Returns
+/// A p-vector of corrected marginal variances.
+pub fn compute_corrected_covariance_diagonal(
+    v_ks: &[Array1<f64>],
+    ext_v: &[Array1<f64>],
+    outer_hessian: &Array2<f64>,
+    hop: &dyn HessianOperator,
+) -> Result<Array1<f64>, String> {
+    let p = hop.dim();
+    let q = v_ks.len() + ext_v.len();
+
+    // Start with diag(H^{-1}).
+    let mut diag = Array1::zeros(p);
+    for i in 0..p {
+        let mut e_i = Array1::zeros(p);
+        e_i[i] = 1.0;
+        let h_inv_ei = hop.solve(&e_i);
+        diag[i] = h_inv_ei[i];
+    }
+
+    if q == 0 {
+        return Ok(diag);
+    }
+
+    if outer_hessian.nrows() != q || outer_hessian.ncols() != q {
+        return Err(format!(
+            "compute_corrected_covariance_diagonal: outer Hessian dimension ({}, {}) \
+             does not match q = {}",
+            outer_hessian.nrows(),
+            outer_hessian.ncols(),
+            q,
+        ));
+    }
+
+    // Compute V_theta^{1/2} via positive-projected eigendecomposition.
+    // V_theta^{1/2} = U diag(sqrt(max(0, 1/sigma_i))) where sigma_i are
+    // eigenvalues of the outer Hessian.
+    let v_theta_sqrt = sqrt_inverse_with_positive_projection(outer_hessian)?;
+
+    // Assemble J_alpha (p x q) with columns = -v_i.
+    let mut j_alpha = Array2::zeros((p, q));
+    for (col, v) in v_ks.iter().enumerate() {
+        for row in 0..p {
+            j_alpha[[row, col]] = -v[row];
+        }
+    }
+    for (i, v) in ext_v.iter().enumerate() {
+        let col = v_ks.len() + i;
+        for row in 0..p {
+            j_alpha[[row, col]] = -v[row];
+        }
+    }
+
+    // Compute M = J_alpha V_theta^{1/2} (p x q).
+    let m = j_alpha.dot(&v_theta_sqrt); // p x q
+
+    // diag(correction) = row_norms(M)^2 = sum_j M[i,j]^2 for each i.
+    for i in 0..p {
+        let mut row_norm_sq = 0.0;
+        for j in 0..m.ncols() {
+            row_norm_sq += m[[i, j]] * m[[i, j]];
+        }
+        diag[i] += row_norm_sq;
+    }
+
+    Ok(diag)
+}
+
+/// Invert a symmetric matrix using eigendecomposition with positive-part
+/// projection: eigenvalues <= 0 are treated as infinite (their directions
+/// are omitted from the inverse, equivalent to clamping to zero).
+///
+/// This handles indefinite outer Hessians gracefully — negative curvature
+/// directions indicate that the Laplace approximation is unreliable in those
+/// directions, so we conservatively omit their contribution rather than
+/// amplifying uncertainty along negatively-curved directions.
+fn invert_with_positive_projection(mat: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let n = mat.nrows();
+    let (eigenvalues, eigenvectors) = mat
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("eigendecomposition failed in positive-projection inverse: {e}"))?;
+
+    let mut result = Array2::zeros((n, n));
+    for j in 0..n {
+        let sigma = eigenvalues[j];
+        if sigma <= 0.0 {
+            continue; // omit non-positive directions
+        }
+        let inv_sigma = 1.0 / sigma;
+        let u = eigenvectors.column(j);
+        for a in 0..n {
+            let ua = inv_sigma * u[a];
+            for b in a..n {
+                let val = ua * u[b];
+                result[[a, b]] += val;
+                if a != b {
+                    result[[b, a]] += val;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Compute V_theta^{1/2} = U diag(sqrt(1/sigma_i^+)) for positive eigenvalues
+/// of the outer Hessian. Non-positive eigenvalues produce zero columns.
+///
+/// The result is q x q_active (where q_active <= q is the number of positive
+/// eigenvalues), but we return the full q x q matrix with zero columns for
+/// omitted directions for simplicity.
+fn sqrt_inverse_with_positive_projection(mat: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let n = mat.nrows();
+    let (eigenvalues, eigenvectors) = mat
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("eigendecomposition failed in sqrt-inverse: {e}"))?;
+
+    let mut result = Array2::zeros((n, n));
+    for j in 0..n {
+        let sigma = eigenvalues[j];
+        if sigma <= 0.0 {
+            continue;
+        }
+        let scale = (1.0 / sigma).sqrt();
+        for row in 0..n {
+            result[[row, j]] = eigenvectors[[row, j]] * scale;
+        }
+    }
+    Ok(result)
+}
+
+/// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
+fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
+    let n = m.nrows();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let avg = 0.5 * (m[[i, j]] + m[[j, i]]);
+            m[[i, j]] = avg;
+            m[[j, i]] = avg;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Smooth spectral regularization
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// For indefinite or near-singular Hessians, hard eigenvalue clamping
+// `max(σ, ε)` is non-smooth and creates inconsistency between log|H| and
+// H⁻¹ at the threshold boundary. We use instead the C∞ regularizer:
+//
+//   r_ε(σ) = ½(σ + √(σ² + 4ε²))
+//
+// Properties:
+//   - C∞ and strictly positive for all σ ∈ ℝ
+//   - r_ε(σ) → σ  as σ → +∞  (transparent for well-conditioned eigenvalues)
+//   - r_ε(σ) → ε  as σ → 0   (smooth floor)
+//   - r_ε(σ) → ε²/|σ| as σ → -∞  (damps negative eigenvalues)
+//
+// Its derivative is:
+//
+//   r'_ε(σ) = ½(1 + σ/√(σ² + 4ε²))
+//
+// Using the SAME r_ε for both log-determinant and inverse ensures the
+// gradient is the exact derivative of a single scalar objective — no
+// inconsistency from mixing different regularizations.
+
+/// Smooth spectral regularizer: `r_ε(σ) = ½(σ + √(σ² + 4ε²))`.
+///
+/// Returns a strictly positive value for any real `sigma`. For large positive
+/// `sigma` this is approximately `sigma`; near zero it smoothly floors at `epsilon`.
+#[inline]
+fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
+    let four_eps_sq = 4.0 * epsilon * epsilon;
+    0.5 * (sigma + (sigma * sigma + four_eps_sq).sqrt())
+}
+
+/// Derivative of the smooth spectral regularizer: `r'_ε(σ) = ½(1 + σ/√(σ² + 4ε²))`.
+#[inline]
+fn spectral_regularize_deriv(sigma: f64, epsilon: f64) -> f64 {
+    let four_eps_sq = 4.0 * epsilon * epsilon;
+    0.5 * (1.0 + sigma / (sigma * sigma + four_eps_sq).sqrt())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1043,28 +1600,29 @@ fn compute_outer_hessian(
 /// Dense spectral Hessian operator using eigendecomposition.
 ///
 /// Computes logdet, trace, and solve from a single eigendecomposition,
-/// guaranteeing spectral consistency.
+/// guaranteeing spectral consistency. Indefinite or near-singular eigenvalues
+/// are handled via smooth spectral regularization `r_ε(σ)` rather than hard
+/// clamping, ensuring that logdet and inverse use the same smooth mapping.
 pub struct DenseSpectralOperator {
-    /// Eigenvalues of H.
-    eigenvalues: Array1<f64>,
+    /// Regularized eigenvalues: `r_ε(σ_i)` for each raw eigenvalue `σ_i`.
+    reg_eigenvalues: Vec<f64>,
     /// Eigenvectors of H (columns).
     eigenvectors: Array2<f64>,
-    /// Boolean mask: true for eigenvalues above threshold.
-    active_mask: Vec<bool>,
-    /// Precomputed: W = U_active diag(1/√λ_active) for efficient traces.
-    /// trace(H⁻¹ A) = ‖AW‖²_F when A is symmetric.
+    /// Precomputed: W = U diag(1/√r_ε(σ)) for efficient traces.
+    /// trace(H⁻¹ A) = Σ (AW ⊙ W)
     w_factor: Array2<f64>,
-    /// Precomputed log-determinant.
+    /// Precomputed log-determinant: Σ ln(r_ε(σ_i)).
     cached_logdet: f64,
     /// Full dimension.
     n_dim: usize,
 }
 
 impl DenseSpectralOperator {
-    /// Create from a symmetric positive (semi-)definite matrix.
+    /// Create from a symmetric matrix (may be indefinite or singular).
     ///
-    /// The eigendecomposition is computed once. All subsequent operations
-    /// (logdet, trace, solve) use this single decomposition.
+    /// The eigendecomposition is computed once. Eigenvalues are smoothly
+    /// regularized via `r_ε(σ)`. All subsequent operations (logdet, trace,
+    /// solve) use the regularized spectrum, ensuring mathematical consistency.
     pub fn from_symmetric(h: &Array2<f64>) -> Result<Self, String> {
         use faer::Side;
 
@@ -1081,41 +1639,37 @@ impl DenseSpectralOperator {
             .eigh(Side::Lower)
             .map_err(|e| format!("Eigendecomposition failed: {e}"))?;
 
-        // Threshold: machine epsilon × dimension × max eigenvalue
+        // Regularization scale: ε = √(machine_eps) × max(|eigenvalues|, 1)
+        // This is O(√eps) × spectral scale — small enough to be transparent
+        // for well-conditioned eigenvalues, large enough to smoothly handle
+        // near-zero or negative eigenvalues.
         let max_ev = eigenvalues
             .iter()
             .copied()
             .fold(0.0_f64, |a: f64, b: f64| a.max(b.abs()));
-        let tol = (n.max(1) as f64) * f64::EPSILON * max_ev.max(1.0);
+        let epsilon = f64::EPSILON.sqrt() * max_ev.max(1.0);
 
-        let active_mask: Vec<bool> = eigenvalues.iter().map(|&v| v > tol).collect();
-        let n_active = active_mask.iter().filter(|&&b| b).count();
+        // Apply smooth regularization to all eigenvalues
+        let reg_eigenvalues: Vec<f64> = eigenvalues
+            .iter()
+            .map(|&sigma| spectral_regularize(sigma, epsilon))
+            .collect();
 
-        // Build W factor for traces: W[:, j] = u_j / sqrt(λ_j) for active j
-        let mut w_factor = Array2::zeros((n, n_active));
-        let mut w_col = 0;
-        for (idx, &is_active) in active_mask.iter().enumerate() {
-            if is_active {
-                let scale = 1.0 / eigenvalues[idx].sqrt();
-                for row in 0..n {
-                    w_factor[[row, w_col]] = eigenvectors[[row, idx]] * scale;
-                }
-                w_col += 1;
+        // Build W factor for traces: W[:, j] = u_j / sqrt(r_ε(σ_j))
+        let mut w_factor = Array2::zeros((n, n));
+        for j in 0..n {
+            let scale = 1.0 / reg_eigenvalues[j].sqrt();
+            for row in 0..n {
+                w_factor[[row, j]] = eigenvectors[[row, j]] * scale;
             }
         }
 
-        // Precompute logdet
-        let cached_logdet: f64 = eigenvalues
-            .iter()
-            .zip(active_mask.iter())
-            .filter(|&(_, &active)| active)
-            .map(|(&v, _): (&f64, _)| v.ln())
-            .sum();
+        // Precompute logdet: Σ ln(r_ε(σ_i))
+        let cached_logdet: f64 = reg_eigenvalues.iter().map(|&v| v.ln()).sum();
 
         Ok(Self {
-            eigenvalues,
+            reg_eigenvalues,
             eigenvectors,
-            active_mask,
             w_factor,
             cached_logdet,
             n_dim: n,
@@ -1129,10 +1683,8 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
-        // tr(H₊⁻¹ A) = tr(WᵀAW) = ‖AW‖²_F when using W = U_+ Λ_+^{-1/2}
-        // Actually: tr(H₊⁻¹ A) = Σ_j (1/λ_j) uⱼᵀAuⱼ = ‖A^{1/2}W‖²_F if A is PSD.
-        // More generally: tr(WW'A) = sum of element-wise (W'A) ⊙ W' = sum (AW) ⊙ W.
-        // Simplest: compute AW, then dot with W.
+        // tr(H_reg⁻¹ A) = Σ_j (1/r_ε(σ_j)) uⱼᵀAuⱼ
+        // Computed as Σ (AW ⊙ W) where W = U diag(1/√r_ε(σ)).
         let aw = a.dot(&self.w_factor);
         aw.iter()
             .zip(self.w_factor.iter())
@@ -1141,15 +1693,13 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        // H⁻¹ v = Σ_j (1/λ_j) (uⱼᵀv) uⱼ for active j
+        // H_reg⁻¹ v = Σ_j (1/r_ε(σ_j)) (uⱼᵀv) uⱼ
         let mut result = Array1::zeros(self.n_dim);
-        for (idx, &is_active) in self.active_mask.iter().enumerate() {
-            if is_active {
-                let u = self.eigenvectors.column(idx);
-                let coeff = u.dot(rhs) / self.eigenvalues[idx];
-                for row in 0..self.n_dim {
-                    result[row] += coeff * u[row];
-                }
+        for j in 0..self.n_dim {
+            let u = self.eigenvectors.column(j);
+            let coeff = u.dot(rhs) / self.reg_eigenvalues[j];
+            for row in 0..self.n_dim {
+                result[row] += coeff * u[row];
             }
         }
         result
@@ -1167,7 +1717,9 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn active_rank(&self) -> usize {
-        self.active_mask.iter().filter(|&&b| b).count()
+        // With smooth regularization all eigenvalues are active (positive).
+        // Return the full dimension for consistency.
+        self.n_dim
     }
 
     fn dim(&self) -> usize {
@@ -1625,8 +2177,14 @@ mod tests {
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
-        // logdet should be ln(2) (only the active eigenvalue)
-        assert!((op.logdet() - 2.0_f64.ln()).abs() < 1e-10);
+        // With smooth regularization, the zero eigenvalue is mapped to
+        // r_ε(0) = ε (small positive), so logdet includes both eigenvalues.
+        // The dominant contribution is ln(r_ε(2)) ≈ ln(2).
+        let epsilon = f64::EPSILON.sqrt() * 2.0; // max_ev = 2
+        let r0 = spectral_regularize(0.0, epsilon);
+        let r2 = spectral_regularize(2.0, epsilon);
+        let expected_logdet = r0.ln() + r2.ln();
+        assert!((op.logdet() - expected_logdet).abs() < 1e-10);
         let trace = op.trace_hinv_product(&Array2::eye(2));
         assert!(trace.is_finite());
     }

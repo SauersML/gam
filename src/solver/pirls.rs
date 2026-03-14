@@ -5134,6 +5134,245 @@ fn computeworkingweight_derivatives_from_eta(
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
 }
 
+// ---------------------------------------------------------------------------
+// General noncanonical observed-information weight corrections
+// ---------------------------------------------------------------------------
+//
+// For an exponential-dispersion family with noncanonical link g, where
+// h(η) = g⁻¹(η) is the inverse link and μ = h(η):
+//
+// Notation (all evaluated at a single observation):
+//   h₁ = h'(η),  h₂ = h''(η),  h₃ = h'''(η),  h₄ = h''''(η)
+//   V  = V(μ),   V₁ = V'(μ),   V₂ = V''(μ),    V₃ = V'''(μ)
+//   φ  = dispersion parameter
+//   pw = prior weight for this observation
+//
+// Fisher (expected) weight and its first two η-derivatives:
+//   w_F = h₁² / (φV)
+//   c_F = (2 h₁ h₂ V − h₁³ V₁) / (φ V²)
+//   d_F = ∂c_F/∂η   (derived below)
+//
+// The observed weight subtracts a (y−μ)-dependent correction:
+//   B   = (h₂ V − h₁² V₁) / (φ V²)
+//   w_obs = w_F − (y−μ) · B
+//
+// First η-derivative of B:
+//   B_η = (h₃ V² − 3 h₁ h₂ V V₁ − h₁³ V V₂ + 2 h₁³ V₁²) / (φ V³)
+//
+// Observed c (∂w_obs/∂η):
+//   c_obs = c_F + h₁·B − (y−μ)·B_η
+//
+// Second η-derivative of B:
+//   B_ηη = ∂B_η/∂η  (full expression in code below)
+//
+// Observed d (∂²w_obs/∂η²):
+//   d_obs = d_F + h₂·B + 2 h₁·B_η − (y−μ)·B_ηη
+//
+// This function unifies all per-link hardcoded c/d computations: given the
+// inverse-link jet (h₁…h₄) and the variance-function jet (V…V₃), it returns
+// (w_obs, c_obs, d_obs) without any family- or link-specific dispatch.
+// ---------------------------------------------------------------------------
+
+/// Variance-function jet evaluated at μ: V(μ), V'(μ), V''(μ), V'''(μ).
+#[derive(Clone, Copy, Debug)]
+pub struct VarianceJet {
+    pub v: f64,
+    pub v1: f64,
+    pub v2: f64,
+    pub v3: f64,
+}
+
+impl VarianceJet {
+    /// Bernoulli / binomial variance V(μ) = μ(1−μ).
+    #[inline]
+    pub fn bernoulli(mu: f64) -> Self {
+        Self {
+            v: mu * (1.0 - mu),
+            v1: 1.0 - 2.0 * mu,
+            v2: -2.0,
+            v3: 0.0,
+        }
+    }
+
+    /// Poisson variance V(μ) = μ.
+    #[inline]
+    pub fn poisson(mu: f64) -> Self {
+        Self {
+            v: mu,
+            v1: 1.0,
+            v2: 0.0,
+            v3: 0.0,
+        }
+    }
+
+    /// Gamma variance V(μ) = μ².
+    #[inline]
+    pub fn gamma(mu: f64) -> Self {
+        Self {
+            v: mu * mu,
+            v1: 2.0 * mu,
+            v2: 2.0,
+            v3: 0.0,
+        }
+    }
+
+    /// Gaussian (identity) variance V(μ) = 1.
+    #[inline]
+    pub fn gaussian() -> Self {
+        Self {
+            v: 1.0,
+            v1: 0.0,
+            v2: 0.0,
+            v3: 0.0,
+        }
+    }
+}
+
+/// Per-observation observed-information weights and their first two
+/// η-derivatives for a general exponential-dispersion family with a
+/// noncanonical link.
+///
+/// # Arguments
+/// * `y`   – response value
+/// * `mu`  – fitted mean h(η)
+/// * `h1`…`h4` – inverse-link derivatives h'(η) … h''''(η)
+/// * `vj`  – variance-function jet (V, V', V'', V''') evaluated at μ
+/// * `phi` – dispersion parameter (1.0 for Bernoulli/Poisson)
+/// * `pw`  – prior weight for this observation
+///
+/// # Returns
+/// `(w_obs, c_obs, d_obs)` – the observed weight and its first two
+/// η-derivatives, all pre-multiplied by `pw`.
+#[inline]
+pub fn observed_weight_noncanonical(
+    y: f64,
+    mu: f64,
+    h1: f64,
+    h2: f64,
+    h3: f64,
+    h4: f64,
+    vj: VarianceJet,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let VarianceJet { v, v1, v2, v3 } = vj;
+    let phi_v = phi * v;
+    let phi_v2 = phi * v * v;
+    let phi_v3 = phi * v * v * v;
+
+    // ---- Fisher weight and derivatives ----
+    let h1_sq = h1 * h1;
+    let w_f = h1_sq / phi_v;
+
+    // c_F = (2 h₁ h₂ V − h₁³ V₁) / (φ V²)
+    let n0 = h1_sq;                      // numerator of w_F
+    let n1 = 2.0 * h1 * h2;             // ∂(h₁²)/∂η
+    let n2 = 2.0 * (h2 * h2 + h1 * h3); // ∂²(h₁²)/∂η²
+    let vd1 = h1 * v1;                   // ∂V/∂η = V'·h'
+    let vd2 = h2 * v1 + h1_sq * v2;     // ∂²V/∂η²
+
+    let c_f = (n1 * v - n0 * vd1) / phi_v2;
+
+    // d_F = ∂c_F/∂η via quotient rule on c_F = (n1·v − n0·vd1) / (φ·v²)
+    let numer_cf = n1 * v - n0 * vd1;
+    let dnumer_cf = n2 * v + n1 * vd1 - n1 * vd1 - n0 * vd2;
+    // = n2 * v - n0 * vd2
+    let dnumer_cf = n2 * v - n0 * vd2;
+    let d_f = (dnumer_cf * v - 2.0 * numer_cf * vd1) / (phi_v3);
+
+    // ---- Observed correction term B and its η-derivatives ----
+    // B = (h₂ V − h₁² V₁) / (φ V²)
+    let b_num = h2 * v - h1_sq * v1;
+    let b = b_num / phi_v2;
+
+    // B_η = (h₃ V² − 3 h₁ h₂ V V₁ − h₁³ V V₂ + 2 h₁³ V₁²) / (φ V³)
+    let b_eta_num = h3 * v * v
+        - 3.0 * h1 * h2 * v * v1
+        - h1_sq * h1 * v * v2
+        + 2.0 * h1_sq * h1 * v1 * v1;
+    let b_eta = b_eta_num / phi_v3;
+
+    // B_ηη = ∂B_η/∂η.
+    //
+    // We differentiate b_eta_num / (φ V³) using the quotient rule.
+    //
+    // Numerator derivative of b_eta_num w.r.t. η, using chain rule ∂/∂η = h₁·∂/∂μ
+    // for the V-dependent parts:
+    //
+    //   ∂/∂η [h₃ V²]               = h₄ V² + 2 h₃ V h₁ V₁
+    //   ∂/∂η [3 h₁ h₂ V V₁]        = 3(h₂² + h₁ h₃)V V₁ + 3 h₁ h₂(h₁ V₁² + V h₁ V₂)
+    //   ∂/∂η [h₁³ V V₂]            = 3 h₁² h₂ V V₂ + h₁³(h₁ V₁ V₂ + V h₁ V₃)
+    //   ∂/∂η [2 h₁³ V₁²]           = 6 h₁² h₂ V₁² + 4 h₁³ V₁ h₁ V₂
+    //                                = 6 h₁² h₂ V₁² + 4 h1_sq * h1_sq * v1 * v2
+    //
+    // Denominator derivative: ∂/∂η [φ V³] = 3 φ V² h₁ V₁.
+
+    let h1_cu = h1_sq * h1;
+    let h1_qu = h1_sq * h1_sq;
+
+    let db_eta_num = h4 * v * v + 2.0 * h3 * v * h1 * v1
+        - 3.0 * (h2 * h2 + h1 * h3) * v * v1
+        - 3.0 * h1 * h2 * (h1 * v1 * v1 + v * h1 * v2)
+        - 3.0 * h1_sq * h2 * v * v2
+        - h1_cu * (h1 * v1 * v2 + v * h1 * v3)
+        + 6.0 * h1_sq * h2 * v1 * v1
+        + 4.0 * h1_qu * v1 * v2;
+
+    let phi_v4 = phi_v3 * v;
+    let b_etaeta = (db_eta_num * v - 3.0 * b_eta_num * h1 * v1) / phi_v4;
+
+    // ---- Assemble observed quantities ----
+    let resid = y - mu;
+
+    let w_obs = w_f - resid * b;
+    let c_obs = c_f + h1 * b - resid * b_eta;
+    let d_obs = d_f + h2 * b + 2.0 * h1 * b_eta - resid * b_etaeta;
+
+    (pw * w_obs, pw * c_obs, pw * d_obs)
+}
+
+/// Vectorised wrapper: compute per-observation observed-information weights
+/// (w, c, d) for an entire response vector, given inverse-link jets, a
+/// variance-function evaluator, dispersion φ, and prior weights.
+///
+/// `h4` is the fourth inverse-link derivative h''''(η), supplied as a
+/// separate array because `InverseLinkJet` only stores up to h''' (d3).
+///
+/// `var_jet_fn` maps μ → `VarianceJet`.
+pub fn compute_noncanonical_observed_weights(
+    eta: &Array1<f64>,
+    y: ArrayView1<f64>,
+    jets: &[MixtureInverseLinkJet],
+    h4: &[f64],
+    var_jet_fn: impl Fn(f64) -> VarianceJet,
+    phi: f64,
+    prior_weights: ArrayView1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let n = eta.len();
+    let mut w = Array1::<f64>::zeros(n);
+    let mut c = Array1::<f64>::zeros(n);
+    let mut d = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let jet = &jets[i];
+        let vj = var_jet_fn(jet.mu);
+        let (wi, ci, di) = observed_weight_noncanonical(
+            y[i],
+            jet.mu,
+            jet.d1,
+            jet.d2,
+            jet.d3,
+            h4[i],
+            vj,
+            phi,
+            prior_weights[i],
+        );
+        w[i] = wi;
+        c[i] = ci;
+        d[i] = di;
+    }
+    (w, c, d)
+}
+
 #[derive(Clone)]
 pub enum DirectionalWorkingCurvature {
     /// Directional derivative of the PIRLS curvature when the working
