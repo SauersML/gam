@@ -972,6 +972,130 @@ pub fn reml_laml_evaluate(
     })
 }
 
+/// Compute the Firth bias-reduction Hessian contribution ∂²Φ/∂ρₖ∂ρₗ.
+///
+/// The Firth penalty is Φ = ½ log|I(β̂)|₊ where I is the Fisher information.
+/// Its second derivative with respect to the outer parameters ρ is:
+///
+/// ```text
+/// J_{kl} = ½ [tr(H⁻¹ Ï_{kl}) − tr(H⁻¹ İ_l H⁻¹ İ_k)]
+/// ```
+///
+/// This parallels the LAML Hessian structure EXACTLY:
+/// - The LAML Hessian has ½[tr(H⁻¹ Ḧ_{kl}) − tr(H⁻¹ Ḣ_l H⁻¹ Ḣ_k)]
+///   with penalized Hessian H and observed-weight corrections.
+/// - The Firth Hessian has ½[tr(H⁻¹ Ï_{kl}) − tr(H⁻¹ İ_l H⁻¹ İ_k)]
+///   using Fisher-weight corrections D(H_φ) and D²(H_φ).
+///
+/// The key identity connecting the two representations is:
+///   İ_k = D_β I[β_k] = D(H_φ)[B_k],  where B_k = −v_k = −H⁻¹(A_k β̂)
+///
+/// For the second drift:
+///   Ï_{kl} = D_β I[β_{kl}] + D²_β I[β_k, β_l]
+///          = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
+///
+/// where β_{kl} is the second implicit mode response from the LAML computation.
+///
+/// Note: we use `hop` (penalized Hessian H) for `tr(H⁻¹ ·)` operations because
+/// the Firth gradient formula ∂Φ/∂ρ_k = −½ tr(H⁻¹ D(H_φ)[B_k]) uses H⁻¹,
+/// not I⁻¹. This is because the chain rule through β̂(ρ) produces H⁻¹ from the
+/// implicit function theorem applied to the penalized score equation.
+///
+/// # Arguments
+/// - `firth_op`: The precomputed Firth dense operator (Fisher info, weight derivatives).
+/// - `hop`: The penalized Hessian operator (for H⁻¹ solves and traces).
+/// - `penalty_roots`: Penalty square roots R_k where S_k = R_k^T R_k.
+/// - `beta`: Coefficients at the converged mode.
+/// - `v_ks`: Precomputed mode responses v_k = H⁻¹(A_k β̂).
+/// - `h_k_matrices`: Precomputed total Hessian drifts Ḣ_k = A_k + C[v_k].
+/// - `a_k_betas`: Precomputed A_k β̂ vectors.
+/// - `a_k_matrices`: Precomputed penalty derivative matrices A_k = λ_k S_k.
+pub fn compute_firth_hessian_contribution(
+    firth_op: &super::FirthDenseOperator,
+    hop: &dyn HessianOperator,
+    penalty_roots: &[Array2<f64>],
+    beta: &Array1<f64>,
+    v_ks: &[Array1<f64>],
+    h_k_matrices: &[Array2<f64>],
+    a_k_betas: &[Array1<f64>],
+    a_k_matrices: &[Array2<f64>],
+) -> Array2<f64> {
+    let k = v_ks.len();
+    let p = beta.len();
+    let mut firth_hess = Array2::zeros((k, k));
+
+    // Precompute Firth directions and D(H_φ)[B_k] for each coordinate.
+    // B_k = −v_k, so δη_k = X·(−v_k).
+    let mut firth_dirs: Vec<super::FirthDirection> = Vec::with_capacity(k);
+    let mut dhphi_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
+
+    for idx in 0..k {
+        let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
+        let dir_k = firth_op.direction_from_deta(deta_k);
+        let dhphi_k = firth_op.hphi_direction(&dir_k);
+        firth_dirs.push(dir_k);
+        dhphi_ks.push(dhphi_k);
+    }
+
+    // Precompute Y_k^F = H⁻¹ D(H_φ)[B_k] for cross-trace terms.
+    let mut y_firth_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for idx in 0..k {
+        y_firth_ks.push(hop.solve_multi(&dhphi_ks[idx]));
+    }
+
+    for kk in 0..k {
+        for ll in kk..k {
+            // ── Cross-trace: tr(H⁻¹ İ_l H⁻¹ İ_k) = tr(Y_l^F · Y_k^F) ──
+            // where İ_k = D(H_φ)[B_k] and Y_k^F = H⁻¹ İ_k.
+            let cross_trace = (&y_firth_ks[ll].t() * &y_firth_ks[kk]).sum();
+
+            // ── Second drift: tr(H⁻¹ Ï_{kl}) ──
+            // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
+            //
+            // B_{kl} = −β_{kl} where β_{kl} = H⁻¹(Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂)
+            // is the second implicit mode response (reused from LAML computation).
+            let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
+            rhs += &a_k_matrices[kk].dot(&v_ks[ll]);
+            if kk == ll {
+                rhs -= &a_k_betas[kk];
+            }
+            let u_kl = hop.solve(&rhs);
+
+            // D(H_φ)[B_{kl}]: first directional derivative at B_{kl} = −u_kl.
+            // δη_{kl} = X·(−u_kl).
+            let deta_kl: Array1<f64> = firth_op.x_dense.dot(&u_kl).mapv(|v| -v);
+            let dir_kl = firth_op.direction_from_deta(deta_kl);
+            let dhphi_kl = firth_op.hphi_direction(&dir_kl);
+
+            // D²(H_φ)[B_k, B_l]: second directional derivative.
+            let eye = Array2::<f64>::eye(p);
+            let d2hphi_kl = firth_op.hphisecond_direction_apply(
+                &firth_dirs[kk],
+                &firth_dirs[ll],
+                &eye,
+            );
+
+            // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
+            let ddot_kl = &dhphi_kl + &d2hphi_kl;
+            let second_drift_trace = hop.trace_hinv_product(&ddot_kl);
+
+            // J_{kl} = −½ [second_drift_trace − cross_trace]
+            //
+            // The sign is negative because the Firth gradient uses
+            // ∂Φ/∂ρ_k = −½ tr(H⁻¹ D(H_φ)[B_k]), so the second derivative
+            // inherits the same overall negative sign.
+            let j_kl = -0.5 * (second_drift_trace - cross_trace);
+
+            firth_hess[[kk, ll]] = j_kl;
+            if kk != ll {
+                firth_hess[[ll, kk]] = j_kl;
+            }
+        }
+    }
+
+    firth_hess
+}
+
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
 /// Uses the precomputed HessianOperator for all linear algebra.
@@ -1320,6 +1444,159 @@ fn compute_outer_hessian(
     }
 
     Ok(hess)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Extended Fellner–Schall (EFS) update for all hyperparameters
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Maximum absolute step size for the EFS update (prevents overshooting).
+const EFS_MAX_STEP: f64 = 5.0;
+
+/// Extended Fellner–Schall update generalized to arbitrary hyperparameter
+/// coordinates via the [`HyperCoord`] abstraction.
+///
+/// The standard EFS update for ρ_k (log-smoothing parameters) avoids the
+/// full outer Hessian by using an approximate Newton step:
+///
+/// ```text
+///   ρ_k^new = ρ_k + [2·a_k - tr(H⁻¹ B_k)] / tr(H⁻¹ B_k H⁻¹ B_k)
+/// ```
+///
+/// where `a_k = ½ λ_k β̂ᵀ S_k β̂` is the penalty quadratic derivative and
+/// `B_k = A_k = λ_k S_k` is the penalty Hessian derivative.
+///
+/// **Generalization to ψ coordinates:** The same formula applies to any
+/// outer coordinate θ_i with its `HyperCoord` objects `(a_i, B_i)`:
+///
+/// ```text
+///   θ_i^new = θ_i + [2·a_i - tr(H⁻¹ B_i)] / tr(H⁻¹ B_i H⁻¹ B_i)
+/// ```
+///
+/// The numerator approximates `2 × gradient` (ignoring the C[β_i] third-
+/// derivative correction and the log|S|₊ derivative). The denominator
+/// approximates the diagonal Hessian. This is deliberately approximate:
+/// EFS is already a quasi-Newton scheme, so dropping the small C[β_i] and
+/// ℓˢ_i terms keeps the update stable without hurting convergence in
+/// practice.
+///
+/// **When this approximation may be poor:** For highly non-Gaussian
+/// families where `B_i` depends strongly on β (e.g., heavy-tailed
+/// location-scale models with ψ controlling the shape), the dropped C[β_i]
+/// correction can be significant. In such cases, prefer the full Newton or
+/// BFGS outer optimizer over EFS.
+///
+/// # Arguments
+/// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
+/// - `rho`: Current log-smoothing parameters.
+///
+/// # Returns
+/// A vector of proposed additive steps for all coordinates: first the ρ
+/// coordinates, then the ext coordinates (in the same order as
+/// `solution.ext_coords`). Apply as `θ_i^new = θ_i + step[i]`.
+///
+/// The steps are clamped to `[-EFS_MAX_STEP, EFS_MAX_STEP]` to prevent
+/// overshooting. For ψ coordinates with domain constraints (e.g., bounded
+/// shape parameters), the caller should additionally clip `θ_i^new` to the
+/// valid range after applying the step.
+pub fn compute_efs_update(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+) -> Vec<f64> {
+    let k = rho.len();
+    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let hop = &*solution.hessian_op;
+    let ext_dim = solution.ext_coords.len();
+    let total = k + ext_dim;
+    let mut steps = vec![0.0; total];
+
+    // Profiled Gaussian rescaling factor.
+    // For Gaussian REML the penalty quadratic derivative a_k enters the
+    // gradient as a_k / φ̂ (with the profiled scale). For non-Gaussian,
+    // the factor is 1.
+    let (profiled_scale, is_profiled) = match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => {
+            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+            let (dp_c, _) = smooth_floor_dp(dp_raw);
+            let denom =
+                (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
+            (dp_c / denom, true)
+        }
+        DispersionHandling::Fixed { phi, .. } => (*phi, false),
+    };
+
+    // ── ρ coordinates ──
+    for idx in 0..k {
+        let r_k = &solution.penalty_roots[idx];
+
+        // a_k = ½ β̂ᵀ A_k β̂ = ½ λ_k β̂ᵀ S_k β̂
+        let r_beta = r_k.dot(&solution.beta);
+        let s_k_beta_sq = r_beta.dot(&r_beta); // β̂ᵀ S_k β̂ = |R_k β̂|²
+        let a_k = 0.5 * lambdas[idx] * s_k_beta_sq;
+
+        // Rescale a_k for profiled Gaussian: effective a = a_k / φ̂
+        let a_k_eff = if is_profiled {
+            a_k / profiled_scale
+        } else {
+            a_k
+        };
+
+        // B_k = A_k = λ_k R_k^T R_k
+        let a_k_matrix = {
+            let mut m = r_k.t().dot(r_k);
+            m *= lambdas[idx];
+            m
+        };
+
+        // Numerator: 2·a_k - tr(H⁻¹ B_k)
+        // We drop the C[β_k] correction for EFS (pass None).
+        let trace_term = hop.trace_hinv_h_k(&a_k_matrix, None);
+        let numerator = 2.0 * a_k_eff - trace_term;
+
+        // Denominator: tr(H⁻¹ B_k H⁻¹ B_k) = ||H⁻¹ B_k||²_F
+        let y_k = hop.solve_multi(&a_k_matrix);
+        let denominator = (&y_k * &y_k).sum();
+
+        let step = if denominator.abs() > 1e-30 {
+            (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+        } else {
+            0.0
+        };
+        steps[idx] = step;
+    }
+
+    // ── Extended (ψ/τ) coordinates ──
+    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+        // Rescale a_i for profiled Gaussian: effective a = a_i / φ̂
+        let a_i_eff = if is_profiled {
+            coord.a / profiled_scale
+        } else {
+            coord.a
+        };
+
+        // Numerator: 2·a_i - tr(H⁻¹ B_i)
+        // We deliberately drop the C[β_i] correction (pass None) for EFS.
+        // This ignores the third-derivative contribution from β-dependent B_i.
+        // Rationale: EFS is already an approximate Newton scheme; the C[β_i]
+        // term is small for well-conditioned models and its omission keeps the
+        // update stable and cheap.
+        let trace_term = hop.trace_hinv_h_k(&coord.b_mat, None);
+        let numerator = 2.0 * a_i_eff - trace_term;
+
+        // Denominator: tr(H⁻¹ B_i H⁻¹ B_i) = ||Y_i||²_F where Y_i = H⁻¹ B_i
+        let y_i = hop.solve_multi(&coord.b_mat);
+        let denominator = (&y_i * &y_i).sum();
+
+        let step = if denominator.abs() > 1e-30 {
+            (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+        } else {
+            0.0
+        };
+
+        steps[k + ext_idx] = step;
+    }
+
+    steps
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
