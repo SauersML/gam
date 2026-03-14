@@ -5226,6 +5226,16 @@ impl VarianceJet {
             v3: 0.0,
         }
     }
+
+    /// Binomial(n, p) variance V(p) = p(1−p), identical to Bernoulli.
+    ///
+    /// The trial count `n` enters as a prior-weight multiplier, not through
+    /// the variance function itself.
+    #[inline]
+    pub fn binomial_n(mu: f64) -> Self {
+        // V(μ) = μ(1−μ), same jet as Bernoulli
+        Self::bernoulli(mu)
+    }
 }
 
 /// Per-observation observed-information weights and their first two
@@ -5369,6 +5379,128 @@ pub fn compute_noncanonical_observed_weights(
         c[i] = ci;
         d[i] = di;
     }
+    (w, c, d)
+}
+
+// ---------------------------------------------------------------------------
+// Direct (closed-form) observed-information weights for specific family-link
+// combinations.  These avoid the overhead of the generic noncanonical formula
+// when the algebra simplifies.
+// ---------------------------------------------------------------------------
+
+/// Gaussian family with log link: y ~ N(μ, φ), μ = exp(η).
+///
+/// Returns `(w_obs, c_obs, d_obs)` pre-multiplied by the prior weight `pw`.
+///
+/// ```text
+/// w_obs = ω μ(2μ − y) / φ
+/// c_obs = ω μ(4μ − y) / φ
+/// d_obs = ω μ(8μ − y) / φ
+/// ```
+#[inline]
+pub fn observed_weight_gaussian_log(
+    y: f64,
+    mu: f64,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let inv_phi = pw / phi;
+    let w = inv_phi * mu * (2.0 * mu - y);
+    let c = inv_phi * mu * (4.0 * mu - y);
+    let d = inv_phi * mu * (8.0 * mu - y);
+    (w, c, d)
+}
+
+/// Fisher-information weights for Gaussian-log (no residual correction).
+///
+/// ```text
+/// w_F = ω μ² / φ,  c_F = ω 2μ² / φ,  d_F = ω 4μ² / φ
+/// ```
+#[inline]
+pub fn fisher_weight_gaussian_log(
+    mu: f64,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let mu2 = mu * mu;
+    let inv_phi = pw / phi;
+    (inv_phi * mu2, inv_phi * 2.0 * mu2, inv_phi * 4.0 * mu2)
+}
+
+/// Gaussian family with inverse link: y ~ N(μ, φ), μ = 1/η.
+///
+/// Returns `(w_obs, c_obs, d_obs)` pre-multiplied by the prior weight `pw`.
+///
+/// ```text
+/// w_obs = ω (3 − 2ηy) / (φ η⁴)
+/// c_obs = 6ω (ηy − 2) / (φ η⁵)
+/// d_obs = 12ω (5 − 2ηy) / (φ η⁶)
+/// ```
+#[inline]
+pub fn observed_weight_gaussian_inverse(
+    y: f64,
+    eta: f64,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let eta2 = eta * eta;
+    let eta4 = eta2 * eta2;
+    let eta5 = eta4 * eta;
+    let eta6 = eta4 * eta2;
+    let ey = eta * y;
+    let inv_phi = pw / phi;
+    let w = inv_phi * (3.0 - 2.0 * ey) / eta4;
+    let c = inv_phi * 6.0 * (ey - 2.0) / eta5;
+    let d = inv_phi * 12.0 * (5.0 - 2.0 * ey) / eta6;
+    (w, c, d)
+}
+
+/// Fisher-information weights for Gaussian-inverse (no residual correction).
+///
+/// ```text
+/// w_F = ω / (φ η⁴),  c_F = −4ω / (φ η⁵),  d_F = 20ω / (φ η⁶)
+/// ```
+#[inline]
+pub fn fisher_weight_gaussian_inverse(
+    eta: f64,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let eta2 = eta * eta;
+    let eta4 = eta2 * eta2;
+    let eta5 = eta4 * eta;
+    let eta6 = eta4 * eta2;
+    let inv_phi = pw / phi;
+    (
+        inv_phi / eta4,
+        -4.0 * inv_phi / eta5,
+        20.0 * inv_phi / eta6,
+    )
+}
+
+/// Binomial(n, p) with canonical logit link.
+///
+/// Returns `(w, c, d)` pre-multiplied by the prior weight `pw`.
+/// Since logit is the canonical link for the binomial family,
+/// observed = Fisher (no residual correction).
+///
+/// ```text
+/// w = ω n p(1−p)
+/// c = ω n p(1−p)(1−2p)
+/// d = ω n p(1−p)(1−6p+6p²)
+/// ```
+#[inline]
+pub fn observed_weight_binomial_logit(
+    n_trials: f64,
+    p: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let q = 1.0 - p;
+    let pq = p * q;
+    let npq = pw * n_trials * pq;
+    let w = npq;
+    let c = npq * (1.0 - 2.0 * p);
+    let d = npq * (1.0 - 6.0 * p * q);
     (w, c, d)
 }
 

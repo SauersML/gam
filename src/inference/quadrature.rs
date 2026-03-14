@@ -3033,6 +3033,271 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + f64::exp(-x_clamped))
 }
 
+// ---------------------------------------------------------------------------
+// CLogLog Gaussian convolution via differentiated Gauss-Hermite quadrature
+// ---------------------------------------------------------------------------
+//
+// For location-scale (GAMLSS) models with CLogLog link we need to evaluate
+//   L(μ,σ) = E[g(μ + σZ)],  Z ~ N(0,1),  g(η) = 1 - exp(-exp(η)),
+// together with all partial derivatives up to fourth order w.r.t. μ and σ.
+//
+// GHQ gives
+//   L(μ,σ) ≈ (1/√π) Σ_m ω_m g(t_m),   t_m = μ + √2 σ x_m
+//
+// and by the chain rule (exact for the quadrature rule since t_m is affine
+// in μ and σ):
+//   ∂^a_μ ∂^b_σ L ≈ (√2)^b / √π  Σ_m ω_m x_m^b g^{(a+b)}(t_m)
+
+/// All partial derivatives of `L(μ,σ) = E[g(μ + σZ)]` up to fourth order,
+/// where `g` is the CLogLog inverse link and `Z ~ N(0,1)`.
+#[derive(Clone, Copy, Debug)]
+pub struct CLogLogConvolutionDerivatives {
+    // 0th order
+    pub l: f64,
+
+    // 1st order
+    pub l_mu: f64,
+    pub l_sigma: f64,
+
+    // 2nd order
+    pub l_mumu: f64,
+    pub l_musigma: f64,
+    pub l_sigmasigma: f64,
+
+    // 3rd order
+    pub l_mumumu: f64,
+    pub l_mumusigma: f64,
+    pub l_musigmasigma: f64,
+    pub l_sigmasigmasigma: f64,
+
+    // 4th order
+    pub l_mumumumu: f64,
+    pub l_mumumusigma: f64,
+    pub l_mumusigmasigma: f64,
+    pub l_musigmasigmasigma: f64,
+    pub l_sigmasigmasigmasigma: f64,
+}
+
+/// CLogLog inverse link `g(t) = 1 - exp(-exp(t))` and its first four
+/// derivatives, evaluated in a numerically stable way.
+///
+/// All derivatives share the common factor `h(t) = exp(t - exp(t))`:
+/// ```text
+///   g  (t) = 1 - exp(-exp(t))
+///   g' (t) = h(t)
+///   g''(t) = (1 - exp(t)) h(t)
+///   g'''(t) = (exp(2t) - 3 exp(t) + 1) h(t)
+///   g''''(t) = (-exp(3t) + 6 exp(2t) - 7 exp(t) + 1) h(t)
+/// ```
+#[inline]
+fn cloglog_g_derivatives(t: f64) -> (f64, f64, f64, f64, f64) {
+    // Guard against overflow/underflow. When |t| is very large the function
+    // and/or its derivatives are saturated.
+    if t > 30.0 {
+        // g(t) → 1, all derivatives → 0 because h(t) = exp(t - exp(t)) → 0
+        // for large positive t (exp(t) dominates in the exponent).
+        return (1.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    if t < -30.0 {
+        // g(t) ≈ exp(t) → 0, g'(t) ≈ exp(t) → 0 (since exp(t) ≈ 0 means
+        // h(t) = exp(t - exp(t)) ≈ exp(t) * exp(-1) ≈ 0 * e^{-1}).
+        // Actually for very negative t: exp(t)→0, so exp(-exp(t))→1,
+        // g(t) = 1 - exp(-exp(t)) → 0, and h(t) = exp(t)*exp(-exp(t)) → 0.
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let et = t.exp(); // exp(t)
+    let neg_et = -et;
+    let s = neg_et.exp(); // exp(-exp(t)) — survival function
+    let g = 1.0 - s;
+
+    // Common factor h(t) = exp(t - exp(t)) = exp(t) * exp(-exp(t)) = et * s
+    let h = et * s;
+
+    // If h is negligibly small, derivatives are zero.
+    if h < 1e-300 {
+        return (g, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let g1 = h;
+    let g2 = (1.0 - et) * h;
+    let et2 = et * et; // exp(2t)
+    let g3 = (et2 - 3.0 * et + 1.0) * h;
+    let et3 = et2 * et; // exp(3t)
+    let g4 = (-et3 + 6.0 * et2 - 7.0 * et + 1.0) * h;
+
+    (g, g1, g2, g3, g4)
+}
+
+/// Compute `L(μ,σ) = E[g(μ + σZ)]` via Gauss-Hermite quadrature.
+///
+/// The number of GHQ nodes is determined by the `QuadratureContext` cache;
+/// `n_nodes` selects from the available rule sizes (7, 15, 21, 31).
+///
+/// When `sigma` is negligibly small the function evaluates `g(mu)` directly,
+/// bypassing quadrature.
+pub fn cloglog_ghq_value(ctx: &QuadratureContext, mu: f64, sigma: f64, n_nodes: usize) -> f64 {
+    if sigma.abs() < 1e-14 {
+        let (g, _, _, _, _) = cloglog_g_derivatives(mu);
+        return g;
+    }
+    let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
+    let scale = SQRT_2 * sigma;
+    with_gh_nodesweights(ctx, n_nodes, |nodes, weights| {
+        let mut sum = 0.0_f64;
+        for i in 0..nodes.len() {
+            let t = mu + scale * nodes[i];
+            let (g, _, _, _, _) = cloglog_g_derivatives(t);
+            sum += weights[i] * g;
+        }
+        sum * inv_sqrt_pi
+    })
+}
+
+/// Compute all partial derivatives of `L(μ,σ)` up to fourth order via
+/// differentiated Gauss-Hermite quadrature.
+///
+/// Uses the identity:
+/// ```text
+///   ∂^a_μ ∂^b_σ L ≈ (√2)^b / √π  Σ_m ω_m x_m^b g^{(a+b)}(t_m)
+/// ```
+///
+/// `n_nodes` selects the GHQ rule size (7, 15, 21, or 31). For location-scale
+/// GAMLSS applications, 21-31 nodes is recommended.
+pub fn cloglog_ghq_derivatives(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+    n_nodes: usize,
+) -> CLogLogConvolutionDerivatives {
+    let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
+
+    // When sigma is negligibly small, evaluate directly at mu.
+    if sigma.abs() < 1e-14 {
+        let (g, g1, g2, g3, g4) = cloglog_g_derivatives(mu);
+        return CLogLogConvolutionDerivatives {
+            l: g,
+            l_mu: g1,
+            l_sigma: 0.0,
+            l_mumu: g2,
+            l_musigma: 0.0,
+            l_sigmasigma: 0.0,
+            l_mumumu: g3,
+            l_mumusigma: 0.0,
+            l_musigmasigma: 0.0,
+            l_sigmasigmasigma: 0.0,
+            l_mumumumu: g4,
+            l_mumumusigma: 0.0,
+            l_mumusigmasigma: 0.0,
+            l_musigmasigmasigma: 0.0,
+            l_sigmasigmasigmasigma: 0.0,
+        };
+    }
+
+    let scale = SQRT_2 * sigma;
+    let sqrt2 = SQRT_2;
+
+    with_gh_nodesweights(ctx, n_nodes, |nodes, weights| {
+        // Accumulators for the weighted sums. For derivative ∂^a_μ ∂^b_σ L,
+        // we need Σ ω_m x_m^b g^{(a+b)}(t_m). We group by the order of g
+        // derivative needed (k = a + b) and the power of x_m (= b).
+        //
+        // k=0: g(t_m)    — need x^0
+        // k=1: g'(t_m)   — need x^0, x^1
+        // k=2: g''(t_m)  — need x^0, x^1, x^2
+        // k=3: g'''(t_m) — need x^0, x^1, x^2, x^3
+        // k=4: g''''(t_m)— need x^0, x^1, x^2, x^3, x^4
+
+        // s[k][b] = Σ_m ω_m x_m^b g^{(k)}(t_m)
+        let mut s = [[0.0_f64; 5]; 5];
+
+        for i in 0..nodes.len() {
+            let x = nodes[i];
+            let t = mu + scale * x;
+            let (g0, g1, g2, g3, g4) = cloglog_g_derivatives(t);
+            let w = weights[i];
+
+            // Powers of x_m
+            let x2 = x * x;
+            let x3 = x2 * x;
+            let x4 = x3 * x;
+
+            // k=0: only need x^0
+            s[0][0] += w * g0;
+
+            // k=1: need x^0, x^1
+            s[1][0] += w * g1;
+            s[1][1] += w * x * g1;
+
+            // k=2: need x^0, x^1, x^2
+            s[2][0] += w * g2;
+            s[2][1] += w * x * g2;
+            s[2][2] += w * x2 * g2;
+
+            // k=3: need x^0, x^1, x^2, x^3
+            s[3][0] += w * g3;
+            s[3][1] += w * x * g3;
+            s[3][2] += w * x2 * g3;
+            s[3][3] += w * x3 * g3;
+
+            // k=4: need x^0, x^1, x^2, x^3, x^4
+            s[4][0] += w * g4;
+            s[4][1] += w * x * g4;
+            s[4][2] += w * x2 * g4;
+            s[4][3] += w * x3 * g4;
+            s[4][4] += w * x4 * g4;
+        }
+
+        // Now assemble derivatives using:
+        //   ∂^a_μ ∂^b_σ L = (√2)^b / √π · s[a+b][b]
+        let sqrt2_1 = sqrt2;
+        let sqrt2_2 = 2.0; // (√2)^2
+        let sqrt2_3 = 2.0 * sqrt2; // (√2)^3
+        let sqrt2_4 = 4.0; // (√2)^4
+
+        CLogLogConvolutionDerivatives {
+            // 0th: a=0, b=0 → (√2)^0 / √π · s[0][0]
+            l: inv_sqrt_pi * s[0][0],
+
+            // 1st: (a=1,b=0), (a=0,b=1)
+            l_mu: inv_sqrt_pi * s[1][0],
+            l_sigma: inv_sqrt_pi * sqrt2_1 * s[1][1],
+
+            // 2nd: (a=2,b=0), (a=1,b=1), (a=0,b=2)
+            l_mumu: inv_sqrt_pi * s[2][0],
+            l_musigma: inv_sqrt_pi * sqrt2_1 * s[2][1],
+            l_sigmasigma: inv_sqrt_pi * sqrt2_2 * s[2][2],
+
+            // 3rd: (a=3,b=0), (a=2,b=1), (a=1,b=2), (a=0,b=3)
+            l_mumumu: inv_sqrt_pi * s[3][0],
+            l_mumusigma: inv_sqrt_pi * sqrt2_1 * s[3][1],
+            l_musigmasigma: inv_sqrt_pi * sqrt2_2 * s[3][2],
+            l_sigmasigmasigma: inv_sqrt_pi * sqrt2_3 * s[3][3],
+
+            // 4th: (a=4,b=0), (a=3,b=1), (a=2,b=2), (a=1,b=3), (a=0,b=4)
+            l_mumumumu: inv_sqrt_pi * s[4][0],
+            l_mumumusigma: inv_sqrt_pi * sqrt2_1 * s[4][1],
+            l_mumusigmasigma: inv_sqrt_pi * sqrt2_2 * s[4][2],
+            l_musigmasigmasigma: inv_sqrt_pi * sqrt2_3 * s[4][3],
+            l_sigmasigmasigmasigma: inv_sqrt_pi * sqrt2_4 * s[4][4],
+        }
+    })
+}
+
+/// Convenience wrapper that uses adaptive node count based on sigma magnitude.
+///
+/// For small sigma, fewer nodes suffice; for large sigma, more are needed to
+/// capture tail contributions accurately. This mirrors the adaptive strategy
+/// used by `integrate_normal_ghq_adaptive`.
+pub fn cloglog_ghq_derivatives_adaptive(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> CLogLogConvolutionDerivatives {
+    let n = adaptive_point_count_from_sd(sigma.abs());
+    cloglog_ghq_derivatives(ctx, mu, sigma, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3809,5 +4074,180 @@ mod tests {
         assert!(out.d2.is_finite());
         assert!(out.d3.is_finite());
         assert!(out.mean > 0.0 && out.mean < 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for CLogLog Gaussian convolution derivatives
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cloglog_g_derivatives_at_zero() {
+        let (g, g1, g2, g3, g4) = cloglog_g_derivatives(0.0);
+        // g(0) = 1 - exp(-1)
+        let expected_g = 1.0 - (-1.0_f64).exp();
+        assert_relative_eq!(g, expected_g, epsilon = 1e-14);
+        // g'(0) = exp(0 - exp(0)) = exp(-1)
+        let e_neg1 = (-1.0_f64).exp();
+        assert_relative_eq!(g1, e_neg1, epsilon = 1e-14);
+        // g''(0) = (1 - 1) * exp(-1) = 0
+        assert_relative_eq!(g2, 0.0, epsilon = 1e-14);
+        // g'''(0) = (1 - 3 + 1) * exp(-1) = -exp(-1)
+        assert_relative_eq!(g3, -e_neg1, epsilon = 1e-14);
+        // g''''(0) = (-1 + 6 - 7 + 1) * exp(-1) = -exp(-1)
+        assert_relative_eq!(g4, -e_neg1, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn cloglog_g_derivatives_saturation() {
+        // Very large t: g→1, derivatives→0
+        let (g, g1, g2, g3, g4) = cloglog_g_derivatives(50.0);
+        assert_relative_eq!(g, 1.0, epsilon = 1e-10);
+        assert_eq!(g1, 0.0);
+        assert_eq!(g2, 0.0);
+        assert_eq!(g3, 0.0);
+        assert_eq!(g4, 0.0);
+
+        // Very negative t: g→0, derivatives→0
+        let (g, g1, g2, g3, g4) = cloglog_g_derivatives(-50.0);
+        assert_eq!(g, 0.0);
+        assert_eq!(g1, 0.0);
+        assert_eq!(g2, 0.0);
+        assert_eq!(g3, 0.0);
+        assert_eq!(g4, 0.0);
+    }
+
+    #[test]
+    fn cloglog_ghq_value_sigma_zero_matches_pointwise() {
+        let ctx = QuadratureContext::new();
+        // When sigma=0, L(mu,0) = g(mu)
+        for &mu in &[-2.0, -1.0, 0.0, 0.5, 1.5] {
+            let val = cloglog_ghq_value(&ctx, mu, 0.0, 21);
+            let (g, _, _, _, _) = cloglog_g_derivatives(mu);
+            assert_relative_eq!(val, g, epsilon = 1e-14);
+        }
+    }
+
+    #[test]
+    fn cloglog_ghq_value_bounded_zero_one() {
+        let ctx = QuadratureContext::new();
+        // g maps to (0,1), so the Gaussian convolution should stay in [0,1]
+        for &mu in &[-5.0, -2.0, 0.0, 1.0, 3.0, 10.0] {
+            for &sigma in &[0.1, 0.5, 1.0, 2.0, 5.0] {
+                let val = cloglog_ghq_value(&ctx, mu, sigma, 31);
+                assert!(val >= 0.0 && val <= 1.0, "L({mu},{sigma}) = {val}");
+            }
+        }
+    }
+
+    #[test]
+    fn cloglog_ghq_derivatives_sigma_zero_matches_pointwise() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.3;
+        let d = cloglog_ghq_derivatives(&ctx, mu, 0.0, 21);
+        let (g, g1, g2, g3, g4) = cloglog_g_derivatives(mu);
+        assert_relative_eq!(d.l, g, epsilon = 1e-14);
+        assert_relative_eq!(d.l_mu, g1, epsilon = 1e-14);
+        assert_eq!(d.l_sigma, 0.0);
+        assert_relative_eq!(d.l_mumu, g2, epsilon = 1e-14);
+        assert_eq!(d.l_musigma, 0.0);
+        assert_eq!(d.l_sigmasigma, 0.0);
+        assert_relative_eq!(d.l_mumumu, g3, epsilon = 1e-14);
+        assert_relative_eq!(d.l_mumumumu, g4, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn cloglog_ghq_derivatives_finite_difference_mu() {
+        // Verify ∂L/∂μ by finite differences
+        let ctx = QuadratureContext::new();
+        let mu = 0.5;
+        let sigma = 0.8;
+        let h = 1e-6;
+        let d = cloglog_ghq_derivatives(&ctx, mu, sigma, 31);
+        let l_plus = cloglog_ghq_value(&ctx, mu + h, sigma, 31);
+        let l_minus = cloglog_ghq_value(&ctx, mu - h, sigma, 31);
+        let fd_mu = (l_plus - l_minus) / (2.0 * h);
+        assert_relative_eq!(d.l_mu, fd_mu, epsilon = 1e-5);
+
+        // Second derivative ∂²L/∂μ²
+        let d_plus = cloglog_ghq_derivatives(&ctx, mu + h, sigma, 31);
+        let d_minus = cloglog_ghq_derivatives(&ctx, mu - h, sigma, 31);
+        let fd_mumu = (d_plus.l_mu - d_minus.l_mu) / (2.0 * h);
+        assert_relative_eq!(d.l_mumu, fd_mumu, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn cloglog_ghq_derivatives_finite_difference_sigma() {
+        // Verify ∂L/∂σ by finite differences
+        let ctx = QuadratureContext::new();
+        let mu = 0.2;
+        let sigma = 1.0;
+        let h = 1e-6;
+        let d = cloglog_ghq_derivatives(&ctx, mu, sigma, 31);
+        let l_plus = cloglog_ghq_value(&ctx, mu, sigma + h, 31);
+        let l_minus = cloglog_ghq_value(&ctx, mu, sigma - h, 31);
+        let fd_sigma = (l_plus - l_minus) / (2.0 * h);
+        assert_relative_eq!(d.l_sigma, fd_sigma, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn cloglog_ghq_derivatives_finite_difference_cross() {
+        // Verify ∂²L/∂μ∂σ by finite differences of ∂L/∂μ w.r.t. σ
+        let ctx = QuadratureContext::new();
+        let mu = -0.5;
+        let sigma = 0.6;
+        let h = 1e-6;
+        let d = cloglog_ghq_derivatives(&ctx, mu, sigma, 31);
+        let d_plus = cloglog_ghq_derivatives(&ctx, mu, sigma + h, 31);
+        let d_minus = cloglog_ghq_derivatives(&ctx, mu, sigma - h, 31);
+        let fd_musigma = (d_plus.l_mu - d_minus.l_mu) / (2.0 * h);
+        assert_relative_eq!(d.l_musigma, fd_musigma, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn cloglog_ghq_l_mu_nonnegative() {
+        // g'(t) = exp(t - exp(t)) >= 0, so ∂L/∂μ = E[g'(t)] >= 0
+        let ctx = QuadratureContext::new();
+        for &mu in &[-3.0, -1.0, 0.0, 1.0, 3.0] {
+            for &sigma in &[0.1, 0.5, 1.0, 2.0] {
+                let d = cloglog_ghq_derivatives(&ctx, mu, sigma, 21);
+                assert!(
+                    d.l_mu >= -1e-14,
+                    "L_mu should be non-negative at mu={mu}, sigma={sigma}: got {}",
+                    d.l_mu
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cloglog_ghq_adaptive_matches_explicit() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.7;
+        let sigma = 1.2;
+        let adaptive = cloglog_ghq_derivatives_adaptive(&ctx, mu, sigma);
+        let n = adaptive_point_count_from_sd(sigma);
+        let explicit = cloglog_ghq_derivatives(&ctx, mu, sigma, n);
+        assert_relative_eq!(adaptive.l, explicit.l, epsilon = 1e-15);
+        assert_relative_eq!(adaptive.l_mu, explicit.l_mu, epsilon = 1e-15);
+        assert_relative_eq!(adaptive.l_sigma, explicit.l_sigma, epsilon = 1e-15);
+        assert_relative_eq!(adaptive.l_mumu, explicit.l_mumu, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn cloglog_ghq_value_consistent_with_existing_cloglog() {
+        // Cross-check: our L(mu, sigma) should match the existing
+        // cloglog_posterior_mean which uses integrate_normal_ghq_adaptive
+        let ctx = QuadratureContext::new();
+        for &mu in &[-1.0, 0.0, 0.5, 2.0] {
+            for &sigma in &[0.1, 0.5, 1.0] {
+                let our_val = cloglog_ghq_value(&ctx, mu, sigma, 31);
+                // The existing function uses eta=mu, se_eta=sigma
+                let existing = cloglog_posterior_mean(&ctx, mu, sigma);
+                // They may use different node counts or different code paths
+                // (the existing one uses controlled/exact backends for some
+                // regimes), so allow a small tolerance.
+                assert_relative_eq!(our_val, existing, epsilon = 1e-6,);
+            }
+        }
     }
 }
