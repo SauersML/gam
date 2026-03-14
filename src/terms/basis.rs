@@ -1823,6 +1823,11 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
+    /// Number of data points.
+    pub fn n_data(&self) -> usize {
+        self.n
+    }
+
     /// Number of axes (D).
     pub fn n_axes(&self) -> usize {
         self.n_axes
