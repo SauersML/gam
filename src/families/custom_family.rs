@@ -125,6 +125,19 @@ pub trait CustomFamily {
         ExactNewtonOuterObjective::QuadraticReml
     }
 
+    /// Whether the joint likelihood Hessian H_L depends on β.
+    ///
+    /// When `true`, the unified evaluator includes M_j[u] = D_β B_j[u]
+    /// moving-design drift correction for ψ coordinates and marks
+    /// `HyperCoord::b_depends_on_beta = true`.
+    ///
+    /// Default: `true` for PseudoLaplace, `false` for QuadraticReml.
+    /// Gaussian location-scale must override to `true` because their
+    /// joint Hessian depends on β even though outer objective is QuadraticReml.
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        self.exact_newton_outerobjective() != ExactNewtonOuterObjective::QuadraticReml
+    }
+
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
     ///
     /// Default `false` allows the generic blockwise diagonal fallback when a
@@ -3984,7 +3997,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
     rho: &[f64],
     penalty_counts: &[usize],
     s_pinv: Option<&Array2<f64>>,
-    is_gaussian: bool,
+    hessian_beta_independent: bool,
 ) -> Result<Vec<HyperCoord>, String> {
     let ranges = block_param_ranges(specs);
     let total = beta_flat.len();
@@ -4342,10 +4355,10 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-    is_gaussian: bool,
+    hessian_beta_independent: bool,
 ) -> Option<FixedDriftDerivFn> {
-    if is_gaussian {
-        // Gaussian families have β-independent Hessians; M_i ≡ 0.
+    if hessian_beta_independent {
+        // Likelihood Hessian is β-independent; M_i ≡ 0.
         return None;
     }
 

@@ -898,6 +898,10 @@ impl BinomialAlphaBetaWarmStartFamily {
 }
 
 impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -4521,6 +4525,16 @@ impl GaussianLocationScaleFamily {
 }
 
 impl CustomFamily for GaussianLocationScaleFamily {
+    /// The Gaussian location-scale joint Hessian depends on β because the
+    /// cross-block (μ,log σ) and (log σ,log σ) blocks contain the residual
+    /// r = y − μ (via the row scalars m = r·w and n = r²·w), which changes
+    /// when β_μ moves.  The (μ,μ) block weight w = 1/σ² also depends on
+    /// β_{log σ}.  This override is essential for correct M_j[u] drift
+    /// corrections when ψ hyperparameters move the design matrices.
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -4968,6 +4982,10 @@ impl BinomialMeanWiggleFamily {
 }
 
 impl CustomFamily for BinomialMeanWiggleFamily {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -6741,6 +6759,13 @@ impl BinomialLocationScaleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
+    /// The Binomial location-scale joint Hessian depends on β because the
+    /// Hessian blocks are functions of q = -t/σ and the link derivatives,
+    /// all of which change when β_t or β_{log σ} move.
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -9304,6 +9329,13 @@ impl BinomialLocationScaleWiggleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleWiggleFamily {
+    /// The Binomial location-scale-wiggle joint Hessian depends on β because
+    /// it involves the nonlinear link function evaluated at the combined
+    /// predictor, which changes with all three coefficient blocks.
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(format!(
