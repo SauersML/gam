@@ -2385,28 +2385,11 @@ pub fn run_joint_beta_rho_sampling(
         })
         .collect();
 
-    // Use diagonal mass matrix for the mixed (β, ρ) space.
-    // The ρ components may have very different scale from β components,
-    // and diagonal adaptation handles this.
-    let mass_cfg = {
-        let nwarmup = config.nwarmup;
-        if nwarmup < 80 {
-            NUTSMassMatrixConfig::disabled()
-        } else {
-            let start_buffer = (nwarmup / 8).clamp(30, 180);
-            let end_buffer = (nwarmup / 6).clamp(30, 180);
-            let initial_window = (nwarmup / 10).clamp(25, 140);
-            NUTSMassMatrixConfig {
-                adaptation: MassMatrixAdaptation::Diagonal,
-                start_buffer,
-                end_buffer,
-                initial_window,
-                regularize: 0.1,
-                jitter: 1e-6,
-                dense_max_dim: 75,
-            }
-        }
-    };
+    // Auto-select dense mass matrix when dimension is small enough.
+    // The joint (β, ρ) posterior has strong cross-block correlations —
+    // changing ρ shifts the entire β posterior through the penalty —
+    // so dense adaptation is critical for efficient sampling.
+    let mass_cfg = robust_mass_matrix_config(total_dim, config.nwarmup);
 
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
