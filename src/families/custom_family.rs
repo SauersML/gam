@@ -7,15 +7,17 @@ use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::FitGeometry;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DispersionHandling, EvalMode, HessianDerivativeProvider,
-    InnerSolutionBuilder, compute_block_penalty_logdet_derivs, embed_penalty_root,
-    penalty_matrix_root, reml_laml_evaluate,
+    BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
+    HessianDerivativeProvider, HyperCoord, HyperCoordPair, InnerSolutionBuilder,
+    compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
+    reml_laml_evaluate,
 };
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
@@ -2541,6 +2543,15 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     }
 }
 
+/// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
+/// to an `InnerSolution` before calling the unified evaluator.
+struct ExtCoordBundle {
+    coords: Vec<HyperCoord>,
+    ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    drift_fn: Option<FixedDriftDerivFn>,
+}
+
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
 /// This is the bridge between the custom family's joint Hessian infrastructure
@@ -2549,6 +2560,10 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 /// 2. Builds penalty roots in the joint parameter space
 /// 3. Computes penalty logdet derivatives
 /// 4. Assembles an `InnerSolution` and calls `reml_laml_evaluate`
+///
+/// When `ext_bundle` is provided, the extended hyperparameter coordinates (ψ)
+/// are attached to the `InnerSolution` so the unified evaluator produces
+/// gradient/Hessian over the combined (ρ + ψ) space.
 fn unified_joint_cost_gradient(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
@@ -2564,6 +2579,7 @@ fn unified_joint_cost_gradient(
     options: &BlockwiseFitOptions,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     eval_mode: EvalMode,
+    ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
     // Build BlockCoupledOperator from the joint Hessian with block structure.
     let hop = BlockCoupledOperator::from_joint_hessian(j_for_traces, ranges.to_vec())
@@ -2595,7 +2611,7 @@ fn unified_joint_cost_gradient(
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
     // Build InnerSolution via builder and call unified evaluator.
-    let builder = InnerSolutionBuilder::new(
+    let mut builder = InnerSolutionBuilder::new(
         inner.log_likelihood,
         inner.penalty_value,
         beta_flat.clone(),
@@ -2610,6 +2626,21 @@ fn unified_joint_cost_gradient(
         },
     )
     .deriv_provider(deriv_provider);
+
+    // Attach extended (ψ) coordinates when provided.
+    if let Some(bundle) = ext_bundle {
+        builder = builder.ext_coords(bundle.coords);
+        if let Some(f) = bundle.ext_ext_fn {
+            builder = builder.ext_coord_pair_fn(f);
+        }
+        if let Some(f) = bundle.rho_ext_fn {
+            builder = builder.rho_ext_pair_fn(f);
+        }
+        if let Some(f) = bundle.drift_fn {
+            builder = builder.fixed_drift_deriv(f);
+        }
+    }
+
     let inner_solution = builder.build();
 
     let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), eval_mode, None)?;
@@ -2650,6 +2681,7 @@ fn joint_outer_evaluate(
     options: &BlockwiseFitOptions,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     // Assemble joint penalty matrix S(ρ) and its pseudo-inverse S⁺.
     let mut s_joint = Array2::<f64>::zeros((total, total));
@@ -2737,6 +2769,7 @@ fn joint_outer_evaluate(
         options,
         provider_box,
         eval_mode,
+        ext_bundle,
     )?;
 
     let warm = ConstrainedWarmStart {
@@ -2927,6 +2960,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             options,
             &compute_dh,
             &compute_d2h,
+            None, // no ext_coords in ρ-only outer evaluation
         );
     }
     if let Some(h_joint_unpen) = family
@@ -2997,6 +3031,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             options,
             &compute_dh,
             &compute_d2h,
+            None, // no ext_coords in ρ-only surrogate path
         );
     }
     // At this point the joint exact path is unavailable.
@@ -3198,6 +3233,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             options,
             Box::new(provider),
             EvalMode::ValueAndGradient,
+            None, // no ext_coords for single-block fallback
         )?
     };
 
@@ -3840,7 +3876,497 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
 /// `D_beta H_psi[u]` contraction, exact joint hyper evaluation treats `rho`
 /// and `psi` identically and returns the full profiled/Laplace Hessian over
 /// `theta = [rho, psi]`.
-pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Unified HyperCoord builders for ψ coordinates
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Assemble the penalty derivative matrix S_ψ = Σ_k exp(ρ_k) ∂S_k/∂ψ
+/// in the *block-local* coefficient space (p_block × p_block).
+///
+/// When the derivative carries multi-penalty components the sum iterates
+/// over all `(penalty_idx, s_part)` pairs.  When only a single
+/// `penalty_index` is stored the derivative `s_psi` is scaled by that
+/// penalty's current lambda.  If neither is present, the derivative is
+/// zero (the ψ coordinate does not move any realized penalty).
+fn assemble_block_local_s_psi(
+    deriv: &CustomFamilyBlockPsiDerivative,
+    per_block_rho: &Array1<f64>,
+    p_block: usize,
+) -> Array2<f64> {
+    if let Some(ref components) = deriv.s_psi_components {
+        let mut s = Array2::<f64>::zeros((p_block, p_block));
+        for (penalty_idx, s_part) in components {
+            s.scaled_add(per_block_rho[*penalty_idx].exp(), s_part);
+        }
+        s
+    } else if let Some(penalty_idx) = deriv.penalty_index {
+        deriv
+            .s_psi
+            .mapv(|v| per_block_rho[penalty_idx].exp() * v)
+    } else {
+        Array2::<f64>::zeros((p_block, p_block))
+    }
+}
+
+/// Assemble the second penalty derivative matrix S_{ψ_i ψ_j} in block-local
+/// coefficient space.
+///
+/// This mirrors the psi/psi branch of `joint_theta_penaltysecond_matrix` but
+/// returns the block-local matrix directly instead of embedding it into the
+/// full flattened coefficient space.
+fn assemble_block_local_s_psi_psi(
+    deriv_i: &CustomFamilyBlockPsiDerivative,
+    local_j: usize,
+    per_block_rho: &Array1<f64>,
+    p_block: usize,
+) -> Array2<f64> {
+    if let Some(ref parts) = deriv_i.s_psi_psi_components {
+        let mut s = Array2::<f64>::zeros((p_block, p_block));
+        if let Some(pair_parts) = parts.get(local_j) {
+            for (penalty_idx, s_part) in pair_parts {
+                s.scaled_add(per_block_rho[*penalty_idx].exp(), s_part);
+            }
+        }
+        s
+    } else if let Some(ref parts) = deriv_i.s_psi_psi {
+        if let Some(s_part) = parts.get(local_j) {
+            if let Some(penalty_index) = deriv_i.penalty_index {
+                s_part.mapv(|v| per_block_rho[penalty_index].exp() * v)
+            } else {
+                Array2::<f64>::zeros((p_block, p_block))
+            }
+        } else {
+            Array2::<f64>::zeros((p_block, p_block))
+        }
+    } else {
+        Array2::<f64>::zeros((p_block, p_block))
+    }
+}
+
+/// Embed a block-local matrix (p_block × p_block) into the full joint
+/// coefficient space (total × total) at the block's parameter range.
+fn embed_block_local_matrix(
+    local: &Array2<f64>,
+    start: usize,
+    end: usize,
+    total: usize,
+) -> Array2<f64> {
+    let mut full = Array2::<f64>::zeros((total, total));
+    full.slice_mut(ndarray::s![start..end, start..end])
+        .assign(local);
+    full
+}
+
+/// Build `HyperCoord` objects for ψ (custom family) hyperparameters.
+///
+/// Converts family-provided (a^ℓ, q, L) objects and penalty derivatives
+/// into the unified (a, g, B, ld_s) format. Each ψ coordinate produces
+/// one `HyperCoord` in the flattened joint coefficient space.
+///
+/// The mapping from family objects to HyperCoord is:
+///
+///   a    = a^ℓ_ψ + 0.5 β̂^T S_ψ β̂
+///   g    = q_ψ + S_ψ β̂
+///   B    = L_ψ + S_ψ
+///   ld_s = tr(S₊⁻¹ S_ψ)
+///
+/// where S_ψ is the assembled penalty derivative in joint coefficient space.
+pub fn build_psi_hyper_coords<F: CustomFamily>(
+    family: &F,
+    synced_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    beta_flat: &Array1<f64>,
+    rho: &[f64],
+    penalty_counts: &[usize],
+    s_pinv: Option<&Array2<f64>>,
+    is_gaussian: bool,
+) -> Result<Vec<HyperCoord>, String> {
+    let ranges = block_param_ranges(specs);
+    let total = beta_flat.len();
+    let per_block = split_log_lambdas(
+        &Array1::from_vec(rho.to_vec()),
+        penalty_counts,
+    )?;
+
+    let mut coords = Vec::new();
+    let mut psi_global = 0usize;
+
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        let (start, end) = ranges[block_idx];
+        let p_block = end - start;
+
+        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            // 1. Get family-provided likelihood objects (joint flattened space).
+            let psi_terms = family
+                .exact_newton_joint_psi_terms(
+                    synced_states,
+                    specs,
+                    derivative_blocks,
+                    psi_global,
+                )?
+                .unwrap_or_else(|| ExactNewtonJointPsiTerms {
+                    objective_psi: 0.0,
+                    score_psi: Array1::zeros(total),
+                    hessian_psi: Array2::zeros((total, total)),
+                });
+
+            // 2. Assemble S_ψ from penalty derivatives, embed into joint space.
+            let s_psi_local =
+                assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
+            let s_psi = embed_block_local_matrix(&s_psi_local, start, end, total);
+
+            // 3. Build HyperCoord.
+            let s_psi_beta = s_psi.dot(beta_flat);
+            let a = psi_terms.objective_psi + 0.5 * beta_flat.dot(&s_psi_beta);
+            let g = &psi_terms.score_psi + &s_psi_beta;
+            let b_mat = &psi_terms.hessian_psi + &s_psi;
+            let ld_s = if let Some(sp) = s_pinv {
+                trace_product(sp, &s_psi)
+            } else {
+                0.0
+            };
+
+            coords.push(HyperCoord {
+                a,
+                g,
+                b_mat: b_mat.to_owned(),
+                ld_s,
+                b_depends_on_beta: !is_gaussian,
+            });
+
+            psi_global += 1;
+            let _ = local_idx; // silence unused warning
+        }
+    }
+
+    Ok(coords)
+}
+
+/// Build pair callbacks for ψ-ψ and ρ-ψ Hessian entries.
+///
+/// Returns two closures:
+///
+/// 1. **ext-ext** `(psi_i, psi_j) -> HyperCoordPair`: second-order
+///    fixed-β objects for a pair of ψ coordinates.
+///
+/// 2. **rho-ext** `(rho_k, psi_j) -> HyperCoordPair`: mixed second-order
+///    fixed-β objects for a ρ-ψ pair.
+///
+/// The closures capture (via `Arc`) shared references to penalty derivatives,
+/// family state, and the penalty pseudo-inverse needed for logdet terms.
+///
+/// # Arguments
+///
+/// * `family` - The custom family instance (must be `Send + Sync + 'static`).
+/// * `synced_states` - Synchronized block states at the current inner mode.
+/// * `specs` - Parameter block specifications.
+/// * `derivative_blocks` - Per-block ψ derivative payloads.
+/// * `beta_flat` - Flattened joint coefficient vector at the inner mode.
+/// * `rho` - Current log-smoothing parameters (flat).
+/// * `penalty_counts` - Number of penalties per block.
+/// * `s_pinv` - Optional pseudo-inverse of total penalty S (for ld_s).
+pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    synced_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    beta_flat: &Array1<f64>,
+    rho: &[f64],
+    penalty_counts: &[usize],
+    s_pinv: Option<&Array2<f64>>,
+) -> Result<
+    (
+        Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
+        Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
+    ),
+    String,
+> {
+    // Precompute shared data into Arc-wrapped clones for the closures.
+    let ranges = block_param_ranges(specs);
+    let total = beta_flat.len();
+    let per_block = Arc::new(split_log_lambdas(
+        &Array1::from_vec(rho.to_vec()),
+        penalty_counts,
+    )?);
+    let derivative_blocks = Arc::new(derivative_blocks.to_vec());
+    let specs_arc = Arc::new(specs.to_vec());
+    let beta_arc = Arc::new(beta_flat.clone());
+    let synced_arc = Arc::new(synced_states.to_vec());
+    let s_pinv_arc = Arc::new(s_pinv.cloned());
+    let ranges_arc = Arc::new(ranges);
+    let family_arc = Arc::new(family.clone());
+
+    // Build the psi coordinate index -> (block_idx, local_idx) mapping.
+    let mut psi_map: Vec<(usize, usize)> = Vec::new();
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        for local_idx in 0..block_derivs.len() {
+            psi_map.push((block_idx, local_idx));
+        }
+    }
+    let psi_map = Arc::new(psi_map);
+
+    // Also build the rho coordinate -> (block_idx, penalty_idx) mapping.
+    let mut rho_map: Vec<(usize, usize)> = Vec::new();
+    for (block_idx, &count) in penalty_counts.iter().enumerate() {
+        for penalty_idx in 0..count {
+            rho_map.push((block_idx, penalty_idx));
+        }
+    }
+    let rho_map = Arc::new(rho_map);
+
+    // ψ-ψ pair callback
+    let ext_ext = {
+        let per_block = Arc::clone(&per_block);
+        let derivative_blocks = Arc::clone(&derivative_blocks);
+        let specs_arc = Arc::clone(&specs_arc);
+        let beta_arc = Arc::clone(&beta_arc);
+        let synced_arc = Arc::clone(&synced_arc);
+        let s_pinv_arc = Arc::clone(&s_pinv_arc);
+        let ranges_arc = Arc::clone(&ranges_arc);
+        let psi_map = Arc::clone(&psi_map);
+        let family_arc = Arc::clone(&family_arc);
+        let total = total;
+
+        Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
+            let (block_i, local_i) = psi_map[psi_i];
+            let (block_j, _local_j) = psi_map[psi_j];
+
+            // Get family-provided second-order likelihood terms.
+            let psi2 = family_arc
+                .exact_newton_joint_psisecond_order_terms(
+                    &synced_arc,
+                    &specs_arc,
+                    &derivative_blocks,
+                    psi_i,
+                    psi_j,
+                )
+                .ok()
+                .flatten();
+
+            let (obj_ll, score_ll, hess_ll) = match psi2 {
+                Some(t) => (t.objective_psi_psi, t.score_psi_psi, t.hessian_psi_psi),
+                None => (
+                    0.0,
+                    Array1::zeros(total),
+                    Array2::zeros((total, total)),
+                ),
+            };
+
+            // Assemble S_{ψ_i ψ_j} in joint space.
+            // Only nonzero when both coordinates share the same block.
+            let s_ij = if block_i == block_j {
+                let (start, end) = ranges_arc[block_i];
+                let p_block = end - start;
+                let deriv_i = &derivative_blocks[block_i][local_i];
+                let s_local = assemble_block_local_s_psi_psi(
+                    deriv_i,
+                    _local_j,
+                    &per_block[block_i],
+                    p_block,
+                );
+                embed_block_local_matrix(&s_local, start, end, total)
+            } else {
+                Array2::<f64>::zeros((total, total))
+            };
+
+            let s_ij_beta = s_ij.dot(&*beta_arc);
+            let a = obj_ll + 0.5 * beta_arc.dot(&s_ij_beta);
+            let g = score_ll + &s_ij_beta;
+            let b_mat = hess_ll + &s_ij;
+
+            // ld_s_{ij} = -tr(S⁺⁻¹ S_j S⁺⁻¹ S_i) + tr(S⁺⁻¹ S_{ij})
+            //
+            // For simplicity and correctness we compute tr(S⁺⁻¹ S_{ij})
+            // directly.  The quadratic tr(S⁺⁻¹ S_j S⁺⁻¹ S_i) term is NOT
+            // included here because it is assembled by the unified outer
+            // evaluator from the first-order ld_s values.  The convention is:
+            //
+            //   HyperCoordPair::ld_s = ∂²_ij log|S|₊
+            //                        = tr(S⁺⁻¹ S_{ij}) - tr(S⁺⁻¹ S_j S⁺⁻¹ S_i)
+            //
+            // We store the full second derivative here.
+            let ld_s = if let Some(ref sp) = *s_pinv_arc {
+                let tr_spinv_sij = trace_product(sp, &s_ij);
+
+                // Compute the quadratic piece.
+                // First reconstruct S_i and S_j in joint space to compute
+                // tr(S⁺⁻¹ S_j S⁺⁻¹ S_i).
+                let s_i_local = assemble_block_local_s_psi(
+                    &derivative_blocks[block_i][local_i],
+                    &per_block[block_i],
+                    ranges_arc[block_i].1 - ranges_arc[block_i].0,
+                );
+                let s_i = embed_block_local_matrix(
+                    &s_i_local,
+                    ranges_arc[block_i].0,
+                    ranges_arc[block_i].1,
+                    total,
+                );
+                let (bj_block, bj_local) = psi_map[psi_j];
+                let s_j_local = assemble_block_local_s_psi(
+                    &derivative_blocks[bj_block][bj_local],
+                    &per_block[bj_block],
+                    ranges_arc[bj_block].1 - ranges_arc[bj_block].0,
+                );
+                let s_j = embed_block_local_matrix(
+                    &s_j_local,
+                    ranges_arc[bj_block].0,
+                    ranges_arc[bj_block].1,
+                    total,
+                );
+                let spinv_si = sp.dot(&s_i);
+                let spinv_sj = sp.dot(&s_j);
+                let tr_quad = trace_product(&spinv_sj, &spinv_si);
+                tr_spinv_sij - tr_quad
+            } else {
+                0.0
+            };
+
+            HyperCoordPair { a, g, b_mat, ld_s }
+        }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+    };
+
+    // ρ-ψ pair callback
+    let rho_ext = {
+        let per_block = Arc::clone(&per_block);
+        let derivative_blocks = Arc::clone(&derivative_blocks);
+        let specs_arc = Arc::clone(&specs_arc);
+        let beta_arc = Arc::clone(&beta_arc);
+        let s_pinv_arc = Arc::clone(&s_pinv_arc);
+        let ranges_arc = Arc::clone(&ranges_arc);
+        let psi_map = Arc::clone(&psi_map);
+        let rho_map = Arc::clone(&rho_map);
+        let total = total;
+
+        Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
+            let (rho_block, rho_penalty) = rho_map[rho_k];
+            let (psi_block, psi_local) = psi_map[psi_j];
+
+            // S_{ρ_k, ψ_j} = λ_k ∂S_k/∂ψ_j.
+            // Only nonzero when both coordinates share the same block and the
+            // ψ derivative touches the k-th penalty.
+            let s_kj = if rho_block == psi_block {
+                let (start, end) = ranges_arc[rho_block];
+                let p_block = end - start;
+                let deriv = &derivative_blocks[psi_block][psi_local];
+                let lambda_k = per_block[rho_block][rho_penalty].exp();
+                let local = if let Some(ref components) = deriv.s_psi_components {
+                    let mut m = Array2::<f64>::zeros((p_block, p_block));
+                    for (penalty_idx, s_part) in components {
+                        if *penalty_idx == rho_penalty {
+                            m.scaled_add(lambda_k, s_part);
+                        }
+                    }
+                    m
+                } else if deriv.penalty_index == Some(rho_penalty) {
+                    deriv.s_psi.mapv(|v| lambda_k * v)
+                } else {
+                    Array2::<f64>::zeros((p_block, p_block))
+                };
+                embed_block_local_matrix(&local, start, end, total)
+            } else {
+                Array2::<f64>::zeros((total, total))
+            };
+
+            let s_kj_beta = s_kj.dot(&*beta_arc);
+            let a = 0.5 * beta_arc.dot(&s_kj_beta);
+            let g = s_kj_beta;
+            let b_mat = s_kj.clone();
+
+            // ld_s for ρ-ψ cross: tr(S⁺⁻¹ S_{kj}) - tr(S⁺⁻¹ S_j S⁺⁻¹ S_k)
+            let ld_s = if let Some(ref sp) = *s_pinv_arc {
+                let tr_spinv_skj = trace_product(sp, &s_kj);
+
+                // Reconstruct S_k (penalty-only derivative for ρ_k).
+                let s_k = {
+                    let (start, end) = ranges_arc[rho_block];
+                    let local = specs_arc[rho_block].penalties[rho_penalty]
+                        .mapv(|v| per_block[rho_block][rho_penalty].exp() * v);
+                    embed_block_local_matrix(&local, start, end, total)
+                };
+                // Reconstruct S_j (ψ penalty derivative).
+                let s_j = {
+                    let (start, end) = ranges_arc[psi_block];
+                    let p_block = end - start;
+                    let s_local = assemble_block_local_s_psi(
+                        &derivative_blocks[psi_block][psi_local],
+                        &per_block[psi_block],
+                        p_block,
+                    );
+                    embed_block_local_matrix(&s_local, start, end, total)
+                };
+                let spinv_sk = sp.dot(&s_k);
+                let spinv_sj = sp.dot(&s_j);
+                let tr_quad = trace_product(&spinv_sj, &spinv_sk);
+                tr_spinv_skj - tr_quad
+            } else {
+                0.0
+            };
+
+            HyperCoordPair { a, g, b_mat, ld_s }
+        }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+    };
+
+    Ok((ext_ext, rho_ext))
+}
+
+/// Build the M_i[u] = D_β B_i[u] callback for ψ coordinates.
+///
+/// This wraps `family.exact_newton_joint_psihessian_directional_derivative`
+/// into the unified `FixedDriftDerivFn` signature. For each external
+/// (ψ) coordinate index `ext_idx`, calling `f(ext_idx, &direction)` returns
+/// `Some(D_β H_ψ[u])` when the family provides it, or `None` otherwise.
+///
+/// The returned closure also adds the penalty-side β-drift when the ψ
+/// coordinate moves realized penalties: `D_β S_ψ[u] = 0` for ψ that
+/// only enters via the likelihood, so the penalty contribution vanishes
+/// and the callback delegates entirely to the family hook. (Penalty
+/// matrices S_ψ do not depend on β, so their β-directional derivative
+/// is zero.)
+///
+/// # Returns
+///
+/// `Some(callback)` when the family potentially provides the drift term.
+/// `None` when the family is Gaussian (B_i is β-independent for all
+/// coordinates, so M_i ≡ 0).
+pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    synced_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    is_gaussian: bool,
+) -> Option<FixedDriftDerivFn> {
+    if is_gaussian {
+        // Gaussian families have β-independent Hessians; M_i ≡ 0.
+        return None;
+    }
+
+    let synced_arc = Arc::new(synced_states.to_vec());
+    let specs_arc = Arc::new(specs.to_vec());
+    let derivative_blocks_arc = Arc::new(derivative_blocks.to_vec());
+    let family_arc = Arc::new(family.clone());
+
+    Some(Box::new(
+        move |ext_idx: usize, direction: &Array1<f64>| -> Option<Array2<f64>> {
+            // The family hook takes a psi index (0-based within ψ coordinates)
+            // and a flattened coefficient direction.
+            family_arc
+                .exact_newton_joint_psihessian_directional_derivative(
+                    &synced_arc,
+                    &specs_arc,
+                    &derivative_blocks_arc,
+                    ext_idx,
+                    direction,
+                )
+                .ok()
+                .flatten()
+        },
+    ))
+}
+
+pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -3871,7 +4397,214 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
         .into());
     }
 
-    let mut result = outerobjectivegradienthessian_internal(
+    if psi_dim > 0 {
+        // ── Unified path: evaluate ρ + ψ together via the unified evaluator ──
+        //
+        // 1. Inner solve (PIRLS).
+        let include_logdet_h = include_exact_newton_logdet_h(family);
+        let include_logdet_s = include_exact_newton_logdet_s(family, options);
+        let strict_spd = use_exact_newton_strict_spd(family);
+        let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
+        let mut inner = inner_blockwise_fit(
+            family,
+            specs,
+            &per_block,
+            options,
+            warm_start.map(|w| &w.inner),
+        )?;
+        let ridge = effective_solverridge(options.ridge_floor);
+        let moderidge = if options.ridge_policy.include_quadratic_penalty {
+            ridge
+        } else {
+            0.0
+        };
+        let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
+            && !options.ridge_policy.include_quadratic_penalty
+        {
+            ridge
+        } else {
+            0.0
+        };
+
+        refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+        let ranges = block_param_ranges(specs);
+        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+
+        // 2. Joint exact-Newton Hessian (required for ψ evaluation).
+        let h_joint_unpen = exact_newton_joint_hessian_symmetrized(
+            family,
+            &inner.block_states,
+            specs,
+            total,
+            "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
+        )?
+        .ok_or_else(|| -> CustomFamilyError {
+            "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus"
+                .to_string()
+                .into()
+        })?;
+
+        let beta_flat = flatten_state_betas(&inner.block_states, specs);
+        let synced_joint_states =
+            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
+
+        // 3. Compute S⁺⁻¹ (penalty pseudo-inverse) for the ψ builders.
+        let s_pinv_joint = if include_logdet_s {
+            let mut sp = Array2::<f64>::zeros((total, total));
+            for (b, spec) in specs.iter().enumerate() {
+                let (start, end) = ranges[b];
+                let p = end - start;
+                let lambdas = per_block[b].mapv(f64::exp);
+                let mut s_lambda = Array2::<f64>::zeros((p, p));
+                for (k, s) in spec.penalties.iter().enumerate() {
+                    s_lambda.scaled_add(lambdas[k], s);
+                }
+                let mut s_for_logdet = s_lambda;
+                if options.ridge_policy.include_penalty_logdet {
+                    for d in 0..p {
+                        s_for_logdet[[d, d]] += ridge;
+                    }
+                }
+                let s_floor = if options.ridge_policy.include_penalty_logdet {
+                    ridge
+                } else {
+                    0.0
+                }
+                .max(1e-14);
+                let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
+                sp.slice_mut(ndarray::s![start..end, start..end])
+                    .assign(&s_part);
+            }
+            Some(sp)
+        } else {
+            None
+        };
+
+        // 4. Build ψ HyperCoords, pair callbacks, and drift derivative callback.
+        let is_gaussian = family.exact_newton_outerobjective()
+            == ExactNewtonOuterObjective::QuadraticReml;
+
+        let psi_coords = build_psi_hyper_coords(
+            family,
+            &synced_joint_states,
+            specs,
+            derivative_blocks,
+            &beta_flat,
+            rho_current.as_slice().unwrap(),
+            &penalty_counts,
+            s_pinv_joint.as_ref(),
+            is_gaussian,
+        )?;
+
+        let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
+            family,
+            &synced_joint_states,
+            specs,
+            derivative_blocks,
+            &beta_flat,
+            rho_current.as_slice().unwrap(),
+            &penalty_counts,
+            s_pinv_joint.as_ref(),
+        )?;
+
+        let drift_fn = build_psi_drift_deriv_callback(
+            family,
+            &synced_joint_states,
+            specs,
+            derivative_blocks,
+            is_gaussian,
+        );
+
+        let ext_bundle = ExtCoordBundle {
+            coords: psi_coords,
+            ext_ext_fn: if need_hessian { Some(ext_ext_fn) } else { None },
+            rho_ext_fn: if need_hessian { Some(rho_ext_fn) } else { None },
+            drift_fn,
+        };
+
+        // 5. Build derivative provider for the ρ coordinates (D_β H[v]).
+        let compute_dh = |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            let h_rho =
+                family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                    &synced_joint_states,
+                    specs,
+                    v_k,
+                )?;
+            match h_rho {
+                Some(h) => {
+                    if h.iter().all(|v| v.is_finite()) {
+                        Ok(Some(symmetrized_square_matrix(
+                            h,
+                            total,
+                            "joint exact-newton dH shape mismatch",
+                        )?))
+                    } else {
+                        Ok(Some(Array2::<f64>::zeros((total, total))))
+                    }
+                }
+                None => Err(
+                    "joint exact-newton dH unavailable for analytic outer gradient"
+                        .to_string(),
+                ),
+            }
+        };
+        let compute_d2h = |u: &Array1<f64>,
+                           v: &Array1<f64>|
+         -> Result<Option<Array2<f64>>, String> {
+            match family
+                .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                    &synced_joint_states,
+                    specs,
+                    u,
+                    v,
+                )? {
+                Some(m) => Ok(Some(symmetrized_square_matrix(
+                    m,
+                    total,
+                    "joint exact-newton d2H shape mismatch",
+                )?)),
+                None => Ok(None),
+            }
+        };
+
+        // 6. Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
+        let eval_result = joint_outer_evaluate(
+            &inner,
+            specs,
+            &per_block,
+            rho_current,
+            &beta_flat,
+            h_joint_unpen,
+            &ranges,
+            total,
+            ridge,
+            moderidge,
+            extra_logdet_ridge,
+            include_logdet_h,
+            include_logdet_s,
+            strict_spd,
+            need_hessian,
+            options,
+            &compute_dh,
+            &compute_d2h,
+            Some(ext_bundle),
+        )?;
+
+        // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
+        // with ρ coordinates first and ψ coordinates appended — matching the expected
+        // output order of CustomFamilyJointHyperResult.
+        return Ok(CustomFamilyJointHyperResult {
+            objective: eval_result.objective,
+            gradient: eval_result.gradient,
+            outer_hessian: eval_result.outer_hessian,
+            warm_start: CustomFamilyWarmStart {
+                inner: eval_result.warm_start,
+            },
+        });
+    }
+
+    // ── ρ-only path (psi_dim == 0): no extended coordinates needed ──
+    let result = outerobjectivegradienthessian_internal(
         family,
         specs,
         options,
@@ -3880,31 +4613,9 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
         warm_start.map(|w| &w.inner),
         need_hessian,
     )?;
-    if psi_dim > 0 {
-        let (gradient, outer_hessian) = compute_custom_family_joint_hyper_exact(
-            family,
-            specs,
-            options,
-            &penalty_counts,
-            rho_current,
-            derivative_blocks,
-            &mut result.inner,
-            need_hessian,
-        )?;
-        return Ok(CustomFamilyJointHyperResult {
-            objective: result.objective,
-            gradient,
-            outer_hessian,
-            warm_start: CustomFamilyWarmStart {
-                inner: result.warm_start,
-            },
-        });
-    }
 
-    let mut gradient = Array1::<f64>::zeros(rho_dim + psi_dim);
-    gradient
-        .slice_mut(ndarray::s![..rho_dim])
-        .assign(&result.gradient);
+    let mut gradient = Array1::<f64>::zeros(rho_dim);
+    gradient.assign(&result.gradient);
 
     Ok(CustomFamilyJointHyperResult {
         objective: result.objective,
