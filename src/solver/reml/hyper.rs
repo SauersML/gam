@@ -1,6 +1,44 @@
 use super::*;
 use crate::matrix::DenseRightProductView;
 
+// ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
+//
+// Mirrors the `BinomialAuxTerms` in estimate.rs but is local to the REML
+// module so that hyper.rs can compute per-observation likelihood derivatives
+// without depending on the estimate module's private helpers.
+
+const LINK_BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
+
+#[derive(Clone, Copy)]
+struct LinkBinomialAux {
+    /// dℓ_i/dμ_i = w_i (y_i/μ_i − (1−y_i)/(1−μ_i))
+    a1: f64,
+    /// d²ℓ_i/dμ_i² = w_i (−y_i/μ_i² − (1−y_i)/(1−μ_i)²)
+    a2: f64,
+    /// μ(1−μ) — binomial variance function
+    variance: f64,
+    /// dVar/dμ = 1−2μ
+    variancemu_scale: f64,
+}
+
+#[inline]
+fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
+    let mu = if mu.is_finite() {
+        mu.clamp(LINK_BINOMIAL_AUX_MU_EPS, 1.0 - LINK_BINOMIAL_AUX_MU_EPS)
+    } else {
+        0.5
+    };
+    let one_minusmu = 1.0 - mu;
+    let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
+    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
+    LinkBinomialAux {
+        a1,
+        a2,
+        variance: mu * one_minusmu,
+        variancemu_scale: 1.0 - 2.0 * mu,
+    }
+}
+
 struct JointHyperThetaBlocks<'a> {
     theta: &'a Array1<f64>,
     rho_dim: usize,
@@ -1628,33 +1666,43 @@ impl<'a> RemlState<'a> {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-        // Pre-build unified τ objects so they are ready for downstream
-        // consumers (e.g. second-order methods that route through the
-        // unified evaluator instead of the piecewise directional path).
         let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
         let rho = blocks.rho_owned();
+
+        // Primary path: route through the unified evaluator with ext_coords.
+        // This produces the joint [ρ, ψ] gradient and Hessian from a single
+        // InnerSolution + reml_laml_evaluate call, eliminating the duplicated
+        // piecewise directional code path.
         if !hyper_dirs.is_empty() {
-            let (ext_coords, ..) =
-                self.build_tau_unified_objects(&rho, hyper_dirs)?;
-            log::trace!(
-                "[joint-hyper] built {} tau coords from unified objects",
-                ext_coords.len()
+            let unified_result = self.evaluate_unified_with_psi_ext(
+                &rho,
+                super::unified::EvalMode::ValueGradientHessian,
+                hyper_dirs,
             );
-            // Cross-validate via the unified evaluator when trace logging is active.
-            if log::log_enabled!(log::Level::Trace) {
-                if let Ok(unified_result) = self.evaluate_unified_with_psi_ext(
-                    &rho,
-                    super::unified::EvalMode::CostGradient,
-                    hyper_dirs,
-                ) {
-                    log::trace!(
-                        "[joint-hyper] unified psi-ext cost={:.6e}, grad_norm={:.4e}",
-                        unified_result.cost,
-                        unified_result.gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
-                    );
-                }
+
+            if let Ok(result) = unified_result {
+                let cost = result.cost;
+                let grad = result.gradient.unwrap_or_else(|| Array1::zeros(theta.len()));
+                let hess = result.hessian.unwrap_or_else(|| {
+                    Array2::zeros((theta.len(), theta.len()))
+                });
+                log::trace!(
+                    "[joint-hyper] unified evaluator: cost={:.6e}, grad_norm={:.4e}, hess_dim={}x{}",
+                    cost,
+                    grad.iter().map(|g| g * g).sum::<f64>().sqrt(),
+                    hess.nrows(),
+                    hess.ncols(),
+                );
+                return Ok((cost, grad, hess));
+            } else {
+                log::trace!(
+                    "[joint-hyper] unified evaluator failed, falling back to piecewise path"
+                );
             }
         }
+
+        // Fallback: piecewise directional path (used when ext_coords are empty
+        // or when the unified path fails).
         let (cost, grad) = self.compute_joint_hypercostgradient(theta, rho_dim, hyper_dirs)?;
         let hess = self.compute_joint_hyperhessian(theta, rho_dim, hyper_dirs)?;
         Ok((cost, grad, hess))
@@ -2975,5 +3023,270 @@ impl<'a> RemlState<'a> {
         };
 
         Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Unified HyperCoord builders for link parameters (SAS ε/log δ, mixture ρ)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Build [`HyperCoord`] objects for SAS link parameters (ε, log δ).
+    ///
+    /// For each SAS parameter θ_j (j=0: epsilon, j=1: log_delta), the
+    /// fixed-β derivative objects are:
+    ///
+    /// | Field   | Formula |
+    /// | `a`     | `−∂ℓ/∂θ_j\|_{η fixed}` (direct likelihood derivative) |
+    /// | `g`     | `−X^T (∂u/∂θ_j)\|_{η fixed}` (score sensitivity) |
+    /// | `B`     | `X^T diag(∂W_explicit/∂θ_j) X` (working-weight drift) |
+    /// | `ld_s`  | `0` (penalties don't depend on link parameters) |
+    ///
+    /// The working-weight derivative `∂W_explicit/∂θ_j` is the change in
+    /// `W_i = w_i d1²/(μ(1−μ))` due to θ changing the link function at
+    /// fixed η, without the IFT-mediated `c ⊙ X dβ/dθ` part (that is
+    /// handled by the unified evaluator's third-derivative correction).
+    ///
+    /// SAS epsilon reparameterization (tanh bounding) is NOT applied here;
+    /// the caller should apply the chain rule `grad[ε_raw] *= d_eps/d_raw`
+    /// after the unified evaluator returns.
+    pub(crate) fn build_sas_link_ext_coords(
+        &self,
+        bundle: &EvalShared,
+        sas_state: &crate::types::SasLinkState,
+        is_beta_logistic: bool,
+    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+        use crate::mixture_link::{
+            beta_logistic_inverse_link_jetwith_param_partials,
+            sas_inverse_link_jetwith_param_partials,
+        };
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+
+        // Transformed design matrix (dense required for link-param B construction).
+        let x_dense_arc = pirls_result
+            .x_transformed
+            .try_to_dense_arc("build_sas_link_ext_coords requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
+        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_dense_arc.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_dense = x_dense_owned
+            .as_ref()
+            .unwrap_or_else(|| x_dense_arc.as_ref());
+
+        let p_dim = x_dense.ncols();
+        let nobs = pirls_result.final_eta.len();
+        let aux_dim = 2usize; // epsilon, log_delta
+
+        if p_dim == 0 {
+            return Ok((0..aux_dim)
+                .map(|_| super::unified::HyperCoord {
+                    a: 0.0,
+                    g: Array1::zeros(0),
+                    b_mat: Array2::zeros((0, 0)),
+                    ld_s: 0.0,
+                    b_depends_on_beta: true,
+                    is_penalty_like: false,
+                })
+                .collect());
+        }
+
+        // Per-observation link jet with parameter partials.
+        let mut direct_ll = [0.0_f64; 2];
+        let mut du_by_j = [Array1::<f64>::zeros(nobs), Array1::<f64>::zeros(nobs)];
+        let mut dw_explicit_by_j = [Array1::<f64>::zeros(nobs), Array1::<f64>::zeros(nobs)];
+
+        for i in 0..nobs {
+            let eta_i = pirls_result.final_eta[i].clamp(-30.0, 30.0);
+            let jets = if is_beta_logistic {
+                beta_logistic_inverse_link_jetwith_param_partials(
+                    eta_i,
+                    sas_state.log_delta,
+                    sas_state.epsilon,
+                )
+            } else {
+                sas_inverse_link_jetwith_param_partials(
+                    eta_i,
+                    sas_state.epsilon,
+                    sas_state.log_delta,
+                )
+            };
+            let mu = jets.jet.mu;
+            let d1 = jets.jet.d1;
+            let yi = self.y[i];
+            let wi = self.weights[i].max(0.0);
+            let aux = link_binomial_aux(yi, wi, mu);
+
+            for j in 0..aux_dim {
+                let dj = if j == 0 {
+                    jets.djet_depsilon
+                } else {
+                    jets.djet_dlog_delta
+                };
+                let dmu = dj.mu;
+                let dd1 = dj.d1;
+                direct_ll[j] += aux.a1 * dmu;
+                du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
+                let variance = aux.variance;
+                let variance_param = aux.variancemu_scale * dmu;
+                let numerator = d1 * d1;
+                let numerator_param = 2.0 * d1 * dd1;
+                dw_explicit_by_j[j][i] = wi
+                    * (numerator_param * variance - numerator * variance_param)
+                    / (variance * variance);
+            }
+        }
+
+        // Build HyperCoord for each link parameter.
+        let mut coords = Vec::with_capacity(aux_dim);
+        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+        for j in 0..aux_dim {
+            // a_j = dF/dθ_j|_{β fixed} = -dℓ/dθ_j|_{η fixed}.
+            let a_j = -direct_ll[j];
+
+            // g_j = -X^T (du/dθ_j) — the score sensitivity at fixed β.
+            let g_j = {
+                let xt_du = x_dense.t().dot(&du_by_j[j]);
+                -xt_du
+            };
+
+            // B_j = X^T diag(dw_explicit_j) X — the fixed-β Hessian drift.
+            let b_j = Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+
+            coords.push(super::unified::HyperCoord {
+                a: a_j,
+                g: g_j,
+                b_mat: b_j,
+                ld_s: 0.0,
+                // Link parameters affect working weights through the link,
+                // and the working weights depend on β through η = Xβ,
+                // so B_j depends on β.
+                b_depends_on_beta: true,
+                // Link parameters are design-moving (not penalty-like):
+                // they change W through the link function, not through
+                // penalty matrix derivatives. Not eligible for EFS.
+                is_penalty_like: false,
+            });
+        }
+
+        Ok(coords)
+    }
+
+    /// Build [`HyperCoord`] objects for mixture (blended inverse-link) logit
+    /// parameters.
+    ///
+    /// Similar structure to SAS coords but with K−1 free logits instead of
+    /// (ε, log δ). Each logit ρ_j controls the softmax weight of the j-th
+    /// component link function.
+    pub(crate) fn build_mixture_link_ext_coords(
+        &self,
+        bundle: &EvalShared,
+        mix_state: &crate::types::MixtureLinkState,
+    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+        use crate::mixture_link::mixture_inverse_link_jetwith_rho_partials_into;
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+
+        let x_dense_arc = pirls_result
+            .x_transformed
+            .try_to_dense_arc("build_mixture_link_ext_coords requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
+        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_dense_arc.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_dense = x_dense_owned
+            .as_ref()
+            .unwrap_or_else(|| x_dense_arc.as_ref());
+
+        let p_dim = x_dense.ncols();
+        let nobs = pirls_result.final_eta.len();
+        let aux_dim = mix_state.rho.len(); // K-1 free logits
+
+        if aux_dim == 0 {
+            return Ok(Vec::new());
+        }
+
+        if p_dim == 0 {
+            return Ok((0..aux_dim)
+                .map(|_| super::unified::HyperCoord {
+                    a: 0.0,
+                    g: Array1::zeros(0),
+                    b_mat: Array2::zeros((0, 0)),
+                    ld_s: 0.0,
+                    b_depends_on_beta: true,
+                    is_penalty_like: false,
+                })
+                .collect());
+        }
+
+        let mut direct_ll = vec![0.0_f64; aux_dim];
+        let mut du_by_j: Vec<Array1<f64>> =
+            (0..aux_dim).map(|_| Array1::<f64>::zeros(nobs)).collect();
+        let mut dw_explicit_by_j: Vec<Array1<f64>> =
+            (0..aux_dim).map(|_| Array1::<f64>::zeros(nobs)).collect();
+        let mut mix_partials = vec![
+            crate::mixture_link::InverseLinkJet {
+                mu: 0.0,
+                d1: 0.0,
+                d2: 0.0,
+                d3: 0.0,
+            };
+            aux_dim
+        ];
+
+        for i in 0..nobs {
+            let jet = mixture_inverse_link_jetwith_rho_partials_into(
+                mix_state,
+                pirls_result.final_eta[i],
+                &mut mix_partials,
+            );
+            let mu = jet.mu;
+            let d1 = jet.d1;
+            let yi = self.y[i];
+            let wi = self.weights[i].max(0.0);
+            let aux = link_binomial_aux(yi, wi, mu);
+
+            for j in 0..aux_dim {
+                let dj = mix_partials[j];
+                let dmu = dj.mu;
+                let dd1 = dj.d1;
+                direct_ll[j] += aux.a1 * dmu;
+                du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
+                let variance = aux.variance;
+                let variance_param = aux.variancemu_scale * dmu;
+                let numerator = d1 * d1;
+                let numerator_param = 2.0 * d1 * dd1;
+                dw_explicit_by_j[j][i] = wi
+                    * (numerator_param * variance - numerator * variance_param)
+                    / (variance * variance);
+            }
+        }
+
+        let mut coords = Vec::with_capacity(aux_dim);
+        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+        for j in 0..aux_dim {
+            let a_j = -direct_ll[j];
+            let g_j = {
+                let xt_du = x_dense.t().dot(&du_by_j[j]);
+                -xt_du
+            };
+            let b_j = Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+
+            coords.push(super::unified::HyperCoord {
+                a: a_j,
+                g: g_j,
+                b_mat: b_j,
+                ld_s: 0.0,
+                b_depends_on_beta: true,
+                is_penalty_like: false,
+            });
+        }
+
+        Ok(coords)
     }
 }
