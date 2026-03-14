@@ -287,9 +287,8 @@ impl GaussianLocationScalePredictor {
         response_scale: f64,
     ) -> Result<Self, EstimationError> {
         let beta_mu = unified
-            .blocks
-            .iter()
-            .find(|b| matches!(b.role, BlockRole::Location | BlockRole::Mean))
+            .block_by_role(BlockRole::Location)
+            .or_else(|| unified.block_by_role(BlockRole::Mean))
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -297,9 +296,7 @@ impl GaussianLocationScalePredictor {
                 )
             })?;
         let beta_noise = unified
-            .blocks
-            .iter()
-            .find(|b| matches!(b.role, BlockRole::Scale))
+            .block_by_role(BlockRole::Scale)
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -315,9 +312,10 @@ impl GaussianLocationScalePredictor {
     }
 
     /// Compute sigma = exp(eta_noise) * response_scale for each observation.
+    /// Clamps eta_noise to [-500, 500] to prevent overflow/underflow in exp().
     fn compute_sigma(&self, design_noise: &DesignMatrix) -> Array1<f64> {
         let eta_noise = design_noise.dot(&self.beta_noise);
-        eta_noise.mapv(|eta| eta.exp() * self.response_scale)
+        eta_noise.mapv(|eta| eta.clamp(-500.0, 500.0).exp() * self.response_scale)
     }
 }
 
@@ -435,9 +433,8 @@ impl BinomialLocationScalePredictor {
         inverse_link: InverseLink,
     ) -> Result<Self, EstimationError> {
         let beta_threshold = unified
-            .blocks
-            .iter()
-            .find(|b| matches!(b.role, BlockRole::Location | BlockRole::Mean))
+            .block_by_role(BlockRole::Location)
+            .or_else(|| unified.block_by_role(BlockRole::Mean))
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -445,9 +442,7 @@ impl BinomialLocationScalePredictor {
                 )
             })?;
         let beta_noise = unified
-            .blocks
-            .iter()
-            .find(|b| matches!(b.role, BlockRole::Scale))
+            .block_by_role(BlockRole::Scale)
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -533,7 +528,11 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 )));
             }
 
-            let design_noise = input.design_noise.as_ref().unwrap();
+            let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "binomial location-scale uncertainty requires noise design matrix".to_string(),
+                )
+            })?;
             let mut se = Array1::zeros(n);
 
             for i in 0..n {
@@ -708,9 +707,8 @@ impl SurvivalPredictor {
         inverse_link: InverseLink,
     ) -> Result<Self, EstimationError> {
         let beta_threshold = unified
-            .blocks
-            .iter()
-            .find(|b| matches!(b.role, BlockRole::Location | BlockRole::Mean))
+            .block_by_role(BlockRole::Location)
+            .or_else(|| unified.block_by_role(BlockRole::Mean))
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -718,9 +716,7 @@ impl SurvivalPredictor {
                 )
             })?;
         let beta_log_sigma = unified
-            .blocks
-            .iter()
-            .find(|b| matches!(b.role, BlockRole::Scale))
+            .block_by_role(BlockRole::Scale)
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
