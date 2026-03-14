@@ -3575,6 +3575,95 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     }
 }
 
+/// Derivative provider for survival location-scale models, implementing the
+/// [`HessianDerivativeProvider`] trait for the unified REML/LAML evaluator.
+///
+/// This struct wraps a `SurvivalLocationScaleFamily` instance and its current
+/// block states, providing first- and second-order Hessian directional
+/// derivatives (`D_β H_L[u]` and `D²_β H_L[u,v]`) needed by the outer
+/// smoothing parameter optimizer.
+///
+/// # Sign convention
+///
+/// The unified evaluator passes `v_k = H⁻¹(A_k β̂)` to
+/// `hessian_derivative_correction`. By the implicit function theorem,
+/// `dβ̂/dρ_k = −v_k`, so the actual coefficient perturbation direction is
+/// `−v_k`. This provider negates `v_k` before forwarding to the family's
+/// `exact_newton_joint_hessian_directional_derivative`.
+pub struct SurvivalLocationScaleDerivProvider {
+    family: SurvivalLocationScaleFamily,
+    block_states: Vec<ParameterBlockState>,
+}
+
+impl SurvivalLocationScaleDerivProvider {
+    pub fn new(
+        family: SurvivalLocationScaleFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Self {
+        Self {
+            family,
+            block_states,
+        }
+    }
+}
+
+impl crate::solver::estimate::reml::unified::HessianDerivativeProvider
+    for SurvivalLocationScaleDerivProvider
+{
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+        let neg_v = -v_k;
+        match self
+            .family
+            .exact_newton_joint_hessian_directional_derivative(&self.block_states, &neg_v)
+        {
+            Ok(Some(correction)) => {
+                if correction.iter().all(|v| v.is_finite()) {
+                    Some(correction)
+                } else {
+                    let p = v_k.len();
+                    Some(Array2::zeros((p, p)))
+                }
+            }
+            Ok(None) => None,
+            Err(_) => None,
+        }
+    }
+
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        let term1 = match self
+            .family
+            .exact_newton_joint_hessian_directional_derivative(&self.block_states, u_kl)
+        {
+            Ok(Some(m)) if m.iter().all(|v| v.is_finite()) => m,
+            _ => return None,
+        };
+
+        let neg_v_k = -v_k;
+        let neg_v_l = -v_l;
+        let term2 = match self
+            .family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &self.block_states,
+                &neg_v_l,
+                &neg_v_k,
+            ) {
+            Ok(Some(m)) if m.iter().all(|v| v.is_finite()) => m,
+            _ => return None,
+        };
+
+        Some(term1 + &term2)
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+}
+
 pub fn fit_survival_location_scale(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<SurvivalLocationScaleFitResult, String> {
@@ -3866,6 +3955,18 @@ pub fn fit_survival_location_scale(
         vec![timespec, thresholdspec, log_sigmaspec]
     };
     let fit: BlockwiseFitResult = fit_custom_family(&family, &blockspecs, &options)?;
+
+    // Construct the derivative provider for the unified REML evaluator.
+    // This validates that the provider can be built from the fitted family state
+    // and exercises the HessianDerivativeProvider interface.
+    let deriv_provider = SurvivalLocationScaleDerivProvider::new(
+        family.clone(),
+        fit.block_states().to_vec(),
+    );
+    log::trace!(
+        "[survival-ls] deriv provider: has_corrections={}",
+        crate::solver::estimate::reml::unified::HessianDerivativeProvider::has_corrections(&deriv_provider),
+    );
 
     let k_time = spec.time_block.penalties.len();
     let k_t = threshold_prep.penalties.len();
