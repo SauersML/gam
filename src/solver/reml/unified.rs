@@ -1004,8 +1004,7 @@ pub fn reml_laml_evaluate(
 /// # Arguments
 /// - `firth_op`: The precomputed Firth dense operator (Fisher info, weight derivatives).
 /// - `hop`: The penalized Hessian operator (for H⁻¹ solves and traces).
-/// - `penalty_roots`: Penalty square roots R_k where S_k = R_k^T R_k.
-/// - `beta`: Coefficients at the converged mode.
+/// - `beta`: Coefficients at the converged mode (for dimensioning the identity matrix).
 /// - `v_ks`: Precomputed mode responses v_k = H⁻¹(A_k β̂).
 /// - `h_k_matrices`: Precomputed total Hessian drifts Ḣ_k = A_k + C[v_k].
 /// - `a_k_betas`: Precomputed A_k β̂ vectors.
@@ -1013,7 +1012,6 @@ pub fn reml_laml_evaluate(
 pub fn compute_firth_hessian_contribution(
     firth_op: &super::FirthDenseOperator,
     hop: &dyn HessianOperator,
-    penalty_roots: &[Array2<f64>],
     beta: &Array1<f64>,
     v_ks: &[Array1<f64>],
     h_k_matrices: &[Array2<f64>],
