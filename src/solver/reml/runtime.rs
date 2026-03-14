@@ -1887,7 +1887,6 @@ impl<'a> RemlState<'a> {
                     Some(super::unified::compute_firth_hessian_contribution(
                         firth_op,
                         &*hessian_op,
-                        &penalty_roots,
                         &beta,
                         &v_ks,
                         &a_k_matrices, // h_k_matrices ≈ a_k_matrices (first-order)
@@ -2110,7 +2109,6 @@ impl<'a> RemlState<'a> {
                     Some(super::unified::compute_firth_hessian_contribution(
                         firth_op,
                         &*hessian_op,
-                        &penalty_roots,
                         &beta,
                         &v_ks,
                         &a_k_matrices,
