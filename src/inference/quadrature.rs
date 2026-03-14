@@ -3033,9 +3033,7 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + f64::exp(-x_clamped))
 }
 
-// ---------------------------------------------------------------------------
 // CLogLog Gaussian convolution via differentiated Gauss-Hermite quadrature
-// ---------------------------------------------------------------------------
 //
 // For location-scale (GAMLSS) models with CLogLog link we need to evaluate
 //   L(μ,σ) = E[g(μ + σZ)],  Z ~ N(0,1),  g(η) = 1 - exp(-exp(η)),
@@ -4076,9 +4074,7 @@ mod tests {
         assert!(out.mean > 0.0 && out.mean < 1.0);
     }
 
-    // -----------------------------------------------------------------------
     // Tests for CLogLog Gaussian convolution derivatives
-    // -----------------------------------------------------------------------
 
     #[test]
     fn cloglog_g_derivatives_at_zero() {

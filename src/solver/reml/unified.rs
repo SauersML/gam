@@ -174,7 +174,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
     ///
     /// Returns `None` for providers that don't support this optimization
     /// (Gaussian, multi-predictor, coupled families).
-    fn adjoint_trace_vector(&self, _hop: &dyn HessianOperator) -> Option<Array1<f64>> {
+    fn adjoint_trace_vector(&self, hop: &dyn HessianOperator) -> Option<Array1<f64>> {
         None
     }
 
@@ -187,9 +187,9 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// Returns `None` if there are no fourth-derivative (d) terms.
     fn fourth_derivative_trace(
         &self,
-        _v_k: &Array1<f64>,
-        _v_l: &Array1<f64>,
-        _hop: &dyn HessianOperator,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        hop: &dyn HessianOperator,
     ) -> Option<f64> {
         None
     }
@@ -2963,13 +2963,13 @@ pub fn embed_penalty_root(
 //
 // where z_m are i.i.d. random vectors with E[zzᵀ] = I.
 //
-// **Rademacher probes** (entries ±1 with equal probability) have strictly
+// Rademacher probes (entries ±1 with equal probability) have strictly
 // lower variance than Gaussian probes:
 //   Var_Rad = 2(‖S‖²_F − Σ_i S²_{ii})
 //   Var_Gau = 2‖S‖²_F
 // where S = sym(H⁻¹ A_k).  The diagonal variance term is always removed.
 //
-// **Key efficiency:** ONE H⁻¹ solve per probe, shared across ALL k
+// Key efficiency: ONE H⁻¹ solve per probe, shared across ALL k
 // coordinates.  For each probe z we compute w = H⁻¹z once, then for each k
 // we get q_k = zᵀ(A_k w) with a cheap matrix–vector multiply.
 
@@ -3070,7 +3070,7 @@ impl StochasticTraceEstimator {
         let mut m2s = vec![0.0_f64; n_coords]; // sum of squared deviations
 
         // Simple splitmix64-seeded Rademacher generator for reproducibility.
-        // We use a lightweight xoshiro256** state derived from the config seed.
+        // We use a lightweight xoshiro256ss state derived from the config seed.
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
 
         let check_interval = 4; // check stopping every this many probes
@@ -3161,9 +3161,9 @@ pub fn stochastic_trace_hinv_product(
     StochasticTraceEstimator::new(config.clone()).estimate_single_trace(hop, a)
 }
 
-// ─── Lightweight xoshiro256** RNG ───────────────────────────────────────
+// Lightweight xoshiro256ss RNG
 //
-// We use a self-contained xoshiro256** implementation so that the stochastic
+// We use a self-contained xoshiro256ss implementation so that the stochastic
 // trace estimator does not impose any new dependency requirements. The
 // codebase already uses `rand` (0.10), but a minimal inline RNG avoids
 // pulling in the full `rand` trait machinery for what is just a stream of

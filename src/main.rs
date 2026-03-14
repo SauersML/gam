@@ -8244,7 +8244,7 @@ fn build_smooth_basis(
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
-                heuristic_centers(ds.values.nrows()),
+                heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
             Ok(SmoothBasisSpec::ThinPlate {
                 feature_cols: cols.to_vec(),
@@ -8259,7 +8259,7 @@ fn build_smooth_basis(
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
-                heuristic_centers(ds.values.nrows()),
+                heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
             let nu = parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("5/2"))?;
             Ok(SmoothBasisSpec::Matern {
@@ -8284,7 +8284,7 @@ fn build_smooth_basis(
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
-                heuristic_centers(ds.values.nrows()),
+                heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
             let power = parse_duchon_power(options)?;
             let nullspace_order = parse_duchon_order(options)?;
@@ -8473,8 +8473,18 @@ fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     (unique / 4).clamp(4, 20)
 }
 
-fn heuristic_centers(n: usize) -> usize {
-    ((n as f64).sqrt() as usize).clamp(8, 48)
+/// Dimension-aware heuristic for the number of centers in spatial smooths
+/// (TPS, Duchon, Matérn).  For low-dimensional inputs (d <= 2) the cap stays
+/// near the old default (~50).  For higher d the cap grows linearly so the
+/// basis can still provide reasonable coverage of the input space.  The result
+/// is further bounded by n/10 and an absolute ceiling of 600 to keep penalty
+/// matrices (p×p dense) tractable.
+fn heuristic_centers(n: usize, d: usize) -> usize {
+    let dim_cap = 50 + 25 * d.saturating_sub(2); // 50 for d<=2, +25 per extra dim
+    let dim_cap = dim_cap.min(600); // absolute ceiling
+    let data_cap = n / 10; // never use more than 10% of the data as centers
+    let upper = dim_cap.min(data_cap);
+    ((n as f64).sqrt() as usize).clamp(8, upper.max(8))
 }
 
 fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {

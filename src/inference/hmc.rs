@@ -1850,15 +1850,7 @@ pub(crate) fn run_nuts_sampling(
 
     // Split-chain R-hat: compare variance within vs between chains
     // Gelman-Rubin diagnostic with split chains
-    let (rhat, ess) = if n_chains >= 2 && n_samples_out >= 4 {
-        (
-            f64::from(run_stats.rhat.mean),
-            f64::from(run_stats.ess.mean),
-        )
-    } else {
-        // Fall back to simple estimates if not enough chains/samples
-        (1.0, (total_samples as f64) * 0.5)
-    };
+    let (rhat, ess) = compute_split_rhat_and_ess(&samples_array);
 
     let converged = rhat < 1.1 && ess > 100.0;
 
@@ -2460,14 +2452,7 @@ pub fn run_joint_beta_rho_sampling(
         .mean_axis(Axis(0))
         .unwrap_or_else(|| Array1::zeros(n_rho));
 
-    let (rhat, ess) = if n_chains >= 2 && n_samples_out >= 4 {
-        (
-            f64::from(run_stats.rhat.mean),
-            f64::from(run_stats.ess.mean),
-        )
-    } else {
-        (1.0, (total_samples as f64) * 0.5)
-    };
+    let (rhat, ess) = compute_split_rhat_and_ess(&samples_array);
 
     let converged = rhat < 1.1 && ess > 50.0;
     if !converged {
@@ -2747,8 +2732,7 @@ mod survival_hmc {
             .mean_axis(Axis(0))
             .unwrap_or_else(|| Array1::zeros(dim));
         let posterior_std = samples.std_axis(Axis(0), 0.0);
-        let rhat = f64::from(run_stats.rhat.mean);
-        let ess = f64::from(run_stats.ess.mean);
+        let (rhat, ess) = compute_split_rhat_and_ess(&samples_array);
         let converged = rhat < 1.1;
 
         Ok(NutsResult {

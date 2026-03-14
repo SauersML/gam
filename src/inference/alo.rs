@@ -491,9 +491,7 @@ pub fn compute_alo_diagnostics_from_pirls(
     compute_alo_diagnostics_from_pirls_impl(base, y, link)
 }
 
-// ---------------------------------------------------------------------------
 // Multi-block ALO for multi-predictor models (GAMLSS, survival, joint)
-// ---------------------------------------------------------------------------
 
 /// Diagnostics returned by multi-block ALO.
 #[derive(Debug, Clone)]
@@ -920,9 +918,7 @@ pub fn compute_multiblock_alo_leverages(
     Ok(leverage)
 }
 
-// ---------------------------------------------------------------------------
-// Small-matrix helpers for B × B systems (B typically 2–4)
-// ---------------------------------------------------------------------------
+// Small-matrix helpers for B × B systems (B typically 2-4)
 
 /// Determinant of a small B × B matrix (B ≤ 4).
 fn det_small(m: &Array2<f64>, b: usize) -> f64 {

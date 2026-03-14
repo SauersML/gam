@@ -1877,6 +1877,198 @@ fn symmetrized_square_matrix(
     Ok(matrix)
 }
 
+/// Try exact Newton joint Hessian first, then surrogate. Returns `None` if
+/// neither path provides a joint Hessian. When successful, returns the
+/// unpenalized joint Hessian, flat beta, and boxed closures for computing
+/// directional derivatives dH[v] and d²H[u,v].
+///
+/// This eliminates the previously duplicated exact-Newton and surrogate
+/// code blocks in `outerobjectivegradienthessian_internal`.
+fn build_joint_hessian_closures<'a, F: CustomFamily>(
+    family: &'a F,
+    block_states: &'a [ParameterBlockState],
+    specs: &'a [ParameterBlockSpec],
+    total: usize,
+) -> Result<
+    Option<(
+        Array2<f64>,
+        Array1<f64>,
+        Box<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
+        Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
+    )>,
+    String,
+> {
+    // Path 1: exact Newton joint Hessian (preferred).
+    if let Some(h_joint_unpen) = exact_newton_joint_hessian_symmetrized(
+        family,
+        block_states,
+        specs,
+        total,
+        "joint exact-newton Hessian shape mismatch in outer gradient",
+    )? {
+        let beta_flat = flatten_state_betas(block_states, specs);
+        let synced = Arc::new(
+            synchronized_states_from_flat_beta(family, specs, block_states, &beta_flat)?,
+        );
+
+        let synced_dh = Arc::clone(&synced);
+        let compute_dh = Box::new(move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                &synced_dh,
+                specs,
+                v_k,
+            )?;
+            match h_rho {
+                Some(h) => {
+                    if h.iter().all(|v| v.is_finite()) {
+                        Ok(Some(symmetrized_square_matrix(
+                            h,
+                            total,
+                            "joint exact-newton dH shape mismatch",
+                        )?))
+                    } else {
+                        Ok(Some(Array2::<f64>::zeros((total, total))))
+                    }
+                }
+                None => Err(
+                    "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
+                ),
+            }
+        });
+        let synced_d2h = Arc::clone(&synced);
+        let compute_d2h = Box::new(
+            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+                match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                    &synced_d2h,
+                    specs,
+                    u,
+                    v,
+                )? {
+                    Some(m) => Ok(Some(symmetrized_square_matrix(
+                        m,
+                        total,
+                        "joint exact-newton d2H shape mismatch",
+                    )?)),
+                    None => Ok(None),
+                }
+            },
+        );
+        return Ok(Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)));
+    }
+
+    // Path 2: surrogate joint Hessian (fallback).
+    if let Some(h_joint_unpen) = family
+        .joint_outer_hyper_surrogate_hessian_with_specs(block_states, specs)?
+        .map(|h| {
+            symmetrized_square_matrix(
+                h,
+                total,
+                "joint outer-hyper surrogate Hessian shape mismatch",
+            )
+        })
+        .transpose()?
+    {
+        let beta_flat = flatten_state_betas(block_states, specs);
+
+        let compute_dh = Box::new(move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            let h_rho = family
+                .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                    block_states,
+                    specs,
+                    v_k,
+                )?;
+            match h_rho {
+                Some(h) => Ok(Some(symmetrized_square_matrix(
+                    h,
+                    total,
+                    "joint surrogate dH shape mismatch",
+                )?)),
+                None => Err(
+                    "joint surrogate dH unavailable for analytic outer gradient".to_string(),
+                ),
+            }
+        });
+        let compute_d2h = Box::new(
+            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+                match family
+                    .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
+                        block_states,
+                        specs,
+                        u,
+                        v,
+                    )? {
+                    Some(m) => Ok(Some(symmetrized_square_matrix(
+                        m,
+                        total,
+                        "joint surrogate d2H shape mismatch",
+                    )?)),
+                    None => Ok(None),
+                }
+            },
+        );
+        return Ok(Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)));
+    }
+
+    Ok(None)
+}
+
+/// Build a closure computing dH[v] using exact Newton derivatives on synced states.
+/// The closure checks for non-finite values and replaces with zeros.
+fn exact_newton_dh_closure<'a, F: CustomFamily>(
+    family: &'a F,
+    synced_states: &'a [ParameterBlockState],
+    specs: &'a [ParameterBlockSpec],
+    total: usize,
+) -> impl Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
+    move |v_k: &Array1<f64>| {
+        let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
+            synced_states,
+            specs,
+            v_k,
+        )?;
+        match h_rho {
+            Some(h) => {
+                if h.iter().all(|v| v.is_finite()) {
+                    Ok(Some(symmetrized_square_matrix(
+                        h,
+                        total,
+                        "joint exact-newton dH shape mismatch",
+                    )?))
+                } else {
+                    Ok(Some(Array2::<f64>::zeros((total, total))))
+                }
+            }
+            None => Err(
+                "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
+            ),
+        }
+    }
+}
+
+/// Build a closure computing d²H[u,v] using exact Newton derivatives on synced states.
+fn exact_newton_d2h_closure<'a, F: CustomFamily>(
+    family: &'a F,
+    synced_states: &'a [ParameterBlockState],
+    specs: &'a [ParameterBlockSpec],
+    total: usize,
+) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
+    move |u: &Array1<f64>, v: &Array1<f64>| {
+        match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            synced_states,
+            specs,
+            u,
+            v,
+        )? {
+            Some(m) => Ok(Some(symmetrized_square_matrix(
+                m,
+                total,
+                "joint exact-newton d2H shape mismatch",
+            )?)),
+            None => Ok(None),
+        }
+    }
+}
+
 fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
@@ -2907,56 +3099,15 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     // therefore must use this joint path whenever the realized specs provide
     // enough design information to build the exact joint curvature, even if
     // the family instance itself did not cache those designs internally.
-    if let Some(h_joint_unpen) = exact_newton_joint_hessian_symmetrized(
-        family,
-        &inner.block_states,
-        specs,
-        total,
-        "joint exact-newton Hessian shape mismatch in outer gradient",
-    )? {
-        let beta_flat = flatten_state_betas(&inner.block_states, specs);
-        let synced_joint_states =
-            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
-        let compute_dh = |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-            let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                &synced_joint_states,
-                specs,
-                v_k,
-            )?;
-            match h_rho {
-                Some(h) => {
-                    if h.iter().all(|v| v.is_finite()) {
-                        Ok(Some(symmetrized_square_matrix(
-                            h,
-                            total,
-                            "joint exact-newton dH shape mismatch",
-                        )?))
-                    } else {
-                        Ok(Some(Array2::<f64>::zeros((total, total))))
-                    }
-                }
-                None => {
-                    Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
-                }
-            }
-        };
-        let compute_d2h =
-            |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-                match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                    &synced_joint_states,
-                    specs,
-                    u,
-                    v,
-                )? {
-                    Some(m) => Ok(Some(symmetrized_square_matrix(
-                        m,
-                        total,
-                        "joint exact-newton d2H shape mismatch",
-                    )?)),
-                    None => Ok(None),
-                }
-            };
-
+    // ── Unified joint Hessian path ──
+    //
+    // Try exact Newton first, then surrogate. Both paths differ only in
+    // which trait methods provide H, dH, d2H and whether states need
+    // synchronization. Once we have the Hessian source, the downstream
+    // evaluation through joint_outer_evaluate() is identical.
+    if let Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)) =
+        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+    {
         return joint_outer_evaluate(
             &inner,
             specs,
@@ -2977,77 +3128,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             &compute_dh,
             &compute_d2h,
             None, // no ext_coords in ρ-only outer evaluation
-        );
-    }
-    if let Some(h_joint_unpen) = family
-        .joint_outer_hyper_surrogate_hessian_with_specs(&inner.block_states, specs)?
-        .map(|h| {
-            symmetrized_square_matrix(
-                h,
-                total,
-                "joint outer-hyper surrogate Hessian shape mismatch",
-            )
-        })
-        .transpose()?
-    {
-        let beta_flat = flatten_state_betas(&inner.block_states, specs);
-
-        let compute_dh = |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-            let h_rho = family
-                .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
-                    &inner.block_states,
-                    specs,
-                    v_k,
-                )?;
-            match h_rho {
-                Some(h) => Ok(Some(symmetrized_square_matrix(
-                    h,
-                    total,
-                    "joint surrogate dH shape mismatch",
-                )?)),
-                None => {
-                    Err("joint surrogate dH unavailable for analytic outer gradient".to_string())
-                }
-            }
-        };
-        let compute_d2h =
-            |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-                match family
-                    .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
-                        &inner.block_states,
-                        specs,
-                        u,
-                        v,
-                    )? {
-                    Some(m) => Ok(Some(symmetrized_square_matrix(
-                        m,
-                        total,
-                        "joint surrogate d2H shape mismatch",
-                    )?)),
-                    None => Ok(None),
-                }
-            };
-
-        return joint_outer_evaluate(
-            &inner,
-            specs,
-            &per_block,
-            rho,
-            &beta_flat,
-            h_joint_unpen,
-            &ranges,
-            total,
-            ridge,
-            moderidge,
-            extra_logdet_ridge,
-            include_logdet_h,
-            include_logdet_s,
-            strict_spd,
-            need_hessian,
-            options,
-            &compute_dh,
-            &compute_d2h,
-            None, // no ext_coords in ρ-only surrogate path
         );
     }
     // At this point the joint exact path is unavailable.
@@ -4049,7 +4129,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                 g,
                 b_mat: b_mat.to_owned(),
                 ld_s,
-                b_depends_on_beta: !is_gaussian,
+                b_depends_on_beta: !hessian_beta_independent,
                 // ψ coordinates move the design/likelihood, so b_mat need not
                 // be PSD. They are NOT penalty-like.
                 is_penalty_like: false,
@@ -4202,7 +4282,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
             let (block_i, local_i) = psi_map[psi_i];
-            let (block_j, _local_j) = psi_map[psi_j];
+            let (block_j, local_j) = psi_map[psi_j];
 
             // Get family-provided second-order likelihood terms.
             let psi2 = family_arc
@@ -4233,7 +4313,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 let deriv_i = &derivative_blocks[block_i][local_i];
                 let s_local = assemble_block_local_s_psi_psi(
                     deriv_i,
-                    _local_j,
+                    local_j,
                     &per_block[block_i],
                     p_block,
                 );
@@ -4612,49 +4692,8 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         };
 
         // 5. Build derivative provider for the ρ coordinates (D_β H[v]).
-        let compute_dh = |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-            let h_rho =
-                family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                    &synced_joint_states,
-                    specs,
-                    v_k,
-                )?;
-            match h_rho {
-                Some(h) => {
-                    if h.iter().all(|v| v.is_finite()) {
-                        Ok(Some(symmetrized_square_matrix(
-                            h,
-                            total,
-                            "joint exact-newton dH shape mismatch",
-                        )?))
-                    } else {
-                        Ok(Some(Array2::<f64>::zeros((total, total))))
-                    }
-                }
-                None => Err(
-                    "joint exact-newton dH unavailable for analytic outer gradient"
-                        .to_string(),
-                ),
-            }
-        };
-        let compute_d2h = |u: &Array1<f64>,
-                           v: &Array1<f64>|
-         -> Result<Option<Array2<f64>>, String> {
-            match family
-                .exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                    &synced_joint_states,
-                    specs,
-                    u,
-                    v,
-                )? {
-                Some(m) => Ok(Some(symmetrized_square_matrix(
-                    m,
-                    total,
-                    "joint exact-newton d2H shape mismatch",
-                )?)),
-                None => Ok(None),
-            }
-        };
+        let compute_dh = exact_newton_dh_closure(family, &synced_joint_states, specs, total);
+        let compute_d2h = exact_newton_d2h_closure(family, &synced_joint_states, specs, total);
 
         // 6. Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
         let eval_result = joint_outer_evaluate(

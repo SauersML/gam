@@ -44,12 +44,6 @@ struct CustomUppercaseCollector {
     file_path: PathBuf,
 }
 
-// A custom collector for checking if comments are primarily composed of dashes
-struct DashHeavyCommentCollector {
-    violations: Vec<String>,
-    file_path: PathBuf,
-}
-
 // A custom collector for #[allow(dead_code)] attribute violations
 struct DeadCodeCollector {
     violations: Vec<String>,
@@ -448,39 +442,6 @@ impl CustomUppercaseCollector {
             "\n⚠️ Comments where over 80% of alphabetic characters are uppercase are STRICTLY FORBIDDEN in this project.\n",
         );
         error_msg.push_str("   STRONGLY CONSIDER deleting the comment completely.\n");
-
-        Some(error_msg)
-    }
-}
-
-impl DashHeavyCommentCollector {
-    fn new(file_path: &Path) -> Self {
-        Self {
-            violations: Vec::new(),
-            file_path: file_path.to_path_buf(),
-        }
-    }
-
-    fn check_and_get_error_message(&self) -> Option<String> {
-        if self.violations.is_empty() {
-            return None;
-        }
-
-        let filename = self.file_path.to_str().unwrap_or("?");
-        let mut error_msg = format!(
-            "\n❌ ERROR: Found {} comments composed primarily of dashes in {}:\n",
-            self.violations.len(),
-            filename
-        );
-
-        for violation in &self.violations {
-            error_msg.push_str(&format!("   {violation}\n"));
-        }
-
-        error_msg.push_str(
-            "\n⚠️ Comments where over 80% of non-whitespace characters are dashes are STRICTLY FORBIDDEN in this project.\n",
-        );
-        error_msg.push_str("   Remove decorative dash-only comments completely.\n");
 
         Some(error_msg)
     }
@@ -1238,51 +1199,6 @@ impl Sink for CustomUppercaseCollector {
             let has_enough_alpha = alpha_count >= 6 && alpha_ratio >= 0.6;
 
             if uppercase_ratio > 0.8 && has_enough_alpha {
-                self.violations.push(format!("{line_number}:{line_text}"));
-            }
-        }
-
-        Ok(true)
-    }
-}
-
-impl Sink for DashHeavyCommentCollector {
-    type Error = std::io::Error;
-
-    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
-        let line_number = mat.line_number().unwrap_or(0);
-        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        if !line_text.trim_start().starts_with("//")
-            && !line_text.contains("/*")
-            && !line_text.starts_with("///")
-        {
-            return Ok(true);
-        }
-
-        let comment_text = if line_text.trim_start().starts_with("///") {
-            line_text.trim_start()[3..].trim()
-        } else if line_text.trim_start().starts_with("//") {
-            line_text.trim_start()[2..].trim()
-        } else if let Some(idx) = line_text.find("/*") {
-            match line_text[idx + 2..].find("*/") {
-                Some(end) => line_text[idx + 2..idx + 2 + end].trim(),
-                None => line_text[idx + 2..].trim(),
-            }
-        } else {
-            return Ok(true);
-        };
-
-        let nonwhitespace_chars: Vec<char> = comment_text
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-
-        if !nonwhitespace_chars.is_empty() {
-            let dash_count = nonwhitespace_chars.iter().filter(|c| **c == '-').count();
-            let dash_ratio = dash_count as f64 / nonwhitespace_chars.len() as f64;
-
-            if dash_ratio > 0.8 {
                 self.violations.push(format!("{line_number}:{line_text}"));
             }
         }
@@ -2279,15 +2195,11 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     let stars_pattern = r"(//|/\*).*\*\*";
     // 3. Pattern to catch comments for uppercase ratio enforcement
     let all_caps_pattern = r"(//|/\*|///).*";
-    // 4. Pattern to catch comments that might be composed primarily of dashes
-    let dash_heavy_pattern = r"(//|/\*|///).*";
-
     let forbidden_matcher = RegexMatcher::new_line_matcher(forbiddenwords_pattern);
     let stars_matcher = RegexMatcher::new_line_matcher(stars_pattern);
     let all_caps_matcher = RegexMatcher::new_line_matcher(all_caps_pattern);
-    let dash_matcher = RegexMatcher::new_line_matcher(dash_heavy_pattern);
 
-    // Single file walk — strip once per file, run all 4 sub-scans.
+    // Single file walk — strip once per file, run all 3 sub-scans.
     for entry in WalkDir::new(".")
         .into_iter()
         .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
@@ -2331,18 +2243,6 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
         if let Ok(ref m) = all_caps_matcher {
             let mut collector = CustomUppercaseCollector::new(path);
-            if searcher
-                .search_reader(m, Cursor::new(&stripped), &mut collector)
-                .is_ok()
-            {
-                if let Some(msg) = collector.check_and_get_error_message() {
-                    allviolations.push(msg);
-                }
-            }
-        }
-
-        if let Ok(ref m) = dash_matcher {
-            let mut collector = DashHeavyCommentCollector::new(path);
             if searcher
                 .search_reader(m, Cursor::new(&stripped), &mut collector)
                 .is_ok()
