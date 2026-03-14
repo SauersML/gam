@@ -1955,6 +1955,12 @@ impl ImplicitDesignPsiDerivative {
     /// Formula in raw knot space:
     ///   [raw]_j = Σ_i v_i · q_{ij} · s_{d,ij}
     /// then project through Z and pad.
+    ///
+    /// Note: q = φ_r/r and s_d = exp(2ψ_d)·h_d² are UNNORMALIZED axis components.
+    /// With this convention, q·s_d = (φ_r/r)·(exp(2ψ_d)·h_d²) = φ_r·(s_d/r),
+    /// which equals the correct ∂φ/∂ψ_d = φ_r·∂r/∂ψ_d = φ_r·s_d/r.
+    /// No r² correction is needed — that would be required only if s_d were
+    /// the fractional quantity s_d/r².
     pub fn transpose_mul(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
         assert!(axis < self.n_axes);
         assert_eq!(v.len(), self.n);
@@ -2027,150 +2033,6 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
-    /// Compute (∂²X/∂ψ_d²)^T v — diagonal second derivative, same axis.
-    ///
-    /// Formula in raw knot space:
-    ///   [raw]_j = Σ_i v_i · [2 · q_{ij} · s_{d,ij} + t_{ij} · s_{d,ij}²]
-    pub(crate) fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
-        assert!(axis < self.n_axes);
-        assert_eq!(v.len(), self.n);
-
-        let af = &self.axis_fractions;
-        let qv = &self.q_values;
-        let tv = &self.t_values;
-
-        let raw = self.accumulate_knot_vector(v, |idx| {
-            let s = af[[idx, axis]];
-            2.0 * qv[idx] * s + tv[idx] * s * s
-        });
-
-        self.project_and_pad(&raw)
-    }
-
-    /// Compute (∂²X/∂ψ_d∂ψ_e)^T v — cross second derivative (d ≠ e).
-    ///
-    /// Formula in raw knot space:
-    ///   [raw]_j = Σ_i v_i · t_{ij} · s_{d,ij} · s_{e,ij}
-    pub(crate) fn transpose_mul_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        v: &ArrayView1<f64>,
-    ) -> Array1<f64> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
-        assert_ne!(axis_d, axis_e);
-        assert_eq!(v.len(), self.n);
-
-        let af = &self.axis_fractions;
-        let tv = &self.t_values;
-
-        let raw = self.accumulate_knot_vector(v, |idx| {
-            tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]
-        });
-
-        self.project_and_pad(&raw)
-    }
-
-    /// Compute the forward product (∂²X/∂ψ_d²) u — diagonal second derivative.
-    ///
-    /// Returns a vector of length n.
-    pub(crate) fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
-        assert!(axis < self.n_axes);
-        assert_eq!(u.len(), self.p_out());
-
-        let u_knot = self.unproject(u);
-        let n = self.n;
-        let k = self.n_knots;
-        let af = &self.axis_fractions;
-        let qv = &self.q_values;
-        let tv = &self.t_values;
-
-        let compute_row = |i: usize| -> f64 {
-            let base = i * k;
-            let mut val = 0.0;
-            for j in 0..k {
-                let s = af[[base + j, axis]];
-                val += (2.0 * qv[base + j] * s + tv[base + j] * s * s) * u_knot[j];
-            }
-            val
-        };
-
-        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
-            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
-            let mut result = Array1::<f64>::zeros(n);
-            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
-                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
-                    let local: Vec<f64> = (start..end).map(compute_row).collect();
-                    (start, local)
-                })
-                .collect();
-            for (start, vals) in chunk_results {
-                for (offset, &v) in vals.iter().enumerate() {
-                    result[start + offset] = v;
-                }
-            }
-            result
-        } else {
-            Array1::from_vec((0..n).map(compute_row).collect())
-        }
-    }
-
-    /// Compute the forward product (∂²X/∂ψ_d∂ψ_e) u — cross second derivative.
-    ///
-    /// Returns a vector of length n.
-    pub(crate) fn forward_mul_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        u: &ArrayView1<f64>,
-    ) -> Array1<f64> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
-        assert_ne!(axis_d, axis_e);
-        assert_eq!(u.len(), self.p_out());
-
-        let u_knot = self.unproject(u);
-        let n = self.n;
-        let k = self.n_knots;
-        let af = &self.axis_fractions;
-        let tv = &self.t_values;
-
-        let compute_row = |i: usize| -> f64 {
-            let base = i * k;
-            let mut val = 0.0;
-            for j in 0..k {
-                val += tv[base + j] * af[[base + j, axis_d]] * af[[base + j, axis_e]] * u_knot[j];
-            }
-            val
-        };
-
-        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
-            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
-            let mut result = Array1::<f64>::zeros(n);
-            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
-                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
-                    let local: Vec<f64> = (start..end).map(compute_row).collect();
-                    (start, local)
-                })
-                .collect();
-            for (start, vals) in chunk_results {
-                for (offset, &v) in vals.iter().enumerate() {
-                    result[start + offset] = v;
-                }
-            }
-            result
-        } else {
-            Array1::from_vec((0..n).map(compute_row).collect())
-        }
-    }
-
     /// Materialize the full (n × p_out) first-derivative matrix for axis d.
     ///
     /// Efficient O(n * k) construction: builds the raw (n × k) kernel derivative
@@ -2207,27 +2069,6 @@ impl ImplicitDesignPsiDerivative {
                 let s = self.axis_fractions[[base + j, axis]];
                 raw[[i, j]] = 2.0 * self.q_values[base + j] * s
                     + self.t_values[base + j] * s * s;
-            }
-        }
-
-        self.project_matrix(raw)
-    }
-
-    /// Materialize the full (n × p_out) cross second derivative matrix for axes (d, e).
-    pub(crate) fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
-        assert_ne!(axis_d, axis_e);
-        let n = self.n;
-        let k = self.n_knots;
-
-        let mut raw = Array2::<f64>::zeros((n, k));
-        for i in 0..n {
-            let base = i * k;
-            for j in 0..k {
-                raw[[i, j]] = self.t_values[base + j]
-                    * self.axis_fractions[[base + j, axis_d]]
-                    * self.axis_fractions[[base + j, axis_e]];
             }
         }
 
@@ -4238,6 +4079,22 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     ),
     BasisError,
 > {
+    // Notation and conventions:
+    //   ψ_b = aniso_log_scales[b] (log-scale parameter for axis b)
+    //   w_b = exp(2ψ_b)  (metric weight for axis b)
+    //   h_b = x_b - c_b  (coordinate displacement)
+    //   s_b = w_b · h_b²  (UNNORMALIZED axis component; note Σ_b s_b = r²)
+    //   q = φ_r / r       (radial jet scalar)
+    //   t = (φ_rr - q) / r² = q_r / r  (second radial jet scalar)
+    //
+    // The operators D₀, D₁, D₂ are:
+    //   D₀: φ(r)                              (magnitude/mass)
+    //   D₁_b: ∂φ/∂x_b = q · w_b · h_b        (gradient component b)
+    //   D₂: Δ_x φ = Σ_b w_b·(t·s_b + q)      (anisotropic Laplacian)
+    //
+    // Key ψ-derivatives (using unnormalized s_b):
+    //   ∂r/∂ψ_a = s_a / r,  ∂q/∂ψ_a = t·s_a,  ∂s_b/∂ψ_a = 2·δ_{ab}·s_b,
+    //   ∂w_b/∂ψ_a = 2·δ_{ab}·w_b
     let p = centers.nrows();
     let d = centers.ncols();
     let dim = aniso_log_scales.len();
@@ -4280,6 +4137,15 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
     let d_f64 = d as f64;
 
+    // Precompute metric weights w_b = exp(2ψ_b) for each axis.
+    // These are needed for the correct anisotropic gradient operator D₁
+    // and anisotropic Laplacian operator D₂.
+    let metric_weights: Vec<f64> = aniso_log_scales
+        .iter()
+        .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
+        .collect();
+    let sum_metric_weights: f64 = metric_weights.iter().sum();
+
     for k in 0..p {
         for j in 0..p {
             let ci: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
@@ -4295,11 +4161,24 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             let dt_dr = jets.t_r;
             let d2t_dr2 = jets.t_rr;
 
-            // D₀, D₂ values.
+            // Anisotropic Laplacian:
+            //   Δ_x φ = Σ_b ∂²φ/∂x_b²
+            //          = Σ_b w_b · (t · s_b + q)
+            //          = t · Σ_b(w_b · s_b) + q · Σ_b(w_b)
+            // where w_b = exp(2ψ_b), s_b = w_b · h_b² (unnormalized), h_b = x_b - c_b.
+            //
+            // Derivation: ∂φ/∂x_b = q · w_b · h_b,
+            //   ∂²φ/∂x_b² = (∂q/∂x_b)·w_b·h_b + q·w_b
+            //              = t·w_b²·h_b² + q·w_b = w_b·(t·s_b + q).
+            //
+            // Note: the old isotropic formula d·q + t·r² is recovered when all w_b = 1.
+            let sum_wb_sb: f64 = (0..d).map(|b| metric_weights[b] * s_vec[b]).sum();
             let lap = if r < 1e-14 {
-                d_f64 * q // At collision: Δφ(0) = d·φ''(0) = d·q(0)
+                // At collision: s_b = 0 for all b, so t·s_b terms vanish.
+                // Δφ(0) = q(0) · Σ_b w_b = φ''(0) · Σ_b exp(2ψ_b)
+                q * sum_metric_weights
             } else {
-                q + t * r * r + (d_f64 - 1.0) * q // φ'' + (d-1)·q = d·q + t·r²
+                t * sum_wb_sb + q * sum_metric_weights
             };
 
             // Fill raw operator matrices (projected through Z_kernel).
@@ -4307,10 +4186,13 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                 let z_jc = z_kernel[[j, col]];
                 d0_raw[[k, col]] += phi * z_jc;
 
-                // D₁: gradient components
+                // D₁: anisotropic gradient components.
+                //   ∂φ/∂x_b = φ_r · ∂r/∂x_b = (φ_r/r) · w_b · h_b = q · w_b · h_b
+                // where w_b = exp(2ψ_b) is the metric weight for axis b.
                 for b in 0..d {
                     let h_b = ci[b] - cj[b];
-                    d1_raw[[k * d + b, col]] += q * h_b * z_jc;
+                    let w_b = metric_weights[b];
+                    d1_raw[[k * d + b, col]] += q * w_b * h_b * z_jc;
                 }
 
                 d2_raw[[k, col]] += lap * z_jc;
@@ -4318,33 +4200,105 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                 // Per-axis η_a derivatives.
                 for a in 0..dim {
                     let s_a = s_vec[a];
+                    let w_a = metric_weights[a];
 
+                    // D₀ derivatives (unchanged — chain rule through r only).
                     d0_raw_eta[a][[k, col]] += q * s_a * z_jc;
                     d0_raw_eta2[a][[k, col]] += (t * s_a * s_a + 2.0 * q * s_a) * z_jc;
 
+                    // D₁ derivatives.
+                    // Base D₁_b = q · w_b · h_b.
+                    //
+                    // First derivative:
+                    //   ∂D₁_b/∂ψ_a = (∂q/∂ψ_a) · w_b · h_b + q · (∂w_b/∂ψ_a) · h_b
+                    //   ∂q/∂ψ_a = q_r · (s_a/r) = t · s_a  (since t = q_r/r)
+                    //   ∂w_b/∂ψ_a = 2 · δ_{ab} · w_b
+                    //
+                    //   = w_b · h_b · (t · s_a + 2 · δ_{ab} · q)
+                    //
+                    // Second derivative (diagonal):
+                    //   ∂²D₁_b/∂ψ_a² = ∂/∂ψ_a [w_b · h_b · (t·s_a + 2·δ_{ab}·q)]
+                    //   For a != b: w_b · h_b · (dt_dr·s_a²/r + 2·t·s_a)
+                    //   For a == b: w_a · h_a · (dt_dr·s_a²/r + 6·t·s_a + 4·q)
                     for b in 0..d {
                         let h_b = ci[b] - cj[b];
+                        let w_b = metric_weights[b];
                         let row = k * d + b;
-                        d1_raw_eta[a][[row, col]] += t * s_a * h_b * z_jc;
+
+                        let d1_first = if a == b {
+                            w_b * h_b * (t * s_a + 2.0 * q)
+                        } else {
+                            w_b * h_b * t * s_a
+                        };
+                        d1_raw_eta[a][[row, col]] += d1_first * z_jc;
+
                         let d1_eta2_val = if r > 1e-14 {
-                            (dt_dr * s_a * s_a / r + 2.0 * t * s_a) * h_b
+                            if a == b {
+                                w_b * h_b
+                                    * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
+                            } else {
+                                w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
+                            }
                         } else {
                             0.0
                         };
                         d1_raw_eta2[a][[row, col]] += d1_eta2_val * z_jc;
                     }
 
+                    // D₂ first derivative (anisotropic Laplacian).
+                    //   Δ = t · W₂ + q · W₁  where W₁ = Σw_b, W₂ = Σ(w_b·s_b).
+                    //   ∂Δ/∂ψ_a = (∂t/∂ψ_a)·W₂ + t·(∂W₂/∂ψ_a) + (∂q/∂ψ_a)·W₁ + q·(∂W₁/∂ψ_a)
+                    //
+                    //   ∂t/∂ψ_a = dt_dr · s_a / r
+                    //   ∂W₂/∂ψ_a = ∂/∂ψ_a[Σ w_b·s_b] = 4·w_a·s_a
+                    //     (∂(w_a·s_a)/∂ψ_a = 2·w_a·s_a + w_a·2·s_a = 4·w_a·s_a)
+                    //   ∂q/∂ψ_a = t · s_a
+                    //   ∂W₁/∂ψ_a = 2 · w_a
                     let dlap_deta = if r > 1e-14 {
-                        ((d_f64 + 2.0) * t + dt_dr * r) * s_a
+                        dt_dr * s_a / r * sum_wb_sb
+                            + 4.0 * t * w_a * s_a
+                            + t * s_a * sum_metric_weights
+                            + 2.0 * q * w_a
                     } else {
                         0.0
                     };
                     d2_raw_eta[a][[k, col]] += dlap_deta * z_jc;
 
+                    // D₂ second derivative (anisotropic Laplacian).
+                    // ∂²Δ/∂ψ_a² = ∂/∂ψ_a of the first derivative above.
+                    //
+                    // Using shorthand T1..T4 for the four terms of dlap_deta:
+                    //   T1 = dt_dr·s_a/r · W₂
+                    //   T2 = 4·t·w_a·s_a
+                    //   T3 = t·s_a·W₁
+                    //   T4 = 2·q·w_a
                     let d2lap_deta2 = if r > 1e-14 {
-                        let w = (d_f64 + 2.0) * t + dt_dr * r;
-                        let dw_dr = (d_f64 + 3.0) * dt_dr + d2t_dr2 * r;
-                        dw_dr * s_a * s_a / r + 2.0 * w * s_a
+                        let s_a2 = s_a * s_a;
+                        let dt_sa_r = dt_dr * s_a / r;
+
+                        // ∂/∂ψ_a[dt_dr·s_a/r]:
+                        //   ∂t_r/∂ψ_a = d2t_dr2·s_a/r,  ∂(s_a/r)/∂ψ_a = s_a/r·(2 - s_a/r²)
+                        //   product rule => d2t_dr2·s_a²/r² + dt_dr·s_a/r·(2 - s_a/r²)
+                        let r2 = r * r;
+                        let d_dt_sa_r =
+                            d2t_dr2 * s_a2 / r2 + dt_dr * s_a / r * (2.0 - s_a / r2);
+
+                        // ∂T1/∂ψ_a = d_dt_sa_r · W₂ + dt_sa_r · 4·w_a·s_a
+                        let dt1 = d_dt_sa_r * sum_wb_sb + dt_sa_r * 4.0 * w_a * s_a;
+
+                        // ∂T2/∂ψ_a = 4·[(dt_dr·s_a/r)·w_a·s_a + t·(2w_a·s_a + w_a·2s_a)]
+                        //           = 4·w_a·s_a·(dt_sa_r + 4·t)
+                        let dt2 = 4.0 * w_a * s_a * (dt_sa_r + 4.0 * t);
+
+                        // ∂T3/∂ψ_a = (dt_dr·s_a/r)·s_a·W₁ + t·2·s_a·W₁ + t·s_a·2·w_a
+                        let dt3 = dt_sa_r * s_a * sum_metric_weights
+                            + 2.0 * t * s_a * sum_metric_weights
+                            + 2.0 * t * s_a * w_a;
+
+                        // ∂T4/∂ψ_a = 2·(t·s_a·w_a + q·2·w_a) = 2·w_a·(t·s_a + 2·q)
+                        let dt4 = 2.0 * w_a * (t * s_a + 2.0 * q);
+
+                        dt1 + dt2 + dt3 + dt4
                     } else {
                         0.0
                     };
@@ -4356,26 +4310,67 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                     let s_a = s_vec[a];
                     let s_b = s_vec[b];
                     let sa_sb = s_a * s_b;
+                    let w_a = metric_weights[a];
+                    let w_b = metric_weights[b];
 
                     // ∂²D₀/∂η_a∂η_b = t · s_a · s_b
                     d0_raw_eta_cross[ci_idx][[k, col]] += t * sa_sb * z_jc;
 
-                    // ∂²D₁/∂η_a∂η_b = (dt_dr · s_a · s_b / r) · h_ℓ
+                    // ∂²D₁_ℓ/∂ψ_a∂ψ_b for gradient component ℓ (a < b, a != b):
+                    //   First: ∂D₁_ℓ/∂ψ_a = w_ℓ·h_ℓ·(t·s_a + 2·δ_{aℓ}·q)
+                    //   Then differentiate w.r.t. ψ_b:
+                    //     ℓ != a, ℓ != b: w_ℓ·h_ℓ · (dt_dr·s_a·s_b/r)
+                    //     ℓ == a:         w_a·h_a · (dt_dr·s_a·s_b/r + 2·t·s_b)
+                    //     ℓ == b:         w_b·h_b · (dt_dr·s_a·s_b/r + 2·t·s_a)
                     for axis in 0..d {
                         let h_l = ci[axis] - cj[axis];
+                        let w_l = metric_weights[axis];
                         let row = k * d + axis;
                         let d1_cross = if r > 1e-14 {
-                            dt_dr * sa_sb / r * h_l
+                            let base = dt_dr * sa_sb / r;
+                            if axis == a {
+                                (base + 2.0 * t * s_b) * w_l * h_l
+                            } else if axis == b {
+                                (base + 2.0 * t * s_a) * w_l * h_l
+                            } else {
+                                base * w_l * h_l
+                            }
                         } else {
                             0.0
                         };
                         d1_raw_eta_cross[ci_idx][[row, col]] += d1_cross * z_jc;
                     }
 
-                    // ∂²D₂/∂η_a∂η_b = dw_dr · s_a · s_b / r
+                    // ∂²D₂/∂ψ_a∂ψ_b (anisotropic Laplacian cross derivative).
+                    //   ∂Δ/∂ψ_a = dt_dr·s_a/r·W₂ + 4·t·w_a·s_a + t·s_a·W₁ + 2·q·w_a
+                    // Differentiating each term w.r.t. ψ_b (a != b):
                     let d2_cross = if r > 1e-14 {
-                        let dw_dr = (d_f64 + 3.0) * dt_dr + d2t_dr2 * r;
-                        dw_dr * sa_sb / r
+                        let r2 = r * r;
+                        let dt_sa_r = dt_dr * s_a / r;
+                        let dt_sb_r = dt_dr * s_b / r;
+
+                        // ∂/∂ψ_b[dt_dr·s_a/r]:
+                        //   ∂t_r/∂ψ_b = d2t_dr2·s_b/r,
+                        //   ∂(s_a/r)/∂ψ_b = -s_a·s_b/r³
+                        //   => d2t_dr2·s_a·s_b/r² - dt_dr·s_a·s_b/r³
+                        let d_dt_sa_r_b =
+                            d2t_dr2 * s_a * s_b / r2 - dt_dr * s_a * s_b / (r2 * r);
+
+                        // T1: ∂/∂ψ_b[dt_dr·s_a/r · W₂]
+                        let term1 =
+                            d_dt_sa_r_b * sum_wb_sb + dt_sa_r * 4.0 * w_b * s_b;
+
+                        // T2: ∂/∂ψ_b[4·t·w_a·s_a] = 4·(dt_dr·s_b/r)·w_a·s_a
+                        let term2 = 4.0 * dt_sb_r * w_a * s_a;
+
+                        // T3: ∂/∂ψ_b[t·s_a·W₁] = dt_sb_r·s_a·W₁ + t·s_a·2·w_b
+                        let term3 =
+                            dt_sb_r * s_a * sum_metric_weights + t * s_a * 2.0 * w_b;
+
+                        // T4: ∂/∂ψ_b[2·q·w_a] = 2·t·s_b·w_a
+                        let term4 = 2.0 * t * s_b * w_a;
+
+                        term1 + term2 + term3 + term4
                     } else {
                         0.0
                     };
@@ -7475,6 +7470,14 @@ fn build_matern_design_psi_aniso_derivatives(
                         aniso_distance_and_components(&data_row_buf, &center_buf, eta);
                     let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
                     t_row[j] = t;
+                    // Design matrix ψ-derivatives using UNNORMALIZED s_a = exp(2ψ_a)·h_a²:
+                    //   ∂X/∂ψ_a  = q · s_a                    (first derivative)
+                    //   ∂²X/∂ψ_a² = 2·q·s_a + t·s_a²          (diagonal second)
+                    //   ∂²X/∂ψ_a∂ψ_b = t·s_a·s_b              (cross, stored via t_raw)
+                    //
+                    // These are correct because ∂r/∂ψ_a = s_a/r with unnormalized s_a,
+                    // giving ∂φ/∂ψ_a = φ_r·(s_a/r) = q·s_a. The formulas would need
+                    // r² factors only if s_a were the FRACTIONAL quantity s_a/r².
                     for a in 0..dim {
                         s_row[a][j] = s_vec[a];
                         kf_row[a][j] = q * s_vec[a];
@@ -7884,6 +7887,11 @@ fn build_duchon_design_psi_aniso_derivatives(
                     let q = jets.q;
                     let t = jets.t;
                     t_row[j] = t;
+                    // Design matrix ψ-derivatives using UNNORMALIZED s_a = exp(2ψ_a)·h_a²:
+                    //   ∂X/∂ψ_a  = q · s_a           (first derivative)
+                    //   ∂²X/∂ψ_a² = 2·q·s_a + t·s_a² (diagonal second)
+                    //   ∂²X/∂ψ_a∂ψ_b = t·s_a·s_b     (cross, via t_raw)
+                    // Correct because ∂r/∂ψ_a = s_a/r with unnormalized s.
                     for a in 0..dim {
                         s_row[a][j] = s_vec[a];
                         kf_row[a][j] = q * s_vec[a];
