@@ -5686,7 +5686,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             converged: inner.converged,
             geometry,
         })
-        .map_err(CustomFamilyError::Fitting);
+        .map_err(CustomFamilyError::Optimization);
     }
 
     if include_exact_newton_logdet_h(family) && family.known_link_wiggle().is_some() {
@@ -5770,7 +5770,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             converged: inner.converged,
             geometry,
         })
-        .map_err(CustomFamilyError::Fitting);
+        .map_err(CustomFamilyError::Optimization);
     }
 
     use crate::estimate::EstimationError;
@@ -6018,7 +6018,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                         converged: inner.converged,
                         geometry,
                     })
-                    .map_err(CustomFamilyError::Fitting);
+                    .map_err(CustomFamilyError::Optimization);
                 }
                 Err(inner_err) => {
                     return Err(format!(
@@ -6079,7 +6079,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         converged: inner.converged,
         geometry,
     })
-    .map_err(CustomFamilyError::Fitting)
+    .map_err(CustomFamilyError::Optimization)
 }
 
 #[cfg(test)]
