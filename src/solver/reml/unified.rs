@@ -3817,6 +3817,14 @@ impl StochasticTraceEstimator {
             return Vec::new();
         }
 
+        // When there are no implicit operators, delegate to the generic
+        // operator-aware estimator which shares the same Hutchinson loop but
+        // avoids the unnecessary shared-X machinery.
+        if n_ops == 0 {
+            let no_ops: &[&dyn HyperOperator] = &[];
+            return self.estimate_traces_with_operators(hop, dense_matrices, no_ops);
+        }
+
         let p = hop.dim();
         if p == 0 {
             return vec![0.0; n_coords];
@@ -3828,11 +3836,7 @@ impl StochasticTraceEstimator {
         let check_interval = 4;
 
         // Get the shared X reference from the first implicit operator (all share the same X).
-        let x_dense = if n_ops > 0 {
-            Some(implicit_ops[0].x_dense.clone())
-        } else {
-            None
-        };
+        let x_dense = Some(implicit_ops[0].x_dense.clone());
 
         for m in 0..self.config.n_probes_max {
             let z = rademacher_probe(p, &mut rng_state);

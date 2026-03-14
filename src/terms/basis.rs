@@ -1806,10 +1806,10 @@ impl ImplicitDesignPsiDerivative {
         n_poly: usize,
         n_axes: usize,
     ) -> Self {
-        debug_assert_eq!(q_values.len(), n * n_knots);
-        debug_assert_eq!(t_values.len(), n * n_knots);
-        debug_assert_eq!(axis_fractions.nrows(), n * n_knots);
-        debug_assert_eq!(axis_fractions.ncols(), n_axes);
+        assert_eq!(q_values.len(), n * n_knots);
+        assert_eq!(t_values.len(), n * n_knots);
+        assert_eq!(axis_fractions.nrows(), n * n_knots);
+        assert_eq!(axis_fractions.ncols(), n_axes);
         Self {
             axis_fractions,
             q_values,
@@ -1826,11 +1826,6 @@ impl ImplicitDesignPsiDerivative {
     /// Number of axes (D).
     pub fn n_axes(&self) -> usize {
         self.n_axes
-    }
-
-    /// Number of data points.
-    pub fn n_data(&self) -> usize {
-        self.n
     }
 
     /// Output dimension: total basis columns in the final space.
@@ -1961,8 +1956,8 @@ impl ImplicitDesignPsiDerivative {
     ///   [raw]_j = Σ_i v_i · q_{ij} · s_{d,ij}
     /// then project through Z and pad.
     pub fn transpose_mul(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
-        debug_assert!(axis < self.n_axes);
-        debug_assert_eq!(v.len(), self.n);
+        assert!(axis < self.n_axes);
+        assert_eq!(v.len(), self.n);
 
         let af = &self.axis_fractions;
         let qv = &self.q_values;
@@ -1982,8 +1977,8 @@ impl ImplicitDesignPsiDerivative {
     ///   result_i = Σ_j q_{ij} · s_{d,ij} · u_knot_j
     /// where u_knot = Z · u_smooth (unprojected back to knot space).
     pub fn forward_mul(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
-        debug_assert!(axis < self.n_axes);
-        debug_assert_eq!(u.len(), self.p_out());
+        assert!(axis < self.n_axes);
+        assert_eq!(u.len(), self.p_out());
 
         let u_knot = self.unproject(u);
         let n = self.n;
@@ -2036,9 +2031,9 @@ impl ImplicitDesignPsiDerivative {
     ///
     /// Formula in raw knot space:
     ///   [raw]_j = Σ_i v_i · [2 · q_{ij} · s_{d,ij} + t_{ij} · s_{d,ij}²]
-    pub fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
-        debug_assert!(axis < self.n_axes);
-        debug_assert_eq!(v.len(), self.n);
+    pub(crate) fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
+        assert!(axis < self.n_axes);
+        assert_eq!(v.len(), self.n);
 
         let af = &self.axis_fractions;
         let qv = &self.q_values;
@@ -2056,16 +2051,16 @@ impl ImplicitDesignPsiDerivative {
     ///
     /// Formula in raw knot space:
     ///   [raw]_j = Σ_i v_i · t_{ij} · s_{d,ij} · s_{e,ij}
-    pub fn transpose_mul_second_cross(
+    pub(crate) fn transpose_mul_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         v: &ArrayView1<f64>,
     ) -> Array1<f64> {
-        debug_assert!(axis_d < self.n_axes);
-        debug_assert!(axis_e < self.n_axes);
-        debug_assert_ne!(axis_d, axis_e);
-        debug_assert_eq!(v.len(), self.n);
+        assert!(axis_d < self.n_axes);
+        assert!(axis_e < self.n_axes);
+        assert_ne!(axis_d, axis_e);
+        assert_eq!(v.len(), self.n);
 
         let af = &self.axis_fractions;
         let tv = &self.t_values;
@@ -2080,9 +2075,9 @@ impl ImplicitDesignPsiDerivative {
     /// Compute the forward product (∂²X/∂ψ_d²) u — diagonal second derivative.
     ///
     /// Returns a vector of length n.
-    pub fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
-        debug_assert!(axis < self.n_axes);
-        debug_assert_eq!(u.len(), self.p_out());
+    pub(crate) fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
+        assert!(axis < self.n_axes);
+        assert_eq!(u.len(), self.p_out());
 
         let u_knot = self.unproject(u);
         let n = self.n;
@@ -2127,16 +2122,16 @@ impl ImplicitDesignPsiDerivative {
     /// Compute the forward product (∂²X/∂ψ_d∂ψ_e) u — cross second derivative.
     ///
     /// Returns a vector of length n.
-    pub fn forward_mul_second_cross(
+    pub(crate) fn forward_mul_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         u: &ArrayView1<f64>,
     ) -> Array1<f64> {
-        debug_assert!(axis_d < self.n_axes);
-        debug_assert!(axis_e < self.n_axes);
-        debug_assert_ne!(axis_d, axis_e);
-        debug_assert_eq!(u.len(), self.p_out());
+        assert!(axis_d < self.n_axes);
+        assert!(axis_e < self.n_axes);
+        assert_ne!(axis_d, axis_e);
+        assert_eq!(u.len(), self.p_out());
 
         let u_knot = self.unproject(u);
         let n = self.n;
@@ -2183,7 +2178,7 @@ impl ImplicitDesignPsiDerivative {
     /// This is used when the dense matrix is needed temporarily (e.g., for
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Array2<f64> {
-        debug_assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes);
         let n = self.n;
         let k = self.n_knots;
 
@@ -2201,7 +2196,7 @@ impl ImplicitDesignPsiDerivative {
 
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
-        debug_assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes);
         let n = self.n;
         let k = self.n_knots;
 
@@ -2219,10 +2214,10 @@ impl ImplicitDesignPsiDerivative {
     }
 
     /// Materialize the full (n × p_out) cross second derivative matrix for axes (d, e).
-    pub fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
-        debug_assert!(axis_d < self.n_axes);
-        debug_assert!(axis_e < self.n_axes);
-        debug_assert_ne!(axis_d, axis_e);
+    pub(crate) fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
+        assert!(axis_d < self.n_axes);
+        assert!(axis_e < self.n_axes);
+        assert_ne!(axis_d, axis_e);
         let n = self.n;
         let k = self.n_knots;
 
@@ -5649,8 +5644,8 @@ fn duchon_matern_kernel_general_from_distance(
 /// which is diagonal + rank-1, so Hessian-vector products are O(d).
 #[inline]
 fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) -> (f64, Vec<f64>) {
-    debug_assert_eq!(data_row.len(), center.len());
-    debug_assert_eq!(data_row.len(), eta.len());
+    assert_eq!(data_row.len(), center.len());
+    assert_eq!(data_row.len(), eta.len());
     let d = data_row.len();
     let mut s_vec = Vec::with_capacity(d);
     let mut r2 = 0.0;
@@ -5671,8 +5666,8 @@ fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) 
 /// call sites that only need the scalar distance `r`.
 #[inline]
 fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
-    debug_assert_eq!(data_row.len(), center.len());
-    debug_assert_eq!(data_row.len(), eta.len());
+    assert_eq!(data_row.len(), center.len());
+    assert_eq!(data_row.len(), eta.len());
     let mut r2 = 0.0;
     for a in 0..data_row.len() {
         let h_a = data_row[a] - center[a];
@@ -10246,7 +10241,7 @@ pub(crate) mod internal {
         scratch: &mut BsplineScratch,
     ) {
         let (mu, num_basis) = evaluate_spline_local_values(x, DEGREE, knots, scratch);
-        debug_assert_eq!(basisvalues.len(), num_basis);
+        assert_eq!(basisvalues.len(), num_basis);
         let n = &scratch.n;
         basisvalues.fill(0.0);
         for i in 0..=DEGREE {
@@ -10269,7 +10264,7 @@ pub(crate) mod internal {
         scratch: &mut BsplineScratch,
     ) {
         let (mu, num_basis) = evaluate_spline_local_values(x, degree, knots, scratch);
-        debug_assert_eq!(basisvalues.len(), num_basis);
+        assert_eq!(basisvalues.len(), num_basis);
         let n = &scratch.n;
         basisvalues.fill(0.0);
         for i in 0..=degree {
@@ -10294,7 +10289,7 @@ pub(crate) mod internal {
         scratch: &mut BsplineScratch,
     ) -> usize {
         let (mu, _) = evaluate_spline_local_values(x, degree, knots, scratch);
-        debug_assert_eq!(values.len(), degree + 1);
+        assert_eq!(values.len(), degree + 1);
         let n = &scratch.n;
         for i in 0..=degree {
             values[i] = n[i];
