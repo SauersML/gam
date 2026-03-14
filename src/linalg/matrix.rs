@@ -1599,6 +1599,10 @@ impl DesignMatrix {
         }
     }
 
+    pub fn dot(&self, vector: &Array1<f64>) -> Array1<f64> {
+        <Self as LinearOperator>::apply(self, vector)
+    }
+
     pub fn matrixvectormultiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         <Self as LinearOperator>::apply(self, vector)
     }

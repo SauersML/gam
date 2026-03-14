@@ -575,7 +575,7 @@ pub fn run_outer(
                                 // log_plan() at the top of run_outer.
                                 None
                             }
-                            HessianSource::BfgsApprox => None,
+                            HessianSource::BfgsApprox | HessianSource::EfsFixedPoint => None,
                         };
                         Ok((eval.cost, eval.gradient, hessian))
                     },

@@ -2190,19 +2190,16 @@ impl<'a> RemlState<'a> {
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
-            return Ok(vec![
+            return Ok((0..psi_dim).map(|_| {
                 super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
                     b_mat: Array2::zeros((0, 0)),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
-                    // τ coordinates are penalty parameters — their B matrices
-                    // derive from penalty derivatives and are PSD.
                     is_penalty_like: true,
-                };
-                psi_dim
-            ]);
+                }
+            }).collect::<Vec<_>>());
         }
 
         // Working residual u = w ⊙ (z − η̂).
