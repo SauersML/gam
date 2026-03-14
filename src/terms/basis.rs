@@ -1419,6 +1419,20 @@ pub struct MaternBasisSpec {
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: MaternIdentifiability,
+    /// Per-axis anisotropy log-scales η_a (contrasts with Ση_a = 0).
+    ///
+    /// This implements geometric anisotropy: Λ = κA where A = diag(exp(η_a)),
+    /// det(A) = 1. The kernel is evaluated at r = κ|Ah| instead of r = κ|h|.
+    /// The decomposition preserves the isotropic scaling law for global κ
+    /// and adds d−1 shape parameters for directional relevance.
+    ///
+    /// Conditional positive definiteness is preserved under any invertible
+    /// linear coordinate transform (Schoenberg), so the kernel remains valid.
+    ///
+    /// When Some, the distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
+    /// When None, isotropic distance r = ‖x - c‖ is used.
+    #[serde(default)]
+    pub aniso_log_scales: Option<Vec<f64>>,
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -1468,6 +1482,21 @@ pub struct DuchonBasisSpec {
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
+    /// Per-axis anisotropy log-scales η_a (contrasts with Ση_a = 0).
+    ///
+    /// Geometric anisotropy for hybrid Duchon: Λ = κA, det(A) = 1, so
+    /// the kernel becomes φ(h; κ, A) = κ^δ H(κ|Ah|) where δ = d − 2p − 2s.
+    /// The partial-fraction spatial evaluator survives: just replace r with |Ah|.
+    /// In frequency domain the spectrum uses the inverse metric Λ⁻²:
+    ///   K̂_Λ(ω) ∝ |det Λ|⁻¹ / ((ω'Λ⁻²ω)^p (κ² + ω'Λ⁻²ω)^s)
+    ///
+    /// Only applies to hybrid Duchon (length_scale is Some). Pure Duchon has
+    /// no κ to optimize, so anisotropy requires a different parameterization.
+    ///
+    /// When Some, the distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
+    /// When None, isotropic distance r = ‖x - c‖ is used.
+    #[serde(default)]
+    pub aniso_log_scales: Option<Vec<f64>>,
 }
 
 /// Metadata returned by generic basis builders.
@@ -1480,6 +1509,8 @@ pub enum BasisMetadata {
     ThinPlate {
         centers: Array2<f64>,
         identifiability_transform: Option<Array2<f64>>,
+        /// Per-column standard deviations used for input standardization (d > 1).
+        input_scales: Option<Vec<f64>>,
     },
     Matern {
         centers: Array2<f64>,
@@ -1487,6 +1518,8 @@ pub enum BasisMetadata {
         nu: MaternNu,
         include_intercept: bool,
         identifiability_transform: Option<Array2<f64>>,
+        /// Per-column standard deviations used for input standardization (d > 1).
+        input_scales: Option<Vec<f64>>,
     },
     Duchon {
         centers: Array2<f64>,
@@ -1494,6 +1527,8 @@ pub enum BasisMetadata {
         power: usize,
         nullspace_order: DuchonNullspaceOrder,
         identifiability_transform: Option<Array2<f64>>,
+        /// Per-column standard deviations used for input standardization (d > 1).
+        input_scales: Option<Vec<f64>>,
     },
     TensorBSpline {
         feature_cols: Vec<usize>,
@@ -2403,6 +2438,7 @@ pub fn build_thin_plate_basiswithworkspace(
         metadata: BasisMetadata::ThinPlate {
             centers,
             identifiability_transform,
+            input_scales: None,
         },
     })
 }
@@ -2715,6 +2751,168 @@ fn matern_kernel_radial_tripletwith_safe_ratio(
         )));
     }
     Ok((phi, phi_r, phi_rr, phi_r_over_r))
+}
+
+/// Anisotropic radial scalars for Matérn kernel.
+///
+/// Returns (φ, q, t) — the R-operator radial scalars needed for per-axis
+/// kappa derivatives under geometric anisotropy.
+///
+/// # R-operator hierarchy
+///
+/// Define the R-operator as Rg := g'(r)/r. Successive applications give:
+///   q = Rφ   = φ'(r)/r
+///   t = R²φ  = (φ''(r) - q) / r²  =  q'(r) / r
+///   u = R³φ  = t'(r) / r           (not computed here; needed for D₂ second derivatives)
+///
+/// # Per-axis ψ_a derivatives via R-operators
+///
+/// For anisotropic distance r = |Λh| with s_a = κ_a² h_a², the kernel
+/// derivatives w.r.t. per-axis log-scales ψ_a = log(κ_a) are:
+///
+///   ∂φ/∂ψ_a = q · s_a
+///   ∂²φ/(∂ψ_a ∂ψ_b) = 2q · s_a · δ_{ab}  +  t · s_a · s_b
+///
+/// The Hessian is "diagonal + rank-1":  ∇²_ψ φ = 2q Diag(s) + t ss'.
+/// Hessian-vector products are O(d) per point pair.
+///
+/// For nu = 1/2 and nu = 3/2 the scalar t diverges at r = 0 because the
+/// kernel lacks sufficient smoothness (C^0 and C^1 respectively).  These
+/// cases return an error when r is exactly zero; at r > 0 the formulas are
+/// well defined and computed directly.
+///
+/// For nu >= 5/2 the quantity (phi'' - q) contains a factor of r^2 that
+/// cancels analytically, yielding a closed-form t with a finite r -> 0
+/// limit.
+///
+/// Closed-form t (a = s*r, s = sqrt(2*nu)/length_scale, E = exp(-a)):
+///   nu = 5/2:  t = (s^4 / 3)  E
+///   nu = 7/2:  t = (s^4 / 15) E (a + 1)
+///   nu = 9/2:  t = (s^4 / 105) (a^2 + 3a + 3) E
+///
+/// Collision limits t(0):
+///   nu = 5/2:  s^4 / 3
+///   nu = 7/2:  s^4 / 15
+///   nu = 9/2:  s^4 / 35  (= 3 s^4 / 105)
+fn matern_aniso_radial_scalars(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn aniso scalar distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let (phi, q, t) = match nu {
+        // ----------------------------------------------------------------
+        // nu = 1/2:  phi = exp(-a), a = r / length_scale.
+        //   phi'/r diverges at r = 0 (cusp kernel).
+        //   t also diverges at r = 0.
+        // ----------------------------------------------------------------
+        MaternNu::Half => {
+            let s = 1.0 / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = e;
+            if r < 1e-14 {
+                return Err(BasisError::InvalidInput(
+                    "Matérn nu=1/2 aniso scalars q and t diverge at r=0".to_string(),
+                ));
+            }
+            // phi' = -s E, q = phi'/r = -s E / r
+            let q = -s * e / r;
+            // phi'' = s^2 E, t = (phi'' - q) / r^2
+            let t = (s * s * e - q) / (r * r);
+            (phi, q, t)
+        }
+        // ----------------------------------------------------------------
+        // nu = 3/2:  phi = (1 + a) exp(-a), a = sqrt(3) r / length_scale.
+        //   q = -s^2 E  (finite at r = 0).
+        //   phi'' - q = s^2 a E = s^3 r E  =>  t = s^3 E / r  =>  diverges at r = 0.
+        // ----------------------------------------------------------------
+        MaternNu::ThreeHalves => {
+            let s = 3.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a) * e;
+            let q = -s * s * e; // exact closed form, finite at r = 0
+            if r < 1e-14 {
+                return Err(BasisError::InvalidInput(
+                    "Matérn nu=3/2 aniso scalar t diverges at r=0".to_string(),
+                ));
+            }
+            // phi'' - q = s^2 a E = s^3 r E  =>  t = s^3 E / r
+            let t = s * s * s * e / r;
+            (phi, q, t)
+        }
+        // ----------------------------------------------------------------
+        // nu = 5/2:  phi = (1 + a + a^2/3) exp(-a).
+        //   q   = -(s^2/3) (a + 1) E
+        //   phi'' - q = (s^2/3) a^2 E = (s^4/3) r^2 E
+        //   t   = (s^4/3) E
+        //   t(0) = s^4/3
+        // ----------------------------------------------------------------
+        MaternNu::FiveHalves => {
+            let s = 5.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (a * a) / 3.0) * e;
+            let q = -(s * s / 3.0) * (a + 1.0) * e;
+            let t = (s * s * s * s / 3.0) * e;
+            (phi, q, t)
+        }
+        // ----------------------------------------------------------------
+        // nu = 7/2:  phi = (1 + a + (2/5)a^2 + (1/15)a^3) exp(-a).
+        //   q   = -(s^2/15)(a^2 + 3a + 3) E
+        //   phi'' - q = (s^2/15) a^2 (a + 1) E
+        //   t   = (s^4/15)(a + 1) E
+        //   t(0) = s^4/15
+        // ----------------------------------------------------------------
+        MaternNu::SevenHalves => {
+            let s = 7.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a * a * a) * e;
+            let q = -(s * s / 15.0) * (a * a + 3.0 * a + 3.0) * e;
+            let t = (s * s * s * s / 15.0) * (a + 1.0) * e;
+            (phi, q, t)
+        }
+        // ----------------------------------------------------------------
+        // nu = 9/2:  phi = (1 + a + (3/7)a^2 + (2/21)a^3 + (1/105)a^4) exp(-a).
+        //   q   = -(s^2/105)(a^3 + 6a^2 + 15a + 15) E
+        //   phi'' - q = (s^2/105) a^2 (a^2 + 3a + 3) E
+        //   t   = (s^4/105)(a^2 + 3a + 3) E
+        //   t(0) = 3 s^4 / 105 = s^4 / 35
+        // ----------------------------------------------------------------
+        MaternNu::NineHalves => {
+            let s = 9.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0
+                + a
+                + (3.0 / 7.0) * a * a
+                + (2.0 / 21.0) * a * a * a
+                + (1.0 / 105.0) * a * a * a * a)
+                * e;
+            let q = -(s * s / 105.0) * (a * a * a + 6.0 * a * a + 15.0 * a + 15.0) * e;
+            let t = (s * s * s * s / 105.0) * (a * a + 3.0 * a + 3.0) * e;
+            (phi, q, t)
+        }
+    };
+
+    if !phi.is_finite() || !q.is_finite() || !t.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Matérn aniso radial scalars at r={r}, length_scale={length_scale}, nu={nu:?}"
+        )));
+    }
+    Ok((phi, q, t))
 }
 
 fn duchon_kernel_radial_triplet(
@@ -3766,6 +3964,69 @@ fn duchon_matern_kernel_general_from_distance(
     Ok(val)
 }
 
+/// Compute anisotropic squared distance components and total distance.
+///
+/// This is the core of **geometric anisotropy**: a linear warp Λ = diag(κ_a)
+/// turns ellipsoidal correlation contours into isotropic ones. Writing h = x − c,
+/// z = Λh, the anisotropic distance is r = |z| = |Λh|.
+///
+/// We decompose Λ = κ · A where det(A) = 1, parameterized as
+///   ψ_a = ψ̄ + η_a,   Σ η_a = 0
+/// where ψ̄ is the global scale (existing scalar κ) and η_a are d−1 anisotropy
+/// contrasts. This separates scale from shape and preserves the Duchon scaling
+/// law φ(r;κ) = κ^δ H(κr) for the global part.
+///
+/// Given per-axis log-scales `eta` (with the convention Σ eta_a = 0 for
+/// identifiability), the anisotropic distance is:
+///
+///   r = √( Σ_a exp(2·eta_a) · (x_a - c_a)² )
+///
+/// Returns `(r, s_vec)` where `s_vec[a] = exp(2·eta_a) · h_a²` is the
+/// per-axis weighted squared displacement. These components are needed for
+/// per-axis derivatives: `∂φ/∂ψ_a = q · s_a`.
+///
+/// The derivative chain through r gives:
+///   ∇_ψ r      = s / r
+///   ∇²_ψ r     = (2/r) Diag(s) − (1/r³) ss'
+/// which is diagonal + rank-1, so Hessian-vector products are O(d).
+#[inline]
+fn aniso_distance_and_components(
+    data_row: &[f64],
+    center: &[f64],
+    eta: &[f64],
+) -> (f64, Vec<f64>) {
+    debug_assert_eq!(data_row.len(), center.len());
+    debug_assert_eq!(data_row.len(), eta.len());
+    let d = data_row.len();
+    let mut s_vec = Vec::with_capacity(d);
+    let mut r2 = 0.0;
+    for a in 0..d {
+        let h_a = data_row[a] - center[a];
+        let w_a = (2.0 * eta[a]).exp();
+        let s_a = w_a * h_a * h_a;
+        s_vec.push(s_a);
+        r2 += s_a;
+    }
+    (r2.sqrt(), s_vec)
+}
+
+/// Compute anisotropic distance without returning per-axis components.
+///
+/// This is the lightweight version of [`aniso_distance_and_components`] for
+/// call sites that only need the scalar distance `r`.
+#[inline]
+fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
+    debug_assert_eq!(data_row.len(), center.len());
+    debug_assert_eq!(data_row.len(), eta.len());
+    let mut r2 = 0.0;
+    for a in 0..data_row.len() {
+        let h_a = data_row[a] - center[a];
+        let w_a = (2.0 * eta[a]).exp();
+        r2 += w_a * h_a * h_a;
+    }
+    r2.sqrt()
+}
+
 fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
     let n = points.nrows();
     let d = points.ncols();
@@ -4282,6 +4543,7 @@ pub fn build_matern_basiswithworkspace(
             nu: spec.nu,
             include_intercept: spec.include_intercept,
             identifiability_transform,
+            input_scales: None,
         },
     })
 }
@@ -5388,6 +5650,14 @@ struct DuchonRadialJets {
     lap: f64,
     lap_r: f64,
     lap_rr: f64,
+    /// R-operator radial scalar: t = R²φ = (φ'' - q) / r² = q' / r.
+    /// At collision (r = 0): t = φ''''(0) / 3, computed via assembled
+    /// fourth-derivative collision limits of the partial-fraction blocks.
+    t: f64,
+    // TODO: t_r = dt/dr = (q'' - t) / r = (phi_rrr - q_r) / r² - 2(phi_rr - q) / r³.
+    // Requires phi_rrr (third radial derivative) which is not currently available
+    // in the partial-fraction block helpers. Add when needed for anisotropic
+    // kappa gradient wiring.
 }
 
 #[inline(always)]
@@ -5590,6 +5860,10 @@ fn duchon_radial_jets(
         out.lap_rr += coeff * l2;
     }
 
+    // Compute t = R²φ = (φ'' - q) / r² = q' / r for r > 0.
+    // At the r_eval floor this is well-defined and numerically stable.
+    out.t = (out.phi_rr - out.q) / (r_eval * r_eval);
+
     if r == 0.0 {
         // The off-origin derivative path uses a small-r evaluation floor to keep
         // the partial-fraction pieces numerically stable. At an exact collision we
@@ -5611,6 +5885,13 @@ fn duchon_radial_jets(
         out.q_rr = 0.0;
         out.lap_r = 0.0;
         out.lap_rr = 0.0;
+
+        // Collision limit for t = R²φ:
+        //   t(0) = φ''''(0) / 3.
+        // Assembled from partial-fraction blocks via
+        // duchon_phi_rrrr_collision, which sums the fourth radial derivative
+        // at r = 0 from each polyharmonic and Matérn-Bessel piece.
+        out.t = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs) / 3.0;
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()
@@ -5620,6 +5901,7 @@ fn duchon_radial_jets(
         || !out.lap.is_finite()
         || !out.lap_r.is_finite()
         || !out.lap_rr.is_finite()
+        || !out.t.is_finite()
     {
         return Err(BasisError::InvalidInput(format!(
             "non-finite Duchon radial jets at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
@@ -5789,6 +6071,88 @@ fn duchonphi_rr_collision_psi_triplet(
         return Ok((phi_rr, scale * phi_rr, scale * scale * phi_rr));
     }
     Ok((phi_rr, phi_rr_psi, phi_rr_psi_psi))
+}
+
+/// Assemble φ''''(0) from the partial-fraction blocks by evaluating the fourth
+/// radial derivative at the standard small-r floor.
+///
+/// For a radial kernel with Taylor expansion φ(r) = a₀ + a₂r² + a₄r⁴ + ...,
+/// we have φ''''(0) = 24 a₄.  This is used to compute the collision limit
+/// t(0) = φ''''(0) / 3, where t = R²φ = (φ'' - q) / r².
+///
+/// Implementation: each polyharmonic block contributes its fourth derivative
+/// evaluated at r_eff analytically; each Matérn-Bessel block uses a
+/// finite-difference stencil on the already-available second-derivative code.
+fn duchon_phi_rrrr_collision(
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> f64 {
+    let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
+    let kappa = 1.0 / length_scale.max(1e-300);
+
+    let mut phi_rrrr = 0.0;
+
+    // Polyharmonic blocks: Φ_m(r) = c · r^α [· ln(r)]
+    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+        if a_m == 0.0 {
+            continue;
+        }
+        let k_half = 0.5 * k_dim as f64;
+        let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
+        let e = alpha - 4.0;
+        if k_dim % 2 == 0 && m >= (k_dim / 2) {
+            // Log branch: Φ_m(r) = c · r^α · ln(r)
+            // d⁴/dr⁴[c·r^α·ln(r)] = c · r^(α-4) · [α↓4 · ln(r) + H₄(α)]
+            // where α↓4 = α(α-1)(α-2)(α-3) and
+            //   H₄(α) = (α-1)(α-2)(α-3) + α(α-2)(α-3) + α(α-1)(α-3) + α(α-1)(α-2)
+            let c = polyharmonic_log_sign(m, k_dim)
+                / (2.0_f64.powi((2 * m - 1) as i32)
+                    * std::f64::consts::PI.powf(k_half)
+                    * gamma_lanczos(m as f64)
+                    * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+            let a4 = alpha * (alpha - 1.0) * (alpha - 2.0) * (alpha - 3.0);
+            let h4 = (alpha - 1.0) * (alpha - 2.0) * (alpha - 3.0)
+                + alpha * (alpha - 2.0) * (alpha - 3.0)
+                + alpha * (alpha - 1.0) * (alpha - 3.0)
+                + alpha * (alpha - 1.0) * (alpha - 2.0);
+            let fourth = c * r_eff.powf(e) * (a4 * r_eff.ln() + h4);
+            phi_rrrr += a_m * fourth;
+        } else {
+            // Pure power branch: Φ_m(r) = c · r^α
+            // d⁴/dr⁴[c·r^α] = c · α(α-1)(α-2)(α-3) · r^(α-4)
+            let c = gamma_lanczos(k_half - m as f64)
+                / (4.0_f64.powi(m as i32)
+                    * std::f64::consts::PI.powf(k_half)
+                    * gamma_lanczos(m as f64));
+            let fourth = c * alpha * (alpha - 1.0) * (alpha - 2.0) * (alpha - 3.0) * r_eff.powf(e);
+            phi_rrrr += a_m * fourth;
+        }
+    }
+
+    // Matérn-Bessel blocks: use central finite-difference on the second
+    // derivative to approximate the fourth derivative.
+    //   φ''''(r) ≈ (φ''(r+h) - 2φ''(r) + φ''(r-h)) / h²
+    let h = 1e-5 * r_eff.max(1e-12);
+    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+        if b_n == 0.0 {
+            continue;
+        }
+        let r_plus = r_eff + h;
+        let r_minus = (r_eff - h).max(1e-300);
+        let (_, _, d2_center) =
+            duchon_matern_block_triplet(r_eff, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
+        let (_, _, d2_plus) =
+            duchon_matern_block_triplet(r_plus, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
+        let (_, _, d2_minus) =
+            duchon_matern_block_triplet(r_minus, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
+        let fourth_fd = (d2_plus - 2.0 * d2_center + d2_minus) / (h * h);
+        phi_rrrr += b_n * fourth_fd;
+    }
+
+    phi_rrrr
 }
 
 fn build_duchon_design_psi_derivativeswithworkspace(
@@ -6263,6 +6627,7 @@ pub fn build_duchon_basiswithworkspace(
             power: spec.power,
             nullspace_order: spec.nullspace_order,
             identifiability_transform,
+            input_scales: None,
         },
     })
 }
@@ -11314,6 +11679,103 @@ mod tests {
         assert!(jets.q_rr.abs() < 1e-12);
         assert!(jets.lap_r.abs() < 1e-12);
         assert!(jets.lap_rr.abs() < 1e-12);
+        // t(0) should be finite (= φ''''(0) / 3) and is checked more
+        // thoroughly in the dedicated t-field tests below.
+        assert!(jets.t.is_finite(), "t at origin should be finite");
+    }
+
+    #[test]
+    fn test_duchon_radial_jets_t_equals_phi_rr_minus_q_over_r2() {
+        // Verify t = (φ'' - q) / r² at several r values.
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 3usize;
+        let k_dim = 4usize;
+        let length_scale = 0.85;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+
+        for &r in &[0.01, 0.1, 0.5, 1.0, 2.0] {
+            let jets =
+                duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets");
+            let t_expected = (jets.phi_rr - jets.q) / (r * r);
+            let rel = if t_expected.abs() > 1e-15 {
+                ((jets.t - t_expected) / t_expected).abs()
+            } else {
+                (jets.t - t_expected).abs()
+            };
+            assert!(
+                rel < 1e-10,
+                "t mismatch at r={r}: jets.t={}, expected={}, rel_err={rel}",
+                jets.t,
+                t_expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_duchon_radial_jets_t_equals_q_r_over_r_fd() {
+        // Finite-difference check: t = q' / r, so
+        //   t ≈ (q(r+ε) - q(r-ε)) / (2ε·r).
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 3usize;
+        let k_dim = 4usize;
+        let length_scale = 0.85;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+
+        for &r in &[0.1, 0.5, 1.0, 2.0] {
+            let eps = 1e-6 * r;
+            let jets_plus =
+                duchon_radial_jets(r + eps, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets+");
+            let jets_minus =
+                duchon_radial_jets(r - eps, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets-");
+            let jets =
+                duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets");
+            let t_fd = (jets_plus.q - jets_minus.q) / (2.0 * eps * r);
+            let rel = if jets.t.abs() > 1e-15 {
+                ((jets.t - t_fd) / jets.t).abs()
+            } else {
+                (jets.t - t_fd).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "t FD mismatch at r={r}: jets.t={}, fd={t_fd}, rel_err={rel}",
+                jets.t,
+            );
+        }
+    }
+
+    #[test]
+    fn test_duchon_radial_jets_t_collision_matches_nearby() {
+        // The collision limit t(0) should be close to t at small r.
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 3usize;
+        let k_dim = 4usize;
+        let length_scale = 0.85;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+
+        let jets_0 =
+            duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
+                .expect("jets at origin");
+        // Evaluate at a small radius
+        let r_small = 1e-4 * length_scale;
+        let jets_small =
+            duchon_radial_jets(r_small, length_scale, p_order, s_order, k_dim, &coeffs)
+                .expect("jets at small r");
+
+        let rel = if jets_0.t.abs() > 1e-15 {
+            ((jets_0.t - jets_small.t) / jets_0.t).abs()
+        } else {
+            (jets_0.t - jets_small.t).abs()
+        };
+        assert!(
+            rel < 1e-2,
+            "t collision limit should be close to nearby value: t(0)={}, t(r_small)={}, rel_err={rel}",
+            jets_0.t,
+            jets_small.t,
+        );
     }
 
     #[test]
@@ -11586,6 +12048,178 @@ mod tests {
         assert!(ratio < 0.0);
     }
 
+    // ---------------------------------------------------------------
+    // Tests for matern_aniso_radial_scalars
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_aniso_scalars_q_matches_phi_prime_over_r() {
+        // For several (nu, r) pairs, verify q == phi'/r by comparing against
+        // the radial triplet which gives us phi'.
+        let ls = 1.4;
+        for &nu in &[
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            for &r in &[0.01, 0.1, 0.5, 1.0, 2.5] {
+                let (_, phi_r, _) =
+                    matern_kernel_radial_triplet(r, ls, nu).expect("triplet");
+                let (_, q, _) =
+                    matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
+                let q_ref = phi_r / r;
+                assert!(
+                    (q - q_ref).abs() < 1e-12 * q_ref.abs().max(1.0),
+                    "q mismatch for nu={nu:?}, r={r}: q={q}, phi'/r={q_ref}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_aniso_scalars_t_matches_definition() {
+        // Verify t == (phi'' - q) / r^2 at several r values by computing
+        // phi'' from the radial triplet.
+        let ls = 1.7;
+        for &nu in &[
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            for &r in &[0.05, 0.2, 0.7, 1.5, 3.0] {
+                let (_, phi_r, phi_rr) =
+                    matern_kernel_radial_triplet(r, ls, nu).expect("triplet");
+                let (_, q, t) =
+                    matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
+                let q_check = phi_r / r;
+                let t_ref = (phi_rr - q_check) / (r * r);
+                assert!(
+                    (t - t_ref).abs() < 1e-10 * t_ref.abs().max(1.0),
+                    "t mismatch for nu={nu:?}, r={r}: t={t}, ref={t_ref}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_aniso_scalars_collision_limits() {
+        // At r = 0, q(0) = phi''(0), t(0) = phi''''(0) / 3 for smooth nus.
+        //   nu=5/2: q(0) = -s^2/3, t(0) = s^4/3
+        //   nu=7/2: q(0) = -s^2·(1/5), t(0) = s^4/15
+        //   nu=9/2: q(0) = -s^2·(1/7), t(0) = 3·s^4/105 = s^4/35
+        let ls = 2.1;
+        {
+            let s2 = 5.0 / (ls * ls);
+            let s4 = s2 * s2;
+            let (phi, q, t) =
+                matern_aniso_radial_scalars(0.0, ls, MaternNu::FiveHalves).expect("5/2 at 0");
+            assert!((phi - 1.0).abs() < 1e-14, "phi(0) should be 1");
+            assert!((q - (-s2 / 3.0)).abs() < 1e-12, "q(0) for 5/2: got {q}");
+            assert!((t - s4 / 3.0).abs() < 1e-10, "t(0) for 5/2: got {t}");
+        }
+        {
+            let s2 = 7.0 / (ls * ls);
+            let s4 = s2 * s2;
+            let (phi, q, t) =
+                matern_aniso_radial_scalars(0.0, ls, MaternNu::SevenHalves).expect("7/2 at 0");
+            assert!((phi - 1.0).abs() < 1e-14);
+            assert!((q - (-s2 / 5.0)).abs() < 1e-12, "q(0) for 7/2: got {q}");
+            // t(0) = s^4/15
+            assert!((t - s4 / 15.0).abs() < 1e-10, "t(0) for 7/2: got {t}");
+        }
+        {
+            let s2 = 9.0 / (ls * ls);
+            let s4 = s2 * s2;
+            let (phi, q, t) =
+                matern_aniso_radial_scalars(0.0, ls, MaternNu::NineHalves).expect("9/2 at 0");
+            assert!((phi - 1.0).abs() < 1e-14);
+            assert!((q - (-s2 / 7.0)).abs() < 1e-12, "q(0) for 9/2: got {q}");
+            // t(0) = 3 s^4 / 105 = s^4 / 35
+            assert!((t - s4 / 35.0).abs() < 1e-10, "t(0) for 9/2: got {t}");
+        }
+    }
+
+    #[test]
+    fn test_aniso_scalars_half_and_three_halves_diverge_at_zero() {
+        let ls = 1.0;
+        assert!(matern_aniso_radial_scalars(0.0, ls, MaternNu::Half).is_err());
+        assert!(matern_aniso_radial_scalars(0.0, ls, MaternNu::ThreeHalves).is_err());
+    }
+
+    #[test]
+    fn test_aniso_scalars_half_and_three_halves_finite_away_from_zero() {
+        let ls = 1.5;
+        let r = 0.3;
+        let (phi, q, t) =
+            matern_aniso_radial_scalars(r, ls, MaternNu::Half).expect("half r>0");
+        assert!(phi.is_finite() && q.is_finite() && t.is_finite());
+        let (phi, q, t) =
+            matern_aniso_radial_scalars(r, ls, MaternNu::ThreeHalves).expect("3/2 r>0");
+        assert!(phi.is_finite() && q.is_finite() && t.is_finite());
+    }
+
+    #[test]
+    fn test_aniso_scalars_t_finite_difference_validation() {
+        // Validate t via finite differences on q:
+        //   t(r) = d/dr[q(r)] / r  (by differentiating q = phi'/r).
+        // Actually, t = (phi'' - q)/r^2. We can also check by finite-diff on
+        // the function f(r) = phi'(r)/r:
+        //   f'(r) = (phi''(r) - phi'(r)/r) / r = (phi''(r) - q(r)) / r = t(r) * r
+        // So t(r) = f'(r) / r = (q(r+h) - q(r-h)) / (2h r).
+        let ls = 1.3;
+        let h = 1e-6;
+        for &nu in &[
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            for &r in &[0.1, 0.5, 1.0, 2.0] {
+                let (_, q_plus, _) =
+                    matern_aniso_radial_scalars(r + h, ls, nu).expect("q+");
+                let (_, q_minus, _) =
+                    matern_aniso_radial_scalars(r - h, ls, nu).expect("q-");
+                let (_, _, t) =
+                    matern_aniso_radial_scalars(r, ls, nu).expect("t");
+                // f'(r) ≈ (q(r+h) - q(r-h)) / (2h), and t = f'(r) / r
+                let t_fd = (q_plus - q_minus) / (2.0 * h * r);
+                assert!(
+                    (t - t_fd).abs() < 1e-4 * t.abs().max(1e-10),
+                    "t finite-diff mismatch for nu={nu:?}, r={r}: t={t}, fd={t_fd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_aniso_scalars_phi_matches_kernel_evaluator() {
+        // Verify that phi from the aniso scalars matches matern_kernel_from_distance.
+        let ls = 0.8;
+        for &nu in &[
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            for &r in &[0.0, 0.1, 0.5, 1.0, 3.0] {
+                let phi_ref = matern_kernel_from_distance(r, ls, nu).expect("kern");
+                let (phi, _, _) =
+                    matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
+                assert!(
+                    (phi - phi_ref).abs() < 1e-14,
+                    "phi mismatch for nu={nu:?}, r={r}: {phi} vs {phi_ref}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_aniso_scalars_invalid_inputs() {
+        assert!(matern_aniso_radial_scalars(-1.0, 1.0, MaternNu::FiveHalves).is_err());
+        assert!(matern_aniso_radial_scalars(1.0, 0.0, MaternNu::FiveHalves).is_err());
+        assert!(matern_aniso_radial_scalars(1.0, -1.0, MaternNu::FiveHalves).is_err());
+        assert!(matern_aniso_radial_scalars(f64::NAN, 1.0, MaternNu::FiveHalves).is_err());
+        assert!(matern_aniso_radial_scalars(1.0, f64::INFINITY, MaternNu::FiveHalves).is_err());
+    }
+
     #[test]
     fn test_duchon_radial_triplet_matches_finite_difference_away_fromzero() {
         let r = 0.42;
@@ -11840,5 +12474,67 @@ mod tests {
                 "matern_operator_psi_triplet component {idx} should decay to 0 for enormous finite distances; got {value}"
             );
         }
+    }
+
+    // ---- anisotropic distance helper tests ----
+
+    #[test]
+    fn aniso_distance_isotropic_when_eta_zero() {
+        // When all η_a = 0, exp(2·0) = 1, so aniso distance == Euclidean distance.
+        let x = [1.0, 2.0, 3.0];
+        let c = [4.0, 5.0, 6.0];
+        let eta = [0.0, 0.0, 0.0];
+        let iso_r = {
+            let mut d2 = 0.0;
+            for a in 0..3 {
+                let h = x[a] - c[a];
+                d2 += h * h;
+            }
+            d2.sqrt()
+        };
+        let (r, s) = aniso_distance_and_components(&x, &c, &eta);
+        assert_abs_diff_eq!(r, iso_r, epsilon = 1e-14);
+        assert_abs_diff_eq!(aniso_distance(&x, &c, &eta), iso_r, epsilon = 1e-14);
+        // s_a components should sum to r²
+        let s_sum: f64 = s.iter().sum();
+        assert_abs_diff_eq!(s_sum, r * r, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn aniso_distance_weighted_correctly() {
+        // Two axes, η = [ln2, -ln2] so exp(2η) = [4, 1/4].
+        // h = [1, 2], so s = [4·1, 0.25·4] = [4, 1], r = √5.
+        let x = [3.0, 5.0];
+        let c = [2.0, 3.0];
+        let eta = [2.0_f64.ln(), -(2.0_f64.ln())];
+        let (r, s) = aniso_distance_and_components(&x, &c, &eta);
+        assert_abs_diff_eq!(s[0], 4.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(s[1], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(r, 5.0_f64.sqrt(), epsilon = 1e-12);
+        assert_abs_diff_eq!(aniso_distance(&x, &c, &eta), 5.0_f64.sqrt(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn aniso_distance_components_sum_to_r_squared() {
+        let x = [1.5, -0.3, 2.7, 0.1];
+        let c = [0.2, 1.1, -0.5, 3.3];
+        let eta = [0.5, -0.2, 0.1, -0.4];
+        let (r, s) = aniso_distance_and_components(&x, &c, &eta);
+        let s_sum: f64 = s.iter().sum();
+        assert_abs_diff_eq!(s_sum, r * r, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn aniso_distance_zero_displacement_gives_zero_component() {
+        // When h_a = 0 for some axis, that s_a must be exactly 0.
+        let x = [1.0, 5.0, 3.0];
+        let c = [1.0, 2.0, 3.0]; // axis 0 and 2 have h=0
+        let eta = [10.0, -5.0, -5.0]; // large eta on axis 0 should not matter
+        let (r, s) = aniso_distance_and_components(&x, &c, &eta);
+        assert_eq!(s[0], 0.0, "s_a should be exactly 0 when h_a = 0");
+        assert_eq!(s[2], 0.0, "s_a should be exactly 0 when h_a = 0");
+        assert!(s[1] > 0.0);
+        // r should equal sqrt(s[1])
+        assert_abs_diff_eq!(r, s[1].sqrt(), epsilon = 1e-14);
     }
 }

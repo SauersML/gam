@@ -91,14 +91,23 @@ pub enum SmoothBasisSpec {
     ThinPlate {
         feature_cols: Vec<usize>,
         spec: ThinPlateBasisSpec,
+        /// Per-column standard deviations used to standardize input dimensions
+        /// before kernel evaluation when d > 1. `None` means no standardization
+        /// (either d == 1 or explicitly disabled).
+        #[serde(default)]
+        input_scales: Option<Vec<f64>>,
     },
     Matern {
         feature_cols: Vec<usize>,
         spec: MaternBasisSpec,
+        #[serde(default)]
+        input_scales: Option<Vec<f64>>,
     },
     Duchon {
         feature_cols: Vec<usize>,
         spec: DuchonBasisSpec,
+        #[serde(default)]
+        input_scales: Option<Vec<f64>>,
     },
     /// Tensor-product smooth built from 1D B-spline marginals.
     ///
@@ -392,13 +401,40 @@ pub(crate) struct SpatialPsiDerivative {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SpatialLogKappaCoords(Array1<f64>);
+pub(crate) struct SpatialLogKappaCoords {
+    /// Flattened ψ values. For isotropic terms, one entry per term.
+    /// For anisotropic terms, d entries per term (one ψ_a per axis).
+    values: Array1<f64>,
+    /// Dimensionality of each term: 1 for isotropic, d for anisotropic.
+    dims_per_term: Vec<usize>,
+}
 
 impl SpatialLogKappaCoords {
+    /// Backward-compatible constructor: assumes 1 ψ value per term (all isotropic).
     pub(crate) fn new(values: Array1<f64>) -> Self {
-        Self(values)
+        let n = values.len();
+        Self {
+            values,
+            dims_per_term: vec![1; n],
+        }
     }
 
+    /// Construct from an explicit dims layout plus values.
+    fn new_with_dims(values: Array1<f64>, dims_per_term: Vec<usize>) -> Self {
+        debug_assert_eq!(
+            values.len(),
+            dims_per_term.iter().sum::<usize>(),
+            "SpatialLogKappaCoords: values length {} != sum of dims_per_term {}",
+            values.len(),
+            dims_per_term.iter().sum::<usize>(),
+        );
+        Self {
+            values,
+            dims_per_term,
+        }
+    }
+
+    /// Isotropic initialization (backward-compatible path).
     pub(crate) fn from_length_scales(
         spec: &TermCollectionSpec,
         term_indices: &[usize],
@@ -411,58 +447,279 @@ impl SpatialLogKappaCoords {
                 .clamp(options.min_length_scale, options.max_length_scale);
             out[slot] = -length_scale.ln();
         }
-        Self(out)
+        Self {
+            values: out,
+            dims_per_term: vec![1; term_indices.len()],
+        }
     }
 
+    /// Anisotropic-aware initialization.
+    ///
+    /// Initialization strategy (per math team recommendation): standardize the
+    /// knot cloud axiswise, then run the existing isotropic κ initializer in
+    /// the standardized space. This reuses the trusted isotropic initializer
+    /// and gives initial η_a = −ln(σ_a) + mean(ln(σ_a)), which satisfies
+    /// Ση_a = 0 by construction.
+    ///
+    /// For each term, checks whether it has `aniso_log_scales` set on its basis spec.
+    /// - If isotropic (no aniso_log_scales, or 1-D): 1 entry = −ln(length_scale).
+    /// - If anisotropic (aniso_log_scales present): d entries, one ψ_a per axis.
+    ///   Initialized as ψ_a = −ln(length_scale) + η_a  where η_a are the existing
+    ///   aniso_log_scales (which sum to zero). If aniso_log_scales is empty or missing
+    ///   for a multi-dimensional term, the scalar −ln(length_scale) is broadcast.
+    pub(crate) fn from_length_scales_aniso(
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        let mut vals = Vec::new();
+        let mut dims = Vec::new();
+        for &term_idx in term_indices {
+            let length_scale = get_spatial_length_scale(spec, term_idx)
+                .unwrap_or(options.min_length_scale)
+                .clamp(options.min_length_scale, options.max_length_scale);
+            let psi_bar = -length_scale.ln(); // global scale = −ln(length_scale)
+
+            let aniso = get_spatial_aniso_log_scales(spec, term_idx);
+            let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(1);
+
+            match aniso {
+                Some(ref eta) if eta.len() == d && d > 1 => {
+                    // Existing per-axis anisotropy: ψ_a = ψ̄ + η_a
+                    for &eta_a in eta {
+                        vals.push(psi_bar + eta_a);
+                    }
+                    dims.push(d);
+                }
+                _ if d > 1 => {
+                    // Anisotropic term but no existing scales: broadcast scalar
+                    for _ in 0..d {
+                        vals.push(psi_bar);
+                    }
+                    dims.push(d);
+                }
+                _ => {
+                    // Isotropic (1-D or no multi-dim info)
+                    vals.push(psi_bar);
+                    dims.push(1);
+                }
+            }
+        }
+        Self {
+            values: Array1::from_vec(vals),
+            dims_per_term: dims,
+        }
+    }
+
+    /// Isotropic lower bounds (backward-compatible): one bound per term.
     pub(crate) fn lower_bounds(
         dim: usize,
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
-        Self(Array1::<f64>::from_elem(
-            dim,
-            -options.max_length_scale.ln(),
-        ))
+        Self {
+            values: Array1::<f64>::from_elem(dim, -options.max_length_scale.ln()),
+            dims_per_term: vec![1; dim],
+        }
     }
 
+    /// Isotropic upper bounds (backward-compatible): one bound per term.
     pub(crate) fn upper_bounds(
         dim: usize,
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
-        Self(Array1::<f64>::from_elem(
-            dim,
-            -options.min_length_scale.ln(),
-        ))
+        Self {
+            values: Array1::<f64>::from_elem(dim, -options.min_length_scale.ln()),
+            dims_per_term: vec![1; dim],
+        }
     }
 
+    /// Anisotropic-aware lower bounds: d bounds per aniso term.
+    pub(crate) fn lower_bounds_aniso(
+        dims_per_term: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        let total: usize = dims_per_term.iter().sum();
+        Self {
+            values: Array1::<f64>::from_elem(total, -options.max_length_scale.ln()),
+            dims_per_term: dims_per_term.to_vec(),
+        }
+    }
+
+    /// Anisotropic-aware upper bounds: d bounds per aniso term.
+    pub(crate) fn upper_bounds_aniso(
+        dims_per_term: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        let total: usize = dims_per_term.iter().sum();
+        Self {
+            values: Array1::<f64>::from_elem(total, -options.min_length_scale.ln()),
+            dims_per_term: dims_per_term.to_vec(),
+        }
+    }
+
+    /// Backward-compatible: reconstruct from theta tail assuming all-isotropic.
     fn from_theta_tail(theta: &Array1<f64>, start: usize) -> Self {
-        Self(theta.slice(s![start..]).to_owned())
+        Self::new(theta.slice(s![start..]).to_owned())
     }
 
+    /// Reconstruct from theta tail with known dimensionality layout.
+    fn from_theta_tail_with_dims(
+        theta: &Array1<f64>,
+        start: usize,
+        dims_per_term: Vec<usize>,
+    ) -> Self {
+        let total: usize = dims_per_term.iter().sum();
+        Self {
+            values: theta.slice(s![start..start + total]).to_owned(),
+            dims_per_term,
+        }
+    }
+
+    /// Total number of ψ values in the flat array (= sum of dims_per_term).
     fn len(&self) -> usize {
-        self.0.len()
+        self.values.len()
+    }
+
+    /// Total number of ψ values (sum of dims_per_term). Alias for `len()`.
+    fn total_dim(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Number of logical terms.
+    fn num_terms(&self) -> usize {
+        self.dims_per_term.len()
+    }
+
+    /// Dimensionality layout: how many ψ values each term contributes.
+    pub(crate) fn dims_per_term(&self) -> &[usize] {
+        &self.dims_per_term
+    }
+
+    /// Get the offset into the flat array for logical term i.
+    fn term_offset(&self, term_idx: usize) -> usize {
+        self.dims_per_term[..term_idx].iter().sum()
+    }
+
+    /// Get the slice of ψ values for logical term i.
+    fn term_slice(&self, term_idx: usize) -> &[f64] {
+        let offset = self.term_offset(term_idx);
+        let d = self.dims_per_term[term_idx];
+        &self.values.as_slice().unwrap()[offset..offset + d]
     }
 
     pub(crate) fn as_array(&self) -> &Array1<f64> {
-        &self.0
+        &self.values
     }
 
+    /// Split at a logical-term boundary. `mid` is the number of terms in the
+    /// first half (not a flat-array index).
     fn split_at(&self, mid: usize) -> (Self, Self) {
+        let flat_mid: usize = self.dims_per_term[..mid].iter().sum();
         (
-            Self(self.0.slice(s![0..mid]).to_owned()),
-            Self(self.0.slice(s![mid..]).to_owned()),
+            Self {
+                values: self.values.slice(s![0..flat_mid]).to_owned(),
+                dims_per_term: self.dims_per_term[..mid].to_vec(),
+            },
+            Self {
+                values: self.values.slice(s![flat_mid..]).to_owned(),
+                dims_per_term: self.dims_per_term[mid..].to_vec(),
+            },
         )
     }
 
     fn to_log_length_scales(&self) -> Array1<f64> {
-        self.0.mapv(|v| -v)
+        self.values.mapv(|v| -v)
     }
 
+    /// Apply optimized ψ values back to the spec.
+    ///
+    /// For isotropic terms (dims=1): sets scalar length_scale = exp(−ψ).
+    /// For anisotropic terms (dims=d): sets length_scale = exp(−ψ̄) where
+    /// ψ̄ = mean(ψ_a), and sets aniso_log_scales = Some([η_a]) where
+    /// η_a = ψ_a − ψ̄ (these sum to zero by construction).
     pub(crate) fn apply_tospec(
         &self,
         spec: &TermCollectionSpec,
         term_indices: &[usize],
     ) -> Result<TermCollectionSpec, EstimationError> {
-        apply_spatial_log_length_scales(spec, term_indices, &self.to_log_length_scales())
+        if term_indices.len() != self.dims_per_term.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "SpatialLogKappaCoords::apply_tospec: term count mismatch: \
+                 term_indices={} dims_per_term={}",
+                term_indices.len(),
+                self.dims_per_term.len()
+            )));
+        }
+        let mut updated = spec.clone();
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            let psi = self.term_slice(slot);
+            let d = self.dims_per_term[slot];
+            if d == 1 {
+                // Isotropic: length_scale = exp(−ψ)
+                let length_scale = (-psi[0]).exp();
+                set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
+            } else {
+                // Anisotropic: decompose ψ_a = ψ̄ + η_a where ψ̄ = mean(ψ_a).
+                // This is the Λ = κA decomposition (det A = 1):
+                //   κ = exp(ψ̄)     → stored as length_scale = exp(−ψ̄)
+                //   A = diag(exp(η_a)) → stored as aniso_log_scales = η
+                // The sum-to-zero constraint Ση_a = 0 is satisfied by construction.
+                let psi_bar = psi.iter().sum::<f64>() / d as f64;
+                let length_scale = (-psi_bar).exp();
+                let eta: Vec<f64> = psi.iter().map(|&p| p - psi_bar).collect();
+                set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
+                set_spatial_aniso_log_scales(&mut updated, term_idx, eta)?;
+            }
+        }
+        Ok(updated)
+    }
+}
+
+/// Get the `aniso_log_scales` from a spatial term, if present.
+fn get_spatial_aniso_log_scales(
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> Option<Vec<f64>> {
+    spec.smooth_terms.get(term_idx).and_then(|term| match &term.basis {
+        SmoothBasisSpec::Matern { spec, .. } => spec.aniso_log_scales.clone(),
+        SmoothBasisSpec::Duchon { spec, .. } => spec.aniso_log_scales.clone(),
+        _ => None,
+    })
+}
+
+/// Get the number of feature columns (spatial dimensionality) for a spatial term.
+fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option<usize> {
+    spec.smooth_terms.get(term_idx).and_then(|term| match &term.basis {
+        SmoothBasisSpec::Matern { feature_cols, .. } => Some(feature_cols.len()),
+        SmoothBasisSpec::Duchon { feature_cols, .. } => Some(feature_cols.len()),
+        _ => None,
+    })
+}
+
+/// Set `aniso_log_scales` on a spatial term's basis spec.
+fn set_spatial_aniso_log_scales(
+    spec: &mut TermCollectionSpec,
+    term_idx: usize,
+    eta: Vec<f64>,
+) -> Result<(), EstimationError> {
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        return Err(EstimationError::InvalidInput(format!(
+            "spatial aniso_log_scales term index {term_idx} out of range"
+        )));
+    };
+    match &mut term.basis {
+        SmoothBasisSpec::Matern { spec, .. } => {
+            spec.aniso_log_scales = Some(eta);
+            Ok(())
+        }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            spec.aniso_log_scales = Some(eta);
+            Ok(())
+        }
+        _ => Err(EstimationError::InvalidInput(format!(
+            "term '{}' does not support aniso_log_scales",
+            term.name
+        ))),
     }
 }
 
@@ -584,6 +841,36 @@ struct RandomEffectBlock {
     name: String,
     design: Array2<f64>,
     kept_levels: Vec<u64>,
+}
+
+/// Compute per-column standard deviations for multivariate spatial inputs (d > 1).
+/// Returns `None` when d == 1 (standardization unnecessary) or when the caller
+/// already supplies frozen scales (prediction path).
+fn compute_spatial_input_scales(x: ArrayView2<'_, f64>) -> Option<Vec<f64>> {
+    let d = x.ncols();
+    if d <= 1 {
+        return None;
+    }
+    let n = x.nrows() as f64;
+    if n < 2.0 {
+        return None;
+    }
+    let mut scales = Vec::with_capacity(d);
+    for j in 0..d {
+        let col = x.column(j);
+        let mean = col.sum() / n;
+        let var = col.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        scales.push(var.sqrt().max(1e-12));
+    }
+    Some(scales)
+}
+
+/// Apply per-column standardization to a data matrix using precomputed scales.
+fn apply_input_standardization(x: &mut Array2<f64>, scales: &[f64]) {
+    for j in 0..x.ncols() {
+        let inv = 1.0 / scales[j];
+        x.column_mut(j).mapv_inplace(|v| v * inv);
+    }
 }
 
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
@@ -820,9 +1107,11 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
         BasisMetadata::ThinPlate {
             centers,
             identifiability_transform: None,
+            input_scales,
         } => BasisMetadata::ThinPlate {
             centers,
             identifiability_transform: Some(Array2::eye(raw_cols)),
+            input_scales,
         },
         BasisMetadata::Duchon {
             centers,
@@ -830,12 +1119,14 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             power,
             nullspace_order,
             identifiability_transform: None,
+            input_scales,
         } => BasisMetadata::Duchon {
             centers,
             length_scale,
             power,
             nullspace_order,
             identifiability_transform: Some(Array2::eye(raw_cols)),
+            input_scales,
         },
         other => other,
     }
@@ -850,6 +1141,7 @@ fn matern_operator_penalty_triplet_from_metadata(
         nu,
         include_intercept,
         identifiability_transform,
+        ..
     } = metadata
     else {
         return Err(BasisError::InvalidInput(
@@ -982,6 +1274,7 @@ fn build_shape_constraint_design_1d(
             BasisMetadata::ThinPlate {
                 centers,
                 identifiability_transform,
+                ..
             },
         ) => {
             let evalspec = ThinPlateBasisSpec {
@@ -1004,6 +1297,7 @@ fn build_shape_constraint_design_1d(
                 nu,
                 include_intercept,
                 identifiability_transform,
+                ..
             },
         ) => {
             let ident = identifiability_transform
@@ -1030,6 +1324,7 @@ fn build_shape_constraint_design_1d(
                 power,
                 nullspace_order,
                 identifiability_transform,
+                ..
             },
         ) => {
             let evalspec = DuchonBasisSpec {
@@ -1561,7 +1856,7 @@ pub fn build_smooth_design(
                 }
                 build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
             }
-            SmoothBasisSpec::ThinPlate { feature_cols, spec } => {
+            SmoothBasisSpec::ThinPlate { feature_cols, spec, input_scales } => {
                 if term.shape != ShapeConstraint::None {
                     if feature_cols.len() != 1 {
                         return Err(BasisError::InvalidInput(format!(
@@ -1573,7 +1868,18 @@ pub fn build_smooth_design(
                     }
                     shape_axis_col = Some(feature_cols[0]);
                 }
-                let x = select_columns(data, feature_cols)?;
+                let mut x = select_columns(data, feature_cols)?;
+                // Auto-standardize multivariate inputs: use stored scales (prediction)
+                // or compute fresh ones (training).
+                let scales = if let Some(s) = input_scales {
+                    apply_input_standardization(&mut x, s);
+                    Some(s.clone())
+                } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                    apply_input_standardization(&mut x, &s);
+                    Some(s)
+                } else {
+                    None
+                };
                 let mut spec_local = spec.clone();
                 if matches!(
                     spec_local.identifiability,
@@ -1582,11 +1888,16 @@ pub fn build_smooth_design(
                 ) {
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
-                build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
+                let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
                     rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
-                })?
+                })?;
+                // Inject input scales into metadata for downstream storage.
+                if let BasisMetadata::ThinPlate { input_scales: ref mut ms, .. } = result.metadata {
+                    *ms = scales;
+                }
+                result
             }
-            SmoothBasisSpec::Matern { feature_cols, spec } => {
+            SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
                 if term.shape != ShapeConstraint::None {
                     if feature_cols.len() != 1 {
                         return Err(BasisError::InvalidInput(format!(
@@ -1598,10 +1909,23 @@ pub fn build_smooth_design(
                     }
                     shape_axis_col = Some(feature_cols[0]);
                 }
-                let x = select_columns(data, feature_cols)?;
-                build_matern_basis(x.view(), spec)?
+                let mut x = select_columns(data, feature_cols)?;
+                let scales = if let Some(s) = input_scales {
+                    apply_input_standardization(&mut x, s);
+                    Some(s.clone())
+                } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                    apply_input_standardization(&mut x, &s);
+                    Some(s)
+                } else {
+                    None
+                };
+                let mut result = build_matern_basis(x.view(), spec)?;
+                if let BasisMetadata::Matern { input_scales: ref mut ms, .. } = result.metadata {
+                    *ms = scales;
+                }
+                result
             }
-            SmoothBasisSpec::Duchon { feature_cols, spec } => {
+            SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
                 if term.shape != ShapeConstraint::None {
                     if feature_cols.len() != 1 {
                         return Err(BasisError::InvalidInput(format!(
@@ -1613,7 +1937,16 @@ pub fn build_smooth_design(
                     }
                     shape_axis_col = Some(feature_cols[0]);
                 }
-                let x = select_columns(data, feature_cols)?;
+                let mut x = select_columns(data, feature_cols)?;
+                let scales = if let Some(s) = input_scales {
+                    apply_input_standardization(&mut x, s);
+                    Some(s.clone())
+                } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                    apply_input_standardization(&mut x, &s);
+                    Some(s)
+                } else {
+                    None
+                };
                 let mut spec_local = spec.clone();
                 if matches!(
                     spec_local.identifiability,
@@ -1622,7 +1955,11 @@ pub fn build_smooth_design(
                 ) {
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
-                build_duchon_basis(x.view(), &spec_local)?
+                let mut result = build_duchon_basis(x.view(), &spec_local)?;
+                if let BasisMetadata::Duchon { input_scales: ref mut ms, .. } = result.metadata {
+                    *ms = scales;
+                }
+                result
             }
             SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
                 build_tensor_bspline_basis(data, feature_cols, spec)?
@@ -2531,11 +2868,13 @@ fn with_spatial_identifiability_transform(
         BasisMetadata::ThinPlate {
             centers,
             identifiability_transform,
+            input_scales,
         } => BasisMetadata::ThinPlate {
             centers: centers.clone(),
             identifiability_transform: transform
                 .cloned()
                 .or_else(|| identifiability_transform.clone()),
+            input_scales: input_scales.clone(),
         },
         BasisMetadata::Duchon {
             centers,
@@ -2543,11 +2882,13 @@ fn with_spatial_identifiability_transform(
             power,
             nullspace_order,
             identifiability_transform,
+            input_scales,
         } => BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
             power: *power,
             nullspace_order: *nullspace_order,
+            input_scales: input_scales.clone(),
             identifiability_transform: transform
                 .cloned()
                 .or_else(|| identifiability_transform.clone()),
@@ -3412,6 +3753,7 @@ fn extract_spatial_operator_runtime_caches(
                         nu,
                         include_intercept,
                         identifiability_transform,
+                        ..
                     },
                 ) => {
                     let ops = build_matern_collocation_operator_matrices(
@@ -6357,13 +6699,19 @@ fn try_build_spatial_term_log_kappa_derivative(
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
     } = match &termspec.basis {
-        SmoothBasisSpec::Matern { feature_cols, spec } => {
-            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+        SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
             build_matern_basis_log_kappa_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::Duchon { feature_cols, spec } => {
-            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+        SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
             build_duchon_basis_log_kappa_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
@@ -6373,13 +6721,19 @@ fn try_build_spatial_term_log_kappa_derivative(
         designsecond_derivative: local_x_psi_psi,
         penaltiessecond_derivative: local_s_psi_psi,
     } = match &termspec.basis {
-        SmoothBasisSpec::Matern { feature_cols, spec } => {
-            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+        SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
             build_matern_basis_log_kappasecond_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::Duchon { feature_cols, spec } => {
-            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+        SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
             build_duchon_basis_log_kappasecond_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
@@ -6994,10 +7348,11 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
         .zip(design.smooth.terms.iter())
     {
         if let (
-            SmoothBasisSpec::Matern { spec: s, .. },
+            SmoothBasisSpec::Matern { spec: s, ref mut input_scales, .. },
             BasisMetadata::Matern {
                 centers,
                 identifiability_transform,
+                input_scales: meta_scales,
                 ..
             },
         ) = (&mut term.basis, &fitted.metadata)
@@ -7008,12 +7363,14 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
                     transform: z.clone(),
                 };
             }
+            *input_scales = meta_scales.clone();
         }
         if let (
-            SmoothBasisSpec::Duchon { spec: s, .. },
+            SmoothBasisSpec::Duchon { spec: s, ref mut input_scales, .. },
             BasisMetadata::Duchon {
                 centers,
                 identifiability_transform,
+                input_scales: meta_scales,
                 ..
             },
         ) = (&mut term.basis, &fitted.metadata)
@@ -7024,6 +7381,17 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
                     transform: z.clone(),
                 };
             }
+            *input_scales = meta_scales.clone();
+        }
+        if let (
+            SmoothBasisSpec::ThinPlate { ref mut input_scales, .. },
+            BasisMetadata::ThinPlate {
+                input_scales: meta_scales,
+                ..
+            },
+        ) = (&mut term.basis, &fitted.metadata)
+        {
+            *input_scales = meta_scales.clone();
         }
     }
     Ok(frozen)
@@ -7758,7 +8126,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             },
         ];
@@ -7798,7 +8167,8 @@ mod tests {
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
 
@@ -7823,7 +8193,8 @@ mod tests {
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained thin-plate");
@@ -7854,7 +8225,8 @@ mod tests {
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::None,
         }];
 
@@ -7886,7 +8258,8 @@ mod tests {
                     double_penalty: false,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Matérn");
@@ -7914,7 +8287,8 @@ mod tests {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Duchon");
@@ -7989,7 +8363,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8032,7 +8407,8 @@ mod tests {
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8082,7 +8458,8 @@ mod tests {
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8139,7 +8516,8 @@ mod tests {
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8199,7 +8577,8 @@ mod tests {
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         },
-                    },
+                        input_scales: None,
+                        },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -8211,8 +8590,10 @@ mod tests {
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         },
-                    },
-                    shape: ShapeConstraint::None,
+                        input_scales: None,
+                        },
+                        input_scales: None,
+                        },
                 },
             ],
         };
@@ -8254,7 +8635,8 @@ mod tests {
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8264,6 +8646,7 @@ mod tests {
             BasisMetadata::ThinPlate {
                 centers,
                 identifiability_transform,
+                ..
             } => (
                 centers.clone(),
                 identifiability_transform
@@ -8285,7 +8668,8 @@ mod tests {
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::FrozenTransform { transform: z },
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8363,7 +8747,8 @@ mod tests {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::None,
         }];
 
@@ -8398,7 +8783,8 @@ mod tests {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::None,
         }];
 
@@ -8431,7 +8817,8 @@ mod tests {
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: SpatialIdentifiability::default(),
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::None,
         }];
 
@@ -8476,7 +8863,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8525,7 +8913,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8566,7 +8955,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8607,7 +8997,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8821,7 +9212,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8918,7 +9310,8 @@ mod tests {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::None,
         };
 
@@ -9001,7 +9394,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9064,7 +9458,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9090,7 +9485,7 @@ mod tests {
             design_derivative: local_x_psi,
             penalties_derivative: local_s_psi,
         } = match &termspec.basis {
-            SmoothBasisSpec::Duchon { feature_cols, spec } => {
+            SmoothBasisSpec::Duchon { feature_cols, spec, .. } => {
                 let x =
                     select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
                 build_duchon_basis_log_kappa_derivative(x.view(), spec)
@@ -9102,7 +9497,7 @@ mod tests {
             designsecond_derivative: local_x_psi_psi,
             penaltiessecond_derivative: local_s_psi_psi,
         } = match &termspec.basis {
-            SmoothBasisSpec::Duchon { feature_cols, spec } => {
+            SmoothBasisSpec::Duchon { feature_cols, spec, .. } => {
                 let x =
                     select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
                 build_duchon_basis_log_kappasecond_derivative(x.view(), spec)
@@ -9163,7 +9558,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9268,7 +9664,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9340,7 +9737,8 @@ mod tests {
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9412,7 +9810,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9498,7 +9897,8 @@ mod tests {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                 },
-            },
+                input_scales: None,
+                },
             shape: ShapeConstraint::None,
         };
 
@@ -10068,7 +10468,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10147,7 +10548,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10224,7 +10626,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10399,7 +10802,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10554,7 +10958,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10710,7 +11115,8 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10788,7 +11194,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };

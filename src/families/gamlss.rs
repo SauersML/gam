@@ -11356,6 +11356,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                     },
+                    input_scales: None,
                 },
                 shape: ShapeConstraint::None,
             }],

@@ -271,6 +271,16 @@ struct FitArgs {
     /// Enable MM-based spatial adaptive regularization for compatible smooth terms.
     #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = true)]
     adaptive_regularization: bool,
+    /// Enable per-axis anisotropic length-scale optimization for all eligible
+    /// spatial terms (Matérn and hybrid Duchon).  Only takes effect when kappa
+    /// optimization is enabled (which it is by default).  Each spatial smooth
+    /// starts with zero-initialized per-axis log-scales that are jointly
+    /// optimized alongside the scalar kappa.
+    ///
+    /// Individual terms can opt in/out via the formula option
+    /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
+    #[arg(long = "scale-dimensions", default_value_t = false)]
+    scale_dimensions: bool,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -800,7 +810,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     progress.set_stage("fit", "building term specification");
-    let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    let mut spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    if args.scale_dimensions {
+        enable_scale_dimensions(&mut spec);
+    }
     progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("dataset parsed and terms resolved");
     progress.advance_workflow(2);
@@ -1163,8 +1176,12 @@ fn run_fitwith_predict_noise(
     }
     progress.set_stage("fit", "building mean/noise term specifications");
     progress.start_secondary_workflow("Mean/Noise Terms", 2);
-    let noisespec = build_termspec(&parsed_noise.terms, ds, col_map, inference_notes)?;
-    let meanspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    let mut noisespec = build_termspec(&parsed_noise.terms, ds, col_map, inference_notes)?;
+    let mut meanspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    if args.scale_dimensions {
+        enable_scale_dimensions(&mut meanspec);
+        enable_scale_dimensions(&mut noisespec);
+    }
     progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("mean and noise terms resolved");
     progress.advance_workflow(2);
@@ -6316,10 +6333,12 @@ fn freeze_term_collectionspec(
                 };
             }
             (
-                SmoothBasisSpec::ThinPlate { spec: s, .. },
+                SmoothBasisSpec::ThinPlate { spec: s, ref mut input_scales, .. },
                 BasisMetadata::ThinPlate {
                     centers,
                     identifiability_transform,
+                    input_scales: meta_scales,
+                    ..
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
@@ -6329,15 +6348,18 @@ fn freeze_term_collectionspec(
                     },
                     None => SpatialIdentifiability::None,
                 };
+                *input_scales = meta_scales.clone();
             }
             (
-                SmoothBasisSpec::Matern { spec: s, .. },
+                SmoothBasisSpec::Matern { spec: s, ref mut input_scales, .. },
                 BasisMetadata::Matern {
                     centers,
                     length_scale,
                     nu,
                     include_intercept,
                     identifiability_transform,
+                    input_scales: meta_scales,
+                    ..
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
@@ -6350,15 +6372,18 @@ fn freeze_term_collectionspec(
                     },
                     None => MaternIdentifiability::None,
                 };
+                *input_scales = meta_scales.clone();
             }
             (
-                SmoothBasisSpec::Duchon { spec: s, .. },
+                SmoothBasisSpec::Duchon { spec: s, ref mut input_scales, .. },
                 BasisMetadata::Duchon {
                     centers,
                     length_scale,
                     power,
                     nullspace_order,
                     identifiability_transform,
+                    input_scales: meta_scales,
+                    ..
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
@@ -6371,6 +6396,7 @@ fn freeze_term_collectionspec(
                     },
                     None => SpatialIdentifiability::None,
                 };
+                *input_scales = meta_scales.clone();
             }
             (
                 SmoothBasisSpec::TensorBSpline {
@@ -8253,6 +8279,7 @@ fn build_smooth_basis(
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                 },
+                input_scales: None,
             })
         }
         "matern" => {
@@ -8262,6 +8289,11 @@ fn build_smooth_basis(
                 heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
             let nu = parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("5/2"))?;
+            let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
+                Some(vec![0.0; cols.len()])
+            } else {
+                None
+            };
             Ok(SmoothBasisSpec::Matern {
                 feature_cols: cols.to_vec(),
                 spec: MaternBasisSpec {
@@ -8271,7 +8303,9 @@ fn build_smooth_basis(
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_matern_identifiability(options)?,
+                    aniso_log_scales,
                 },
+                input_scales: None,
             })
         }
         "duchon" => {
@@ -8288,18 +8322,54 @@ fn build_smooth_basis(
             )?;
             let power = parse_duchon_power(options)?;
             let nullspace_order = parse_duchon_order(options)?;
+            let length_scale = option_f64(options, "length_scale");
+            // Per-term scale_dims only applies to hybrid Duchon (has length_scale).
+            let aniso_log_scales =
+                if length_scale.is_some() && option_bool(options, "scale_dims").unwrap_or(false) {
+                    Some(vec![0.0; cols.len()])
+                } else {
+                    None
+                };
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
                     center_strategy: spatial_center_strategy_for_dimension(centers),
-                    length_scale: option_f64(options, "length_scale"),
+                    length_scale,
                     power,
                     nullspace_order,
                     identifiability: parse_spatial_identifiability(options)?,
+                    aniso_log_scales,
                 },
+                input_scales: None,
             })
         }
         other => Err(format!("unsupported smooth type '{other}'")),
+    }
+}
+
+/// Initialise per-axis anisotropic log-scales on eligible spatial smooth specs.
+///
+/// Eligible specs are Matérn (always has a length_scale) and hybrid Duchon
+/// (has `length_scale = Some(...)`).  Pure (scale-free) Duchon terms are
+/// skipped because they have no kappa to optimise.
+fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
+    for smooth in spec.smooth_terms.iter_mut() {
+        match &mut smooth.basis {
+            SmoothBasisSpec::Matern { feature_cols, spec: matern, .. } => {
+                if matern.aniso_log_scales.is_none() {
+                    let d = feature_cols.len();
+                    matern.aniso_log_scales = Some(vec![0.0; d]);
+                }
+            }
+            SmoothBasisSpec::Duchon { feature_cols, spec: duchon, .. } => {
+                // Only hybrid Duchon (has a length_scale) supports kappa optimisation.
+                if duchon.length_scale.is_some() && duchon.aniso_log_scales.is_none() {
+                    let d = feature_cols.len();
+                    duchon.aniso_log_scales = Some(vec![0.0; d]);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -10893,7 +10963,8 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                         },
-                    },
+                        input_scales: None,
+                        },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -10907,7 +10978,8 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                         },
-                    },
+                        input_scales: None,
+                        },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -10921,7 +10993,8 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                         },
-                    },
+                        input_scales: None,
+                        },
                     shape: ShapeConstraint::None,
                 },
             ],
@@ -10957,7 +11030,8 @@ mod tests {
                         include_intercept: false,
                         identifiability: gam::basis::MaternIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10983,7 +11057,8 @@ mod tests {
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },
-                    },
+                        input_scales: None,
+                        },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -10995,8 +11070,10 @@ mod tests {
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },
-                    },
-                    shape: ShapeConstraint::None,
+                        input_scales: None,
+                        },
+                        input_scales: None,
+                        },
                 },
             ],
         };
@@ -11033,7 +11110,8 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                     },
-                },
+                    input_scales: None,
+                    },
                 shape: ShapeConstraint::None,
             }],
         };
