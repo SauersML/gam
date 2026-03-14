@@ -613,7 +613,13 @@ impl<'a> BarrierDerivativeProvider<'a> {
 
 impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
-        let barrier_corr = self.barrier_correction(v_k);
+        // The trait convention passes vₖ = H⁻¹(Aₖβ̂), but the barrier
+        // third-derivative should be evaluated at the mode sensitivity
+        // direction β̂_ρk = −vₖ.  barrier_correction(u) computes
+        // D_β(B_ββ)[u] = −2τ u_j/gap³, so we negate vₖ to get:
+        //   D_β(B_ββ)[−vₖ] = +2τ vₖ_j/gap³.
+        let neg_v_k = v_k.mapv(|x| -x);
+        let barrier_corr = self.barrier_correction(&neg_v_k);
         match self.inner.hessian_derivative_correction(v_k) {
             Some(mut ic) => {
                 ic += &barrier_corr;

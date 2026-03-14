@@ -239,7 +239,7 @@ impl<'a> RemlState<'a> {
         // Needed for computing hat leverages and mode response projections.
         let x_eff_dense = if compute_gradient {
             if let Some(z) = free_basis_opt {
-                Some(std::sync::Arc::new(pirls_result.x_transformed.to_dense().dot(z)))
+                Some(Arc::new(pirls_result.x_transformed.to_dense().dot(z)))
             } else {
                 Some(pirls_result.x_transformed.to_dense_arc())
             }

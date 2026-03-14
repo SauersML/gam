@@ -7782,6 +7782,29 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             let op = implicit_op_arc.as_ref().unwrap();
             let x_first = op.materialize_first(a);
             let x_second = op.materialize_second_diag(a);
+            // Cross-validate implicit transpose_mul against materialized.
+            // This exercises the matrix-free path and catches any divergence.
+            let ones_n = Array1::from_elem(op.n_data(), 1.0);
+            let implicit_xt_ones = op.transpose_mul_second_diag(a, &ones_n.view());
+            let materialized_xt_ones = x_second.t().dot(&ones_n);
+            let matvec_dev = implicit_xt_ones.iter().zip(materialized_xt_ones.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                matvec_dev < 1e-8,
+                "implicit vs materialized second_diag mismatch: {matvec_dev:.4e}"
+            );
+            // Also validate forward_mul_second_diag.
+            let ones_p = Array1::from_elem(op.p_out(), 1.0);
+            let implicit_x_ones = op.forward_mul_second_diag(a, &ones_p.view());
+            let materialized_x_ones = x_second.dot(&ones_p);
+            let fwd_dev = implicit_x_ones.iter().zip(materialized_x_ones.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                fwd_dev < 1e-8,
+                "implicit vs materialized forward second_diag mismatch: {fwd_dev:.4e}"
+            );
         } else {
             let x_first = aniso_result.design_first[a].clone();
             let x_second = aniso_result.design_second_diag[a].clone();
@@ -7805,7 +7828,17 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         // For the implicit path, cross designs are computed on the fly, so we
         // skip pre-materialization.
         let cross_designs = if use_implicit {
-            Vec::new()
+            // Use the implicit operator's materialize_second_cross for cross-axis
+            // coupling matrices, avoiding the full t_proj * s_proj element-wise path.
+            let op = implicit_op_arc.as_ref().unwrap();
+            let mut cd = Vec::with_capacity(d - 1);
+            for b in 0..d {
+                if b == a {
+                    continue;
+                }
+                cd.push((b, op.materialize_second_cross(a, b)));
+            }
+            cd
         } else {
             let t_proj_ref = t_proj.unwrap();
             let s_proj_ref = s_proj.unwrap();
