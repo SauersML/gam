@@ -129,6 +129,16 @@ pub trait HessianOperator: Send + Sync {
 
     /// Full dimension of H.
     fn dim(&self) -> usize;
+
+    /// Whether this operator is backed by a dense factorization.
+    ///
+    /// Dense operators (eigendecomposition) have O(p²) trace cost per matrix,
+    /// making stochastic trace estimation worthwhile for large p.  Sparse
+    /// operators (Cholesky) have O(nnz) solve cost, so exact column-by-column
+    /// traces are already cheap and stochastic estimation is not needed.
+    fn is_dense(&self) -> bool {
+        false
+    }
 }
 
 /// Provider of family-specific Hessian derivative information.
@@ -812,6 +822,11 @@ pub struct InnerSolution<'dp> {
     /// M_i[u] = D_β B_i[u] callback for extended coordinates.
     /// Arguments: (ext_index, direction) → correction matrix.
     pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
+
+    /// Optional log-barrier configuration for monotonicity-constrained coefficients.
+    /// When present, the barrier cost and Hessian corrections are added to the
+    /// outer REML/LAML objective.
+    pub barrier_config: Option<BarrierConfig>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -839,6 +854,7 @@ pub struct InnerSolutionBuilder<'dp> {
     ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
+    barrier_config: Option<BarrierConfig>,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -873,6 +889,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
+            barrier_config: None,
         }
     }
 
@@ -934,6 +951,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    pub fn barrier_config(mut self, config: Option<BarrierConfig>) -> Self {
+        self.barrier_config = config;
+        self
+    }
+
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty roots.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
@@ -962,6 +984,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             ext_coord_pair_fn: self.ext_coord_pair_fn,
             rho_ext_pair_fn: self.rho_ext_pair_fn,
             fixed_drift_deriv: self.fixed_drift_deriv,
+            barrier_config: self.barrier_config,
         }
     }
 }
@@ -1095,10 +1118,20 @@ pub fn reml_laml_evaluate(
     };
 
     // Add prior.
-    let cost = match &prior_cost_gradient {
+    let mut cost = match &prior_cost_gradient {
         Some((pc, _, _)) => cost + pc,
         None => cost,
     };
+
+    // Add log-barrier cost for monotonicity-constrained coefficients.
+    if let Some(ref barrier_cfg) = solution.barrier_config {
+        match barrier_cfg.barrier_cost(&solution.beta) {
+            Ok(bc) => cost += bc,
+            Err(e) => {
+                log::warn!("Barrier cost skipped (infeasible): {e}");
+            }
+        }
+    }
 
     if !cost.is_finite() {
         return Err(format!(
@@ -2477,6 +2510,10 @@ impl HessianOperator for DenseSpectralOperator {
     fn dim(&self) -> usize {
         self.n_dim
     }
+
+    fn is_dense(&self) -> bool {
+        true
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2681,6 +2718,10 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn dim(&self) -> usize {
         self.inner.dim()
+    }
+
+    fn is_dense(&self) -> bool {
+        true
     }
 }
 

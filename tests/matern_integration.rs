@@ -1,8 +1,9 @@
 use gam::estimate::AdaptiveRegularizationOptions;
 use gam::{
-    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection,
-    predict_gam,
+    CenterStrategy, FitOptions, FittedTermCollectionWithSpec, LikelihoodFamily, MaternBasisSpec,
+    MaternIdentifiability, MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, fit_term_collection,
+    fit_term_collectionwith_spatial_length_scale_optimization, predict_gam,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -227,5 +228,169 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
     assert!(
         mse_model < 0.90 * mse_baseline,
         "exact adaptive Matérn integration fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Anisotropic Matérn test (3D)
+// ---------------------------------------------------------------------------
+
+/// Generate a 3D dataset where axis 0 carries strong signal, axis 1 carries
+/// mild signal, and axis 2 is pure noise.
+fn simulate_matern_aniso_3d(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let noise_dist = Normal::new(0.0, 0.12).expect("normal params must be valid");
+    let mut x = Array2::<f64>::zeros((n, 3));
+    let mut y = Array1::<f64>::zeros(n);
+    let mut y_true = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let x1 = rng.random_range(-2.0..2.0); // strong signal
+        let x2 = rng.random_range(-2.0..2.0); // mild signal
+        let x3 = rng.random_range(-2.0..2.0); // noise
+        x[[i, 0]] = x1;
+        x[[i, 1]] = x2;
+        x[[i, 2]] = x3;
+
+        let f = 1.0 * (-x1 * x1 / 2.0).exp()
+            + 0.3 * (std::f64::consts::PI * x2 * 0.5).sin();
+        y_true[i] = f;
+        y[i] = f + noise_dist.sample(&mut rng);
+    }
+
+    (x, y, y_true)
+}
+
+/// Fit a Matérn smooth on 3D data with aniso_log_scales enabled (Gaussian).
+/// Verifies the fit succeeds, coefficients are finite, and the resolved spec
+/// contains the correct aniso_log_scales dimension with sum-to-zero constraint.
+#[test]
+#[ignore]
+fn matern_3d_aniso_fits_successfully() {
+    let n = 700usize;
+    let d = 3usize;
+    let (x, y, y_true) = simulate_matern_aniso_3d(n, 20260314);
+
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "matern_3d_aniso".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: (0..d).collect(),
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
+                    length_scale: 1.0,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    // Sentinel zeros: will be replaced by knot-cloud initialization.
+                    aniso_log_scales: Some(vec![0.0; d]),
+                },
+            },
+            shape: ShapeConstraint::None,
+        }],
+    };
+
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+
+    let kappa_options = SpatialLengthScaleOptimizationOptions {
+        enabled: true,
+        max_outer_iter: 8,
+        rel_tol: 1e-5,
+        log_step: std::f64::consts::LN_2,
+        min_length_scale: 1e-2,
+        max_length_scale: 1e2,
+        allow_finite_difference_fallback: true,
+    };
+
+    let fitted: FittedTermCollectionWithSpec =
+        fit_term_collectionwith_spatial_length_scale_optimization(
+            x.view(),
+            y.clone(),
+            weights.clone(),
+            offset.clone(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                compute_inference: true,
+                max_iter: 60,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                adaptive_regularization: None,
+                penalty_shrinkage_floor: None,
+            },
+            &kappa_options,
+        )
+        .expect("anisotropic Matérn 3D fit should succeed");
+
+    // Coefficients must be finite.
+    assert!(fitted.fit.beta.iter().all(|v| v.is_finite()));
+    assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
+
+    // Extract the resolved aniso_log_scales from the fitted spec.
+    let resolved_term = &fitted.resolvedspec.smooth_terms[0];
+    let aniso = match &resolved_term.basis {
+        SmoothBasisSpec::Matern { spec, .. } => spec
+            .aniso_log_scales
+            .as_ref()
+            .expect("resolved spec should have aniso_log_scales after fitting"),
+        _ => panic!("expected Matérn basis in resolved spec"),
+    };
+
+    // Correct dimension.
+    assert_eq!(
+        aniso.len(),
+        d,
+        "aniso_log_scales should have {d} entries for {d}D smooth"
+    );
+
+    // Sum-to-zero constraint.
+    let eta_sum: f64 = aniso.iter().sum();
+    assert!(
+        eta_sum.abs() < 1e-6,
+        "aniso_log_scales should sum to zero (got {eta_sum:.6e})"
+    );
+
+    // All eta values must be finite.
+    assert!(
+        aniso.iter().all(|v| v.is_finite()),
+        "aniso_log_scales must contain finite values"
+    );
+
+    // Prediction quality check.
+    let pred = predict_gam(
+        fitted.design.design.view(),
+        fitted.fit.beta.view(),
+        offset.view(),
+        LikelihoodFamily::GaussianIdentity,
+    )
+    .expect("prediction on fitted aniso Matérn design should succeed");
+    assert!(pred.mean.iter().all(|v| v.is_finite()));
+
+    let mse_model = (&pred.mean - &y_true)
+        .mapv(|v| v * v)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+    let y_mean = y_true.mean().unwrap_or(0.0);
+    let mse_baseline = y_true
+        .iter()
+        .map(|&v| {
+            let d = v - y_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / (n as f64);
+
+    assert!(
+        mse_model < 0.50 * mse_baseline,
+        "aniso Matérn 3D fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
     );
 }

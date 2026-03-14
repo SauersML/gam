@@ -402,6 +402,12 @@ pub(crate) struct SpatialPsiDerivative {
     /// Pre-computed cross-derivative design matrices for other axes
     /// in the same aniso group: Vec of (axis_offset_in_group, matrix).
     pub aniso_cross_designs: Option<Vec<(usize, Array2<f64>)>>,
+    /// Pre-computed cross-penalty second derivatives ∂²S_m/∂ψ_a∂ψ_b for axes
+    /// in the same aniso group. Each entry is (b_axis, Vec<Array2<f64>>),
+    /// where b_axis is the axis offset within the group and the Vec has one
+    /// matrix per active penalty. Only stored for pairs where this entry's
+    /// axis a < b_axis (upper triangle); the symmetric pair is the transpose.
+    pub aniso_cross_penalties: Option<Vec<(usize, Vec<Array2<f64>>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -680,7 +686,7 @@ impl SpatialLogKappaCoords {
 }
 
 /// Get the `aniso_log_scales` from a spatial term, if present.
-fn get_spatial_aniso_log_scales(spec: &TermCollectionSpec, term_idx: usize) -> Option<Vec<f64>> {
+pub fn get_spatial_aniso_log_scales(spec: &TermCollectionSpec, term_idx: usize) -> Option<Vec<f64>> {
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
@@ -699,6 +705,44 @@ fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option
             SmoothBasisSpec::Duchon { feature_cols, .. } => Some(feature_cols.len()),
             _ => None,
         })
+}
+
+/// Log the learned per-axis anisotropic length scales for all spatial terms
+/// that have `aniso_log_scales` set after optimization.
+///
+/// For each anisotropic term, reports the per-axis eta values (deviation from
+/// the mean log-kappa), the effective per-axis length scales, and the per-axis
+/// kappa values.
+pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
+    for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
+        let (aniso, length_scale) = match &term.basis {
+            SmoothBasisSpec::Matern { spec, .. } => {
+                (spec.aniso_log_scales.as_ref(), Some(spec.length_scale))
+            }
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                (spec.aniso_log_scales.as_ref(), spec.length_scale)
+            }
+            _ => (None, None),
+        };
+        let Some(eta) = aniso else { continue };
+        if eta.is_empty() { continue; }
+        let Some(ls) = length_scale else { continue };
+        // psi_bar = -ln(length_scale), kappa_bar = 1/length_scale
+        // per-axis: kappa_a = kappa_bar * exp(eta_a), length_a = ls * exp(-eta_a)
+        let mut lines = format!(
+            "[spatial-kappa] term {} (\"{}\"): anisotropic length scales optimized (global length_scale={:.4})",
+            term_idx, term.name, ls
+        );
+        for (a, &eta_a) in eta.iter().enumerate() {
+            let length_a = ls * (-eta_a).exp();
+            let kappa_a = (1.0 / ls) * eta_a.exp();
+            lines.push_str(&format!(
+                "\n  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
+                a, eta_a, length_a, kappa_a
+            ));
+        }
+        log::info!("{}", lines);
+    }
 }
 
 /// Set `aniso_log_scales` on a spatial term's basis spec.
@@ -7580,6 +7624,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         s_psi_psi_components_local,
         aniso_group_id: None,
         aniso_cross_designs: None,
+        aniso_cross_penalties: None,
     }))
 }
 
@@ -7710,6 +7755,25 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             let cross = t_proj * &s_proj[a] * &s_proj[b];
             cross_designs.push((b, cross));
         }
+        // Build cross-penalty entries for this axis a.
+        // For each pair (a, b) with a < b in penalties_cross_pairs, store it
+        // under axis a with key b. For pairs (c, a) with c < a, store it
+        // under axis a with key c (the penalty is symmetric).
+        let mut cross_penalties = Vec::new();
+        for (cp_idx, &(pa, pb)) in aniso_result.penalties_cross_pairs.iter().enumerate() {
+            if pa == a {
+                cross_penalties.push((pb, aniso_result.penalties_cross[cp_idx].clone()));
+            } else if pb == a {
+                // Symmetric: ∂²S/∂ψ_b∂ψ_a = ∂²S/∂ψ_a∂ψ_b (penalty matrices are symmetric)
+                cross_penalties.push((pa, aniso_result.penalties_cross[cp_idx].clone()));
+            }
+        }
+        let cross_penalties_opt = if cross_penalties.is_empty() {
+            None
+        } else {
+            Some(cross_penalties)
+        };
+
         entries.push(SpatialPsiDerivative {
             penalty_index: penalty_indices[0],
             penalty_indices: penalty_indices.clone(),
@@ -7723,6 +7787,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             s_psi_psi_components_local: s_psi_psi_components,
             aniso_group_id: Some(aniso_group_id),
             aniso_cross_designs: Some(cross_designs),
+            aniso_cross_penalties: cross_penalties_opt,
         });
     }
     Ok(Some(entries))
@@ -7941,11 +8006,33 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
-        // Cross penalty second derivatives (∂²S/∂ψ_a∂ψ_b, a≠b) are None:
-        // the diagonal + rank-1 structure means the optimizer treats penalty
-        // contributions as axis-independent. The design cross-terms above
-        // capture the dominant coupling; penalty cross-terms add O(p²) cost
-        // for marginal accuracy improvement in the REML Hessian off-diagonals.
+        // Cross penalty second derivatives (∂²S/∂ψ_a∂ψ_b, a≠b).
+        if let Some(ref cross_penalties) = info.aniso_cross_penalties {
+            if let Some(gid) = info.aniso_group_id {
+                let base = info_list
+                    .iter()
+                    .position(|e| e.aniso_group_id == Some(gid))
+                    .unwrap_or(i);
+                for &(b_axis, ref cross_pens) in cross_penalties {
+                    let j = base + b_axis;
+                    if j < log_kappa_dim {
+                        let cross_components = info
+                            .penalty_indices
+                            .iter()
+                            .copied()
+                            .zip(cross_pens.iter().map(|local| {
+                                crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                                    local.clone(),
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                            }))
+                            .collect::<Vec<_>>();
+                        ssecond_components[j] = Some(cross_components);
+                    }
+                }
+            }
+        }
         hyper_dirs.push(DirectionalHyperParam::new_compact(
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
                 info.x_psi_local.clone(),
@@ -8405,7 +8492,7 @@ fn set_spatial_length_scale(
     }
 }
 
-pub(crate) fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
+pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
@@ -8688,6 +8775,8 @@ where
         best_fit = best_eval.fit;
     }
 
+    log_spatial_aniso_scales(&best_meanspec);
+    log_spatial_aniso_scales(&best_noisespec);
     Ok(TwoBlockSpatialLengthScaleOptimizationResult {
         resolved_meanspec: best_meanspec,
         resolved_noisespec: best_noisespec,
@@ -8948,6 +9037,8 @@ where
         &mean_design,
         &noise_design,
     )?;
+    log_spatial_aniso_scales(&resolved_meanspec);
+    log_spatial_aniso_scales(&resolved_noisespec);
     Ok(TwoBlockSpatialLengthScaleOptimizationResult {
         resolved_meanspec,
         resolved_noisespec,
@@ -9083,6 +9174,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         )? {
             let exact_score = fit_score(&exact_joint.fit);
             if exact_score <= initial_score + 1e-10 {
+                log_spatial_aniso_scales(&exact_joint.resolvedspec);
                 return Ok(exact_joint);
             }
             log::warn!(
@@ -9127,6 +9219,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         )?;
         let fallback_score = fit_score(&fallback.fit.fit);
         if fallback_score <= initial_score + 1e-10 {
+            log_spatial_aniso_scales(&fallback.resolvedspec);
             return Ok(FittedTermCollectionWithSpec {
                 fit: fallback.fit.fit,
                 design: fallback.design,
@@ -12416,6 +12509,59 @@ mod tests {
         assert!(
             err2 < 1e-8,
             "Duchon stiffness penalty mismatch too large: {err2}"
+        );
+    }
+
+    #[test]
+    fn spatial_adaptive_explicit_second_order_kind_matches_block_sparsity() {
+        let alpha_mass_0 = SpatialAdaptiveHyperSpec {
+            cache_index: 0,
+            kind: SpatialAdaptiveHyperKind::LogLambdaMagnitude,
+        };
+        let alpha_mass_1 = SpatialAdaptiveHyperSpec {
+            cache_index: 1,
+            kind: SpatialAdaptiveHyperKind::LogLambdaMagnitude,
+        };
+        let alpha_grad_0 = SpatialAdaptiveHyperSpec {
+            cache_index: 0,
+            kind: SpatialAdaptiveHyperKind::LogLambdaGradient,
+        };
+        let eta_mass = SpatialAdaptiveHyperSpec {
+            cache_index: 0,
+            kind: SpatialAdaptiveHyperKind::LogEpsilonMagnitude,
+        };
+        let eta_grad = SpatialAdaptiveHyperSpec {
+            cache_index: 0,
+            kind: SpatialAdaptiveHyperKind::LogEpsilonGradient,
+        };
+
+        assert_eq!(
+            alpha_mass_0.explicit_second_order_kind(alpha_mass_0),
+            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaAlpha
+        );
+        assert_eq!(
+            alpha_mass_0.explicit_second_order_kind(alpha_mass_1),
+            SpatialAdaptiveExplicitSecondOrderKind::StructuralZero
+        );
+        assert_eq!(
+            alpha_mass_0.explicit_second_order_kind(alpha_grad_0),
+            SpatialAdaptiveExplicitSecondOrderKind::StructuralZero
+        );
+        assert_eq!(
+            alpha_mass_1.explicit_second_order_kind(eta_mass),
+            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaEta
+        );
+        assert_eq!(
+            eta_mass.explicit_second_order_kind(alpha_mass_1),
+            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaEta
+        );
+        assert_eq!(
+            eta_mass.explicit_second_order_kind(eta_mass),
+            SpatialAdaptiveExplicitSecondOrderKind::SharedEtaEta
+        );
+        assert_eq!(
+            eta_mass.explicit_second_order_kind(eta_grad),
+            SpatialAdaptiveExplicitSecondOrderKind::StructuralZero
         );
     }
 

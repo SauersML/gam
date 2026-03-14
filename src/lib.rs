@@ -106,5 +106,7 @@ pub use terms::smooth::{
     fit_term_collectionwith_matern_kappa_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization, optimize_two_block_matern_kappa,
     optimize_two_block_spatial_length_scale,
+    get_spatial_aniso_log_scales, get_spatial_length_scale,
+    log_spatial_aniso_scales,
 };
 pub use types::{LikelihoodFamily, LinkFunction};
