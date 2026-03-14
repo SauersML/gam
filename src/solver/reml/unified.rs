@@ -737,6 +737,14 @@ pub trait HyperOperator: Send + Sync {
 
     /// Whether this operator uses implicit (non-materialized) storage.
     fn is_implicit(&self) -> bool;
+
+    /// Downcast to `ImplicitHyperOperator` if this is one.
+    ///
+    /// Returns `Some` for implicit operators that use the weighted-Gram
+    /// structure (A_d = X^T C_d X + P_d), `None` for dense wrappers.
+    fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
+        None
+    }
 }
 
 /// Dense wrapper: wraps an existing (p × p) matrix as a `HyperOperator`.
@@ -824,6 +832,90 @@ impl HyperOperator for ImplicitHyperOperator {
 
     fn is_implicit(&self) -> bool {
         true
+    }
+
+    fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
+        Some(self)
+    }
+}
+
+impl ImplicitHyperOperator {
+    /// Compute the design-part bilinear form u^T (X^T C_d X) z using precomputed
+    /// shared X-multiplies, avoiding the full B_d matvec.
+    ///
+    /// The design part of B_d is:
+    ///   (∂X/∂ψ_d)^T W X + X^T W (∂X/∂ψ_d)
+    ///
+    /// For vectors z and u, the bilinear form u^T [design_part] z equals:
+    ///   ((∂X/∂ψ_d) u)^T (W (Xz)) + (Xu)^T (W ((∂X/∂ψ_d) z))
+    ///   = 2 * (w ⊙ y_vec)^T dx_z       [when u = u, z = z]
+    ///
+    /// where y_vec = X u, dx_z = (∂X/∂ψ_d) z.
+    ///
+    /// But the full bilinear form is NOT symmetric in its dependence on z vs u
+    /// through the design derivative, so we compute both cross-terms:
+    ///   dx_z^T (w ⊙ y_vec) + dx_u^T (w ⊙ x_vec)
+    ///
+    /// # Arguments
+    /// - `x_vec`: X z (precomputed, shared across axes)
+    /// - `y_vec`: X u (precomputed, shared across axes)
+    /// - `z`: the probe vector (needed for forward_mul and penalty)
+    /// - `u`: H⁻¹ z (needed for forward_mul and penalty)
+    ///
+    /// # Returns
+    /// The full bilinear form u^T B_d z = design_part + penalty_part.
+    pub fn bilinear_with_shared_x(
+        &self,
+        x_vec: &Array1<f64>,
+        y_vec: &Array1<f64>,
+        z: &Array1<f64>,
+        u: &Array1<f64>,
+    ) -> f64 {
+        // Design part: dx_z^T (w ⊙ y_vec) + dx_u^T (w ⊙ x_vec)
+        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view());
+        let dx_u = self.implicit_deriv.forward_mul(self.axis, &u.view());
+
+        let mut design = 0.0f64;
+        let w = &*self.w_diag;
+        for i in 0..x_vec.len() {
+            let wi = w[i];
+            design += dx_z[i] * wi * y_vec[i];
+            design += dx_u[i] * wi * x_vec[i];
+        }
+
+        // Penalty part: u^T S_psi z
+        let penalty = u.dot(&self.s_psi.dot(z));
+
+        design + penalty
+    }
+
+    /// Compute the design-part contribution to A_d z without the X^T step.
+    ///
+    /// Returns the n-vector C_d (X z) where C_d encodes the diagonal weighting.
+    /// Specifically: (∂X/∂ψ_d)^T maps FROM n-space, but for stochastic trace
+    /// estimation we need q_d = A_d z = X^T (C_d x_vec) + P_d z.
+    ///
+    /// This method computes q_d = A_d z using the shared x_vec = X z:
+    ///   q_d = (∂X/∂ψ_d)^T (W (X z)) + X^T (W ((∂X/∂ψ_d) z)) + S_psi z
+    /// which is the standard mul_vec but we can share x_vec across axes.
+    pub fn matvec_with_shared_xz(
+        &self,
+        x_vec: &Array1<f64>,
+        z: &Array1<f64>,
+    ) -> Array1<f64> {
+        // Term 1: (∂X/∂ψ_d)^T (W · x_vec)
+        let w_x_vec = &*self.w_diag * x_vec;
+        let term1 = self.implicit_deriv.transpose_mul(self.axis, &w_x_vec.view());
+
+        // Term 2: X^T (W · ((∂X/∂ψ_d) · z))
+        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view());
+        let w_dx_z = &*self.w_diag * &dx_z;
+        let term2 = self.x_dense.t().dot(&w_dx_z);
+
+        // Term 3: S_{ψ_d} · z
+        let term3 = self.s_psi.dot(z);
+
+        term1 + term2 + term3
     }
 }
 
@@ -1344,8 +1436,9 @@ pub fn reml_laml_evaluate(
 
         if any_implicit {
             // Mixed path: some ext coordinates use implicit operators.
-            // Collect dense matrices (rho + dense ext) and implicit operators separately,
-            // then use estimate_traces_with_operators for a single-pass estimation.
+            // Use the structural estimator that exploits the weighted-Gram
+            // structure A_d = X^T C_d X + P_d, sharing one H⁻¹ solve and
+            // two X multiplies per probe across all D axes.
             let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
 
             // rho-coordinates: always dense.
@@ -1372,11 +1465,23 @@ pub fn reml_laml_evaluate(
             //
             // Output layout: [rho_0..rho_k, dense_ext_0.., implicit_ext_0..]
             let mut ext_is_implicit = Vec::with_capacity(ext_dim);
-            let mut implicit_ops: Vec<&dyn HyperOperator> = Vec::new();
+            let mut implicit_ops: Vec<&ImplicitHyperOperator> = Vec::new();
             for coord in solution.ext_coords.iter() {
                 if let Some(ref op) = coord.b_operator {
-                    ext_is_implicit.push(true);
-                    implicit_ops.push(op.as_ref());
+                    if let Some(imp) = op.as_implicit() {
+                        ext_is_implicit.push(true);
+                        implicit_ops.push(imp);
+                    } else {
+                        ext_is_implicit.push(false);
+                        let mut h_i = op.to_dense();
+                        if effective_deriv.has_corrections() {
+                            let v_i = hop.solve(&coord.g);
+                            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                                h_i += &corr;
+                            }
+                        }
+                        dense_matrices.push(h_i);
+                    }
                 } else {
                     ext_is_implicit.push(false);
                     let mut h_i = coord.b_mat.clone();
@@ -1392,7 +1497,7 @@ pub fn reml_laml_evaluate(
 
             let estimator = StochasticTraceEstimator::with_defaults();
             let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
-            let raw_traces = estimator.estimate_traces_with_operators(
+            let raw_traces = estimator.estimate_traces_structural(
                 hop,
                 &dense_refs,
                 &implicit_ops,
@@ -1843,12 +1948,34 @@ fn compute_outer_hessian(
 
     // ── ext precomputation ──
 
+    // Check if any ext coordinate uses implicit operators and if the problem
+    // is large enough to warrant stochastic cross-traces instead of
+    // materializing p x p Hessian drift matrices.
+    let any_ext_implicit = solution.ext_coords.iter().any(|c| {
+        c.b_operator.as_ref().map_or(false, |op| op.is_implicit())
+    });
+    let total_p = hop.dim();
+    let use_stochastic_cross_traces =
+        any_ext_implicit && total_p > 500 && hop.is_dense() && incl_logdet_h;
+
     // Precompute ext mode responses and total Hessian drifts.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_matrices: Vec<Array2<f64>> = Vec::with_capacity(ext_dim);
 
     for coord in solution.ext_coords.iter() {
         let v_i = hop.solve(&coord.g);
+
+        if use_stochastic_cross_traces {
+            if let Some(ref op) = coord.b_operator {
+                if op.is_implicit() {
+                    // Skip dense materialization: stochastic cross-traces
+                    // will use the implicit operator directly.
+                    ext_v.push(v_i);
+                    ext_h_matrices.push(Array2::zeros((0, 0)));
+                    continue;
+                }
+            }
+        }
 
         // Materialize the Hessian drift matrix. When an implicit operator is
         // present and b_mat is a zero-sized placeholder, fall back to dense
@@ -1867,6 +1994,81 @@ fn compute_outer_hessian(
         ext_v.push(v_i);
         ext_h_matrices.push(h_i);
     }
+
+    // ── Stochastic second-order cross-trace precomputation ──
+    //
+    // When implicit operators are present and the problem is large, compute
+    // the full (total x total) cross-trace matrix
+    //   cross[d,e] = tr(H^{-1} Hd H^{-1} He)
+    // stochastically using the CORRECT estimator:
+    //   u = H^{-1} z,  q_e = A_e z,  r_e = H^{-1} q_e,  estimate = u^T A_d r_e
+    //
+    // This avoids materializing the (p x p) Hessian drift matrices for
+    // implicit operators, and uses the correct tr(H^{-1} A_d H^{-1} A_e)
+    // formula rather than the WRONG tr(A_d H^{-2} A_e).
+    //
+    // NOTE: The sign convention here gives +tr(H^{-1} Hd H^{-1} He).
+    // The outer Hessian uses -tr(H^{-1} Hj H^{-1} Hi) = -(this value).
+    let stochastic_cross_traces: Option<Array2<f64>> = if use_stochastic_cross_traces {
+        let total_coords = k + ext_dim;
+        let mut dense_mats: Vec<Array2<f64>> = Vec::new();
+        let mut coord_is_implicit: Vec<bool> = Vec::with_capacity(total_coords);
+        let mut impl_ops: Vec<&ImplicitHyperOperator> = Vec::new();
+
+        // rho coordinates: always dense.
+        for idx in 0..k {
+            dense_mats.push(h_k_matrices[idx].clone());
+            coord_is_implicit.push(false);
+        }
+
+        // ext coordinates: dense or implicit.
+        for (ei, coord) in solution.ext_coords.iter().enumerate() {
+            if let Some(ref op) = coord.b_operator {
+                if let Some(imp) = op.as_implicit() {
+                    coord_is_implicit.push(true);
+                    impl_ops.push(imp);
+                    continue;
+                }
+            }
+            // Dense ext: use already-materialized matrix.
+            dense_mats.push(ext_h_matrices[ei].clone());
+            coord_is_implicit.push(false);
+        }
+
+        let estimator = StochasticTraceEstimator::with_defaults();
+        let dense_refs: Vec<&Array2<f64>> = dense_mats.iter().collect();
+        let raw_cross = estimator.estimate_second_order_traces(
+            hop,
+            &dense_refs,
+            &impl_ops,
+        );
+
+        // Re-map from [dense_0..N, implicit_0..M] to [rho_0..k, ext_0..D].
+        let n_dense_total = coord_is_implicit.iter().filter(|&&b| !b).count();
+        let mut original_to_raw: Vec<usize> = Vec::with_capacity(total_coords);
+        let mut dense_cursor = 0usize;
+        let mut impl_cursor = n_dense_total;
+        for &is_impl in &coord_is_implicit {
+            if is_impl {
+                original_to_raw.push(impl_cursor);
+                impl_cursor += 1;
+            } else {
+                original_to_raw.push(dense_cursor);
+                dense_cursor += 1;
+            }
+        }
+
+        let mut mapped = Array2::zeros((total_coords, total_coords));
+        for i in 0..total_coords {
+            for j in 0..total_coords {
+                mapped[[i, j]] = raw_cross[[original_to_raw[i], original_to_raw[j]]];
+            }
+        }
+
+        Some(mapped)
+    } else {
+        None
+    };
 
     // ── ρ-ρ block ──
 
@@ -1891,7 +2093,16 @@ fn compute_outer_hessian(
             //
             // The Γ-cross term uses the spectral divided-difference kernel
             // (replacing the standard -tr(H⁻¹ Ḣ_l H⁻¹ Ḣ_k) for non-spectral backends).
-            let cross_trace = hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll]);
+            //
+            // When stochastic cross-traces are available, use the precomputed
+            // matrix (which uses the CORRECT estimator for tr(H⁻¹ A_d H⁻¹ A_e)).
+            let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
+                // Stochastic cross-trace gives +tr(H⁻¹ Hk H⁻¹ Hl).
+                // The outer Hessian needs -tr(...), matching trace_logdet_hessian_cross.
+                -sct[[kk, ll]]
+            } else {
+                hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
+            };
 
             // tr(G_ε Ḧ_{kl}): computed via the deriv_provider.
             //
@@ -1998,17 +2209,37 @@ fn compute_outer_hessian(
                 };
 
                 let l_term = if incl_logdet_h {
-                    // Γ-cross term via spectral divided-difference kernel
-                    // (replaces standard -tr(H⁻¹ Ḣ_ext H⁻¹ Ḣ_rho) for spectral backends).
-                    let cross_trace = hop.trace_logdet_hessian_cross(
-                        &h_k_matrices[rho_idx],
-                        &ext_h_matrices[ext_idx],
-                    );
+                    // Cross term: -tr(H⁻¹ Ḣ_ext H⁻¹ Ḣ_rho).
+                    // Use stochastic precomputed matrix when available,
+                    // otherwise fall back to exact spectral computation.
+                    let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
+                        -sct[[rho_idx, k + ext_idx]]
+                    } else {
+                        hop.trace_logdet_hessian_cross(
+                            &h_k_matrices[rho_idx],
+                            &ext_h_matrices[ext_idx],
+                        )
+                    };
 
                     // β_{ρ,ext} = H⁻¹(−g_{ρ,ext} + B_ρ v_ext + B_ext v_ρ − C[v_ext] v_ρ)
                     //           = H⁻¹(−g_{ρ,ext} + A_ρ v_ext + Ḣ_ext v_ρ)
                     // where Ḣ_ext = B_ext + C[β_ext] already encodes the −C[v_ext] v_ρ.
-                    let mut rhs = ext_h_matrices[ext_idx].dot(&v_ks[rho_idx]);
+                    //
+                    // When using stochastic cross-traces, ext_h_matrices[ext_idx]
+                    // may be a zero-sized placeholder. Use the implicit operator
+                    // for the matvec when needed.
+                    let ext_h_v_rho = if ext_h_matrices[ext_idx].nrows() == 0 {
+                        // Implicit operator path.
+                        let coord = &solution.ext_coords[ext_idx];
+                        if let Some(ref op) = coord.b_operator {
+                            op.mul_vec(&v_ks[rho_idx])
+                        } else {
+                            coord.b_mat.dot(&v_ks[rho_idx])
+                        }
+                    } else {
+                        ext_h_matrices[ext_idx].dot(&v_ks[rho_idx])
+                    };
+                    let mut rhs = ext_h_v_rho;
                     rhs += &a_k_matrices[rho_idx].dot(&ext_v[ext_idx]);
                     rhs -= &pair.g;
 
@@ -2088,18 +2319,30 @@ fn compute_outer_hessian(
                 };
 
                 let l_term = if incl_logdet_h {
-                    // Γ-cross term via spectral divided-difference kernel.
-                    let cross_trace =
-                        hop.trace_logdet_hessian_cross(&ext_h_matrices[ii], &ext_h_matrices[jj]);
+                    // Cross term: -tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i).
+                    // Use stochastic precomputed matrix when available.
+                    let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
+                        -sct[[k + ii, k + jj]]
+                    } else {
+                        hop.trace_logdet_hessian_cross(&ext_h_matrices[ii], &ext_h_matrices[jj])
+                    };
 
-                    // β_{ij} = H⁻¹(−g_ij + B_i v_j + B_j v_i − C[v_j] v_i)
-                    //        = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
-                    // where Ḣ_j = B_j + C[β_j] already encodes the −C[v_j] v_i term.
-                    let mut rhs = ext_h_matrices[jj].dot(&ext_v[ii]);
-                    // Use the implicit operator for B_i · v_j when available,
-                    // otherwise fall back to the dense b_mat.
-                    let bi_vj = if coord_i.b_operator.is_some() && coord_i.b_mat.nrows() == 0 {
-                        coord_i.b_operator.as_ref().unwrap().mul_vec(&ext_v[jj])
+                    // β_{ij} = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
+                    // When stochastic cross-traces are active, ext_h_matrices may
+                    // be zero-sized placeholders. Use implicit operators directly.
+                    let hj_vi = if ext_h_matrices[jj].nrows() == 0 {
+                        if let Some(ref op) = coord_j.b_operator {
+                            op.mul_vec(&ext_v[ii])
+                        } else {
+                            coord_j.b_mat.dot(&ext_v[ii])
+                        }
+                    } else {
+                        ext_h_matrices[jj].dot(&ext_v[ii])
+                    };
+                    let mut rhs = hj_vi;
+                    // Use the implicit operator for B_i · v_j when available.
+                    let bi_vj = if let Some(ref op) = coord_i.b_operator {
+                        op.mul_vec(&ext_v[jj])
                     } else {
                         coord_i.b_mat.dot(&ext_v[jj])
                     };
@@ -3530,6 +3773,292 @@ impl StochasticTraceEstimator {
         }
 
         means
+    }
+
+    /// Estimate first-order traces `tr(H⁻¹ A_d)` for implicit operators using the
+    /// weighted-Gram structure, sharing one H⁻¹ solve and two X multiplies per probe.
+    ///
+    /// For each implicit operator d, the bilinear form `u^T A_d z` is computed using
+    /// shared `x_vec = X z` and `y_vec = X u`, plus per-axis `forward_mul` calls.
+    /// This avoids the X^T multiply per axis that the standard `mul_vec` requires.
+    ///
+    /// Dense matrices are handled alongside implicit operators in a single pass.
+    ///
+    /// # Arguments
+    /// - `hop`: the Hessian operator providing `solve(rhs)`.
+    /// - `dense_matrices`: dense A_k matrices.
+    /// - `implicit_ops`: implicit `ImplicitHyperOperator` trait objects.
+    ///
+    /// # Returns
+    /// Estimated traces: first for dense matrices, then for implicit operators.
+    pub fn estimate_traces_structural(
+        &self,
+        hop: &dyn HessianOperator,
+        dense_matrices: &[&Array2<f64>],
+        implicit_ops: &[&ImplicitHyperOperator],
+    ) -> Vec<f64> {
+        let n_dense = dense_matrices.len();
+        let n_ops = implicit_ops.len();
+        let n_coords = n_dense + n_ops;
+        if n_coords == 0 {
+            return Vec::new();
+        }
+
+        let p = hop.dim();
+        if p == 0 {
+            return vec![0.0; n_coords];
+        }
+
+        let mut means = vec![0.0_f64; n_coords];
+        let mut m2s = vec![0.0_f64; n_coords];
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let check_interval = 4;
+
+        // Get the shared X reference from the first implicit operator (all share the same X).
+        let x_dense = if n_ops > 0 {
+            Some(implicit_ops[0].x_dense.clone())
+        } else {
+            None
+        };
+
+        for m in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+
+            // ONE shared solve: u = H⁻¹ z
+            let u = hop.solve(&z);
+
+            // Shared X multiplies (only needed when implicit operators present).
+            let (x_vec, y_vec) = if let Some(ref x) = x_dense {
+                (x.dot(&z), x.dot(&u))
+            } else {
+                (Array1::zeros(0), Array1::zeros(0))
+            };
+
+            // Dense matrices: standard estimator.
+            for k in 0..n_dense {
+                let a_w = dense_matrices[k].dot(&u);
+                let q_k = z.dot(&a_w);
+                let count = (m + 1) as f64;
+                let delta = q_k - means[k];
+                means[k] += delta / count;
+                let delta2 = q_k - means[k];
+                m2s[k] += delta * delta2;
+            }
+
+            // Implicit operators: exploit shared X multiplies.
+            for (oi, op) in implicit_ops.iter().enumerate() {
+                let k = n_dense + oi;
+                let q_k = op.bilinear_with_shared_x(&x_vec, &y_vec, &z, &u);
+                let count = (m + 1) as f64;
+                let delta = q_k - means[k];
+                means[k] += delta / count;
+                let delta2 = q_k - means[k];
+                m2s[k] += delta * delta2;
+            }
+
+            let n_done = m + 1;
+            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+                if self.check_convergence(n_done, &means, &m2s) {
+                    break;
+                }
+            }
+        }
+
+        means
+    }
+
+    /// Estimate the full D×D matrix of second-order traces `tr(H⁻¹ A_d H⁻¹ A_e)`
+    /// for implicit operators, using the CORRECT estimator.
+    ///
+    /// The correct Girard-Hutchinson estimator for `tr(H⁻¹ A_d H⁻¹ A_e)` is:
+    ///
+    /// ```text
+    /// u = H⁻¹ z
+    /// q_e = A_e z        for each axis e
+    /// r_e = H⁻¹ q_e      for each axis e  (block solve, D RHS)
+    /// estimate = u^T A_d r_e
+    /// ```
+    ///
+    /// This gives tr(H⁻¹ A_d H⁻¹ A_e) correctly, NOT tr(A_d H⁻² A_e).
+    ///
+    /// Dense matrices are included alongside implicit operators. The output
+    /// is a (total × total) matrix of cross-traces, symmetrized.
+    ///
+    /// # Arguments
+    /// - `hop`: the Hessian operator providing `solve` and `solve_multi`.
+    /// - `dense_matrices`: dense A_k matrices.
+    /// - `implicit_ops`: implicit `ImplicitHyperOperator` trait objects.
+    ///
+    /// # Returns
+    /// Estimated D×D matrix of `tr(H⁻¹ A_d H⁻¹ A_e)` values, symmetrized.
+    #[allow(dead_code)]
+    pub fn estimate_second_order_traces(
+        &self,
+        hop: &dyn HessianOperator,
+        dense_matrices: &[&Array2<f64>],
+        implicit_ops: &[&ImplicitHyperOperator],
+    ) -> Array2<f64> {
+        let n_dense = dense_matrices.len();
+        let n_ops = implicit_ops.len();
+        let total = n_dense + n_ops;
+        if total == 0 {
+            return Array2::zeros((0, 0));
+        }
+
+        let p = hop.dim();
+        if p == 0 {
+            return Array2::zeros((total, total));
+        }
+
+        let mut t_sum = Array2::zeros((total, total));
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+
+        // Get the shared X reference from the first implicit operator.
+        let x_dense = if n_ops > 0 {
+            Some(implicit_ops[0].x_dense.clone())
+        } else {
+            None
+        };
+
+        for _ in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+
+            // Step 1: u = H⁻¹ z (shared solve)
+            let u = hop.solve(&z);
+
+            // Shared X multiplies for implicit operators.
+            let x_vec = if let Some(ref x) = x_dense {
+                x.dot(&z)
+            } else {
+                Array1::zeros(0)
+            };
+
+            // Step 2: Form q_e = A_e z for all axes e.
+            // For dense: q_e = dense_matrix * z
+            // For implicit: q_e = op.matvec_with_shared_xz(&x_vec, &z)
+            let mut q_columns = Array2::zeros((p, total));
+            for e in 0..n_dense {
+                let q_e = dense_matrices[e].dot(&z);
+                q_columns.column_mut(e).assign(&q_e);
+            }
+            for (oi, op) in implicit_ops.iter().enumerate() {
+                let e = n_dense + oi;
+                let q_e = op.matvec_with_shared_xz(&x_vec, &z);
+                q_columns.column_mut(e).assign(&q_e);
+            }
+
+            // Step 3: R = H⁻¹ [q_1, ..., q_D] (block solve, total RHS)
+            let r = hop.solve_multi(&q_columns);
+
+            // Step 4: Compute T[d, e] = u^T A_d r_e for all (d, e) pairs.
+            // For dense A_d: T[d, e] = (A_d^T u)^T r_e = (A_d u)^T r_e (A_d symmetric)
+            // For implicit A_d: use bilinear_with_shared_x or direct bilinear.
+
+            // Precompute X u and X r_e for implicit operators.
+            let y_vec = if let Some(ref x) = x_dense {
+                x.dot(&u)
+            } else {
+                Array1::zeros(0)
+            };
+
+            // For dense operators, precompute A_d u once.
+            let mut dense_a_u: Vec<Array1<f64>> = Vec::with_capacity(n_dense);
+            for d in 0..n_dense {
+                dense_a_u.push(dense_matrices[d].dot(&u));
+            }
+
+            // Precompute X r_e for all axes e (for implicit operators).
+            let x_r = if let Some(ref x) = x_dense {
+                // X * R: (n × total)
+                x.dot(&r)
+            } else {
+                Array2::zeros((0, total))
+            };
+
+            // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
+            let implicit_dx_u: Vec<Array1<f64>> = implicit_ops.iter().map(|op| {
+                op.implicit_deriv.forward_mul(op.axis, &u.view())
+            }).collect();
+
+            // Precompute u^T S_psi for each implicit axis (for penalty dot products).
+            let implicit_u_s: Vec<Array1<f64>> = implicit_ops.iter().map(|op| {
+                op.s_psi.t().dot(&u)
+            }).collect();
+
+            for d in 0..total {
+                for e in d..total {
+                    let r_e = r.column(e);
+
+                    let val = if d < n_dense {
+                        // Dense A_d: u^T A_d r_e = (A_d u)^T r_e
+                        dense_a_u[d].dot(&r_e)
+                    } else {
+                        // Implicit A_d: compute u^T A_d r_e using shared X multiplies.
+                        // u^T A_d r_e = ((∂X/∂ψ_d)u)^T (W X r_e) + (Xu)^T (W (∂X/∂ψ_d) r_e)
+                        //             + u^T S_psi r_e
+                        let oi = d - n_dense;
+                        let op = &implicit_ops[oi];
+                        let x_re = x_r.column(e);
+
+                        let dx_u = &implicit_dx_u[oi];
+                        let r_e_owned = r_e.to_owned();
+                        let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e_owned.view());
+
+                        let w = &*op.w_diag;
+                        let mut design_val = 0.0f64;
+                        for i in 0..w.len() {
+                            let wi = w[i];
+                            design_val += dx_u[i] * wi * x_re[i];
+                            design_val += y_vec[i] * wi * dx_re[i];
+                        }
+
+                        // Penalty: u^T S_psi r_e = (S_psi^T u)^T r_e
+                        let penalty_val = implicit_u_s[oi].dot(&r_e);
+
+                        design_val + penalty_val
+                    };
+
+                    t_sum[[d, e]] += val;
+                    if d != e {
+                        // For the symmetric entry, compute u^T A_e r_d
+                        let r_d = r.column(d);
+
+                        let val_sym = if e < n_dense {
+                            dense_a_u[e].dot(&r_d)
+                        } else {
+                            let oi = e - n_dense;
+                            let op = &implicit_ops[oi];
+                            let x_rd = x_r.column(d);
+
+                            let dx_u = &implicit_dx_u[oi];
+                            let r_d_owned = r_d.to_owned();
+                            let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d_owned.view());
+
+                            let w = &*op.w_diag;
+                            let mut design_val = 0.0f64;
+                            for i in 0..w.len() {
+                                let wi = w[i];
+                                design_val += dx_u[i] * wi * x_rd[i];
+                                design_val += y_vec[i] * wi * dx_rd[i];
+                            }
+
+                            let penalty_val = implicit_u_s[oi].dot(&r_d);
+                            design_val + penalty_val
+                        };
+
+                        t_sum[[e, d]] += val_sym;
+                    }
+                }
+            }
+        }
+
+        // Average over probes and symmetrize.
+        let n_probes = self.config.n_probes_max as f64;
+        t_sum /= n_probes;
+
+        // Symmetrize: T = (T + T^T) / 2
+        let t_sym = (&t_sum + &t_sum.t()) / 2.0;
+        t_sym
     }
 
     /// Check the adaptive stopping criterion.
