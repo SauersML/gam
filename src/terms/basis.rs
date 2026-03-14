@@ -3364,6 +3364,202 @@ fn build_matern_operator_penalty_aniso_derivatives(
     Ok(per_axis_results)
 }
 
+/// Build exact per-axis η_a derivatives of operator penalty matrices for
+/// anisotropic hybrid Duchon terms.
+///
+/// Analogous to [`build_matern_operator_penalty_aniso_derivatives`] but for
+/// the Duchon kernel.  Uses `duchon_radial_jets` for (φ, q, t) and central
+/// finite differences on t for dt_dr (since the partial-fraction assembly
+/// does not yet expose an analytic third R-operator scalar).
+///
+/// The formulas are identical to the Matérn case (y-space operators):
+///   ∂D₀/∂η_a = q · s_a
+///   ∂D₁/∂η_a = t · s_a · h_b       (for each gradient component b)
+///   ∂D₂/∂η_a = [(d+2)·t + dt_dr·r] · s_a
+fn build_duchon_operator_penalty_aniso_derivatives(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: &[f64],
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<Vec<(Vec<Array2<f64>>, Vec<Array2<f64>>)>, BasisError> {
+    let p = centers.nrows();
+    let d = centers.ncols();
+    let dim = aniso_log_scales.len();
+    assert_eq!(dim, d);
+
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let s_order = power;
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+
+    let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    let z_cols = z_kernel.ncols();
+
+    // Raw operator matrices and their per-axis derivatives (in kernel-Z space).
+    let mut d0_raw = Array2::<f64>::zeros((p, z_cols));
+    let mut d1_raw = Array2::<f64>::zeros((p * d, z_cols));
+    let mut d2_raw = Array2::<f64>::zeros((p, z_cols));
+    let mut d0_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, z_cols))).collect();
+    let mut d1_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p * d, z_cols))).collect();
+    let mut d2_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, z_cols))).collect();
+    let mut d0_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, z_cols))).collect();
+    let mut d1_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p * d, z_cols))).collect();
+    let mut d2_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, z_cols))).collect();
+
+    let d_f64 = d as f64;
+
+    for k in 0..p {
+        for j in 0..p {
+            let ci: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
+            let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+            let (r, s_vec) = aniso_distance_and_components(&ci, &cj, aniso_log_scales);
+
+            // Get (φ, q, t) from Duchon jets.
+            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, d, &coeffs)?;
+            let phi = jets.phi;
+            let q = jets.q;
+            let t = jets.t;
+
+            // dt_dr via central FD on t: evaluate jets at r±h, extract t.
+            let (dt_dr, d2t_dr2) = if r > 1e-10 {
+                let h = 1e-5 * r.max(1e-8);
+                let jets_plus = duchon_radial_jets(r + h, length_scale, p_order, s_order, d, &coeffs)?;
+                let jets_minus = duchon_radial_jets((r - h).max(1e-300), length_scale, p_order, s_order, d, &coeffs)?;
+                let dt = (jets_plus.t - jets_minus.t) / (2.0 * h);
+                let d2t = (jets_plus.t - 2.0 * t + jets_minus.t) / (h * h);
+                (dt, d2t)
+            } else {
+                (0.0, 0.0) // At collision, all products with s_a vanish.
+            };
+
+            // D₀, D₂ values.
+            let lap = if r < 1e-14 {
+                d_f64 * q // At collision: Δφ(0) = d·φ''(0) = d·q(0)
+            } else {
+                q + t * r * r + (d_f64 - 1.0) * q // φ'' + (d-1)·q = d·q + t·r²
+            };
+
+            // Fill raw operator matrices (projected through Z_kernel).
+            for col in 0..z_cols {
+                let z_jc = z_kernel[[j, col]];
+                d0_raw[[k, col]] += phi * z_jc;
+
+                // D₁: gradient components
+                for b in 0..d {
+                    let h_b = ci[b] - cj[b];
+                    d1_raw[[k * d + b, col]] += q * h_b * z_jc;
+                }
+
+                d2_raw[[k, col]] += lap * z_jc;
+
+                // Per-axis η_a derivatives.
+                for a in 0..dim {
+                    let s_a = s_vec[a];
+
+                    d0_raw_eta[a][[k, col]] += q * s_a * z_jc;
+                    d0_raw_eta2[a][[k, col]] += (t * s_a * s_a + 2.0 * q * s_a) * z_jc;
+
+                    for b in 0..d {
+                        let h_b = ci[b] - cj[b];
+                        let row = k * d + b;
+                        d1_raw_eta[a][[row, col]] += t * s_a * h_b * z_jc;
+                        let d1_eta2_val = if r > 1e-14 {
+                            (dt_dr * s_a * s_a / r + 2.0 * t * s_a) * h_b
+                        } else {
+                            0.0
+                        };
+                        d1_raw_eta2[a][[row, col]] += d1_eta2_val * z_jc;
+                    }
+
+                    let dlap_deta = if r > 1e-14 {
+                        ((d_f64 + 2.0) * t + dt_dr * r) * s_a
+                    } else {
+                        0.0
+                    };
+                    d2_raw_eta[a][[k, col]] += dlap_deta * z_jc;
+
+                    let d2lap_deta2 = if r > 1e-14 {
+                        let w = (d_f64 + 2.0) * t + dt_dr * r;
+                        let dw_dr = (d_f64 + 3.0) * dt_dr + d2t_dr2 * r;
+                        dw_dr * s_a * s_a / r + 2.0 * w * s_a
+                    } else {
+                        0.0
+                    };
+                    d2_raw_eta2[a][[k, col]] += d2lap_deta2 * z_jc;
+                }
+            }
+        }
+    }
+
+    // Build per-axis results via Gram product rule + normalization.
+    let mut per_axis_results = Vec::with_capacity(dim);
+
+    for a in 0..dim {
+        let d0 = &d0_raw;
+        let d1 = &d1_raw;
+        let d2 = &d2_raw;
+        let d0_eta = &d0_raw_eta[a];
+        let d1_eta = &d1_raw_eta[a];
+        let d2_eta = &d2_raw_eta[a];
+        let d0_eta2 = &d0_raw_eta2[a];
+        let d1_eta2 = &d1_raw_eta2[a];
+        let d2_eta2 = &d2_raw_eta2[a];
+
+        let (s0, s0_eta, s0_eta2) =
+            gram_and_psi_derivatives_from_operator(d0, d0_eta, d0_eta2);
+        let (s1, s1_eta, s1_eta2) =
+            gram_and_psi_derivatives_from_operator(d1, d1_eta, d1_eta2);
+        let (s2, s2_eta, s2_eta2) =
+            gram_and_psi_derivatives_from_operator(d2, d2_eta, d2_eta2);
+
+        let (s0_norm, s0_norm_eta, s0_norm_eta2, c0) =
+            normalize_penaltywith_psi_derivatives(&s0, &s0_eta, &s0_eta2);
+        let (s1_norm, s1_norm_eta, s1_norm_eta2, c1) =
+            normalize_penaltywith_psi_derivatives(&s1, &s1_eta, &s1_eta2);
+        let (s2_norm, s2_norm_eta, s2_norm_eta2, c2) =
+            normalize_penaltywith_psi_derivatives(&s2, &s2_eta, &s2_eta2);
+
+        let candidates = vec![
+            PenaltyCandidate {
+                matrix: s0_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::OperatorMass,
+                normalization_scale: c0,
+            },
+            PenaltyCandidate {
+                matrix: s1_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::OperatorTension,
+                normalization_scale: c1,
+            },
+            PenaltyCandidate {
+                matrix: s2_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::OperatorStiffness,
+                normalization_scale: c2,
+            },
+        ];
+        let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+        let pen_first = active_operator_penalty_derivatives(
+            &penaltyinfo,
+            &[s0_norm_eta, s1_norm_eta, s2_norm_eta],
+            "Duchon-aniso",
+        )?;
+        let pen_second = active_operator_penalty_derivatives(
+            &penaltyinfo,
+            &[s0_norm_eta2, s1_norm_eta2, s2_norm_eta2],
+            "Duchon-aniso",
+        )?;
+
+        per_axis_results.push((pen_first, pen_second));
+    }
+
+    Ok(per_axis_results)
+}
+
 fn duchon_kernel_radial_triplet(
     r: f64,
     length_scale: Option<f64>,
@@ -6445,11 +6641,10 @@ fn build_duchon_design_psi_aniso_derivatives(
 /// Build per-axis ψ_a derivatives for anisotropic Duchon terms, including
 /// both design-matrix and penalty derivatives.
 ///
-/// Duchon terms use operator penalties (no double-penalty path), so penalty
-/// derivatives follow the fractional weighting approach:
-///   dS_op/d(ψ_a) ≈ f_a · dS_op/d(ψ)
-/// where f_a = mean(s_a / r²) is the per-axis fraction of the total anisotropic
-/// distance contributed by axis a.
+/// Uses exact per-axis operator derivatives via
+/// [`build_duchon_operator_penalty_aniso_derivatives`], which computes
+/// D₀, D₁, D₂ and their η_a first/second derivatives at all center pairs
+/// and assembles penalty derivatives via the Gram product rule.
 pub fn build_duchon_basis_log_kappa_aniso_derivatives(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -6467,6 +6662,12 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         )));
     }
 
+    let length_scale = spec.length_scale.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "aniso Duchon derivatives require hybrid Duchon with length_scale".to_string(),
+        )
+    })?;
+
     let mut workspace = BasisWorkspace::default();
     let (centers, identifiability_transform) =
         prepare_duchon_derivative_contextwithworkspace(data, spec, &mut workspace)?;
@@ -6479,49 +6680,23 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         &mut workspace,
     )?;
 
-    // Operator penalty path: fractional weighting approach.
-    // dS_op/d(ψ_a) ≈ f_a · dS_op/d(ψ) where f_a = mean(s_a / r²).
-    let (iso_pen_first, iso_pen_second) = build_duchon_operator_penalty_psi_derivatives(
+    // Exact operator penalty path: per-axis D₀, D₁, D₂ derivatives via
+    // Gram product rule, replacing the former fractional approximation.
+    let per_axis = build_duchon_operator_penalty_aniso_derivatives(
         centers.view(),
-        spec,
+        length_scale,
+        spec.power,
+        spec.nullspace_order,
+        eta,
         identifiability_transform.as_ref(),
         &mut workspace,
     )?;
 
-    let p = centers.nrows();
-    let d_spatial = centers.ncols();
-    let mut mean_frac = vec![0.0_f64; dim];
-    let mut npairs = 0usize;
-    for i in 0..p {
-        let ci: Vec<f64> = (0..d_spatial).map(|a| centers[[i, a]]).collect();
-        for j in 0..p {
-            let cj: Vec<f64> = (0..d_spatial).map(|a| centers[[j, a]]).collect();
-            let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
-            let r2 = r * r;
-            for a in 0..dim {
-                mean_frac[a] += if r2 > 1e-28 {
-                    s_vec[a] / r2
-                } else {
-                    1.0 / dim as f64
-                };
-            }
-            npairs += 1;
-        }
-    }
-    if npairs > 0 {
-        for a in 0..dim {
-            mean_frac[a] /= npairs as f64;
-        }
-    }
-
     result.penalties_first = Vec::with_capacity(dim);
     result.penalties_second_diag = Vec::with_capacity(dim);
-    for a in 0..dim {
-        let w = mean_frac[a];
-        let pf: Vec<Array2<f64>> = iso_pen_first.iter().map(|m| m * w).collect();
-        let ps: Vec<Array2<f64>> = iso_pen_second.iter().map(|m| m * w).collect();
-        result.penalties_first.push(pf);
-        result.penalties_second_diag.push(ps);
+    for (pen_first, pen_second) in per_axis {
+        result.penalties_first.push(pen_first);
+        result.penalties_second_diag.push(pen_second);
     }
 
     Ok(result)
