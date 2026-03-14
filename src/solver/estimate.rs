@@ -1825,7 +1825,7 @@ where
                 // Use the unified REML evaluator with link ext_coords.
                 // This computes ρ gradient AND link parameter gradient jointly
                 // through the same HyperCoord infrastructure used for aniso ψ.
-                let eval_mode = crate::solver::reml::unified::EvalMode::ValueAndGradient;
+                let eval_mode = self::reml::unified::EvalMode::ValueAndGradient;
                 let result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
 
                 let mut cost = result.cost;
