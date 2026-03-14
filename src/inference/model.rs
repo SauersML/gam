@@ -1,6 +1,7 @@
 use crate::estimate::{BlockRole, FitResult, FittedLinkParameters, UnifiedFitResult};
 use crate::inference::predict::{
-    GaussianLocationScalePredictor, PredictableModel, StandardPredictor,
+    BinomialLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
+    StandardPredictor, SurvivalPredictor,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{
@@ -568,8 +569,29 @@ impl FittedModel {
                     covariance,
                 }))
             }
-            // Binomial location-scale and survival predictors not yet implemented.
-            _ => None,
+            PredictModelClass::Survival => {
+                let unified = self.unified()?;
+                // Default to probit inverse link for survival models.
+                let inverse_link = self
+                    .resolved_inverse_link()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(InverseLink::Standard(LinkFunction::Probit));
+                SurvivalPredictor::from_unified(unified, inverse_link)
+                    .ok()
+                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::BinomialLocationScale => {
+                let unified = self.unified()?;
+                let inverse_link = self
+                    .resolved_inverse_link()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(InverseLink::Standard(LinkFunction::Probit));
+                BinomialLocationScalePredictor::from_unified(unified, inverse_link)
+                    .ok()
+                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+            }
         }
     }
 

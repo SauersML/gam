@@ -976,6 +976,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: Some(true),
+                penalty_shrinkage_floor: Some(1e-6),
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
@@ -1004,6 +1005,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: adaptive_opts,
+            penalty_shrinkage_floor: Some(1e-6),
         };
         progress.set_stage("fit", "optimizing penalized likelihood");
         let fitted = match fit_term_collectionwith_spatial_length_scale_optimization(
@@ -2640,6 +2642,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
                 adaptive_regularization: None,
+                penalty_shrinkage_floor: Some(1e-6),
             },
         )
         .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
@@ -6359,6 +6362,7 @@ fn freeze_term_collectionspec(
                     include_intercept,
                     identifiability_transform,
                     input_scales: meta_scales,
+                    aniso_log_scales: meta_aniso,
                     ..
                 },
             ) => {
@@ -6372,6 +6376,7 @@ fn freeze_term_collectionspec(
                     },
                     None => MaternIdentifiability::None,
                 };
+                s.aniso_log_scales = meta_aniso.clone();
                 *input_scales = meta_scales.clone();
             }
             (
@@ -10962,6 +10967,7 @@ mod tests {
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
+                            aniso_log_scales: None,
                         },
                         input_scales: None,
                         },
@@ -10977,6 +10983,7 @@ mod tests {
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
+                            aniso_log_scales: None,
                         },
                         input_scales: None,
                         },
@@ -10992,6 +10999,7 @@ mod tests {
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
+                            aniso_log_scales: None,
                         },
                         input_scales: None,
                         },
@@ -11029,6 +11037,7 @@ mod tests {
                         double_penalty: true,
                         include_intercept: false,
                         identifiability: gam::basis::MaternIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -11109,6 +11118,7 @@ mod tests {
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },

@@ -1520,6 +1520,9 @@ pub enum BasisMetadata {
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).
         input_scales: Option<Vec<f64>>,
+        /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
+        /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
+        aniso_log_scales: Option<Vec<f64>>,
     },
     Duchon {
         centers: Array2<f64>,
@@ -1529,6 +1532,8 @@ pub enum BasisMetadata {
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).
         input_scales: Option<Vec<f64>>,
+        /// Per-axis anisotropy log-scales η_a, stored for prediction.
+        aniso_log_scales: Option<Vec<f64>>,
     },
     TensorBSpline {
         feature_cols: Vec<usize>,
@@ -1605,6 +1610,35 @@ pub struct BasisPsiDerivativeResult {
 pub struct BasisPsiSecondDerivativeResult {
     pub designsecond_derivative: Array2<f64>,
     pub penaltiessecond_derivative: Vec<Array2<f64>>,
+}
+
+/// Per-axis psi_a derivative package for anisotropic spatial terms.
+///
+/// For a d-dimensional anisotropic term, the kernel phi(r) depends on
+/// the anisotropic distance r = |Lambda h| where Lambda = diag(kappa_a). Each axis a
+/// has its own log-scale psi_a = log(kappa_a), yielding d first derivatives,
+/// d diagonal second derivatives, and d*(d-1)/2 cross second derivatives.
+///
+/// The cross second derivative d2 phi/(d psi_a d psi_b) = t * s_a * s_b (a != b)
+/// is rank-1, so we store the t_values and s_components vectors rather
+/// than materializing d^2 matrices.
+#[derive(Debug, Clone)]
+pub struct AnisoBasisPsiDerivatives {
+    /// d matrices, each (n x p_smooth): dX/d psi_a.
+    pub design_first: Vec<Array2<f64>>,
+    /// d matrices, each (n x p_smooth): d2X/d psi_a^2 (diagonal second derivatives).
+    pub design_second_diag: Vec<Array2<f64>>,
+    /// Per data-point (i,j) R-operator scalar t(r_ij) for cross-term assembly.
+    /// Shape (n x p_smooth) after identifiability transform.
+    pub design_cross_t: Array2<f64>,
+    /// Per data-point (i,j) per-axis component s_a(i,j) = exp(2 eta_a) * h_a^2.
+    /// Vec of d arrays, each (n x k_raw) -- needed for cross-term assembly:
+    ///   d2 X[i,j]/(d psi_a d psi_b) = t[i,j] * s_a[i,j] * s_b[i,j]  (a != b).
+    pub s_components_raw: Vec<Array2<f64>>,
+    /// d x num_penalties: dS_m/d psi_a for each axis a and penalty m.
+    pub penalties_first: Vec<Vec<Array2<f64>>>,
+    /// d x num_penalties: d2S_m/d psi_a^2 for each axis a and penalty m.
+    pub penalties_second_diag: Vec<Vec<Array2<f64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2444,6 +2478,30 @@ pub fn build_thin_plate_basiswithworkspace(
 }
 
 #[inline(always)]
+fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
+    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
+}
+
+#[inline(always)]
+fn stable_nonnegative_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
+    if coeffs.is_empty() || !x.is_finite() {
+        return 0.0;
+    }
+    if x <= 600.0 {
+        return horner_polynomial(x, coeffs) * (-x).exp();
+    }
+
+    let inv_x = x.recip();
+    let mut tail = 0.0;
+    for &c in coeffs {
+        tail = tail * inv_x + c;
+    }
+    let degree = (coeffs.len() - 1) as f64;
+    let scale = (degree * x.ln() - x).exp();
+    scale * tail
+}
+
+#[inline(always)]
 fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Result<f64, BasisError> {
     if !r.is_finite() || r < 0.0 {
         return Err(BasisError::InvalidInput(
@@ -2466,27 +2524,25 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
     // (for ν=1/2, a=x since sqrt(2ν)=1).
     let x = r / length_scale;
     let k = match nu {
-        MaternNu::Half => (-x).exp(),
+        MaternNu::Half => stable_nonnegative_poly_times_exp_neg(x, &[1.0]),
         MaternNu::ThreeHalves => {
             let a = 3.0_f64.sqrt() * x;
-            (1.0 + a) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(a, &[1.0, 1.0])
         }
         MaternNu::FiveHalves => {
             let a = 5.0_f64.sqrt() * x;
-            (1.0 + a + (a * a) / 3.0) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(a, &[1.0, 1.0, 1.0 / 3.0])
         }
         MaternNu::SevenHalves => {
             let a = 7.0_f64.sqrt() * x;
-            let a2 = a * a;
-            let a3 = a2 * a;
-            (1.0 + a + (2.0 / 5.0) * a2 + (1.0 / 15.0) * a3) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(a, &[1.0, 1.0, 2.0 / 5.0, 1.0 / 15.0])
         }
         MaternNu::NineHalves => {
             let a = 9.0_f64.sqrt() * x;
-            let a2 = a * a;
-            let a3 = a2 * a;
-            let a4 = a2 * a2;
-            (1.0 + a + (3.0 / 7.0) * a2 + (2.0 / 21.0) * a3 + (1.0 / 105.0) * a4) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(
+                a,
+                &[1.0, 1.0, 3.0 / 7.0, 2.0 / 21.0, 1.0 / 105.0],
+            )
         }
     };
     Ok(k)
@@ -2511,29 +2567,28 @@ fn matern_kernel_log_kappa_derivative_from_distance(
 
     let x = r / length_scale;
     let deriv = match nu {
-        MaternNu::Half => -x * (-x).exp(),
+        MaternNu::Half => stable_nonnegative_poly_times_exp_neg(x, &[0.0, -1.0]),
         MaternNu::ThreeHalves => {
             let a = 3.0_f64.sqrt() * x;
-            -(a * a) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(a, &[0.0, 0.0, -1.0])
         }
         MaternNu::FiveHalves => {
             let a = 5.0_f64.sqrt() * x;
-            -((a * a) * (1.0 + a) / 3.0) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(a, &[0.0, 0.0, -1.0 / 3.0, -1.0 / 3.0])
         }
         MaternNu::SevenHalves => {
             let a = 7.0_f64.sqrt() * x;
-            let a2 = a * a;
-            let a3 = a2 * a;
-            let a4 = a2 * a2;
-            -((a2 / 5.0) + (a3 / 5.0) + (a4 / 15.0)) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(
+                a,
+                &[0.0, 0.0, -1.0 / 5.0, -1.0 / 5.0, -1.0 / 15.0],
+            )
         }
         MaternNu::NineHalves => {
             let a = 9.0_f64.sqrt() * x;
-            let a2 = a * a;
-            let a3 = a2 * a;
-            let a4 = a2 * a2;
-            let a5 = a4 * a;
-            -((a2 / 7.0) + (a3 / 7.0) + (2.0 * a4 / 35.0) + (a5 / 105.0)) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(
+                a,
+                &[0.0, 0.0, -1.0 / 7.0, -1.0 / 7.0, -2.0 / 35.0, -1.0 / 105.0],
+            )
         }
     };
     Ok(deriv)
@@ -2558,27 +2613,31 @@ fn matern_kernel_log_kappasecond_derivative_from_distance(
 
     let x = r / length_scale;
     let second = match nu {
-        MaternNu::Half => x * (x - 1.0) * (-x).exp(),
+        MaternNu::Half => stable_nonnegative_poly_times_exp_neg(x, &[0.0, -1.0, 1.0]),
         MaternNu::ThreeHalves => {
             let a = 3.0_f64.sqrt() * x;
-            (a * a * (a - 2.0)) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(a, &[0.0, 0.0, -2.0, 1.0])
         }
         MaternNu::FiveHalves => {
             let a = 5.0_f64.sqrt() * x;
-            (a * a * (a * a - 2.0 * a - 2.0) / 3.0) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(
+                a,
+                &[0.0, 0.0, -2.0 / 3.0, -2.0 / 3.0, 1.0 / 3.0],
+            )
         }
         MaternNu::SevenHalves => {
             let a = 7.0_f64.sqrt() * x;
-            let a2 = a * a;
-            let a3 = a2 * a;
-            (a2 * (a3 - a2 - 6.0 * a - 6.0) / 15.0) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(
+                a,
+                &[0.0, 0.0, -2.0 / 5.0, -2.0 / 5.0, -1.0 / 15.0, 1.0 / 15.0],
+            )
         }
         MaternNu::NineHalves => {
             let a = 9.0_f64.sqrt() * x;
-            let a2 = a * a;
-            let a3 = a2 * a;
-            let a4 = a2 * a2;
-            (a2 * (a4 + a3 - 18.0 * a2 - 30.0 * a - 30.0) / 105.0) * (-a).exp()
+            stable_nonnegative_poly_times_exp_neg(
+                a,
+                &[0.0, 0.0, -2.0 / 7.0, -2.0 / 7.0, -6.0 / 35.0, 1.0 / 105.0, 1.0 / 105.0],
+            )
         }
     };
     Ok(second)
@@ -3171,6 +3230,7 @@ pub fn build_matern_collocation_operator_matrices(
     nu: MaternNu,
     include_intercept: bool,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
+    aniso_log_scales: Option<&[f64]>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     // Specialized Matérn operator assembly using explicit half-integer formulas:
     // - one exp(-a) and small polynomials per pair,
@@ -3205,12 +3265,21 @@ pub fn build_matern_collocation_operator_matrices(
     for k in 0..p {
         let scale_k = row_scales[k];
         for j in 0..p {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = centers[[k, c]] - centers[[j, c]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            // Distance: anisotropic r = |Ah| when eta present, isotropic |h| otherwise.
+            let r = if let Some(eta) = aniso_log_scales {
+                aniso_distance(
+                    centers.row(k).as_slice().unwrap(),
+                    centers.row(j).as_slice().unwrap(),
+                    eta,
+                )
+            } else {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = centers[[k, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                dist2.sqrt()
+            };
             if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
                 return Err(BasisError::InvalidInput(
                     "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
@@ -3293,6 +3362,7 @@ pub fn build_duchon_collocation_operator_matrices(
         length_scale,
         power,
         nullspace_order,
+        None, // public convenience wrapper: no anisotropy
         identifiability_transform,
         &mut workspace,
     )
@@ -3304,6 +3374,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
@@ -3342,12 +3413,18 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         let scale_k = row_scales[k];
         for j in k..p_colloc {
             let scale_j = row_scales[j];
-            let mut dist2 = 0.0;
-            for axis in 0..dim {
-                let delta = centers[[k, axis]] - centers[[j, axis]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = if let Some(eta) = aniso_log_scales {
+                let row_k: Vec<f64> = (0..dim).map(|a| centers[[k, a]]).collect();
+                let row_j: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
+                aniso_distance(&row_k, &row_j, eta)
+            } else {
+                let mut dist2 = 0.0;
+                for axis in 0..dim {
+                    let delta = centers[[k, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                dist2.sqrt()
+            };
             let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
                 r,
                 length_scale,
@@ -4027,6 +4104,77 @@ fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
     r2.sqrt()
 }
 
+/// Compute per-axis standard deviations of knot center coordinates.
+///
+/// Returns σ_a for each axis column of `centers`. Axes with zero variance
+/// (constant column) get σ_a = 1.0. All values are clamped to [1e-6, 1e6].
+pub fn knot_cloud_axis_scales(centers: ArrayView2<'_, f64>) -> Vec<f64> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    if k < 2 || d == 0 {
+        return vec![1.0; d];
+    }
+    let n = k as f64;
+    let mut scales = Vec::with_capacity(d);
+    for a in 0..d {
+        let col = centers.column(a);
+        let mean = col.sum() / n;
+        let var = col.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let sigma = var.sqrt();
+        // If variance is zero (constant column), use 1.0 (no scaling).
+        let sigma = if sigma < 1e-12 { 1.0 } else { sigma };
+        scales.push(sigma.clamp(1e-6, 1e6));
+    }
+    scales
+}
+
+/// Compute initial anisotropy contrasts η_a from knot center geometry.
+///
+/// Returns η_a = −ln(σ_a) + (1/d) Σ_b ln(σ_b), which satisfies Ση_a = 0
+/// by construction. Axes with more spread get negative η_a (smaller κ_a,
+/// longer correlation range), axes with less spread get positive η_a.
+///
+/// If d ≤ 1, returns an empty vector (anisotropy is meaningless for 1-D).
+pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
+    let d = centers.ncols();
+    if d <= 1 {
+        return Vec::new();
+    }
+    let scales = knot_cloud_axis_scales(centers);
+    let neg_log_scales: Vec<f64> = scales.iter().map(|&s| -s.ln()).collect();
+    let mean_neg_log: f64 = neg_log_scales.iter().sum::<f64>() / d as f64;
+    // η_a = −ln(σ_a) + (1/d) Σ_b ln(σ_b)
+    //     = −ln(σ_a) − mean(−ln(σ_b))
+    //     = neg_log_scales[a] − mean(neg_log_scales)
+    neg_log_scales
+        .iter()
+        .map(|&nls| nls - mean_neg_log)
+        .collect()
+}
+
+/// Detect the all-zero sentinel from `--scale-dimensions` and replace with
+/// knot-cloud-derived contrasts. Non-zero or absent aniso is passed through.
+fn maybe_initialize_aniso_contrasts(
+    centers: ArrayView2<'_, f64>,
+    aniso: Option<&[f64]>,
+) -> Option<Vec<f64>> {
+    let eta = match aniso {
+        Some(v) if v.len() > 1 => v,
+        Some(v) => return Some(v.to_vec()),
+        None => return None,
+    };
+    let all_zero = eta.iter().all(|&e| e == 0.0);
+    if !all_zero {
+        return Some(eta.to_vec());
+    }
+    let contrasts = initial_aniso_contrasts(centers);
+    if contrasts.is_empty() {
+        Some(eta.to_vec())
+    } else {
+        Some(contrasts)
+    }
+}
+
 fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
     let n = points.nrows();
     let d = points.ncols();
@@ -4303,6 +4451,7 @@ fn build_matern_operator_penalty_candidates(
     nu: MaternNu,
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
+    aniso_log_scales: Option<&[f64]>,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let ops = build_matern_collocation_operator_matrices(
         centers,
@@ -4311,6 +4460,7 @@ fn build_matern_operator_penalty_candidates(
         nu,
         include_intercept,
         z_opt.map(|z| z.view()),
+        aniso_log_scales,
     )?;
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0, &ops.d1, &ops.d2,
@@ -4355,6 +4505,7 @@ pub fn create_matern_spline_basis(
     length_scale: f64,
     nu: MaternNu,
     include_intercept: bool,
+    aniso_log_scales: Option<&[f64]>,
 ) -> Result<MaternSplineBasis, BasisError> {
     let mut workspace = BasisWorkspace::default();
     create_matern_spline_basiswithworkspace(
@@ -4363,6 +4514,7 @@ pub fn create_matern_spline_basis(
         length_scale,
         nu,
         include_intercept,
+        aniso_log_scales,
         &mut workspace,
     )
 }
@@ -4373,6 +4525,7 @@ pub fn create_matern_spline_basiswithworkspace(
     length_scale: f64,
     nu: MaternNu,
     include_intercept: bool,
+    aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
     let n = data.nrows();
@@ -4405,6 +4558,19 @@ pub fn create_matern_spline_basiswithworkspace(
             "Matérn length_scale must be finite and positive".to_string(),
         ));
     }
+    if let Some(eta) = aniso_log_scales {
+        if eta.len() != d {
+            return Err(BasisError::DimensionMismatch(format!(
+                "aniso_log_scales length {} does not match data dimension {d}",
+                eta.len()
+            )));
+        }
+        if eta.iter().any(|v| !v.is_finite()) {
+            return Err(BasisError::InvalidInput(
+                "aniso_log_scales must contain finite values".to_string(),
+            ));
+        }
+    }
 
     // Practical safe operating range for κ from center geometry (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min], with κ = 1/length_scale.
@@ -4428,30 +4594,66 @@ pub fn create_matern_spline_basiswithworkspace(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
-    let (data_center_r, center_center_r) =
-        spatial_distance_matrices(data, centers, &mut workspace.cache)?;
-
+    // Distance computation: anisotropic when eta is present, isotropic otherwise.
+    // Under anisotropy we work in y-space (y = Ax), so r = |Ah| replaces |h|.
     let mut kernel_block = Array2::<f64>::zeros((n, k));
-    let kernel_result: Result<(), BasisError> = kernel_block
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                row[j] = matern_kernel_from_distance(data_center_r[[i, j]], length_scale, nu)?;
-            }
-            Ok(())
-        });
-    kernel_result?;
-
-    // Center-center Gram matrix K_CC. In RKHS form, the kernel penalty on
-    // radial coefficients is alpha^T K_CC alpha.
     let mut center_kernel = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let kij = matern_kernel_from_distance(center_center_r[[i, j]], length_scale, nu)?;
-            center_kernel[[i, j]] = kij;
-            center_kernel[[j, i]] = kij;
+    if let Some(eta) = aniso_log_scales {
+        // Anisotropic path: compute distances via aniso_distance.
+        let kernel_result: Result<(), BasisError> = kernel_block
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(i, mut row)| {
+                let xi = data.row(i);
+                for j in 0..k {
+                    let r = aniso_distance(
+                        xi.as_slice().unwrap(),
+                        centers.row(j).as_slice().unwrap(),
+                        eta,
+                    );
+                    row[j] = matern_kernel_from_distance(r, length_scale, nu)?;
+                }
+                Ok(())
+            });
+        kernel_result?;
+        for i in 0..k {
+            for j in i..k {
+                let r = aniso_distance(
+                    centers.row(i).as_slice().unwrap(),
+                    centers.row(j).as_slice().unwrap(),
+                    eta,
+                );
+                let kij = matern_kernel_from_distance(r, length_scale, nu)?;
+                center_kernel[[i, j]] = kij;
+                center_kernel[[j, i]] = kij;
+            }
+        }
+    } else {
+        // Isotropic path: use cached spatial distance matrices.
+        let (data_center_r, center_center_r) =
+            spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+        let kernel_result: Result<(), BasisError> = kernel_block
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(i, mut row)| {
+                for j in 0..k {
+                    row[j] =
+                        matern_kernel_from_distance(data_center_r[[i, j]], length_scale, nu)?;
+                }
+                Ok(())
+            });
+        kernel_result?;
+        // Center-center Gram matrix K_CC. In RKHS form, the kernel penalty on
+        // radial coefficients is alpha^T K_CC alpha.
+        for i in 0..k {
+            for j in i..k {
+                let kij =
+                    matern_kernel_from_distance(center_center_r[[i, j]], length_scale, nu)?;
+                center_kernel[[i, j]] = kij;
+                center_kernel[[j, i]] = kij;
+            }
         }
     }
 
@@ -4498,6 +4700,12 @@ pub fn build_matern_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    // Initialize anisotropy contrasts from knot cloud geometry when the caller
+    // enabled scale-dimensions but left η at the zero default.
+    let aniso = maybe_initialize_aniso_contrasts(
+        centers.view(),
+        spec.aniso_log_scales.as_deref(),
+    );
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let m = create_matern_spline_basiswithworkspace(
         data,
@@ -4505,6 +4713,7 @@ pub fn build_matern_basiswithworkspace(
         spec.length_scale,
         spec.nu,
         spec.include_intercept,
+        aniso.as_deref(),
         workspace,
     )?;
     let identifiability_transform = z_opt.clone();
@@ -4529,6 +4738,7 @@ pub fn build_matern_basiswithworkspace(
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
+            aniso.as_deref(),
         )?
     };
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -4544,6 +4754,7 @@ pub fn build_matern_basiswithworkspace(
             include_intercept: spec.include_intercept,
             identifiability_transform,
             input_scales: None,
+            aniso_log_scales: aniso,
         },
     })
 }
@@ -4816,6 +5027,7 @@ fn build_matern_operator_penalty_psi_derivatives(
     nu: MaternNu,
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
+    aniso_log_scales: Option<&[f64]>,
 ) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
     // Full operator-to-penalty derivative pipeline in constrained coordinates:
     //
@@ -4844,12 +5056,20 @@ fn build_matern_operator_penalty_psi_derivatives(
 
     for k in 0..p {
         for j in 0..p {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = centers[[k, c]] - centers[[j, c]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = if let Some(eta) = aniso_log_scales {
+                aniso_distance(
+                    centers.row(k).as_slice().unwrap(),
+                    centers.row(j).as_slice().unwrap(),
+                    eta,
+                )
+            } else {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = centers[[k, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                dist2.sqrt()
+            };
             let (
                 phi,
                 phi_psi,
@@ -5010,14 +5230,21 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let mut d1_raw_psi_psi = Array2::<f64>::zeros((p * d, z_kernel.ncols()));
     let mut d2_raw_psi_psi = Array2::<f64>::zeros((p, z_kernel.ncols()));
 
+    let aniso = spec.aniso_log_scales.as_deref();
     for k in 0..p {
         for j in k..p {
-            let mut dist2 = 0.0;
-            for axis in 0..d {
-                let delta = centers[[k, axis]] - centers[[j, axis]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = if let Some(eta) = aniso {
+                let row_k: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
+                let row_j: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+                aniso_distance(&row_k, &row_j, eta)
+            } else {
+                let mut dist2 = 0.0;
+                for axis in 0..d {
+                    let delta = centers[[k, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                dist2.sqrt()
+            };
             let core =
                 duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)?;
             for col in 0..z_kernel.ncols() {
@@ -5209,6 +5436,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
         spec.length_scale,
         spec.power,
         spec.nullspace_order,
+        spec.aniso_log_scales.as_deref(),
         workspace,
     )?;
     let identifiability_transform = spatial_identifiability_transform_from_design(
@@ -5227,20 +5455,38 @@ fn build_matern_design_psi_derivatives(
     nu: MaternNu,
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
+    aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
-    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
-    for i in 0..n {
-        for j in 0..k {
-            let r = data_center_r[[i, j]];
+    if let Some(eta) = aniso_log_scales {
+        for i in 0..n {
+            let xi = data.row(i);
+            for j in 0..k {
+                let r = aniso_distance(
+                    xi.as_slice().unwrap(),
+                    centers.row(j).as_slice().unwrap(),
+                    eta,
+                );
+                kernel_psi[[i, j]] =
+                    matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
+                kernel_psi_psi[[i, j]] =
+                    matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
+            }
+        }
+    } else {
+        let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
+        for i in 0..n {
+            for j in 0..k {
+                let r = data_center_r[[i, j]];
             kernel_psi[[i, j]] =
                 matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
             kernel_psi_psi[[i, j]] =
                 matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
+            }
         }
     }
     let (kernel_psi, kernel_psi_psi) = if let Some(z) = z_opt {
@@ -5265,6 +5511,7 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
     nu: MaternNu,
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
+    aniso_log_scales: Option<&[f64]>,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, f64), BasisError> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
@@ -5275,12 +5522,20 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
 
     for i in 0..k {
         for j in i..k {
-            let mut dist2 = 0.0;
-            for axis in 0..centers.ncols() {
-                let delta = centers[[i, axis]] - centers[[j, axis]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = if let Some(eta) = aniso_log_scales {
+                aniso_distance(
+                    centers.row(i).as_slice().unwrap(),
+                    centers.row(j).as_slice().unwrap(),
+                    eta,
+                )
+            } else {
+                let mut dist2 = 0.0;
+                for axis in 0..centers.ncols() {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                dist2.sqrt()
+            };
             let value = matern_kernel_from_distance(r, length_scale, nu)?;
             let d1 = matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
             let d2 = matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
@@ -5353,6 +5608,7 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     // Analytic psi derivative assembly for the Matérn basis block.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
+    let aniso = spec.aniso_log_scales.as_deref();
     let (design_derivative, _) = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -5360,6 +5616,7 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
         spec.nu,
         spec.include_intercept,
         z_opt.as_ref(),
+        aniso,
         workspace,
     )?;
     let penalties_derivative = if spec.double_penalty {
@@ -5371,6 +5628,7 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
+                aniso,
             )?;
         active_matern_double_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?
     } else {
@@ -5380,6 +5638,7 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
+            aniso,
         )?;
         penalties_derivative
     };
@@ -5407,6 +5666,7 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     // mapping logic and constrained normalized penalty geometry.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
+    let aniso = spec.aniso_log_scales.as_deref();
     let (_, designsecond_derivative) = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -5414,6 +5674,7 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
         spec.nu,
         spec.include_intercept,
         z_opt.as_ref(),
+        aniso,
         workspace,
     )?;
     let penaltiessecond_derivative = if spec.double_penalty {
@@ -5425,6 +5686,7 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
+                aniso,
             )?;
         active_matern_double_penalty_derivatives(&base.penaltyinfo, &primarysecond_derivative)?
     } else {
@@ -5434,6 +5696,7 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
+            aniso,
         )?;
         penaltiessecond_derivative
     };
@@ -5444,7 +5707,249 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     })
 }
 
-#[inline(always)]
+/// Build per-axis ψ_a design-matrix derivatives for anisotropic Matérn terms.
+///
+/// Uses R-operator scalars (q, t) from `matern_aniso_radial_scalars` and per-axis
+/// squared-displacement components s_a to assemble:
+///   dX[i,j]/d(ψ_a)   = q_{ij} · s_a_{ij}
+///   d²X[i,j]/d(ψ_a)² = 2·q_{ij}·s_a_{ij} + t_{ij}·s_a_{ij}²
+fn build_matern_design_psi_aniso_derivatives(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    eta: &[f64],
+    include_intercept: bool,
+    z_opt: Option<&Array2<f64>>,
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
+    let n = data.nrows();
+    let k = centers.nrows();
+    let dim = data.ncols();
+    debug_assert_eq!(eta.len(), dim);
+
+    // Raw kernel-level per-axis derivatives: (n x k) matrices.
+    let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
+    let mut kernel_second_diag = vec![Array2::<f64>::zeros((n, k)); dim];
+    let mut t_raw = Array2::<f64>::zeros((n, k));
+    let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
+
+    for i in 0..n {
+        let data_row: Vec<f64> = (0..dim).map(|a| data[[i, a]]).collect();
+        for j in 0..k {
+            let center: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
+            let (r, s_vec) = aniso_distance_and_components(&data_row, &center, eta);
+            let (_phi, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
+            t_raw[[i, j]] = t;
+            for a in 0..dim {
+                s_components_raw[a][[i, j]] = s_vec[a];
+                kernel_first[a][[i, j]] = q * s_vec[a];
+                kernel_second_diag[a][[i, j]] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+            }
+        }
+    }
+
+    // Apply identifiability transform Z (ψ-independent).
+    let project = |mat: Array2<f64>| -> Array2<f64> {
+        if let Some(z) = z_opt {
+            fast_ab(&mat, z)
+        } else {
+            mat
+        }
+    };
+
+    let kernel_first: Vec<_> = kernel_first.into_iter().map(&project).collect();
+    let kernel_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&project).collect();
+    let design_cross_t = project(t_raw);
+
+    // Pad with intercept column (zero derivative for intercept).
+    let cols = kernel_first[0].ncols();
+    let total_cols = cols + usize::from(include_intercept);
+
+    let pad = |mat: Array2<f64>| -> Array2<f64> {
+        if include_intercept {
+            let mut out = Array2::<f64>::zeros((n, total_cols));
+            out.slice_mut(s![.., 0..cols]).assign(&mat);
+            out
+        } else {
+            mat
+        }
+    };
+
+    let design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
+    let design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
+    let design_cross_t = pad(design_cross_t);
+
+    // Penalty derivatives are assembled by the caller.
+    let penalties_first = vec![Vec::new(); dim];
+    let penalties_second_diag = vec![Vec::new(); dim];
+
+    Ok(AnisoBasisPsiDerivatives {
+        design_first,
+        design_second_diag,
+        design_cross_t,
+        s_components_raw,
+        penalties_first,
+        penalties_second_diag,
+    })
+}
+
+/// Build per-axis ψ_a derivatives for anisotropic Matérn terms, including
+/// both design-matrix and penalty derivatives.
+///
+/// For each axis a (0..d), produces first and second derivative information.
+/// The penalty derivatives use the fractional weighting approach for operator
+/// penalties, and exact per-axis R-operator derivatives for double penalties.
+pub fn build_matern_basis_log_kappa_aniso_derivatives(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
+    let eta = spec.aniso_log_scales.as_deref().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "aniso derivatives require aniso_log_scales to be set".to_string(),
+        )
+    })?;
+    let dim = data.ncols();
+    if eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "aniso_log_scales length {} != data dimension {dim}",
+            eta.len()
+        )));
+    }
+
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
+
+    let mut result = build_matern_design_psi_aniso_derivatives(
+        data,
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        eta,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
+
+    // Penalty per-axis derivatives.
+    if spec.double_penalty {
+        // Double-penalty path: per-axis primary penalty derivatives via R-operators.
+        let k = centers.nrows();
+        let kernel_cols = z_opt.as_ref().map(|z| z.ncols()).unwrap_or(k);
+        let total_cols = kernel_cols + usize::from(spec.include_intercept);
+        let mut primary_first = vec![
+            Array2::<f64>::zeros((total_cols, total_cols));
+            dim
+        ];
+        let mut primary_second_diag = vec![
+            Array2::<f64>::zeros((total_cols, total_cols));
+            dim
+        ];
+        let mut raw_first = vec![Array2::<f64>::zeros((k, k)); dim];
+        let mut raw_second_diag = vec![Array2::<f64>::zeros((k, k)); dim];
+        for i in 0..k {
+            let ci: Vec<f64> = (0..dim).map(|a| centers[[i, a]]).collect();
+            for j in i..k {
+                let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+                let (_phi, q, t) = matern_aniso_radial_scalars(r, spec.length_scale, spec.nu)?;
+                for a in 0..dim {
+                    let d1 = q * s_vec[a];
+                    let d2 = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                    raw_first[a][[i, j]] = d1;
+                    raw_first[a][[j, i]] = d1;
+                    raw_second_diag[a][[i, j]] = d2;
+                    raw_second_diag[a][[j, i]] = d2;
+                }
+            }
+        }
+        for a in 0..dim {
+            let projected_first = if let Some(z) = z_opt.as_ref() {
+                z.t().dot(&raw_first[a]).dot(z)
+            } else {
+                raw_first[a].clone()
+            };
+            let projected_second = if let Some(z) = z_opt.as_ref() {
+                z.t().dot(&raw_second_diag[a]).dot(z)
+            } else {
+                raw_second_diag[a].clone()
+            };
+            primary_first[a]
+                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(&projected_first);
+            primary_second_diag[a]
+                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(&projected_second);
+        }
+        let base = build_matern_basiswithworkspace(
+            data,
+            spec,
+            &mut BasisWorkspace::default(),
+        )?;
+        result.penalties_first = Vec::with_capacity(dim);
+        result.penalties_second_diag = Vec::with_capacity(dim);
+        for a in 0..dim {
+            let pf = active_matern_double_penalty_derivatives(
+                &base.penaltyinfo,
+                &primary_first[a],
+            )?;
+            let ps = active_matern_double_penalty_derivatives(
+                &base.penaltyinfo,
+                &primary_second_diag[a],
+            )?;
+            result.penalties_first.push(pf);
+            result.penalties_second_diag.push(ps);
+        }
+    } else {
+        // Operator penalty path: fractional weighting approach.
+        // dS_op/d(ψ_a) ≈ f_a · dS_op/d(ψ) where f_a = mean(s_a / r²).
+        let (iso_pen_first, iso_pen_second) = build_matern_operator_penalty_psi_derivatives(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            z_opt.as_ref(),
+            spec.aniso_log_scales.as_deref(),
+        )?;
+
+        let p = centers.nrows();
+        let d_spatial = centers.ncols();
+        let mut mean_frac = vec![0.0_f64; dim];
+        let mut npairs = 0usize;
+        for i in 0..p {
+            let ci: Vec<f64> = (0..d_spatial).map(|a| centers[[i, a]]).collect();
+            for j in 0..p {
+                let cj: Vec<f64> = (0..d_spatial).map(|a| centers[[j, a]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+                let r2 = r * r;
+                for a in 0..dim {
+                    mean_frac[a] += if r2 > 1e-28 {
+                        s_vec[a] / r2
+                    } else {
+                        1.0 / dim as f64
+                    };
+                }
+                npairs += 1;
+            }
+        }
+        if npairs > 0 {
+            for a in 0..dim {
+                mean_frac[a] /= npairs as f64;
+            }
+        }
+
+        result.penalties_first = Vec::with_capacity(dim);
+        result.penalties_second_diag = Vec::with_capacity(dim);
+        for a in 0..dim {
+            let w = mean_frac[a];
+            let pf: Vec<Array2<f64>> = iso_pen_first.iter().map(|m| m * w).collect();
+            let ps: Vec<Array2<f64>> = iso_pen_second.iter().map(|m| m * w).collect();
+            result.penalties_first.push(pf);
+            result.penalties_second_diag.push(ps);
+        }
+    }
+
+    Ok(result)
+}
+
 fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
     // In the partial fractions
     //   1 / (z^p (z + kappa^2)^s)
@@ -6195,13 +6700,20 @@ fn build_duchon_design_psi_derivativeswithworkspace(
         .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
             let mut local_psi = vec![0.0; k];
             let mut local_psi_psi = vec![0.0; k];
+            let aniso = spec.aniso_log_scales.as_deref();
             for j in 0..k {
-                let mut dist2 = 0.0;
-                for axis in 0..d {
-                    let delta = data[[i, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                let r = dist2.sqrt();
+                let r = if let Some(eta) = aniso {
+                    let data_row: Vec<f64> = (0..d).map(|a| data[[i, a]]).collect();
+                    let center: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+                    aniso_distance(&data_row, &center, eta)
+                } else {
+                    let mut dist2 = 0.0;
+                    for axis in 0..d {
+                        let delta = data[[i, axis]] - centers[[j, axis]];
+                        dist2 += delta * delta;
+                    }
+                    dist2.sqrt()
+                };
                 let core =
                     duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)?;
                 local_psi[j] = core.phi.psi;
@@ -6348,6 +6860,7 @@ pub fn create_duchon_spline_basiswithworkspace(
         length_scale,
         power,
         nullspace_order,
+        None, // create_duchon_spline_basis does not support anisotropy
         workspace,
     )?;
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
@@ -6409,6 +6922,7 @@ fn build_duchon_basis_designwithworkspace(
     length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonBasisDesign, BasisError> {
     let n = data.nrows();
@@ -6521,12 +7035,18 @@ fn build_duchon_basis_designwithworkspace(
             for local_i in 0..chunk.nrows() {
                 let i = chunk_start + local_i;
                 for j in 0..k {
-                    let mut dist2 = 0.0;
-                    for axis in 0..d {
-                        let delta = data[[i, axis]] - centers[[j, axis]];
-                        dist2 += delta * delta;
-                    }
-                    let r = dist2.sqrt();
+                    let r = if let Some(eta) = aniso_log_scales {
+                        let data_row: Vec<f64> = (0..d).map(|a| data[[i, a]]).collect();
+                        let center: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+                        aniso_distance(&data_row, &center, eta)
+                    } else {
+                        let mut dist2 = 0.0;
+                        for axis in 0..d {
+                            let delta = data[[i, axis]] - centers[[j, axis]];
+                            dist2 += delta * delta;
+                        }
+                        dist2.sqrt()
+                    };
                     kernel_row[j] = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
                         if r == 0.0 && p_order > 0 {
@@ -6585,12 +7105,19 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    // Initialize anisotropy contrasts from knot cloud geometry when the caller
+    // enabled scale-dimensions but left η at the zero default.
+    let aniso = maybe_initialize_aniso_contrasts(
+        centers.view(),
+        spec.aniso_log_scales.as_deref(),
+    );
     let d = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
         spec.length_scale,
         spec.power,
         spec.nullspace_order,
+        aniso.as_deref(),
         workspace,
     )?;
     let basis = d.basis;
@@ -6611,6 +7138,7 @@ pub fn build_duchon_basiswithworkspace(
         spec.length_scale,
         spec.power,
         spec.nullspace_order,
+        aniso.as_deref(),
         identifiability_transform.as_ref().map(|z| z.view()),
         workspace,
     )?;
@@ -6628,6 +7156,7 @@ pub fn build_duchon_basiswithworkspace(
             nullspace_order: spec.nullspace_order,
             identifiability_transform,
             input_scales: None,
+            aniso_log_scales: aniso,
         },
     })
 }
@@ -10871,6 +11400,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
+            aniso_log_scales: None,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         match &out.metadata {
@@ -10898,6 +11428,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
+            aniso_log_scales: None,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
 
@@ -10938,6 +11469,7 @@ mod tests {
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -10972,6 +11504,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penaltyinfo.len(), 3);
@@ -11080,6 +11613,7 @@ mod tests {
             include_intercept: false,
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -11112,6 +11646,7 @@ mod tests {
             include_intercept: true,
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -11131,6 +11666,7 @@ mod tests {
             include_intercept: false,
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -11151,6 +11687,7 @@ mod tests {
             include_intercept: true,
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -11175,6 +11712,7 @@ mod tests {
             include_intercept: false,
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -11241,6 +11779,7 @@ mod tests {
             include_intercept: true,
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -11286,6 +11825,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
         };
         let mut workspace = BasisWorkspace::default();
         let derivative = build_duchon_basis_log_kappa_derivativewithworkspace(
@@ -11352,6 +11892,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
         };
         let mut workspace = BasisWorkspace::default();
         let second_derivative = build_duchon_basis_log_kappasecond_derivativewithworkspace(
@@ -11814,6 +12355,7 @@ mod tests {
             include_intercept: false,
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
+            aniso_log_scales: None,
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -11865,6 +12407,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
         };
         let analytic = build_duchon_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Duchon second derivative should build");
@@ -11938,6 +12481,7 @@ mod tests {
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
         };
         let out =
             build_duchon_basis(data.view(), &spec).expect("pure Duchon default tuple should build");
@@ -12364,6 +12908,7 @@ mod tests {
             MaternNu::FiveHalves,
             false,
             None,
+            None,
         )
         .expect("matern ops");
         assert!(m_ops.d1.iter().all(|v| v.is_finite()));
@@ -12392,6 +12937,7 @@ mod tests {
             MaternNu::FiveHalves,
             false,
             None,
+            None, // aniso_log_scales
         )
         .expect("unit weights");
         let weights = array![4.0, 1.0];
@@ -12402,6 +12948,7 @@ mod tests {
             MaternNu::FiveHalves,
             false,
             None,
+            None, // aniso_log_scales
         )
         .expect("weighted");
         // First collocation row should scale by sqrt(4)=2.

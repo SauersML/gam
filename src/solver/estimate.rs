@@ -1224,6 +1224,9 @@ pub struct ExternalOptimOptions {
     /// - `Some(false)`: force Firth off
     /// - `None`: use family default behavior
     pub firth_bias_reduction: Option<bool>,
+    /// Relative shrinkage floor for penalized block eigenvalues.
+    /// See [`FitOptions::penalty_shrinkage_floor`] for details.
+    pub penalty_shrinkage_floor: Option<f64>,
 }
 
 fn resolve_external_family(
@@ -1501,6 +1504,7 @@ where
         None,
         fit_linear_constraints.clone(),
     )?;
+    reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
     let smoothing_options = crate::solver::smoothing::SmoothingBfgsOptions {
@@ -2293,6 +2297,7 @@ where
             p,
             coefficient_lower_bounds: None,
             linear_constraints_original: fit_linear_constraints.as_ref(),
+            penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
         },
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2468,6 +2473,7 @@ where
                             p,
                             coefficient_lower_bounds: None,
                             linear_constraints_original: fit_linear_constraints.as_ref(),
+                            penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
                         },
                         &pirls::PirlsConfig {
                             link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2933,6 +2939,21 @@ pub struct FitOptions {
     pub nullspace_dims: Vec<usize>,
     pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
     pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
+    /// Relative shrinkage floor for penalized block eigenvalues.
+    ///
+    /// When `Some(epsilon)`, a rho-independent ridge of magnitude
+    /// `epsilon * max_balanced_eigenvalue` is added to each eigenvalue of the
+    /// combined penalty on the penalized block. This acts as a weak proper
+    /// complexity prior that prevents barely-penalized directions from causing
+    /// pathological non-Gaussianity in the posterior (e.g., extreme skewness
+    /// under logit link with high-dimensional spatial smooths).
+    ///
+    /// The ridge is rho-independent, so LAML gradients remain correct without
+    /// modification (d(epsilon*I)/d(rho_k) = 0).
+    ///
+    /// Typical value: `Some(1e-6)`. Set to `None` or `Some(0.0)` to disable.
+    /// Default: `Some(1e-6)`.
+    pub penalty_shrinkage_floor: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4060,6 +4081,7 @@ where
         nullspace_dims: opts.nullspace_dims.clone(),
         linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: None,
+        penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
     };
 
     let result = if matches!(
@@ -4328,6 +4350,7 @@ where
         None,
         fit_linear_constraints,
     )?;
+    reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
@@ -4395,6 +4418,7 @@ where
         None,
         fit_linear_constraints,
     )?;
+    reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
@@ -4478,6 +4502,7 @@ where
         None,
         fit_linear_constraints,
     )?;
+    reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
@@ -4885,6 +4910,7 @@ mod fd_policy_tests {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -5078,6 +5104,7 @@ mod fd_policy_tests {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -5224,6 +5251,7 @@ mod fd_policy_tests {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];

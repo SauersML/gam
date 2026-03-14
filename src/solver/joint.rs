@@ -1935,6 +1935,7 @@ impl<'a> JointRemlState<'a> {
                 &lambda_base.to_vec(),
                 EngineDims::new(state.layout_base.p, base_rs_list.len()),
                 invariant,
+                None, // Joint fitting does not apply shrinkage floor independently
             )
         } else {
             stable_reparameterization_engine(

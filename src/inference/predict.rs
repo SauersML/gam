@@ -353,9 +353,10 @@ impl PredictableModel for GaussianLocationScalePredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        _fit: &FitResult,
+        fit: &FitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
+        let _ = fit; // not needed for Gaussian LS intervals
         let pred = self.predict_with_uncertainty(input)?;
         let sigma = pred.mean_se.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sigma for Gaussian LS intervals".to_string())
@@ -385,9 +386,10 @@ impl PredictableModel for GaussianLocationScalePredictor {
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        _fit: &FitResult,
+        fit: &FitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Gaussian identity link: posterior mean = point estimate (no nonlinearity).
+        let _ = fit;
         let result = self.predict_response(input)?;
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -398,6 +400,531 @@ impl PredictableModel for GaussianLocationScalePredictor {
         Ok(PredictPosteriorMeanResult {
             eta: result.eta,
             eta_standard_error: sigma,
+            mean: result.mean,
+        })
+    }
+
+    fn n_blocks(&self) -> usize {
+        2
+    }
+
+    fn block_roles(&self) -> Vec<BlockRole> {
+        vec![BlockRole::Location, BlockRole::Scale]
+    }
+}
+
+/// Binomial location-scale predictor: two blocks (threshold + log-sigma).
+///
+/// Predicts probabilities through the threshold-scale parameterisation:
+///   eta_t = X_threshold @ beta_threshold + offset
+///   eta_s = X_noise @ beta_noise + offset_noise
+///   sigma = exp(eta_s)
+///   q0    = -eta_t / sigma
+///   prob  = inverse_link(q0)
+///
+/// Delta-method SEs propagate through the chain rule of q0 w.r.t. both
+/// linear predictors.
+pub struct BinomialLocationScalePredictor {
+    pub beta_threshold: Array1<f64>,
+    pub beta_noise: Array1<f64>,
+    pub covariance: Option<Array2<f64>>,
+    pub inverse_link: InverseLink,
+}
+
+impl BinomialLocationScalePredictor {
+    pub(crate) fn from_unified(
+        unified: &UnifiedFitResult,
+        inverse_link: InverseLink,
+    ) -> Result<Self, EstimationError> {
+        let beta_threshold = unified
+            .blocks
+            .iter()
+            .find(|b| matches!(b.role, BlockRole::Location | BlockRole::Mean))
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Binomial location-scale model missing location/mean block".to_string(),
+                )
+            })?;
+        let beta_noise = unified
+            .blocks
+            .iter()
+            .find(|b| matches!(b.role, BlockRole::Scale))
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Binomial location-scale model missing scale block".to_string(),
+                )
+            })?;
+        Ok(Self {
+            beta_threshold,
+            beta_noise,
+            covariance: unified.covariance_conditional.clone(),
+            inverse_link,
+        })
+    }
+
+    /// Compute q0 = -eta_t / sigma for each observation, where
+    /// eta_t is the threshold linear predictor and sigma = exp(eta_s).
+    ///
+    /// Returns (q0, sigma, eta_t).
+    fn compute_q0_and_sigma(
+        &self,
+        input: &PredictInput,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let eta_t = input.design.dot(&self.beta_threshold) + &input.offset;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Binomial location-scale prediction requires noise design matrix".to_string(),
+            )
+        })?;
+        let offset_noise = input
+            .offset_noise
+            .as_ref()
+            .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
+        let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
+        let sigma = eta_s.mapv(f64::exp);
+        let q0 = Array1::from_shape_fn(eta_t.len(), |i| -eta_t[i] / sigma[i]);
+        Ok((q0, sigma, eta_t))
+    }
+
+    /// Apply the inverse link to q0 to get probabilities.
+    fn apply_link(&self, q0: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        let mut prob = Array1::zeros(q0.len());
+        for i in 0..q0.len() {
+            let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                &self.inverse_link,
+                q0[i],
+            )?;
+            prob[i] = jet.mu.clamp(0.0, 1.0);
+        }
+        Ok(prob)
+    }
+}
+
+impl PredictableModel for BinomialLocationScalePredictor {
+    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
+        let (q0, _sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let prob = self.apply_link(&q0)?;
+        Ok(PredictResult {
+            eta: eta_t,
+            mean: prob,
+        })
+    }
+
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError> {
+        let (q0, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let prob = self.apply_link(&q0)?;
+
+        let mean_se = if let Some(ref cov) = self.covariance {
+            let n = eta_t.len();
+            let p_t = self.beta_threshold.len();
+            let p_s = self.beta_noise.len();
+            let p_total = p_t + p_s;
+
+            if cov.nrows() != p_total || cov.ncols() != p_total {
+                return Err(EstimationError::InvalidInput(format!(
+                    "covariance dimension mismatch for binomial LS: expected {}x{}, got {}x{}",
+                    p_total,
+                    p_total,
+                    cov.nrows(),
+                    cov.ncols()
+                )));
+            }
+
+            let design_noise = input.design_noise.as_ref().unwrap();
+            let mut se = Array1::zeros(n);
+
+            for i in 0..n {
+                // Derivative of inverse link at q0: d(prob)/d(q0) = jet.d1
+                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                    &self.inverse_link,
+                    q0[i],
+                )?;
+                let dphi = jet.d1;
+
+                // q0 = -eta_t / sigma, sigma = exp(eta_s)
+                // d(q0)/d(eta_t) = -1 / sigma
+                // d(q0)/d(eta_s) = d(q0)/d(sigma) * d(sigma)/d(eta_s)
+                //                = (eta_t / sigma^2) * sigma = eta_t / sigma
+                // d(prob)/d(eta_t) = dphi * (-1 / sigma)
+                // d(prob)/d(eta_s) = dphi * (eta_t / sigma)
+                let dprob_deta_t = dphi * (-1.0 / sigma[i]);
+                let dprob_deta_s = dphi * (eta_t[i] / sigma[i]);
+
+                // Build gradient: [dprob/d(beta_t), dprob/d(beta_s)]
+                let mut grad = Vec::with_capacity(p_total);
+                for j in 0..p_t {
+                    grad.push(dprob_deta_t * input.design.get(i, j));
+                }
+                for j in 0..p_s {
+                    grad.push(dprob_deta_s * design_noise.get(i, j));
+                }
+
+                let var = quadratic_form(cov, &grad)?;
+                se[i] = var.sqrt();
+            }
+            Some(se)
+        } else {
+            None
+        };
+
+        Ok(PredictionWithSE {
+            eta: eta_t,
+            mean: prob,
+            eta_se: None,
+            mean_se,
+        })
+    }
+
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+        options: &PredictUncertaintyOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError> {
+        let _ = fit; // not needed for binomial LS intervals
+        let pred = self.predict_with_uncertainty(input)?;
+        let z = standard_normal_quantile(0.5 + options.confidence_level * 0.5)
+            .map_err(EstimationError::InvalidInput)?;
+
+        let mean_se = pred
+            .mean_se
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Array1::zeros(pred.mean.len()));
+
+        let mut mean_lower = &pred.mean - &mean_se.mapv(|s| z * s);
+        let mut mean_upper = &pred.mean + &mean_se.mapv(|s| z * s);
+        // Clamp probabilities to [0, 1].
+        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+
+        // For binomial LS, eta intervals on the threshold predictor are not
+        // directly meaningful for response-scale inference. Provide the
+        // response-scale SE as the primary uncertainty measure.
+        Ok(PredictUncertaintyResult {
+            eta: pred.eta.clone(),
+            mean: pred.mean.clone(),
+            eta_standard_error: mean_se.clone(),
+            mean_standard_error: mean_se,
+            eta_lower: pred.eta.clone(),
+            eta_upper: pred.eta,
+            mean_lower,
+            mean_upper,
+            observation_lower: None,
+            observation_upper: None,
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: false,
+        })
+    }
+
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        // Full posterior mean with 2D quadrature over (eta_t, eta_s) uncertainty
+        // is too complex to extract here. Return point prediction.
+        let _ = fit;
+        let (q0, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let prob = self.apply_link(&q0)?;
+        let eta_se = if let Some(ref cov) = self.covariance {
+            let n = eta_t.len();
+            let p_t = self.beta_threshold.len();
+            let p_s = self.beta_noise.len();
+            let p_total = p_t + p_s;
+            if cov.nrows() == p_total && cov.ncols() == p_total {
+                let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "Binomial location-scale posterior mean requires noise design matrix"
+                            .to_string(),
+                    )
+                })?;
+                let mut se = Array1::zeros(n);
+                for i in 0..n {
+                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                        &self.inverse_link,
+                        q0[i],
+                    )?;
+                    let dphi = jet.d1;
+                    let dprob_deta_t = dphi * (-1.0 / sigma[i]);
+                    let dprob_deta_s = dphi * (eta_t[i] / sigma[i]);
+                    let mut grad = Vec::with_capacity(p_total);
+                    for j in 0..p_t {
+                        grad.push(dprob_deta_t * input.design.get(i, j));
+                    }
+                    for j in 0..p_s {
+                        grad.push(dprob_deta_s * design_noise.get(i, j));
+                    }
+                    let var = quadratic_form(cov, &grad)?;
+                    se[i] = var.sqrt();
+                }
+                se
+            } else {
+                Array1::zeros(n)
+            }
+        } else {
+            Array1::zeros(eta_t.len())
+        };
+        Ok(PredictPosteriorMeanResult {
+            eta: eta_t,
+            eta_standard_error: eta_se,
+            mean: prob,
+        })
+    }
+
+    fn n_blocks(&self) -> usize {
+        2
+    }
+
+    fn block_roles(&self) -> Vec<BlockRole> {
+        vec![BlockRole::Location, BlockRole::Scale]
+    }
+}
+
+/// Survival location-scale predictor: two blocks (threshold + log-sigma).
+///
+/// Predicts survival probability via:
+///   q0 = -eta_threshold / exp(eta_log_sigma)
+///   survival_prob = 1 - inverse_link(q0)
+///
+/// The "design" in `PredictInput` is the threshold design matrix, and
+/// "design_noise" is the log-sigma design matrix. The time dimension
+/// (x_time_exit) is handled externally and is not part of this predictor.
+pub struct SurvivalPredictor {
+    pub beta_threshold: Array1<f64>,
+    pub beta_log_sigma: Array1<f64>,
+    pub covariance: Option<Array2<f64>>,
+    pub inverse_link: InverseLink,
+}
+
+impl SurvivalPredictor {
+    /// Build a `SurvivalPredictor` from a `UnifiedFitResult`, extracting betas
+    /// from blocks by role: Location/Mean → beta_threshold, Scale → beta_log_sigma.
+    pub(crate) fn from_unified(
+        unified: &UnifiedFitResult,
+        inverse_link: InverseLink,
+    ) -> Result<Self, EstimationError> {
+        let beta_threshold = unified
+            .blocks
+            .iter()
+            .find(|b| matches!(b.role, BlockRole::Location | BlockRole::Mean))
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Survival model missing location/mean (threshold) block".to_string(),
+                )
+            })?;
+        let beta_log_sigma = unified
+            .blocks
+            .iter()
+            .find(|b| matches!(b.role, BlockRole::Scale))
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Survival model missing scale (log-sigma) block".to_string(),
+                )
+            })?;
+        Ok(Self {
+            beta_threshold,
+            beta_log_sigma,
+            covariance: unified.covariance_conditional.clone(),
+            inverse_link,
+        })
+    }
+
+    /// Compute q0 = -eta_threshold / sigma and survival_prob = 1 - F(q0).
+    fn compute_survival(
+        &self,
+        eta_threshold: &Array1<f64>,
+        eta_log_sigma: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let n = eta_threshold.len();
+        let strategy = strategy_for_family(
+            crate::types::LikelihoodFamily::BinomialProbit,
+            Some(&self.inverse_link),
+        );
+        let mut survival_prob = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let sigma = eta_log_sigma[i].exp();
+            let q0 = -eta_threshold[i] / sigma;
+            // survival = 1 - F(q0) = F(-q0)
+            let jet = strategy.inverse_link_jet(-q0)?;
+            survival_prob[i] = jet.mu.clamp(0.0, 1.0);
+        }
+        Ok(survival_prob)
+    }
+}
+
+impl PredictableModel for SurvivalPredictor {
+    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
+        let eta_threshold = input.design.dot(&self.beta_threshold) + &input.offset;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival prediction requires noise (log-sigma) design matrix".to_string(),
+            )
+        })?;
+        let offset_noise = input.offset_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival prediction requires noise (log-sigma) offset".to_string(),
+            )
+        })?;
+        let eta_log_sigma = design_noise.dot(&self.beta_log_sigma) + offset_noise;
+        let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+        Ok(PredictResult {
+            eta: eta_threshold,
+            mean: survival_prob,
+        })
+    }
+
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError> {
+        let eta_threshold = input.design.dot(&self.beta_threshold) + &input.offset;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival prediction requires noise (log-sigma) design matrix".to_string(),
+            )
+        })?;
+        let offset_noise = input.offset_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival prediction requires noise (log-sigma) offset".to_string(),
+            )
+        })?;
+        let eta_log_sigma = design_noise.dot(&self.beta_log_sigma) + offset_noise;
+        let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+
+        let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
+            let n = eta_threshold.len();
+            let p_t = self.beta_threshold.len();
+            let p_s = self.beta_log_sigma.len();
+
+            // Eta SE for threshold linear predictor only.
+            let cov_tt = cov.slice(ndarray::s![..p_t, ..p_t]).to_owned();
+            let eta_se = eta_standard_errors_from_design(&input.design, &cov_tt)?;
+
+            // Delta-method SE for survival probability.
+            // Convert design matrices to dense for element access.
+            let x_t_dense = input.design.to_dense();
+            let x_s_dense = design_noise.to_dense();
+            let strategy = strategy_for_family(
+                crate::types::LikelihoodFamily::BinomialProbit,
+                Some(&self.inverse_link),
+            );
+            let mut mean_se_vec = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let sigma = eta_log_sigma[i].exp();
+                let q0 = -eta_threshold[i] / sigma;
+                // surv = F(-q0), so d(surv)/d(q0) = -F'(-q0) = -phi(-q0)
+                let jet = strategy.inverse_link_jet(-q0)?;
+                let phi_neg_q0 = jet.d1; // F'(-q0) = phi(-q0)
+
+                // d(q0)/d(eta_t) = -1/sigma
+                // d(q0)/d(eta_s) = eta_t/sigma  (since q0 = -eta_t/sigma)
+                // d(surv)/d(eta_t) = -phi_neg_q0 * (-1/sigma) = phi_neg_q0 / sigma
+                // d(surv)/d(eta_s) = -phi_neg_q0 * (eta_t/sigma)
+                let dsurv_deta_t = phi_neg_q0 / sigma;
+                let dsurv_deta_s = -phi_neg_q0 * eta_threshold[i] / sigma;
+
+                // Build combined gradient: [dsurv/d(beta_t), dsurv/d(beta_s)]
+                let mut grad = Vec::with_capacity(p_t + p_s);
+                for j in 0..p_t {
+                    grad.push(dsurv_deta_t * x_t_dense[[i, j]]);
+                }
+                for j in 0..p_s {
+                    grad.push(dsurv_deta_s * x_s_dense[[i, j]]);
+                }
+
+                let var = quadratic_form(cov, &grad)?;
+                mean_se_vec[i] = var.sqrt();
+            }
+            (Some(eta_se), Some(mean_se_vec))
+        } else {
+            (None, None)
+        };
+
+        Ok(PredictionWithSE {
+            eta: eta_threshold,
+            mean: survival_prob,
+            eta_se,
+            mean_se,
+        })
+    }
+
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+        options: &PredictUncertaintyOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError> {
+        let _ = fit; // not needed for survival LS intervals
+        let pred = self.predict_with_uncertainty(input)?;
+        let z = crate::probability::standard_normal_quantile(
+            0.5 + options.confidence_level * 0.5,
+        )
+        .map_err(|e| EstimationError::InvalidInput(e))?;
+
+        let eta_se = pred.eta_se.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival full uncertainty requires covariance (eta_se unavailable)".to_string(),
+            )
+        })?;
+        let mean_se = pred.mean_se.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival full uncertainty requires covariance (mean_se unavailable)".to_string(),
+            )
+        })?;
+
+        let eta_lower = &pred.eta - &eta_se.mapv(|s| z * s);
+        let eta_upper = &pred.eta + &eta_se.mapv(|s| z * s);
+        let mut mean_lower = &pred.mean - &mean_se.mapv(|s| z * s);
+        let mut mean_upper = &pred.mean + &mean_se.mapv(|s| z * s);
+        // Clamp survival probabilities to [0, 1].
+        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+
+        Ok(PredictUncertaintyResult {
+            eta: pred.eta,
+            mean: pred.mean,
+            eta_standard_error: eta_se.clone(),
+            mean_standard_error: mean_se.clone(),
+            eta_lower,
+            eta_upper,
+            mean_lower,
+            mean_upper,
+            observation_lower: None,
+            observation_upper: None,
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: false,
+        })
+    }
+
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        fit: &FitResult,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        // Exact posterior mean integration not yet implemented for survival.
+        // Return point prediction as approximation.
+        let _ = fit;
+        let result = self.predict_response(input)?;
+        let eta_se = if let Some(ref cov) = self.covariance {
+            let p_t = self.beta_threshold.len();
+            eta_standard_errors_from_design(
+                &input.design,
+                &cov.slice(ndarray::s![..p_t, ..p_t]).to_owned(),
+            )?
+        } else {
+            Array1::zeros(result.eta.len())
+        };
+        Ok(PredictPosteriorMeanResult {
+            eta: result.eta,
+            eta_standard_error: eta_se,
             mean: result.mean,
         })
     }

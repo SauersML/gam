@@ -2003,6 +2003,8 @@ pub(crate) struct RemlState<'a> {
     nullspace_dims: Vec<usize>,
     coefficient_lower_bounds: Option<Array1<f64>>,
     linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    /// Relative shrinkage floor for penalized block eigenvalues (rho-independent).
+    penalty_shrinkage_floor: Option<f64>,
 
     cache_manager: EvalCacheManager,
     arena: RemlArena,

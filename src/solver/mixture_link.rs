@@ -34,6 +34,30 @@ fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
 }
 
 #[inline]
+fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
+    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
+}
+
+#[inline]
+fn stable_nonnegative_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
+    if coeffs.is_empty() || !x.is_finite() {
+        return 0.0;
+    }
+    if x <= 600.0 {
+        return horner_polynomial(x, coeffs) * (-x).exp();
+    }
+
+    let inv_x = x.recip();
+    let mut tail = 0.0;
+    for &c in coeffs {
+        tail = tail * inv_x + c;
+    }
+    let degree = (coeffs.len() - 1) as f64;
+    let scale = (degree * x.ln() - x).exp();
+    scale * tail
+}
+
+#[inline]
 fn logistic_stable(eta: f64) -> f64 {
     if eta.is_nan() {
         f64::NAN
@@ -157,8 +181,10 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
                 return 0.0;
             }
             let t = eta.exp();
-            let d1 = t * (-t).exp();
-            d1 * (1.0 - 7.0 * t + 6.0 * t * t - t * t * t)
+            canonicalzero(stable_nonnegative_poly_times_exp_neg(
+                t,
+                &[0.0, 1.0, -7.0, 6.0, -1.0],
+            ))
         }
         LinkComponent::LogLog => {
             // LogLog link is the reflected cloglog family with `r = exp(-eta)`:
@@ -174,8 +200,10 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
                 return 0.0;
             }
             let r = (-eta).exp();
-            let d1 = (-r).exp() * r;
-            d1 * (r * r * r - 6.0 * r * r + 7.0 * r - 1.0)
+            canonicalzero(stable_nonnegative_poly_times_exp_neg(
+                r,
+                &[0.0, -1.0, 7.0, -6.0, 1.0],
+            ))
         }
         LinkComponent::Cauchit => {
             // Cauchit link:
@@ -442,7 +470,8 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                     d3: f64::NAN,
                 };
             }
-            if eta == f64::INFINITY {
+            let t = eta.exp();
+            if !t.is_finite() {
                 return InverseLinkJet {
                     mu: 1.0,
                     d1: 0.0,
@@ -450,24 +479,11 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                     d3: 0.0,
                 };
             }
-            if eta == f64::NEG_INFINITY {
-                return InverseLinkJet {
-                    mu: 0.0,
-                    d1: 0.0,
-                    d2: 0.0,
-                    d3: 0.0,
-                };
-            }
-            let t = eta.exp();
-            let s = (-t).exp();
-            let d1 = t * s;
-            let d2 = -d1 * (t - 1.0);
-            let d3 = d1 * (t * t - 3.0 * t + 1.0);
             InverseLinkJet {
-                mu: 1.0 - s,
-                d1,
-                d2,
-                d3,
+                mu: -(-t).exp_m1(),
+                d1: stable_nonnegative_poly_times_exp_neg(t, &[0.0, 1.0]),
+                d2: stable_nonnegative_poly_times_exp_neg(t, &[0.0, 1.0, -1.0]),
+                d3: stable_nonnegative_poly_times_exp_neg(t, &[0.0, 1.0, -3.0, 1.0]),
             }
         }
         LinkComponent::LogLog => {
@@ -479,15 +495,8 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                     d3: f64::NAN,
                 };
             }
-            if eta == f64::INFINITY {
-                return InverseLinkJet {
-                    mu: 1.0,
-                    d1: 0.0,
-                    d2: 0.0,
-                    d3: 0.0,
-                };
-            }
-            if eta == f64::NEG_INFINITY {
+            let r = (-eta).exp();
+            if !r.is_finite() {
                 return InverseLinkJet {
                     mu: 0.0,
                     d1: 0.0,
@@ -495,12 +504,12 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                     d3: 0.0,
                 };
             }
-            let r = (-eta).exp();
-            let mu = (-r).exp();
-            let d1 = mu * r;
-            let d2 = d1 * (r - 1.0);
-            let d3 = d1 * (r * r - 3.0 * r + 1.0);
-            InverseLinkJet { mu, d1, d2, d3 }
+            InverseLinkJet {
+                mu: (-r).exp(),
+                d1: stable_nonnegative_poly_times_exp_neg(r, &[0.0, 1.0]),
+                d2: stable_nonnegative_poly_times_exp_neg(r, &[0.0, -1.0, 1.0]),
+                d3: stable_nonnegative_poly_times_exp_neg(r, &[0.0, 1.0, -3.0, 1.0]),
+            }
         }
         LinkComponent::Cauchit => {
             if eta.is_nan() {
