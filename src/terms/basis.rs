@@ -5076,7 +5076,8 @@ fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) 
     let mut r2 = 0.0;
     for a in 0..d {
         let h_a = data_row[a] - center[a];
-        let w_a = (2.0 * eta[a]).exp();
+        // Clamp exp(2η) to avoid overflow/underflow: η ∈ [-50, 50] → exp(2η) ∈ [~1e-44, ~1e43].
+        let w_a = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
         let s_a = w_a * h_a * h_a;
         s_vec.push(s_a);
         r2 += s_a;
@@ -5095,7 +5096,7 @@ fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
     let mut r2 = 0.0;
     for a in 0..data_row.len() {
         let h_a = data_row[a] - center[a];
-        let w_a = (2.0 * eta[a]).exp();
+        let w_a = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
         r2 += w_a * h_a * h_a;
     }
     r2.sqrt()
@@ -6775,7 +6776,12 @@ fn build_matern_design_psi_aniso_derivatives(
     let n = data.nrows();
     let k = centers.nrows();
     let dim = data.ncols();
-    debug_assert_eq!(eta.len(), dim);
+    if eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Duchon aniso design derivatives: eta.len()={} != data dimension {dim}",
+            eta.len()
+        )));
+    }
 
     // Raw kernel-level per-axis derivatives: (n x k) matrices.
     let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
@@ -7065,7 +7071,12 @@ fn build_duchon_design_psi_aniso_derivatives(
     let n = data.nrows();
     let k = centers.nrows();
     let dim = data.ncols();
-    debug_assert_eq!(eta.len(), dim);
+    if eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Duchon aniso penalty derivatives: eta.len()={} != data dimension {dim}",
+            eta.len()
+        )));
+    }
 
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
