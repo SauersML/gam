@@ -16,45 +16,45 @@ warnings = "deny"
 
 [dependencies]
 ahash = "0.8.12"
-clap = { version = "4.5.39", features = ["derive"] }
-comfy-table = "7.1.4"
+clap = { version = "4.6.0", features = ["derive"] }
+comfy-table = "7.2.2"
 rayon = "1.11.0"
 crossbeam-queue = "0.3.12"
-tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 num_cpus = "1.17.0"
 rand = "0.10.0"
-rand08 = { package = "rand", version = "0.8.5" }
+rand08 = { package = "rand", version = "0.10.0" }
 polya-gamma = "0.5.3"
-ryu = "1.0.20"
+ryu = "1.0.23"
 crossbeam-channel = "0.5.15"
-indicatif = "0.18"
-ndarray = { version = "0.17.1", features = ["serde", "rayon"] }
+indicatif = "0.18.4"
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.17"
-toml = "0.9.7"
+thiserror = "2.0.18"
+toml = "1.0.6"
 opt = "0.1.0"
-log = "0.4.28"
+log = "0.4.29"
 csv = "1.4.0"
-faer = "0.23.2"
+faer = "0.24.0"
 spindle = "0.2.6"
 dyn-stack = "0.13.2"
-serde_json = "1.0.145"
-sysinfo = "0.30.12"
-ratatui = "0.30"
-crossterm = "0.28.1"
-burn = { version = "0.19.1", default-features = false }
-cudarc = { version = "0.19.2", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "dynamic-loading", "cuda-12000"] }
-criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1.0.149"
+sysinfo = "0.38.4"
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+burn = { version = "0.20.1", default-features = false }
+cudarc = { version = "0.19.3", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "dynamic-loading", "cuda-12000"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 rand_distr = "0.6.0"
-tempfile = "3.21"
-approx = "0.5"
-reqwest = { version = "0.12.8", features = ["blocking", "rustls-tls"] }
-zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
-logtest = "2"
-serial_test = "3.2.0"
+tempfile = "3.27.0"
+approx = "0.5.1"
+reqwest = { version = "0.13.2", features = ["blocking", "rustls"] }
+zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
+logtest = "2.0.0"
+serial_test = "3.4.0"
 statrs = "0.18.0"
-pest = "2.8.3"
-pest_derive = "2.8.3"
+pest = "2.8.6"
+pest_derive = "2.8.6"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
@@ -62,13 +62,13 @@ version = "0.9.0"
 default-features = false
 
 [dev-dependencies]
-num-dual = "0.13.4"
+num-dual = "0.13.6"
 autodiff = "0.7.0"
 ad_trait = "0.2.2"
 
 [build-dependencies]
-walkdir = "2"
-grep = "0.3"
+walkdir = "2.5.0"
+grep = "0.4.1"
 
 [[bin]]
 name = "gam"
