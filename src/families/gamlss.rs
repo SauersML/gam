@@ -1528,7 +1528,7 @@ pub fn fit_binomial_location_scalewiggle(
 }
 
 trait LocationScaleFamilyBuilder {
-    type Family: CustomFamily;
+    type Family: CustomFamily + Clone + Send + Sync + 'static;
 
     fn meanspec(&self) -> &TermCollectionSpec;
     fn noisespec(&self) -> &TermCollectionSpec;

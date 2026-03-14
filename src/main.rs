@@ -1451,6 +1451,237 @@ fn run_fitwith_predict_noise(
     Ok(())
 }
 
+/// Returns `true` when a model requires special-case prediction handling that
+/// cannot go through the unified `PredictableModel` path.
+///
+/// Special cases:
+/// - **Survival**: time basis construction, entry/exit handling, location-scale
+///   sub-branch, and time wiggles are deeply model-specific.
+/// - **BinomialLocationScale** with link wiggles: the wiggle-augmented q0
+///   prediction path (probit-wiggle, joint conditional integration) is not
+///   captured by `BinomialLocationScalePredictor`.
+/// - **Standard** with link wiggles or joint flexible link: the `StandardPredictor`
+///   does not handle these augmented prediction paths.
+fn needs_special_predict_handling(model: &SavedModel) -> bool {
+    match model.predict_model_class() {
+        // Survival always needs specialised handling (time basis, entry/exit).
+        PredictModelClass::Survival => true,
+        // Binomial location-scale with link wiggles needs the hand-rolled path.
+        PredictModelClass::BinomialLocationScale => model.betawiggle.is_some(),
+        // Standard models with wiggle or joint link need their special paths.
+        PredictModelClass::Standard => {
+            let family = model.likelihood();
+            let has_wiggle = model.betawiggle.is_some() && is_binomial_family(family);
+            let has_joint = model.joint_beta_link.is_some();
+            has_wiggle || has_joint
+        }
+        // GaussianLocationScale always goes through the unified path.
+        PredictModelClass::GaussianLocationScale => false,
+    }
+}
+
+/// Build a `PredictInput` for any model type that can go through the unified
+/// `PredictableModel` path.
+///
+/// - **Standard**: single design from `resolved_termspec`, zero offset, no noise design.
+/// - **GaussianLocationScale**: mean design from `resolved_termspec`, noise design
+///   from `resolved_termspec_noise`, with scale deviation transform applied.
+/// - **BinomialLocationScale** (no wiggle): threshold design from `resolved_termspec`,
+///   noise design from `resolved_termspec_noise`, with scale deviation transform applied.
+///
+/// Survival models and special-case models should not call this function; they are
+/// handled by the model-specific `run_predict_*` functions.
+fn build_predict_input_for_model(
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+) -> Result<PredictInput, String> {
+    let spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build prediction design: {e}"))?;
+    let n = data.nrows();
+    let offset = Array1::zeros(n);
+
+    match model.predict_model_class() {
+        PredictModelClass::Standard => {
+            let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+            let beta = fit_saved.beta.clone();
+            if beta.len() != design.design.ncols() {
+                return Err(format!(
+                    "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
+                    beta.len(),
+                    design.design.ncols()
+                ));
+            }
+            Ok(PredictInput {
+                design: DesignMatrix::Dense(design.design),
+                offset,
+                design_noise: None,
+                offset_noise: None,
+            })
+        }
+        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
+            // Build the noise/scale design from resolved_termspec_noise.
+            let spec_noise = resolve_termspec_for_prediction(
+                &model.resolved_termspec_noise,
+                training_headers,
+                col_map,
+                "resolved_termspec_noise",
+            )?;
+            let design_noise_raw = build_term_collection_design(data, &spec_noise)
+                .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
+
+            // Apply the scale deviation transform if present.
+            let noise_transform = scale_transform_from_payload(
+                &model.noise_projection,
+                &model.noise_center,
+                &model.noise_scale,
+                model.noise_non_intercept_start,
+            )?;
+            let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+                apply_scale_deviation_transform(
+                    &design.design,
+                    &design_noise_raw.design,
+                    transform,
+                )?
+            } else {
+                design_noise_raw.design.clone()
+            };
+
+            Ok(PredictInput {
+                design: DesignMatrix::Dense(design.design),
+                offset,
+                design_noise: Some(DesignMatrix::Dense(prepared_noise_design)),
+                offset_noise: Some(Array1::zeros(n)),
+            })
+        }
+        PredictModelClass::Survival => {
+            Err("build_predict_input_for_model should not be called for survival models".to_string())
+        }
+    }
+}
+
+/// Unified prediction + CSV output path for models that go through `PredictableModel`.
+///
+/// Handles the three prediction modes (simple, posterior-mean, uncertainty) and
+/// writes the appropriate CSV format for the model class.
+fn run_predict_unified(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    pred_input: &PredictInput,
+    predictor: &dyn gam::predict::PredictableModel,
+) -> Result<(), String> {
+    let fit_for_predict = fit_result_from_saved_model_for_prediction(model)?;
+    let model_class = model.predict_model_class();
+    let family = model.likelihood();
+    let nonlinear = matches!(
+        family,
+        LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture
+    );
+
+    // --- Compute prediction ---
+    let (eta, mean, se_opt, mean_lo, mean_hi, sigma_opt) = if args.uncertainty {
+        let options = gam::estimate::PredictUncertaintyOptions {
+            confidence_level: args.level,
+            covariance_mode: infer_covariance_mode(args.covariance_mode),
+            mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+        };
+        let pred = predictor
+            .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
+            .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
+
+        // For Gaussian LS, extract sigma from the predictor separately.
+        let sigma = if model_class == PredictModelClass::GaussianLocationScale {
+            let with_se = predictor
+                .predict_with_uncertainty(pred_input)
+                .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
+            with_se.mean_se
+        } else {
+            None
+        };
+
+        (
+            pred.eta,
+            pred.mean,
+            Some(pred.eta_standard_error),
+            Some(pred.mean_lower),
+            Some(pred.mean_upper),
+            sigma,
+        )
+    } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
+        let pm = predictor
+            .predict_posterior_mean(pred_input, &fit_for_predict)
+            .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
+        (pm.eta, pm.mean, Some(pm.eta_standard_error), None, None, None)
+    } else {
+        let pred = predictor
+            .predict_response(pred_input)
+            .map_err(|e| format!("predict_response failed: {e}"))?;
+
+        // For Gaussian LS, always compute sigma even without uncertainty.
+        let sigma = if model_class == PredictModelClass::GaussianLocationScale {
+            let with_se = predictor
+                .predict_with_uncertainty(pred_input)
+                .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
+            with_se.mean_se
+        } else {
+            None
+        };
+
+        (pred.eta, pred.mean, None, None, None, sigma)
+    };
+
+    // --- Write CSV output ---
+    progress.advance_workflow(4);
+    progress.set_stage("predict", "writing predictions");
+
+    match model_class {
+        PredictModelClass::GaussianLocationScale => {
+            // Gaussian location-scale always includes sigma.
+            let sigma = sigma_opt
+                .ok_or_else(|| "internal error: sigma missing for Gaussian LS prediction".to_string())?;
+            write_gaussian_location_scale_prediction_csv(
+                &args.out,
+                eta.view(),
+                mean.view(),
+                sigma.view(),
+                mean_lo.as_ref().map(|a| a.view()),
+                mean_hi.as_ref().map(|a| a.view()),
+            )?;
+        }
+        _ => {
+            write_prediction_csv(
+                &args.out,
+                eta.view(),
+                mean.view(),
+                se_opt.as_ref().map(|a| a.view()),
+                mean_lo.as_ref().map(|a| a.view()),
+                mean_hi.as_ref().map(|a| a.view()),
+            )?;
+        }
+    }
+
+    println!(
+        "wrote predictions: {} (rows={})",
+        args.out.display(),
+        mean.len()
+    );
+    Ok(())
+}
+
 fn run_predict(args: PredictArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
@@ -1481,9 +1712,49 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("predict", "building prediction matrices");
-    // The Standard branch delegates to PredictableModel internally.
-    // Survival and location-scale branches need SurvivalPredictor /
-    // LocationScalePredictor implementations to collapse this dispatch.
+
+    // ── Unified path via PredictableModel ──────────────────────────────────
+    //
+    // Models that don't require special handling (link wiggles, joint flexible
+    // link, survival time basis) go through build_predict_input_for_model() +
+    // model.predictor(). This replaces the previous 4-way match for the
+    // common cases (Standard without wiggle/joint, GaussianLocationScale,
+    // BinomialLocationScale without wiggles).
+    if !needs_special_predict_handling(&model) {
+        if let Some(predictor) = model.predictor() {
+            let pred_input = build_predict_input_for_model(
+                &model,
+                ds.values.view(),
+                &col_map,
+                training_headers,
+            )?;
+            progress.advance_workflow(3);
+            let result = run_predict_unified(
+                &mut progress,
+                &args,
+                &model,
+                &pred_input,
+                &*predictor,
+            );
+            if result.is_ok() {
+                progress.advance_workflow(5);
+                progress.finish_progress("prediction complete");
+            }
+            return result;
+        }
+        // predictor() returned None (e.g. missing UnifiedFitResult) — fall
+        // through to model-specific paths which can use the legacy FitResult.
+    }
+
+    // ── Special-case dispatch ──────────────────────────────────────────────
+    //
+    // These branches handle genuinely model-specific prediction logic that
+    // PredictableModel does not (yet) cover:
+    // - Survival: time basis construction, entry/exit columns, baseline offsets,
+    //   time wiggles, and the LocationScale sub-branch.
+    // - BinomialLocationScale with link wiggles: probit-wiggle q0 path with
+    //   conditional integration over wiggle coefficients.
+    // - Standard with link wiggles or joint flexible link.
     let result = match model.predict_model_class() {
         PredictModelClass::Survival => run_predict_survival(
             &mut progress,
@@ -1540,6 +1811,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     result
 }
 
+/// Special-case survival prediction.
+///
+/// This handles the full survival prediction pipeline which cannot go through
+/// `PredictableModel` because of time basis construction, entry/exit column
+/// handling, baseline offsets, time wiggles, and the LocationScale sub-branch.
+/// The unified path in `run_predict` bypasses this function for non-survival models.
 fn run_predict_survival(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -1896,6 +2173,12 @@ fn run_predict_survival(
     Ok(())
 }
 
+/// Legacy Gaussian location-scale prediction path.
+///
+/// This is the fallback when `model.predictor()` returns `None` (e.g. models
+/// saved before the `UnifiedFitResult` era). For models with a
+/// `UnifiedFitResult`, the unified path in `run_predict` handles this case
+/// via `GaussianLocationScalePredictor`.
 fn run_predict_gaussian_location_scale(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -1989,6 +2272,14 @@ fn run_predict_gaussian_location_scale(
     Ok(())
 }
 
+/// Special-case binomial location-scale prediction.
+///
+/// This handles the full binomial location-scale prediction pipeline.  When
+/// the model has link wiggles (`betawiggle`), this path is required because the
+/// probit-wiggle q0 augmentation and conditional integration over wiggle
+/// coefficients are not captured by `BinomialLocationScalePredictor`.
+/// For models without wiggles, the unified path in `run_predict` handles this
+/// via `BinomialLocationScalePredictor`.
 fn run_predict_binomial_location_scale(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -2282,6 +2573,16 @@ fn run_predict_binomial_location_scale(
     Ok(())
 }
 
+/// Special-case standard / flexible-link prediction.
+///
+/// This handles two cases that cannot go through `PredictableModel`:
+/// - **Link wiggles**: standard binomial models with `betawiggle` use a
+///   hand-rolled path through `predict_standard_binomial_linkwiggle`.
+/// - **Joint flexible link**: models with `joint_beta_link` go through the
+///   `predict_joint` engine with its own SE propagation.
+///
+/// For plain standard models (no wiggle, no joint), the unified path in
+/// `run_predict` handles prediction via `StandardPredictor`.
 fn run_predict_standard_or_flexible(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -5648,38 +5949,37 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("generate", "building predictive state");
-    // The Standard branch delegates to PredictableModel for the basic path.
-    // LocationScalePredictor would collapse the remaining branches.
-    let spec = match model.predict_model_class() {
-        PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-        )?,
-        PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-        )?,
-        PredictModelClass::Standard => {
-            run_generate_standard_or_flexible(
+    // Unified path: delegate to PredictableModel for models that don't need
+    // special handling (link wiggles, joint flexible link).  Fall back to the
+    // legacy per-class helpers for those special cases.
+    let spec = if needs_special_predict_handling(&model) {
+        match model.predict_model_class() {
+            PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
                 &mut progress,
                 &model,
                 ds.values.view(),
                 &col_map,
                 training_headers,
-            )?
+            )?,
+            PredictModelClass::Standard => run_generate_standard_or_flexible(
+                &mut progress,
+                &model,
+                ds.values.view(),
+                &col_map,
+                training_headers,
+            )?,
+            PredictModelClass::Survival => {
+                return Err(
+                    "generate is not available for survival models in this command; \
+                     use survival-specific simulation APIs"
+                        .to_string(),
+                )
+            }
+            // GaussianLocationScale never needs special handling.
+            PredictModelClass::GaussianLocationScale => unreachable!(),
         }
-        PredictModelClass::Survival => {
-            return Err(
-                "generate is not available for survival models in this command; use survival-specific simulation APIs"
-                    .to_string(),
-            )
-        }
+    } else {
+        run_generate_unified(&mut progress, &model, ds.values.view(), &col_map, training_headers)?
     };
     progress.advance_workflow(3);
 
@@ -5701,6 +6001,75 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         draws.ncols()
     );
     Ok(())
+}
+
+/// Unified generate path: uses `PredictableModel` to produce a `GenerativeSpec`
+/// for any model class that doesn't require special handling (link wiggles,
+/// joint flexible links).
+///
+/// Covers: Standard (plain), GaussianLocationScale, BinomialLocationScale
+/// (without wiggles).  For Gaussian LS the sigma vector is extracted via
+/// `predict_with_uncertainty`; all other families derive their noise model
+/// from `generativespec_from_predict`.
+fn run_generate_unified(
+    progress: &mut gam::visualizer::VisualizerSession,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+) -> Result<gam::generative::GenerativeSpec, String> {
+    progress.set_stage("generate", "building unified generation design");
+
+    // Bounded-coefficient check: resolve the primary termspec just for this
+    // guard (build_predict_input_for_model resolves it again internally, but
+    // this keeps the error path clean and avoids leaking the spec).
+    let primary_spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    if termspec_has_bounded_terms(&primary_spec) {
+        return Err(
+            "sample is not yet supported for models with bounded() coefficients".to_string(),
+        );
+    }
+
+    let pred_input = build_predict_input_for_model(model, data, col_map, training_headers)?;
+    let predictor = model
+        .predictor()
+        .ok_or_else(|| "failed to build predictor for generate".to_string())?;
+
+    let model_class = model.predict_model_class();
+
+    if model_class == PredictModelClass::GaussianLocationScale {
+        // Gaussian LS needs the per-observation sigma for its GenerativeSpec.
+        // predict_with_uncertainty stashes sigma in mean_se for this model class.
+        let pred = predictor
+            .predict_response(&pred_input)
+            .map_err(|e| format!("predict_response failed: {e}"))?;
+        let with_se = predictor
+            .predict_with_uncertainty(&pred_input)
+            .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
+        let sigma = with_se.mean_se.ok_or_else(|| {
+            "gaussian location-scale predictor did not produce sigma via predict_with_uncertainty"
+                .to_string()
+        })?;
+        Ok(gam::generative::GenerativeSpec {
+            mean: pred.mean,
+            noise: gam::generative::NoiseModel::Gaussian { sigma },
+        })
+    } else {
+        // Standard or BinomialLocationScale (no wiggle): predict_response gives
+        // the response-scale mean; derive the noise model from the family.
+        let pred = predictor
+            .predict_response(&pred_input)
+            .map_err(|e| format!("predict_response failed: {e}"))?;
+        let family = model.likelihood();
+        let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+        generativespec_from_predict(pred, family, Some(fit_saved.standard_deviation))
+            .map_err(|e| format!("failed to build generative spec: {e}"))
+    }
 }
 
 fn run_generate_gaussian_location_scale(
@@ -9890,6 +10259,52 @@ fn survival_probability_from_eta(eta: ArrayView1<'_, f64>) -> Array1<f64> {
     eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0))
 }
 
+/// Unified CSV prediction writer.  Each column is a `(name, data)` pair;
+/// the function writes a header row from the names and one data row per
+/// element, formatting every value to 12 decimal places.
+///
+/// All columns must have the same length.  An empty column list is an error.
+fn write_prediction_csv_unified(
+    path: &Path,
+    columns: &[(&str, &[f64])],
+) -> Result<(), String> {
+    if columns.is_empty() {
+        return Err("internal error: write_prediction_csv_unified called with no columns".into());
+    }
+    let n = columns[0].1.len();
+    for (name, data) in columns.iter() {
+        if data.len() != n {
+            return Err(format!(
+                "internal error: column '{}' has length {} but expected {}",
+                name,
+                data.len(),
+                n,
+            ));
+        }
+    }
+
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(path)
+        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+
+    let headers: Vec<&str> = columns.iter().map(|(name, _)| *name).collect();
+    wtr.write_record(&headers)
+        .map_err(|e| format!("failed writing csv header: {e}"))?;
+
+    for i in 0..n {
+        let row: Vec<String> = columns.iter().map(|(_, data)| format!("{:.12}", data[i])).collect();
+        wtr.write_record(&row)
+            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
+    }
+
+    wtr.flush()
+        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
+    Ok(())
+}
+
+/// Convenience wrapper: builds a standard (non-survival, non-location-scale)
+/// prediction column list and delegates to [`write_prediction_csv_unified`].
 fn write_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
@@ -9898,46 +10313,33 @@ fn write_prediction_csv(
     mean_lower: Option<ArrayView1<'_, f64>>,
     mean_upper: Option<ArrayView1<'_, f64>>,
 ) -> Result<(), String> {
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+    // Materialise views into contiguous vecs so we can pass &[f64] slices.
+    let eta_v: Vec<f64> = eta.to_vec();
+    let mean_v: Vec<f64> = mean.to_vec();
 
-    if eta_se.is_some() {
-        wtr.write_record(["eta", "mean", "effective_se", "mean_lower", "mean_upper"])
-            .map_err(|e| format!("failed writing csv header: {e}"))?;
-    } else {
-        wtr.write_record(["eta", "mean"])
-            .map_err(|e| format!("failed writing csv header: {e}"))?;
+    let mut cols: Vec<(&str, &[f64])> = vec![("eta", &eta_v), ("mean", &mean_v)];
+
+    let se_v: Vec<f64>;
+    let lo_v: Vec<f64>;
+    let hi_v: Vec<f64>;
+    if let Some(se) = eta_se {
+        se_v = se.to_vec();
+        lo_v = mean_lower
+            .ok_or_else(|| "internal error: mean_lower missing while effective_se is present".to_string())?
+            .to_vec();
+        hi_v = mean_upper
+            .ok_or_else(|| "internal error: mean_upper missing while effective_se is present".to_string())?
+            .to_vec();
+        cols.push(("effective_se", &se_v));
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
     }
 
-    for i in 0..eta.len() {
-        if let Some(se) = eta_se {
-            let lo = mean_lower.as_ref().ok_or_else(|| {
-                "internal error: mean_lower missing while effective_se is present".to_string()
-            })?;
-            let hi = mean_upper.as_ref().ok_or_else(|| {
-                "internal error: mean_upper missing while effective_se is present".to_string()
-            })?;
-            wtr.write_record([
-                format!("{:.12}", eta[i]),
-                format!("{:.12}", mean[i]),
-                format!("{:.12}", se[i]),
-                format!("{:.12}", lo[i]),
-                format!("{:.12}", hi[i]),
-            ])
-            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
-        } else {
-            wtr.write_record([format!("{:.12}", eta[i]), format!("{:.12}", mean[i])])
-                .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
-        }
-    }
-
-    wtr.flush()
-        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
-    Ok(())
+    write_prediction_csv_unified(path, &cols)
 }
 
+/// Convenience wrapper for Gaussian location-scale predictions (always
+/// includes a `sigma` column).
 fn write_gaussian_location_scale_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
@@ -9946,62 +10348,37 @@ fn write_gaussian_location_scale_prediction_csv(
     mean_lower: Option<ArrayView1<'_, f64>>,
     mean_upper: Option<ArrayView1<'_, f64>>,
 ) -> Result<(), String> {
-    if eta.len() != mean.len() || eta.len() != sigma.len() {
-        return Err(format!(
-            "internal error: gaussian location-scale output length mismatch (eta={}, mean={}, sigma={})",
-            eta.len(),
-            mean.len(),
-            sigma.len()
-        ));
-    }
-    if mean_lower.is_some() != mean_upper.is_some() {
+    let eta_v: Vec<f64> = eta.to_vec();
+    let mean_v: Vec<f64> = mean.to_vec();
+    let sigma_v: Vec<f64> = sigma.to_vec();
+
+    let mut cols: Vec<(&str, &[f64])> = vec![
+        ("eta", &eta_v),
+        ("mean", &mean_v),
+        ("sigma", &sigma_v),
+    ];
+
+    let lo_v: Vec<f64>;
+    let hi_v: Vec<f64>;
+    if let Some(lo) = mean_lower {
+        lo_v = lo.to_vec();
+        hi_v = mean_upper
+            .ok_or_else(|| "internal error: mean_upper missing while mean_lower is present".to_string())?
+            .to_vec();
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
+    } else if mean_upper.is_some() {
         return Err(
             "internal error: gaussian location-scale output requires both mean_lower and mean_upper"
                 .to_string(),
         );
     }
 
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
-
-    if mean_lower.is_some() {
-        wtr.write_record(["eta", "mean", "sigma", "mean_lower", "mean_upper"])
-            .map_err(|e| format!("failed writing csv header: {e}"))?;
-    } else {
-        wtr.write_record(["eta", "mean", "sigma"])
-            .map_err(|e| format!("failed writing csv header: {e}"))?;
-    }
-
-    for i in 0..eta.len() {
-        if let Some(lo) = mean_lower {
-            let hi = mean_upper.as_ref().ok_or_else(|| {
-                "internal error: mean_upper missing while mean_lower is present".to_string()
-            })?;
-            wtr.write_record([
-                format!("{:.12}", eta[i]),
-                format!("{:.12}", mean[i]),
-                format!("{:.12}", sigma[i]),
-                format!("{:.12}", lo[i]),
-                format!("{:.12}", hi[i]),
-            ])
-            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
-        } else {
-            wtr.write_record([
-                format!("{:.12}", eta[i]),
-                format!("{:.12}", mean[i]),
-                format!("{:.12}", sigma[i]),
-            ])
-            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
-        }
-    }
-
-    wtr.flush()
-        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
-    Ok(())
+    write_prediction_csv_unified(path, &cols)
 }
 
+/// Convenience wrapper for survival predictions (includes derived
+/// `survival_prob`, `risk_score`, and `failure_prob` columns).
 fn write_survival_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
@@ -10010,65 +10387,36 @@ fn write_survival_prediction_csv(
     survival_lower: Option<ArrayView1<'_, f64>>,
     survival_upper: Option<ArrayView1<'_, f64>>,
 ) -> Result<(), String> {
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+    let eta_v: Vec<f64> = eta.to_vec();
+    let surv_v: Vec<f64> = survival_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
+    let risk_v: Vec<f64> = eta_v.clone();
+    let fail_v: Vec<f64> = surv_v.iter().map(|&s| (1.0 - s).clamp(0.0, 1.0)).collect();
 
-    if eta_se.is_some() {
-        wtr.write_record([
-            "eta",
-            "mean",
-            "survival_prob",
-            "risk_score",
-            "failure_prob",
-            "effective_se",
-            "mean_lower",
-            "mean_upper",
-        ])
-        .map_err(|e| format!("failed writing csv header: {e}"))?;
-    } else {
-        wtr.write_record(["eta", "mean", "survival_prob", "risk_score", "failure_prob"])
-            .map_err(|e| format!("failed writing csv header: {e}"))?;
+    let mut cols: Vec<(&str, &[f64])> = vec![
+        ("eta", &eta_v),
+        ("mean", &surv_v),
+        ("survival_prob", &surv_v),
+        ("risk_score", &risk_v),
+        ("failure_prob", &fail_v),
+    ];
+
+    let se_v: Vec<f64>;
+    let lo_v: Vec<f64>;
+    let hi_v: Vec<f64>;
+    if let Some(se) = eta_se {
+        se_v = se.to_vec();
+        lo_v = survival_lower
+            .ok_or_else(|| "internal error: survival_lower missing while effective_se is present".to_string())?
+            .to_vec();
+        hi_v = survival_upper
+            .ok_or_else(|| "internal error: survival_upper missing while effective_se is present".to_string())?
+            .to_vec();
+        cols.push(("effective_se", &se_v));
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
     }
 
-    for i in 0..eta.len() {
-        let surv = survival_prob[i].clamp(0.0, 1.0);
-        let failure = (1.0 - surv).clamp(0.0, 1.0);
-        let risk_score = eta[i];
-        if let Some(se) = eta_se {
-            let lo = survival_lower.as_ref().ok_or_else(|| {
-                "internal error: survival_lower missing while effective_se is present".to_string()
-            })?;
-            let hi = survival_upper.as_ref().ok_or_else(|| {
-                "internal error: survival_upper missing while effective_se is present".to_string()
-            })?;
-            wtr.write_record([
-                format!("{:.12}", eta[i]),
-                format!("{:.12}", surv),
-                format!("{:.12}", surv),
-                format!("{:.12}", risk_score),
-                format!("{:.12}", failure),
-                format!("{:.12}", se[i]),
-                format!("{:.12}", lo[i]),
-                format!("{:.12}", hi[i]),
-            ])
-            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
-        } else {
-            wtr.write_record([
-                format!("{:.12}", eta[i]),
-                format!("{:.12}", surv),
-                format!("{:.12}", surv),
-                format!("{:.12}", risk_score),
-                format!("{:.12}", failure),
-            ])
-            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
-        }
-    }
-
-    wtr.flush()
-        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
-    Ok(())
+    write_prediction_csv_unified(path, &cols)
 }
 
 #[cfg(test)]
