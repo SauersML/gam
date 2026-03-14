@@ -1418,6 +1418,22 @@ impl HyperDesignDerivative {
         }
     }
 
+    /// If this derivative uses implicit storage at the first-derivative level,
+    /// return the shared implicit operator and the axis index.
+    ///
+    /// Returns `None` for dense/embedded storage or for second-derivative levels.
+    pub(crate) fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>, usize)> {
+        match &self.storage {
+            DerivativeMatrixStorage::Implicit(op) => match op.level {
+                ImplicitDerivLevel::First(axis) => Some((op.operator.clone(), axis)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub(crate) fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
@@ -1749,6 +1765,19 @@ impl DirectionalHyperParam {
             x_tau_tau_original,
             penaltysecond_components,
         )
+    }
+
+    /// Whether this coordinate's design derivative uses implicit storage at the
+    /// first-derivative level.
+    pub(crate) fn has_implicit_operator(&self) -> bool {
+        self.x_tau_original.implicit_first_axis_info().is_some()
+    }
+
+    /// Extract the implicit design derivative operator and axis, if available.
+    pub(crate) fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>, usize)> {
+        self.x_tau_original.implicit_first_axis_info()
     }
 
     pub(crate) fn penalty_first_components(&self) -> &[PenaltyDerivativeComponent] {

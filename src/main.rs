@@ -4734,6 +4734,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     hessian: Derivative::Unavailable,
                     n_params: dim,
                     all_penalty_like: false,
+                    barrier_active: false,
                 },
                 cost_fn: |state: &mut (), rho: &Array1<f64>| {
                     let _ = state;

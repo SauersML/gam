@@ -227,27 +227,28 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 /// where c is the first eta-derivative of the working curvature W(η),
 /// and vₖ = H⁻¹(Aₖβ̂) is the mode response.
 ///
-/// TODO(observed-hessian): For non-canonical links (probit, cloglog, SAS,
-/// mixture), `c_array` and `d_array` currently store the **Fisher** weight
-/// derivatives (c_F, d_F). Exact REML/LAML requires the **observed**
-/// information derivatives:
+/// For non-canonical links (probit, cloglog, SAS, mixture, beta-logistic),
+/// `c_array` and `d_array` store the **observed-information** weight
+/// derivatives (c_obs, d_obs) that include residual-dependent corrections:
+///
 ///   c_obs = c_F + h'·B − (y−μ)·B_η
 ///   d_obs = d_F + h''·B + 2h'·B_η − (y−μ)·B_ηη
-/// where B = (h''V − h'²V') / (φV²). For canonical links (logit for
-/// binomial, log for Poisson), observed = Fisher so the current code is
-/// exact. For non-canonical links, the ρ-direction Hessian drift
-/// dH/dρ_k inherits a Fisher approximation. The link-parameter ext_coord
-/// path (build_sas_link_ext_coords / build_mixture_link_ext_coords) has
-/// already been corrected to use observed weight derivatives.
+///
+/// where B = (h''V − h'²V') / (φV²).  For canonical links (logit for
+/// binomial, log for Poisson), B = 0 so observed = Fisher and the arrays
+/// are populated with the Fisher values unchanged.  The observed
+/// correction is applied in `RemlState::observed_cd_arrays` at the
+/// construction sites in `runtime.rs`.
+///
+/// The link-parameter ext_coord path (build_sas_link_ext_coords /
+/// build_mixture_link_ext_coords) independently uses observed weight
+/// derivatives computed inline.
 pub struct SinglePredictorGlmDerivatives {
-    /// c_array: dW/dη, the first eta-derivative of the working curvature.
-    ///
-    /// Currently stores Fisher c_F for all links. For non-canonical links
-    /// this is approximate; see the TODO on the struct for details.
+    /// c_array: dW_obs/dη, the first eta-derivative of the observed
+    /// working curvature.  For canonical links this equals c_F.
     pub c_array: Array1<f64>,
-    /// d_array: d²W/dη², the second eta-derivative (for Hessian corrections).
-    ///
-    /// Currently stores Fisher d_F; same caveat as c_array.
+    /// d_array: d²W_obs/dη², the second eta-derivative of the observed
+    /// working curvature.  For canonical links this equals d_F.
     pub d_array: Option<Array1<f64>>,
     /// Design matrix X in the transformed basis.
     pub x_transformed: DesignMatrix,
@@ -560,6 +561,32 @@ impl BarrierConfig {
             .slacks(beta)
             .ok_or_else(|| "Barrier: infeasible point (slack ≤ 0)".to_string())?;
         Ok(-self.tau * slacks.iter().map(|&d| d.ln()).sum::<f64>())
+    }
+
+    /// Check whether the barrier curvature is non-negligible relative to a
+    /// reference Hessian diagonal scale.
+    ///
+    /// Returns `true` when `max_j τ / (β_j − l_j)² > threshold * ref_diag`,
+    /// indicating that EFS (which ignores the barrier Hessian drift) would be
+    /// unreliable. If β is infeasible, conservatively returns `true`.
+    ///
+    /// `ref_diag` should be a representative diagonal of X'WX + S (e.g. the
+    /// median or mean). A typical `threshold` is 0.01–0.1.
+    pub fn barrier_curvature_is_significant(
+        &self,
+        beta: &Array1<f64>,
+        ref_diag: f64,
+        threshold: f64,
+    ) -> bool {
+        let slacks = match self.slacks(beta) {
+            Some(s) => s,
+            None => return true, // infeasible → conservatively active
+        };
+        let max_barrier_curv = slacks
+            .iter()
+            .map(|&d| self.tau / (d * d))
+            .fold(0.0_f64, f64::max);
+        max_barrier_curv > threshold * ref_diag
     }
 }
 
