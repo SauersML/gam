@@ -2643,10 +2643,13 @@ fn unified_joint_cost_gradient(
 
     let inner_solution = builder.build();
 
+    let ext_dim = inner_solution.ext_coords.len();
     let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), eval_mode, None)?;
 
     let cost = result.cost;
-    let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
+    let gradient = result
+        .gradient
+        .unwrap_or_else(|| Array1::zeros(rho.len() + ext_dim));
 
     Ok((cost, gradient, result.hessian))
 }
