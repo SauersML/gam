@@ -3128,15 +3128,46 @@ impl<'a> RemlState<'a> {
                 };
                 let dmu = dj.mu;
                 let dd1 = dj.d1;
+                let dd2 = dj.d2;
                 direct_ll[j] += aux.a1 * dmu;
                 du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
                 let variance = aux.variance;
                 let variance_param = aux.variancemu_scale * dmu;
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
-                dw_explicit_by_j[j][i] = wi
+                // Fisher weight derivative: ∂W_F/∂θ = ∂(h'²/V)/∂θ
+                let dw_fisher = wi
                     * (numerator_param * variance - numerator * variance_param)
                     / (variance * variance);
+
+                // Observed correction: W_obs = W_F − (y−μ)·B where
+                //   B = (h''·V − h'²·V') / V²
+                // so ∂W_obs/∂θ = ∂W_F/∂θ + (dμ/dθ)·B − (y−μ)·∂B/∂θ
+                //
+                // For binomial: V = μ(1−μ), V' = 1−2μ, V'' = −2.
+                let h2 = jets.jet.d2;
+                let resid = yi - mu;
+                let v_prime = aux.variancemu_scale; // 1 − 2μ
+                let v_dprime = -2.0_f64;            // V''(μ) for binomial
+
+                let b_num = h2 * variance - numerator * v_prime;
+                let var_sq = variance * variance;
+                let b_val = b_num / var_sq;
+
+                // ∂B/∂θ via quotient rule on b_num / V²:
+                //   dV/dθ  = V'·dμ/dθ
+                //   dV'/dθ = V''·dμ/dθ
+                //   d(b_num)/dθ = dd2·V + h''·dV − 2·h'·dd1·V' − h'²·dV'
+                let d_var = v_prime * dmu;     // dV/dθ
+                let d_vprime = v_dprime * dmu; // dV'/dθ
+                let db_num = dd2 * variance + h2 * d_var
+                    - 2.0 * d1 * dd1 * v_prime
+                    - numerator * d_vprime;
+                // Quotient rule: (db_num·V² − b_num·2V·dV) / V⁴
+                //              = (db_num − 2·B·dV) / V²
+                let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
+
+                dw_explicit_by_j[j][i] = dw_fisher + dmu * b_val - resid * db_val;
             }
         }
 
@@ -3153,7 +3184,9 @@ impl<'a> RemlState<'a> {
                 -xt_du
             };
 
-            // B_j = X^T diag(dw_explicit_j) X — the fixed-β Hessian drift.
+            // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
+            // Uses observed-information weight derivatives (not Fisher) for exact
+            // REML/LAML with non-canonical links (SAS, beta-logistic).
             let b_j = Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
 
             coords.push(super::unified::HyperCoord {
@@ -3258,15 +3291,44 @@ impl<'a> RemlState<'a> {
                 let dj = mix_partials[j];
                 let dmu = dj.mu;
                 let dd1 = dj.d1;
+                let dd2 = dj.d2;
                 direct_ll[j] += aux.a1 * dmu;
                 du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
                 let variance = aux.variance;
                 let variance_param = aux.variancemu_scale * dmu;
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
-                dw_explicit_by_j[j][i] = wi
+                // Fisher weight derivative: ∂W_F/∂θ = ∂(h'²/V)/∂θ
+                let dw_fisher = wi
                     * (numerator_param * variance - numerator * variance_param)
                     / (variance * variance);
+
+                // Observed correction: W_obs = W_F − (y−μ)·B where
+                //   B = (h''·V − h'²·V') / V²
+                // so ∂W_obs/∂θ = ∂W_F/∂θ + (dμ/dθ)·B − (y−μ)·∂B/∂θ
+                //
+                // For binomial: V = μ(1−μ), V' = 1−2μ, V'' = −2.
+                let h2 = jet.d2;
+                let resid = yi - mu;
+                let v_prime = aux.variancemu_scale; // 1 − 2μ
+                let v_dprime = -2.0_f64;            // V''(μ) for binomial
+
+                let b_num = h2 * variance - numerator * v_prime;
+                let var_sq = variance * variance;
+                let b_val = b_num / var_sq;
+
+                // ∂B/∂θ via quotient rule on b_num / V²:
+                //   dV/dθ  = V'·dμ/dθ
+                //   dV'/dθ = V''·dμ/dθ
+                //   d(b_num)/dθ = dd2·V + h''·dV − 2·h'·dd1·V' − h'²·dV'
+                let d_var = v_prime * dmu;     // dV/dθ
+                let d_vprime = v_dprime * dmu; // dV'/dθ
+                let db_num = dd2 * variance + h2 * d_var
+                    - 2.0 * d1 * dd1 * v_prime
+                    - numerator * d_vprime;
+                let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
+
+                dw_explicit_by_j[j][i] = dw_fisher + dmu * b_val - resid * db_val;
             }
         }
 
@@ -3278,6 +3340,9 @@ impl<'a> RemlState<'a> {
                 let xt_du = x_dense.t().dot(&du_by_j[j]);
                 -xt_du
             };
+            // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
+            // Uses observed-information weight derivatives (not Fisher) for exact
+            // REML/LAML with non-canonical links (mixture/blended).
             let b_j = Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
 
             coords.push(super::unified::HyperCoord {
