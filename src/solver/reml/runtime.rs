@@ -603,6 +603,48 @@ impl<'a> RemlState<'a> {
         Some(z.slice(ndarray::s![.., 0..kept]).to_owned())
     }
 
+    /// Construct a `BarrierConfig` from linear inequality constraints `A β ≥ b`
+    /// by extracting rows that represent simple coordinate bounds (β_j ≥ b_i).
+    ///
+    /// A row is a simple bound iff it has exactly one nonzero entry equal to 1.0.
+    /// Returns `None` if no simple-bound rows are found.
+    fn barrier_config_from_constraints(
+        constraints: &crate::pirls::LinearInequalityConstraints,
+    ) -> Option<super::unified::BarrierConfig> {
+        let mut indices = Vec::new();
+        let mut lower_bounds = Vec::new();
+        for i in 0..constraints.a.nrows() {
+            let row = constraints.a.row(i);
+            let mut single_col = None;
+            let mut is_simple = true;
+            for (j, &val) in row.iter().enumerate() {
+                if val.abs() < 1e-14 {
+                    continue;
+                }
+                if (val - 1.0).abs() < 1e-14 && single_col.is_none() {
+                    single_col = Some(j);
+                } else {
+                    is_simple = false;
+                    break;
+                }
+            }
+            if is_simple {
+                if let Some(col) = single_col {
+                    indices.push(col);
+                    lower_bounds.push(constraints.b[i]);
+                }
+            }
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        Some(super::unified::BarrierConfig {
+            tau: 1e-6,
+            constrained_indices: indices,
+            lower_bounds,
+        })
+    }
+
     pub(super) fn enforce_constraint_kkt(&self, pr: &PirlsResult) -> Result<(), EstimationError> {
         let Some(kkt) = pr.constraint_kkt.as_ref() else {
             return Ok(());
@@ -995,6 +1037,19 @@ impl<'a> RemlState<'a> {
             }
             firth_dense_operator = Some(firth_op);
         }
+
+        // Add log-barrier Hessian diagonal for monotonicity-constrained coefficients.
+        // This augments the penalized Hessian before the spectral decomposition so
+        // that logdet, trace, and solve operations all reflect the barrier curvature.
+        if let Some(ref lin) = pirls_result.linear_constraints_transformed {
+            if let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
+                let beta_t = pirls_result.beta_transformed.as_ref();
+                if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total, beta_t) {
+                    log::warn!("Barrier Hessian diagonal skipped: {e}");
+                }
+            }
+        }
+
         let (eigvals, eigvecs) = h_total
             .eigh(Side::Lower)
             .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
@@ -1122,6 +1177,18 @@ impl<'a> RemlState<'a> {
                 s_lambda.scaled_add(lambdas[k], s_k);
             }
         }
+        // Add log-barrier Hessian diagonal for monotonicity-constrained
+        // coefficients (sparse path uses original coordinates).
+        if let Some(ref lin) = self.linear_constraints {
+            if let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
+                let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
+                if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig)
+                {
+                    log::warn!("Sparse barrier Hessian diagonal skipped: {e}");
+                }
+            }
+        }
+
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
         let sparse_system = assemble_and_factor_sparse_penalized_system(
             &mut workspace,
@@ -1915,6 +1982,18 @@ impl<'a> RemlState<'a> {
             (None, None)
         };
 
+        // Construct barrier config for monotonicity constraints when no
+        // active-set projection is in effect (barrier indices are in the
+        // full transformed-coefficient space).
+        let barrier_config = if free_basis_opt.is_none() {
+            pirls_result
+                .linear_constraints_transformed
+                .as_ref()
+                .and_then(Self::barrier_config_from_constraints)
+        } else {
+            None
+        };
+
         self.evaluate_unified_tail(
             rho,
             mode,
@@ -1931,6 +2010,7 @@ impl<'a> RemlState<'a> {
             dispersion,
             log_likelihood,
             pirls_result.stable_penalty_term,
+            barrier_config,
         )
     }
 
@@ -2136,6 +2216,14 @@ impl<'a> RemlState<'a> {
                 (None, None)
             };
 
+        // Construct barrier config for monotonicity constraints.
+        // The sparse path operates in the original (non-reparameterized)
+        // coordinate system, so use the original linear constraints.
+        let barrier_config = self
+            .linear_constraints
+            .as_ref()
+            .and_then(Self::barrier_config_from_constraints);
+
         self.evaluate_unified_tail(
             rho,
             mode,
@@ -2152,6 +2240,7 @@ impl<'a> RemlState<'a> {
             dispersion,
             log_likelihood,
             pirls_result.stable_penalty_term,
+            barrier_config,
         )
     }
 
@@ -2174,6 +2263,7 @@ impl<'a> RemlState<'a> {
         dispersion: super::unified::DispersionHandling,
         log_likelihood: f64,
         penalty_quadratic: f64,
+        barrier_config: Option<super::unified::BarrierConfig>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{InnerSolutionBuilder, reml_laml_evaluate};
 
@@ -2194,6 +2284,7 @@ impl<'a> RemlState<'a> {
         .firth(firth_logdet, firth_gradient)
         .firth_hessian(firth_hessian)
         .nullspace_dim_override(nullspace_dim)
+        .barrier_config(barrier_config)
         .build();
 
         let prior = if mode == super::unified::EvalMode::ValueOnly {

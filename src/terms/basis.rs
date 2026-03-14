@@ -1374,6 +1374,40 @@ pub enum CenterStrategy {
     },
 }
 
+/// Adaptive default center count for spatial smooths (TPS, Duchon, Matérn).
+///
+/// Use this when the user has not explicitly specified a knot/center count.
+/// The formula `min(2000, max(200, ceil(8 * d_factor * n^0.4)))` scales
+/// sub-linearly with sample size and gives a mild boost for higher input
+/// dimensionality:
+///
+/// | n      | d=1  | d=2  | d=5  |
+/// |--------|------|------|------|
+/// | 1 000  | 200  | 200  | 200  |
+/// | 10 000 | 320  | 368  | 512  |
+/// | 100 000| 800  | 920  | 1280 |
+/// | 400 000| 1240 | 1426 | 1984 |
+/// | 1 000 000| 1600 | 1840 | 2000 |
+///
+/// # Arguments
+/// * `n` - sample size (number of observations)
+/// * `d` - covariate dimensionality (number of input variables in the smooth)
+pub fn default_num_centers(n: usize, d: usize) -> usize {
+    const K_MIN: usize = 200;
+    const K_MAX: usize = 2000;
+    const ALPHA: f64 = 0.4;
+    const C: f64 = 8.0;
+
+    let d_factor = 1.0 + 0.15 * (d.max(1) - 1) as f64;
+    let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
+    let k = raw.clamp(K_MIN, K_MAX);
+
+    // Never exceed n itself; on small datasets cap at n/4 to keep
+    // penalty matrices well-conditioned relative to data.
+    let small_data_cap = if n < 800 { n / 4 } else { n };
+    k.min(n).min(small_data_cap)
+}
+
 /// Thin-plate basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinPlateBasisSpec {
@@ -1878,25 +1912,56 @@ fn select_kmeans_centers(
     let mut assign = vec![0usize; n];
     let iters = max_iter.max(1);
 
+    // For large n (biobank-scale), parallelize the assignment step.
+    // Each observation's nearest-center query is independent.
+    let use_parallel = n >= 10_000;
+
     for _ in 0..iters {
-        // Assignment
-        for i in 0..n {
-            let mut best = 0usize;
-            let mut best_d2 = f64::INFINITY;
-            for k in 0..num_centers {
-                let mut d2 = 0.0;
-                for c in 0..d {
-                    let delta = data[[i, c]] - centers[[k, c]];
-                    d2 += delta * delta;
+        // Assignment: find nearest center for each observation.
+        if use_parallel {
+            const KMEANS_CHUNK: usize = 4096;
+            assign
+                .par_chunks_mut(KMEANS_CHUNK)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let base = ci * KMEANS_CHUNK;
+                    for (local, slot) in chunk.iter_mut().enumerate() {
+                        let i = base + local;
+                        let mut best = 0usize;
+                        let mut best_d2 = f64::INFINITY;
+                        for k in 0..num_centers {
+                            let mut d2 = 0.0;
+                            for c in 0..d {
+                                let delta = data[[i, c]] - centers[[k, c]];
+                                d2 += delta * delta;
+                            }
+                            if d2 < best_d2 {
+                                best_d2 = d2;
+                                best = k;
+                            }
+                        }
+                        *slot = best;
+                    }
+                });
+        } else {
+            for i in 0..n {
+                let mut best = 0usize;
+                let mut best_d2 = f64::INFINITY;
+                for k in 0..num_centers {
+                    let mut d2 = 0.0;
+                    for c in 0..d {
+                        let delta = data[[i, c]] - centers[[k, c]];
+                        d2 += delta * delta;
+                    }
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = k;
+                    }
                 }
-                if d2 < best_d2 {
-                    best_d2 = d2;
-                    best = k;
-                }
+                assign[i] = best;
             }
-            assign[i] = best;
         }
-        // Update
+        // Update: recompute centroids from assignments.
         let mut sums = Array2::<f64>::zeros((num_centers, d));
         let mut counts = vec![0usize; num_centers];
         for i in 0..n {
@@ -6718,17 +6783,43 @@ fn build_matern_design_psi_aniso_derivatives(
     let mut t_raw = Array2::<f64>::zeros((n, k));
     let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
 
-    for i in 0..n {
-        let data_row: Vec<f64> = (0..dim).map(|a| data[[i, a]]).collect();
-        for j in 0..k {
-            let center: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-            let (r, s_vec) = aniso_distance_and_components(&data_row, &center, eta);
-            let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
-            t_raw[[i, j]] = t;
+    // Parallel over rows with pre-allocated thread-local buffers to avoid
+    // n*k Vec allocations in the anisotropic distance path.
+    let row_results: Result<Vec<_>, BasisError> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut data_row_buf = vec![0.0; dim];
+            let mut center_buf = vec![0.0; dim];
             for a in 0..dim {
-                s_components_raw[a][[i, j]] = s_vec[a];
-                kernel_first[a][[i, j]] = q * s_vec[a];
-                kernel_second_diag[a][[i, j]] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                data_row_buf[a] = data[[i, a]];
+            }
+            let mut t_row = vec![0.0; k];
+            let mut s_row = vec![vec![0.0; k]; dim];
+            let mut kf_row = vec![vec![0.0; k]; dim];
+            let mut ksd_row = vec![vec![0.0; k]; dim];
+            for j in 0..k {
+                for a in 0..dim {
+                    center_buf[a] = centers[[j, a]];
+                }
+                let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
+                t_row[j] = t;
+                for a in 0..dim {
+                    s_row[a][j] = s_vec[a];
+                    kf_row[a][j] = q * s_vec[a];
+                    ksd_row[a][j] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                }
+            }
+            Ok((i, t_row, s_row, kf_row, ksd_row))
+        })
+        .collect();
+    for (i, t_row, s_row, kf_row, ksd_row) in row_results? {
+        for j in 0..k {
+            t_raw[[i, j]] = t_row[j];
+            for a in 0..dim {
+                s_components_raw[a][[i, j]] = s_row[a][j];
+                kernel_first[a][[i, j]] = kf_row[a][j];
+                kernel_second_diag[a][[i, j]] = ksd_row[a][j];
             }
         }
     }
@@ -6992,19 +7083,45 @@ fn build_duchon_design_psi_aniso_derivatives(
     let mut t_raw = Array2::<f64>::zeros((n, k));
     let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
 
-    for i in 0..n {
-        let data_row: Vec<f64> = (0..dim).map(|a| data[[i, a]]).collect();
-        for j in 0..k {
-            let center: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-            let (r, s_vec) = aniso_distance_and_components(&data_row, &center, eta);
-            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
-            let q = jets.q;
-            let t = jets.t;
-            t_raw[[i, j]] = t;
+    // Parallel over rows with pre-allocated thread-local buffers to avoid
+    // n*k Vec allocations.  Each thread writes into its own row slice.
+    let row_results: Result<Vec<_>, BasisError> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut data_row_buf = vec![0.0; dim];
+            let mut center_buf = vec![0.0; dim];
             for a in 0..dim {
-                s_components_raw[a][[i, j]] = s_vec[a];
-                kernel_first[a][[i, j]] = q * s_vec[a];
-                kernel_second_diag[a][[i, j]] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                data_row_buf[a] = data[[i, a]];
+            }
+            let mut t_row = vec![0.0; k];
+            let mut s_row = vec![vec![0.0; k]; dim];
+            let mut kf_row = vec![vec![0.0; k]; dim];
+            let mut ksd_row = vec![vec![0.0; k]; dim];
+            for j in 0..k {
+                for a in 0..dim {
+                    center_buf[a] = centers[[j, a]];
+                }
+                let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+                let q = jets.q;
+                let t = jets.t;
+                t_row[j] = t;
+                for a in 0..dim {
+                    s_row[a][j] = s_vec[a];
+                    kf_row[a][j] = q * s_vec[a];
+                    ksd_row[a][j] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                }
+            }
+            Ok((i, t_row, s_row, kf_row, ksd_row))
+        })
+        .collect();
+    for (i, t_row, s_row, kf_row, ksd_row) in row_results? {
+        for j in 0..k {
+            t_raw[[i, j]] = t_row[j];
+            for a in 0..dim {
+                s_components_raw[a][[i, j]] = s_row[a][j];
+                kernel_first[a][[i, j]] = kf_row[a][j];
+                kernel_second_diag[a][[i, j]] = ksd_row[a][j];
             }
         }
     }
@@ -7976,11 +8093,20 @@ fn build_duchon_design_psi_derivativeswithworkspace(
             let mut local_psi = vec![0.0; k];
             let mut local_psi_psi = vec![0.0; k];
             let aniso = spec.aniso_log_scales.as_deref();
+            // Pre-allocate row/center buffers once per thread.
+            let mut data_row_buf = vec![0.0; d];
+            let mut center_buf = vec![0.0; d];
+            if aniso.is_some() {
+                for a in 0..d {
+                    data_row_buf[a] = data[[i, a]];
+                }
+            }
             for j in 0..k {
                 let r = if let Some(eta) = aniso {
-                    let data_row: Vec<f64> = (0..d).map(|a| data[[i, a]]).collect();
-                    let center: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
-                    aniso_distance(&data_row, &center, eta)
+                    for a in 0..d {
+                        center_buf[a] = centers[[j, a]];
+                    }
+                    aniso_distance(&data_row_buf, &center_buf, eta)
                 } else {
                     let mut dist2 = 0.0;
                     for axis in 0..d {
@@ -8306,14 +8432,25 @@ fn build_duchon_basis_designwithworkspace(
         .enumerate()
         .try_for_each(|(ci, mut chunk)| {
             let mut kernel_row = vec![0.0; k];
+            // Pre-allocate row/center buffers once per thread to avoid 200M+
+            // heap allocations in the anisotropic distance path.
+            let mut data_row_buf = vec![0.0; d];
+            let mut center_buf = vec![0.0; d];
             let chunk_start = ci * chunk_size;
             for local_i in 0..chunk.nrows() {
                 let i = chunk_start + local_i;
+                // Copy data row once; reuse across all k centers.
+                if aniso_log_scales.is_some() {
+                    for a in 0..d {
+                        data_row_buf[a] = data[[i, a]];
+                    }
+                }
                 for j in 0..k {
                     let r = if let Some(eta) = aniso_log_scales {
-                        let data_row: Vec<f64> = (0..d).map(|a| data[[i, a]]).collect();
-                        let center: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
-                        aniso_distance(&data_row, &center, eta)
+                        for a in 0..d {
+                            center_buf[a] = centers[[j, a]];
+                        }
+                        aniso_distance(&data_row_buf, &center_buf, eta)
                     } else {
                         let mut dist2 = 0.0;
                         for axis in 0..d {

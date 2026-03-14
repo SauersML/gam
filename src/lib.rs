@@ -88,7 +88,7 @@ pub use terms::basis::{
     BasisBuildResult, BasisMetadata, BasisWorkspace, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonSplineBasis, MaternBasisSpec, MaternIdentifiability, MaternNu,
     MaternSplineBasis, SpatialIdentifiability, ThinPlateBasisSpec, ThinPlateSplineBasis,
-    build_bspline_basis_1d, build_duchon_basis, build_matern_basis, build_thin_plate_basis,
+    build_bspline_basis_1d, build_duchon_basis, build_matern_basis, build_thin_plate_basis, default_num_centers,
     create_duchon_spline_basis, create_matern_spline_basis, create_thin_plate_spline_basis,
     create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,
 };

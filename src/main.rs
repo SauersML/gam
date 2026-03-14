@@ -11,7 +11,7 @@ use gam::basis::{
     CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec,
     MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     build_bspline_basis_1d, compute_geometric_constraint_transform, create_basis,
-    create_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
+    create_difference_penalty_matrix, default_num_centers, evaluate_bspline_derivative_scalar,
 };
 use gam::construction::kronecker_product;
 use gam::estimate::{
@@ -8504,8 +8504,21 @@ fn strip_quotes(v: &str) -> &str {
     }
 }
 
-fn spatial_center_strategy_for_dimension(num_centers: usize) -> CenterStrategy {
-    CenterStrategy::EqualMass { num_centers }
+fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> CenterStrategy {
+    // For d >= 4, recursive bisection along the widest axis (EqualMass) gives
+    // poor space-filling properties because each split only partitions one axis
+    // at a time, leaving large Voronoi cells in the other dimensions.  KMeans
+    // with farthest-point seeding produces much better space-filling centers in
+    // moderate-to-high dimensions.  For d <= 3 the axis-aligned partitioning is
+    // adequate and avoids the extra KMeans iterations.
+    if d >= 4 {
+        CenterStrategy::KMeans {
+            num_centers,
+            max_iter: 25,
+        }
+    } else {
+        CenterStrategy::EqualMass { num_centers }
+    }
 }
 
 fn build_termspec(
@@ -8764,7 +8777,7 @@ fn build_smooth_basis(
             Ok(SmoothBasisSpec::ThinPlate {
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(centers),
+                    center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                 },
@@ -8786,7 +8799,7 @@ fn build_smooth_basis(
             Ok(SmoothBasisSpec::Matern {
                 feature_cols: cols.to_vec(),
                 spec: MaternBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(centers),
+                    center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
@@ -8822,7 +8835,7 @@ fn build_smooth_basis(
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(centers),
+                    center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
                     length_scale,
                     power,
                     nullspace_order,
@@ -9040,18 +9053,10 @@ fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     (unique / 4).clamp(4, 20)
 }
 
-/// Dimension-aware heuristic for the number of centers in spatial smooths
-/// (TPS, Duchon, Matérn).  For low-dimensional inputs (d <= 2) the cap stays
-/// near the old default (~50).  For higher d the cap grows linearly so the
-/// basis can still provide reasonable coverage of the input space.  The result
-/// is further bounded by n/10 and an absolute ceiling of 600 to keep penalty
-/// matrices (p×p dense) tractable.
+/// Adaptive heuristic for the number of centers in spatial smooths
+/// (TPS, Duchon, Matérn).  Delegates to [`gam::basis::default_num_centers`].
 fn heuristic_centers(n: usize, d: usize) -> usize {
-    let dim_cap = 50 + 25 * d.saturating_sub(2); // 50 for d<=2, +25 per extra dim
-    let dim_cap = dim_cap.min(600); // absolute ceiling
-    let data_cap = n / 10; // never use more than 10% of the data as centers
-    let upper = dim_cap.min(data_cap);
-    ((n as f64).sqrt() as usize).clamp(8, upper.max(8))
+    default_num_centers(n, d)
 }
 
 fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
