@@ -311,6 +311,8 @@ pub struct JointModelResult {
     pub backfit_iterations: usize,
     /// Converged flag
     pub converged: bool,
+    /// Final measured outer gradient norm.
+    pub outer_gradient_norm: f64,
     /// Stored knot range for prediction (min, max)
     pub knot_range: (f64, f64),
     /// Stored knot vector for prediction
@@ -1841,10 +1843,15 @@ impl<'a> JointRemlState<'a> {
         lambda_link: f64,
         base_reparam_invariant: Option<&ReparamInvariant>,
         base_rs_list: &[Array2<f64>],
-    ) -> Result<(crate::estimate::reml::unified::InnerSolution<'static>, Option<f64>), EstimationError> {
+    ) -> Result<
+        (
+            crate::estimate::reml::unified::InnerSolution<'static>,
+            Option<f64>,
+        ),
+        EstimationError,
+    > {
         use crate::estimate::reml::unified::{
-            DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder,
-            PenaltyLogdetDerivs,
+            DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder, PenaltyLogdetDerivs,
         };
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
@@ -2394,6 +2401,13 @@ impl<'a> JointRemlState<'a> {
         let bwiggle = state.build_link_basis_from_state(&u);
         let eta = state.compute_eta_full(&u, &bwiggle);
         let deviance = state.recompute_deviance_from_eta(&eta);
+        let outer_gradient_norm = self
+            .eval
+            .compute_unified_eval(&rho)
+            .ok()
+            .map(|eval| eval.gradient.dot(&eval.gradient).sqrt())
+            .filter(|v| v.is_finite())
+            .unwrap_or(f64::NAN);
 
         // Compute base-coefficient covariance: (X' W_eff X + S_λ + δI)^{-1}
         // where W_eff = w_glm * g_prime^2, accounting for the chain rule through
@@ -2478,6 +2492,7 @@ impl<'a> JointRemlState<'a> {
             edf: cached_edf.unwrap_or(f64::NAN),
             backfit_iterations: cached_iters,
             converged: cached_converged,
+            outer_gradient_norm,
             knot_range,
             knot_vector,
             link_transform: state
@@ -3019,6 +3034,7 @@ mod tests {
             edf: 5.0,
             backfit_iterations: 1,
             converged: true,
+            outer_gradient_norm: 0.0,
             knot_range: (0.0, 1.0),
             knot_vector,
             link_transform: Array2::eye(num_basis),
@@ -3075,6 +3091,7 @@ mod tests {
             edf: 5.0,
             backfit_iterations: 1,
             converged: true,
+            outer_gradient_norm: 0.0,
             knot_range: (0.0, 1.0),
             knot_vector,
             link_transform: Array2::eye(num_basis),
@@ -3113,6 +3130,7 @@ mod tests {
             edf: 0.0,
             backfit_iterations: 0,
             converged: false,
+            outer_gradient_norm: 1.0,
             knot_range: (0.0, 1.0),
             knot_vector,
             link_transform: Array2::eye(num_basis),

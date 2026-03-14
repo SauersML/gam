@@ -1,4 +1,6 @@
-use gam::estimate::{FitArtifacts, FitResult, FittedLinkParameters};
+use gam::estimate::{
+    BlockRole, FitArtifacts, FitResult, FittedBlock, FittedLinkParameters, UnifiedFitResultParts,
+};
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::pirls::PirlsStatus;
 use gam::types::{LikelihoodFamily, LinkFunction, SasLinkState};
@@ -6,22 +8,36 @@ use ndarray::{Array1, Array2};
 use tempfile::tempdir;
 
 fn minimal_fit_result(fitted_link_parameters: FittedLinkParameters) -> FitResult {
-    FitResult {
-        beta: Array1::from_vec(vec![0.0]),
+    FitResult::try_from_parts(UnifiedFitResultParts {
+        blocks: vec![FittedBlock {
+            beta: Array1::from_vec(vec![0.0]),
+            role: BlockRole::Mean,
+            edf: 0.0,
+            lambdas: Array1::zeros(0),
+        }],
+        log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
-        standard_deviation: 1.0,
-        iterations: 1,
-        finalgrad_norm: 0.0,
-        pirls_status: PirlsStatus::Converged,
-        deviance: 0.0,
+        log_likelihood: 0.0,
+        reml_score: 0.0,
         stable_penalty_term: 0.0,
+        penalized_objective: 0.0,
+        outer_iterations: 1,
+        outer_converged: true,
+        outer_gradient_norm: 0.0,
+        standard_deviation: 1.0,
+        covariance_conditional: None,
+        covariance_corrected: None,
+        inference: None,
+        fitted_link: fitted_link_parameters,
+        geometry: None,
+        block_states: Vec::new(),
+        pirls_status: PirlsStatus::Converged,
         max_abs_eta: 0.0,
         constraint_kkt: None,
         artifacts: FitArtifacts { pirls: None },
-        inference: None,
-        reml_score: 0.0,
-        fitted_link_parameters,
-    }
+        inner_cycles: 0,
+    })
+    .expect("minimal fit result must be valid")
 }
 
 #[test]

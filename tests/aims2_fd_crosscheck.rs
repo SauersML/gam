@@ -58,7 +58,10 @@ fn assert_gradient_fd_match(
         assert!(
             abs_err < abs_tol || rel_err < rel_tol,
             "{label} gradient mismatch at k={k}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
-            analytic[k], fd[k], abs_err, rel_err,
+            analytic[k],
+            fd[k],
+            abs_err,
+            rel_err,
         );
     }
 }
@@ -311,14 +314,28 @@ fn profiled_gaussian_reml_hessian_fd_symmetric_and_finite() {
         let mut rp = rho.clone();
         rp[l] += eps;
         let (gp, _) = evaluate_externalgradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rp,
-        ).expect("grad+");
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rp,
+        )
+        .expect("grad+");
 
         let mut rm = rho.clone();
         rm[l] -= eps;
         let (gm, _) = evaluate_externalgradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rm,
-        ).expect("grad-");
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rm,
+        )
+        .expect("grad-");
 
         for k in 0..n_rho {
             fd_hess[[k, l]] = (gp[k] - gm[k]) / (2.0 * eps);
@@ -345,7 +362,9 @@ fn profiled_gaussian_reml_hessian_fd_symmetric_and_finite() {
             assert!(
                 rel_err < 5e-2,
                 "FD Hessian not symmetric at [{k},{l}]: {:.6e} vs {:.6e} rel={:.3e}",
-                fd_hess[[k, l]], fd_hess[[l, k]], rel_err,
+                fd_hess[[k, l]],
+                fd_hess[[l, k]],
+                rel_err,
             );
         }
     }

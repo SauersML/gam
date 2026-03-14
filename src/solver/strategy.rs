@@ -399,12 +399,77 @@ pub fn run_outer(
     let upper = Array1::<f64>::from_elem(cap.n_params, config.rho_bound);
     let bounds_template = (lower, upper);
 
+    struct RawOuterCandidate {
+        rho: Array1<f64>,
+        final_value: f64,
+        iterations: usize,
+        converged: bool,
+    }
+
     let mut best: Option<OuterResult> = None;
+
+    let finalize_candidate = |obj: &mut dyn OuterObjective,
+                              candidate: RawOuterCandidate|
+     -> Result<OuterResult, EstimationError> {
+        obj.reset();
+        let (final_value, final_grad_norm) = if cap.gradient == Derivative::Analytic {
+            let eval = obj.eval(&candidate.rho)?;
+            if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "final outer evaluation returned non-finite cost/gradient".to_string(),
+                ));
+            }
+            let grad_norm = eval.gradient.dot(&eval.gradient).sqrt();
+            if !grad_norm.is_finite() {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "final outer gradient norm was non-finite".to_string(),
+                ));
+            }
+            (eval.cost, grad_norm)
+        } else {
+            let cost = obj.eval_cost(&candidate.rho)?;
+            if !cost.is_finite() {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "final outer cost was non-finite".to_string(),
+                ));
+            }
+            let mut grad = Array1::zeros(cap.n_params);
+            for i in 0..cap.n_params {
+                let h = config.fd_step * (1.0 + candidate.rho[i].abs());
+                let mut rp = candidate.rho.clone();
+                let mut rm = candidate.rho.clone();
+                rp[i] += h;
+                rm[i] -= h;
+                let fp = obj.eval_cost(&rp)?;
+                let fm = obj.eval_cost(&rm)?;
+                if !fp.is_finite() || !fm.is_finite() {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "final outer finite-difference gradient used non-finite costs".to_string(),
+                    ));
+                }
+                grad[i] = (fp - fm) / (2.0 * h);
+            }
+            let grad_norm = grad.dot(&grad).sqrt();
+            if !grad_norm.is_finite() {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "final outer finite-difference gradient norm was non-finite".to_string(),
+                ));
+            }
+            (cost, grad_norm)
+        };
+        Ok(OuterResult {
+            rho: candidate.rho,
+            final_value,
+            iterations: candidate.iterations,
+            final_grad_norm,
+            converged: candidate.converged,
+        })
+    };
 
     for seed in &screened {
         obj.reset();
 
-        let result: Result<OuterResult, EstimationError> = match the_plan.solver {
+        let result: Result<RawOuterCandidate, EstimationError> = match the_plan.solver {
             Solver::Arc | Solver::NewtonTrustRegion => {
                 let hessian_source = the_plan.hessian_source;
                 let fd_step = config.fd_step;
@@ -467,19 +532,17 @@ pub fn run_outer(
                         .with_tolerance(tol)
                         .with_max_iterations(max_iter);
                     match optimizer.run() {
-                        Ok(sol) => Ok(OuterResult {
+                        Ok(sol) => Ok(RawOuterCandidate {
                             rho: sol.final_point.clone(),
                             final_value: sol.final_value,
                             iterations: sol.iterations,
-                            final_grad_norm: f64::NAN,
                             converged: true,
                         }),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
-                            Ok(OuterResult {
+                            Ok(RawOuterCandidate {
                                 rho: last_solution.final_point.clone(),
                                 final_value: last_solution.final_value,
                                 iterations: last_solution.iterations,
-                                final_grad_norm: f64::NAN,
                                 converged: false,
                             })
                         }
@@ -493,19 +556,17 @@ pub fn run_outer(
                         .with_tolerance(tol)
                         .with_max_iterations(max_iter);
                     match optimizer.run() {
-                        Ok(sol) => Ok(OuterResult {
+                        Ok(sol) => Ok(RawOuterCandidate {
                             rho: sol.final_point.clone(),
                             final_value: sol.final_value,
                             iterations: sol.iterations,
-                            final_grad_norm: f64::NAN,
                             converged: true,
                         }),
                         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-                            Ok(OuterResult {
+                            Ok(RawOuterCandidate {
                                 rho: last_solution.final_point.clone(),
                                 final_value: last_solution.final_value,
                                 iterations: last_solution.iterations,
-                                final_grad_norm: f64::NAN,
                                 converged: false,
                             })
                         }
@@ -580,27 +641,28 @@ pub fn run_outer(
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid"),
                     );
                 match optimizer.run() {
-                    Ok(sol) => Ok(OuterResult {
+                    Ok(sol) => Ok(RawOuterCandidate {
                         rho: sol.final_point.clone(),
                         final_value: sol.final_value,
                         iterations: sol.iterations,
-                        final_grad_norm: f64::NAN,
                         converged: true,
                     }),
-                    Err(BfgsError::MaxIterationsReached { last_solution }) => Ok(OuterResult {
-                        rho: last_solution.final_point.clone(),
-                        final_value: last_solution.final_value,
-                        iterations: last_solution.iterations,
-                        final_grad_norm: f64::NAN,
-                        converged: false,
-                    }),
-                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => Ok(OuterResult {
-                        rho: last_solution.final_point.clone(),
-                        final_value: last_solution.final_value,
-                        iterations: last_solution.iterations,
-                        final_grad_norm: f64::NAN,
-                        converged: false,
-                    }),
+                    Err(BfgsError::MaxIterationsReached { last_solution }) => {
+                        Ok(RawOuterCandidate {
+                            rho: last_solution.final_point.clone(),
+                            final_value: last_solution.final_value,
+                            iterations: last_solution.iterations,
+                            converged: false,
+                        })
+                    }
+                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+                        Ok(RawOuterCandidate {
+                            rho: last_solution.final_point.clone(),
+                            final_value: last_solution.final_value,
+                            iterations: last_solution.iterations,
+                            converged: false,
+                        })
+                    }
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                         "BFGS solver failed: {e:?}"
                     ))),
@@ -608,7 +670,7 @@ pub fn run_outer(
             }
         };
 
-        match result {
+        match result.and_then(|candidate| finalize_candidate(obj, candidate)) {
             Ok(candidate) => {
                 let dominated = best.as_ref().is_some_and(|b| {
                     b.converged && (!candidate.converged || b.final_value <= candidate.final_value)

@@ -1373,10 +1373,8 @@ impl<'a> RemlState<'a> {
 
         // Moving nullspace correction data for τ-τ penalty pseudo-logdet.
         // See build_tau_pair_callbacks for the full derivation.
-        let pos_indices_old: Vec<usize> =
-            (0..p_dim).filter(|&idx| s_eigs[idx] > s_tol).collect();
-        let null_indices_old: Vec<usize> =
-            (0..p_dim).filter(|&idx| s_eigs[idx] <= s_tol).collect();
+        let pos_indices_old: Vec<usize> = (0..p_dim).filter(|&idx| s_eigs[idx] > s_tol).collect();
+        let null_indices_old: Vec<usize> = (0..p_dim).filter(|&idx| s_eigs[idx] <= s_tol).collect();
         let n_null_old = null_indices_old.len();
         let n_pos_old = pos_indices_old.len();
         let has_moving_nullspace_old = n_null_old > 0 && n_pos_old > 0;
@@ -2133,9 +2131,7 @@ impl<'a> RemlState<'a> {
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         let x_dense_arc = pirls_result
             .x_transformed
-            .try_to_dense_arc(
-                "build_tau_hyper_coords requires dense transformed design",
-            )
+            .try_to_dense_arc("build_tau_hyper_coords requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
         let x_dense_owned = free_basis_opt.as_ref().map(|z| {
             DenseRightProductView::new(x_dense_arc.as_ref())
@@ -2177,8 +2173,7 @@ impl<'a> RemlState<'a> {
         let c_array = &pirls_result.solve_c_array;
 
         // Whether third-derivative corrections are needed (non-Gaussian).
-        let is_gaussian_identity =
-            matches!(self.config.link_function(), LinkFunction::Identity);
+        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
         let b_depends_on_beta = !is_gaussian_identity;
 
         // Firth operator (Firth-logit only).
@@ -2228,8 +2223,7 @@ impl<'a> RemlState<'a> {
             // --- a_j: fixed-β cost derivative (envelope term) ---
             // a_j = −u^T (X_{τ_j} β̂) + 0.5 β̂^T S_{τ_j} β̂  [+ Φ_{τ_j}|_β for Firth]
             let x_tau_beta_j = x_tau_j.dot(&beta_eval);
-            let mut a_j = -u.dot(&x_tau_beta_j)
-                + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
             // Firth partial: Φ_{τ_j}|_β = 0.5 tr(I_r^{-1} I_{r,τ_j}).
             let mut firth_tau_kernel_j: Option<FirthTauPartialKernel> = None;
             if let Some(op) = firth_op.as_ref() {
@@ -2251,8 +2245,7 @@ impl<'a> RemlState<'a> {
                 - x_dense.t().dot(&weighted_x_tau_beta_j)
                 - s_tau_j.dot(&beta_eval);
             if let Some(op) = firth_op.as_ref() {
-                let tau_bundle =
-                    Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, false);
+                let tau_bundle = Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, false);
                 g_j -= &tau_bundle.gphi_tau;
             }
 
@@ -2268,11 +2261,7 @@ impl<'a> RemlState<'a> {
                 // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
                 let c_x_tau_beta = c_array * &x_tau_beta_j;
                 let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                b_j += &Self::xt_diag_x_dense_into(
-                    x_dense,
-                    &c_x_tau_beta,
-                    &mut weighted_scratch,
-                );
+                b_j += &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
             }
 
             // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
@@ -2290,11 +2279,8 @@ impl<'a> RemlState<'a> {
 
             // --- ld_s_j: penalty pseudo-logdet derivative ---
             // ld_s_j = tr(S_+^{−1} S_{τ_j}).
-            let ld_s_j = self.fixed_subspace_penalty_trace(
-                &e_eval,
-                &s_tau_j,
-                pirls_result.ridge_passport,
-            )?;
+            let ld_s_j =
+                self.fixed_subspace_penalty_trace(&e_eval, &s_tau_j, pirls_result.ridge_passport)?;
 
             coords.push(super::unified::HyperCoord {
                 a: a_j,
@@ -2385,8 +2371,7 @@ impl<'a> RemlState<'a> {
             .collect();
 
         // Pre-compute second-order penalty matrices S_{τ_i τ_j} for all pairs.
-        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
-            vec![vec![None; psi_dim]; psi_dim];
+        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
                 let second_components =
@@ -2399,15 +2384,15 @@ impl<'a> RemlState<'a> {
                     &reparam_result.qs,
                     free_basis_opt.as_ref(),
                 );
-                let total = transformed.iter().fold(
-                    Array2::<f64>::zeros((p_dim, p_dim)),
-                    |mut acc, c| {
-                        c.matrix
-                            .scaled_add_to(&mut acc, rho[c.penalty_index].exp())
-                            .expect("valid second penalty component");
-                        acc
-                    },
-                );
+                let total =
+                    transformed
+                        .iter()
+                        .fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
+                            c.matrix
+                                .scaled_add_to(&mut acc, rho[c.penalty_index].exp())
+                                .expect("valid second penalty component");
+                            acc
+                        });
                 s_tau_tau[i][j] = Some(total);
             }
         }
@@ -2497,14 +2482,12 @@ impl<'a> RemlState<'a> {
         };
         // Σ⁺² = diag(1/σ_i²) for positive eigenvalues.
         let sigma_pinv_sq: Option<Array1<f64>> = if has_moving_nullspace {
-            Some(
-                Array1::from_vec(
-                    pos_indices
-                        .iter()
-                        .map(|&i| 1.0 / (s_eigs[i] * s_eigs[i]))
-                        .collect(),
-                ),
-            )
+            Some(Array1::from_vec(
+                pos_indices
+                    .iter()
+                    .map(|&i| 1.0 / (s_eigs[i] * s_eigs[i]))
+                    .collect(),
+            ))
         } else {
             None
         };
@@ -2526,8 +2509,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Pre-compute S_+^{-1} S_{τ_j} products for the quadratic trace term.
-        let sdag_s_tau: Vec<Array2<f64>> =
-            s_tau_list.iter().map(|s| s_dag.dot(s)).collect();
+        let sdag_s_tau: Vec<Array2<f64>> = s_tau_list.iter().map(|s| s_dag.dot(s)).collect();
 
         // Pre-compute A_k = λ_k R_k^T R_k for ρ-τ pairs.
         let a_k_mats: Vec<Array2<f64>> = rs_eval
@@ -2537,15 +2519,12 @@ impl<'a> RemlState<'a> {
             .collect();
 
         // Precompute S_+^{-1} A_k for ρ-τ pairs.
-        let sdag_a_k: Vec<Array2<f64>> =
-            a_k_mats.iter().map(|a| s_dag.dot(a)).collect();
+        let sdag_a_k: Vec<Array2<f64>> = a_k_mats.iter().map(|a| s_dag.dot(a)).collect();
 
         // Pre-compute transformed design matrices X_{τ_j} for each τ direction.
         let x_dense_arc = pirls_result
             .x_transformed
-            .try_to_dense_arc(
-                "build_tau_pair_callbacks requires dense transformed design",
-            )
+            .try_to_dense_arc("build_tau_pair_callbacks requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
         let x_dense_owned = free_basis_opt.as_ref().map(|z| {
             DenseRightProductView::new(x_dense_arc.as_ref())
@@ -2572,8 +2551,7 @@ impl<'a> RemlState<'a> {
             .collect();
 
         // Pre-compute second-order design matrices X_{τ_i τ_j} for all pairs.
-        let mut x_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
-            vec![vec![None; psi_dim]; psi_dim];
+        let mut x_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in i..psi_dim {
                 let xij = hyper_dirs[i]
@@ -2582,7 +2560,11 @@ impl<'a> RemlState<'a> {
                     .flatten()
                     .or_else(|| {
                         hyper_dirs[j]
-                            .transformed_x_tau_tau_at(i, &reparam_result.qs, free_basis_opt.as_ref())
+                            .transformed_x_tau_tau_at(
+                                i,
+                                &reparam_result.qs,
+                                free_basis_opt.as_ref(),
+                            )
                             .ok()
                             .flatten()
                     });
@@ -2599,8 +2581,7 @@ impl<'a> RemlState<'a> {
         let w_diag = pirls_result.solveweights.clone();
         let c_array = pirls_result.solve_c_array.clone();
         let d_array = pirls_result.solve_d_array.clone();
-        let is_gaussian_identity =
-            matches!(self.config.link_function(), LinkFunction::Identity);
+        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         // Pre-compute per-penalty-index components of S_{τ_j} for ρ-τ cross
         // derivative A_{k,τ_j} = λ_k (dS_k/dτ_j).
@@ -2619,8 +2600,7 @@ impl<'a> RemlState<'a> {
 
         // Build A_{k,τ_j} = λ_k * (component of S_{τ_j} at penalty k).
         // Stored as a_k_tau_j[j][k]: Option<Array2<f64>>.
-        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
-            vec![vec![None; k_count]; psi_dim];
+        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
         for j in 0..psi_dim {
             for component in &penalty_components_per_dir[j] {
                 let k = component.penalty_index;
@@ -2781,7 +2761,11 @@ impl<'a> RemlState<'a> {
             // term5: -X^T W(X_{τ_i τ_j} β̂)
             let term5 = x_tau_tau_tt[i][j]
                 .as_ref()
-                .map(|xij| x_dense_tt.t().dot(&(w_tt.as_ref() * &xij.dot(beta_tt.as_ref()))))
+                .map(|xij| {
+                    x_dense_tt
+                        .t()
+                        .dot(&(w_tt.as_ref() * &xij.dot(beta_tt.as_ref())))
+                })
                 .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
 
             // term6: -S_{τ_i τ_j} β̂

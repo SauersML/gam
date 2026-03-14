@@ -361,10 +361,8 @@ impl PredictableModel for GaussianLocationScalePredictor {
         let sigma = pred.mean_se.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sigma for Gaussian LS intervals".to_string())
         })?;
-        let z = crate::probability::standard_normal_quantile(
-            0.5 + options.confidence_level * 0.5,
-        )
-        .map_err(|e| EstimationError::InvalidInput(e))?;
+        let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
+            .map_err(|e| EstimationError::InvalidInput(e))?;
         let eta_lower = &pred.eta - &sigma.mapv(|s| z * s);
         let eta_upper = &pred.eta + &sigma.mapv(|s| z * s);
         Ok(PredictUncertaintyResult {
@@ -504,7 +502,7 @@ impl BinomialLocationScalePredictor {
 
 impl PredictableModel for BinomialLocationScalePredictor {
     fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
-        let (q0, _sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let (q0, _, eta_t) = self.compute_q0_and_sigma(input)?;
         let prob = self.apply_link(&q0)?;
         Ok(PredictResult {
             eta: eta_t,
@@ -864,10 +862,8 @@ impl PredictableModel for SurvivalPredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let _ = fit; // not needed for survival LS intervals
         let pred = self.predict_with_uncertainty(input)?;
-        let z = crate::probability::standard_normal_quantile(
-            0.5 + options.confidence_level * 0.5,
-        )
-        .map_err(|e| EstimationError::InvalidInput(e))?;
+        let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
+            .map_err(|e| EstimationError::InvalidInput(e))?;
 
         let eta_se = pred.eta_se.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(

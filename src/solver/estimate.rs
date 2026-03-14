@@ -22,8 +22,8 @@
 
 use self::reml::{DirectionalHyperParam, RemlState};
 use crate::basis::analyze_penalty_block;
-use crate::families::custom_family::BlockwiseFitResult;
-use crate::families::survival_location_scale::SurvivalLocationScaleFitResult;
+// BlockwiseFitResult and SurvivalLocationScaleFitResult are now type aliases
+// for UnifiedFitResult, defined in their respective modules.
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::fmt;
 use std::time::Instant;
@@ -2986,10 +2986,18 @@ impl Default for AdaptiveRegularizationOptions {
 
 /// Post-fit artifacts needed by downstream diagnostics/inference without
 /// re-running PIRLS.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FitArtifacts {
     #[serde(default, skip_serializing, skip_deserializing)]
     pub pirls: Option<crate::pirls::PirlsResult>,
+}
+
+impl std::fmt::Debug for FitArtifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FitArtifacts")
+            .field("pirls", &self.pirls.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3015,28 +3023,11 @@ pub struct FitInference {
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct FitResult {
-    pub beta: Array1<f64>,
-    pub lambdas: Array1<f64>,
-    /// Residual scale on the response scale.
-    ///
-    /// Contract: Gaussian identity models store residual standard deviation
-    /// sigma here. This is serialized into saved models and consumed by
-    /// prediction/benchmark code as a standard deviation, not a variance.
-    pub standard_deviation: f64,
-    pub iterations: usize,
-    pub finalgrad_norm: f64,
-    pub pirls_status: crate::pirls::PirlsStatus,
-    pub deviance: f64,
-    pub stable_penalty_term: f64,
-    pub max_abs_eta: f64,
-    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
-    pub artifacts: FitArtifacts,
-    pub inference: Option<FitInference>,
-    pub reml_score: f64,
-    pub fitted_link_parameters: FittedLinkParameters,
-}
+/// Type alias: the old `FitResult` is now `UnifiedFitResult`.
+pub type FitResult = UnifiedFitResult;
+
+/// Type alias: the old `FitResultParts` is now `UnifiedFitResultParts`.
+pub type FitResultParts = UnifiedFitResultParts;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FittedLinkParameters {
@@ -3072,121 +3063,45 @@ pub enum FittedLinkState {
     },
 }
 
-impl FitResult {
-    pub fn inference(&self) -> Option<&FitInference> {
-        self.inference.as_ref()
-    }
-
-    pub fn edf_total(&self) -> Option<f64> {
-        self.inference.as_ref().map(|inf| inf.edf_total)
-    }
-
-    pub fn edf_by_block(&self) -> &[f64] {
-        self.inference
-            .as_ref()
-            .map(|inf| inf.edf_by_block.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn penalized_hessian(&self) -> Option<&Array2<f64>> {
-        self.inference.as_ref().map(|inf| &inf.penalized_hessian)
-    }
-
-    pub fn working_weights(&self) -> Option<&Array1<f64>> {
-        self.inference.as_ref().map(|inf| &inf.working_weights)
-    }
-
-    pub fn working_response(&self) -> Option<&Array1<f64>> {
-        self.inference.as_ref().map(|inf| &inf.working_response)
-    }
-
-    pub fn beta_covariance(&self) -> Option<&Array2<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.beta_covariance.as_ref())
-    }
-
-    pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.beta_covariance_corrected.as_ref())
-    }
-
-    pub fn beta_standard_errors(&self) -> Option<&Array1<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.beta_standard_errors.as_ref())
-    }
-
-    pub fn beta_standard_errors_corrected(&self) -> Option<&Array1<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.beta_standard_errors_corrected.as_ref())
-    }
-
-    pub fn fitted_link_state(
-        &self,
-        family: crate::types::LikelihoodFamily,
-    ) -> Result<FittedLinkState, EstimationError> {
-        match family {
-            crate::types::LikelihoodFamily::GaussianIdentity => {
-                Ok(FittedLinkState::Standard(LinkFunction::Identity))
+fn validate_fitted_link_parameters_estimation(
+    fitted_link: &FittedLinkParameters,
+) -> Result<(), EstimationError> {
+    match fitted_link {
+        FittedLinkParameters::Standard => Ok(()),
+        FittedLinkParameters::Mixture { state, covariance } => {
+            validate_all_finite_estimation(
+                "fit_result.mixture_link_rho",
+                state.rho.iter().copied(),
+            )?;
+            validate_all_finite_estimation(
+                "fit_result.mixture_linkweights",
+                state.pi.iter().copied(),
+            )?;
+            if let Some(v) = covariance.as_ref() {
+                validate_all_finite_estimation(
+                    "fit_result.mixture_link_param_covariance",
+                    v.iter().copied(),
+                )?;
             }
-            crate::types::LikelihoodFamily::BinomialLogit => {
-                Ok(FittedLinkState::Standard(LinkFunction::Logit))
+            Ok(())
+        }
+        FittedLinkParameters::Sas { state, covariance }
+        | FittedLinkParameters::BetaLogistic { state, covariance } => {
+            ensure_finite_scalar_estimation("fit_result.sas_epsilon", state.epsilon)?;
+            ensure_finite_scalar_estimation("fit_result.sas_log_delta", state.log_delta)?;
+            ensure_finite_scalar_estimation("fit_result.sas_delta", state.delta)?;
+            if let Some(v) = covariance.as_ref() {
+                validate_all_finite_estimation(
+                    "fit_result.sas_param_covariance",
+                    v.iter().copied(),
+                )?;
             }
-            crate::types::LikelihoodFamily::BinomialProbit => {
-                Ok(FittedLinkState::Standard(LinkFunction::Probit))
-            }
-            crate::types::LikelihoodFamily::BinomialCLogLog => {
-                Ok(FittedLinkState::Standard(LinkFunction::CLogLog))
-            }
-            crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link_parameters {
-                FittedLinkParameters::Sas { state, covariance } => Ok(FittedLinkState::Sas {
-                    state: state.clone(),
-                    covariance: covariance.clone(),
-                }),
-                _ => Err(EstimationError::InvalidInput(
-                    "BinomialSas requires fitted SAS link parameters".to_string(),
-                )),
-            },
-            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                match &self.fitted_link_parameters {
-                    FittedLinkParameters::BetaLogistic { state, covariance } => {
-                        Ok(FittedLinkState::BetaLogistic {
-                            state: state.clone(),
-                            covariance: covariance.clone(),
-                        })
-                    }
-                    _ => Err(EstimationError::InvalidInput(
-                        "BinomialBetaLogistic requires fitted beta-logistic link parameters"
-                            .to_string(),
-                    )),
-                }
-            }
-            crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link_parameters {
-                FittedLinkParameters::Mixture { state, covariance } => {
-                    Ok(FittedLinkState::Mixture {
-                        state: state.clone(),
-                        covariance: covariance.clone(),
-                    })
-                }
-                _ => Err(EstimationError::InvalidInput(
-                    "BinomialMixture requires fitted mixture link parameters".to_string(),
-                )),
-            },
-            crate::types::LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-                "fitted_link_state is not defined for PoissonLog".to_string(),
-            )),
-            crate::types::LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-                "fitted_link_state is not defined for GammaLog".to_string(),
-            )),
-            crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "fitted_link_state is not defined for RoystonParmar".to_string(),
-            )),
+            Ok(())
         }
     }
 }
+
+// Old FitResult impl block deleted — methods now live on UnifiedFitResult.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Unified fit result — single type for all model families
@@ -3234,12 +3149,48 @@ pub struct FitGeometry {
     pub working_response: Array1<f64>,
 }
 
+pub struct UnifiedFitResultParts {
+    pub blocks: Vec<FittedBlock>,
+    pub log_lambdas: Array1<f64>,
+    pub lambdas: Array1<f64>,
+    pub log_likelihood: f64,
+    pub reml_score: f64,
+    pub stable_penalty_term: f64,
+    pub penalized_objective: f64,
+    pub outer_iterations: usize,
+    pub outer_converged: bool,
+    pub outer_gradient_norm: f64,
+    pub standard_deviation: f64,
+    pub covariance_conditional: Option<Array2<f64>>,
+    pub covariance_corrected: Option<Array2<f64>>,
+    pub inference: Option<FitInference>,
+    pub fitted_link: FittedLinkParameters,
+    pub geometry: Option<FitGeometry>,
+    pub block_states: Vec<crate::families::custom_family::ParameterBlockState>,
+    // Backward-compatible fields (all have sensible defaults).
+    #[doc(hidden)]
+    pub pirls_status: crate::pirls::PirlsStatus,
+    #[doc(hidden)]
+    pub max_abs_eta: f64,
+    #[doc(hidden)]
+    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
+    #[doc(hidden)]
+    pub artifacts: FitArtifacts,
+    #[doc(hidden)]
+    pub inner_cycles: usize,
+}
+
 /// Unified fit result for all model types (standard GAM, GAMLSS, survival).
 ///
 /// Standard models have a single block; GAMLSS and survival models have
 /// multiple blocks with different roles.
+///
+/// Backward-compatible field aliases are provided so that code written against
+/// the old `FitResult`, `BlockwiseFitResult`, and `SurvivalLocationScaleFitResult`
+/// types continues to compile after the unification.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnifiedFitResult {
+    // ── canonical fields ──────────────────────────────────────────────────
     /// Coefficient blocks (1 for standard GAM, N for GAMLSS/survival).
     pub blocks: Vec<FittedBlock>,
     /// Log-smoothing parameters (all blocks concatenated in block order).
@@ -3278,151 +3229,399 @@ pub struct UnifiedFitResult {
     /// Working-set geometry at convergence (for ALO diagnostics).
     #[serde(skip)]
     pub geometry: Option<FitGeometry>,
+    /// Internal block states from custom-family paths.
+    #[serde(skip)]
+    pub block_states: Vec<crate::families::custom_family::ParameterBlockState>,
+
+    // ── backward-compatible aliases (old FitResult fields) ────────────────
+    /// Joint coefficient vector (first block for standard GAMs, concatenated for multi-block).
+    #[serde(default)]
+    pub beta: Array1<f64>,
+    /// Alias for `outer_iterations` (old FitResult name).
+    #[serde(default)]
+    pub iterations: usize,
+    /// Alias for `outer_gradient_norm` (old FitResult name).
+    #[serde(default)]
+    pub finalgrad_norm: f64,
+    /// Inner solver convergence status.
+    #[serde(default = "default_pirls_status")]
+    pub pirls_status: crate::pirls::PirlsStatus,
+    /// Maximum absolute linear predictor value at convergence.
+    #[serde(default)]
+    pub max_abs_eta: f64,
+    /// Constraint KKT diagnostics (monotone-constrained fits).
+    #[serde(default)]
+    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
+    /// Solver artifacts (e.g. cached PIRLS result for ALO).
+    #[serde(skip)]
+    pub artifacts: FitArtifacts,
+    /// Alias for `fitted_link` (old FitResult name).
+    #[serde(default)]
+    pub fitted_link_parameters: FittedLinkParameters,
+
+    // ── backward-compatible aliases (old BlockwiseFitResult fields) ───────
+    /// Alias for `outer_converged` (old BlockwiseFitResult name).
+    #[serde(default)]
+    pub converged: bool,
+    /// Alias for `penalized_objective` (old BlockwiseFitResult name).
+    #[serde(default)]
+    pub penalizedobjective: f64,
+    /// Alias for `outer_gradient_norm` (old BlockwiseFitResult name).
+    #[serde(default)]
+    pub outer_final_gradient_norm: f64,
+    /// Inner cycle count (blockwise path).
+    #[serde(default)]
+    pub inner_cycles: usize,
+
+    // ── backward-compatible survival fields ───────────────────────────────
+    /// Time/baseline-hazard coefficients (survival location-scale).
+    #[serde(default)]
+    pub beta_time: Array1<f64>,
+    /// Threshold coefficients (survival location-scale).
+    #[serde(default)]
+    pub beta_threshold: Array1<f64>,
+    /// Log-sigma coefficients (survival location-scale).
+    #[serde(default)]
+    pub beta_log_sigma: Array1<f64>,
+    /// Link-wiggle coefficients (survival location-scale, optional).
+    #[serde(default)]
+    pub beta_link_wiggle: Option<Array1<f64>>,
+    /// Smoothing parameters for time block.
+    #[serde(default)]
+    pub lambdas_time: Array1<f64>,
+    /// Smoothing parameters for threshold block.
+    #[serde(default)]
+    pub lambdas_threshold: Array1<f64>,
+    /// Smoothing parameters for log-sigma block.
+    #[serde(default)]
+    pub lambdas_log_sigma: Array1<f64>,
+    /// Smoothing parameters for link-wiggle block.
+    #[serde(default)]
+    pub lambdas_linkwiggle: Option<Array1<f64>>,
 }
 
-impl From<&FitResult> for UnifiedFitResult {
-    fn from(fit: &FitResult) -> Self {
-        let edf = fit
-            .inference
-            .as_ref()
-            .map(|inf| inf.edf_total)
-            .unwrap_or(0.0);
-        let geometry = fit.inference.as_ref().map(|inf| FitGeometry {
-            penalized_hessian: inf.penalized_hessian.clone(),
-            working_weights: inf.working_weights.clone(),
-            working_response: inf.working_response.clone(),
-        });
-        UnifiedFitResult {
-            blocks: vec![FittedBlock {
-                beta: fit.beta.clone(),
-                role: BlockRole::Mean,
-                edf,
-                lambdas: fit.lambdas.clone(),
-            }],
-            log_lambdas: fit.lambdas.mapv(f64::ln),
-            log_likelihood: -0.5 * fit.deviance,
-            penalized_objective: -0.5 * fit.deviance + fit.stable_penalty_term + fit.reml_score,
-            outer_iterations: fit.iterations,
-            outer_converged: true, // standard path converges or errors
-            outer_gradient_norm: fit.finalgrad_norm,
-            covariance_conditional: fit
-                .inference
-                .as_ref()
-                .and_then(|inf| inf.beta_covariance.clone()),
-            fitted_link: fit.fitted_link_parameters.clone(),
-            geometry,
-        }
+fn default_pirls_status() -> crate::pirls::PirlsStatus {
+    crate::pirls::PirlsStatus::Converged
+}
+
+impl Default for FittedLinkParameters {
+    fn default() -> Self {
+        FittedLinkParameters::Standard
     }
 }
 
-impl From<&BlockwiseFitResult> for UnifiedFitResult {
-    fn from(fit: &BlockwiseFitResult) -> Self {
-        let blocks: Vec<FittedBlock> = fit
-            .block_states
-            .iter()
-            .enumerate()
-            .map(|(i, bs)| {
-                let role = if fit.block_states.len() == 1 {
-                    BlockRole::Mean
-                } else if i == 0 {
-                    BlockRole::Location
-                } else {
-                    BlockRole::Scale
-                };
-                FittedBlock {
-                    beta: bs.beta.clone(),
-                    role,
-                    edf: 0.0, // BlockwiseFitResult does not track per-block EDF
-                    lambdas: Array1::zeros(0),
-                }
-            })
-            .collect();
-        UnifiedFitResult {
-            blocks,
-            log_lambdas: fit.log_lambdas.clone(),
-            log_likelihood: fit.log_likelihood,
-            penalized_objective: fit.penalizedobjective,
-            outer_iterations: fit.outer_iterations,
-            outer_converged: fit.converged,
-            outer_gradient_norm: fit.outer_final_gradient_norm,
-            covariance_conditional: fit.covariance_conditional.clone(),
-            fitted_link: FittedLinkParameters::Standard,
-            geometry: None,
-        }
+pub(crate) fn ensure_finite_scalar_estimation(
+    name: &str,
+    value: f64,
+) -> Result<(), EstimationError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{name} must be finite, got {value}"
+        )))
     }
 }
 
-impl From<&SurvivalLocationScaleFitResult> for UnifiedFitResult {
-    fn from(fit: &SurvivalLocationScaleFitResult) -> Self {
-        let mut blocks = vec![
-            FittedBlock {
-                beta: fit.beta_time.clone(),
-                role: BlockRole::Time,
-                edf: 0.0,
-                lambdas: fit.lambdas_time.clone(),
-            },
-            FittedBlock {
-                beta: fit.beta_threshold.clone(),
-                role: BlockRole::Threshold,
-                edf: 0.0,
-                lambdas: fit.lambdas_threshold.clone(),
-            },
-            FittedBlock {
-                beta: fit.beta_log_sigma.clone(),
-                role: BlockRole::Scale,
-                edf: 0.0,
-                lambdas: fit.lambdas_log_sigma.clone(),
-            },
-        ];
-        if let Some(ref bw) = fit.beta_link_wiggle {
-            blocks.push(FittedBlock {
-                beta: bw.clone(),
-                role: BlockRole::LinkWiggle,
-                edf: 0.0,
-                lambdas: fit
-                    .lambdas_linkwiggle
-                    .clone()
-                    .unwrap_or_else(|| Array1::zeros(0)),
-            });
+pub(crate) fn validate_all_finite_estimation<I>(
+    label: &str,
+    values: I,
+) -> Result<(), EstimationError>
+where
+    I: IntoIterator<Item = f64>,
+{
+    for (idx, value) in values.into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label}[{idx}] must be finite, got {value}"
+            )));
         }
-        let all_lambdas: Vec<f64> = blocks
-            .iter()
-            .flat_map(|b| b.lambdas.iter().copied())
-            .collect();
-        let log_lambdas = Array1::from_vec(
-            all_lambdas
-                .iter()
-                .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
-                .collect(),
-        );
-        UnifiedFitResult {
-            blocks,
-            log_lambdas,
-            log_likelihood: fit.log_likelihood,
-            penalized_objective: fit.penalizedobjective,
-            outer_iterations: fit.iterations,
-            outer_converged: fit.converged,
-            outer_gradient_norm: fit.finalgrad_norm,
-            covariance_conditional: fit.covariance_conditional.clone(),
-            fitted_link: FittedLinkParameters::Standard,
-            geometry: None,
-        }
+    }
+    Ok(())
+}
+
+impl FitGeometry {
+    pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        validate_all_finite_estimation(
+            "fit_result.geometry.penalized_hessian",
+            self.penalized_hessian.iter().copied(),
+        )?;
+        validate_all_finite_estimation(
+            "fit_result.geometry.working_weights",
+            self.working_weights.iter().copied(),
+        )?;
+        validate_all_finite_estimation(
+            "fit_result.geometry.working_response",
+            self.working_response.iter().copied(),
+        )?;
+        Ok(())
     }
 }
 
-impl FitResult {
-    /// Convert to the unified fit result representation.
-    pub fn to_unified(&self) -> UnifiedFitResult {
-        UnifiedFitResult::from(self)
+impl FitInference {
+    pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        ensure_finite_scalar_estimation("fit_result.edf_total", self.edf_total)?;
+        validate_all_finite_estimation(
+            "fit_result.edf_by_block",
+            self.edf_by_block.iter().copied(),
+        )?;
+        validate_all_finite_estimation(
+            "fit_result.working_weights",
+            self.working_weights.iter().copied(),
+        )?;
+        validate_all_finite_estimation(
+            "fit_result.working_response",
+            self.working_response.iter().copied(),
+        )?;
+        validate_all_finite_estimation(
+            "fit_result.penalized_hessian",
+            self.penalized_hessian.iter().copied(),
+        )?;
+        if let Some(v) = self.beta_covariance.as_ref() {
+            validate_all_finite_estimation("fit_result.beta_covariance", v.iter().copied())?;
+        }
+        if let Some(v) = self.beta_covariance_corrected.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.beta_covariance_corrected",
+                v.iter().copied(),
+            )?;
+        }
+        if let Some(v) = self.beta_standard_errors.as_ref() {
+            validate_all_finite_estimation("fit_result.beta_standard_errors", v.iter().copied())?;
+        }
+        if let Some(v) = self.beta_standard_errors_corrected.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.beta_standard_errors_corrected",
+                v.iter().copied(),
+            )?;
+        }
+        if let Some(v) = self.smoothing_correction.as_ref() {
+            validate_all_finite_estimation("fit_result.smoothing_correction", v.iter().copied())?;
+        }
+        if let Some(v) = self.reparam_qs.as_ref() {
+            validate_all_finite_estimation("fit_result.reparam_qs", v.iter().copied())?;
+        }
+        Ok(())
     }
 }
+
+// Old FitResult::try_from_parts / validate deleted — now handled by UnifiedFitResult.
 
 impl UnifiedFitResult {
-    /// Get beta from the first (or only) block -- convenience for single-block models.
-    pub fn beta(&self) -> &Array1<f64> {
-        &self.blocks[0].beta
+    pub fn try_from_parts(parts: UnifiedFitResultParts) -> Result<Self, EstimationError> {
+        let UnifiedFitResultParts {
+            blocks,
+            log_lambdas,
+            lambdas,
+            log_likelihood,
+            reml_score,
+            stable_penalty_term,
+            penalized_objective,
+            outer_iterations,
+            outer_converged,
+            outer_gradient_norm,
+            standard_deviation,
+            covariance_conditional,
+            covariance_corrected,
+            inference,
+            fitted_link,
+            geometry,
+            block_states,
+            pirls_status,
+            max_abs_eta,
+            constraint_kkt,
+            artifacts,
+            inner_cycles,
+        } = parts;
+
+        if blocks.is_empty() {
+            return Err(EstimationError::InvalidInput(
+                "UnifiedFitResult requires at least one coefficient block".to_string(),
+            ));
+        }
+        if log_lambdas.len() != lambdas.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "UnifiedFitResult lambda mismatch: log_lambdas={}, lambdas={}",
+                log_lambdas.len(),
+                lambdas.len()
+            )));
+        }
+        for (idx, block) in blocks.iter().enumerate() {
+            validate_all_finite_estimation(
+                &format!("fit_result.blocks[{idx}].beta"),
+                block.beta.iter().copied(),
+            )?;
+            ensure_finite_scalar_estimation(&format!("fit_result.blocks[{idx}].edf"), block.edf)?;
+            validate_all_finite_estimation(
+                &format!("fit_result.blocks[{idx}].lambdas"),
+                block.lambdas.iter().copied(),
+            )?;
+        }
+        validate_all_finite_estimation("fit_result.log_lambdas", log_lambdas.iter().copied())?;
+        validate_all_finite_estimation("fit_result.lambdas", lambdas.iter().copied())?;
+        ensure_finite_scalar_estimation("fit_result.log_likelihood", log_likelihood)?;
+        ensure_finite_scalar_estimation("fit_result.reml_score", reml_score)?;
+        ensure_finite_scalar_estimation("fit_result.stable_penalty_term", stable_penalty_term)?;
+        ensure_finite_scalar_estimation("fit_result.penalized_objective", penalized_objective)?;
+        ensure_finite_scalar_estimation("fit_result.outer_gradient_norm", outer_gradient_norm)?;
+        ensure_finite_scalar_estimation("fit_result.standard_deviation", standard_deviation)?;
+        if let Some(v) = covariance_conditional.as_ref() {
+            validate_all_finite_estimation("fit_result.beta_covariance", v.iter().copied())?;
+        }
+        if let Some(v) = covariance_corrected.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.beta_covariance_corrected",
+                v.iter().copied(),
+            )?;
+        }
+        if let Some(inf) = inference.as_ref() {
+            inf.validate_numeric_finiteness()?;
+        }
+        if let Some(geom) = geometry.as_ref() {
+            geom.validate_numeric_finiteness()?;
+        }
+        for (idx, state) in block_states.iter().enumerate() {
+            validate_all_finite_estimation(
+                &format!("fit_result.block_states[{idx}].beta"),
+                state.beta.iter().copied(),
+            )?;
+            validate_all_finite_estimation(
+                &format!("fit_result.block_states[{idx}].eta"),
+                state.eta.iter().copied(),
+            )?;
+        }
+        validate_fitted_link_parameters_estimation(&fitted_link)?;
+
+        // Build the flat beta vector from all blocks.
+        let beta = {
+            let total: usize = blocks.iter().map(|b| b.beta.len()).sum();
+            let mut flat = Array1::zeros(total);
+            let mut off = 0;
+            for b in &blocks {
+                let p = b.beta.len();
+                flat.slice_mut(ndarray::s![off..off + p]).assign(&b.beta);
+                off += p;
+            }
+            flat
+        };
+
+        // Extract survival-specific block data for backward compatibility.
+        let beta_time = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::Time)
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let beta_threshold = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::Threshold)
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let beta_log_sigma_val = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::Scale)
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let beta_link_wiggle = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::LinkWiggle)
+            .map(|b| b.beta.clone());
+        let lambdas_time = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::Time)
+            .map(|b| b.lambdas.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let lambdas_threshold = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::Threshold)
+            .map(|b| b.lambdas.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let lambdas_log_sigma_val = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::Scale)
+            .map(|b| b.lambdas.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let lambdas_linkwiggle = blocks
+            .iter()
+            .find(|b| b.role == BlockRole::LinkWiggle)
+            .map(|b| b.lambdas.clone());
+
+        Ok(Self {
+            // canonical
+            blocks,
+            log_lambdas,
+            lambdas,
+            log_likelihood,
+            deviance: -2.0 * log_likelihood,
+            reml_score,
+            stable_penalty_term,
+            penalized_objective,
+            outer_iterations,
+            outer_converged,
+            outer_gradient_norm,
+            standard_deviation,
+            covariance_conditional,
+            covariance_corrected,
+            inference,
+            fitted_link_parameters: fitted_link.clone(),
+            fitted_link,
+            geometry,
+            block_states,
+            // backward-compat aliases
+            beta,
+            iterations: outer_iterations,
+            finalgrad_norm: outer_gradient_norm,
+            pirls_status,
+            max_abs_eta,
+            constraint_kkt,
+            artifacts,
+            converged: outer_converged,
+            penalizedobjective: penalized_objective,
+            outer_final_gradient_norm: outer_gradient_norm,
+            inner_cycles,
+            // survival fields
+            beta_time,
+            beta_threshold,
+            beta_log_sigma: beta_log_sigma_val,
+            beta_link_wiggle,
+            lambdas_time,
+            lambdas_threshold,
+            lambdas_log_sigma: lambdas_log_sigma_val,
+            lambdas_linkwiggle,
+        })
     }
 
+    pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        Self::try_from_parts(UnifiedFitResultParts {
+            blocks: self.blocks.clone(),
+            log_lambdas: self.log_lambdas.clone(),
+            lambdas: self.lambdas.clone(),
+            log_likelihood: self.log_likelihood,
+            reml_score: self.reml_score,
+            stable_penalty_term: self.stable_penalty_term,
+            penalized_objective: self.penalized_objective,
+            outer_iterations: self.outer_iterations,
+            outer_converged: self.outer_converged,
+            outer_gradient_norm: self.outer_gradient_norm,
+            standard_deviation: self.standard_deviation,
+            covariance_conditional: self.covariance_conditional.clone(),
+            covariance_corrected: self.covariance_corrected.clone(),
+            inference: self.inference.clone(),
+            fitted_link: self.fitted_link.clone(),
+            geometry: self.geometry.clone(),
+            block_states: self.block_states.clone(),
+            pirls_status: self.pirls_status,
+            max_abs_eta: self.max_abs_eta,
+            constraint_kkt: self.constraint_kkt.clone(),
+            artifacts: self.artifacts.clone(),
+            inner_cycles: self.inner_cycles,
+        })
+        .map(|_| ())
+    }
+}
+
+// Old From impls and to_unified deleted — the types are now unified.
+
+impl UnifiedFitResult {
     /// Get the beta covariance matrix (conditional) if available.
     pub fn beta_covariance(&self) -> Option<&Array2<f64>> {
         self.covariance_conditional.as_ref()
@@ -3430,13 +3629,11 @@ impl UnifiedFitResult {
 
     /// Get the smoothing-parameter-corrected beta covariance if available.
     pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
-        self.covariance_corrected
-            .as_ref()
-            .or_else(|| {
-                self.inference
-                    .as_ref()
-                    .and_then(|inf| inf.beta_covariance_corrected.as_ref())
-            })
+        self.covariance_corrected.as_ref().or_else(|| {
+            self.inference
+                .as_ref()
+                .and_then(|inf| inf.beta_covariance_corrected.as_ref())
+        })
     }
 
     /// Get beta standard errors (conditional) if available.
@@ -3487,17 +3684,9 @@ impl UnifiedFitResult {
     }
 
     /// Flat coefficient vector (all blocks concatenated).
+    /// This is equivalent to `self.beta.clone()`.
     pub fn beta_flat(&self) -> Array1<f64> {
-        let total: usize = self.blocks.iter().map(|b| b.beta.len()).sum();
-        let mut flat = Array1::zeros(total);
-        let mut offset = 0;
-        for block in &self.blocks {
-            let p = block.beta.len();
-            flat.slice_mut(ndarray::s![offset..offset + p])
-                .assign(&block.beta);
-            offset += p;
-        }
-        flat
+        self.beta.clone()
     }
 
     /// Number of coefficient blocks.
@@ -3537,20 +3726,18 @@ impl UnifiedFitResult {
                     "BinomialSas requires fitted SAS link parameters".to_string(),
                 )),
             },
-            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                match &self.fitted_link {
-                    FittedLinkParameters::BetaLogistic { state, covariance } => {
-                        Ok(FittedLinkState::BetaLogistic {
-                            state: state.clone(),
-                            covariance: covariance.clone(),
-                        })
-                    }
-                    _ => Err(EstimationError::InvalidInput(
-                        "BinomialBetaLogistic requires fitted beta-logistic link parameters"
-                            .to_string(),
-                    )),
+            crate::types::LikelihoodFamily::BinomialBetaLogistic => match &self.fitted_link {
+                FittedLinkParameters::BetaLogistic { state, covariance } => {
+                    Ok(FittedLinkState::BetaLogistic {
+                        state: state.clone(),
+                        covariance: covariance.clone(),
+                    })
                 }
-            }
+                _ => Err(EstimationError::InvalidInput(
+                    "BinomialBetaLogistic requires fitted beta-logistic link parameters"
+                        .to_string(),
+                )),
+            },
             crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link {
                 FittedLinkParameters::Mixture { state, covariance } => {
                     Ok(FittedLinkState::Mixture {
@@ -4311,21 +4498,55 @@ where
             &ext_opts,
         )?
     };
-    Ok(FitResult {
-        beta: result.beta,
+    let log_lambdas = result.lambdas.mapv(|v| v.max(1e-300).ln());
+    let edf = result
+        .inference
+        .as_ref()
+        .map(|inf| inf.edf_total)
+        .unwrap_or(0.0);
+    let geometry = result.inference.as_ref().map(|inf| FitGeometry {
+        penalized_hessian: inf.penalized_hessian.clone(),
+        working_weights: inf.working_weights.clone(),
+        working_response: inf.working_response.clone(),
+    });
+    let covariance_conditional = result
+        .inference
+        .as_ref()
+        .and_then(|inf| inf.beta_covariance.clone());
+    let covariance_corrected = result
+        .inference
+        .as_ref()
+        .and_then(|inf| inf.beta_covariance_corrected.clone());
+    let penalized_objective =
+        -0.5 * result.deviance + result.stable_penalty_term + result.reml_score;
+    UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+        blocks: vec![FittedBlock {
+            beta: result.beta.clone(),
+            role: BlockRole::Mean,
+            edf,
+            lambdas: result.lambdas.clone(),
+        }],
+        log_lambdas,
         lambdas: result.lambdas,
-        standard_deviation: result.standard_deviation,
-        iterations: result.iterations,
-        finalgrad_norm: result.finalgrad_norm,
-        pirls_status: result.pirls_status,
-        deviance: result.deviance,
+        log_likelihood: -0.5 * result.deviance,
+        reml_score: result.reml_score,
         stable_penalty_term: result.stable_penalty_term,
+        penalized_objective,
+        outer_iterations: result.iterations,
+        outer_converged: true,
+        outer_gradient_norm: result.finalgrad_norm,
+        standard_deviation: result.standard_deviation,
+        covariance_conditional,
+        covariance_corrected,
+        inference: result.inference,
+        fitted_link: result.fitted_link_parameters,
+        geometry,
+        block_states: Vec::new(),
+        pirls_status: result.pirls_status,
         max_abs_eta: result.max_abs_eta,
         constraint_kkt: result.constraint_kkt,
         artifacts: result.artifacts,
-        inference: result.inference,
-        reml_score: result.reml_score,
-        fitted_link_parameters: result.fitted_link_parameters,
+        inner_cycles: 0,
     })
 }
 

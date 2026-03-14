@@ -31,6 +31,7 @@ use crate::smooth::{
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
+use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 const MIN_PROB: f64 = 1e-10;
@@ -595,12 +596,10 @@ fn build_two_block_exact_joint_setup(
     }
 
     // Use aniso-aware initialization: each aniso term gets d ψ entries.
-    let mean_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
-        meanspec, &mean_terms, kappa_options,
-    );
-    let noise_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
-        noisespec, &noise_terms, kappa_options,
-    );
+    let mean_kappa =
+        SpatialLogKappaCoords::from_length_scales_aniso(meanspec, &mean_terms, kappa_options);
+    let noise_kappa =
+        SpatialLogKappaCoords::from_length_scales_aniso(noisespec, &noise_terms, kappa_options);
 
     // Concatenate mean and noise ψ values and dims.
     let mut all_values = mean_kappa.as_array().to_vec();
@@ -608,10 +607,8 @@ fn build_two_block_exact_joint_setup(
     let mut all_dims = mean_kappa.dims_per_term().to_vec();
     all_dims.extend(noise_kappa.dims_per_term());
 
-    let log_kappa0 = SpatialLogKappaCoords::new_with_dims(
-        Array1::from_vec(all_values),
-        all_dims.clone(),
-    );
+    let log_kappa0 =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(all_values), all_dims.clone());
     let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&all_dims, kappa_options);
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&all_dims, kappa_options);
 
@@ -1177,10 +1174,216 @@ pub struct BlockwiseTermFitResult {
     pub noise_design: TermCollectionDesign,
 }
 
+struct BlockwiseTermFitResultParts {
+    pub fit: BlockwiseFitResult,
+    pub meanspec_resolved: TermCollectionSpec,
+    pub noisespec_resolved: TermCollectionSpec,
+    pub mean_design: TermCollectionDesign,
+    pub noise_design: TermCollectionDesign,
+}
+
 pub struct BlockwiseTermWiggleFitResult {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
+}
+
+struct BlockwiseTermWiggleFitResultParts {
+    pub fit: BlockwiseTermFitResult,
+    pub wiggle_knots: Array1<f64>,
+    pub wiggle_degree: usize,
+}
+
+fn validate_term_collection_design(
+    label: &str,
+    design: &TermCollectionDesign,
+) -> Result<(), String> {
+    let p = design.design.ncols();
+    validate_all_finite_estimation(&format!("{label}.design"), design.design.iter().copied())
+        .map_err(|e| e.to_string())?;
+    if design.nullspace_dims.len() != design.penalties.len() {
+        return Err(format!(
+            "{label}.nullspace_dims length mismatch: got {}, expected {}",
+            design.nullspace_dims.len(),
+            design.penalties.len()
+        ));
+    }
+    if design.penaltyinfo.len() != design.penalties.len() {
+        return Err(format!(
+            "{label}.penaltyinfo length mismatch: got {}, expected {}",
+            design.penaltyinfo.len(),
+            design.penalties.len()
+        ));
+    }
+    for (idx, penalty) in design.penalties.iter().enumerate() {
+        validate_all_finite_estimation(
+            &format!("{label}.penalties[{idx}]"),
+            penalty.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+        let (rows, cols) = penalty.dim();
+        if rows != p || cols != p {
+            return Err(format!(
+                "{label}.penalties[{idx}] must be {}x{}, got {}x{}",
+                p, p, rows, cols
+            ));
+        }
+    }
+    if let Some(bounds) = design.coefficient_lower_bounds.as_ref() {
+        if bounds.len() != p {
+            return Err(format!(
+                "{label}.coefficient_lower_bounds length mismatch: got {}, expected {p}",
+                bounds.len()
+            ));
+        }
+        for (idx, &bound) in bounds.iter().enumerate() {
+            if !(bound.is_finite() || bound == f64::NEG_INFINITY) {
+                return Err(format!(
+                    "{label}.coefficient_lower_bounds[{idx}] must be finite or -inf, got {bound}",
+                ));
+            }
+        }
+    }
+    if let Some(constraints) = design.linear_constraints.as_ref() {
+        validate_all_finite_estimation(
+            &format!("{label}.linear_constraints.a"),
+            constraints.a.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+        validate_all_finite_estimation(
+            &format!("{label}.linear_constraints.b"),
+            constraints.b.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+        if constraints.a.ncols() != p {
+            return Err(format!(
+                "{label}.linear_constraints.a column mismatch: got {}, expected {p}",
+                constraints.a.ncols()
+            ));
+        }
+        if constraints.a.nrows() != constraints.b.len() {
+            return Err(format!(
+                "{label}.linear_constraints row mismatch: a has {}, b has {}",
+                constraints.a.nrows(),
+                constraints.b.len()
+            ));
+        }
+    }
+    if design.intercept_range.start > design.intercept_range.end || design.intercept_range.end > p {
+        return Err(format!(
+            "{label}.intercept_range out of bounds: {:?} for {} columns",
+            design.intercept_range, p
+        ));
+    }
+    Ok(())
+}
+
+impl BlockwiseTermFitResult {
+    fn try_from_parts(parts: BlockwiseTermFitResultParts) -> Result<Self, String> {
+        let BlockwiseTermFitResultParts {
+            fit,
+            meanspec_resolved,
+            noisespec_resolved,
+            mean_design,
+            noise_design,
+        } = parts;
+
+        fit.validate_numeric_finiteness()?;
+        if fit.block_states.len() < 2 {
+            return Err(format!(
+                "BlockwiseTermFitResult requires at least 2 block states, got {}",
+                fit.block_states.len()
+            ));
+        }
+        validate_term_collection_design("blockwise_term.mean_design", &mean_design)?;
+        validate_term_collection_design("blockwise_term.noise_design", &noise_design)?;
+        if mean_design.design.nrows() != noise_design.design.nrows() {
+            return Err(format!(
+                "BlockwiseTermFitResult row mismatch: mean_design={}, noise_design={}",
+                mean_design.design.nrows(),
+                noise_design.design.nrows()
+            ));
+        }
+        if fit.block_states[0].beta.len() != mean_design.design.ncols() {
+            return Err(format!(
+                "BlockwiseTermFitResult mean beta length mismatch: got {}, expected {}",
+                fit.block_states[0].beta.len(),
+                mean_design.design.ncols()
+            ));
+        }
+        if fit.block_states[1].beta.len() != noise_design.design.ncols() {
+            return Err(format!(
+                "BlockwiseTermFitResult noise beta length mismatch: got {}, expected {}",
+                fit.block_states[1].beta.len(),
+                noise_design.design.ncols()
+            ));
+        }
+        if fit.block_states[0].eta.len() != mean_design.design.nrows() {
+            return Err(format!(
+                "BlockwiseTermFitResult mean eta length mismatch: got {}, expected {}",
+                fit.block_states[0].eta.len(),
+                mean_design.design.nrows()
+            ));
+        }
+        if fit.block_states[1].eta.len() != noise_design.design.nrows() {
+            return Err(format!(
+                "BlockwiseTermFitResult noise eta length mismatch: got {}, expected {}",
+                fit.block_states[1].eta.len(),
+                noise_design.design.nrows()
+            ));
+        }
+
+        Ok(Self {
+            fit,
+            meanspec_resolved,
+            noisespec_resolved,
+            mean_design,
+            noise_design,
+        })
+    }
+
+    fn validate_numeric_finiteness(&self) -> Result<(), String> {
+        Self::try_from_parts(BlockwiseTermFitResultParts {
+            fit: self.fit.clone(),
+            meanspec_resolved: self.meanspec_resolved.clone(),
+            noisespec_resolved: self.noisespec_resolved.clone(),
+            mean_design: self.mean_design.clone(),
+            noise_design: self.noise_design.clone(),
+        })
+        .map(|_| ())
+    }
+}
+
+impl BlockwiseTermWiggleFitResult {
+    fn try_from_parts(parts: BlockwiseTermWiggleFitResultParts) -> Result<Self, String> {
+        let BlockwiseTermWiggleFitResultParts {
+            fit,
+            wiggle_knots,
+            wiggle_degree,
+        } = parts;
+
+        fit.validate_numeric_finiteness()?;
+        if fit.fit.block_states.len() < 3 {
+            return Err(format!(
+                "BlockwiseTermWiggleFitResult requires at least 3 block states, got {}",
+                fit.fit.block_states.len()
+            ));
+        }
+        if wiggle_knots.is_empty() {
+            return Err("BlockwiseTermWiggleFitResult requires non-empty wiggle_knots".to_string());
+        }
+        validate_all_finite_estimation(
+            "blockwise_term_wiggle.wiggle_knots",
+            wiggle_knots.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            fit,
+            wiggle_knots,
+            wiggle_degree,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1955,7 +2158,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     builder.augment_result_designs(&mut solved.mean_design, &mut solved.noise_design);
 
-    Ok(BlockwiseTermFitResult {
+    BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit: solved.fit,
         meanspec_resolved: solved.resolved_meanspec,
         noisespec_resolved: solved.resolved_noisespec,
@@ -2525,14 +2728,14 @@ pub fn fit_binomial_location_scalewiggle_terms_auto(
         options,
     )?;
 
-    Ok(BlockwiseTermWiggleFitResult {
-        fit: BlockwiseTermFitResult {
+    BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
+        fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
             fit,
             meanspec_resolved: pilot.meanspec_resolved,
             noisespec_resolved: pilot.noisespec_resolved,
             mean_design: pilot.mean_design,
             noise_design: pilot.noise_design,
-        },
+        })?,
         wiggle_knots,
         wiggle_degree: wiggle_cfg.degree,
     })
@@ -2562,13 +2765,13 @@ pub fn fit_binomial_location_scale_termsworkflow(
         let fit = solved.fit.fit;
         let betawiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
         Ok(BinomialLocationScaleWorkflowResult {
-            fit: BlockwiseTermFitResult {
+            fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
                 fit,
                 meanspec_resolved: solved.fit.meanspec_resolved,
                 noisespec_resolved: solved.fit.noisespec_resolved,
                 mean_design: solved.fit.mean_design,
                 noise_design: solved.fit.noise_design,
-            },
+            })?,
             wiggle_knots: Some(solved.wiggle_knots),
             wiggle_degree: Some(solved.wiggle_degree),
             betawiggle,
@@ -3260,13 +3463,14 @@ fn binomial_location_scale_working_sets(
 
         // Scale chain from the shared floor-aware q helper.
         // On the active sigma floor branch this is exactly zero.
-        let (_, q0_ls, _, _, _, _) = crate::families::survival_location_scale::q_chain_derivs_scalar(
-            eta_t[i],
-            core.sigma[i],
-            core.dsigma_deta[i],
-            0.0,
-            0.0,
-        );
+        let (_, q0_ls, _, _, _, _) =
+            crate::families::survival_location_scale::q_chain_derivs_scalar(
+                eta_t[i],
+                core.sigma[i],
+                core.dsigma_deta[i],
+                0.0,
+                0.0,
+            );
         let chain_ls = link_chain * q0_ls;
         let dmu_ls = core.dmu_dq[i] * chain_ls;
         if weights[i] == 0.0 || dmu_ls == 0.0 {
@@ -4734,8 +4938,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 let sigma_i = safe_exp(eta_log_sigma[i]).max(1e-12);
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let r = self.y[i] - etamu[i];
-                ll += self.weights[i]
-                    * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
+                ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
             }
         }
         Ok(ll)

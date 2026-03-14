@@ -1136,8 +1136,8 @@ mod tests {
     // --- Multi-block ALO tests ---
 
     use super::{
-        compute_multiblock_alo, compute_multiblock_alo_leverages, det_small, solve_small,
-        MultiBlockAloInput,
+        MultiBlockAloInput, compute_multiblock_alo, compute_multiblock_alo_leverages, det_small,
+        solve_small,
     };
     use ndarray::{Array1, Array2};
 
@@ -1175,11 +1175,7 @@ mod tests {
         // H_ii = x_i^T H^{-1} x_i * w_i  (scalar).
         let n = 3;
         let p = 2;
-        let x = Array2::from_shape_vec(
-            (n, p),
-            vec![1.0, 0.5, 0.8, -0.3, 0.2, 1.1],
-        )
-        .unwrap();
+        let x = Array2::from_shape_vec((n, p), vec![1.0, 0.5, 0.8, -0.3, 0.2, 1.1]).unwrap();
         // H = X'WX + I (simple regularisation).
         let w = vec![1.0, 2.0, 0.5];
         let mut h = Array2::<f64>::eye(p);
@@ -1212,10 +1208,8 @@ mod tests {
 
         // Multi-block with B=1.
         let block_designs = vec![x.clone()];
-        let block_weights: Vec<Array2<f64>> = w
-            .iter()
-            .map(|&wi| Array2::from_elem((1, 1), wi))
-            .collect();
+        let block_weights: Vec<Array2<f64>> =
+            w.iter().map(|&wi| Array2::from_elem((1, 1), wi)).collect();
         let scores: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.1])).collect();
         let eta_hat: Vec<Array1<f64>> = (0..n).map(|i| Array1::from_vec(vec![i as f64])).collect();
 
@@ -1258,10 +1252,8 @@ mod tests {
                 Array2::from_shape_vec((2, 2), vec![v, 0.1, 0.1, v * 0.5]).unwrap()
             })
             .collect();
-        let scores: Vec<Array1<f64>> =
-            (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
-        let eta_hat: Vec<Array1<f64>> =
-            (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
+        let scores: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
+        let eta_hat: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
         let block_designs = vec![x1.clone(), x2.clone()];
 
         let input = MultiBlockAloInput {
@@ -1275,8 +1267,7 @@ mod tests {
         };
         let full = compute_multiblock_alo(&input).unwrap();
         let lev_only =
-            compute_multiblock_alo_leverages(n, 2, &block_designs, &h_inv, &block_weights)
-                .unwrap();
+            compute_multiblock_alo_leverages(n, 2, &block_designs, &h_inv, &block_weights).unwrap();
 
         for i in 0..n {
             assert!(

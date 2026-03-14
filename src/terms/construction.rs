@@ -1301,7 +1301,13 @@ pub fn stable_reparameterizationwith_invariant_engine(
     invariant: &ReparamInvariant,
     penalty_shrinkage_floor: Option<f64>,
 ) -> Result<ReparamResult, EstimationError> {
-    stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, invariant, penalty_shrinkage_floor)
+    stable_reparameterizationwith_invariant(
+        rs_list,
+        lambdas,
+        dims.p,
+        invariant,
+        penalty_shrinkage_floor,
+    )
 }
 
 /// Calculate the 2-norm condition number of a matrix.
