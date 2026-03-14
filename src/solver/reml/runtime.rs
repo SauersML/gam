@@ -2982,7 +2982,7 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        let (tk_correction, _tk_gradient_unused) = if !is_gaussian_identity {
+        let (tk_correction, _) = if !is_gaussian_identity {
             let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
                 Self::projectwith_basis(bundle.h_eff.as_ref(), z)
             } else {
@@ -3094,6 +3094,16 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        // Firth bias reduction modifies the score equations in ways that the
+        // link ext_coord construction does not yet account for. Reject early.
+        if self.config.firth_bias_reduction {
+            return Err(EstimationError::InvalidInput(
+                "link-parameter ext_coord optimization is incompatible with \
+                 Firth-adjusted outer gradients"
+                    .to_string(),
+            ));
+        }
+
         let bundle = self.obtain_eval_bundle(rho)?;
 
         // Build link ext_coords from the current runtime link state.

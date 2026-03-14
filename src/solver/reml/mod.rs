@@ -1465,6 +1465,10 @@ pub(crate) struct DirectionalHyperParam {
     // Pairwise second derivatives are stored in the same canonical base-penalty
     // decomposition as the first derivatives.
     penaltysecond_components: Option<Vec<Option<Vec<PenaltyDerivativeComponent>>>>,
+    /// Whether this coordinate is penalty-like (B_i = ∂H/∂τ_i is PSD).
+    /// True for τ (penalty scaling) coordinates; false for ψ (design-moving,
+    /// anisotropic length-scale) coordinates. Controls EFS eligibility.
+    pub(crate) is_penalty_like: bool,
 }
 
 impl DirectionalHyperParam {
@@ -1550,7 +1554,15 @@ impl DirectionalHyperParam {
             penalty_first_components,
             x_tau_tau_original,
             penaltysecond_components,
+            is_penalty_like: true, // default: τ coords are penalty-like
         })
+    }
+
+    /// Mark this coordinate as non-penalty-like (design-moving).
+    /// EFS will skip it; use Newton/BFGS for these coordinates.
+    pub(crate) fn not_penalty_like(mut self) -> Self {
+        self.is_penalty_like = false;
+        self
     }
 
     pub(crate) fn x_tau_dense(&self) -> Array2<f64> {

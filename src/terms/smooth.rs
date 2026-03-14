@@ -8078,7 +8078,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             s_components,
             Some(xsecond),
             Some(ssecond_components),
-        )?);
+        )?.not_penalty_like());
     }
     Ok(hyper_dirs)
 }

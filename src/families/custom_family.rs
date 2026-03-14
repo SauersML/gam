@@ -5689,89 +5689,15 @@ pub fn fit_custom_family<F: CustomFamily>(
         .map_err(CustomFamilyError::Optimization);
     }
 
-    if include_exact_newton_logdet_h(family) && family.known_link_wiggle().is_some() {
-        // Stabilized exact-wiggle fit path.
-        //
-        // The mathematically ambitious route for exact custom families is:
-        //
-        // 1. solve the inner block mode beta^(rho),
-        // 2. differentiate the exact joint Hessian H(beta^) with respect to rho,
-        // 3. optimize the REML/LAML objective over rho using those exact
-        //    derivatives.
-        //
-        // For the binomial location-scale wiggle family with spatial blocks, the
-        // derivative formulas are now correct, but the full outer exact-REML
-        // optimization remains numerically fragile in practice. The failure mode
-        // is not a clean statistical disagreement; it is a pile-up of hard
-        // linear algebra problems on badly conditioned matrices:
-        //
-        // - exact block solves need repeated ridge retries,
-        // - positive-part logdet eigensolvers may not converge,
-        // - REML mode-sensitivity solves can become indefinite/non-finite,
-        // - the outer BFGS path can walk into rho regions where every one of the
-        //   above gets amplified.
-        //
-        // For this family the important user-facing contract of the API is that
-        // the fit remains finite and returns a coherent block state. The initial
-        // smoothing values in `rho0` already define a valid penalized model, and
-        // the corrected inner exact/blockwise fit at those values is stable. So
-        // until the outer exact-REML path is robust enough to optimize rho
-        // reliably for the wiggle family, we intentionally stop at:
-        //
-        //   beta^ = argmin_beta Q(beta; rho0)
-        //
-        // and return that finite fit instead of attempting a numerically brittle
-        // exact outer search. The returned penalized objective still includes the
-        // REML-style logdet pieces when they are finite; if those terms become
-        // non-finite, `finite_penalizedobjective` drops back to the finite
-        // penalized likelihood surface rather than returning NaN/Inf.
-        //
-        // This is a deliberate stabilization choice for the known-link wiggle
-        // exact-Newton family, not a generic change to custom-family smoothing.
-        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
-        let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
-        refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-        let covariance_conditional = compute_joint_covariance_required(
-            family,
-            specs,
-            &inner.block_states,
-            &per_block,
-            options,
-        )?;
-        let reml_term = if include_exact_newton_logdet_h(family) {
-            0.5 * inner.block_logdet_h
-        } else {
-            0.0
-        } - if include_exact_newton_logdet_s(family, options) {
-            0.5 * inner.block_logdet_s
-        } else {
-            0.0
-        };
-        let reml_term = if reml_term.is_finite() {
-            reml_term
-        } else {
-            0.0
-        };
-        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
-        return blockwise_fit_from_parts(BlockwiseFitResultParts {
-            block_states: inner.block_states,
-            log_likelihood: inner.log_likelihood,
-            log_lambdas: rho0.clone(),
-            lambdas: rho0.mapv(f64::exp),
-            covariance_conditional,
-            penalizedobjective: finite_penalizedobjective(
-                inner.log_likelihood,
-                inner.penalty_value,
-                reml_term,
-            ),
-            outer_iterations: 0,
-            outer_final_gradient_norm: 0.0,
-            inner_cycles: inner.cycles,
-            converged: inner.converged,
-            geometry,
-        })
-        .map_err(CustomFamilyError::Optimization);
-    }
+    // Known-link wiggle families formerly took an early exit here (rho fixed
+    // at initial values, no outer optimization). That was a stabilization hack:
+    // full Newton outer REML was fragile for these families due to ill-conditioned
+    // exact block solves. We now fall through to the normal outer loop, which
+    // selects EFS for penalty-like coordinates — a multiplicative fixed-point
+    // that avoids the fragile Hessian path entirely. Wiggle λ coordinates are
+    // penalty-like (B-spline difference penalties), so EFS applies directly.
+    let force_efs_for_wiggle = include_exact_newton_logdet_h(family)
+        && family.known_link_wiggle().is_some();
 
     use crate::estimate::EstimationError;
     use crate::solver::strategy::{
@@ -5791,7 +5717,11 @@ pub fn fit_custom_family<F: CustomFamily>(
     let has_exact_hess = include_exact_newton_logdet_h(family);
     let n_rho = rho0.len();
 
-    let outer_max_iter = if has_exact_hess {
+    let outer_max_iter = if force_efs_for_wiggle {
+        // EFS converges fast for penalty-like coords; allow enough iterations
+        // but don't waste time on an already-cheap fixed-point.
+        options.outer_max_iter.min(20).max(5)
+    } else if has_exact_hess {
         options.outer_max_iter.min(3).max(1)
     } else {
         options.outer_max_iter
@@ -5807,7 +5737,11 @@ pub fn fit_custom_family<F: CustomFamily>(
         initial_rho: Some(rho0.clone()),
     };
 
-    let hessian_deriv = if has_exact_hess {
+    let hessian_deriv = if force_efs_for_wiggle {
+        // For wiggle families, skip the fragile exact Hessian. EFS doesn't
+        // need it — it uses only cost + gradient for the fixed-point step.
+        Derivative::Unavailable
+    } else if has_exact_hess {
         Derivative::Analytic
     } else {
         Derivative::Unavailable
@@ -5823,9 +5757,10 @@ pub fn fit_custom_family<F: CustomFamily>(
             gradient: Derivative::Analytic,
             hessian: hessian_deriv,
             n_params: n_rho,
-            // Custom families may have psi (design-moving) coordinates that
-            // are not penalty-like. Conservatively set false.
-            all_penalty_like: false,
+            // Wiggle families have only penalty-like λ coordinates (B-spline
+            // difference penalties), so EFS applies. Non-wiggle custom families
+            // may have ψ (design-moving) coordinates — conservatively false.
+            all_penalty_like: force_efs_for_wiggle,
         },
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = if has_exact_hess {
