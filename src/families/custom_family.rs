@@ -4037,6 +4037,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                 b_mat: b_mat.to_owned(),
                 ld_s,
                 b_depends_on_beta: !is_gaussian,
+                // ψ coordinates move the design/likelihood, so b_mat need not
+                // be PSD. They are NOT penalty-like.
+                is_penalty_like: false,
             });
 
             psi_global += 1;

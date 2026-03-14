@@ -2110,6 +2110,9 @@ impl<'a> RemlState<'a> {
                     b_mat: Array2::zeros((0, 0)),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
+                    // τ coordinates are penalty parameters — their B matrices
+                    // derive from penalty derivatives and are PSD.
+                    is_penalty_like: true,
                 };
                 psi_dim
             ]);
@@ -2247,6 +2250,9 @@ impl<'a> RemlState<'a> {
                 b_mat: b_j,
                 ld_s: ld_s_j,
                 b_depends_on_beta,
+                // τ coordinates are penalty parameters — their B matrices
+                // derive from penalty derivatives and are PSD.
+                is_penalty_like: true,
             });
         }
 
