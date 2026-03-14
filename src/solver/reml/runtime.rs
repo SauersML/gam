@@ -2329,11 +2329,13 @@ impl<'a> RemlState<'a> {
                 )
             };
 
-        // TK correction and gradient (non-Gaussian only): use sparse leverages.
+        // TK correction and gradient (non-Gaussian only): use sparse solves.
         //
-        // The gradient d(TK)/dρ_k uses the same H⁻¹ column solves as the
-        // correction value.  See `tierney_kadane_laml_correction` for the
-        // derivation.
+        // The TK value uses the Bartlett third-order correction.
+        // The TK gradient uses the basis-invariant trace formula:
+        //   ∂V_TK/∂ρ_k ≈ -½ tr(H_pen⁻¹ A_k^obs)
+        //              = ½ Σ_i c_i · (X v_k)_i · hat_ii
+        // with H_obs⁻¹ ≈ H_pen⁻¹ (see tierney_kadane_laml_correction docs).
         let (tk_correction, tk_gradient) = if !is_gaussian_identity {
             let mut d_vec = pirls_result.solve_c_array.clone();
             for val in &mut d_vec {
@@ -2344,11 +2346,21 @@ impl<'a> RemlState<'a> {
             let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
 
             let compute_grad = mode != super::unified::EvalMode::ValueOnly;
-            let k = penalty_roots.len();
-            let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-            let mut tk_grad = Array1::<f64>::zeros(k);
+            let n_obs = d_vec.len();
 
             let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
+            // Hat leverages for the trace-based gradient.
+            let x_dense = if compute_grad {
+                Some(self.x().to_dense_arc())
+            } else {
+                None
+            };
+            let mut hat_leverages = if compute_grad {
+                Array1::<f64>::zeros(n_obs)
+            } else {
+                Array1::<f64>::zeros(0)
+            };
+
             for j in 0..p_dim {
                 let mut e_j = Array1::<f64>::zeros(p_dim);
                 e_j[j] = 1.0;
@@ -2357,15 +2369,12 @@ impl<'a> RemlState<'a> {
                 {
                     h_inv_diag[j] = f_j[j];
 
-                    // Accumulate TK gradient contribution from column j.
+                    // Accumulate hat leverage: hat[i] += X[i,j] * (X f_j)[i]
                     if compute_grad {
-                        let hjj_sq_d3 = h_inv_diag[j] * h_inv_diag[j] * third_deriv[j];
-                        if hjj_sq_d3.abs() > 0.0 {
-                            for kidx in 0..k {
-                                let r_k_f_j = penalty_roots[kidx].dot(&f_j);
-                                let norm_sq: f64 = r_k_f_j.iter().map(|v| v * v).sum();
-                                tk_grad[kidx] += lambdas[kidx] * hjj_sq_d3 * norm_sq;
-                            }
+                        let xd = x_dense.as_ref().unwrap();
+                        let x_fj: Array1<f64> = self.x().matrixvectormultiply(&f_j);
+                        for i in 0..n_obs {
+                            hat_leverages[i] += xd[[i, j]] * x_fj[i];
                         }
                     }
                 }
@@ -2381,7 +2390,33 @@ impl<'a> RemlState<'a> {
             let correction = if correction.is_finite() { correction } else { 0.0 };
 
             let gradient = if compute_grad {
-                tk_grad *= 0.5;
+                let k = penalty_roots.len();
+                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+                let mut tk_grad = Array1::<f64>::zeros(k);
+
+                for kidx in 0..k {
+                    // Mode sensitivity: v_k = H_pen⁻¹(λ_k S_k β̂)
+                    let r_beta = penalty_roots[kidx].dot(&beta);
+                    let s_k_beta = fast_atv(&penalty_roots[kidx], &r_beta);
+                    let a_k_beta = &s_k_beta * lambdas[kidx];
+                    let v_k = match crate::linalg::sparse_exact::solve_sparse_spd(
+                        &sparse.factor,
+                        &a_k_beta,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let x_v_k: Array1<f64> = self.x().matrixvectormultiply(&v_k);
+
+                    // TK gradient[k] = ½ Σ_i c_i · (X v_k)_i · hat_ii
+                    let mut acc = 0.0;
+                    for i in 0..n_obs {
+                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
+                    }
+                    tk_grad[kidx] = 0.5 * acc;
+                }
+
                 for v in tk_grad.iter_mut() {
                     if !v.is_finite() {
                         *v = 0.0;
