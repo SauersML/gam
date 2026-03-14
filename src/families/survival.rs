@@ -1459,7 +1459,7 @@ fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
         }
     }
 
-    nodesweights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    nodesweights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     nodesweights
 }
 
@@ -1531,7 +1531,7 @@ where
         .collect();
     sorted_breaks.push(t0);
     sorted_breaks.push(t1);
-    sorted_breaks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_breaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     sorted_breaks.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
     if sorted_breaks.len() < 2 {
         return Err(SurvivalError::InvalidIntegrationSetup);
