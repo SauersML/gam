@@ -343,13 +343,12 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
         .iter()
         .map(|b| {
             if has_roles {
-                let role_label = b
-                    .role
-                    .as_deref()
-                    .unwrap_or("\u{2014}");
+                let role_label = b.role.as_deref().unwrap_or("\u{2014}");
                 format!(
                     "<tr><td class=\"mono\">{}</td><td>{}</td><td class=\"num\">{:.4}</td></tr>",
-                    b.index, esc(role_label), b.edf
+                    b.index,
+                    esc(role_label),
+                    b.edf
                 )
             } else {
                 format!(

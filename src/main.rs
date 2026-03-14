@@ -4807,7 +4807,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let state = plain_model.update_state(&beta).map_err(|e| {
                 format!("failed to evaluate survival optimum in coefficient coordinates: {e}")
             })?;
-            (summary, beta, state, "baseline-timewiggle".to_string(), plain_model)
+            (
+                summary,
+                beta,
+                state,
+                "baseline-timewiggle".to_string(),
+                plain_model,
+            )
         } else {
             let mut constrained_model = model;
             let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
@@ -6135,21 +6141,20 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     .ok()
                     .and_then(|r| r.map(|lk| lk.link_function()))
                 {
-                    let alo_result =
-                        if let Some(unified) = model.unified() {
-                            let eta = design.design.dot(&fit.beta);
-                            let report_offset = Array1::<f64>::zeros(design.design.nrows());
-                            gam::alo::compute_alo_diagnostics_from_unified(
-                                unified,
-                                &design.design,
-                                &eta,
-                                &report_offset,
-                                link,
-                                1.0,
-                            )
-                        } else {
-                            compute_alo_diagnostics_from_fit(&fit, y.view(), link)
-                        };
+                    let alo_result = if let Some(unified) = model.unified() {
+                        let eta = design.design.dot(&fit.beta);
+                        let report_offset = Array1::<f64>::zeros(design.design.nrows());
+                        gam::alo::compute_alo_diagnostics_from_unified(
+                            unified,
+                            &design.design,
+                            &eta,
+                            &report_offset,
+                            link,
+                            1.0,
+                        )
+                    } else {
+                        compute_alo_diagnostics_from_fit(&fit, y.view(), link)
+                    };
                     match alo_result {
                         Ok(alo) => {
                             alo_data = Some(report::AloData {

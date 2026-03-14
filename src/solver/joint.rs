@@ -1792,8 +1792,7 @@ impl crate::estimate::reml::unified::HessianDerivativeProvider for LinkWiggleDer
         // Term 5: J' diag(w'' · dot_eta_k · dot_eta_l + w' · dot_eta_kl) J
         //   where dot_eta_kl = dot_J_k · delta_l + J · u_kl
         let term5 = {
-            let dot_eta_kl: Array1<f64> =
-                dot_j_k.dot(&delta_l) + self.j_mat.dot(u_kl);
+            let dot_eta_kl: Array1<f64> = dot_j_k.dot(&delta_l) + self.j_mat.dot(u_kl);
             let mut w_ddot = Array1::<f64>::zeros(self.n);
             for i in 0..self.n {
                 w_ddot[i] = self.w_double_prime[i] * dot_eta_k[i] * dot_eta_l[i]
@@ -1903,7 +1902,8 @@ impl<'a> JointRemlState<'a> {
                     // For binomial logit: d³(-ℓ)/dη³ = μ(1-μ)(1-2μ)
                     if matches!(state.link, LinkFunction::Logit) {
                         let p = mu[i].clamp(1e-10, 1.0 - 1e-10);
-                        _third_deriv_weights[i] = state.weights[i] * p * (1.0 - p) * (1.0 - 2.0 * p);
+                        _third_deriv_weights[i] =
+                            state.weights[i] * p * (1.0 - p) * (1.0 - 2.0 * p);
                     }
                 }
             }

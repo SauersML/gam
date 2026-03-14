@@ -341,7 +341,8 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
 /// expects the actual perturbation direction δβ, so we negate v_k before calling it.
 pub struct JointModelDerivProvider {
     compute_dh: Box<dyn Fn(&Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
-    compute_d2h: Option<Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>>,
+    compute_d2h:
+        Option<Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>>,
 }
 
 impl JointModelDerivProvider {
@@ -351,9 +352,14 @@ impl JointModelDerivProvider {
     /// `compute_d2h`: given (u, v), returns D²_β H_L[u, v] (optional)
     pub fn new(
         compute_dh: Box<dyn Fn(&Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
-        compute_d2h: Option<Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>>,
+        compute_d2h: Option<
+            Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
+        >,
     ) -> Self {
-        Self { compute_dh, compute_d2h }
+        Self {
+            compute_dh,
+            compute_d2h,
+        }
     }
 }
 
@@ -480,7 +486,6 @@ pub struct InnerSolution {
 
     /// How the dispersion parameter is handled.
     pub dispersion: DispersionHandling,
-
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and

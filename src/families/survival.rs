@@ -1283,8 +1283,8 @@ impl WorkingModelSurvival {
                         d_h_rc += exp_exit[i] * (deta_e * he[r] + dhe_r);
                     }
                     if has_entry {
-                        d_h_rc -= exp_entry[i]
-                            * (deta_s * gs[r] * gs[c] + dgs_r * gs[c] + gs[r] * dgs_c);
+                        d_h_rc -=
+                            exp_entry[i] * (deta_s * gs[r] * gs[c] + dgs_r * gs[c] + gs[r] * dgs_c);
                         if r == c {
                             d_h_rc -= exp_entry[i] * (deta_s * hs[r] + dhs_r);
                         }
@@ -1362,8 +1362,7 @@ impl WorkingModelSurvival {
         // --- Penalty roots (embedded in full parameter space) ---
         let mut penalty_roots = Vec::with_capacity(k_count);
         for block in &self.penalties.blocks {
-            let root =
-                penalty_matrix_root(&block.matrix).map_err(EstimationError::InvalidInput)?;
+            let root = penalty_matrix_root(&block.matrix).map_err(EstimationError::InvalidInput)?;
             let embedded = embed_penalty_root(&root, block.range.start, block.range.end, p);
             penalty_roots.push(embedded);
         }
@@ -1423,9 +1422,7 @@ impl WorkingModelSurvival {
             },
         );
 
-        let solution = builder
-            .deriv_provider(Box::new(provider))
-            .build();
+        let solution = builder.deriv_provider(Box::new(provider)).build();
 
         Ok(solution)
     }
@@ -1475,7 +1472,10 @@ impl crate::estimate::reml::unified::HessianDerivativeProvider for SurvivalDeriv
         // The trait provides v_k = H^{-1}(A_k beta_hat) (positive).
         // The survival method expects u_k = -H^{-1} A_k beta_hat = -v_k.
         let u_k = -v_k;
-        match self.model.survival_hessian_derivative_correction(&self.beta, &u_k) {
+        match self
+            .model
+            .survival_hessian_derivative_correction(&self.beta, &u_k)
+        {
             Ok(correction) => Some(correction),
             Err(_) => None,
         }
@@ -2321,7 +2321,10 @@ mod tests {
         let beta = array![0.2, 0.2, 0.1];
         let state = model.update_state(&beta).expect("state at structural beta");
         let rho = Array1::from_iter(
-            model.penalties.blocks.iter()
+            model
+                .penalties
+                .blocks
+                .iter()
                 .filter(|b| b.lambda > 0.0)
                 .map(|b| b.lambda.ln()),
         );
@@ -2725,7 +2728,10 @@ mod tests {
 
         let state = model.update_state(&beta).expect("state at beta");
         let rho = Array1::from_iter(
-            model.penalties.blocks.iter()
+            model
+                .penalties
+                .blocks
+                .iter()
                 .filter(|b| b.lambda > 0.0)
                 .map(|b| b.lambda.ln()),
         );

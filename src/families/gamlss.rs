@@ -10953,8 +10953,8 @@ mod tests {
         let coded_sigma = |x: f64| safe_exp(x).max(1e-12);
         let h = 1e-6;
         let fd1 = (coded_sigma(eta0 + h) - coded_sigma(eta0 - h)) / (2.0 * h);
-        let fd2 = (coded_sigma(eta0 + h) - 2.0 * coded_sigma(eta0) + coded_sigma(eta0 - h))
-            / (h * h);
+        let fd2 =
+            (coded_sigma(eta0 + h) - 2.0 * coded_sigma(eta0) + coded_sigma(eta0 - h)) / (h * h);
         assert_eq!(fd1, 0.0);
         assert_eq!(fd2, 0.0);
         assert!(
@@ -12620,7 +12620,7 @@ mod tests {
 
     #[test]
     fn binomial_location_scalewiggle_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau()
-    {
+     {
         let n = 4usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
@@ -12700,7 +12700,7 @@ mod tests {
 
     #[test]
     fn binomial_location_scalewiggle_exact_log_sigma_d2h_should_match_zero_fourth_derivative_on_plateau()
-    {
+     {
         let n = 4usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
@@ -13316,42 +13316,40 @@ mod tests {
             },
             0.0,
         );
-        let (_, _, _, _, _, _, _, score_mu_psi_psi) =
-            third_partial_derivative_vec(
-                |v| {
-                    gaussian_negloglik_log_sigma_beta_vec_numdual(
-                        v,
-                        &y,
-                        &weights,
-                        &x_mu0,
-                        &x_ls0,
-                        &x_ls_psi,
-                        &x_ls_psi_psi,
-                    )
-                },
-                &vars,
-                0,
-                2,
-                2,
-            );
-        let (_, _, _, _, _, _, _, score_ls_psi_psi) =
-            third_partial_derivative_vec(
-                |v| {
-                    gaussian_negloglik_log_sigma_beta_vec_numdual(
-                        v,
-                        &y,
-                        &weights,
-                        &x_mu0,
-                        &x_ls0,
-                        &x_ls_psi,
-                        &x_ls_psi_psi,
-                    )
-                },
-                &vars,
-                1,
-                2,
-                2,
-            );
+        let (_, _, _, _, _, _, _, score_mu_psi_psi) = third_partial_derivative_vec(
+            |v| {
+                gaussian_negloglik_log_sigma_beta_vec_numdual(
+                    v,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            &vars,
+            0,
+            2,
+            2,
+        );
+        let (_, _, _, _, _, _, _, score_ls_psi_psi) = third_partial_derivative_vec(
+            |v| {
+                gaussian_negloglik_log_sigma_beta_vec_numdual(
+                    v,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_ls_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            &vars,
+            1,
+            2,
+            2,
+        );
 
         assert!(
             (psi2_terms.objective_psi_psi - d2psi).abs() <= 1e-10,
