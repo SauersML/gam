@@ -294,7 +294,6 @@ fn simulate_duchon_aniso_2d(
 /// Verifies the fit succeeds, coefficients are finite, and the resolved spec
 /// contains the correct aniso_log_scales dimension with sum-to-zero constraint.
 #[test]
-#[ignore]
 fn duchon_2d_aniso_gaussian_fits_successfully() {
     let n = 600usize;
     let d = 2usize;
@@ -428,11 +427,10 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
 /// Verifies the fit succeeds, coefficients are finite, and the resolved spec
 /// contains the correct aniso_log_scales dimension with sum-to-zero constraint.
 #[test]
-#[ignore]
 fn duchon_2d_aniso_binomial_fits_successfully() {
     let n = 800usize;
     let d = 2usize;
-    let (x, y, _y_true) = simulate_duchon_aniso_2d(n, 20260315, true);
+    let (x, y, ..) = simulate_duchon_aniso_2d(n, 20260315, true);
 
     let spec = TermCollectionSpec {
         linear_terms: vec![],

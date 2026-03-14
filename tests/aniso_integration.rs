@@ -55,7 +55,6 @@ fn simulate_aniso_binomial(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
 /// For the signal axis (x1), we expect more detail => η_0 < η_1.
 /// Equivalently, η_1 > η_0 (the noise axis is smoother).
 #[test]
-#[ignore] // slow integration test
 fn aniso_matern_recovers_signal_axis() {
     let n = 1000;
     let (x, y) = simulate_aniso_binomial(n, 20260314);

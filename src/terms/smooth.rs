@@ -9155,6 +9155,10 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         options,
     )?;
     resolvedspec = freeze_spatial_length_scale_terms_from_design(&resolvedspec, &best.design)?;
+    // Sync knot-cloud-derived aniso contrasts from the basis metadata back
+    // into the spec so the optimizer starts from the geometry-informed η values
+    // rather than the zero sentinel from --scale-dimensions.
+    sync_aniso_contrasts_from_metadata(&mut resolvedspec, &best.design);
     let initial_score = fit_score(&best.fit);
     if !initial_score.is_finite() {
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
