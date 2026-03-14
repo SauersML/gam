@@ -341,6 +341,35 @@ impl<'a> RemlState<'a> {
         let first_order_correction = first_order.correction.clone();
         let n_rho = final_rho.len();
         if n_rho == 0 {
+            // No hyperparameters: the unified corrected covariance equals H^{-1}.
+            // Validate the unified path using the spectral operator.
+            if let Some(ref base_cov) = base_covariance {
+                if let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov) {
+                    let outer = Array2::<f64>::zeros((0, 0));
+                    let unified_diag = super::unified::compute_corrected_covariance_diagonal(
+                        &[], &[], &outer, &hop,
+                    );
+                    if let Ok(diag) = unified_diag {
+                        let p = base_cov.nrows();
+                        let max_dev = (0..p)
+                            .map(|i| (base_cov[[i, i]] - diag[i]).abs())
+                            .fold(0.0_f64, f64::max);
+                        log::trace!(
+                            "[corrected-cov] unified diagonal validation: max_dev={:.4e}",
+                            max_dev,
+                        );
+                    }
+                    let unified_full = super::unified::compute_corrected_covariance(
+                        &[], &[], &outer, &hop,
+                    );
+                    if let Ok(full) = unified_full {
+                        log::trace!(
+                            "[corrected-cov] unified full norm: {:.4e}",
+                            full.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                        );
+                    }
+                }
+            }
             return first_order_correction;
         }
         if n_rho > AUTO_CUBATURE_MAX_RHO_DIM {

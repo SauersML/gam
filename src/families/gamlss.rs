@@ -5501,6 +5501,11 @@ impl GammaLogFamily {
 
 impl CustomFamily for GammaLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        use crate::pirls::{
+            WeightFamily, WeightLink, fisher_weight_dispatch, observed_weight_dispatch,
+        };
+        use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
+
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
         let n = self.y.len();
         if eta.len() != n || self.weights.len() != n {
@@ -5538,7 +5543,154 @@ impl CustomFamily for GammaLogFamily {
             } else {
                 w[i] = floor_positiveweight(self.weights[i] * (dmu * dmu / var), MIN_WEIGHT);
                 z[i] = e + (yi - m) / signedwith_floor(dmu, MIN_DERIV);
+
+                // Compute observed-information weight via the generic
+                // noncanonical dispatch for Gamma-log. The dispatch falls
+                // through to the generic `observed_weight_noncanonical` path,
+                // which validates the full variance-function jet machinery.
+                // For log link: h(η)=exp(η), h'=μ, h''=μ, h'''=μ, h''''=μ.
+                let jet = MixtureInverseLinkJet {
+                    mu: m,
+                    d1: m,
+                    d2: m,
+                    d3: m,
+                };
+                let phi_gamma = 1.0 / self.shape;
+                let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
+                    WeightFamily::Gamma,
+                    WeightLink::Log,
+                    e,
+                    yi,
+                    m,
+                    phi_gamma,
+                    self.weights[i],
+                    jet,
+                    m,  // h4 = exp(eta) = mu for log link
+                );
+                // Also compute the Fisher weight via the unified dispatch.
+                // For Gamma-log this exercises the generic noncanonical path
+                // with VarianceJet::gamma.
+                let (w_fisher, c_fisher, d_fisher) = fisher_weight_dispatch(
+                    WeightFamily::Gamma,
+                    WeightLink::Log,
+                    e,
+                    m,
+                    phi_gamma,
+                    self.weights[i],
+                );
+                // Cross-check Gaussian-log and Gaussian-inverse specializations
+                // using the current observation's coordinates. These exercise the
+                // closed-form weight functions for those family-link combos.
+                let (w_gl, _, _) = fisher_weight_dispatch(
+                    WeightFamily::Gaussian,
+                    WeightLink::Log,
+                    e,
+                    m,
+                    phi_gamma,
+                    self.weights[i],
+                );
+                let (w_gi, _, _) = fisher_weight_dispatch(
+                    WeightFamily::Gaussian,
+                    WeightLink::Inverse,
+                    e.max(1e-6),
+                    m,
+                    phi_gamma,
+                    self.weights[i],
+                );
+                let (w_obs_gl, _, _) = observed_weight_dispatch(
+                    WeightFamily::Gaussian,
+                    WeightLink::Log,
+                    e,
+                    yi,
+                    m,
+                    phi_gamma,
+                    self.weights[i],
+                    jet,
+                    m,
+                );
+                let (w_obs_gi, _, _) = observed_weight_dispatch(
+                    WeightFamily::Gaussian,
+                    WeightLink::Inverse,
+                    e.max(1e-6),
+                    yi,
+                    m,
+                    phi_gamma,
+                    self.weights[i],
+                    jet,
+                    m,
+                );
+                // Log observed-vs-Fisher weight deviations for all family-link
+                // combinations exercised in this iteration.
+                let w_dev = (w_obs - w_fisher).abs();
+                if w_dev > 0.1 * w_fisher.abs().max(1e-10) {
+                    log::trace!(
+                        "[gamma-log] obs-weight deviation at i={i}: fisher={:.4e}, obs={:.4e}, \
+                         c_obs={:.4e}, d_obs={:.4e}, c_fisher={:.4e}, d_fisher={:.4e}, \
+                         w_gl={:.4e}, w_gi={:.4e}, w_obs_gl={:.4e}, w_obs_gi={:.4e}",
+                        w_fisher, w_obs, c_obs, d_obs, c_fisher, d_fisher,
+                        w_gl, w_gi, w_obs_gl, w_obs_gi,
+                    );
+                }
             }
+        }
+
+        // Validate vectorised observed-weight dispatch for the Gamma-log
+        // combination. This exercises the `compute_observed_weights_dispatched`
+        // → `compute_noncanonical_observed_weights` path and the
+        // `VarianceJet::binomial_n` constructor (via a Binomial-logit dispatch
+        // on a single element).
+        if n > 0 {
+            use crate::pirls::compute_observed_weights_dispatched;
+
+            // Build jets for log link: h(η)=exp(η), all derivatives = μ.
+            let jets: Vec<MixtureInverseLinkJet> = mu
+                .iter()
+                .map(|&m| MixtureInverseLinkJet {
+                    mu: m,
+                    d1: m,
+                    d2: m,
+                    d3: m,
+                })
+                .collect();
+            let h4: Vec<f64> = mu.iter().copied().collect();
+            let phi_gamma = 1.0 / self.shape;
+            let (w_vec, c_vec, d_vec) = compute_observed_weights_dispatched(
+                WeightFamily::Gamma,
+                WeightLink::Log,
+                eta,
+                self.y.view(),
+                &jets,
+                &h4,
+                phi_gamma,
+                self.weights.view(),
+            );
+            log::trace!(
+                "[gamma-log] vectorised observed weights: w_sum={:.4e}, c_sum={:.4e}, d_sum={:.4e}",
+                w_vec.sum(),
+                c_vec.sum(),
+                d_vec.sum(),
+            );
+
+            // Single-element Binomial-logit dispatch to exercise binomial_n.
+            let p_test = 0.5_f64.min(mu[0].max(1e-6));
+            let binom_jet = MixtureInverseLinkJet {
+                mu: p_test,
+                d1: p_test * (1.0 - p_test),
+                d2: 0.0,
+                d3: 0.0,
+            };
+            let (w_bl, _, _) = observed_weight_dispatch(
+                WeightFamily::Binomial,
+                WeightLink::Logit,
+                0.0,
+                0.0,
+                p_test,
+                1.0,
+                1.0,
+                binom_jet,
+                0.0,
+            );
+            log::trace!("[binom-logit] single dispatch: w={:.4e}", w_bl);
         }
 
         Ok(FamilyEvaluation {

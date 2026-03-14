@@ -1545,6 +1545,30 @@ impl<'a> JointRemlState<'a> {
         })
     }
 
+    /// Compute EFS (Extended Fellner-Schall) steps for the joint model by
+    /// building an `InnerSolution` at the converged state and delegating to
+    /// the unified `compute_efs_update`.
+    pub fn compute_efs_eval(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+        use crate::estimate::reml::unified::compute_efs_update;
+
+        let cost = self.compute_cost(rho)?;
+        let penalty_layout = JointPenaltyLayout::for_state(&self.core.state);
+        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
+        let (inner_solution, ..) = Self::build_inner_solution_at_convergence(
+            &self.core.state,
+            rho.as_slice().unwrap(),
+            &lambda_base,
+            lambda_link,
+            self.core.base_reparam_invariant.as_ref(),
+            &self.core.base_rs_list,
+        )?;
+        let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
+        Ok(crate::solver::strategy::EfsEval { cost, steps })
+    }
+
     fn fixed_subspace_logdet_for_penalty(
         s_lambda: &Array2<f64>,
         structural_rank: usize,
@@ -2609,7 +2633,9 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
                 snap.restore(state);
             }
         },
-        efs_fn: None::<fn(&mut JointRemlState<'_>, &Array1<f64>) -> Result<crate::solver::strategy::EfsEval, crate::estimate::EstimationError>>,
+        efs_fn: Some(|state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
+            state.compute_efs_eval(rho)
+        }),
     };
 
     let result =

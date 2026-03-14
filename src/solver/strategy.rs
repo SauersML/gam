@@ -255,7 +255,8 @@ pub trait OuterObjective {
     /// Evaluate cost + EFS step vector. Only needed when the plan selects
     /// `Solver::Efs`. The default returns an error indicating EFS is not
     /// supported by this objective.
-    fn eval_efs(&mut self, _rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        let _ = rho;
         Err(EstimationError::RemlOptimizationFailed(
             "EFS evaluation not implemented for this objective".to_string(),
         ))
@@ -751,8 +752,8 @@ pub fn run_outer(
                 let mut total_iter = 0_usize;
                 let mut converged = false;
 
-                for _iter in 0..max_efs_iter {
-                    total_iter += 1;
+                for iter in 0..max_efs_iter {
+                    total_iter = iter + 1;
 
                     let efs_eval = match obj.eval_efs(&rho) {
                         Ok(e) => e,

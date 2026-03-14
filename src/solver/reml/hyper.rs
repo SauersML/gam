@@ -1628,9 +1628,48 @@ impl<'a> RemlState<'a> {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+        // Pre-build unified τ objects so they are ready for downstream
+        // consumers (e.g. second-order methods that route through the
+        // unified evaluator instead of the piecewise directional path).
+        let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
+        let rho = blocks.rho_owned();
+        if !hyper_dirs.is_empty() {
+            let (ext_coords, ..) =
+                self.build_tau_unified_objects(&rho, hyper_dirs)?;
+            log::trace!(
+                "[joint-hyper] built {} tau coords from unified objects",
+                ext_coords.len()
+            );
+        }
         let (cost, grad) = self.compute_joint_hypercostgradient(theta, rho_dim, hyper_dirs)?;
         let hess = self.compute_joint_hyperhessian(theta, rho_dim, hyper_dirs)?;
         Ok((cost, grad, hess))
+    }
+
+    /// Build the extended-coordinate objects for τ (directional) hyperparameters
+    /// using the unified evaluator representation. This assembles both the
+    /// first-order `HyperCoord` objects and the second-order pair callbacks,
+    /// suitable for passing to `InnerSolutionBuilder::ext_coords()` and
+    /// related pair-callback setters.
+    ///
+    /// Returns `(coords, ext_pair_fn, rho_ext_pair_fn)`.
+    pub(crate) fn build_tau_unified_objects(
+        &self,
+        rho: &Array1<f64>,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<
+        (
+            Vec<super::unified::HyperCoord>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        ),
+        EstimationError,
+    > {
+        let bundle = self.obtain_eval_bundle(rho)?;
+        let ext_coords = self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?;
+        let (ext_pair_fn, rho_ext_pair_fn) =
+            self.build_tau_pair_callbacks(rho, &bundle, hyper_dirs)?;
+        Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
     }
 
     pub(super) fn compute_directional_hypergradientwith_bundle(

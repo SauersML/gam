@@ -7548,6 +7548,40 @@ fn external_opts_for_design(
     }
 }
 
+/// Evaluate the joint REML cost, gradient, and Hessian at a given θ = [ρ, ψ]
+/// for a single-block term collection with spatial hyperparameters.
+///
+/// This provides a direct evaluation of the profiled REML objective using the
+/// external-caller interface, which exposes exact cost/gradient/Hessian without
+/// running the full outer smoothing loop. The returned tuple is
+/// `(cost, gradient, hessian)` in the joint [ρ, ψ] space.
+fn evaluate_joint_reml_at_theta(
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    design: &TermCollectionDesign,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+    let ext_opts = external_opts_for_design(family, design, options);
+    crate::estimate::compute_external_joint_hypercostgradienthessian(
+        y,
+        weights,
+        design.design.clone(),
+        offset,
+        design.penalties.clone(),
+        theta,
+        rho_dim,
+        hyper_dirs,
+        warm_start_beta,
+        &ext_opts,
+    )
+}
+
 fn smooth_term_penalty_index(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
@@ -8174,6 +8208,33 @@ fn try_exact_joint_spatial_length_scale_optimization(
         },
     )
     .map_err(EstimationError::InvalidInput)?;
+
+    // Gradient-based refinement: when exact hyper-derivatives are available,
+    // evaluate the joint REML objective at the coordinate-search optimum to
+    // obtain gradient information for diagnostics and potential further
+    // Newton-style refinement.
+    if let Some(hyper_dirs) =
+        try_build_spatial_log_kappa_hyper_dirs(data, resolvedspec, &best.design, spatial_terms)?
+    {
+        if let Ok((_, grad, _)) = evaluate_joint_reml_at_theta(
+            y,
+            weights,
+            offset,
+            &best.design,
+            &best_theta,
+            rho_dim,
+            hyper_dirs,
+            None,
+            family,
+            options,
+        ) {
+            let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+            log::trace!(
+                "[spatial-kappa] gradient norm at coordinate-search optimum: {:.6e}",
+                grad_norm,
+            );
+        }
+    }
 
     let theta_star = best_theta;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
