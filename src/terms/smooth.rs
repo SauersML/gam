@@ -24,7 +24,7 @@ use crate::estimate::{
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
-use crate::families::strategy::{FamilyStrategy, strategy_for_family};
+use crate::families::strategy::strategy_for_family;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
@@ -572,12 +572,6 @@ impl SpatialLogKappaCoords {
             values: Array1::<f64>::from_elem(total, -options.min_length_scale.ln()),
             dims_per_term: dims_per_term.to_vec(),
         }
-    }
-
-    /// Backward-compatible: reconstruct from theta tail assuming all-isotropic.
-    #[allow(dead_code)]
-    fn from_theta_tail(theta: &Array1<f64>, start: usize) -> Self {
-        Self::new(theta.slice(s![start..]).to_owned())
     }
 
     /// Reconstruct from theta tail with known dimensionality layout.

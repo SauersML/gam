@@ -24,15 +24,11 @@ use self::reml::{DirectionalHyperParam, RemlState};
 use crate::basis::analyze_penalty_block;
 // BlockwiseFitResult and SurvivalLocationScaleFitResult are now type aliases
 // for UnifiedFitResult, defined in their respective modules.
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::fmt;
 use std::time::Instant;
 
 // Crate-level imports
-use crate::construction::{
-    ReparamInvariant, compute_penalty_square_roots, create_balanced_penalty_root,
-    precompute_reparam_invariant,
-};
+use crate::construction::compute_penalty_square_roots;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
@@ -48,19 +44,16 @@ use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
     Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
-    RidgePassport, SasLinkState,
+    SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
 // faer: high-performance dense solvers
-use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_atb,
-};
+use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::{MatRef, Side};
 
-use crate::diagnostics::should_emit_h_min_eig_diag;
 use serde::{Deserialize, Serialize};
 
 // Note: deflateweights_by_se was removed. We now use integrated (GHQ)
