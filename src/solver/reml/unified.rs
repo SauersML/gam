@@ -471,6 +471,21 @@ pub struct InnerSolution<'dp> {
     /// Gradient of the Firth contribution with respect to ρ.
     pub firth_gradient: Option<Array1<f64>>,
 
+    /// Hessian of the Firth contribution with respect to ρ (q × q matrix).
+    ///
+    /// This is the second derivative ∂²Φ/∂ρₖ∂ρₗ of the Firth penalty
+    /// Φ = ½ log|I(β̂)|₊, computed via:
+    ///
+    /// ```text
+    /// J_{kl} = ½ [tr(I⁻¹ Ï_{kl}) − tr(I⁻¹ İ_l I⁻¹ İ_k)]
+    /// ```
+    ///
+    /// This parallels the LAML Hessian structure exactly — the same
+    /// trace-of-product and trace-of-second-derivative pattern — but uses
+    /// Fisher information I in place of penalized Hessian H, and
+    /// D(H_φ) / D²(H_φ) in place of observed-weight corrections.
+    pub firth_hessian: Option<Array2<f64>>,
+
     // === Model dimensions ===
     /// Number of observations.
     pub n_observations: usize,
@@ -520,6 +535,7 @@ pub struct InnerSolutionBuilder<'dp> {
     tk_gradient: Option<Array1<f64>>,
     firth_logdet: f64,
     firth_gradient: Option<Array1<f64>>,
+    firth_hessian: Option<Array2<f64>>,
     nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     ext_coords: Vec<HyperCoord>,
@@ -554,6 +570,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_gradient: None,
             firth_logdet: 0.0,
             firth_gradient: None,
+            firth_hessian: None,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -576,6 +593,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
     pub fn firth(mut self, logdet: f64, gradient: Option<Array1<f64>>) -> Self {
         self.firth_logdet = logdet;
         self.firth_gradient = gradient;
+        self
+    }
+
+    pub fn firth_hessian(mut self, hessian: Option<Array2<f64>>) -> Self {
+        self.firth_hessian = hessian;
         self
     }
 
@@ -635,6 +657,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_gradient: self.tk_gradient,
             firth_logdet: self.firth_logdet,
             firth_gradient: self.firth_gradient,
+            firth_hessian: self.firth_hessian,
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,
@@ -927,6 +950,11 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let mut h = compute_outer_hessian(solution, rho, &lambdas, hop)?;
+        // Add Firth Hessian (second derivatives of the Firth penalty on ρ, ρ-only).
+        if let Some(ref fh) = solution.firth_hessian {
+            let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+            sl += fh;
+        }
         // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
         if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
             let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
@@ -2238,6 +2266,7 @@ mod tests {
             tk_gradient: None,
             firth_logdet: 0.0,
             firth_gradient: None,
+            firth_hessian: None,
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -2365,6 +2394,7 @@ mod tests {
             tk_gradient: None,
             firth_logdet: 0.0,
             firth_gradient: None,
+            firth_hessian: None,
             n_observations: n,
             nullspace_dim: (p - penalty_rank) as f64,
             dispersion: DispersionHandling::ProfiledGaussian,

@@ -5274,9 +5274,8 @@ pub fn observed_weight_noncanonical(
     let c_f = (n1 * v - n0 * vd1) / phi_v2;
 
     // d_F = ∂c_F/∂η via quotient rule on c_F = (n1·v − n0·vd1) / (φ·v²)
+    // numerator of c_F and its η-derivative (cross terms cancel):
     let numer_cf = n1 * v - n0 * vd1;
-    let dnumer_cf = n2 * v + n1 * vd1 - n1 * vd1 - n0 * vd2;
-    // = n2 * v - n0 * vd2
     let dnumer_cf = n2 * v - n0 * vd2;
     let d_f = (dnumer_cf * v - 2.0 * numer_cf * vd1) / (phi_v3);
 
