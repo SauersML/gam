@@ -159,6 +159,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
+    penalty_shrinkage_floor: None,
     };
     let rho = array![0.0];
     let (analytic, _) = evaluate_externalgradients(
@@ -231,6 +232,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
+    penalty_shrinkage_floor: None,
     };
     let rho = array![0.0];
     let (analytic, _) = evaluate_externalgradients(
@@ -301,6 +303,7 @@ fn stress_test_firthgradientvs_conditioning() {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
         };
         let rho = array![0.0];
         let Ok((analytic, _)) = evaluate_externalgradients(

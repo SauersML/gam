@@ -124,6 +124,7 @@ fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f6
         nullspace_dims: vec![0],
         linear_constraints: None,
         firth_bias_reduction: None,
+    penalty_shrinkage_floor: None,
     };
     let rho_arr = array![rho];
     let (analytic_grad, _) = evaluate_externalgradients(
@@ -371,6 +372,7 @@ fn test_externalgradient_adapter_isolated_matchesfd_direction() {
         nullspace_dims: vec![1, 0],
         linear_constraints: None,
         firth_bias_reduction: None,
+    penalty_shrinkage_floor: None,
     };
     let rho = array![1.5, 0.8];
     let (analytic, fd) = evaluate_externalgradients(

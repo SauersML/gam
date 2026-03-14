@@ -482,6 +482,7 @@ fn sas_exact_outergradient_seed19_epsilon_component_matches_profiledfd() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
+    penalty_shrinkage_floor: None,
     };
 
     let theta = array![0.10, 0.12, -0.18];

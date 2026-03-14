@@ -223,6 +223,7 @@ fn theta_evaluator_accepts_intrinsic_sas_defaults() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
     };
 
     let theta = array![0.2, -0.1, 0.05];
@@ -472,6 +473,7 @@ fn outer_profileobjective_stationary_near_fitted_sas_and_mixture_params() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
     };
     let sascost = |raw_eps: f64, ld: f64| -> Result<f64, String> {
         let mut theta_sas = Array1::<f64>::zeros(rho_hat.len() + 2);

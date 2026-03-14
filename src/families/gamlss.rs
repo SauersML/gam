@@ -589,36 +589,39 @@ fn build_two_block_exact_joint_setup(
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
     let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
     let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
-    let mut log_kappa0 = Array1::<f64>::zeros(mean_terms.len() + noise_terms.len());
 
     for (i, &rho_init) in extra_rho0.iter().enumerate() {
         rho0vec[mean_penalties + noise_penalties + i] = rho_init;
     }
-    for (slot, &term_idx) in mean_terms.iter().enumerate() {
-        let length_scale = get_spatial_length_scale(meanspec, term_idx)
-            .unwrap_or(kappa_options.min_length_scale)
-            .clamp(
-                kappa_options.min_length_scale,
-                kappa_options.max_length_scale,
-            );
-        log_kappa0[slot] = -length_scale.ln();
-    }
-    for (slot, &term_idx) in noise_terms.iter().enumerate() {
-        let length_scale = get_spatial_length_scale(noisespec, term_idx)
-            .unwrap_or(kappa_options.min_length_scale)
-            .clamp(
-                kappa_options.min_length_scale,
-                kappa_options.max_length_scale,
-            );
-        log_kappa0[mean_terms.len() + slot] = -length_scale.ln();
-    }
+
+    // Use aniso-aware initialization: each aniso term gets d ψ entries.
+    let mean_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
+        meanspec, &mean_terms, kappa_options,
+    );
+    let noise_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
+        noisespec, &noise_terms, kappa_options,
+    );
+
+    // Concatenate mean and noise ψ values and dims.
+    let mut all_values = mean_kappa.as_array().to_vec();
+    all_values.extend(noise_kappa.as_array().iter());
+    let mut all_dims = mean_kappa.dims_per_term().to_vec();
+    all_dims.extend(noise_kappa.dims_per_term());
+
+    let log_kappa0 = SpatialLogKappaCoords::new_with_dims(
+        Array1::from_vec(all_values),
+        all_dims.clone(),
+    );
+    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&all_dims, kappa_options);
+    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&all_dims, kappa_options);
+
     TwoBlockExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
         rho_upper,
-        SpatialLogKappaCoords::new(log_kappa0),
-        SpatialLogKappaCoords::lower_bounds(mean_terms.len() + noise_terms.len(), kappa_options),
-        SpatialLogKappaCoords::upper_bounds(mean_terms.len() + noise_terms.len(), kappa_options),
+        log_kappa0,
+        log_kappa_lower,
+        log_kappa_upper,
     )
 }
 
@@ -11134,11 +11137,18 @@ mod tests {
             for i in 0..n {
                 let w = weights[i];
                 let eta = eta_ls[i];
-                let two_eta = 2.0 * eta;
-                let sigma = safe_exp(eta).max(1e-12);
-                let inv_s2 = safe_exp(-two_eta).min(1e24);
+                let SigmaJet1 {
+                    sigma: raw_sigma,
+                    d1: raw_dsigma,
+                } = exp_sigma_jet1_scalar(eta);
+                let (sigma, d_sigma) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
+                    (1e-12, 0.0)
+                } else {
+                    (raw_sigma, raw_dsigma)
+                };
+                let inv_s2 = (sigma * sigma).recip().min(1e24);
                 let r = y[i] - mu[i];
-                ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+                ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
                 if w == 0.0 {
                     wmu[i] = 0.0;
                     zmu[i] = mu[i];
@@ -11146,7 +11156,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = if sigma <= 1e-10 { sigma * 1e10 } else { 1.0 };
+                let dlogsigma_du = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
@@ -11169,12 +11179,19 @@ mod tests {
             let mut wls = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let eta = eta_ls[i];
-                let two_eta = 2.0 * eta;
-                let sigma = safe_exp(eta).max(1e-12);
+                let SigmaJet1 {
+                    sigma: raw_sigma,
+                    d1: raw_dsigma,
+                } = exp_sigma_jet1_scalar(eta);
+                let (sigma, d_sigma) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
+                    (1e-12, 0.0)
+                } else {
+                    (raw_sigma, raw_dsigma)
+                };
                 let inv_s2 = (sigma * sigma).recip().min(1e24);
                 let w = weights[i];
                 let r = y[i] - mu[i];
-                ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + two_eta));
+                ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
                 if w == 0.0 {
                     wmu[i] = 0.0;
                     zmu[i] = mu[i];
@@ -11182,7 +11199,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = if sigma <= 1e-10 { sigma * 1e10 } else { 1.0 };
+                let dlogsigma_du = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {

@@ -5508,6 +5508,7 @@ fn run_sample_standard(
             nullspace_dims: design.nullspace_dims.clone(),
             linear_constraints: design.linear_constraints.clone(),
             adaptive_regularization: None,
+            penalty_shrinkage_floor: Some(1e-6),
         },
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
