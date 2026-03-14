@@ -2977,6 +2977,393 @@ fn matern_aniso_radial_scalars(
     Ok((phi, q, t))
 }
 
+/// Extended radial scalars for exact per-axis η_a derivatives of the Matérn
+/// operator collocation matrices D₁ (gradient) and D₂ (Laplacian).
+///
+/// Returns `(phi, q, t, dt_dr, d2t_dr2)` where:
+///   - phi   = φ(r)                  (kernel value)
+///   - q     = φ'(r)/r               (used in D₁)
+///   - t     = (φ''(r) - q) / r²     (used in D₀/D₁ per-axis chain)
+///   - dt_dr = dt/dr                 (needed for D₁ second η-derivative)
+///   - d2t_dr2 = d²t/dr²            (needed for D₂ second η-derivative)
+///
+/// At r = 0 (center collision), the function returns zeros for all quantities
+/// that would be multiplied by s_a (which also vanishes at collision).
+///
+/// For ν = 1/2 and ν = 3/2 where t and/or dt_dr diverge at r = 0, the
+/// collision entries are safe because D₁ and D₂ derivatives at coincident
+/// centers vanish via s_a = 0.
+fn matern_aniso_extended_radial_scalars(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(f64, f64, f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn extended radial scalar distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    match nu {
+        // ----------------------------------------------------------------
+        // ν = 1/2:  φ = exp(-a), a = r / ℓ, s = 1/ℓ
+        //   q = -s·E/r  (diverges at r=0)
+        //   t = (s²E - q) / r²  (diverges at r=0)
+        //   At r=0 all products with s_a vanish, so return 0 for dt_dr, d2t_dr2.
+        // ----------------------------------------------------------------
+        MaternNu::Half => {
+            let s = 1.0 / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = e;
+            if r < 1e-14 {
+                // Collision: q diverges but s_a = 0 ⇒ products vanish.
+                return Ok((phi, 0.0, 0.0, 0.0, 0.0));
+            }
+            let q = -s * e / r;
+            let phi_rr = s * s * e;
+            let t = (phi_rr - q) / (r * r);
+            // t' from: t = f/r² where f = φ'' - q.
+            //   f'  = φ''' - q' = -s³E - t·r   (since q' = t·r)
+            //   t'  = (f' - 2t·r) / r²  = (-s³E - 3t·r) / r²
+            let dt_dr = (-s * s * s * e - 3.0 * t * r) / (r * r);
+            // t'' from: t' = g/r² where g = -s³E - 3tr.
+            //   g' = s⁴E - 3(t'r + t)
+            //   t'' = (g' - 2t'r) / r² = (s⁴E - 3t'r - 3t - 2t'r) / r²
+            //        = (s⁴E - 5t'r - 3t) / r²
+            let d2t_dr2 = (s.powi(4) * e - 5.0 * dt_dr * r - 3.0 * t) / (r * r);
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 3/2:  φ = (1 + a)E, a = √3·r/ℓ, s = √3/ℓ
+        //   q  = -s²E         (finite at r=0)
+        //   t  = s³E/r        (diverges at r=0)
+        //   dt/dr = s³E(-sr - 1)/r²  (diverges at r=0)
+        //   At r=0, s_a = 0 so all products vanish.
+        // ----------------------------------------------------------------
+        MaternNu::ThreeHalves => {
+            let s = 3.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a) * e;
+            let q = -s * s * e;
+            if r < 1e-14 {
+                return Ok((phi, q, 0.0, 0.0, 0.0));
+            }
+            let t = s * s * s * e / r;
+            // dt/dr: d/dr [s³ E / r] = s³ [-s E r - E] / r² = -s³ E (sr + 1) / r²
+            let dt_dr = -s * s * s * e * (a + 1.0) / (r * r);
+            // d²t/dr²: d/dr [-s³ E (a+1) / r²]
+            //   = -s³ [(-s E)(a+1)r² + s E r² - 2r E(a+1)] / r⁴ ... expand
+            // Let g(r) = -s³ E (a+1) / r²
+            // g'(r) = -s³ [E'(a+1) + E·s] / r² + 2s³ E(a+1) / r³
+            //       = -s³ [-sE(a+1) + sE] / r² + 2s³ E(a+1) / r³
+            //       = -s³ · sE[-a-1+1] / r² + 2s³ E(a+1) / r³
+            //       = s⁴ a E / r² + 2s³ E(a+1) / r³
+            //       = s³ E [s a r + 2(a+1)] / r³
+            let d2t_dr2 = s * s * s * e * (s * a * r + 2.0 * (a + 1.0)) / (r * r * r);
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 5/2:  φ = (1 + a + a²/3)E, a = √5·r/ℓ, s = √5/ℓ
+        //   q = -(s²/3)(a+1)E
+        //   t = (s⁴/3)E
+        //   dt/dr = -(s⁵/3)E
+        //   d²t/dr² = (s⁶/3)E
+        // ----------------------------------------------------------------
+        MaternNu::FiveHalves => {
+            let s = 5.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (a * a) / 3.0) * e;
+            let q = -(s * s / 3.0) * (a + 1.0) * e;
+            let t = (s * s * s * s / 3.0) * e;
+            let dt_dr = -(s * s * s * s * s / 3.0) * e;
+            let d2t_dr2 = (s.powi(6) / 3.0) * e;
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 7/2:  φ = (1 + a + (2/5)a² + (1/15)a³)E
+        //   q = -(s²/15)(a² + 3a + 3)E
+        //   t = (s⁴/15)(a + 1)E
+        //   dt/dr = -(s⁵/15)aE
+        //   d²t/dr² = (s⁶/15)(a - 1)E
+        // ----------------------------------------------------------------
+        MaternNu::SevenHalves => {
+            let s = 7.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a * a * a) * e;
+            let q = -(s * s / 15.0) * (a * a + 3.0 * a + 3.0) * e;
+            let t = (s * s * s * s / 15.0) * (a + 1.0) * e;
+            let dt_dr = -(s.powi(5) / 15.0) * a * e;
+            let d2t_dr2 = (s.powi(6) / 15.0) * (a - 1.0) * e;
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 9/2:  φ = (1 + a + (3/7)a² + (2/21)a³ + (1/105)a⁴)E
+        //   q = -(s²/105)(a³ + 6a² + 15a + 15)E
+        //   t = (s⁴/105)(a² + 3a + 3)E
+        //   dt/dr = -(s⁵/105)a(a + 1)E
+        //   d²t/dr² = (s⁶/105)(a² - a - 1)E
+        // ----------------------------------------------------------------
+        MaternNu::NineHalves => {
+            let s = 9.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0
+                + a
+                + (3.0 / 7.0) * a * a
+                + (2.0 / 21.0) * a * a * a
+                + (1.0 / 105.0) * a * a * a * a)
+                * e;
+            let q = -(s * s / 105.0) * (a * a * a + 6.0 * a * a + 15.0 * a + 15.0) * e;
+            let t = (s * s * s * s / 105.0) * (a * a + 3.0 * a + 3.0) * e;
+            let dt_dr = -(s.powi(5) / 105.0) * a * (a + 1.0) * e;
+            let d2t_dr2 = (s.powi(6) / 105.0) * (a * a - a - 1.0) * e;
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+    }
+}
+
+/// Build exact per-axis η_a derivatives of operator penalty matrices for
+/// anisotropic Matérn terms.
+///
+/// Instead of the fractional approximation `dS_op/dη_a ≈ f_a · dS_op/dψ`,
+/// this computes exact first and second η_a derivatives of each operator
+/// collocation matrix (D₀, D₁, D₂) and assembles the Gram product-rule
+/// derivatives:
+///   S_{m,a}  = D_{m,a}ᵀ D_m + D_mᵀ D_{m,a}
+///   S_{m,aa} = D_{m,aa}ᵀ D_m + 2 D_{m,a}ᵀ D_{m,a} + D_mᵀ D_{m,aa}
+///
+/// ## Per-axis derivative formulas (y-space operators)
+///
+/// With r = √(Σ exp(2η_a) h_a²) and s_a = exp(2η_a) h_a²:
+///
+/// **D₀[k,j] = φ(r):**
+///   ∂φ/∂η_a = q · s_a
+///   ∂²φ/∂η_a² = t · s_a² + 2q · s_a
+///
+/// **D₁[(k,b),j] = q(r) · h_b** (y-space gradient):
+///   ∂D₁/∂η_a = t · s_a · h_b
+///   ∂²D₁/∂η_a² = (dt/dr · s_a²/r + 2t · s_a) · h_b
+///
+/// **D₂[k,j] = φ''(r) + (d-1)·q(r)** (y-space Laplacian):
+///   ∂D₂/∂η_a = [(d+2)·t + dt/dr · r] · s_a
+///   ∂²D₂/∂η_a² = [(d+3)·dt/dr/r + d²t/dr²] · s_a² + 2·[(d+2)·t + dt/dr·r] · s_a
+fn build_matern_operator_penalty_aniso_derivatives(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    z_opt: Option<&Array2<f64>>,
+    eta: &[f64],
+) -> Result<Vec<(Vec<Array2<f64>>, Vec<Array2<f64>>)>, BasisError> {
+    let p = centers.nrows();
+    let d = centers.ncols();
+    let dim = eta.len();
+    assert_eq!(dim, d);
+
+    // Per-axis: build raw D₀, D₁, D₂ and their η_a first/second derivatives.
+    // D₀: p × p
+    // D₁: (p·d) × p
+    // D₂: p × p
+    let mut d0_raw = Array2::<f64>::zeros((p, p));
+    let mut d1_raw = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw = Array2::<f64>::zeros((p, p));
+    let mut d0_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
+    let mut d1_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p * d, p))).collect();
+    let mut d2_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
+    let mut d0_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
+    let mut d1_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p * d, p))).collect();
+    let mut d2_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
+
+    let d_f64 = d as f64;
+
+    for k in 0..p {
+        for j in 0..p {
+            let ci: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
+            let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
+            let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+
+            let (phi, q, t, dt_dr, d2t_dr2) =
+                matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+
+            // --- D₀ ---
+            d0_raw[[k, j]] = phi;
+
+            // --- D₂ (Laplacian) ---
+            let lap = if r < 1e-14 {
+                // At collision, φ''(0) + (d-1)·q(0).
+                // For ν=1/2 this diverges but the penalty contribution at collision
+                // is typically handled by the existing operator assembly.
+                // Use the same scalar value:
+                let (_phi_c, _phi_psi_c, _phi_psi_psi_c, _ratio_c, _ratio_psi_c, _ratio_psi_psi_c,
+                    lap_c, _lap_psi_c, _lap_psi_psi_c) =
+                    matern_operator_psi_triplet(r, length_scale, nu, d)?;
+                lap_c
+            } else {
+                // φ'' = q + t·r², so lap = q + t·r² + (d-1)·q = d·q + t·r²
+                q + t * r * r + (d_f64 - 1.0) * q
+            };
+            d2_raw[[k, j]] = lap;
+
+            // --- D₁ (gradient) ---
+            for axis in 0..d {
+                let h_b = ci[axis] - cj[axis];
+                let row = k * d + axis;
+                d1_raw[[row, j]] = q * h_b;
+            }
+
+            // --- Per-axis η_a derivatives ---
+            for a in 0..dim {
+                let s_a = s_vec[a];
+
+                // ∂D₀/∂η_a = q · s_a
+                d0_raw_eta[a][[k, j]] = q * s_a;
+                // ∂²D₀/∂η_a² = t · s_a² + 2q · s_a
+                d0_raw_eta2[a][[k, j]] = t * s_a * s_a + 2.0 * q * s_a;
+
+                // ∂D₁/∂η_a: for each axis b, ∂(q · h_b)/∂η_a = (dq/dη_a) · h_b = t · s_a · h_b
+                for b in 0..d {
+                    let h_b = ci[b] - cj[b];
+                    let row = k * d + b;
+                    d1_raw_eta[a][[row, j]] = t * s_a * h_b;
+                    // ∂²D₁/∂η_a² = (dt/dr · s_a/r · s_a + 2t · s_a) · h_b
+                    //             = (dt/dr · s_a²/r + 2t · s_a) · h_b
+                    let d2q_deta2 = if r > 1e-14 {
+                        dt_dr * s_a * s_a / r + 2.0 * t * s_a
+                    } else {
+                        // At collision s_a = 0, so the whole expression is 0.
+                        0.0
+                    };
+                    d1_raw_eta2[a][[row, j]] = d2q_deta2 * h_b;
+                }
+
+                // ∂D₂/∂η_a = [(d+2)·t + dt_dr · r] · s_a
+                let dlap_deta = if r > 1e-14 {
+                    ((d_f64 + 2.0) * t + dt_dr * r) * s_a
+                } else {
+                    0.0
+                };
+                d2_raw_eta[a][[k, j]] = dlap_deta;
+
+                // ∂²D₂/∂η_a²:
+                // Let w = (d+2)·t + dt_dr · r.
+                // ∂²D₂/∂η_a² = (dw/dr · s_a/r) · s_a + w · 2 · s_a
+                // dw/dr = (d+2)·dt_dr + d²t_dr²·r + dt_dr = (d+3)·dt_dr + d²t_dr²·r
+                let d2lap_deta2 = if r > 1e-14 {
+                    let w = (d_f64 + 2.0) * t + dt_dr * r;
+                    let dw_dr = (d_f64 + 3.0) * dt_dr + d2t_dr2 * r;
+                    dw_dr * s_a * s_a / r + 2.0 * w * s_a
+                } else {
+                    0.0
+                };
+                d2_raw_eta2[a][[k, j]] = d2lap_deta2;
+            }
+        }
+    }
+
+    // Project through identifiability transform Z (ψ-independent).
+    let project = |mat: Array2<f64>| -> Array2<f64> {
+        if let Some(z) = z_opt {
+            fast_ab(&mat, z)
+        } else {
+            mat
+        }
+    };
+
+    let d0_kernel = project(d0_raw);
+    let d1_kernel = project(d1_raw);
+    let d2_kernel = project(d2_raw);
+
+    let kernel_cols = d0_kernel.ncols();
+    let total_cols = kernel_cols + usize::from(include_intercept);
+
+    // Pad with intercept column.
+    let pad = |kernel_mat: Array2<f64>, nrows: usize, add_intercept_ones: bool| -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((nrows, total_cols));
+        out.slice_mut(s![.., 0..kernel_cols]).assign(&kernel_mat);
+        if add_intercept_ones && include_intercept {
+            out.column_mut(kernel_cols).fill(1.0);
+        }
+        out
+    };
+
+    let d0 = pad(d0_kernel, p, true);
+    let d1 = pad(d1_kernel, p * d, false);
+    let d2 = pad(d2_kernel, p, false);
+
+    // Build per-axis results.
+    let mut per_axis_results = Vec::with_capacity(dim);
+
+    for a in 0..dim {
+        let d0_eta = pad(project(std::mem::replace(&mut d0_raw_eta[a], Array2::zeros((0, 0)))), p, false);
+        let d1_eta = pad(project(std::mem::replace(&mut d1_raw_eta[a], Array2::zeros((0, 0)))), p * d, false);
+        let d2_eta = pad(project(std::mem::replace(&mut d2_raw_eta[a], Array2::zeros((0, 0)))), p, false);
+        let d0_eta2 = pad(project(std::mem::replace(&mut d0_raw_eta2[a], Array2::zeros((0, 0)))), p, false);
+        let d1_eta2 = pad(project(std::mem::replace(&mut d1_raw_eta2[a], Array2::zeros((0, 0)))), p * d, false);
+        let d2_eta2 = pad(project(std::mem::replace(&mut d2_raw_eta2[a], Array2::zeros((0, 0)))), p, false);
+
+        // Gram product-rule derivatives for each operator.
+        let (s0, s0_eta, s0_eta2) =
+            gram_and_psi_derivatives_from_operator(&d0, &d0_eta, &d0_eta2);
+        let (s1, s1_eta, s1_eta2) =
+            gram_and_psi_derivatives_from_operator(&d1, &d1_eta, &d1_eta2);
+        let (s2, s2_eta, s2_eta2) =
+            gram_and_psi_derivatives_from_operator(&d2, &d2_eta, &d2_eta2);
+
+        // Normalize each operator block (Frobenius normalization).
+        let (s0_norm, s0_norm_eta, s0_norm_eta2, c0) =
+            normalize_penaltywith_psi_derivatives(&s0, &s0_eta, &s0_eta2);
+        let (s1_norm, s1_norm_eta, s1_norm_eta2, c1) =
+            normalize_penaltywith_psi_derivatives(&s1, &s1_eta, &s1_eta2);
+        let (s2_norm, s2_norm_eta, s2_norm_eta2, c2) =
+            normalize_penaltywith_psi_derivatives(&s2, &s2_eta, &s2_eta2);
+
+        let candidates = vec![
+            PenaltyCandidate {
+                matrix: s0_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::OperatorMass,
+                normalization_scale: c0,
+            },
+            PenaltyCandidate {
+                matrix: s1_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::OperatorTension,
+                normalization_scale: c1,
+            },
+            PenaltyCandidate {
+                matrix: s2_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::OperatorStiffness,
+                normalization_scale: c2,
+            },
+        ];
+        let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+        let pen_first = active_operator_penalty_derivatives(
+            &penaltyinfo,
+            &[s0_norm_eta, s1_norm_eta, s2_norm_eta],
+            "Matérn-aniso",
+        )?;
+        let pen_second = active_operator_penalty_derivatives(
+            &penaltyinfo,
+            &[s0_norm_eta2, s1_norm_eta2, s2_norm_eta2],
+            "Matérn-aniso",
+        )?;
+
+        per_axis_results.push((pen_first, pen_second));
+    }
+
+    Ok(per_axis_results)
+}
+
 fn duchon_kernel_radial_triplet(
     r: f64,
     length_scale: Option<f64>,
@@ -3356,6 +3743,7 @@ pub fn build_duchon_collocation_operator_matrices(
     length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let mut workspace = BasisWorkspace::default();
@@ -3365,7 +3753,7 @@ pub fn build_duchon_collocation_operator_matrices(
         length_scale,
         power,
         nullspace_order,
-        None, // public convenience wrapper: no anisotropy
+        aniso_log_scales,
         identifiability_transform,
         &mut workspace,
     )
@@ -5907,52 +6295,233 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             result.penalties_second_diag.push(ps);
         }
     } else {
-        // Operator penalty path: fractional weighting approach.
-        // dS_op/d(ψ_a) ≈ f_a · dS_op/d(ψ) where f_a = mean(s_a / r²).
-        let (iso_pen_first, iso_pen_second) = build_matern_operator_penalty_psi_derivatives(
+        // Operator penalty path: exact per-axis η_a derivatives.
+        // Replaces the former fractional approximation with exact analytic
+        // derivatives of D₀, D₁, D₂ w.r.t. each aniso log-scale η_a,
+        // assembled via the Gram product rule into penalty derivatives.
+        let per_axis = build_matern_operator_penalty_aniso_derivatives(
             centers.view(),
             spec.length_scale,
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
-            spec.aniso_log_scales.as_deref(),
+            eta,
         )?;
-
-        let p = centers.nrows();
-        let d_spatial = centers.ncols();
-        let mut mean_frac = vec![0.0_f64; dim];
-        let mut npairs = 0usize;
-        for i in 0..p {
-            let ci: Vec<f64> = (0..d_spatial).map(|a| centers[[i, a]]).collect();
-            for j in 0..p {
-                let cj: Vec<f64> = (0..d_spatial).map(|a| centers[[j, a]]).collect();
-                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
-                let r2 = r * r;
-                for a in 0..dim {
-                    mean_frac[a] += if r2 > 1e-28 {
-                        s_vec[a] / r2
-                    } else {
-                        1.0 / dim as f64
-                    };
-                }
-                npairs += 1;
-            }
-        }
-        if npairs > 0 {
-            for a in 0..dim {
-                mean_frac[a] /= npairs as f64;
-            }
-        }
 
         result.penalties_first = Vec::with_capacity(dim);
         result.penalties_second_diag = Vec::with_capacity(dim);
-        for a in 0..dim {
-            let w = mean_frac[a];
-            let pf: Vec<Array2<f64>> = iso_pen_first.iter().map(|m| m * w).collect();
-            let ps: Vec<Array2<f64>> = iso_pen_second.iter().map(|m| m * w).collect();
-            result.penalties_first.push(pf);
-            result.penalties_second_diag.push(ps);
+        for (pen_first, pen_second) in per_axis {
+            result.penalties_first.push(pen_first);
+            result.penalties_second_diag.push(pen_second);
         }
+    }
+
+    Ok(result)
+}
+
+/// Build per-axis ψ_a design-matrix derivatives for anisotropic Duchon terms.
+///
+/// Exactly parallels [`build_matern_design_psi_aniso_derivatives`] but uses
+/// [`duchon_radial_jets`] to obtain the radial scalars (φ, q, t).
+///
+/// The per-axis chain rule is identical:
+///   ∂φ/∂ψ_a         = q · s_a
+///   ∂²φ/(∂ψ_a²)     = 2q · s_a + t · s_a²
+///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b, stored via design_cross_t)
+fn build_duchon_design_psi_aniso_derivatives(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
+    let length_scale = spec.length_scale.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "aniso Duchon derivatives require hybrid Duchon with length_scale".to_string(),
+        )
+    })?;
+    let eta = spec.aniso_log_scales.as_deref().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "aniso derivatives require aniso_log_scales to be set".to_string(),
+        )
+    })?;
+    let n = data.nrows();
+    let k = centers.nrows();
+    let dim = data.ncols();
+    debug_assert_eq!(eta.len(), dim);
+
+    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let s_order = spec.power;
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+
+    // Z_kernel: null-space constraint projection for Duchon polynomial conditions.
+    let z_kernel =
+        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
+    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+
+    // Raw kernel-level per-axis derivatives: (n x k) matrices.
+    let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
+    let mut kernel_second_diag = vec![Array2::<f64>::zeros((n, k)); dim];
+    let mut t_raw = Array2::<f64>::zeros((n, k));
+    let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
+
+    for i in 0..n {
+        let data_row: Vec<f64> = (0..dim).map(|a| data[[i, a]]).collect();
+        for j in 0..k {
+            let center: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
+            let (r, s_vec) = aniso_distance_and_components(&data_row, &center, eta);
+            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+            let q = jets.q;
+            let t = jets.t;
+            t_raw[[i, j]] = t;
+            for a in 0..dim {
+                s_components_raw[a][[i, j]] = s_vec[a];
+                kernel_first[a][[i, j]] = q * s_vec[a];
+                kernel_second_diag[a][[i, j]] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+            }
+        }
+    }
+
+    // Project through Z_kernel (null-space constraint), then pad with
+    // polynomial columns (zero derivative for the polynomial block).
+    let project_kernel = |mat: Array2<f64>| -> Array2<f64> { fast_ab(&mat, &z_kernel) };
+
+    let kernel_first: Vec<_> = kernel_first.into_iter().map(&project_kernel).collect();
+    let kernel_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&project_kernel).collect();
+    let design_cross_t = project_kernel(t_raw);
+
+    let pad = |mat: Array2<f64>| -> Array2<f64> {
+        if poly_cols > 0 {
+            let cols = mat.ncols();
+            let mut out = Array2::<f64>::zeros((n, cols + poly_cols));
+            out.slice_mut(s![.., 0..cols]).assign(&mat);
+            out
+        } else {
+            mat
+        }
+    };
+
+    let mut design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
+    let mut design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
+    let mut design_cross_t = pad(design_cross_t);
+    let mut s_components_projected: Vec<_> = s_components_raw
+        .iter()
+        .map(|raw| pad(project_kernel(raw.clone())))
+        .collect();
+
+    // Apply the full identifiability transform (if present).
+    if let Some(zf) = identifiability_transform {
+        design_first = design_first
+            .into_iter()
+            .map(|m| fast_ab(&m, zf))
+            .collect();
+        design_second_diag = design_second_diag
+            .into_iter()
+            .map(|m| fast_ab(&m, zf))
+            .collect();
+        design_cross_t = fast_ab(&design_cross_t, zf);
+        s_components_projected = s_components_projected
+            .into_iter()
+            .map(|m| fast_ab(&m, zf))
+            .collect();
+    }
+
+    // Penalty derivatives are assembled by the caller.
+    let penalties_first = vec![Vec::new(); dim];
+    let penalties_second_diag = vec![Vec::new(); dim];
+
+    Ok(AnisoBasisPsiDerivatives {
+        design_first,
+        design_second_diag,
+        design_cross_t,
+        s_components_raw,
+        s_components_projected,
+        penalties_first,
+        penalties_second_diag,
+    })
+}
+
+/// Build per-axis ψ_a derivatives for anisotropic Duchon terms, including
+/// both design-matrix and penalty derivatives.
+///
+/// Duchon terms use operator penalties (no double-penalty path), so penalty
+/// derivatives follow the fractional weighting approach:
+///   dS_op/d(ψ_a) ≈ f_a · dS_op/d(ψ)
+/// where f_a = mean(s_a / r²) is the per-axis fraction of the total anisotropic
+/// distance contributed by axis a.
+pub fn build_duchon_basis_log_kappa_aniso_derivatives(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
+    let eta = spec.aniso_log_scales.as_deref().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "aniso derivatives require aniso_log_scales to be set".to_string(),
+        )
+    })?;
+    let dim = data.ncols();
+    if eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "aniso_log_scales length {} != data dimension {dim}",
+            eta.len()
+        )));
+    }
+
+    let mut workspace = BasisWorkspace::default();
+    let (centers, identifiability_transform) =
+        prepare_duchon_derivative_contextwithworkspace(data, spec, &mut workspace)?;
+
+    let mut result = build_duchon_design_psi_aniso_derivatives(
+        data,
+        centers.view(),
+        spec,
+        identifiability_transform.as_ref(),
+        &mut workspace,
+    )?;
+
+    // Operator penalty path: fractional weighting approach.
+    // dS_op/d(ψ_a) ≈ f_a · dS_op/d(ψ) where f_a = mean(s_a / r²).
+    let (iso_pen_first, iso_pen_second) = build_duchon_operator_penalty_psi_derivatives(
+        centers.view(),
+        spec,
+        identifiability_transform.as_ref(),
+        &mut workspace,
+    )?;
+
+    let p = centers.nrows();
+    let d_spatial = centers.ncols();
+    let mut mean_frac = vec![0.0_f64; dim];
+    let mut npairs = 0usize;
+    for i in 0..p {
+        let ci: Vec<f64> = (0..d_spatial).map(|a| centers[[i, a]]).collect();
+        for j in 0..p {
+            let cj: Vec<f64> = (0..d_spatial).map(|a| centers[[j, a]]).collect();
+            let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
+            let r2 = r * r;
+            for a in 0..dim {
+                mean_frac[a] += if r2 > 1e-28 {
+                    s_vec[a] / r2
+                } else {
+                    1.0 / dim as f64
+                };
+            }
+            npairs += 1;
+        }
+    }
+    if npairs > 0 {
+        for a in 0..dim {
+            mean_frac[a] /= npairs as f64;
+        }
+    }
+
+    result.penalties_first = Vec::with_capacity(dim);
+    result.penalties_second_diag = Vec::with_capacity(dim);
+    for a in 0..dim {
+        let w = mean_frac[a];
+        let pf: Vec<Array2<f64>> = iso_pen_first.iter().map(|m| m * w).collect();
+        let ps: Vec<Array2<f64>> = iso_pen_second.iter().map(|m| m * w).collect();
+        result.penalties_first.push(pf);
+        result.penalties_second_diag.push(ps);
     }
 
     Ok(result)
@@ -12929,6 +13498,7 @@ mod tests {
             3,
             DuchonNullspaceOrder::Linear,
             None,
+            None,
         )
         .expect("duchon ops");
         assert!(d_ops.d1.iter().all(|v| v.is_finite()));
@@ -13091,5 +13661,214 @@ mod tests {
         assert!(s[1] > 0.0);
         // r should equal sqrt(s[1])
         assert_abs_diff_eq!(r, s[1].sqrt(), epsilon = 1e-14);
+    }
+
+    // ── knot_cloud_axis_scales tests ─────────────────────────────────────
+
+    #[test]
+    fn test_knot_cloud_axis_scales_basic() {
+        // 5x3 center matrix with known std devs per axis.
+        // Axis 0: values 1,2,3,4,5 → std = sqrt(2.5) ≈ 1.5811
+        // Axis 1: values 10,20,30,40,50 → std = sqrt(250) ≈ 15.811
+        // Axis 2: values 0,0,0,0,1 → std = sqrt(0.2) ≈ 0.4472
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (5, 3),
+            vec![
+                1.0, 10.0, 0.0,
+                2.0, 20.0, 0.0,
+                3.0, 30.0, 0.0,
+                4.0, 40.0, 0.0,
+                5.0, 50.0, 1.0,
+            ],
+        )
+        .unwrap();
+        let scales = knot_cloud_axis_scales(centers.view());
+        assert_eq!(scales.len(), 3);
+        // Axis 0: sample std of [1,2,3,4,5]
+        let expected_0 = (2.5_f64).sqrt(); // sqrt(10/4)
+        assert_abs_diff_eq!(scales[0], expected_0, epsilon = 1e-10);
+        // Axis 1: 10x axis 0
+        assert_abs_diff_eq!(scales[1], expected_0 * 10.0, epsilon = 1e-10);
+        // Axis 2: sample std of [0,0,0,0,1]
+        let var2 = (4.0 * 0.04 + 0.64) / 4.0; // mean=0.2, var = sum((xi-0.2)^2)/4
+        let expected_2 = var2.sqrt();
+        // Re-derive: mean=0.2, deviations: -0.2,-0.2,-0.2,-0.2,0.8
+        // sum of sq = 4*0.04 + 0.64 = 0.8, var = 0.8/4 = 0.2, std = sqrt(0.2)
+        assert_abs_diff_eq!(scales[2], (0.2_f64).sqrt(), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_knot_cloud_axis_scales_zero_variance() {
+        // One axis is constant → should return sigma=1.0 for that axis.
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (4, 2),
+            vec![
+                1.0, 5.0,
+                2.0, 5.0,
+                3.0, 5.0,
+                4.0, 5.0,
+            ],
+        )
+        .unwrap();
+        let scales = knot_cloud_axis_scales(centers.view());
+        assert_eq!(scales.len(), 2);
+        // Axis 0 has nonzero variance
+        assert!(scales[0] > 1e-6);
+        // Axis 1 is constant → sigma clamped to 1.0
+        assert_abs_diff_eq!(scales[1], 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_knot_cloud_axis_scales_single_center() {
+        // Fewer than 2 centers → returns vec![1.0; d].
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec((1, 3), vec![1.0, 2.0, 3.0]).unwrap();
+        let scales = knot_cloud_axis_scales(centers.view());
+        assert_eq!(scales, vec![1.0, 1.0, 1.0]);
+    }
+
+    // ── initial_aniso_contrasts tests ────────────────────────────────────
+
+    #[test]
+    fn test_initial_aniso_contrasts_sum_to_zero() {
+        // Create centers with different axis scales; verify sum of η ≈ 0.
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (5, 3),
+            vec![
+                1.0, 10.0, 100.0,
+                2.0, 20.0, 200.0,
+                3.0, 30.0, 300.0,
+                4.0, 40.0, 400.0,
+                5.0, 50.0, 500.0,
+            ],
+        )
+        .unwrap();
+        let eta = initial_aniso_contrasts(centers.view());
+        assert_eq!(eta.len(), 3);
+        let sum: f64 = eta.iter().sum();
+        assert_abs_diff_eq!(sum, 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_initial_aniso_contrasts_1d_returns_empty() {
+        // 1-D centers → empty vec (anisotropy meaningless).
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let eta = initial_aniso_contrasts(centers.view());
+        assert!(eta.is_empty());
+    }
+
+    #[test]
+    fn test_initial_aniso_contrasts_equal_scales() {
+        // All axes have same std dev → all η should be ~0.
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (4, 3),
+            vec![
+                1.0, 1.0, 1.0,
+                2.0, 2.0, 2.0,
+                3.0, 3.0, 3.0,
+                4.0, 4.0, 4.0,
+            ],
+        )
+        .unwrap();
+        let eta = initial_aniso_contrasts(centers.view());
+        assert_eq!(eta.len(), 3);
+        for &e in &eta {
+            assert_abs_diff_eq!(e, 0.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_initial_aniso_contrasts_unequal_scales() {
+        // Axis 0 has 10x the std dev of axis 1.
+        // η_a = −ln(σ_a) + mean(−ln(σ_b))
+        // Axis with larger σ → more negative −ln(σ) → η_a < 0
+        // Axis with smaller σ → more positive −ln(σ) → η_a > 0
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (4, 2),
+            vec![
+                10.0, 1.0,
+                20.0, 2.0,
+                30.0, 3.0,
+                40.0, 4.0,
+            ],
+        )
+        .unwrap();
+        let eta = initial_aniso_contrasts(centers.view());
+        assert_eq!(eta.len(), 2);
+        // Axis 0 has 10x spread → negative η (larger scale → smaller κ)
+        assert!(eta[0] < 0.0, "axis with larger spread should have negative η, got {}", eta[0]);
+        // Axis 1 has smaller spread → positive η
+        assert!(eta[1] > 0.0, "axis with smaller spread should have positive η, got {}", eta[1]);
+        // Sum should be zero
+        assert_abs_diff_eq!(eta[0] + eta[1], 0.0, epsilon = 1e-12);
+        // |η| should be ln(10) ≈ 2.3026
+        assert_abs_diff_eq!(eta[0].abs(), 10.0_f64.ln(), epsilon = 1e-12);
+    }
+
+    // ── maybe_initialize_aniso_contrasts tests ──────────────────────────
+
+    #[test]
+    fn test_maybe_initialize_replaces_zeros() {
+        // Input: Some(&[0.0, 0.0, 0.0]) → should be replaced with knot-derived values.
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (5, 3),
+            vec![
+                1.0, 10.0, 100.0,
+                2.0, 20.0, 200.0,
+                3.0, 30.0, 300.0,
+                4.0, 40.0, 400.0,
+                5.0, 50.0, 500.0,
+            ],
+        )
+        .unwrap();
+        let zeros = vec![0.0, 0.0, 0.0];
+        let result = maybe_initialize_aniso_contrasts(centers.view(), Some(&zeros));
+        let eta = result.expect("should return Some");
+        assert_eq!(eta.len(), 3);
+        // Should NOT be all zeros any more — should match initial_aniso_contrasts
+        let expected = initial_aniso_contrasts(centers.view());
+        for (a, b) in eta.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-14);
+        }
+    }
+
+    #[test]
+    fn test_maybe_initialize_preserves_nonzero() {
+        // Input: Some(&[0.1, -0.05, -0.05]) → should be returned unchanged.
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (4, 3),
+            vec![
+                1.0, 2.0, 3.0,
+                4.0, 5.0, 6.0,
+                7.0, 8.0, 9.0,
+                10.0, 11.0, 12.0,
+            ],
+        )
+        .unwrap();
+        let input = vec![0.1, -0.05, -0.05];
+        let result = maybe_initialize_aniso_contrasts(centers.view(), Some(&input));
+        let eta = result.expect("should return Some");
+        assert_eq!(eta, input);
+    }
+
+    #[test]
+    fn test_maybe_initialize_preserves_none() {
+        // Input: None → should remain None.
+        use ndarray::Array2;
+        let centers = Array2::from_shape_vec(
+            (4, 2),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        )
+        .unwrap();
+        let result = maybe_initialize_aniso_contrasts(centers.view(), None);
+        assert!(result.is_none());
     }
 }

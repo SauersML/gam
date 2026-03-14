@@ -5,6 +5,7 @@ use crate::basis::{
     MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     ThinPlateBasisSpec, apply_sum_to_zero_constraint, applyweighted_orthogonality_constraint,
     build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_derivative,
+    build_duchon_basis_log_kappa_aniso_derivatives,
     build_duchon_basis_log_kappasecond_derivative, build_duchon_collocation_operator_matrices,
     build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
     build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappasecond_derivative,
@@ -20,7 +21,7 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
-    FittedLinkParameters,
+    FittedLinkParameters, UnifiedFitResult,
     fit_gamwith_heuristic_lambdas, reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -4127,7 +4128,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     }
 
     let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
-        &baseline.fit.beta,
+        &baseline.fit.beta(),
         runtime_caches,
         adaptive_opts.min_epsilon,
     )?;
@@ -4241,7 +4242,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         offset: offset.to_owned(),
         penalties: retained_penalties.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
-        initial_beta: Some(baseline.fit.beta.clone()),
+        initial_beta: Some(baseline.fit.beta().clone()),
     };
     let outer_opts = BlockwiseFitOptions {
         inner_max_cycles: options.max_iter,
@@ -4452,7 +4453,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         offset: offset.to_owned(),
         penalties: vec![],
         initial_log_lambdas: Array1::zeros(0),
-        initial_beta: Some(baseline.fit.beta.clone()),
+        initial_beta: Some(baseline.fit.beta().clone()),
     };
     let final_fit = fit_custom_family(
         &final_family,
@@ -4610,29 +4611,40 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             .unwrap_or(FittedLinkParameters::Standard),
         _ => FittedLinkParameters::Standard,
     };
+    let beta_covariance_ref = beta_covariance.clone();
+    let geometry = Some(crate::estimate::FitGeometry {
+        penalized_hessian: penalized_hessian.clone(),
+        working_weights: final_eval.obs.fisherweight.clone(),
+        working_response: {
+            let mut out = final_eval.obs.eta.clone();
+            for i in 0..out.len() {
+                let wi = final_eval.obs.fisherweight[i].max(1e-12);
+                out[i] += final_eval.obs.score[i] / wi;
+            }
+            out
+        },
+    });
     let fitted = FittedTermCollection {
-        fit: FitResult {
-            beta,
+        fit: UnifiedFitResult {
+            blocks: vec![crate::estimate::FittedBlock {
+                beta: beta.clone(),
+                role: crate::estimate::BlockRole::Mean,
+                edf: edf_total,
+                lambdas: full_lambdas.clone(),
+            }],
+            log_lambdas: full_lambdas.mapv(|v| v.max(1e-300).ln()),
             lambdas: full_lambdas,
-            standard_deviation,
-            iterations: outer_iterations,
-            finalgrad_norm: outer_grad_norm,
-            pirls_status: if final_fit.converged {
-                crate::pirls::PirlsStatus::Converged
-            } else {
-                crate::pirls::PirlsStatus::MaxIterationsReached
-            },
+            log_likelihood: -0.5 * deviance,
             deviance,
+            reml_score: final_fit.penalized_objective,
             stable_penalty_term,
-            max_abs_eta: final_eval
-                .obs
-                .eta
-                .iter()
-                .copied()
-                .map(f64::abs)
-                .fold(0.0, f64::max),
-            constraint_kkt: None,
-            artifacts: crate::estimate::FitArtifacts { pirls: None },
+            penalized_objective: -0.5 * deviance + stable_penalty_term + final_fit.penalized_objective,
+            outer_iterations,
+            outer_converged: final_fit.outer_converged,
+            outer_gradient_norm: outer_grad_norm,
+            standard_deviation,
+            covariance_conditional: beta_covariance_ref,
+            covariance_corrected: None,
             inference: Some(FitInference {
                 edf_by_block,
                 edf_total,
@@ -4653,8 +4665,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
             }),
-            reml_score: final_fit.penalizedobjective,
-            fitted_link_parameters,
+            fitted_link: fitted_link_parameters,
+            geometry,
+            block_states: Vec::new(),
         },
         design: baseline.design,
         adaptive_diagnostics: Some(AdaptiveRegularizationDiagnostics {
@@ -4663,7 +4676,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             epsilon_c: eps_star[2],
             epsilon_outer_iterations: outer_iterations,
             mm_iterations: 0,
-            converged: final_fit.converged,
+            converged: final_fit.outer_converged,
             maps,
         }),
     };
@@ -6128,28 +6141,40 @@ fn fit_bounded_term_collection_forspec(
     } else {
         (vec![0.0; fit_penalties.len()], 0.0)
     };
+    let beta_cov_ref = beta_covariance.clone();
+    let geometry = Some(crate::estimate::FitGeometry {
+        penalized_hessian: penalized_hessian.clone(),
+        working_weights: eta_state.fisherweight.clone(),
+        working_response: {
+            let mut working_response = eta_state.eta.clone();
+            for i in 0..working_response.len() {
+                let wi = eta_state.fisherweight[i].max(1e-12);
+                working_response[i] += eta_state.score[i] / wi;
+            }
+            working_response
+        },
+    });
     Ok(FittedTermCollection {
-        fit: FitResult {
-            beta: beta_user,
+        fit: UnifiedFitResult {
+            blocks: vec![crate::estimate::FittedBlock {
+                beta: beta_user.clone(),
+                role: crate::estimate::BlockRole::Mean,
+                edf: edf_total,
+                lambdas: fit.lambdas.clone(),
+            }],
+            log_lambdas: fit.lambdas.mapv(|v| v.max(1e-300).ln()),
             lambdas: fit.lambdas,
-            standard_deviation: 1.0,
-            iterations: fit.outer_iterations,
-            finalgrad_norm: 0.0,
-            pirls_status: if fit.converged {
-                crate::pirls::PirlsStatus::Converged
-            } else {
-                crate::pirls::PirlsStatus::MaxIterationsReached
-            },
+            log_likelihood: -0.5 * deviance,
             deviance,
+            reml_score: fit.penalized_objective,
             stable_penalty_term: penalty_term,
-            max_abs_eta: eta_state
-                .eta
-                .iter()
-                .copied()
-                .map(f64::abs)
-                .fold(0.0, f64::max),
-            constraint_kkt: None,
-            artifacts: crate::estimate::FitArtifacts { pirls: None },
+            penalized_objective: -0.5 * deviance + penalty_term + fit.penalized_objective,
+            outer_iterations: fit.outer_iterations,
+            outer_converged: fit.outer_converged,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: beta_cov_ref,
+            covariance_corrected: None,
             inference: Some(FitInference {
                 edf_by_block,
                 edf_total,
@@ -6170,8 +6195,9 @@ fn fit_bounded_term_collection_forspec(
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
             }),
-            reml_score: fit.penalizedobjective,
-            fitted_link_parameters: crate::estimate::FittedLinkParameters::Standard,
+            fitted_link: crate::estimate::FittedLinkParameters::Standard,
+            geometry,
+            block_states: Vec::new(),
         },
         design,
         adaptive_diagnostics: None,
@@ -6190,7 +6216,7 @@ fn enforce_term_constraint_feasibility(
     let mut violations: Vec<String> = Vec::new();
     for term in &design.smooth.terms {
         let gr = (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
-        let beta_local = fit.beta.slice(s![gr.clone()]).to_owned();
+        let beta_local = fit.beta().slice(s![gr.clone()]).to_owned();
         if let Some(lb) = term.lower_bounds_local.as_ref() {
             let mut worst = 0.0_f64;
             let mut worst_idx = 0usize;
@@ -6759,6 +6785,14 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                 apply_input_standardization(&mut x, s);
             }
             build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_duchon_basis_log_kappa_aniso_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
         _ => return Ok(None),
@@ -9890,7 +9924,7 @@ mod tests {
             _ => panic!("expected Matérn term"),
         };
         assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
-        assert!(optimized.fit.beta.iter().all(|v| v.is_finite()));
+        assert!(optimized.fit.beta().iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -10205,7 +10239,7 @@ mod tests {
         .expect("bounded gaussian fit");
 
         let bounded_idx = fitted.design.linear_ranges[0].1.start;
-        let estimate = fitted.fit.beta[bounded_idx];
+        let estimate = fitted.fit.beta()[bounded_idx];
         assert!(
             (0.0..=0.5).contains(&estimate),
             "bounded coefficient escaped interval: {estimate}"
@@ -10701,7 +10735,7 @@ mod tests {
         assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
         assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
         assert_eq!(diag.maps.len(), 1);
-        assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
+        assert!(fit.fit.beta().iter().all(|v| v.is_finite()));
         assert!(fit.fit.reml_score.is_finite());
     }
 
@@ -10777,7 +10811,7 @@ mod tests {
         )
         .expect("exact adaptive SAS fit should succeed");
 
-        match fit.fit.fitted_link_parameters {
+        match fit.fit.fitted_link {
             FittedLinkParameters::Sas { state, covariance } => {
                 assert!(state.epsilon.is_finite());
                 assert!(state.log_delta.is_finite());
@@ -10850,7 +10884,7 @@ mod tests {
 
         let adaptive_opts = AdaptiveRegularizationOptions::default();
         let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
-            &baseline.fit.beta,
+            &baseline.fit.beta(),
             &runtime_caches,
             adaptive_opts.min_epsilon,
         )
@@ -10900,7 +10934,7 @@ mod tests {
             offset: Array1::zeros(n),
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(baseline.fit.beta.clone()),
+            initial_beta: Some(baseline.fit.beta().clone()),
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 30,
@@ -11026,7 +11060,7 @@ mod tests {
             .expect("runtime caches");
         assert_eq!(runtime_caches.len(), 1);
         let (eps_0, eps_g, eps_c) =
-            compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
+            compute_initial_epsilons(&baseline.fit.beta(), &runtime_caches, 1e-8)
                 .expect("initial epsilons");
         let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
         let derivative_blocks = vec![
@@ -11073,7 +11107,7 @@ mod tests {
             offset: Array1::zeros(n),
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(baseline.fit.beta.clone()),
+            initial_beta: Some(baseline.fit.beta().clone()),
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 20,
@@ -11191,7 +11225,7 @@ mod tests {
         )
         .expect("high-center adaptive Duchon fit should not fail");
 
-        assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
+        assert!(fit.fit.beta().iter().all(|v| v.is_finite()));
         assert!(fit.fit.deviance.is_finite());
         assert!(fit.fit.edf_total().is_some_and(f64::is_finite));
         let diag = fit
