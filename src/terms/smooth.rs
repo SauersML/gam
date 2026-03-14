@@ -425,7 +425,7 @@ impl SpatialLogKappaCoords {
     }
 
     /// Construct from an explicit dims layout plus values.
-    fn new_with_dims(values: Array1<f64>, dims_per_term: Vec<usize>) -> Self {
+    pub(crate) fn new_with_dims(values: Array1<f64>, dims_per_term: Vec<usize>) -> Self {
         debug_assert_eq!(
             values.len(),
             dims_per_term.iter().sum::<usize>(),
@@ -9401,7 +9401,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -9752,7 +9752,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -9860,7 +9860,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -10015,7 +10015,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         };
         let y = Array1::linspace(0.0, 1.0, data.nrows());
         let weights = Array1::ones(data.nrows());
@@ -10195,7 +10195,7 @@ mod tests {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 adaptive_regularization: None,
-            penalty_shrinkage_floor: None,
+                penalty_shrinkage_floor: None,
             },
             &SpatialLengthScaleOptimizationOptions {
                 enabled: false,
@@ -10687,7 +10687,7 @@ mod tests {
                     weight_floor: 1e-8,
                     weight_ceiling: 1e8,
                 }),
-            penalty_shrinkage_floor: None,
+                penalty_shrinkage_floor: None,
             },
         )
         .expect("exact adaptive spatial fit should succeed");
@@ -10772,7 +10772,7 @@ mod tests {
                     weight_floor: 1e-8,
                     weight_ceiling: 1e8,
                 }),
-            penalty_shrinkage_floor: None,
+                penalty_shrinkage_floor: None,
             },
         )
         .expect("exact adaptive SAS fit should succeed");
@@ -10840,7 +10840,7 @@ mod tests {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 adaptive_regularization: None,
-            penalty_shrinkage_floor: None,
+                penalty_shrinkage_floor: None,
             },
         )
         .expect("baseline fit");
@@ -11018,7 +11018,7 @@ mod tests {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 adaptive_regularization: None,
-            penalty_shrinkage_floor: None,
+                penalty_shrinkage_floor: None,
             },
         )
         .expect("baseline fit");
@@ -11186,7 +11186,7 @@ mod tests {
                     weight_floor: 1e-8,
                     weight_ceiling: 1e8,
                 }),
-            penalty_shrinkage_floor: None,
+                penalty_shrinkage_floor: None,
             },
         )
         .expect("high-center adaptive Duchon fit should not fail");

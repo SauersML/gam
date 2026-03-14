@@ -63,7 +63,7 @@ fn tracethird_auto_correction_againstfd() {
         nullspace_dims: vec![0, 0],
         linear_constraints: None,
         firth_bias_reduction: Some(false),
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = Array1::from_vec(vec![1.0, 1.5]);
 

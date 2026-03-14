@@ -440,7 +440,7 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
 
     // Standalone cost & FD
@@ -546,7 +546,7 @@ fn test_single_penalty_logit_gradient() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = array![2.0];
     let (analytic, fd) = evaluate_externalgradients(
@@ -596,7 +596,7 @@ fn test_two_overlapping_penalties_logit_gradient() {
         nullspace_dims: vec![1, 0],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = array![2.0, -1.0];
     let (analytic, fd) = evaluate_externalgradients(
@@ -649,7 +649,7 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
         nullspace_dims: vec![1, 0], // S1 has nullspace of 1 (intercept)
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = array![2.0, -1.0];
     let (analytic, fd) = evaluate_externalgradients(
@@ -717,7 +717,7 @@ fn test_gaussian_gradient_vs_fd() {
         nullspace_dims: vec![1, 0],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = array![1.5, 0.8];
     let (analytic, fd) = evaluate_externalgradients(
@@ -764,7 +764,7 @@ fn test_probit_single_penalty_gradient() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = array![2.0];
     let (analytic, fd) = evaluate_externalgradients(
@@ -812,7 +812,7 @@ fn test_probit_overlapping_penalties_gradient() {
         nullspace_dims: vec![1, 0],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
     let rho = array![2.0, -1.0];
     let (analytic, fd) = evaluate_externalgradients(

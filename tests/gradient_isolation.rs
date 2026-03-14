@@ -53,7 +53,7 @@ fn default_logit_opts() -> ExternalOptimOptions {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     }
 }
 
@@ -266,7 +266,7 @@ fn conditioned_helpercost_matches_fittedobjective() {
         nullspace_dims: vec![2],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
 
     let result = optimize_external_design(
