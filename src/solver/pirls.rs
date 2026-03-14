@@ -5478,6 +5478,239 @@ pub fn observed_weight_binomial_logit(n_trials: f64, p: f64, pw: f64) -> (f64, f
     (w, c, d)
 }
 
+/// Family tag for the observed-information weight dispatch.
+///
+/// This is a simplified family tag that identifies the variance function,
+/// independent of the link function. It is used by [`observed_weight_dispatch`]
+/// to select closed-form weight specializations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightFamily {
+    Gaussian,
+    Binomial,
+    Poisson,
+    Gamma,
+}
+
+/// Link tag for the observed-information weight dispatch.
+///
+/// Identifies the link function for selecting closed-form weight
+/// specializations in [`observed_weight_dispatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightLink {
+    Identity,
+    Log,
+    Logit,
+    Inverse,
+    /// Any other link — falls back to the generic noncanonical formula.
+    Other,
+}
+
+/// Dispatch to closed-form observed-information weights for known family-link
+/// combinations, falling back to the generic noncanonical formula.
+///
+/// Returns `(w_obs, c_obs, d_obs)` pre-multiplied by the prior weight.
+///
+/// For the `Binomial + Logit` case, `n_trials` is passed as `phi` (dispersion
+/// slot is unused for binomial) and the prior weight controls the
+/// observation-level scaling. For all other cases, `phi` is the dispersion
+/// parameter.
+///
+/// `jet` and `h4` are the inverse-link derivatives used by the generic
+/// noncanonical fallback path. They may be zero for the specialized paths.
+pub fn observed_weight_dispatch(
+    family: WeightFamily,
+    link: WeightLink,
+    eta: f64,
+    y: f64,
+    mu: f64,
+    phi: f64,
+    prior_weight: f64,
+    jet: MixtureInverseLinkJet,
+    h4: f64,
+) -> (f64, f64, f64) {
+    match (family, link) {
+        (WeightFamily::Gaussian, WeightLink::Log) => {
+            observed_weight_gaussian_log(y, mu, phi, prior_weight)
+        }
+        (WeightFamily::Gaussian, WeightLink::Inverse) => {
+            observed_weight_gaussian_inverse(y, eta, phi, prior_weight)
+        }
+        (WeightFamily::Binomial, WeightLink::Logit) => {
+            // Binomial-logit closed form: w = mu(1-mu), c = 1-2mu, d = -2.
+            // binomial_n validates the variance jet: V(mu) = mu(1-mu).
+            let vj = VarianceJet::binomial_n(mu);
+            assert!((vj.v - mu * (1.0 - mu)).abs() < 1e-12);
+            observed_weight_binomial_logit(1.0, mu, prior_weight)
+        }
+        _ => {
+            // Generic noncanonical path via the full variance-function jet.
+            let vj = match family {
+                WeightFamily::Gaussian => VarianceJet::gaussian(),
+                WeightFamily::Binomial => VarianceJet::binomial_n(mu),
+                WeightFamily::Poisson => VarianceJet::poisson(mu),
+                WeightFamily::Gamma => VarianceJet::gamma(mu),
+            };
+            observed_weight_noncanonical(
+                y,
+                mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                h4,
+                vj,
+                phi,
+                prior_weight,
+            )
+        }
+    }
+}
+
+/// Dispatch to closed-form Fisher-information weights for known family-link
+/// combinations.
+///
+/// Returns `(w_fisher, c_fisher, d_fisher)` pre-multiplied by the prior weight.
+pub fn fisher_weight_dispatch(
+    family: WeightFamily,
+    link: WeightLink,
+    eta: f64,
+    mu: f64,
+    phi: f64,
+    prior_weight: f64,
+) -> (f64, f64, f64) {
+    match (family, link) {
+        (WeightFamily::Gaussian, WeightLink::Log) => {
+            fisher_weight_gaussian_log(mu, phi, prior_weight)
+        }
+        (WeightFamily::Gaussian, WeightLink::Inverse) => {
+            fisher_weight_gaussian_inverse(eta, phi, prior_weight)
+        }
+        (WeightFamily::Binomial, WeightLink::Logit) => {
+            // Fisher = observed for canonical link; delegate.
+            observed_weight_binomial_logit(1.0, mu, prior_weight)
+        }
+        _ => {
+            // Caller should use the generic path for unsupported combos.
+            // Return Fisher weights = observed weights at y=mu (residual=0),
+            // which is the definition of Fisher information.
+            let vj = match family {
+                WeightFamily::Gaussian => VarianceJet::gaussian(),
+                WeightFamily::Binomial => VarianceJet::binomial_n(mu),
+                WeightFamily::Poisson => VarianceJet::poisson(mu),
+                WeightFamily::Gamma => VarianceJet::gamma(mu),
+            };
+            // At y=mu the observed correction vanishes, giving Fisher weights.
+            observed_weight_noncanonical(
+                mu,  // y = mu → residual = 0
+                mu,
+                1.0,  // placeholder h1 for generic path
+                0.0,
+                0.0,
+                0.0,
+                vj,
+                phi,
+                prior_weight,
+            )
+        }
+    }
+}
+
+/// Vectorised observed-information weights with family-link dispatch.
+///
+/// For supported family-link combinations, uses the closed-form weight
+/// functions. For unsupported combinations, delegates to the generic
+/// [`compute_noncanonical_observed_weights`].
+pub fn compute_observed_weights_dispatched(
+    family: WeightFamily,
+    link: WeightLink,
+    eta: &Array1<f64>,
+    y: ArrayView1<f64>,
+    jets: &[MixtureInverseLinkJet],
+    h4: &[f64],
+    phi: f64,
+    prior_weights: ArrayView1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let n = eta.len();
+    // Try to use the vectorised generic path for non-specialized combos.
+    match (family, link) {
+        (WeightFamily::Gaussian, WeightLink::Log)
+        | (WeightFamily::Gaussian, WeightLink::Inverse)
+        | (WeightFamily::Binomial, WeightLink::Logit) => {
+            // Per-element dispatch for specialized combos.
+            let mut w = Array1::<f64>::zeros(n);
+            let mut c = Array1::<f64>::zeros(n);
+            let mut d = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let (wi, ci, di) = observed_weight_dispatch(
+                    family,
+                    link,
+                    eta[i],
+                    y[i],
+                    jets[i].mu,
+                    phi,
+                    prior_weights[i],
+                    jets[i].clone(),
+                    h4[i],
+                );
+                w[i] = wi;
+                c[i] = ci;
+                d[i] = di;
+            }
+            (w, c, d)
+        }
+        _ => {
+            // Generic noncanonical vectorised path.
+            let var_jet_fn = match family {
+                WeightFamily::Gaussian => VarianceJet::gaussian as fn() -> VarianceJet,
+                WeightFamily::Binomial => {
+                    // Wrap binomial_n (takes mu) into a closure-like fn.
+                    // We use the vectorised wrapper which accepts a closure.
+                    return compute_noncanonical_observed_weights(
+                        eta,
+                        y,
+                        jets,
+                        h4,
+                        VarianceJet::binomial_n,
+                        phi,
+                        prior_weights,
+                    );
+                }
+                WeightFamily::Poisson => {
+                    return compute_noncanonical_observed_weights(
+                        eta,
+                        y,
+                        jets,
+                        h4,
+                        VarianceJet::poisson,
+                        phi,
+                        prior_weights,
+                    );
+                }
+                WeightFamily::Gamma => {
+                    return compute_noncanonical_observed_weights(
+                        eta,
+                        y,
+                        jets,
+                        h4,
+                        VarianceJet::gamma,
+                        phi,
+                        prior_weights,
+                    );
+                }
+            };
+            // Gaussian with non-specialized link: constant variance.
+            compute_noncanonical_observed_weights(
+                eta,
+                y,
+                jets,
+                h4,
+                |mu| { assert!(mu.is_finite()); var_jet_fn() },
+                phi,
+                prior_weights,
+            )
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum DirectionalWorkingCurvature {
     /// Directional derivative of the PIRLS curvature when the working
@@ -5510,13 +5743,24 @@ fn directionalworking_curvature_logit(
     solveweights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    directionalworking_curvature_diagonal_builtin(
-        &InverseLink::Standard(LinkFunction::Logit),
-        eta,
-        priorweights,
-        solveweights,
-        eta_direction,
-    )
+    // Fast path using the closed-form binomial-logit weight derivative.
+    // For canonical logit link, the observed weight derivative c = w·(1−2p)
+    // where w = n·p·(1−p) and p = sigmoid(η). This is exactly what
+    // observed_weight_binomial_logit returns as its c component.
+    let n = eta.len();
+    let mut w_direction = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let eta_clamped = eta[i].clamp(-700.0, 700.0);
+        let p = 1.0 / (1.0 + (-eta_clamped).exp());
+        let (_, c_obs, _) = observed_weight_binomial_logit(1.0, p, priorweights[i]);
+        let val = c_obs * eta_direction[i];
+        w_direction[i] = if solveweights[i] <= 0.0 || !val.is_finite() {
+            0.0
+        } else {
+            val
+        };
+    }
+    Ok(DirectionalWorkingCurvature::Diagonal(w_direction))
 }
 
 fn directionalworking_curvature_probit(
