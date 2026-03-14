@@ -4825,6 +4825,9 @@ pub fn fit_custom_family<F: CustomFamily>(
             // difference penalties), so EFS applies. Non-wiggle custom families
             // may have ψ (design-moving) coordinates — conservatively false.
             all_penalty_like: force_efs_for_wiggle,
+            // Custom families enforce constraints via active-set QP in the inner
+            // loop, not via log-barrier in the outer evaluator.
+            barrier_active: false,
         },
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = if has_exact_hess {

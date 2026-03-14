@@ -4559,6 +4559,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             hessian: Derivative::Analytic,
             n_params: n_theta,
             all_penalty_like: false,
+            barrier_active: false,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
@@ -8540,6 +8541,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             // ψ coordinates are NOT penalty-like (they move the design),
             // so EFS is not appropriate.
             all_penalty_like: false,
+            barrier_active: false,
         },
         cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);

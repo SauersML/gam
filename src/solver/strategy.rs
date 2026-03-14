@@ -41,6 +41,12 @@ pub struct OuterCapability {
     /// optimizer is eligible. When false (e.g. psi/design-moving coordinates),
     /// EFS cannot be used because the multiplicative update structure breaks down.
     pub all_penalty_like: bool,
+    /// Whether a log-barrier for structural monotonicity constraints is active.
+    /// When true, the barrier curvature τ/(β_j − l_j)² can dominate the Hessian
+    /// near active constraints, making the EFS fixed-point unreliable (it ignores
+    /// the barrier contribution to the Hessian derivative A_ρk). In this case,
+    /// EFS is skipped in favor of BFGS even when all coordinates are penalty-like.
+    pub barrier_active: bool,
 }
 
 /// Which solver algorithm to use for the outer optimization.
@@ -116,10 +122,17 @@ pub fn plan(cap: OuterCapability) -> OuterPlan {
         // EFS: all penalty-like coords, no analytic Hessian, many params.
         // Multiplicative fixed-point needs only traces — no gradient evals.
         // Much cheaper than BFGS for k=10-50 smoothing parameters.
-        (_, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
-            solver: S::Efs,
-            hessian_source: H::EfsFixedPoint,
-        },
+        //
+        // However, when a log-barrier is active (monotonicity constraints),
+        // EFS ignores the barrier Hessian drift A_θ^barrier = -2τ·D(β̂_θ/(β̂-l)³).
+        // Near active constraints this term can dominate, making EFS unreliable.
+        // Fall back to BFGS which uses the exact gradient.
+        (_, Unavailable) if cap.all_penalty_like && cap.n_params > 8 && !cap.barrier_active => {
+            OuterPlan {
+                solver: S::Efs,
+                hessian_source: H::EfsFixedPoint,
+            }
+        }
 
         // With many params, FD Hessian is too expensive; fall back to BFGS.
         (Analytic, Unavailable) => OuterPlan {
@@ -148,8 +161,13 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         }
         _ => String::new(),
     };
+    let barrier_note = if cap.barrier_active && cap.all_penalty_like && cap.n_params > 8 {
+        " [EFS skipped: log-barrier active from monotonicity constraints]"
+    } else {
+        ""
+    };
     log::info!(
-        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}",
+        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}{barrier_note}",
         cap.n_params,
         cap.gradient,
         cap.hessian,
@@ -846,6 +864,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 3,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -859,6 +878,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 3,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::NewtonTrustRegion);
@@ -872,6 +892,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 12,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -886,6 +907,7 @@ mod tests {
                 hessian: Derivative::Unavailable,
                 n_params: n,
                 all_penalty_like: false,
+                barrier_active: false,
             };
             let p = plan(cap);
             assert_eq!(p.solver, Solver::Bfgs);
@@ -900,6 +922,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 3,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -912,6 +935,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 8,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
@@ -924,6 +948,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 9,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
@@ -936,6 +961,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 15,
             all_penalty_like: true,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -949,6 +975,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 5,
             all_penalty_like: true,
+            barrier_active: false,
         };
         let p = plan(cap);
         // With few params and analytic gradient, FD Newton is better.
@@ -962,6 +989,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 20,
             all_penalty_like: true,
+            barrier_active: false,
         };
         let p = plan(cap);
         // Arc is always preferred when analytic Hessian is available.
@@ -977,10 +1005,43 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 20,
             all_penalty_like: true,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Efs);
         assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_efs_skipped_when_barrier_active() {
+        // When barrier is active (monotonicity constraints), EFS should be
+        // skipped in favor of BFGS even when all coords are penalty-like.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: true,
+            barrier_active: true,
+        };
+        let p = plan(cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn plan_efs_skipped_when_barrier_active_no_gradient() {
+        // Without analytic gradient but with barrier active, should still
+        // skip EFS and use BFGS (with FD gradient).
+        let cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params: 20,
+            all_penalty_like: true,
+            barrier_active: true,
+        };
+        let p = plan(cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1006,6 +1067,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 0,
             all_penalty_like: false,
+            barrier_active: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -1031,6 +1093,7 @@ mod tests {
                 hessian: Derivative::Unavailable,
                 n_params: 1,
                 all_penalty_like: false,
+                barrier_active: false,
             },
             cost_fn: |st: &mut i32, rho: &Array1<f64>| {
                 let _ = (*st, rho.len());

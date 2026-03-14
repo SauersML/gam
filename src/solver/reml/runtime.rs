@@ -460,6 +460,94 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Returns `true` when the current link is the canonical link for the
+    /// binomial family (i.e. the standard logit link without mixture or
+    /// SAS reparametrisation).  For canonical links the observed and Fisher
+    /// weight derivatives coincide, so no correction is needed.
+    fn is_binomial_canonical_link(&self) -> bool {
+        matches!(
+            self.runtime_inverse_link(),
+            InverseLink::Standard(LinkFunction::Logit)
+        )
+    }
+
+    /// Compute **observed-information** `c_obs` and `d_obs` arrays that
+    /// replace the Fisher `c_F` / `d_F` stored in `PirlsResult` for
+    /// non-canonical binomial links.
+    ///
+    /// For canonical links (logit) this returns the Fisher arrays unchanged
+    /// (bit-identical).
+    ///
+    /// The observed-information corrections account for the residual-
+    /// dependent term `B = (h''V − h'²V') / (φV²)`:
+    ///
+    /// ```text
+    /// c_obs = c_F + h'·B − (y−μ)·B_η
+    /// d_obs = d_F + h''·B + 2h'·B_η − (y−μ)·B_ηη
+    /// ```
+    ///
+    /// These are needed for exact ρ-direction Hessian drifts `dH/dρ_k` in
+    /// the outer REML/LAML evaluator when the link is non-canonical.
+    fn observed_cd_arrays(
+        &self,
+        pirls_result: &PirlsResult,
+    ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+        use crate::mixture_link::{
+            inverse_link_jet_for_link_function,
+            inverse_link_pdfthird_derivative_for_inverse_link,
+        };
+        use crate::pirls::{VarianceJet, observed_weight_noncanonical};
+
+        // For canonical binomial-logit, B = 0 so observed = Fisher.
+        if self.is_binomial_canonical_link() {
+            return Ok((
+                pirls_result.solve_c_array.clone(),
+                pirls_result.solve_d_array.clone(),
+            ));
+        }
+
+        let inv_link = self.runtime_inverse_link();
+        let n = pirls_result.final_eta.len();
+        let mut c_obs = Array1::<f64>::zeros(n);
+        let mut d_obs = Array1::<f64>::zeros(n);
+        let phi = 1.0_f64; // binomial dispersion
+
+        for i in 0..n {
+            let eta_i = pirls_result.final_eta[i];
+            let eta_clamped = match inv_link.link_function() {
+                LinkFunction::Logit => eta_i.clamp(-700.0, 700.0),
+                LinkFunction::Identity => eta_i,
+                _ => eta_i.clamp(-30.0, 30.0),
+            };
+
+            let jet = inverse_link_jet_for_link_function(
+                inv_link.link_function(),
+                eta_clamped,
+                inv_link.mixture_state(),
+                inv_link.sas_state(),
+            )?;
+
+            // h4 = h''''(η), the fourth inverse-link derivative.
+            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(
+                &inv_link,
+                eta_clamped,
+            )?;
+
+            let mu = jet.mu;
+            let vj = VarianceJet::bernoulli(mu);
+            let pw = self.weights[i].max(0.0);
+            let yi = self.y[i];
+
+            let (_w_obs, ci, di) = observed_weight_noncanonical(
+                yi, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, pw,
+            );
+            c_obs[i] = ci;
+            d_obs[i] = di;
+        }
+
+        Ok((c_obs, d_obs))
+    }
+
     /// Compute soft prior cost without needing workspace
     pub(super) fn compute_soft_priorcost(&self, rho: &Array1<f64>) -> f64 {
         let len = rho.len();
@@ -547,14 +635,16 @@ impl<'a> RemlState<'a> {
     ///   H_eff = X'WX + S_λ + ridge I,
     /// and adding another ridge here places the Laplace expansion on a different surface.
     ///
-    /// TODO(observed-hessian): W here is the Fisher (expected information)
+    /// NOTE(observed-hessian): W here is the Fisher (expected information)
     /// weight W_F = h'(η)²/V(μ). For non-canonical links (probit, cloglog,
     /// SAS, mixture), the Laplace approximation is more accurate when using
     /// the observed Hessian W_obs = W_F − (y−μ)·B at the converged β̂.
     /// For canonical links (logit for binomial, log for Poisson), W_obs = W_F
-    /// so the current code is exact. The link-parameter ext_coord derivatives
-    /// have already been corrected to use observed weights; this TODO covers
-    /// upgrading H itself and the ρ-direction c/d arrays.
+    /// so the current code is exact.
+    ///
+    /// The ρ-direction c/d arrays have been corrected to use observed
+    /// weight derivatives (via `observed_cd_arrays`). Upgrading H itself
+    /// to the observed Hessian remains a potential future improvement.
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
@@ -2053,8 +2143,9 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                // c/d arrays don't change with projection — they're observation-level.
-                let c_array = pirls_result.solve_c_array.clone();
+                // Use observed-information c/d for non-canonical links;
+                // for canonical logit this returns the Fisher arrays unchanged.
+                let (c_array, d_array) = self.observed_cd_arrays(pirls_result)?;
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
@@ -2064,7 +2155,7 @@ impl<'a> RemlState<'a> {
                 };
                 let base = SinglePredictorGlmDerivatives {
                     c_array,
-                    d_array: Some(pirls_result.solve_d_array.clone()),
+                    d_array: Some(d_array),
                     x_transformed,
                 };
                 if firth_active_for_derivs {
@@ -2315,6 +2406,8 @@ impl<'a> RemlState<'a> {
                     Box::new(GaussianDerivatives),
                 )
             } else {
+                // Use observed-information c/d for non-canonical links.
+                let (c_array, d_array) = self.observed_cd_arrays(pirls_result)?;
                 (
                     DispersionHandling::Fixed {
                         phi: 1.0,
@@ -2322,8 +2415,8 @@ impl<'a> RemlState<'a> {
                         include_logdet_s: true,
                     },
                     Box::new(SinglePredictorGlmDerivatives {
-                        c_array: pirls_result.solve_c_array.clone(),
-                        d_array: Some(pirls_result.solve_d_array.clone()),
+                        c_array,
+                        d_array: Some(d_array),
                         x_transformed: self.x().clone(),
                     }),
                 )
@@ -2745,7 +2838,8 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                let c_array = pirls_result.solve_c_array.clone();
+                // Use observed-information c/d for non-canonical links.
+                let (c_array, d_array) = self.observed_cd_arrays(pirls_result)?;
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     let x_dense = pirls_result.x_transformed.to_dense();
                     crate::linalg::matrix::DesignMatrix::Dense(x_dense.dot(z))
@@ -2754,7 +2848,7 @@ impl<'a> RemlState<'a> {
                 };
                 let base = SinglePredictorGlmDerivatives {
                     c_array,
-                    d_array: Some(pirls_result.solve_d_array.clone()),
+                    d_array: Some(d_array),
                     x_transformed,
                 };
                 if firth_active_for_derivs {
@@ -3107,7 +3201,8 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                let c_array = pirls_result.solve_c_array.clone();
+                // Use observed-information c/d for non-canonical links.
+                let (c_array, d_array) = self.observed_cd_arrays(pirls_result)?;
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     let x_dense = pirls_result.x_transformed.to_dense();
                     crate::linalg::matrix::DesignMatrix::Dense(x_dense.dot(z))
@@ -3116,7 +3211,7 @@ impl<'a> RemlState<'a> {
                 };
                 Box::new(SinglePredictorGlmDerivatives {
                     c_array,
-                    d_array: Some(pirls_result.solve_d_array.clone()),
+                    d_array: Some(d_array),
                     x_transformed,
                 })
             };

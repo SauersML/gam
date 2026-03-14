@@ -1585,6 +1585,7 @@ where
                 hessian: Derivative::Analytic,
                 n_params: k,
                 all_penalty_like: true,
+                barrier_active: fit_linear_constraints.is_some(),
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
@@ -1689,6 +1690,7 @@ where
                 n_params: theta_dim,
                 // Mixture/SAS coords are design-moving (not penalty-like).
                 all_penalty_like: false,
+                barrier_active: fit_linear_constraints.is_some(),
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let rho = theta.slice(s![..k]).to_owned();

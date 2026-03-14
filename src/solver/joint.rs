@@ -2622,6 +2622,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             // Joint models have both rho (penalty) and potentially psi (design-moving)
             // coordinates. Conservatively false.
             all_penalty_like: false,
+            barrier_active: false,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {

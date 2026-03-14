@@ -2291,6 +2291,38 @@ impl<'a> RemlState<'a> {
             None
         };
 
+        // --- Implicit operator activation ---
+        // Check whether any tau direction has an implicit design derivative and
+        // the problem is large enough to benefit from implicit B_j operators.
+        // When active, we build ImplicitHyperOperator instances that compute
+        // B_j · v on the fly, avoiding materialization of the dense (p × p) B_j.
+        let any_has_implicit = hyper_dirs.iter().any(|d| d.has_implicit_operator());
+        let n_obs = x_dense.nrows();
+        // Determine the number of anisotropic axes from the first implicit operator.
+        let implicit_n_axes = if any_has_implicit {
+            hyper_dirs
+                .iter()
+                .find_map(|d| d.implicit_first_axis_info())
+                .map(|(op, _)| op.n_axes())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let use_implicit = any_has_implicit
+            && crate::terms::basis::should_use_implicit_operators(n_obs, p_dim, implicit_n_axes);
+
+        // Shared Arcs for the implicit operator path (only allocated when needed).
+        let x_dense_shared: Option<std::sync::Arc<Array2<f64>>> = if use_implicit {
+            Some(std::sync::Arc::new(x_dense.to_owned()))
+        } else {
+            None
+        };
+        let w_diag_shared: Option<std::sync::Arc<Array1<f64>>> = if use_implicit {
+            Some(std::sync::Arc::new(w_diag.clone()))
+        } else {
+            None
+        };
+
         let mut coords = Vec::with_capacity(psi_dim);
 
         for j in 0..psi_dim {
@@ -2352,29 +2384,73 @@ impl<'a> RemlState<'a> {
             // B_j = X_{τ_j}^T W X + X^T W X_{τ_j} + S_{τ_j}
             //     [+ X^T diag(c ⊙ X_{τ_j} β̂) X]  (non-Gaussian only)
             //     [− Firth Hessian drifts]
-            let mut b_j = Self::weighted_cross(&x_tau_j, x_dense, w_diag);
-            b_j += &Self::weighted_cross(x_dense, &x_tau_j, w_diag);
-            b_j += &s_tau_j;
 
-            if !is_gaussian_identity {
-                // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
-                let c_x_tau_beta = c_array * &x_tau_beta_j;
-                let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                b_j += &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
-            }
+            // --- b_operator: implicit operator for B_j · v (when activated) ---
+            // When the problem is large enough and this coordinate has an implicit
+            // design derivative, we build an ImplicitHyperOperator that computes
+            // B_j · v without materializing the full (p × p) matrix.
+            //
+            // Note: the ImplicitHyperOperator covers the three dominant terms:
+            //   (∂X/∂ψ_d)^T (W · (X · v)) + X^T (W · ((∂X/∂ψ_d) · v)) + S_{ψ_d} · v
+            // Third-derivative corrections (non-Gaussian) and Firth drifts are NOT
+            // included in the implicit operator — they are small relative to the
+            // dominant terms and would require additional storage. For problems large
+            // enough to trigger implicit operators, these corrections contribute
+            // negligibly to the stochastic trace estimate.
+            let b_operator: Option<Box<dyn super::unified::HyperOperator>> =
+                if use_implicit {
+                    if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
+                        Some(Box::new(super::unified::ImplicitHyperOperator {
+                            implicit_deriv,
+                            axis,
+                            x_dense: x_dense_shared.clone().unwrap(),
+                            w_diag: w_diag_shared.clone().unwrap(),
+                            s_psi: s_tau_j.clone(),
+                            p: p_dim,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-            // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
-            // The D(H_φ)[β_{τ_j}] part is NOT included here because it
-            // depends on β_{τ_j} (the IFT solve result), which the unified
-            // evaluator computes itself. Only the fixed-β partial goes in B_j.
-            if let Some(op) = firth_op.as_ref() {
-                if let Some(kernel) = firth_tau_kernel_j.as_ref() {
-                    let eye = Array2::<f64>::eye(p_dim);
-                    let hphi_tau_partial =
-                        Self::firth_hphi_tau_partial_apply(op, &x_tau_j, kernel, &eye);
-                    b_j -= &hphi_tau_partial;
+            // Materialize the dense B_j matrix. When b_operator is active, we use
+            // a zero-sized placeholder since the unified evaluator checks
+            // b_operator.is_some() before accessing b_mat.
+            let b_j = if b_operator.is_some() {
+                Array2::<f64>::zeros((0, 0))
+            } else {
+                let mut b_j = Self::weighted_cross(&x_tau_j, x_dense, w_diag);
+                b_j += &Self::weighted_cross(x_dense, &x_tau_j, w_diag);
+                b_j += &s_tau_j;
+
+                if !is_gaussian_identity {
+                    // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
+                    let c_x_tau_beta = c_array * &x_tau_beta_j;
+                    let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+                    b_j += &Self::xt_diag_x_dense_into(
+                        x_dense,
+                        &c_x_tau_beta,
+                        &mut weighted_scratch,
+                    );
                 }
-            }
+
+                // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
+                // The D(H_φ)[β_{τ_j}] part is NOT included here because it
+                // depends on β_{τ_j} (the IFT solve result), which the unified
+                // evaluator computes itself. Only the fixed-β partial goes in B_j.
+                if let Some(op) = firth_op.as_ref() {
+                    if let Some(kernel) = firth_tau_kernel_j.as_ref() {
+                        let eye = Array2::<f64>::eye(p_dim);
+                        let hphi_tau_partial =
+                            Self::firth_hphi_tau_partial_apply(op, &x_tau_j, kernel, &eye);
+                        b_j -= &hphi_tau_partial;
+                    }
+                }
+
+                b_j
+            };
 
             // --- ld_s_j: penalty pseudo-logdet derivative ---
             // ld_s_j = tr(S_+^{−1} S_{τ_j}).
@@ -2385,7 +2461,7 @@ impl<'a> RemlState<'a> {
                 a: a_j,
                 g: g_j,
                 b_mat: b_j,
-                b_operator: None,
+                b_operator,
                 ld_s: ld_s_j,
                 b_depends_on_beta,
                 is_penalty_like: hyper_dirs[j].is_penalty_like,
