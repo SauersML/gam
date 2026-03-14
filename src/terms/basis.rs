@@ -1684,6 +1684,550 @@ pub struct AnisoBasisPsiDerivatives {
     /// The (a, b) axis pairs corresponding to each entry in penalties_cross.
     /// Only the upper triangle (a < b) is stored.
     pub penalties_cross_pairs: Vec<(usize, usize)>,
+    /// Optional implicit operator for memory-efficient matrix-vector products.
+    /// When present, the `design_first` / `design_second_diag` / `design_cross_t`
+    /// fields may be empty (zero-sized) and all design-derivative matvecs should
+    /// go through this operator instead.
+    pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Implicit derivative operator for scalable anisotropic REML gradients
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Memory threshold (in bytes) above which implicit operators are used
+/// instead of dense materialization of ∂X/∂ψ_d matrices.
+///
+/// For D axes with n data points and p_smooth basis columns, the dense path
+/// allocates D * n * p_smooth * 8 bytes for first-derivative matrices alone
+/// (plus a similar amount for second derivatives). The implicit path stores
+/// only the compact (n * n_knots) radial jets plus (n * n_knots * D) axis
+/// fractions, which is O(n * k * D) instead of O(n * p * D).
+const IMPLICIT_OPERATOR_MEMORY_THRESHOLD: usize = 1_000_000_000; // 1 GB
+
+/// Determine whether implicit operators should be used based on problem size.
+///
+/// Returns `true` when the dense materialization of D first-derivative
+/// matrices would exceed the memory threshold (default 1 GB).
+pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
+    // Each first-derivative matrix is (n x p) f64 → n*p*8 bytes.
+    // We need D of them for first derivatives, D for second diag, plus
+    // the cross-t matrix and s_components. Conservative estimate: 3*D matrices.
+    let dense_bytes = 3 * n * p * d * 8;
+    dense_bytes > IMPLICIT_OPERATOR_MEMORY_THRESHOLD
+}
+
+/// Implicit representation of ∂X/∂ψ_d that supports matrix-vector products
+/// without materializing the full (n × p) derivative matrices.
+///
+/// For anisotropic Matérn / Duchon terms with D axes, the dense path creates
+/// D matrices of size (n × p_smooth) for ∂X/∂ψ_d. At n=400K, p=2000, D=16,
+/// that is ~100 GB. This struct stores only the compact radial jet scalars:
+///
+/// - `q_values[i*n_knots + j]` = φ'(r_{ij}) / r_{ij}  (R-operator first scalar)
+/// - `t_values[i*n_knots + j]` = (φ''(r_{ij}) - q_{ij}) / r_{ij}²  (R-operator second scalar)
+/// - `axis_fractions[i*n_knots + j, d]` = exp(2η_d) · (x_{id} - c_{jd})² / r_{ij}²
+///
+/// Memory: O(n · k · (D + 2)) instead of O(n · p · D), where k = n_knots.
+///
+/// The per-axis chain rule (shared by both Matérn and Duchon):
+///   ∂φ/∂ψ_a         = q · s_a
+///   ∂²φ/(∂ψ_a²)     = 2q · s_a + t · s_a²
+///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b)
+#[derive(Debug, Clone)]
+pub struct ImplicitDesignPsiDerivative {
+    /// Per (data, knot) pair axis-fraction components.
+    /// Shape: (n * n_knots, D) stored in row-major order.
+    /// `axis_fractions[[i * n_knots + j, d]]` = s_{d,i,j} = exp(2η_d) · h_{d,ij}².
+    axis_fractions: Array2<f64>,
+
+    /// Per (data, knot) pair R-operator first scalar.
+    /// Shape: (n * n_knots,).
+    /// `q_values[i * n_knots + j]` = φ'(r_{ij}) / r_{ij}.
+    q_values: Array1<f64>,
+
+    /// Per (data, knot) pair R-operator second scalar.
+    /// Shape: (n * n_knots,).
+    /// `t_values[i * n_knots + j]` = (φ''(r_{ij}) - q_{ij}) / r_{ij}².
+    t_values: Array1<f64>,
+
+    /// Identifiability/constraint transform Z: (n_knots × p_constrained).
+    /// Converts raw knot-space vectors to the identifiability-constrained
+    /// basis. For Duchon this is the kernel-constraint nullspace Z_kernel;
+    /// for Matérn with identifiability constraints, it is the corresponding Z.
+    /// `None` means the identity (no constraint).
+    ident_transform: Option<Array2<f64>>,
+
+    /// Optional full identifiability transform applied after Z_kernel + padding.
+    /// For Duchon terms that have an additional global identifiability transform,
+    /// this is applied after the kernel constraint and polynomial padding.
+    /// Shape: (p_constrained + n_poly, p_final).
+    full_ident_transform: Option<Array2<f64>>,
+
+    /// Number of data points.
+    n: usize,
+
+    /// Number of knots (raw basis functions before identifiability transform).
+    n_knots: usize,
+
+    /// Number of polynomial columns appended after the smooth part.
+    /// These have zero derivative with respect to ψ_d.
+    n_poly: usize,
+
+    /// Number of axes (dimension D).
+    n_axes: usize,
+}
+
+/// The rayon chunk size for parallel implicit matvec operations.
+/// Each chunk processes this many data points before reducing.
+const IMPLICIT_MATVEC_CHUNK_SIZE: usize = 1000;
+
+/// Minimum data size to activate parallel iteration for implicit matvecs.
+const IMPLICIT_MATVEC_PAR_THRESHOLD: usize = 10_000;
+
+impl ImplicitDesignPsiDerivative {
+    /// Construct from pre-computed radial jet scalars.
+    ///
+    /// # Arguments
+    /// - `q_values`: (n * n_knots,) — φ'(r)/r for each (data, knot) pair.
+    /// - `t_values`: (n * n_knots,) — (φ''(r) - q) / r² for each pair.
+    /// - `axis_fractions`: (n * n_knots, D) — s_{d,ij} = exp(2η_d) · h_d² for each pair/axis.
+    /// - `ident_transform`: optional (n_knots × p_constrained) constraint projection.
+    /// - `full_ident_transform`: optional further projection after padding.
+    /// - `n`, `n_knots`, `n_poly`, `n_axes`: dimensions.
+    pub fn new(
+        q_values: Array1<f64>,
+        t_values: Array1<f64>,
+        axis_fractions: Array2<f64>,
+        ident_transform: Option<Array2<f64>>,
+        full_ident_transform: Option<Array2<f64>>,
+        n: usize,
+        n_knots: usize,
+        n_poly: usize,
+        n_axes: usize,
+    ) -> Self {
+        debug_assert_eq!(q_values.len(), n * n_knots);
+        debug_assert_eq!(t_values.len(), n * n_knots);
+        debug_assert_eq!(axis_fractions.nrows(), n * n_knots);
+        debug_assert_eq!(axis_fractions.ncols(), n_axes);
+        Self {
+            axis_fractions,
+            q_values,
+            t_values,
+            ident_transform,
+            full_ident_transform,
+            n,
+            n_knots,
+            n_poly,
+            n_axes,
+        }
+    }
+
+    /// Number of axes (D).
+    pub fn n_axes(&self) -> usize {
+        self.n_axes
+    }
+
+    /// Number of data points.
+    pub fn n_data(&self) -> usize {
+        self.n
+    }
+
+    /// Output dimension: total basis columns in the final space.
+    pub fn p_out(&self) -> usize {
+        if let Some(ref zf) = self.full_ident_transform {
+            zf.ncols()
+        } else {
+            self.p_after_pad()
+        }
+    }
+
+    /// Dimension after kernel constraint + polynomial padding (before full ident).
+    fn p_after_pad(&self) -> usize {
+        let p_constrained = self.p_constrained();
+        p_constrained + self.n_poly
+    }
+
+    /// Dimension after kernel constraint projection (before poly padding).
+    fn p_constrained(&self) -> usize {
+        match &self.ident_transform {
+            Some(z) => z.ncols(),
+            None => self.n_knots,
+        }
+    }
+
+    /// Accumulate raw knot-space vector from weighted (data, knot) contributions.
+    /// Returns a vector of length n_knots: Σ_i w_i · scalar_{ij} for each knot j.
+    ///
+    /// This is the core primitive: for each data point i, accumulate
+    /// `v[i] * per_pair_scalar(i,j)` into knot j.
+    fn accumulate_knot_vector<F>(&self, v: &ArrayView1<f64>, per_pair: F) -> Array1<f64>
+    where
+        F: Fn(usize) -> f64 + Send + Sync,
+    {
+        let n = self.n;
+        let k = self.n_knots;
+
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            // Parallel path: chunk data points and reduce.
+            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let partial_sums: Vec<Array1<f64>> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                    let mut local = Array1::<f64>::zeros(k);
+                    for i in start..end {
+                        let vi = v[i];
+                        if vi == 0.0 {
+                            continue;
+                        }
+                        let base = i * k;
+                        for j in 0..k {
+                            local[j] += vi * per_pair(base + j);
+                        }
+                    }
+                    local
+                })
+                .collect();
+            let mut total = Array1::<f64>::zeros(k);
+            for p in partial_sums {
+                total += &p;
+            }
+            total
+        } else {
+            // Sequential path.
+            let mut total = Array1::<f64>::zeros(k);
+            for i in 0..n {
+                let vi = v[i];
+                if vi == 0.0 {
+                    continue;
+                }
+                let base = i * k;
+                for j in 0..k {
+                    total[j] += vi * per_pair(base + j);
+                }
+            }
+            total
+        }
+    }
+
+    /// Project a raw knot-space vector through the identifiability transform
+    /// and pad with zeros for polynomial columns.
+    fn project_and_pad(&self, raw_knot_vec: &Array1<f64>) -> Array1<f64> {
+        // Step 1: apply kernel constraint Z (if present).
+        let constrained = match &self.ident_transform {
+            Some(z) => z.t().dot(raw_knot_vec),
+            None => raw_knot_vec.clone(),
+        };
+
+        // Step 2: pad with polynomial zeros.
+        let p_padded = constrained.len() + self.n_poly;
+        let mut padded = Array1::<f64>::zeros(p_padded);
+        padded.slice_mut(s![..constrained.len()]).assign(&constrained);
+
+        // Step 3: apply full identifiability transform (if present).
+        match &self.full_ident_transform {
+            Some(zf) => zf.t().dot(&padded),
+            None => padded,
+        }
+    }
+
+    /// Expand a coefficient vector from the final space back to raw knot space.
+    /// This is the transpose path: p_out → (padded) → (constrained) → n_knots.
+    fn unproject(&self, u: &ArrayView1<f64>) -> Array1<f64> {
+        // Step 1: undo full identifiability transform.
+        let after_full = match &self.full_ident_transform {
+            Some(zf) => zf.dot(u),
+            None => u.to_owned(),
+        };
+
+        // Step 2: extract smooth part (drop polynomial padding).
+        let p_constrained = self.p_constrained();
+        let smooth_part = after_full.slice(s![..p_constrained]);
+
+        // Step 3: undo kernel constraint Z.
+        match &self.ident_transform {
+            Some(z) => z.dot(&smooth_part),
+            None => smooth_part.to_owned(),
+        }
+    }
+
+    /// Compute (∂X/∂ψ_d)^T v for a given axis d and vector v of length n.
+    ///
+    /// Returns a vector of length p_out (total basis dimension after all transforms).
+    ///
+    /// Formula in raw knot space:
+    ///   [raw]_j = Σ_i v_i · q_{ij} · s_{d,ij}
+    /// then project through Z and pad.
+    pub fn transpose_mul(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
+        debug_assert!(axis < self.n_axes);
+        debug_assert_eq!(v.len(), self.n);
+
+        let af = &self.axis_fractions;
+        let qv = &self.q_values;
+
+        let raw = self.accumulate_knot_vector(v, |idx| {
+            qv[idx] * af[[idx, axis]]
+        });
+
+        self.project_and_pad(&raw)
+    }
+
+    /// Compute (∂X/∂ψ_d) u for a given axis d and vector u of length p_out.
+    ///
+    /// Returns a vector of length n.
+    ///
+    /// Formula: for each data point i,
+    ///   result_i = Σ_j q_{ij} · s_{d,ij} · u_knot_j
+    /// where u_knot = Z · u_smooth (unprojected back to knot space).
+    pub fn forward_mul(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
+        debug_assert!(axis < self.n_axes);
+        debug_assert_eq!(u.len(), self.p_out());
+
+        let u_knot = self.unproject(u);
+        let n = self.n;
+        let k = self.n_knots;
+        let af = &self.axis_fractions;
+        let qv = &self.q_values;
+
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let mut result = Array1::<f64>::zeros(n);
+            // Parallel over chunks of data points.
+            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                    let mut local = vec![0.0; end - start];
+                    for i in start..end {
+                        let base = i * k;
+                        let mut val = 0.0;
+                        for j in 0..k {
+                            val += qv[base + j] * af[[base + j, axis]] * u_knot[j];
+                        }
+                        local[i - start] = val;
+                    }
+                    (start, local)
+                })
+                .collect();
+            for (start, vals) in chunk_results {
+                for (offset, &v) in vals.iter().enumerate() {
+                    result[start + offset] = v;
+                }
+            }
+            result
+        } else {
+            let mut result = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let base = i * k;
+                let mut val = 0.0;
+                for j in 0..k {
+                    val += qv[base + j] * af[[base + j, axis]] * u_knot[j];
+                }
+                result[i] = val;
+            }
+            result
+        }
+    }
+
+    /// Compute (∂²X/∂ψ_d²)^T v — diagonal second derivative, same axis.
+    ///
+    /// Formula in raw knot space:
+    ///   [raw]_j = Σ_i v_i · [2 · q_{ij} · s_{d,ij} + t_{ij} · s_{d,ij}²]
+    pub fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
+        debug_assert!(axis < self.n_axes);
+        debug_assert_eq!(v.len(), self.n);
+
+        let af = &self.axis_fractions;
+        let qv = &self.q_values;
+        let tv = &self.t_values;
+
+        let raw = self.accumulate_knot_vector(v, |idx| {
+            let s = af[[idx, axis]];
+            2.0 * qv[idx] * s + tv[idx] * s * s
+        });
+
+        self.project_and_pad(&raw)
+    }
+
+    /// Compute (∂²X/∂ψ_d∂ψ_e)^T v — cross second derivative (d ≠ e).
+    ///
+    /// Formula in raw knot space:
+    ///   [raw]_j = Σ_i v_i · t_{ij} · s_{d,ij} · s_{e,ij}
+    pub fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<f64>,
+    ) -> Array1<f64> {
+        debug_assert!(axis_d < self.n_axes);
+        debug_assert!(axis_e < self.n_axes);
+        debug_assert_ne!(axis_d, axis_e);
+        debug_assert_eq!(v.len(), self.n);
+
+        let af = &self.axis_fractions;
+        let tv = &self.t_values;
+
+        let raw = self.accumulate_knot_vector(v, |idx| {
+            tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]
+        });
+
+        self.project_and_pad(&raw)
+    }
+
+    /// Compute the forward product (∂²X/∂ψ_d²) u — diagonal second derivative.
+    ///
+    /// Returns a vector of length n.
+    pub fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
+        debug_assert!(axis < self.n_axes);
+        debug_assert_eq!(u.len(), self.p_out());
+
+        let u_knot = self.unproject(u);
+        let n = self.n;
+        let k = self.n_knots;
+        let af = &self.axis_fractions;
+        let qv = &self.q_values;
+        let tv = &self.t_values;
+
+        let compute_row = |i: usize| -> f64 {
+            let base = i * k;
+            let mut val = 0.0;
+            for j in 0..k {
+                let s = af[[base + j, axis]];
+                val += (2.0 * qv[base + j] * s + tv[base + j] * s * s) * u_knot[j];
+            }
+            val
+        };
+
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let mut result = Array1::<f64>::zeros(n);
+            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                    let local: Vec<f64> = (start..end).map(compute_row).collect();
+                    (start, local)
+                })
+                .collect();
+            for (start, vals) in chunk_results {
+                for (offset, &v) in vals.iter().enumerate() {
+                    result[start + offset] = v;
+                }
+            }
+            result
+        } else {
+            Array1::from_vec((0..n).map(compute_row).collect())
+        }
+    }
+
+    /// Compute the forward product (∂²X/∂ψ_d∂ψ_e) u — cross second derivative.
+    ///
+    /// Returns a vector of length n.
+    pub fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<f64>,
+    ) -> Array1<f64> {
+        debug_assert!(axis_d < self.n_axes);
+        debug_assert!(axis_e < self.n_axes);
+        debug_assert_ne!(axis_d, axis_e);
+        debug_assert_eq!(u.len(), self.p_out());
+
+        let u_knot = self.unproject(u);
+        let n = self.n;
+        let k = self.n_knots;
+        let af = &self.axis_fractions;
+        let tv = &self.t_values;
+
+        let compute_row = |i: usize| -> f64 {
+            let base = i * k;
+            let mut val = 0.0;
+            for j in 0..k {
+                val += tv[base + j] * af[[base + j, axis_d]] * af[[base + j, axis_e]] * u_knot[j];
+            }
+            val
+        };
+
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let mut result = Array1::<f64>::zeros(n);
+            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                    let local: Vec<f64> = (start..end).map(compute_row).collect();
+                    (start, local)
+                })
+                .collect();
+            for (start, vals) in chunk_results {
+                for (offset, &v) in vals.iter().enumerate() {
+                    result[start + offset] = v;
+                }
+            }
+            result
+        } else {
+            Array1::from_vec((0..n).map(compute_row).collect())
+        }
+    }
+
+    /// Materialize the full (n × p_out) first-derivative matrix for axis d.
+    ///
+    /// This is the dense fallback for debugging or small-problem compatibility.
+    /// Avoid calling this for large problems — it defeats the purpose of implicit operators.
+    pub fn materialize_first(&self, axis: usize) -> Array2<f64> {
+        debug_assert!(axis < self.n_axes);
+        let n = self.n;
+        let p = self.p_out();
+        let mut out = Array2::<f64>::zeros((n, p));
+        let mut ei = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            ei[i] = 1.0;
+            let col = self.transpose_mul(axis, &ei.view());
+            out.row_mut(i).assign(&col);
+            ei[i] = 0.0;
+        }
+        out
+    }
+
+    /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
+    pub fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
+        debug_assert!(axis < self.n_axes);
+        let n = self.n;
+        let p = self.p_out();
+        let mut out = Array2::<f64>::zeros((n, p));
+        let mut ei = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            ei[i] = 1.0;
+            let col = self.transpose_mul_second_diag(axis, &ei.view());
+            out.row_mut(i).assign(&col);
+            ei[i] = 0.0;
+        }
+        out
+    }
+
+    /// Materialize the full (n × p_out) cross second derivative matrix for axes (d, e).
+    pub fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
+        debug_assert!(axis_d < self.n_axes);
+        debug_assert!(axis_e < self.n_axes);
+        debug_assert_ne!(axis_d, axis_e);
+        let n = self.n;
+        let p = self.p_out();
+        let mut out = Array2::<f64>::zeros((n, p));
+        let mut ei = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            ei[i] = 1.0;
+            let col = self.transpose_mul_second_cross(axis_d, axis_e, &ei.view());
+            out.row_mut(i).assign(&col);
+            ei[i] = 0.0;
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6879,6 +7423,7 @@ fn build_matern_design_psi_aniso_derivatives(
         penalties_second_diag,
         penalties_cross: Vec::new(),
         penalties_cross_pairs: Vec::new(),
+        implicit_operator: None,
     })
 }
 
@@ -14593,7 +15138,7 @@ mod tests {
         let expected_2 = var2.sqrt();
         // Re-derive: mean=0.2, deviations: -0.2,-0.2,-0.2,-0.2,0.8
         // sum of sq = 4*0.04 + 0.64 = 0.8, var = 0.8/4 = 0.2, std = sqrt(0.2)
-        assert_abs_diff_eq!(scales[2], (0.2_f64).sqrt(), epsilon = 1e-10);
+        assert_abs_diff_eq!(scales[2], expected_2, epsilon = 1e-10);
     }
 
     #[test]

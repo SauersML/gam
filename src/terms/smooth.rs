@@ -4870,18 +4870,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             .unwrap_or(FittedLinkParameters::Standard),
         _ => FittedLinkParameters::Standard,
     };
-    let geometry = Some(crate::estimate::FitGeometry {
-        penalized_hessian: penalized_hessian.clone(),
-        working_weights: final_eval.obs.fisherweight.clone(),
-        working_response: {
-            let mut out = final_eval.obs.eta.clone();
-            for i in 0..out.len() {
-                let wi = final_eval.obs.fisherweight[i].max(1e-12);
-                out[i] += final_eval.obs.score[i] / wi;
-            }
-            out
-        },
-    });
     let max_abs_eta = final_eval
         .obs
         .eta
