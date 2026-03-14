@@ -1640,6 +1640,20 @@ impl<'a> RemlState<'a> {
                 "[joint-hyper] built {} tau coords from unified objects",
                 ext_coords.len()
             );
+            // Cross-validate via the unified evaluator when trace logging is active.
+            if log::log_enabled!(log::Level::Trace) {
+                if let Ok(unified_result) = self.evaluate_unified_with_psi_ext(
+                    &rho,
+                    super::unified::EvalMode::CostGradient,
+                    hyper_dirs,
+                ) {
+                    log::trace!(
+                        "[joint-hyper] unified psi-ext cost={:.6e}, grad_norm={:.4e}",
+                        unified_result.cost,
+                        unified_result.gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
+                    );
+                }
+            }
         }
         let (cost, grad) = self.compute_joint_hypercostgradient(theta, rho_dim, hyper_dirs)?;
         let hess = self.compute_joint_hyperhessian(theta, rho_dim, hyper_dirs)?;

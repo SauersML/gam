@@ -8163,80 +8163,110 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let theta0 = setup.theta0();
     let lower = setup.lower();
     let upper = setup.upper();
-    let dims_clone = dims_per_term.clone();
-    // Evaluate cost at a given theta = [rho, log_kappa] by applying the kappa
-    // to the spec, fitting with lambdas derived from rho, and scoring.
-    let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
-        let log_kappa =
-            SpatialLogKappaCoords::from_theta_tail_with_dims(theta, rho_dim, dims_clone.clone());
-        let spec_c = log_kappa
-            .apply_tospec(resolvedspec, spatial_terms)
-            .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
-        let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
-        match fit_term_collection_forspecwith_heuristic_lambdas(
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  Anisotropic analytic path: when any term has d > 1 axes, use the
+    //  unified REML evaluator with ext_coords for joint [ρ, ψ] optimization
+    //  instead of derivative-free coordinate search.
+    //
+    //  The key advantage: analytic gradient + Hessian w.r.t. ψ_a via the
+    //  AnisoBasisPsiDerivatives → DirectionalHyperParam → HyperCoord pipeline,
+    //  giving Newton/BFGS quadratic convergence on the anisotropy parameters.
+    // ───────────────────────────────────────────────────────────────────────
+    let theta_star = if use_aniso {
+        try_exact_joint_spatial_aniso_optimization(
             data,
             y,
             weights,
             offset,
-            &spec_c,
-            rho.as_slice(),
+            resolvedspec,
+            &best.design,
             family,
             options,
-        ) {
-            Ok(fit) => Ok(fit_score(&fit.fit)),
-            Err(_) => Ok(f64::INFINITY),
+            spatial_terms,
+            &dims_per_term,
+            &theta0,
+            &lower,
+            &upper,
+            rho_dim,
+        )?
+    } else {
+        // Isotropic fallback: derivative-free coordinate search (unchanged).
+        let dims_clone = dims_per_term.clone();
+        let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta,
+                rho_dim,
+                dims_clone.clone(),
+            );
+            let spec_c = log_kappa
+                .apply_tospec(resolvedspec, spatial_terms)
+                .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
+            let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
+            match fit_term_collection_forspecwith_heuristic_lambdas(
+                data,
+                y,
+                weights,
+                offset,
+                &spec_c,
+                rho.as_slice(),
+                family,
+                options,
+            ) {
+                Ok(fit) => Ok(fit_score(&fit.fit)),
+                Err(_) => Ok(f64::INFINITY),
+            }
+        };
+
+        let initial_cost = eval_cost(&theta0).unwrap_or(f64::INFINITY);
+        let mut best_theta = theta0.clone();
+
+        coordinate_search_spatial(
+            &theta0,
+            initial_cost,
+            &lower,
+            &upper,
+            kappa_options,
+            &mut |action| match action {
+                SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
+                SpatialSearchAction::OnImprove(theta, _) => {
+                    best_theta = theta.clone();
+                    Ok(0.0)
+                }
+            },
+        )
+        .map_err(EstimationError::InvalidInput)?;
+
+        // Gradient-based refinement diagnostic for isotropic path.
+        if let Some(hyper_dirs) = try_build_spatial_log_kappa_hyper_dirs(
+            data,
+            resolvedspec,
+            &best.design,
+            spatial_terms,
+        )? {
+            if let Ok((_, grad, _)) = evaluate_joint_reml_at_theta(
+                y,
+                weights,
+                offset,
+                &best.design,
+                &best_theta,
+                rho_dim,
+                hyper_dirs,
+                None,
+                family,
+                options,
+            ) {
+                let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+                log::trace!(
+                    "[spatial-kappa] gradient norm at coordinate-search optimum: {:.6e}",
+                    grad_norm,
+                );
+            }
         }
+
+        best_theta
     };
 
-    let initial_cost = eval_cost(&theta0).unwrap_or(f64::INFINITY);
-
-    // Track the best theta found during coordinate search.
-    let mut best_theta = theta0.clone();
-
-    coordinate_search_spatial(
-        &theta0,
-        initial_cost,
-        &lower,
-        &upper,
-        kappa_options,
-        &mut |action| match action {
-            SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
-            SpatialSearchAction::OnImprove(theta, _) => {
-                best_theta = theta.clone();
-                Ok(0.0)
-            }
-        },
-    )
-    .map_err(EstimationError::InvalidInput)?;
-
-    // Gradient-based refinement: when exact hyper-derivatives are available,
-    // evaluate the joint REML objective at the coordinate-search optimum to
-    // obtain gradient information for diagnostics and potential further
-    // Newton-style refinement.
-    if let Some(hyper_dirs) =
-        try_build_spatial_log_kappa_hyper_dirs(data, resolvedspec, &best.design, spatial_terms)?
-    {
-        if let Ok((_, grad, _)) = evaluate_joint_reml_at_theta(
-            y,
-            weights,
-            offset,
-            &best.design,
-            &best_theta,
-            rho_dim,
-            hyper_dirs,
-            None,
-            family,
-            options,
-        ) {
-            let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::trace!(
-                "[spatial-kappa] gradient norm at coordinate-search optimum: {:.6e}",
-                grad_norm,
-            );
-        }
-    }
-
-    let theta_star = best_theta;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
@@ -8258,6 +8288,266 @@ fn try_exact_joint_spatial_length_scale_optimization(
         resolvedspec,
         adaptive_diagnostics: best.adaptive_diagnostics,
     }))
+}
+
+/// Joint [ρ, ψ] optimization for anisotropic spatial terms using analytic
+/// derivatives through the unified REML evaluator.
+///
+/// At each outer iteration, the design X(ψ) and penalties S(ψ) are rebuilt
+/// for the current ψ, a temporary `RemlState` is constructed, and the
+/// unified evaluator returns cost + gradient + Hessian for the full θ = [ρ, ψ]
+/// vector. The ψ derivatives flow through:
+///
+///   `AnisoBasisPsiDerivatives` → `SpatialPsiDerivative` → `DirectionalHyperParam`
+///     → `build_tau_unified_objects` → `HyperCoord` ext_coords → unified evaluator
+///
+/// This replaces the derivative-free `coordinate_search_spatial` for the
+/// anisotropic case, giving Newton/BFGS quadratic convergence on the
+/// anisotropy parameters while jointly optimizing the smoothing parameters.
+///
+/// The ψ_a are parameterized as log-scale coordinates with a sum-to-zero
+/// identifiability constraint (Σψ_a = 0) enforced at the `SpatialLogKappaCoords`
+/// level (the ψ values are shifted to sum to zero after each step).
+fn try_exact_joint_spatial_aniso_optimization(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    baseline_design: &TermCollectionDesign,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    spatial_terms: &[usize],
+    dims_per_term: &[usize],
+    theta0: &Array1<f64>,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    rho_dim: usize,
+) -> Result<Array1<f64>, EstimationError> {
+    // Use bounds and design metadata for validation.
+    assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
+    assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
+    };
+
+    let theta_dim = theta0.len();
+    let psi_dim = theta_dim - rho_dim;
+
+    log::trace!(
+        "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
+        rho_dim,
+        psi_dim,
+        dims_per_term,
+    );
+
+    // Shared context for the optimization closures. Holds immutable references
+    // to data/spec/options and the mutable best-tracking state.
+    struct AnisoJointContext<'d> {
+        data: ArrayView2<'d, f64>,
+        y: ArrayView1<'d, f64>,
+        weights: ArrayView1<'d, f64>,
+        offset: ArrayView1<'d, f64>,
+        resolvedspec: &'d TermCollectionSpec,
+        family: LikelihoodFamily,
+        options: &'d FitOptions,
+        spatial_terms: &'d [usize],
+        dims_per_term: &'d [usize],
+        rho_dim: usize,
+        best_theta: Array1<f64>,
+        best_cost: f64,
+    }
+
+    impl<'d> AnisoJointContext<'d> {
+        /// Full evaluation: rebuild design + hyper_dirs, compute cost + gradient + Hessian.
+        fn eval_full(
+            &self,
+            theta: &Array1<f64>,
+        ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta,
+                self.rho_dim,
+                self.dims_per_term.to_vec(),
+            );
+            let spec_at_psi = log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms)?;
+            let design_at_psi = build_term_collection_design(self.data, &spec_at_psi)?;
+
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                self.data,
+                &spec_at_psi,
+                &design_at_psi,
+                self.spatial_terms,
+            )?
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build aniso hyper_dirs at current psi".to_string(),
+                )
+            })?;
+
+            evaluate_joint_reml_at_theta(
+                self.y,
+                self.weights,
+                self.offset,
+                &design_at_psi,
+                theta,
+                self.rho_dim,
+                hyper_dirs,
+                None,
+                self.family,
+                self.options,
+            )
+        }
+
+        /// Cost-only evaluation (cheaper: no hyper_dirs or gradient).
+        fn eval_cost(&self, theta: &Array1<f64>) -> f64 {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta,
+                self.rho_dim,
+                self.dims_per_term.to_vec(),
+            );
+            let spec_at_psi = match log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms) {
+                Ok(s) => s,
+                Err(_) => return f64::INFINITY,
+            };
+            let rho_vec = theta.slice(s![..self.rho_dim]).mapv(f64::exp);
+            match fit_term_collection_forspecwith_heuristic_lambdas(
+                self.data,
+                self.y,
+                self.weights,
+                self.offset,
+                &spec_at_psi,
+                rho_vec.as_slice(),
+                self.family,
+                self.options,
+            ) {
+                Ok(fit) => fit_score(&fit.fit),
+                Err(_) => f64::INFINITY,
+            }
+        }
+
+        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            if cost < self.best_cost {
+                self.best_cost = cost;
+                self.best_theta = theta.clone();
+            }
+        }
+    }
+
+    let mut ctx = AnisoJointContext {
+        data,
+        y,
+        weights,
+        offset,
+        resolvedspec,
+        family,
+        options,
+        spatial_terms,
+        dims_per_term,
+        rho_dim,
+        best_theta: theta0.clone(),
+        best_cost: f64::INFINITY,
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: 1e-6,
+        max_iter: 50,
+        fd_step: 1e-5,
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            num_auxiliary_trailing: psi_dim,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+    };
+
+    let mut obj = ClosureObjective {
+        state: &mut ctx,
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: theta_dim,
+            // ψ coordinates are NOT penalty-like (they move the design),
+            // so EFS is not appropriate.
+            all_penalty_like: false,
+        },
+        cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+            let cost = ctx.eval_cost(theta);
+            ctx.track_best(theta, cost);
+            Ok(cost)
+        },
+        eval_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+            match ctx.eval_full(theta) {
+                Ok((cost, grad, hess)) => {
+                    ctx.track_best(theta, cost);
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: HessianResult::Analytic(hess),
+                    })
+                }
+                Err(_) => {
+                    // On failure, return +inf cost to make optimizer retreat.
+                    Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            }
+        },
+        reset_fn: |_ctx: &mut &mut AnisoJointContext<'_>| {},
+        efs_fn: None::<
+            fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+        >,
+    };
+
+    match crate::solver::strategy::run_outer(&mut obj, &outer_config, "aniso-psi joint REML") {
+        Ok(result) => {
+            log::trace!(
+                "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm,
+            );
+            // Enforce sum-to-zero constraint on ψ coordinates for each aniso group.
+            let mut theta_star = result.rho;
+            enforce_psi_sum_to_zero(&mut theta_star, rho_dim, dims_per_term);
+            Ok(theta_star)
+        }
+        Err(e) => {
+            log::warn!(
+                "[spatial-aniso-joint] analytic optimization failed ({}), falling back to initial theta",
+                e
+            );
+            Ok(theta0.clone())
+        }
+    }
+}
+
+/// Enforce sum-to-zero constraint on ψ coordinates for identifiability.
+///
+/// For each anisotropic group with d > 1 axes, the d ψ values are shifted
+/// so that their mean is zero: ψ_a ← ψ_a − mean(ψ).
+/// This preserves the anisotropy ratios while centering the log-scale coordinates.
+fn enforce_psi_sum_to_zero(
+    theta: &mut Array1<f64>,
+    rho_dim: usize,
+    dims_per_term: &[usize],
+) {
+    let mut offset = rho_dim;
+    for &d in dims_per_term {
+        if d > 1 {
+            let mean = theta.slice(s![offset..offset + d]).mean().unwrap_or(0.0);
+            for a in 0..d {
+                theta[offset + a] -= mean;
+            }
+        }
+        offset += d;
+    }
 }
 
 fn spatial_score_improves(candidate: f64, baseline: f64, rel_tol: f64) -> bool {

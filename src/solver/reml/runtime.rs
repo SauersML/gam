@@ -2360,7 +2360,6 @@ impl<'a> RemlState<'a> {
     /// ext_coords can be threaded into the builder. The alternative — making
     /// `evaluate_unified` generic over an optional ext_coords — would touch
     /// every existing call site, so this targeted method is preferred.
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_unified_with_ext_from_bundle(
         &self,
         rho: &Array1<f64>,
