@@ -329,64 +329,58 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
     }
 }
 
-/// Derivative provider for joint/coupled models (GAMLSS, link wiggles, survival).
+// ═══════════════════════════════════════════════════════════════════════════
+//  Extended hyperparameter coordinate types
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Fixed-β objects for a single outer hyperparameter coordinate.
 ///
-/// Wraps closures that compute the directional derivatives of the joint
-/// likelihood Hessian D_β H_L[v] and D²_β H_L[u, v].
+/// For ρ_k:  a = ½β̂ᵀAₖβ̂,  g = Aₖβ̂,  b_mat = Aₖ,  ld_s = (log|S|₊)'_k
+/// For ψ_j:  family provides likelihood-side objects, penalty adds S_j terms.
 ///
-/// # Sign convention
-///
-/// `reml_laml_evaluate` passes v_k = H⁻¹(A_k β̂) to `hessian_derivative_correction`.
-/// By the implicit function theorem, dβ̂/dρ_k = −v_k. The stored `compute_dh`
-/// expects the actual perturbation direction δβ, so we negate v_k before calling it.
-pub struct JointModelDerivProvider {
-    compute_dh: Box<dyn Fn(&Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
-    compute_d2h:
-        Option<Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>>,
+/// The unified evaluator uses these to compute gradient and Hessian entries
+/// for any outer coordinate, whether it moves the penalty only (ρ) or also
+/// moves the design/likelihood (ψ).
+pub struct HyperCoord {
+    /// ∂_i F|_β — fixed-β cost derivative (scalar).
+    pub a: f64,
+    /// ∂_i (∇_β F)|_β — fixed-β score (p-vector).
+    pub g: Array1<f64>,
+    /// ∂_i H|_β — fixed-β Hessian drift (p×p matrix).
+    pub b_mat: Array2<f64>,
+    /// ∂_i log|S|₊ — penalty pseudo-logdet first derivative.
+    pub ld_s: f64,
+    /// Whether B_i depends on β (true for ψ with non-Gaussian likelihood).
+    /// When true, M_i[u] = D_β B_i[u] contributes to the exact outer Hessian.
+    pub b_depends_on_beta: bool,
 }
 
-impl JointModelDerivProvider {
-    /// Create a new joint model derivative provider from closures.
-    ///
-    /// `compute_dh`: given direction δβ, returns D_β H_L[δβ]
-    /// `compute_d2h`: given (u, v), returns D²_β H_L[u, v] (optional)
-    pub fn new(
-        compute_dh: Box<dyn Fn(&Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
-        compute_d2h: Option<
-            Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>,
-        >,
-    ) -> Self {
-        Self {
-            compute_dh,
-            compute_d2h,
-        }
-    }
+/// Second-order fixed-β objects for a pair of outer coordinates.
+///
+/// Used by the outer Hessian computation. For ρ-ρ diagonal pairs, these
+/// equal the first-order objects (a_kk = a_k, g_kk = g_k, B_kk = B_k).
+/// For ρ-ρ off-diagonal pairs with k≠l, these are all zero.
+pub struct HyperCoordPair {
+    /// ∂²_ij F|_β — fixed-β cost second derivative (scalar).
+    pub a: f64,
+    /// ∂²_ij (∇_β F)|_β — fixed-β score second derivative (p-vector).
+    pub g: Array1<f64>,
+    /// ∂²_ij H|_β — fixed-β Hessian second drift (p×p matrix).
+    pub b_mat: Array2<f64>,
+    /// ∂²_ij log|S|₊ — penalty pseudo-logdet second derivative.
+    pub ld_s: f64,
 }
 
-impl HessianDerivativeProvider for JointModelDerivProvider {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
-        let neg_v = -v_k;
-        (self.compute_dh)(&neg_v)
-    }
-
-    fn hessian_second_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        let d2h = self.compute_d2h.as_ref()?;
-        let term1 = (self.compute_dh)(u_kl)?;
-        let neg_v_k = -v_k;
-        let neg_v_l = -v_l;
-        let term2 = d2h(&neg_v_l, &neg_v_k)?;
-        Some(term1 + &term2)
-    }
-
-    fn has_corrections(&self) -> bool {
-        true
-    }
-}
+/// Callback for computing M_i[u] = D_β B_i[u], the directional derivative
+/// of the fixed-β Hessian drift along direction u.
+///
+/// This is needed for the exact outer Hessian when B_i depends on β
+/// (i.e., for ψ coordinates with non-Gaussian likelihoods).
+/// For ρ coordinates, B_i = A_i is β-independent, so M_i ≡ 0.
+///
+/// When unavailable, the outer Hessian is approximate (fine for BFGS/ARC,
+/// insufficient for exact Newton quadratic convergence).
+pub type FixedDriftDerivFn = Box<dyn Fn(usize, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
@@ -435,7 +429,7 @@ pub enum DispersionHandling {
 /// - Single-block PIRLS (via `PirlsResult::into_inner_solution()`)
 /// - Blockwise coupled Newton (via `BlockwiseInnerResult::into_inner_solution()`)
 /// - Sparse Cholesky (via `SparsePenalizedSystem::into_inner_solution()`)
-pub struct InnerSolution {
+pub struct InnerSolution<'dp> {
     // === Objective ingredients ===
     /// ℓ(β̂) — log-likelihood at the converged mode.
     /// For Gaussian: −0.5 × deviance (RSS). For GLMs: actual log-likelihood.
@@ -462,7 +456,7 @@ pub struct InnerSolution {
 
     // === Family-specific derivative info ===
     /// Provider of third-derivative corrections for non-Gaussian families.
-    pub deriv_provider: Box<dyn HessianDerivativeProvider>,
+    pub deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
 
     // === Corrections ===
     /// Tierney-Kadane correction to the Laplace approximation.
@@ -486,11 +480,31 @@ pub struct InnerSolution {
 
     /// How the dispersion parameter is handled.
     pub dispersion: DispersionHandling,
+
+    // === Extended hyperparameter coordinates (ψ / τ) ===
+    /// External (non-ρ) hyperparameter coordinates with their fixed-β objects.
+    /// These are appended after the ρ coordinates in the gradient/Hessian output.
+    pub ext_coords: Vec<HyperCoord>,
+
+    /// Callback to compute second-order fixed-β objects for a pair (i, j)
+    /// of external coordinates (or external × ρ cross pairs).
+    /// Arguments: (ext_index_i, ext_index_j) → HyperCoordPair.
+    /// When None, the outer Hessian is not computed for extended coordinates.
+    pub ext_coord_pair_fn:
+        Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+
+    /// Callback for ρ × ext cross pairs: (rho_index, ext_index) → HyperCoordPair.
+    pub rho_ext_pair_fn:
+        Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+
+    /// M_i[u] = D_β B_i[u] callback for extended coordinates.
+    /// Arguments: (ext_index, direction) → correction matrix.
+    pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
 /// auto-computes derived quantities (nullspace_dim).
-pub struct InnerSolutionBuilder {
+pub struct InnerSolutionBuilder<'dp> {
     // Required fields
     log_likelihood: f64,
     penalty_quadratic: f64,
@@ -501,15 +515,20 @@ pub struct InnerSolutionBuilder {
     n_observations: usize,
     dispersion: DispersionHandling,
     // Optional fields with defaults
-    deriv_provider: Box<dyn HessianDerivativeProvider>,
+    deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     tk_correction: f64,
     tk_gradient: Option<Array1<f64>>,
     firth_logdet: f64,
     firth_gradient: Option<Array1<f64>>,
     nullspace_dim_override: Option<f64>,
+    // Extended hyperparameter coordinates
+    ext_coords: Vec<HyperCoord>,
+    ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    fixed_drift_deriv: Option<FixedDriftDerivFn>,
 }
 
-impl InnerSolutionBuilder {
+impl<'dp> InnerSolutionBuilder<'dp> {
     /// Create a builder with the required core fields.
     pub fn new(
         log_likelihood: f64,
@@ -536,10 +555,14 @@ impl InnerSolutionBuilder {
             firth_logdet: 0.0,
             firth_gradient: None,
             nullspace_dim_override: None,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
         }
     }
 
-    pub fn deriv_provider(mut self, p: Box<dyn HessianDerivativeProvider>) -> Self {
+    pub fn deriv_provider(mut self, p: Box<dyn HessianDerivativeProvider + 'dp>) -> Self {
         self.deriv_provider = p;
         self
     }
@@ -567,7 +590,7 @@ impl InnerSolutionBuilder {
     }
 
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty roots.
-    pub fn build(self) -> InnerSolution {
+    pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
             let total_p = self.beta.len();
             let penalty_rank: usize = self.penalty_roots.iter().map(|r| r.nrows()).sum();
@@ -589,6 +612,10 @@ impl InnerSolutionBuilder {
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,
+            ext_coords: self.ext_coords,
+            ext_coord_pair_fn: self.ext_coord_pair_fn,
+            rho_ext_pair_fn: self.rho_ext_pair_fn,
+            fixed_drift_deriv: self.fixed_drift_deriv,
         }
     }
 }
@@ -668,7 +695,7 @@ const DENOM_RIDGE: f64 = 1e-8;
 /// - `mode`: What to compute (value only, value+gradient, or all three).
 /// - `prior_cost_gradient`: Optional soft prior on ρ (value, gradient, optional Hessian).
 pub fn reml_laml_evaluate(
-    solution: &InnerSolution,
+    solution: &InnerSolution<'_>,
     rho: &[f64],
     mode: EvalMode,
     prior_cost_gradient: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
@@ -848,7 +875,7 @@ pub fn reml_laml_evaluate(
 ///
 /// Uses the precomputed HessianOperator for all linear algebra.
 fn compute_outer_hessian(
-    solution: &InnerSolution,
+    solution: &InnerSolution<'_>,
     rho: &[f64],
     lambdas: &[f64],
     hop: &dyn HessianOperator,
@@ -1656,6 +1683,10 @@ mod tests {
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -1779,6 +1810,10 @@ mod tests {
             n_observations: n,
             nullspace_dim: (p - penalty_rank) as f64,
             dispersion: DispersionHandling::ProfiledGaussian,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
         }
     }
 

@@ -1,17 +1,13 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x, fast_xt_diag_y};
-use crate::linalg::utils::{default_slq_parameters, stochastic_lanczos_logdet_spd};
+use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 use thiserror::Error;
-
-const SURVIVAL_TRACE_SOLVE_TARGET_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum SurvivalError {
@@ -634,25 +630,6 @@ impl WorkingModelSurvival {
         Ok(())
     }
 
-    fn spd_logdet(hessian: &Array2<f64>) -> Result<f64, EstimationError> {
-        if let Ok(chol) = hessian.cholesky(Side::Lower) {
-            let l = chol.lower_triangular();
-            return Ok(2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>());
-        }
-
-        let (eval, _) = match hessian.eigh(Side::Lower) {
-            Ok(out) => out,
-            Err(_) => {
-                let (probes, steps) = default_slq_parameters(hessian.nrows());
-                return stochastic_lanczos_logdet_spd(hessian, probes, steps, 97)
-                    .map_err(EstimationError::InvalidInput);
-            }
-        };
-        let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let tol = (max_eval * 1e-12).max(1e-14);
-        Ok(eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum())
-    }
-
     fn derivative_guard(&self) -> f64 {
         if self.structurally_monotonic {
             // I-spline basis is monotone by construction when coefficients ≥ 0.
@@ -1150,51 +1127,6 @@ impl WorkingModelSurvival {
         })
     }
 
-    fn lamlobjective_from_state(
-        &self,
-        beta: &Array1<f64>,
-        state: &WorkingState,
-    ) -> Result<f64, EstimationError> {
-        let p = beta.len();
-        if state.hessian.nrows() != p || state.hessian.ncols() != p {
-            return Err(EstimationError::LayoutError(
-                "survival laml objective: Hessian/beta dimension mismatch".to_string(),
-            ));
-        }
-
-        let h_dense = state.hessian.to_dense();
-        let logdet_h = Self::spd_logdet(&h_dense)?;
-
-        if self.penalties.blocks.is_empty() {
-            // With no penalty blocks, S=0 and log|S|_+ = 0 by convention.
-            return Ok(0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h);
-        }
-
-        // Build S(rho) and compute pseudo-logdet over positive eigenspace.
-        let mut s_total = Array2::<f64>::zeros((p, p));
-        for block in &self.penalties.blocks {
-            if block.lambda == 0.0 {
-                continue;
-            }
-            let start = block.range.start;
-            let end = block.range.end;
-            s_total
-                .slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(block.lambda, &block.matrix);
-        }
-        let (s_eval, _) = s_total
-            .eigh(Side::Lower)
-            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-        let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let s_tol = (max_s_eval * 1e-12).max(1e-14);
-        let logdet_s = s_eval
-            .iter()
-            .filter(|&&ev| ev > s_tol)
-            .map(|&ev| ev.ln())
-            .sum::<f64>();
-
-        Ok(0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h - 0.5 * logdet_s)
-    }
     /// Compute the third-derivative correction matrix for a given mode response `u_k`.
     ///
     /// This is the directional derivative of the unpenalized NLL Hessian w.r.t.
@@ -1345,7 +1277,7 @@ impl WorkingModelSurvival {
         beta: &Array1<f64>,
         state: &WorkingState,
         rho: &Array1<f64>,
-    ) -> Result<crate::estimate::reml::unified::InnerSolution, EstimationError> {
+    ) -> Result<crate::estimate::reml::unified::InnerSolution<'static>, EstimationError> {
         use crate::estimate::reml::unified::{
             DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
@@ -2740,7 +2672,11 @@ mod tests {
             .expect("laml objective for no-penalty model");
 
         let h_dense = state.hessian.to_dense();
-        let logdet_h = WorkingModelSurvival::spd_logdet(&h_dense).expect("SPD hessian logdet");
+        let logdet_h: f64 = {
+            use crate::faer_ndarray::FaerEigh;
+            let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
+            evals.iter().map(|&v| v.ln()).sum()
+        };
         let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
 
         assert_eq!(grad.len(), 0);
@@ -2750,42 +2686,6 @@ mod tests {
             obj,
             expected
         );
-    }
-
-    #[test]
-    fn laml_objective_uses_positive_spectrum_logdet_fallback() {
-        let age_entry = array![1.0_f64];
-        let age_exit = array![2.0_f64];
-        let event_target = array![1u8];
-        let event_competing = array![0u8];
-        let sampleweight = array![1.0];
-        let x_entry = array![[0.0]];
-        let x_exit = array![[0.2]];
-        let x_derivative = array![[0.5]];
-        let model = survival_model(
-            survival_inputs(
-                &age_entry,
-                &age_exit,
-                &event_target,
-                &event_competing,
-                &sampleweight,
-                &x_entry,
-                &x_exit,
-                &x_derivative,
-            ),
-            PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
-            SurvivalSpec::Net,
-        )
-        .expect("construct survival model");
-        let beta = array![0.3];
-        let mut state = model.update_state(&beta).expect("state at beta");
-        state.hessian = crate::linalg::matrix::SymmetricMatrix::Dense(array![[-1.0]]);
-
-        let objective = model
-            .lamlobjective_from_state(&beta, &state)
-            .expect("indefinite hessian should use positive-spectrum logdet fallback");
-        assert!(objective.is_finite());
     }
 
     #[test]

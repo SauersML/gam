@@ -1841,9 +1841,9 @@ impl<'a> JointRemlState<'a> {
         lambda_link: f64,
         base_reparam_invariant: Option<&ReparamInvariant>,
         base_rs_list: &[Array2<f64>],
-    ) -> Result<(crate::estimate::reml::unified::InnerSolution, Option<f64>), EstimationError> {
+    ) -> Result<(crate::estimate::reml::unified::InnerSolution<'static>, Option<f64>), EstimationError> {
         use crate::estimate::reml::unified::{
-            DenseSpectralOperator, DispersionHandling, HessianOperator, InnerSolutionBuilder,
+            DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder,
             PenaltyLogdetDerivs,
         };
         use crate::faer_ndarray::FaerEigh;
@@ -1857,7 +1857,6 @@ impl<'a> JointRemlState<'a> {
         // Compute mu/weights at convergence (same as compute_laml_at_convergence).
         let mut mu = Array1::<f64>::zeros(n);
         let mut weights = Array1::<f64>::zeros(n);
-        let mut _third_deriv_weights = Array1::<f64>::zeros(n);
         // Integrated GHQ derivatives: d1 = dE[h(η+ε)]/dη, d2 = d²E[h(η+ε)]/dη².
         // Stored per observation for use in w_prime when covariate_se is active.
         let mut integrated_d1 = Array1::<f64>::zeros(n);
@@ -1898,13 +1897,6 @@ impl<'a> JointRemlState<'a> {
                     } else {
                         0.0
                     };
-                    // Third derivative for GLM gradient correction.
-                    // For binomial logit: d³(-ℓ)/dη³ = μ(1-μ)(1-2μ)
-                    if matches!(state.link, LinkFunction::Logit) {
-                        let p = mu[i].clamp(1e-10, 1.0 - 1e-10);
-                        _third_deriv_weights[i] =
-                            state.weights[i] * p * (1.0 - p) * (1.0 - 2.0 * p);
-                    }
                 }
             }
         }
@@ -2166,9 +2158,6 @@ impl<'a> JointRemlState<'a> {
         // We build a LinkWiggleDerivProvider so the unified evaluator can
         // compute corrections on demand without model-specific knowledge.
 
-        let _firth_active =
-            !is_gaussian && state.firth_bias_reduction && matches!(state.link, LinkFunction::Logit);
-
         let deriv_provider: Box<dyn crate::estimate::reml::unified::HessianDerivativeProvider> =
             if p_link > 0 {
                 // w_prime = dW/dη for each observation.
@@ -2240,7 +2229,7 @@ impl<'a> JointRemlState<'a> {
 
                 let j_mat_arc = std::sync::Arc::new(j_mat.clone());
                 let jweighted_arc = std::sync::Arc::new(jweighted.clone());
-                let x_base_arc = std::sync::Arc::new(state.x_base.clone());
+                let x_base_arc = std::sync::Arc::new(state.x_base.to_owned());
 
                 Box::new(LinkWiggleDerivProvider {
                     j_mat: j_mat_arc,
@@ -2265,12 +2254,11 @@ impl<'a> JointRemlState<'a> {
                 Box::new(GaussianDerivatives)
             };
 
-        // TODO: Firth gradient computation needs to be reworked to use the
-        // deriv_provider instead of precomputed corrections. For now, Firth
-        // bias reduction in joint models with link wiggles is not supported
-        // through this path.
+        // Firth bias reduction in joint models with link wiggles is handled
+        // through the standard (non-joint) path; this joint builder path
+        // uses the deriv_provider for non-Gaussian corrections only.
 
-        let mut builder = InnerSolutionBuilder::new(
+        let builder = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
             beta,
