@@ -93,6 +93,7 @@ fn fit_duchon_simulated_10d(
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
         },
     )
     .expect("Duchon term-collection fit should succeed");
@@ -200,6 +201,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 weight_floor: 1e-8,
                 weight_ceiling: 1e8,
             }),
+        penalty_shrinkage_floor: None,
         },
     )
     .expect("exact adaptive Duchon term-collection fit should succeed");

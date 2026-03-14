@@ -1635,6 +1635,9 @@ pub struct AnisoBasisPsiDerivatives {
     /// Vec of d arrays, each (n x k_raw) -- needed for cross-term assembly:
     ///   d2 X[i,j]/(d psi_a d psi_b) = t[i,j] * s_a[i,j] * s_b[i,j]  (a != b).
     pub s_components_raw: Vec<Array2<f64>>,
+    /// Projected+padded s_a components, same shape as design_first entries.
+    /// Used for cross-derivative assembly in smooth.rs.
+    pub s_components_projected: Vec<Array2<f64>>,
     /// d x num_penalties: dS_m/d psi_a for each axis a and penalty m.
     pub penalties_first: Vec<Vec<Array2<f64>>>,
     /// d x num_penalties: d2S_m/d psi_a^2 for each axis a and penalty m.
@@ -5778,6 +5781,10 @@ fn build_matern_design_psi_aniso_derivatives(
     let design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
     let design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
     let design_cross_t = pad(design_cross_t);
+    let s_components_projected: Vec<_> = s_components_raw
+        .iter()
+        .map(|raw| pad(project(raw.clone())))
+        .collect();
 
     // Penalty derivatives are assembled by the caller.
     let penalties_first = vec![Vec::new(); dim];
@@ -5788,6 +5795,7 @@ fn build_matern_design_psi_aniso_derivatives(
         design_second_diag,
         design_cross_t,
         s_components_raw,
+        s_components_projected,
         penalties_first,
         penalties_second_diag,
     })

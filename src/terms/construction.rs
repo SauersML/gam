@@ -1435,7 +1435,7 @@ mod tests {
         let rs_list = vec![array![[1.0, 0.0, 0.0]]];
         let lambdas = vec![2.0];
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
         let expected = rep.qs.t().dot(&inv.split.q_null);
@@ -1453,7 +1453,7 @@ mod tests {
         let rs_list: Vec<Array2<f64>> = Vec::new();
         let lambdas: Vec<f64> = Vec::new();
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
             .expect("stable reparam");
         assert_eq!(rep.u_truncated, Array2::<f64>::eye(p));
     }
@@ -1466,7 +1466,7 @@ mod tests {
         let rs_list = vec![array![[inv_sqrt2, inv_sqrt2, 0.0]]];
         let lambdas = vec![4.0];
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
         assert_eq!(rep.e_transformed.nrows(), 1);
@@ -1507,7 +1507,7 @@ mod tests {
         let lambdas = vec![5.0];
 
         let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv)
+        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
         assert_eq!(rep.e_transformed.nrows(), p);

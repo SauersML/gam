@@ -400,8 +400,9 @@ pub(crate) struct SpatialPsiDerivative {
     pub s_psi_psi_local: Array2<f64>,
     pub s_psi_psi_components_local: Vec<Array2<f64>>,
     pub aniso_group_id: Option<usize>,
-    pub aniso_cross_t_local: Option<Array2<f64>>,
-    pub aniso_s_component_raw: Option<Array2<f64>>,
+    /// Pre-computed cross-derivative design matrices for other axes
+    /// in the same aniso group: Vec of (axis_offset_in_group, matrix).
+    pub aniso_cross_designs: Option<Vec<(usize, Array2<f64>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -818,6 +819,11 @@ impl TwoBlockExactJointHyperSetup {
         out.slice_mut(s![self.rho_dim()..])
             .assign(self.log_kappa_upper.as_array());
         out
+    }
+
+    /// Per-term dimensionality layout for the ψ block.
+    pub(crate) fn log_kappa_dims_per_term(&self) -> Vec<usize> {
+        self.log_kappa0.dims_per_term().to_vec()
     }
 }
 
@@ -4719,6 +4725,7 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         nullspace_dims: design.nullspace_dims.clone(),
         linear_constraints: design.linear_constraints.clone(),
         adaptive_regularization: None,
+        penalty_shrinkage_floor: options.penalty_shrinkage_floor,
     }
 }
 
@@ -6693,8 +6700,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         s_psi_psi_local: s_psi_psi0,
         s_psi_psi_components_local,
         aniso_group_id: None,
-        aniso_cross_t_local: None,
-        aniso_s_component_raw: None,
+        aniso_cross_designs: None,
     }))
 }
 
@@ -6768,6 +6774,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         ..(smooth_start + smooth_term.coeff_range.end);
     let num_penalties = aniso_result.penalties_first[0].len();
     let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
+    // Pre-compute cross-derivative design matrices: d2X/(d psi_a d psi_b) = t * s_a * s_b
+    // using projected+padded components (element-wise product in design space).
+    let t_proj = &aniso_result.design_cross_t;
+    let s_proj = &aniso_result.s_components_projected;
+
     let mut entries = Vec::with_capacity(d);
     for a in 0..d {
         let x_psi_local = aniso_result.design_first[a].clone();
@@ -6775,14 +6786,23 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         if x_psi_local.ncols() != smooth_term.coeff_range.len() { return Ok(None); }
         let s_psi_components = aniso_result.penalties_first[a].clone();
         let s_psi_psi_components = aniso_result.penalties_second_diag[a].clone();
+        let p_smooth = smooth_term.coeff_range.len();
         let s_psi_local = s_psi_components.iter().fold(
-            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
-            |acc, m| acc + m,
+            Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m,
         );
         let s_psi_psi_local = s_psi_psi_components.iter().fold(
-            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
-            |acc, m| acc + m,
+            Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m,
         );
+        // Build cross-design entries for other axes b != a in this group.
+        // These will be indexed by (b, cross_matrix) where b is the axis
+        // offset within the d-entry block.
+        let mut cross_designs = Vec::with_capacity(d - 1);
+        for b in 0..d {
+            if b == a { continue; }
+            // d2X/(d psi_a d psi_b) = t * s_a * s_b (element-wise in projected space)
+            let cross = t_proj * &s_proj[a] * &s_proj[b];
+            cross_designs.push((b, cross));
+        }
         entries.push(SpatialPsiDerivative {
             penalty_index: penalty_indices[0],
             penalty_indices: penalty_indices.clone(),
@@ -6795,8 +6815,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             s_psi_psi_local,
             s_psi_psi_components_local: s_psi_psi_components,
             aniso_group_id: Some(aniso_group_id),
-            aniso_cross_t_local: Some(aniso_result.design_cross_t.clone()),
-            aniso_s_component_raw: Some(aniso_result.s_components_raw[a].clone()),
+            aniso_cross_designs: Some(cross_designs),
         });
     }
     Ok(Some(entries))
@@ -6951,24 +6970,23 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             info.total_p,
         ));
         // Cross second derivatives for axes in the same aniso group.
-        if let Some(gid) = info.aniso_group_id {
-            if let (Some(t_mat), Some(s_a)) =
-                (&info.aniso_cross_t_local, &info.aniso_s_component_raw)
-            {
-                for (j, other) in info_list.iter().enumerate() {
-                    if j == i { continue; }
-                    if other.aniso_group_id == Some(gid) {
-                        if let Some(s_b) = &other.aniso_s_component_raw {
-                            // d2X/(d psi_a d psi_b) = t * s_a * s_b
-                            let cross = t_mat * s_a * s_b;
-                            xsecond[j] = Some(
-                                crate::estimate::reml::HyperDesignDerivative::from_embedded(
-                                    cross,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                ),
-                            );
-                        }
+        if let Some(ref cross_designs) = info.aniso_cross_designs {
+            // Find the base index of this aniso group in the info_list.
+            // Entries for the same group are contiguous: the first entry
+            // with matching group_id gives the base, and axis b is at base+b.
+            if let Some(gid) = info.aniso_group_id {
+                let base = info_list.iter().position(|e| e.aniso_group_id == Some(gid))
+                    .unwrap_or(i);
+                for &(b_axis, ref cross_mat) in cross_designs {
+                    let j = base + b_axis;
+                    if j < log_kappa_dim {
+                        xsecond[j] = Some(
+                            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                                cross_mat.clone(),
+                                info.global_range.clone(),
+                                info.total_p,
+                            ),
+                        );
                     }
                 }
             }
@@ -7765,7 +7783,8 @@ where
 {
     let mean_terms = spatial_length_scale_term_indices(meanspec);
     let noise_terms = spatial_length_scale_term_indices(noisespec);
-    let log_kappa_dim = mean_terms.len() + noise_terms.len();
+    // Total ψ dimension: accounts for d entries per aniso term.
+    let log_kappa_dim = joint_setup.log_kappa_dim();
     if !kappa_options.enabled || log_kappa_dim == 0 {
         let mean_design = build_term_collection_design(data, meanspec).map_err(|e| {
             format!("failed to build mean design during exact joint κ optimization: {e}")
@@ -7823,6 +7842,7 @@ where
         ));
     }
     let rho_dim = joint_setup.rho_dim();
+    let all_dims = joint_setup.log_kappa_dims_per_term();
 
     let build_pair = |ms: &TermCollectionSpec,
                       ns: &TermCollectionSpec|
@@ -7852,7 +7872,10 @@ where
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
     let objective = CachedSecondOrderObjective::new(
         |theta: &Array1<f64>| {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta, rho_dim, all_dims.clone(),
+            );
+            // split_at operates on logical term count, not flat ψ index.
             let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(mean_terms.len());
             let meanspec_c = match mean_log_kappa.apply_tospec(&best_meanspec, &mean_terms) {
                 Ok(v) => v,
@@ -7965,7 +7988,9 @@ where
     };
 
     let theta_star = solution.final_point;
-    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail(&theta_star, rho_dim);
+    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail_with_dims(
+        &theta_star, rho_dim, all_dims,
+    );
     let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
     let resolved_meanspec = mean_log_kappa
         .apply_tospec(&best_meanspec, &mean_terms)
@@ -9376,6 +9401,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -9726,6 +9752,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -9833,6 +9860,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -9987,6 +10015,7 @@ mod tests {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
         };
         let y = Array1::linspace(0.0, 1.0, data.nrows());
         let weights = Array1::ones(data.nrows());
@@ -10166,6 +10195,7 @@ mod tests {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
             },
             &SpatialLengthScaleOptimizationOptions {
                 enabled: false,
@@ -10657,6 +10687,7 @@ mod tests {
                     weight_floor: 1e-8,
                     weight_ceiling: 1e8,
                 }),
+            penalty_shrinkage_floor: None,
             },
         )
         .expect("exact adaptive spatial fit should succeed");
@@ -10741,6 +10772,7 @@ mod tests {
                     weight_floor: 1e-8,
                     weight_ceiling: 1e8,
                 }),
+            penalty_shrinkage_floor: None,
             },
         )
         .expect("exact adaptive SAS fit should succeed");
@@ -10808,6 +10840,7 @@ mod tests {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
             },
         )
         .expect("baseline fit");
@@ -10985,6 +11018,7 @@ mod tests {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
             },
         )
         .expect("baseline fit");
@@ -11152,6 +11186,7 @@ mod tests {
                     weight_floor: 1e-8,
                     weight_ceiling: 1e8,
                 }),
+            penalty_shrinkage_floor: None,
             },
         )
         .expect("high-center adaptive Duchon fit should not fail");

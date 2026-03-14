@@ -89,6 +89,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             nullspace_dims: vec![],
             linear_constraints: None,
             adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
         },
     )
     .expect("Matérn term-collection fit should succeed");
@@ -184,6 +185,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 weight_floor: 1e-8,
                 weight_ceiling: 1e8,
             }),
+        penalty_shrinkage_floor: None,
         },
     )
     .expect("exact adaptive Matérn term-collection fit should succeed");
