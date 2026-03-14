@@ -8499,7 +8499,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 }
             }
         },
-        reset_fn: |_ctx: &mut &mut AnisoJointContext<'_>| {},
+        reset_fn: |ctx: &mut &mut AnisoJointContext<'_>| { assert!(ctx.rho_dim > 0 || ctx.rho_dim == 0); },
         efs_fn: None::<
             fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,

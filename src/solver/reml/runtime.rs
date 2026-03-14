@@ -149,15 +149,43 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Compute the Tierney-Kadane correction to the Laplace approximation.
+    ///
+    /// The TK correction is a third-order refinement:
+    ///
+    /// ```text
+    /// TK = -(1/6) Σ_j (H⁻¹)_jj³ · d3_j
+    /// ```
+    ///
+    /// where H is the penalized Hessian and d3_j = Σ_i c_i · X_ij³ is the
+    /// third-derivative projection of the negative log-likelihood.
+    ///
+    /// When `gradient_info` is `Some((penalty_roots, lambdas))`, also computes
+    /// the gradient d(TK)/dρ_k. The derivative uses:
+    ///
+    /// ```text
+    /// d(H⁻¹)_jj / dρ_k = −(H⁻¹ Aₖ H⁻¹)_jj,   Aₖ = λₖ Sₖ = λₖ Rₖᵀ Rₖ
+    /// ```
+    ///
+    /// so that:
+    ///
+    /// ```text
+    /// d(TK)/dρ_k = (λₖ / 2) Σ_j (H⁻¹)_jj² · d3_j · ‖Rₖ fⱼ‖²
+    /// ```
+    ///
+    /// where fⱼ = H⁻¹ eⱼ is the j-th column of H⁻¹. This reuses the same
+    /// Cholesky/eigensolve columns already needed for the correction value,
+    /// so the marginal cost is O(K·p·rank(Rₖ)) multiplies.
     fn tierney_kadane_laml_correction(
         &self,
         pirls_result: &PirlsResult,
         h_eff_eval: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
-    ) -> Result<f64, EstimationError> {
+        gradient_info: Option<(&[Array2<f64>], &[f64])>,
+    ) -> Result<(f64, Option<Array1<f64>>), EstimationError> {
         let mut d_vec = pirls_result.solve_c_array.clone();
         if d_vec.is_empty() {
-            return Ok(0.0);
+            return Ok((0.0, gradient_info.map(|(roots, _)| Array1::zeros(roots.len()))));
         }
         for val in &mut d_vec {
             if !val.is_finite() {
@@ -167,34 +195,11 @@ impl<'a> RemlState<'a> {
 
         let p_eff = h_eff_eval.ncols();
         if p_eff == 0 {
-            return Ok(0.0);
+            return Ok((0.0, gradient_info.map(|(roots, _)| Array1::zeros(roots.len()))));
         }
 
-        let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
-        if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            for j in 0..p_eff {
-                let mut e_j = Array1::<f64>::zeros(p_eff);
-                e_j[j] = 1.0;
-                h_inv_diag[j] = chol.solvevec(&e_j)[j];
-            }
-        } else {
-            let (evals, evecs) = h_eff_eval
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = 1e-12;
-            for j in 0..p_eff {
-                let mut acc = 0.0;
-                for k in 0..evals.len() {
-                    let ev = evals[k];
-                    if ev > floor {
-                        let u = evecs[[j, k]];
-                        acc += (u * u) / ev;
-                    }
-                }
-                h_inv_diag[j] = acc;
-            }
-        }
-
+        // Compute the third-derivative projection first, so we can accumulate
+        // the gradient in the same column-solve loop below.
         let third_deriv = if let Some(z) = free_basis_opt {
             let mut out = Array1::<f64>::zeros(z.ncols());
             for j in 0..z.ncols() {
@@ -212,17 +217,102 @@ impl<'a> RemlState<'a> {
             self.third_derivative_projection_from_design(&pirls_result.x_transformed, &d_vec)?
         };
 
+        let num_penalties = gradient_info.map_or(0, |(roots, _)| roots.len());
+        let mut tk_grad = Array1::<f64>::zeros(num_penalties);
+        let compute_gradient = gradient_info.is_some();
+
+        let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+        if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            for j in 0..p_eff {
+                let mut e_j = Array1::<f64>::zeros(p_eff);
+                e_j[j] = 1.0;
+                let f_j = chol.solvevec(&e_j);
+                h_inv_diag[j] = f_j[j];
+
+                // Accumulate TK gradient contribution from column j.
+                // d(TK)/dρ_k += (λ_k/2) · (H⁻¹)_jj² · d3_j · ‖R_k f_j‖²
+                if compute_gradient {
+                    let (roots, lambdas) = gradient_info.unwrap();
+                    let hjj_sq_d3 = h_inv_diag[j] * h_inv_diag[j] * third_deriv[j];
+                    if hjj_sq_d3.abs() > 0.0 {
+                        for k in 0..num_penalties {
+                            let r_k_f_j = roots[k].dot(&f_j);
+                            let norm_sq: f64 = r_k_f_j.iter().map(|v| v * v).sum();
+                            tk_grad[k] += lambdas[k] * hjj_sq_d3 * norm_sq;
+                        }
+                    }
+                }
+            }
+        } else {
+            let (evals, evecs) = h_eff_eval
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = 1e-12;
+
+            // For the eigendecomposition path, we need the full columns of H⁻¹
+            // when computing the gradient. H⁻¹ e_j = Σ_m (1/σ_m) u_m u_m[j].
+            // We reconstruct f_j on the fly if the gradient is requested.
+            for j in 0..p_eff {
+                let mut acc = 0.0;
+                for m in 0..evals.len() {
+                    let ev = evals[m];
+                    if ev > floor {
+                        let u = evecs[[j, m]];
+                        acc += (u * u) / ev;
+                    }
+                }
+                h_inv_diag[j] = acc;
+
+                if compute_gradient {
+                    let (roots, lambdas) = gradient_info.unwrap();
+                    let hjj_sq_d3 = h_inv_diag[j] * h_inv_diag[j] * third_deriv[j];
+                    if hjj_sq_d3.abs() > 0.0 {
+                        // Reconstruct f_j = H⁻¹ e_j from the eigendecomposition.
+                        let mut f_j = Array1::<f64>::zeros(p_eff);
+                        for m in 0..evals.len() {
+                            let ev = evals[m];
+                            if ev > floor {
+                                let u_jm = evecs[[j, m]];
+                                let scale = u_jm / ev;
+                                for i in 0..p_eff {
+                                    f_j[i] += scale * evecs[[i, m]];
+                                }
+                            }
+                        }
+                        for k in 0..num_penalties {
+                            let r_k_f_j = roots[k].dot(&f_j);
+                            let norm_sq: f64 = r_k_f_j.iter().map(|v| v * v).sum();
+                            tk_grad[k] += lambdas[k] * hjj_sq_d3 * norm_sq;
+                        }
+                    }
+                }
+            }
+        }
+
         let correction = -h_inv_diag
             .iter()
             .zip(third_deriv.iter())
             .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
             .sum::<f64>()
             / 6.0;
-        if correction.is_finite() {
-            Ok(correction)
+
+        // Scale the accumulated gradient by 1/2 (from the chain rule on h_jj^3).
+        tk_grad *= 0.5;
+
+        let correction = if correction.is_finite() { correction } else { 0.0 };
+        let gradient = if compute_gradient {
+            // Zero out non-finite entries for robustness.
+            for v in tk_grad.iter_mut() {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+            }
+            Some(tk_grad)
         } else {
-            Ok(0.0)
-        }
+            None
+        };
+
+        Ok((correction, gradient))
     }
 
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -1887,16 +1977,30 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        // TK correction (non-Gaussian only).
-        let tk_correction = if !is_gaussian_identity {
+        // TK correction and gradient (non-Gaussian only).
+        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
             let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
                 Self::projectwith_basis(bundle.h_eff.as_ref(), z)
             } else {
                 bundle.h_eff.as_ref().clone()
             };
-            self.tierney_kadane_laml_correction(pirls_result, &h_eff_eval, free_basis_opt.as_ref())?
+            let grad_info = if mode != super::unified::EvalMode::ValueOnly {
+                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+                Some((penalty_roots.as_slice(), lambdas))
+            } else {
+                None
+            };
+            let grad_ref = grad_info
+                .as_ref()
+                .map(|(roots, lams)| (*roots as &[Array2<f64>], lams.as_slice()));
+            self.tierney_kadane_laml_correction(
+                pirls_result,
+                &h_eff_eval,
+                free_basis_opt.as_ref(),
+                grad_ref,
+            )?
         } else {
-            0.0
+            (0.0, None)
         };
 
         // Firth log-det.
@@ -2003,6 +2107,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             deriv_provider,
             tk_correction,
+            tk_gradient,
             firth_logdet,
             firth_gradient,
             firth_hessian,
@@ -2111,18 +2216,12 @@ impl<'a> RemlState<'a> {
                 )
             };
 
-        // TK correction (non-Gaussian only): use sparse leverages.
-        let tk_correction = if !is_gaussian_identity {
-            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
-            for j in 0..p_dim {
-                let mut e_j = Array1::<f64>::zeros(p_dim);
-                e_j[j] = 1.0;
-                if let Ok(solved) =
-                    crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
-                {
-                    h_inv_diag[j] = solved[j];
-                }
-            }
+        // TK correction and gradient (non-Gaussian only): use sparse leverages.
+        //
+        // The gradient d(TK)/dρ_k uses the same H⁻¹ column solves as the
+        // correction value.  See `tierney_kadane_laml_correction` for the
+        // derivation.
+        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
             let mut d_vec = pirls_result.solve_c_array.clone();
             for val in &mut d_vec {
                 if !val.is_finite() {
@@ -2130,19 +2229,59 @@ impl<'a> RemlState<'a> {
                 }
             }
             let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
+
+            let compute_grad = mode != super::unified::EvalMode::ValueOnly;
+            let k = penalty_roots.len();
+            let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+            let mut tk_grad = Array1::<f64>::zeros(k);
+
+            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
+            for j in 0..p_dim {
+                let mut e_j = Array1::<f64>::zeros(p_dim);
+                e_j[j] = 1.0;
+                if let Ok(f_j) =
+                    crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
+                {
+                    h_inv_diag[j] = f_j[j];
+
+                    // Accumulate TK gradient contribution from column j.
+                    if compute_grad {
+                        let hjj_sq_d3 = h_inv_diag[j] * h_inv_diag[j] * third_deriv[j];
+                        if hjj_sq_d3.abs() > 0.0 {
+                            for kidx in 0..k {
+                                let r_k_f_j = penalty_roots[kidx].dot(&f_j);
+                                let norm_sq: f64 = r_k_f_j.iter().map(|v| v * v).sum();
+                                tk_grad[kidx] += lambdas[kidx] * hjj_sq_d3 * norm_sq;
+                            }
+                        }
+                    }
+                }
+            }
+
             let correction = -h_inv_diag
                 .iter()
                 .zip(third_deriv.iter())
                 .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
                 .sum::<f64>()
                 / 6.0;
-            if correction.is_finite() {
-                correction
+
+            let correction = if correction.is_finite() { correction } else { 0.0 };
+
+            let gradient = if compute_grad {
+                tk_grad *= 0.5;
+                for v in tk_grad.iter_mut() {
+                    if !v.is_finite() {
+                        *v = 0.0;
+                    }
+                }
+                Some(tk_grad)
             } else {
-                0.0
-            }
+                None
+            };
+
+            (correction, gradient)
         } else {
-            0.0
+            (0.0, None)
         };
 
         // Firth log-det.
@@ -2233,6 +2372,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             deriv_provider,
             tk_correction,
+            tk_gradient,
             firth_logdet,
             firth_gradient,
             firth_hessian,
@@ -2256,6 +2396,7 @@ impl<'a> RemlState<'a> {
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
+        tk_gradient: Option<Array1<f64>>,
         firth_logdet: f64,
         firth_gradient: Option<Array1<f64>>,
         firth_hessian: Option<Array2<f64>>,
@@ -2280,7 +2421,7 @@ impl<'a> RemlState<'a> {
             dispersion,
         )
         .deriv_provider(deriv_provider)
-        .tk(tk_correction, None)
+        .tk(tk_correction, tk_gradient)
         .firth(firth_logdet, firth_gradient)
         .firth_hessian(firth_hessian)
         .nullspace_dim_override(nullspace_dim)
@@ -2490,20 +2631,30 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        // TK correction.
-        let tk_correction = if !is_gaussian_identity {
+        // TK correction and gradient.
+        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
             let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
                 Self::projectwith_basis(bundle.h_eff.as_ref(), z)
             } else {
                 bundle.h_eff.as_ref().clone()
             };
+            let grad_info = if mode != super::unified::EvalMode::ValueOnly {
+                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+                Some((penalty_roots.as_slice(), lambdas))
+            } else {
+                None
+            };
+            let grad_ref = grad_info
+                .as_ref()
+                .map(|(roots, lams)| (*roots as &[Array2<f64>], lams.as_slice()));
             self.tierney_kadane_laml_correction(
                 pirls_result,
                 &h_eff_eval,
                 free_basis_opt.as_ref(),
+                grad_ref,
             )?
         } else {
-            0.0
+            (0.0, None)
         };
 
         // Firth log-det.
@@ -2591,7 +2742,7 @@ impl<'a> RemlState<'a> {
             dispersion,
         )
         .deriv_provider(deriv_provider)
-        .tk(tk_correction, None)
+        .tk(tk_correction, tk_gradient)
         .firth(firth_logdet, firth_gradient)
         .firth_hessian(firth_hessian)
         .nullspace_dim_override(nullspace_dim)
@@ -2831,15 +2982,21 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        let tk_correction = if !is_gaussian_identity {
+        let (tk_correction, _tk_gradient_unused) = if !is_gaussian_identity {
             let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
                 Self::projectwith_basis(bundle.h_eff.as_ref(), z)
             } else {
                 bundle.h_eff.as_ref().clone()
             };
-            self.tierney_kadane_laml_correction(pirls_result, &h_eff_eval, free_basis_opt.as_ref())?
+            // EFS path: ValueOnly, no gradient needed.
+            self.tierney_kadane_laml_correction(
+                pirls_result,
+                &h_eff_eval,
+                free_basis_opt.as_ref(),
+                None,
+            )?
         } else {
-            0.0
+            (0.0, None)
         };
 
         let firth_logdet = if self.config.firth_bias_reduction
@@ -2904,5 +3061,65 @@ impl<'a> RemlState<'a> {
         let result =
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
         Ok(result.gradient.unwrap())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Unified REML evaluation with link-parameter ext_coords
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Evaluate the unified REML/LAML objective with SAS or mixture link
+    /// parameters injected as ext_coords into the `InnerSolution`.
+    ///
+    /// This replaces the manual gradient computation in the outer optimizer's
+    /// eval_fn closure. The link parameter derivatives (du/dθ, dW/dθ, dℓ/dθ)
+    /// are wrapped as `HyperCoord` objects and passed through the same unified
+    /// evaluator that handles ρ coordinates, giving a single Newton/BFGS step
+    /// over `[ρ, θ_link]` jointly.
+    ///
+    /// # Parameters
+    ///
+    /// - `rho`: log-smoothing parameters (penalty coordinates only, length k)
+    /// - `mode`: evaluation mode (cost-only, cost+gradient, cost+gradient+Hessian)
+    ///
+    /// # Returns
+    ///
+    /// `RemlLamlResult` whose gradient (when requested) has length `k + aux_dim`,
+    /// with the link parameters appended after the ρ coordinates. The caller is
+    /// responsible for:
+    /// - Applying SAS epsilon reparameterization chain rule (`grad[k] *= d_eps/d_raw`)
+    /// - Adding SAS ridge/barrier gradient contributions to `grad[k+1]`
+    /// - Adding SAS ridge/barrier cost contributions to `result.cost`
+    pub fn evaluate_unified_with_link_ext(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let bundle = self.obtain_eval_bundle(rho)?;
+
+        // Build link ext_coords from the current runtime link state.
+        let ext_coords = if let Some(sas_state) = &self.runtime_sas_link_state {
+            let is_beta_logistic = matches!(
+                self.config.link_function(),
+                crate::types::LinkFunction::BetaLogistic
+            );
+            self.build_sas_link_ext_coords(&bundle, sas_state, is_beta_logistic)?
+        } else if let Some(mix_state) = &self.runtime_mixture_link_state {
+            self.build_mixture_link_ext_coords(&bundle, mix_state)?
+        } else {
+            Vec::new()
+        };
+
+        if ext_coords.is_empty() {
+            // No link parameters to optimize — fall back to standard path.
+            return self.evaluate_unified(rho, &bundle, mode);
+        }
+
+        // Delegate to the existing ext_coords injection path.
+        // No pair callbacks for link parameters: the outer Hessian for link
+        // coords is left to BFGS (HessianResult::Unavailable). This matches
+        // the current behavior where link parameters have gradient-only.
+        self.evaluate_unified_with_ext_from_bundle(
+            rho, &bundle, mode, ext_coords, None, None,
+        )
     }
 }
