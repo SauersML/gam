@@ -2593,6 +2593,9 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params,
+            // Joint models have both rho (penalty) and potentially psi (design-moving)
+            // coordinates. Conservatively false.
+            all_penalty_like: false,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
@@ -2606,6 +2609,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
                 snap.restore(state);
             }
         },
+        efs_fn: None::<fn(&mut JointRemlState<'_>, &Array1<f64>) -> Result<crate::solver::strategy::EfsEval, crate::estimate::EstimationError>>,
     };
 
     let result =

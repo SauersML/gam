@@ -1571,7 +1571,8 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::strategy::{
-            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+            ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+            OuterEval,
         };
 
         let outer_config = OuterConfig {
@@ -1590,6 +1591,7 @@ where
                 gradient: Derivative::Analytic,
                 hessian: Derivative::Analytic,
                 n_params: k,
+                all_penalty_like: true,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
@@ -1613,6 +1615,9 @@ where
                 // State is accessed to satisfy the borrow checker.
                 let _ = state.x();
             },
+            efs_fn: Some(|state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+                state.compute_efs_steps(rho)
+            }),
         };
 
         let strategy_result =
@@ -1670,7 +1675,8 @@ where
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         smoothing_options_mix.seed_config.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::strategy::{
-            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+            ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+            OuterEval,
         };
         let initial_link_kind = cfg.link_kind.clone();
         let outer_config = OuterConfig {
@@ -1688,6 +1694,8 @@ where
                 gradient: Derivative::Analytic,
                 hessian: Derivative::Unavailable,
                 n_params: theta_dim,
+                // Mixture/SAS coords are design-moving (not penalty-like).
+                all_penalty_like: false,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let rho = theta.slice(s![..k]).to_owned();
@@ -2111,6 +2119,7 @@ where
                 );
                 let _ = state.x();
             },
+            efs_fn: None::<fn(&mut &mut self::reml::RemlState<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         };
         let strategy_result = crate::solver::strategy::run_outer(
             &mut obj,
@@ -2891,7 +2900,7 @@ where
     eval(&reml_state, &hyper_dirs)
 }
 
-pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
+pub fn compute_external_joint_hypercostgradienthessian<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,

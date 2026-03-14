@@ -80,7 +80,8 @@ pub use solver::estimate::{
     FitResultParts, FittedBlock, FittedLinkParameters, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     UnifiedFitResult, UnifiedFitResultParts, coefficient_uncertainty,
-    coefficient_uncertaintywith_mode, fit_gam, optimize_external_design, predict_gam,
+    coefficient_uncertaintywith_mode, compute_external_joint_hypercostgradienthessian,
+    fit_gam, optimize_external_design, predict_gam,
     predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use terms::basis::{

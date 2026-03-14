@@ -1235,13 +1235,7 @@ pub fn reml_laml_evaluate(
             all_h_k_matrices.push(h_i);
         }
 
-        let config = StochasticTraceConfig {
-            n_probes_min: 30,
-            n_probes_max: 80,
-            relative_tol: 0.05,
-            ..StochasticTraceConfig::default()
-        };
-        let estimator = StochasticTraceEstimator::new(config);
+        let estimator = StochasticTraceEstimator::with_defaults();
         let refs: Vec<&Array2<f64>> = all_h_k_matrices.iter().collect();
         Some(estimator.estimate_traces(hop, &refs))
     } else {
@@ -3250,6 +3244,7 @@ pub fn stochastic_trace_hinv_product(
     StochasticTraceEstimator::new(config.clone()).estimate_single_trace(hop, a)
 }
 
+
 // Lightweight xoshiro256ss RNG
 //
 // We use a self-contained xoshiro256ss implementation so that the stochastic
@@ -3705,5 +3700,364 @@ mod tests {
         let mut rng2 = Xoshiro256SS::from_seed(99);
         let z2 = rademacher_probe(100, &mut rng2);
         assert_eq!(z, z2, "Same seed must produce identical probes");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Test 1: Spectral logdet gradient with r_epsilon regularization
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Verify that the analytic gradient of log|H(t)| computed through
+    /// `DenseSpectralOperator` (with smooth spectral regularization r_epsilon)
+    /// matches a central finite-difference estimate.
+    ///
+    /// Setup: H(t) = diag(2 + t, 0.01 + 2t, 3 - t) — one eigenvalue near
+    /// zero so the regularization is exercised.
+    #[test]
+    fn test_spectral_logdet_gradient_fd() {
+        let t0 = 0.0_f64;
+        let h_step = 1e-6;
+
+        // H(t) = diag(2+t, 0.01+2t, 3-t)
+        // dH/dt = diag(1, 2, -1)
+        let dh_dt = Array2::from_diag(&array![1.0, 2.0, -1.0]);
+
+        // Build operator at t0
+        let h0 = Array2::from_diag(&array![2.0 + t0, 0.01 + 2.0 * t0, 3.0 - t0]);
+        let op0 = DenseSpectralOperator::from_symmetric(&h0).unwrap();
+
+        // Analytic gradient: d/dt log|R_eps(H(t))| = tr(G_eps(H) dH/dt)
+        let analytic = op0.trace_logdet_gradient(&dh_dt);
+
+        // Finite difference: (logdet(t+h) - logdet(t-h)) / (2h)
+        let h_plus =
+            Array2::from_diag(&array![2.0 + t0 + h_step, 0.01 + 2.0 * (t0 + h_step), 3.0 - (t0 + h_step)]);
+        let h_minus =
+            Array2::from_diag(&array![2.0 + t0 - h_step, 0.01 + 2.0 * (t0 - h_step), 3.0 - (t0 - h_step)]);
+        let op_plus = DenseSpectralOperator::from_symmetric(&h_plus).unwrap();
+        let op_minus = DenseSpectralOperator::from_symmetric(&h_minus).unwrap();
+        let fd = (op_plus.logdet() - op_minus.logdet()) / (2.0 * h_step);
+
+        let rel_err = (analytic - fd).abs() / fd.abs().max(1e-12);
+        assert!(
+            rel_err < 1e-5,
+            "Spectral logdet gradient mismatch: analytic={:.10e}, fd={:.10e}, rel_err={:.3e}",
+            analytic,
+            fd,
+            rel_err,
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Test 2: Moving nullspace correction for penalty pseudo-logdet
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Helper: build a 3x3 penalty matrix S(psi) whose nullspace rotates.
+    ///
+    /// S(psi) = R(psi) diag(s1, s2, 0) R(psi)^T
+    /// where R(psi) is a rotation around the z-axis by angle psi.
+    /// The nullspace is spanned by R(psi) * e3, which rotates as psi changes.
+    fn rotating_nullspace_penalty(psi: f64, s1: f64, s2: f64) -> Array2<f64> {
+        let c = psi.cos();
+        let s = psi.sin();
+        // R rotates in the (0,2) plane so the nullspace direction changes.
+        let r = array![
+            [c, 0.0, -s],
+            [0.0, 1.0, 0.0],
+            [s, 0.0, c],
+        ];
+        let d = Array2::from_diag(&array![s1, s2, 0.0]);
+        r.dot(&d).dot(&r.t())
+    }
+
+    /// Compute log|S|_+ (pseudo-logdeterminant over positive eigenvalues).
+    fn pseudo_logdet(s: &Array2<f64>, tol: f64) -> f64 {
+        let (eigs, _) = s.eigh(faer::Side::Lower).unwrap();
+        eigs.iter().filter(|&&v| v > tol).map(|v| v.ln()).sum()
+    }
+
+    /// Compute d/dpsi log|S(psi)|_+ by central finite difference.
+    fn pseudo_logdet_fd_first(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
+        let sp = rotating_nullspace_penalty(psi + h, s1, s2);
+        let sm = rotating_nullspace_penalty(psi - h, s1, s2);
+        (pseudo_logdet(&sp, tol) - pseudo_logdet(&sm, tol)) / (2.0 * h)
+    }
+
+    /// Compute d^2/dpsi^2 log|S(psi)|_+ by central finite difference.
+    fn pseudo_logdet_fd_second(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
+        let sp = pseudo_logdet(&rotating_nullspace_penalty(psi + h, s1, s2), tol);
+        let s0 = pseudo_logdet(&rotating_nullspace_penalty(psi, s1, s2), tol);
+        let sm = pseudo_logdet(&rotating_nullspace_penalty(psi - h, s1, s2), tol);
+        (sp - 2.0 * s0 + sm) / (h * h)
+    }
+
+    /// Analytic second derivative of log|S(psi)|_+ WITH the moving-nullspace
+    /// correction, and WITHOUT it, so we can verify the correction is needed.
+    ///
+    /// Returns (with_correction, without_correction).
+    fn analytic_pseudo_logdet_second(
+        psi: f64,
+        s1: f64,
+        s2: f64,
+        tol: f64,
+    ) -> (f64, f64) {
+        let s_mat = rotating_nullspace_penalty(psi, s1, s2);
+
+        // Eigendecompose S
+        let (eigs, vecs) = s_mat.eigh(faer::Side::Lower).unwrap();
+        let p = eigs.len();
+
+        let pos_idx: Vec<usize> = (0..p).filter(|&i| eigs[i] > tol).collect();
+        let null_idx: Vec<usize> = (0..p).filter(|&i| eigs[i] <= tol).collect();
+
+        // Build S_psi = dS/dpsi analytically.
+        // S(psi) = R D R^T => dS/dpsi = R' D R^T + R D R'^T
+        let c = psi.cos();
+        let s = psi.sin();
+        let r = array![
+            [c, 0.0, -s],
+            [0.0, 1.0, 0.0],
+            [s, 0.0, c],
+        ];
+        // R' = dR/dpsi
+        let rp = array![
+            [-s, 0.0, -c],
+            [0.0, 0.0, 0.0],
+            [c, 0.0, -s],
+        ];
+        let d = Array2::from_diag(&array![s1, s2, 0.0]);
+        let s_psi = rp.dot(&d).dot(&r.t()) + r.dot(&d).dot(&rp.t());
+
+        // Build S_psi_psi = d^2S/dpsi^2 analytically.
+        // R'' = d^2R/dpsi^2
+        let rpp = array![
+            [-c, 0.0, s],
+            [0.0, 0.0, 0.0],
+            [-s, 0.0, -c],
+        ];
+        let s_psi_psi = rpp.dot(&d).dot(&r.t())
+            + 2.0 * &rp.dot(&d).dot(&rp.t())
+            + r.dot(&d).dot(&rpp.t());
+
+        // Build S^+ (pseudoinverse): S^+ = V diag(1/sigma_i for pos, 0 for null) V^T
+        let mut s_dag = Array2::<f64>::zeros((p, p));
+        for &i in &pos_idx {
+            let col = vecs.column(i);
+            for r in 0..p {
+                for c2 in 0..p {
+                    s_dag[[r, c2]] += col[r] * col[c2] / eigs[i];
+                }
+            }
+        }
+
+        // Fixed-nullspace formula:
+        //   d^2/dpsi^2 log|S|_+ = tr(S^+ S_psi_psi) - tr(S^+ S_psi S^+ S_psi)
+        let sdag_s_psi = s_dag.dot(&s_psi);
+        let term_linear = trace_mat(&s_dag.dot(&s_psi_psi));
+        let term_quad = trace_mat(&sdag_s_psi.dot(&sdag_s_psi));
+        let without_correction = term_linear - term_quad;
+
+        // Moving-nullspace correction:
+        //   +2 * tr(S^{+2} S_psi P_0 S_psi)
+        // where P_0 = U_0 U_0^T, S^{+2} = (S^+)^2
+        //
+        // Efficient: tr(Sigma^{+2} L L^T) where L = U_+^T S_psi U_0
+        let mut correction = 0.0_f64;
+        if !pos_idx.is_empty() && !null_idx.is_empty() {
+            // Build U_+ and U_0
+            let n_pos = pos_idx.len();
+            let n_null = null_idx.len();
+            let mut u_pos = Array2::<f64>::zeros((p, n_pos));
+            let mut u_null = Array2::<f64>::zeros((p, n_null));
+            for (out, &idx) in pos_idx.iter().enumerate() {
+                u_pos.column_mut(out).assign(&vecs.column(idx));
+            }
+            for (out, &idx) in null_idx.iter().enumerate() {
+                u_null.column_mut(out).assign(&vecs.column(idx));
+            }
+
+            // L = U_+^T S_psi U_0  (n_pos x n_null)
+            let l_mat = u_pos.t().dot(&s_psi.dot(&u_null));
+
+            // Sigma^{+2} = diag(1/sigma_i^2) for positive eigenvalues
+            for a in 0..n_pos {
+                let sigma_inv_sq = 1.0 / (eigs[pos_idx[a]] * eigs[pos_idx[a]]);
+                correction += sigma_inv_sq * l_mat.row(a).dot(&l_mat.row(a));
+            }
+            // The full correction is 2 * tr(Sigma^{+2} L L^T)
+            correction *= 2.0;
+        }
+
+        let with_correction = without_correction + correction;
+        (with_correction, without_correction)
+    }
+
+    /// tr(A) for a square matrix.
+    fn trace_mat(a: &Array2<f64>) -> f64 {
+        (0..a.nrows()).map(|i| a[[i, i]]).sum()
+    }
+
+    #[test]
+    fn test_moving_nullspace_correction_needed() {
+        // S(psi) = R(psi) diag(4, 1, 0) R(psi)^T — rank-2, nullspace rotates.
+        let s1 = 4.0;
+        let s2 = 1.0;
+        let psi = 0.3; // nonzero angle
+        let tol = 1e-10;
+        let h = 1e-5;
+
+        let fd_second = pseudo_logdet_fd_second(psi, h, s1, s2, tol);
+        let (with_corr, without_corr) = analytic_pseudo_logdet_second(psi, s1, s2, tol);
+
+        // WITH correction should match FD
+        let rel_err_with = (with_corr - fd_second).abs() / fd_second.abs().max(1e-12);
+        assert!(
+            rel_err_with < 1e-4,
+            "With correction: analytic={:.8e}, fd={:.8e}, rel_err={:.3e}",
+            with_corr,
+            fd_second,
+            rel_err_with,
+        );
+
+        // WITHOUT correction should NOT match FD (error should be large)
+        let rel_err_without = (without_corr - fd_second).abs() / fd_second.abs().max(1e-12);
+        assert!(
+            rel_err_without > 1e-2,
+            "Without correction should disagree with FD: \
+             without={:.8e}, fd={:.8e}, rel_err={:.3e} (expected > 1e-2)",
+            without_corr,
+            fd_second,
+            rel_err_without,
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Test 3: Correction vanishes when nullspace is fixed
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fixed_nullspace_correction_vanishes() {
+        // S(rho) = diag(exp(rho1), exp(rho2), 0) — the nullspace is always e3,
+        // regardless of rho. The correction terms should vanish, so both
+        // formulas (with and without correction) should agree with FD.
+        let tol = 1e-10;
+        let h = 1e-5;
+
+        // Evaluate at a specific point
+        let rho1 = 0.5_f64;
+        let rho2 = -0.3_f64;
+
+        // Pseudo-logdet: log(exp(rho1)) + log(exp(rho2)) = rho1 + rho2
+        // d/drho1 = 1, d^2/drho1^2 = 0 (exact).
+        // But let's verify via the analytic+FD machinery for consistency.
+
+        // We parameterize by a single scalar t: rho1 = 0.5 + t, rho2 = -0.3 + 2t.
+        // S(t) = diag(exp(0.5+t), exp(-0.3+2t), 0)
+        // log|S|_+ = (0.5+t) + (-0.3+2t) = 0.2 + 3t
+        // d/dt = 3, d^2/dt^2 = 0.
+
+        let build_s = |t: f64| -> Array2<f64> {
+            Array2::from_diag(&array![
+                (rho1 + t).exp(),
+                (rho2 + 2.0 * t).exp(),
+                0.0
+            ])
+        };
+
+        let t0 = 0.0_f64;
+
+        // FD second derivative
+        let ld_plus = pseudo_logdet(&build_s(t0 + h), tol);
+        let ld_0 = pseudo_logdet(&build_s(t0), tol);
+        let ld_minus = pseudo_logdet(&build_s(t0 - h), tol);
+        let fd_second = (ld_plus - 2.0 * ld_0 + ld_minus) / (h * h);
+
+        // Analytic: S_t = diag(exp(rho1+t), 2*exp(rho2+2t), 0)
+        // S_tt = diag(exp(rho1+t), 4*exp(rho2+2t), 0)
+        let s_mat = build_s(t0);
+        let s_t = Array2::from_diag(&array![
+            (rho1 + t0).exp(),
+            2.0 * (rho2 + 2.0 * t0).exp(),
+            0.0
+        ]);
+        let s_tt = Array2::from_diag(&array![
+            (rho1 + t0).exp(),
+            4.0 * (rho2 + 2.0 * t0).exp(),
+            0.0
+        ]);
+
+        let (eigs, vecs) = s_mat.eigh(faer::Side::Lower).unwrap();
+        let p = 3;
+        let pos_idx: Vec<usize> = (0..p).filter(|&i| eigs[i] > tol).collect();
+        let null_idx: Vec<usize> = (0..p).filter(|&i| eigs[i] <= tol).collect();
+
+        // Build S^+
+        let mut s_dag = Array2::<f64>::zeros((p, p));
+        for &i in &pos_idx {
+            let col = vecs.column(i);
+            for r in 0..p {
+                for c in 0..p {
+                    s_dag[[r, c]] += col[r] * col[c] / eigs[i];
+                }
+            }
+        }
+
+        // Fixed-nullspace formula
+        let sdag_s_t = s_dag.dot(&s_t);
+        let term_linear = trace_mat(&s_dag.dot(&s_tt));
+        let term_quad = trace_mat(&sdag_s_t.dot(&sdag_s_t));
+        let without_correction = term_linear - term_quad;
+
+        // Compute the correction (should be ~0 since nullspace doesn't move)
+        let mut correction = 0.0_f64;
+        if !pos_idx.is_empty() && !null_idx.is_empty() {
+            let n_pos = pos_idx.len();
+            let n_null = null_idx.len();
+            let mut u_pos = Array2::<f64>::zeros((p, n_pos));
+            let mut u_null = Array2::<f64>::zeros((p, n_null));
+            for (out, &idx) in pos_idx.iter().enumerate() {
+                u_pos.column_mut(out).assign(&vecs.column(idx));
+            }
+            for (out, &idx) in null_idx.iter().enumerate() {
+                u_null.column_mut(out).assign(&vecs.column(idx));
+            }
+            let l_mat = u_pos.t().dot(&s_t.dot(&u_null));
+            for a in 0..n_pos {
+                let sigma_inv_sq = 1.0 / (eigs[pos_idx[a]] * eigs[pos_idx[a]]);
+                correction += sigma_inv_sq * l_mat.row(a).dot(&l_mat.row(a));
+            }
+            correction *= 2.0;
+        }
+
+        // The correction should be negligible (nullspace is fixed)
+        assert!(
+            correction.abs() < 1e-12,
+            "Correction should vanish for fixed nullspace, got {:.3e}",
+            correction,
+        );
+
+        // Both formulas should match FD
+        let with_correction = without_correction + correction;
+        let rel_err_with = (with_correction - fd_second).abs() / fd_second.abs().max(1e-12);
+        let rel_err_without = (without_correction - fd_second).abs() / fd_second.abs().max(1e-12);
+
+        // For diag(e^a, e^b, 0), d^2/dt^2 log|S|_+ = 0, so use absolute error
+        // since fd_second ~ 0.
+        let abs_err_with = (with_correction - fd_second).abs();
+        let abs_err_without = (without_correction - fd_second).abs();
+        assert!(
+            abs_err_with < 1e-4,
+            "With correction should match FD: with={:.8e}, fd={:.8e}, abs_err={:.3e}",
+            with_correction,
+            fd_second,
+            abs_err_with,
+        );
+        assert!(
+            abs_err_without < 1e-4,
+            "Without correction should also match FD (fixed nullspace): \
+             without={:.8e}, fd={:.8e}, abs_err={:.3e}",
+            without_correction,
+            fd_second,
+            abs_err_without,
+        );
     }
 }

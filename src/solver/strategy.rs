@@ -36,6 +36,11 @@ pub struct OuterCapability {
     pub hessian: Derivative,
     /// Number of smoothing (+ any auxiliary hyper-) parameters being optimized.
     pub n_params: usize,
+    /// Whether all hyperparameter coordinates (both rho and any extended coords)
+    /// are penalty-like. When true, the EFS (Extended Fellner-Schall) fixed-point
+    /// optimizer is eligible. When false (e.g. psi/design-moving coordinates),
+    /// EFS cannot be used because the multiplicative update structure breaks down.
+    pub all_penalty_like: bool,
 }
 
 /// Which solver algorithm to use for the outer optimization.
@@ -47,6 +52,11 @@ pub enum Solver {
     NewtonTrustRegion,
     /// L-BFGS; gradient only, builds curvature from history.
     Bfgs,
+    /// Extended Fellner-Schall; multiplicative fixed-point iteration.
+    /// Only valid when all hyperparameter coordinates are penalty-like.
+    /// Needs no gradient or Hessian — only traces tr(H^{-1} A_k) and
+    /// Frobenius norms from the inner solution.
+    Efs,
 }
 
 /// How the Hessian will be obtained for the outer optimizer.
@@ -60,6 +70,9 @@ pub enum HessianSource {
     /// No explicit Hessian; BFGS builds a rank-2 approximation from
     /// gradient history.
     BfgsApprox,
+    /// No explicit Hessian or gradient needed. EFS uses traces and
+    /// Frobenius norms from the inner solution directly.
+    EfsFixedPoint,
 }
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
@@ -98,6 +111,14 @@ pub fn plan(cap: OuterCapability) -> OuterPlan {
         (Analytic, Unavailable) if cap.n_params <= 8 => OuterPlan {
             solver: S::NewtonTrustRegion,
             hessian_source: H::FiniteDifference,
+        },
+
+        // EFS: all penalty-like coords, no analytic Hessian, many params.
+        // Multiplicative fixed-point needs only traces — no gradient evals.
+        // Much cheaper than BFGS for k=10-50 smoothing parameters.
+        (_, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
+            solver: S::Efs,
+            hessian_source: H::EfsFixedPoint,
         },
 
         // With many params, FD Hessian is too expensive; fall back to BFGS.
@@ -186,6 +207,21 @@ impl HessianResult {
     }
 }
 
+/// Result of an EFS (Extended Fellner-Schall) evaluation at a given rho.
+///
+/// Contains the REML/LAML cost at the current rho and the additive step
+/// vector produced by `compute_efs_update`. The caller applies the step as
+/// `rho_new[i] = rho[i] + steps[i]`.
+#[derive(Clone, Debug)]
+pub struct EfsEval {
+    /// REML/LAML cost at the current rho (for convergence monitoring and
+    /// comparing candidates).
+    pub cost: f64,
+    /// Additive EFS steps. Length = n_rho + n_ext_coords.
+    /// Steps for non-penalty-like coordinates are 0.0.
+    pub steps: Vec<f64>,
+}
+
 /// Common interface for outer smoothing-parameter objectives.
 ///
 /// Every model path that optimizes smoothing parameters implements this trait.
@@ -201,6 +237,10 @@ impl HessianResult {
 ///   `HessianResult::Unavailable`. The runner handles FD or BFGS.
 /// - `eval_cost()` is used for seed screening (cheap, no gradient needed).
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
+/// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
+///   builds the `InnerSolution`, and computes the EFS step vector. The default
+///   implementation returns an error; only objectives that support EFS need
+///   to override it.
 /// - `reset()` restores state to a clean baseline (for multi-start).
 pub trait OuterObjective {
     /// Declare what this objective can compute analytically.
@@ -212,6 +252,15 @@ pub trait OuterObjective {
     /// Evaluate cost + gradient + (if capable) Hessian.
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError>;
 
+    /// Evaluate cost + EFS step vector. Only needed when the plan selects
+    /// `Solver::Efs`. The default returns an error indicating EFS is not
+    /// supported by this objective.
+    fn eval_efs(&mut self, _rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(
+            "EFS evaluation not implemented for this objective".to_string(),
+        ))
+    }
+
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
 }
@@ -221,19 +270,23 @@ pub trait OuterObjective {
 /// This allows any call site to construct an `OuterObjective` from closures
 /// without needing to define a wrapper struct or modify the state type.
 /// Each call site wraps its existing methods into closures and passes them here.
-pub struct ClosureObjective<S, Fc, Fe, Fr> {
+pub struct ClosureObjective<S, Fc, Fe, Fr, Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>> {
     pub state: S,
     pub cap: OuterCapability,
     pub cost_fn: Fc,
     pub eval_fn: Fe,
     pub reset_fn: Fr,
+    /// Optional EFS evaluation closure. When `None`, the default
+    /// `OuterObjective::eval_efs` returns an error.
+    pub efs_fn: Option<Fefs>,
 }
 
-impl<S, Fc, Fe, Fr> OuterObjective for ClosureObjective<S, Fc, Fe, Fr>
+impl<S, Fc, Fe, Fr, Fefs> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
     Fr: FnMut(&mut S),
+    Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
 {
     fn capability(&self) -> OuterCapability {
         self.cap
@@ -245,6 +298,15 @@ where
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         (self.eval_fn)(&mut self.state, rho)
+    }
+
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        match self.efs_fn.as_mut() {
+            Some(f) => f(&mut self.state, rho),
+            None => Err(EstimationError::RemlOptimizationFailed(
+                "EFS evaluation not implemented for this objective".to_string(),
+            )),
+        }
     }
 
     fn reset(&mut self) {
@@ -668,6 +730,82 @@ pub fn run_outer(
                     ))),
                 }
             }
+            Solver::Efs => {
+                // EFS (Extended Fellner-Schall) multiplicative fixed-point loop.
+                //
+                // Each iteration:
+                //   1. Run inner P-IRLS at current rho to get InnerSolution
+                //   2. Compute EFS step from traces tr(H^{-1} A_k) and Frobenius norms
+                //   3. Apply: rho_new = rho + step (additive in log-lambda space)
+                //   4. Clamp to bounds
+                //   5. Check convergence via step norm
+                //
+                // No line search needed — the multiplicative fixed-point is
+                // guaranteed to decrease REML for penalty-like coordinates.
+                let max_efs_iter = config.max_iter;
+                let efs_tol = config.tolerance;
+                let (lo, hi) = &bounds_template;
+
+                let mut rho = seed.clone();
+                let mut last_cost = f64::INFINITY;
+                let mut total_iter = 0_usize;
+                let mut converged = false;
+
+                for _iter in 0..max_efs_iter {
+                    total_iter += 1;
+
+                    let efs_eval = match obj.eval_efs(&rho) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            log::debug!(
+                                "[OUTER] EFS iteration {_iter} failed: {e}; using last rho"
+                            );
+                            break;
+                        }
+                    };
+
+                    if !efs_eval.cost.is_finite() {
+                        log::debug!(
+                            "[OUTER] EFS iteration {_iter}: non-finite cost; stopping"
+                        );
+                        break;
+                    }
+                    last_cost = efs_eval.cost;
+
+                    // Apply steps and clamp to bounds.
+                    let mut step_sq_sum = 0.0_f64;
+                    for i in 0..cap.n_params {
+                        let step_i = if i < efs_eval.steps.len() {
+                            efs_eval.steps[i]
+                        } else {
+                            0.0
+                        };
+                        let new_val = (rho[i] + step_i).clamp(lo[i], hi[i]);
+                        let actual_step = new_val - rho[i];
+                        step_sq_sum += actual_step * actual_step;
+                        rho[i] = new_val;
+                    }
+
+                    let step_norm = step_sq_sum.sqrt();
+                    log::trace!(
+                        "[OUTER] EFS iter {_iter}: cost={:.6e}, step_norm={:.4e}",
+                        last_cost,
+                        step_norm
+                    );
+
+                    if step_norm < efs_tol {
+                        converged = true;
+                        break;
+                    }
+                }
+
+                Ok(RawOuterCandidate {
+                    rho,
+                    final_value: last_cost,
+                    iterations: total_iter,
+                    converged,
+                })
+            }
         };
 
         match result.and_then(|candidate| finalize_candidate(obj, candidate)) {
@@ -706,6 +844,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 3,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -718,6 +857,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 3,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::NewtonTrustRegion);
@@ -730,6 +870,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 12,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -743,6 +884,7 @@ mod tests {
                 gradient: Derivative::Unavailable,
                 hessian: Derivative::Unavailable,
                 n_params: n,
+                all_penalty_like: false,
             };
             let p = plan(cap);
             assert_eq!(p.solver, Solver::Bfgs);
@@ -756,6 +898,7 @@ mod tests {
             gradient: Derivative::Unavailable,
             hessian: Derivative::Analytic,
             n_params: 3,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -767,6 +910,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 8,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
@@ -778,9 +922,64 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 9,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn plan_efs_selected_for_penalty_like_many_params() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: true,
+        };
+        let p = plan(cap);
+        assert_eq!(p.solver, Solver::Efs);
+        assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_efs_not_selected_few_params_even_if_penalty_like() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 5,
+            all_penalty_like: true,
+        };
+        let p = plan(cap);
+        // With few params and analytic gradient, FD Newton is better.
+        assert_eq!(p.solver, Solver::NewtonTrustRegion);
+    }
+
+    #[test]
+    fn plan_efs_not_selected_with_analytic_hessian() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 20,
+            all_penalty_like: true,
+        };
+        let p = plan(cap);
+        // Arc is always preferred when analytic Hessian is available.
+        assert_eq!(p.solver, Solver::Arc);
+    }
+
+    #[test]
+    fn plan_efs_with_no_gradient_penalty_like_many_params() {
+        // Even without analytic gradient, EFS works because it doesn't
+        // need the gradient at all.
+        let cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params: 20,
+            all_penalty_like: true,
+        };
+        let p = plan(cap);
+        assert_eq!(p.solver, Solver::Efs);
+        assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
     }
 
     #[test]
@@ -805,6 +1004,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 0,
+            all_penalty_like: false,
         };
         let p = plan(cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -829,6 +1029,7 @@ mod tests {
                 gradient: Derivative::Analytic,
                 hessian: Derivative::Unavailable,
                 n_params: 1,
+                all_penalty_like: false,
             },
             cost_fn: |st: &mut i32, rho: &Array1<f64>| {
                 let _ = (*st, rho.len());
@@ -845,6 +1046,7 @@ mod tests {
             reset_fn: |st: &mut i32| {
                 *st = 42;
             },
+            efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
