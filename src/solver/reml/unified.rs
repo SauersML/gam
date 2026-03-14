@@ -1955,8 +1955,22 @@ fn compute_outer_hessian(
         c.b_operator.as_ref().map_or(false, |op| op.is_implicit())
     });
     let total_p = hop.dim();
-    let use_stochastic_cross_traces =
-        any_ext_implicit && total_p > 500 && hop.is_dense() && incl_logdet_h;
+    // Stochastic cross-traces are only used when:
+    // (1) implicit operators are present
+    // (2) problem is large (p > 500)
+    // (3) dense operator (eigendecomposition-based)
+    // (4) logdet_h is included
+    // (5) no third-derivative corrections (Gaussian family)
+    //
+    // Condition (5) ensures correctness: the stochastic estimator uses
+    // B_d (the implicit operator) which equals Ḣ_d only when C[v_d] = 0.
+    // For non-Gaussian families, Ḣ_d = B_d + C[v_d] and the correction
+    // is a dense p x p matrix, so we fall back to dense materialization.
+    let use_stochastic_cross_traces = any_ext_implicit
+        && total_p > 500
+        && hop.is_dense()
+        && incl_logdet_h
+        && !effective_deriv.has_corrections();
 
     // Precompute ext mode responses and total Hessian drifts.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
@@ -2873,7 +2887,6 @@ fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
 
 /// Derivative of the smooth spectral regularizer: `r'_ε(σ) = ½(1 + σ/√(σ² + 4ε²))`.
 #[inline]
-#[allow(dead_code)]
 fn spectral_regularize_deriv(sigma: f64, epsilon: f64) -> f64 {
     let four_eps_sq = 4.0 * epsilon * epsilon;
     0.5 * (1.0 + sigma / (sigma * sigma + four_eps_sq).sqrt())
@@ -3891,7 +3904,6 @@ impl StochasticTraceEstimator {
     ///
     /// # Returns
     /// Estimated D×D matrix of `tr(H⁻¹ A_d H⁻¹ A_e)` values, symmetrized.
-    #[allow(dead_code)]
     pub fn estimate_second_order_traces(
         &self,
         hop: &dyn HessianOperator,
@@ -3920,6 +3932,10 @@ impl StochasticTraceEstimator {
             None
         };
 
+        // NOTE: uses a fixed probe count (no adaptive stopping) because
+        // monitoring convergence of a D x D matrix of estimates is more
+        // complex than for a scalar trace. The symmetrization at the end
+        // effectively doubles the sample count for variance reduction.
         for _ in 0..self.config.n_probes_max {
             let z = rademacher_probe(p, &mut rng_state);
 
@@ -4001,8 +4017,7 @@ impl StochasticTraceEstimator {
                         let x_re = x_r.column(e);
 
                         let dx_u = &implicit_dx_u[oi];
-                        let r_e_owned = r_e.to_owned();
-                        let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e_owned.view());
+                        let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e);
 
                         let w = &*op.w_diag;
                         let mut design_val = 0.0f64;
@@ -4031,8 +4046,7 @@ impl StochasticTraceEstimator {
                             let x_rd = x_r.column(d);
 
                             let dx_u = &implicit_dx_u[oi];
-                            let r_d_owned = r_d.to_owned();
-                            let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d_owned.view());
+                            let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d);
 
                             let w = &*op.w_diag;
                             let mut design_val = 0.0f64;
@@ -4231,6 +4245,19 @@ mod tests {
         assert!((op.logdet() - expected_logdet).abs() < 1e-10);
         let trace = op.trace_hinv_product(&Array2::eye(2));
         assert!(trace.is_finite());
+
+        // Verify spectral_regularize_deriv via finite differences
+        let fd_h = 1e-7;
+        for &sigma in &[0.0, 2.0, -0.5, 1.0] {
+            let analytic = spectral_regularize_deriv(sigma, epsilon);
+            let fd = (spectral_regularize(sigma + fd_h, epsilon)
+                - spectral_regularize(sigma - fd_h, epsilon))
+                / (2.0 * fd_h);
+            assert!(
+                (analytic - fd).abs() < 1e-5,
+                "spectral_regularize_deriv mismatch at sigma={sigma}: analytic={analytic}, fd={fd}"
+            );
+        }
     }
 
     #[test]
@@ -4635,7 +4662,6 @@ mod tests {
     }
 
     /// Compute d/dpsi log|S(psi)|_+ by central finite difference.
-    #[allow(dead_code)]
     fn pseudo_logdet_fd_first(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
         let sp = rotating_nullspace_penalty(psi + h, s1, s2);
         let sm = rotating_nullspace_penalty(psi - h, s1, s2);
@@ -4764,6 +4790,14 @@ mod tests {
         let psi = 0.3; // nonzero angle
         let tol = 1e-10;
         let h = 1e-5;
+
+        // Sanity-check: first derivative via FD should be finite and nonzero
+        // (the pseudo-logdet changes with psi because the nullspace rotates).
+        let fd_first = pseudo_logdet_fd_first(psi, h, s1, s2, tol);
+        assert!(
+            fd_first.is_finite() && fd_first.abs() > 1e-12,
+            "First derivative should be finite and nonzero for rotating nullspace, got {fd_first}"
+        );
 
         let fd_second = pseudo_logdet_fd_second(psi, h, s1, s2, tol);
         let (with_corr, without_corr) = analytic_pseudo_logdet_second(psi, s1, s2, tol);
