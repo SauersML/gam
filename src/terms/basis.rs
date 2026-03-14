@@ -2178,37 +2178,44 @@ impl ImplicitDesignPsiDerivative {
 
     /// Materialize the full (n × p_out) first-derivative matrix for axis d.
     ///
-    /// This is the dense fallback for debugging or small-problem compatibility.
-    /// Avoid calling this for large problems — it defeats the purpose of implicit operators.
+    /// Efficient O(n * k) construction: builds the raw (n × k) kernel derivative
+    /// matrix directly, then projects through identifiability transforms.
+    /// This is used when the dense matrix is needed temporarily (e.g., for
+    /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Array2<f64> {
         debug_assert!(axis < self.n_axes);
         let n = self.n;
-        let p = self.p_out();
-        let mut out = Array2::<f64>::zeros((n, p));
-        let mut ei = Array1::<f64>::zeros(n);
+        let k = self.n_knots;
+
+        // Build raw (n × k) kernel derivative: row i, col j = q_{ij} * s_{d,ij}.
+        let mut raw = Array2::<f64>::zeros((n, k));
         for i in 0..n {
-            ei[i] = 1.0;
-            let col = self.transpose_mul(axis, &ei.view());
-            out.row_mut(i).assign(&col);
-            ei[i] = 0.0;
+            let base = i * k;
+            for j in 0..k {
+                raw[[i, j]] = self.q_values[base + j] * self.axis_fractions[[base + j, axis]];
+            }
         }
-        out
+
+        self.project_matrix(raw)
     }
 
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
         debug_assert!(axis < self.n_axes);
         let n = self.n;
-        let p = self.p_out();
-        let mut out = Array2::<f64>::zeros((n, p));
-        let mut ei = Array1::<f64>::zeros(n);
+        let k = self.n_knots;
+
+        let mut raw = Array2::<f64>::zeros((n, k));
         for i in 0..n {
-            ei[i] = 1.0;
-            let col = self.transpose_mul_second_diag(axis, &ei.view());
-            out.row_mut(i).assign(&col);
-            ei[i] = 0.0;
+            let base = i * k;
+            for j in 0..k {
+                let s = self.axis_fractions[[base + j, axis]];
+                raw[[i, j]] = 2.0 * self.q_values[base + j] * s
+                    + self.t_values[base + j] * s * s;
+            }
         }
-        out
+
+        self.project_matrix(raw)
     }
 
     /// Materialize the full (n × p_out) cross second derivative matrix for axes (d, e).
@@ -2217,16 +2224,45 @@ impl ImplicitDesignPsiDerivative {
         debug_assert!(axis_e < self.n_axes);
         debug_assert_ne!(axis_d, axis_e);
         let n = self.n;
-        let p = self.p_out();
-        let mut out = Array2::<f64>::zeros((n, p));
-        let mut ei = Array1::<f64>::zeros(n);
+        let k = self.n_knots;
+
+        let mut raw = Array2::<f64>::zeros((n, k));
         for i in 0..n {
-            ei[i] = 1.0;
-            let col = self.transpose_mul_second_cross(axis_d, axis_e, &ei.view());
-            out.row_mut(i).assign(&col);
-            ei[i] = 0.0;
+            let base = i * k;
+            for j in 0..k {
+                raw[[i, j]] = self.t_values[base + j]
+                    * self.axis_fractions[[base + j, axis_d]]
+                    * self.axis_fractions[[base + j, axis_e]];
+            }
         }
-        out
+
+        self.project_matrix(raw)
+    }
+
+    /// Project a raw (n × k) kernel-space matrix through all transforms to
+    /// produce an (n × p_out) matrix: Z_kernel → pad poly → full ident.
+    fn project_matrix(&self, raw: Array2<f64>) -> Array2<f64> {
+        // Step 1: kernel constraint projection.
+        let constrained = match &self.ident_transform {
+            Some(z) => fast_ab(&raw, z),
+            None => raw,
+        };
+
+        // Step 2: polynomial padding.
+        let padded = if self.n_poly > 0 {
+            let cols = constrained.ncols();
+            let mut out = Array2::<f64>::zeros((self.n, cols + self.n_poly));
+            out.slice_mut(s![.., ..cols]).assign(&constrained);
+            out
+        } else {
+            constrained
+        };
+
+        // Step 3: full identifiability transform.
+        match &self.full_ident_transform {
+            Some(zf) => fast_ab(&padded, zf),
+            None => padded,
+        }
     }
 }
 
@@ -7726,115 +7762,218 @@ fn build_duchon_design_psi_aniso_derivatives(
         kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
     let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
 
-    // Raw kernel-level per-axis derivatives: (n x k) matrices.
-    let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
-    let mut kernel_second_diag = vec![Array2::<f64>::zeros((n, k)); dim];
-    let mut t_raw = Array2::<f64>::zeros((n, k));
-    let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
+    // Determine output dimension to decide dense vs implicit.
+    let p_constrained = z_kernel.ncols();
+    let p_padded = p_constrained + poly_cols;
+    let p_final = identifiability_transform.map(|zf| zf.ncols()).unwrap_or(p_padded);
 
-    // Parallel over rows with pre-allocated thread-local buffers to avoid
-    // n*k Vec allocations.  Each thread writes into its own row slice.
-    let row_results: Result<Vec<_>, BasisError> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut data_row_buf = vec![0.0; dim];
-            let mut center_buf = vec![0.0; dim];
-            for a in 0..dim {
-                data_row_buf[a] = data[[i, a]];
-            }
-            let mut t_row = vec![0.0; k];
-            let mut s_row = vec![vec![0.0; k]; dim];
-            let mut kf_row = vec![vec![0.0; k]; dim];
-            let mut ksd_row = vec![vec![0.0; k]; dim];
+    let use_implicit = should_use_implicit_operators(n, p_final, dim);
+
+    if use_implicit {
+        // ── Implicit path: store compact radial jets ──────────────────────
+        let nk = n * k;
+        let mut q_values = Array1::<f64>::zeros(nk);
+        let mut t_values = Array1::<f64>::zeros(nk);
+        let mut axis_fractions = Array2::<f64>::zeros((nk, dim));
+        let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
+
+        let row_results: Result<Vec<_>, BasisError> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut data_row_buf = vec![0.0; dim];
+                let mut center_buf = vec![0.0; dim];
+                for a in 0..dim {
+                    data_row_buf[a] = data[[i, a]];
+                }
+                let mut q_row = vec![0.0; k];
+                let mut t_row = vec![0.0; k];
+                let mut s_row = vec![vec![0.0; k]; dim];
+                for j in 0..k {
+                    for a in 0..dim {
+                        center_buf[a] = centers[[j, a]];
+                    }
+                    let (r, s_vec) =
+                        aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                    let jets =
+                        duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+                    q_row[j] = jets.q;
+                    t_row[j] = jets.t;
+                    for a in 0..dim {
+                        s_row[a][j] = s_vec[a];
+                    }
+                }
+                Ok((i, q_row, t_row, s_row))
+            })
+            .collect();
+        for (i, q_row, t_row, s_row) in row_results? {
+            let base = i * k;
             for j in 0..k {
+                q_values[base + j] = q_row[j];
+                t_values[base + j] = t_row[j];
                 for a in 0..dim {
-                    center_buf[a] = centers[[j, a]];
-                }
-                let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
-                let q = jets.q;
-                let t = jets.t;
-                t_row[j] = t;
-                for a in 0..dim {
-                    s_row[a][j] = s_vec[a];
-                    kf_row[a][j] = q * s_vec[a];
-                    ksd_row[a][j] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                    axis_fractions[[base + j, a]] = s_row[a][j];
+                    s_components_raw[a][[i, j]] = s_row[a][j];
                 }
             }
-            Ok((i, t_row, s_row, kf_row, ksd_row))
+        }
+
+        // For Duchon, the identifiability pipeline is:
+        //   raw knot (k) → Z_kernel → constrained (p_constrained)
+        //   → pad with poly_cols → padded (p_padded)
+        //   → full_ident_transform → final (p_final)
+        let full_ident = identifiability_transform.map(|zf| {
+            // Build the combined padding + full ident transform.
+            // The implicit operator handles Z_kernel internally, then pads,
+            // then applies zf. We need zf to be (p_padded × p_final).
+            zf.clone()
+        });
+
+        let implicit_op = ImplicitDesignPsiDerivative::new(
+            q_values,
+            t_values,
+            axis_fractions,
+            Some(z_kernel),
+            full_ident,
+            n,
+            k,
+            poly_cols,
+            dim,
+        );
+
+        let penalties_first = vec![Vec::new(); dim];
+        let penalties_second_diag = vec![Vec::new(); dim];
+
+        Ok(AnisoBasisPsiDerivatives {
+            design_first: Vec::new(),
+            design_second_diag: Vec::new(),
+            design_cross_t: Array2::zeros((0, 0)),
+            s_components_raw,
+            s_components_projected: Vec::new(),
+            penalties_first,
+            penalties_second_diag,
+            penalties_cross: Vec::new(),
+            penalties_cross_pairs: Vec::new(),
+            implicit_operator: Some(implicit_op),
         })
-        .collect();
-    for (i, t_row, s_row, kf_row, ksd_row) in row_results? {
-        for j in 0..k {
-            t_raw[[i, j]] = t_row[j];
-            for a in 0..dim {
-                s_components_raw[a][[i, j]] = s_row[a][j];
-                kernel_first[a][[i, j]] = kf_row[a][j];
-                kernel_second_diag[a][[i, j]] = ksd_row[a][j];
+    } else {
+        // ── Dense path (original code) ────────────────────────────────────
+
+        // Raw kernel-level per-axis derivatives: (n x k) matrices.
+        let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
+        let mut kernel_second_diag = vec![Array2::<f64>::zeros((n, k)); dim];
+        let mut t_raw = Array2::<f64>::zeros((n, k));
+        let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
+
+        // Parallel over rows with pre-allocated thread-local buffers to avoid
+        // n*k Vec allocations.  Each thread writes into its own row slice.
+        let row_results: Result<Vec<_>, BasisError> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut data_row_buf = vec![0.0; dim];
+                let mut center_buf = vec![0.0; dim];
+                for a in 0..dim {
+                    data_row_buf[a] = data[[i, a]];
+                }
+                let mut t_row = vec![0.0; k];
+                let mut s_row = vec![vec![0.0; k]; dim];
+                let mut kf_row = vec![vec![0.0; k]; dim];
+                let mut ksd_row = vec![vec![0.0; k]; dim];
+                for j in 0..k {
+                    for a in 0..dim {
+                        center_buf[a] = centers[[j, a]];
+                    }
+                    let (r, s_vec) =
+                        aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                    let jets =
+                        duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+                    let q = jets.q;
+                    let t = jets.t;
+                    t_row[j] = t;
+                    for a in 0..dim {
+                        s_row[a][j] = s_vec[a];
+                        kf_row[a][j] = q * s_vec[a];
+                        ksd_row[a][j] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
+                    }
+                }
+                Ok((i, t_row, s_row, kf_row, ksd_row))
+            })
+            .collect();
+        for (i, t_row, s_row, kf_row, ksd_row) in row_results? {
+            for j in 0..k {
+                t_raw[[i, j]] = t_row[j];
+                for a in 0..dim {
+                    s_components_raw[a][[i, j]] = s_row[a][j];
+                    kernel_first[a][[i, j]] = kf_row[a][j];
+                    kernel_second_diag[a][[i, j]] = ksd_row[a][j];
+                }
             }
         }
-    }
 
-    // Project through Z_kernel (null-space constraint), then pad with
-    // polynomial columns (zero derivative for the polynomial block).
-    let project_kernel = |mat: Array2<f64>| -> Array2<f64> { fast_ab(&mat, &z_kernel) };
+        // Project through Z_kernel (null-space constraint), then pad with
+        // polynomial columns (zero derivative for the polynomial block).
+        let project_kernel = |mat: Array2<f64>| -> Array2<f64> { fast_ab(&mat, &z_kernel) };
 
-    let kernel_first: Vec<_> = kernel_first.into_iter().map(&project_kernel).collect();
-    let kernel_second_diag: Vec<_> = kernel_second_diag
-        .into_iter()
-        .map(&project_kernel)
-        .collect();
-    let design_cross_t = project_kernel(t_raw);
+        let kernel_first: Vec<_> = kernel_first.into_iter().map(&project_kernel).collect();
+        let kernel_second_diag: Vec<_> = kernel_second_diag
+            .into_iter()
+            .map(&project_kernel)
+            .collect();
+        let design_cross_t = project_kernel(t_raw);
 
-    let pad = |mat: Array2<f64>| -> Array2<f64> {
-        if poly_cols > 0 {
-            let cols = mat.ncols();
-            let mut out = Array2::<f64>::zeros((n, cols + poly_cols));
-            out.slice_mut(s![.., 0..cols]).assign(&mat);
-            out
-        } else {
-            mat
+        let pad = |mat: Array2<f64>| -> Array2<f64> {
+            if poly_cols > 0 {
+                let cols = mat.ncols();
+                let mut out = Array2::<f64>::zeros((n, cols + poly_cols));
+                out.slice_mut(s![.., 0..cols]).assign(&mat);
+                out
+            } else {
+                mat
+            }
+        };
+
+        let mut design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
+        let mut design_second_diag: Vec<_> =
+            kernel_second_diag.into_iter().map(&pad).collect();
+        let mut design_cross_t = pad(design_cross_t);
+        let mut s_components_projected: Vec<_> = s_components_raw
+            .iter()
+            .map(|raw| pad(project_kernel(raw.clone())))
+            .collect();
+
+        // Apply the full identifiability transform (if present).
+        if let Some(zf) = identifiability_transform {
+            design_first = design_first
+                .into_iter()
+                .map(|m| fast_ab(&m, zf))
+                .collect();
+            design_second_diag = design_second_diag
+                .into_iter()
+                .map(|m| fast_ab(&m, zf))
+                .collect();
+            design_cross_t = fast_ab(&design_cross_t, zf);
+            s_components_projected = s_components_projected
+                .into_iter()
+                .map(|m| fast_ab(&m, zf))
+                .collect();
         }
-    };
 
-    let mut design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
-    let mut design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
-    let mut design_cross_t = pad(design_cross_t);
-    let mut s_components_projected: Vec<_> = s_components_raw
-        .iter()
-        .map(|raw| pad(project_kernel(raw.clone())))
-        .collect();
+        // Penalty derivatives are assembled by the caller.
+        let penalties_first = vec![Vec::new(); dim];
+        let penalties_second_diag = vec![Vec::new(); dim];
 
-    // Apply the full identifiability transform (if present).
-    if let Some(zf) = identifiability_transform {
-        design_first = design_first.into_iter().map(|m| fast_ab(&m, zf)).collect();
-        design_second_diag = design_second_diag
-            .into_iter()
-            .map(|m| fast_ab(&m, zf))
-            .collect();
-        design_cross_t = fast_ab(&design_cross_t, zf);
-        s_components_projected = s_components_projected
-            .into_iter()
-            .map(|m| fast_ab(&m, zf))
-            .collect();
+        Ok(AnisoBasisPsiDerivatives {
+            design_first,
+            design_second_diag,
+            design_cross_t,
+            s_components_raw,
+            s_components_projected,
+            penalties_first,
+            penalties_second_diag,
+            penalties_cross: Vec::new(),
+            penalties_cross_pairs: Vec::new(),
+            implicit_operator: None,
+        })
     }
-
-    // Penalty derivatives are assembled by the caller.
-    let penalties_first = vec![Vec::new(); dim];
-    let penalties_second_diag = vec![Vec::new(); dim];
-
-    Ok(AnisoBasisPsiDerivatives {
-        design_first,
-        design_second_diag,
-        design_cross_t,
-        s_components_raw,
-        s_components_projected,
-        penalties_first,
-        penalties_second_diag,
-        penalties_cross: Vec::new(),
-        penalties_cross_pairs: Vec::new(),
-        implicit_operator: None,
-    })
 }
 
 /// Build per-axis ψ_a derivatives for anisotropic Duchon terms, including

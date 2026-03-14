@@ -1571,7 +1571,7 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::strategy::{
-            ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig,
             OuterEval,
         };
 

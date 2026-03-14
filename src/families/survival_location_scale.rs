@@ -3315,7 +3315,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let x_ls_en = x_log_sigma_entry.as_ref().unwrap_or(&x_log_sigma_exit);
                 let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
                 let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-                let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+                // d2q_tls_entry is resolved but not needed in the bilinear cross term;
+                // the entry bilinear uses per-axis deltas directly.
                 // Exit bilinear.
                 let d2_w_exit = &d_d2_q_exit_u * &delta_q_exit_v * &(&q.dq_t * &q.dq_ls)
                     + &d_d2_q_exit_v * &delta_q_exit_u * &(&q.dq_t * &q.dq_ls)
@@ -3365,7 +3366,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u - &delta_q_exit_u);
             let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v - &entry_deltas.delta_q_v);
             let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v - &delta_q_exit_v);
-            if let (Some(x_t_en), Some(dq_t_en)) =
+            if let (Some(x_t_en), Some(_)) =
                 (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
             {
                 let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v
@@ -3387,12 +3388,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     &(d2_h_ht_exit + d2_h_ht_entry),
                 );
             } else {
-                let d2_w = &dh_h0_u * &delta_q_t_exit_v
-                    + &dh_h0_v * &delta_q_t_exit_u
-                    + &q.h_time_h0 * &(&delta_q_t_exit_u * &xi_h0_v + &delta_q_t_exit_v * &xi_h0_u)
-                    + &dh_h1_u * &delta_q_t_exit_v
-                    + &dh_h1_v * &delta_q_t_exit_u
-                    + &q.h_time_h1 * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
+                // The combined weight d2_w = h0 + h1 contributions is split across
+                // the two design matrices (x_time_entry, x_time_exit) below.
                 let d2_h_ht_0 = weighted_crossprod_dense(
                     &self.x_time_entry,
                     &(-&(&dh_h0_u * &delta_q_t_exit_v
@@ -3424,7 +3421,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u - &delta_q_exit_u);
             let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v - &entry_deltas.delta_q_v);
             let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v - &delta_q_exit_v);
-            if let (Some(x_ls_en), Some(dq_ls_en)) =
+            if let (Some(x_ls_en), Some(_)) =
                 (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
             {
                 let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v
@@ -3593,12 +3590,14 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 /// `dβ̂/dρ_k = −v_k`, so the actual coefficient perturbation direction is
 /// `−v_k`. This provider negates `v_k` before forwarding to the family's
 /// `exact_newton_joint_hessian_directional_derivative`.
+#[allow(dead_code)]
 pub(crate) struct SurvivalLocationScaleDerivProvider {
     family: SurvivalLocationScaleFamily,
     block_states: Vec<ParameterBlockState>,
 }
 
 impl SurvivalLocationScaleDerivProvider {
+    #[allow(dead_code)]
     pub(crate) fn new(
         family: SurvivalLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,

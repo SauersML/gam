@@ -185,6 +185,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// Returns `None` for providers that don't support this optimization
     /// (Gaussian, multi-predictor, coupled families).
     fn adjoint_trace_vector(&self, hop: &dyn HessianOperator) -> Option<Array1<f64>> {
+        let _ = hop;
         None
     }
 
@@ -201,6 +202,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
         v_l: &Array1<f64>,
         hop: &dyn HessianOperator,
     ) -> Option<f64> {
+        let _ = (v_k, v_l, hop);
         None
     }
 }
@@ -646,7 +648,18 @@ pub struct HyperCoord {
     /// ∂_i (∇_β F)|_β — fixed-β score (p-vector).
     pub g: Array1<f64>,
     /// ∂_i H|_β — fixed-β Hessian drift (p×p matrix).
+    ///
+    /// For dense mode, this is the fully materialized B_i matrix.
+    /// When `b_operator` is `Some(...)`, this field may be a zero-sized
+    /// placeholder and all B_i · v operations should go through the operator.
     pub b_mat: Array2<f64>,
+    /// Optional implicit operator for B_i · v products.
+    ///
+    /// When present, the stochastic trace estimator uses this instead of
+    /// `b_mat.dot(v)`, avoiding materialization of the (p × p) matrix.
+    /// This is activated for anisotropic ψ coordinates when the problem size
+    /// exceeds the implicit operator memory threshold.
+    pub b_operator: Option<Box<dyn HyperOperator>>,
     /// ∂_i log|S|₊ — penalty pseudo-logdet first derivative.
     pub ld_s: f64,
     /// Whether B_i depends on β (true for ψ with non-Gaussian likelihood).
@@ -690,6 +703,129 @@ pub struct HyperCoordPair {
 /// When unavailable, the outer Hessian is approximate (fine for BFGS/ARC,
 /// insufficient for exact Newton quadratic convergence).
 pub type FixedDriftDerivFn = Box<dyn Fn(usize, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Implicit Hessian-drift operators for scalable anisotropic REML
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Trait for operators that can compute B_i · v (matrix-vector product)
+/// without materializing the full (p × p) B_i matrix.
+///
+/// This is used for anisotropic ψ coordinates where the Hessian drift
+/// B_i = (∂X/∂ψ_d)^T W X + X^T W (∂X/∂ψ_d) + S_{ψ_d} involves the
+/// implicit design-derivative operator. For small problems, a dense
+/// fallback wraps an `Array2<f64>`.
+///
+/// The key integration point is the stochastic trace estimator: instead of
+/// materializing B_i as a (p × p) matrix and calling `A_k · w`, we compute
+/// `B_i · w` on the fly using implicit design-derivative matvecs.
+pub trait HyperOperator: Send + Sync {
+    /// Compute B · v (matrix-vector product). v and result are p-vectors.
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64>;
+
+    /// Compute v^T · B · u (bilinear form).
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        let bv = self.mul_vec(v);
+        u.dot(&bv)
+    }
+
+    /// Full dense materialization (fallback for exact trace computation).
+    ///
+    /// Panics or returns a zero matrix if the operator was designed to avoid
+    /// materialization. Callers should check `is_implicit()` first.
+    fn to_dense(&self) -> Array2<f64>;
+
+    /// Whether this operator uses implicit (non-materialized) storage.
+    fn is_implicit(&self) -> bool;
+}
+
+/// Dense wrapper: wraps an existing (p × p) matrix as a `HyperOperator`.
+pub struct DenseHyperOperator {
+    pub mat: Array2<f64>,
+}
+
+impl HyperOperator for DenseHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.mat.dot(v)
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        v.dot(&self.mat.dot(u))
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.mat.clone()
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
+/// Implicit Hessian-drift operator for a single anisotropic ψ_d coordinate.
+///
+/// Computes B_d · v on the fly:
+///   B_d · v = (∂X/∂ψ_d)^T (W · (X · v)) + X^T (W · ((∂X/∂ψ_d) · v)) + S_{ψ_d} · v
+///
+/// The first two terms use the implicit design-derivative operator (no dense
+/// (n × p) matrices), and S_{ψ_d} is a dense (p × p) penalty matrix (manageable).
+///
+/// Storage: the implicit operator holds O(n·k·D) radial jets, plus references
+/// to X (the design matrix) and W (the working weights). The penalty matrix
+/// S_{ψ_d} is stored as a dense (p × p) matrix.
+pub struct ImplicitHyperOperator {
+    /// The implicit design-derivative operator (shared across all axes).
+    pub implicit_deriv: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    /// Which axis this operator is for.
+    pub axis: usize,
+    /// The design matrix X in dense form (n × p). Shared reference.
+    pub x_dense: std::sync::Arc<Array2<f64>>,
+    /// Working weights W (diagonal, length n). Shared reference.
+    pub w_diag: std::sync::Arc<Array1<f64>>,
+    /// Penalty derivative matrix S_{ψ_d} (p × p), dense.
+    pub s_psi: Array2<f64>,
+    /// Total basis dimension p.
+    pub p: usize,
+}
+
+impl HyperOperator for ImplicitHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+
+        // Term 1: (∂X/∂ψ_d)^T (W · (X · v))
+        let x_v = self.x_dense.dot(v); // (n,)
+        let w_x_v = &*self.w_diag * &x_v; // (n,)
+        let term1 = self.implicit_deriv.transpose_mul(self.axis, &w_x_v.view()); // (p,)
+
+        // Term 2: X^T (W · ((∂X/∂ψ_d) · v))
+        let dx_v = self.implicit_deriv.forward_mul(self.axis, &v.view()); // (n,)
+        let w_dx_v = &*self.w_diag * &dx_v; // (n,)
+        let term2 = self.x_dense.t().dot(&w_dx_v); // (p,)
+
+        // Term 3: S_{ψ_d} · v
+        let term3 = self.s_psi.dot(v); // (p,)
+
+        term1 + term2 + term3
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        // Fallback: materialize column by column.
+        let p = self.p;
+        let mut out = Array2::<f64>::zeros((p, p));
+        let mut ei = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            ei[j] = 1.0;
+            let col = self.mul_vec(&ei);
+            out.column_mut(j).assign(&col);
+            ei[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
@@ -1203,41 +1339,125 @@ pub fn reml_laml_evaluate(
     // This amortizes the H^{-1} solve cost: ONE solve per probe, shared across
     // all k + ext_dim coordinates.
     let stochastic_trace_values: Option<Vec<f64>> = if use_stochastic_traces {
-        let mut all_h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
+        // Check if any ext coordinate uses implicit operators.
+        let any_implicit = solution.ext_coords.iter().any(|c| c.b_operator.is_some());
 
-        // rho-coordinates: H_k = A_k + correction(v_k)
-        for idx in 0..k {
-            let r_k = &solution.penalty_roots[idx];
-            let mut a_k = r_k.t().dot(r_k);
-            a_k *= lambdas[idx];
+        if any_implicit {
+            // Mixed path: some ext coordinates use implicit operators.
+            // Collect dense matrices (rho + dense ext) and implicit operators separately,
+            // then use estimate_traces_with_operators for a single-pass estimation.
+            let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
 
-            if effective_deriv.has_corrections() {
-                let r_beta = r_k.dot(&solution.beta);
-                let s_k_beta = r_k.t().dot(&r_beta);
-                let a_k_beta = &s_k_beta * lambdas[idx];
-                let v_k = hop.solve(&a_k_beta);
-                if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k) {
-                    a_k += &corr;
+            // rho-coordinates: always dense.
+            for idx in 0..k {
+                let r_k = &solution.penalty_roots[idx];
+                let mut a_k = r_k.t().dot(r_k);
+                a_k *= lambdas[idx];
+
+                if effective_deriv.has_corrections() {
+                    let r_beta = r_k.dot(&solution.beta);
+                    let s_k_beta = r_k.t().dot(&r_beta);
+                    let a_k_beta = &s_k_beta * lambdas[idx];
+                    let v_k = hop.solve(&a_k_beta);
+                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k) {
+                        a_k += &corr;
+                    }
+                }
+                dense_matrices.push(a_k);
+            }
+
+            // ext-coordinates: separate into dense and implicit.
+            // Build a mapping: ext_trace_idx[i] tells where in the output
+            // the trace for ext coord i lives.
+            //
+            // Output layout: [rho_0..rho_k, dense_ext_0.., implicit_ext_0..]
+            let mut ext_is_implicit = Vec::with_capacity(ext_dim);
+            let mut implicit_ops: Vec<&dyn HyperOperator> = Vec::new();
+            for coord in solution.ext_coords.iter() {
+                if let Some(ref op) = coord.b_operator {
+                    ext_is_implicit.push(true);
+                    implicit_ops.push(op.as_ref());
+                } else {
+                    ext_is_implicit.push(false);
+                    let mut h_i = coord.b_mat.clone();
+                    if effective_deriv.has_corrections() {
+                        let v_i = hop.solve(&coord.g);
+                        if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                            h_i += &corr;
+                        }
+                    }
+                    dense_matrices.push(h_i);
                 }
             }
-            all_h_k_matrices.push(a_k);
-        }
 
-        // ext-coordinates: dH_i = B_i + correction(v_i)
-        for coord in solution.ext_coords.iter() {
-            let mut h_i = coord.b_mat.clone();
-            if effective_deriv.has_corrections() {
-                let v_i = hop.solve(&coord.g);
-                if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
-                    h_i += &corr;
+            let estimator = StochasticTraceEstimator::with_defaults();
+            let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
+            let raw_traces = estimator.estimate_traces_with_operators(
+                hop,
+                &dense_refs,
+                &implicit_ops,
+            );
+
+            // Re-map traces back to the [rho_0..rho_k, ext_0..ext_N] layout.
+            let mut result = Vec::with_capacity(k + ext_dim);
+            // rho traces come first in raw_traces.
+            for idx in 0..k {
+                result.push(raw_traces[idx]);
+            }
+            // ext traces: dense ext are at indices k..(k+n_dense_ext),
+            // implicit ext are at indices n_all_dense..(n_all_dense+n_implicit).
+            let n_dense_ext = ext_is_implicit.iter().filter(|&&b| !b).count();
+            let mut dense_cursor = k; // next dense ext index in raw_traces
+            let mut implicit_cursor = k + n_dense_ext; // next implicit index
+            for &is_impl in &ext_is_implicit {
+                if is_impl {
+                    result.push(raw_traces[implicit_cursor]);
+                    implicit_cursor += 1;
+                } else {
+                    result.push(raw_traces[dense_cursor]);
+                    dense_cursor += 1;
                 }
             }
-            all_h_k_matrices.push(h_i);
-        }
 
-        let estimator = StochasticTraceEstimator::with_defaults();
-        let refs: Vec<&Array2<f64>> = all_h_k_matrices.iter().collect();
-        Some(estimator.estimate_traces(hop, &refs))
+            Some(result)
+        } else {
+            // All-dense path (original code).
+            let mut all_h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
+
+            // rho-coordinates: H_k = A_k + correction(v_k)
+            for idx in 0..k {
+                let r_k = &solution.penalty_roots[idx];
+                let mut a_k = r_k.t().dot(r_k);
+                a_k *= lambdas[idx];
+
+                if effective_deriv.has_corrections() {
+                    let r_beta = r_k.dot(&solution.beta);
+                    let s_k_beta = r_k.t().dot(&r_beta);
+                    let a_k_beta = &s_k_beta * lambdas[idx];
+                    let v_k = hop.solve(&a_k_beta);
+                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k) {
+                        a_k += &corr;
+                    }
+                }
+                all_h_k_matrices.push(a_k);
+            }
+
+            // ext-coordinates: dH_i = B_i + correction(v_i)
+            for coord in solution.ext_coords.iter() {
+                let mut h_i = coord.b_mat.clone();
+                if effective_deriv.has_corrections() {
+                    let v_i = hop.solve(&coord.g);
+                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                        h_i += &corr;
+                    }
+                }
+                all_h_k_matrices.push(h_i);
+            }
+
+            let estimator = StochasticTraceEstimator::with_defaults();
+            let refs: Vec<&Array2<f64>> = all_h_k_matrices.iter().collect();
+            Some(estimator.estimate_traces(hop, &refs))
+        }
     } else {
         None
     };
@@ -1325,7 +1545,17 @@ pub fn reml_laml_evaluate(
             } else {
                 None
             };
-            0.5 * hop.trace_logdet_h_k(&coord.b_mat, correction.as_ref())
+            // When an implicit operator is present, materialize the dense B_i
+            // for the exact trace computation. This fallback path only triggers
+            // when stochastic traces are disabled (p <= 500 or sparse), where
+            // the problem is small enough for materialization.
+            let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
+                let materialized = coord.b_operator.as_ref().unwrap().to_dense();
+                0.5 * hop.trace_logdet_h_k(&materialized, correction.as_ref())
+            } else {
+                0.5 * hop.trace_logdet_h_k(&coord.b_mat, correction.as_ref())
+            };
+            b_ref
         };
 
         // Penalty term: a_i (with profiled Gaussian rescaling if applicable)
@@ -1620,7 +1850,14 @@ fn compute_outer_hessian(
     for coord in solution.ext_coords.iter() {
         let v_i = hop.solve(&coord.g);
 
-        let mut h_i = coord.b_mat.clone();
+        // Materialize the Hessian drift matrix. When an implicit operator is
+        // present and b_mat is a zero-sized placeholder, fall back to dense
+        // materialization through the operator.
+        let mut h_i = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
+            coord.b_operator.as_ref().unwrap().to_dense()
+        } else {
+            coord.b_mat.clone()
+        };
         if effective_deriv.has_corrections() {
             if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
                 h_i += &corr;
@@ -1859,7 +2096,14 @@ fn compute_outer_hessian(
                     //        = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
                     // where Ḣ_j = B_j + C[β_j] already encodes the −C[v_j] v_i term.
                     let mut rhs = ext_h_matrices[jj].dot(&ext_v[ii]);
-                    rhs += &coord_i.b_mat.dot(&ext_v[jj]);
+                    // Use the implicit operator for B_i · v_j when available,
+                    // otherwise fall back to the dense b_mat.
+                    let bi_vj = if coord_i.b_operator.is_some() && coord_i.b_mat.nrows() == 0 {
+                        coord_i.b_operator.as_ref().unwrap().mul_vec(&ext_v[jj])
+                    } else {
+                        coord_i.b_mat.dot(&ext_v[jj])
+                    };
+                    rhs += &bi_vj;
                     rhs -= &pair.g;
 
                     // Ḧ_{ij}: second Hessian drift (using logdet gradient operator G_ε).
@@ -2065,11 +2309,19 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         // Rationale: EFS is already an approximate Newton scheme; the C[β_i]
         // term is small for well-conditioned models and its omission keeps the
         // update stable and cheap.
-        let trace_term = hop.trace_hinv_h_k(&coord.b_mat, None);
+        // Get the dense B_i matrix, materializing from implicit operator if needed.
+        let b_mat_dense;
+        let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
+            b_mat_dense = coord.b_operator.as_ref().unwrap().to_dense();
+            &b_mat_dense
+        } else {
+            &coord.b_mat
+        };
+        let trace_term = hop.trace_hinv_h_k(b_ref, None);
         let numerator = 2.0 * a_i_eff - trace_term;
 
         // Denominator: tr(H⁻¹ B_i H⁻¹ B_i) = ||Y_i||²_F where Y_i = H⁻¹ B_i
-        let y_i = hop.solve_multi(&coord.b_mat);
+        let y_i = hop.solve_multi(b_ref);
         let denominator = (&y_i * &y_i).sum();
 
         let step = if denominator.abs() > 1e-30 {
@@ -2378,6 +2630,7 @@ fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
 
 /// Derivative of the smooth spectral regularizer: `r'_ε(σ) = ½(1 + σ/√(σ² + 4ε²))`.
 #[inline]
+#[allow(dead_code)]
 fn spectral_regularize_deriv(sigma: f64, epsilon: f64) -> f64 {
     let four_eps_sq = 4.0 * epsilon * epsilon;
     0.5 * (1.0 + sigma / (sigma * sigma + four_eps_sq).sqrt())
@@ -3204,6 +3457,81 @@ impl StochasticTraceEstimator {
         self.estimate_traces(hop, &refs)[0]
     }
 
+    /// Estimate `tr(H⁻¹ A_k)` for a mix of dense matrices and implicit operators.
+    ///
+    /// This extends [`estimate_traces`] to support implicit `HyperOperator` trait
+    /// objects alongside dense matrices. The dense matrices are passed first,
+    /// followed by the operators. Each probe requires ONE `H⁻¹` solve (shared),
+    /// plus one matvec per coordinate.
+    ///
+    /// # Arguments
+    /// - `hop`: the Hessian operator providing `solve(rhs)`.
+    /// - `dense_matrices`: dense `A_k` matrices for which to estimate `tr(H⁻¹ A_k)`.
+    /// - `operators`: implicit `HyperOperator` trait objects.
+    ///
+    /// # Returns
+    /// A vector of estimated traces: first for dense matrices, then for operators.
+    pub fn estimate_traces_with_operators(
+        &self,
+        hop: &dyn HessianOperator,
+        dense_matrices: &[&Array2<f64>],
+        operators: &[&dyn HyperOperator],
+    ) -> Vec<f64> {
+        let n_dense = dense_matrices.len();
+        let n_ops = operators.len();
+        let n_coords = n_dense + n_ops;
+        if n_coords == 0 {
+            return Vec::new();
+        }
+
+        let p = hop.dim();
+        if p == 0 {
+            return vec![0.0; n_coords];
+        }
+
+        let mut means = vec![0.0_f64; n_coords];
+        let mut m2s = vec![0.0_f64; n_coords];
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let check_interval = 4;
+
+        for m in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+            let w = hop.solve(&z);
+
+            // Dense matrices.
+            for k in 0..n_dense {
+                let a_w = dense_matrices[k].dot(&w);
+                let q_k = z.dot(&a_w);
+                let count = (m + 1) as f64;
+                let delta = q_k - means[k];
+                means[k] += delta / count;
+                let delta2 = q_k - means[k];
+                m2s[k] += delta * delta2;
+            }
+
+            // Implicit operators.
+            for (oi, op) in operators.iter().enumerate() {
+                let k = n_dense + oi;
+                let a_w = op.mul_vec(&w);
+                let q_k = z.dot(&a_w);
+                let count = (m + 1) as f64;
+                let delta = q_k - means[k];
+                means[k] += delta / count;
+                let delta2 = q_k - means[k];
+                m2s[k] += delta * delta2;
+            }
+
+            let n_done = m + 1;
+            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+                if self.check_convergence(n_done, &means, &m2s) {
+                    break;
+                }
+            }
+        }
+
+        means
+    }
+
     /// Check the adaptive stopping criterion.
     ///
     /// Returns `true` if all coordinates have converged:
@@ -3778,6 +4106,7 @@ mod tests {
     }
 
     /// Compute d/dpsi log|S(psi)|_+ by central finite difference.
+    #[allow(dead_code)]
     fn pseudo_logdet_fd_first(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
         let sp = rotating_nullspace_penalty(psi + h, s1, s2);
         let sm = rotating_nullspace_penalty(psi - h, s1, s2);
