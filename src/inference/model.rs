@@ -749,70 +749,8 @@ impl FittedModel {
 
     pub fn validate_numeric_finiteness(&self) -> Result<(), String> {
         if let Some(fit) = self.fit_result.as_ref() {
-            ensure_finite_scalar("fit_result.standard_deviation", fit.standard_deviation)?;
-            ensure_finite_scalar("fit_result.finalgrad_norm", fit.finalgrad_norm)?;
-            ensure_finite_scalar("fit_result.deviance", fit.deviance)?;
-            ensure_finite_scalar("fit_result.stable_penalty_term", fit.stable_penalty_term)?;
-            ensure_finite_scalar("fit_result.max_abs_eta", fit.max_abs_eta)?;
-            ensure_finite_scalar("fit_result.reml_score", fit.reml_score)?;
-            validate_all_finite("fit_result.beta", fit.beta.iter().copied())?;
-            validate_all_finite("fit_result.lambdas", fit.lambdas.iter().copied())?;
-            if let Some(inf) = fit.inference() {
-                ensure_finite_scalar("fit_result.edf_total", inf.edf_total)?;
-                validate_all_finite("fit_result.edf_by_block", inf.edf_by_block.iter().copied())?;
-                validate_all_finite(
-                    "fit_result.working_weights",
-                    inf.working_weights.iter().copied(),
-                )?;
-                validate_all_finite(
-                    "fit_result.working_response",
-                    inf.working_response.iter().copied(),
-                )?;
-                validate_all_finite(
-                    "fit_result.penalized_hessian",
-                    inf.penalized_hessian.iter().copied(),
-                )?;
-                if let Some(v) = inf.beta_covariance.as_ref() {
-                    validate_all_finite("fit_result.beta_covariance", v.iter().copied())?;
-                }
-                if let Some(v) = inf.beta_covariance_corrected.as_ref() {
-                    validate_all_finite("fit_result.beta_covariance_corrected", v.iter().copied())?;
-                }
-                if let Some(v) = inf.beta_standard_errors.as_ref() {
-                    validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
-                }
-                if let Some(v) = inf.beta_standard_errors_corrected.as_ref() {
-                    validate_all_finite(
-                        "fit_result.beta_standard_errors_corrected",
-                        v.iter().copied(),
-                    )?;
-                }
-            }
-            match &fit.fitted_link_parameters {
-                FittedLinkParameters::Standard => {}
-                FittedLinkParameters::Mixture { state, covariance } => {
-                    validate_all_finite("fit_result.mixture_link_rho", state.rho.iter().copied())?;
-                    validate_all_finite(
-                        "fit_result.mixture_linkweights",
-                        state.pi.iter().copied(),
-                    )?;
-                    if let Some(v) = covariance.as_ref() {
-                        validate_all_finite(
-                            "fit_result.mixture_link_param_covariance",
-                            v.iter().copied(),
-                        )?;
-                    }
-                }
-                FittedLinkParameters::Sas { state, covariance }
-                | FittedLinkParameters::BetaLogistic { state, covariance } => {
-                    ensure_finite_scalar("fit_result.sas_epsilon", state.epsilon)?;
-                    ensure_finite_scalar("fit_result.sas_log_delta", state.log_delta)?;
-                    ensure_finite_scalar("fit_result.sas_delta", state.delta)?;
-                    if let Some(v) = covariance.as_ref() {
-                        validate_all_finite("fit_result.sas_param_covariance", v.iter().copied())?;
-                    }
-                }
-            }
+            fit.validate_numeric_finiteness()
+                .map_err(|e| e.to_string())?;
         }
 
         for (name, opt) in [

@@ -16,8 +16,8 @@ use gam::basis::{
 use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FittedLinkParameters,
-    ModelSummary, ParametricTermSummary, PredictInput, SmoothTermSummary,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FitResultParts,
+    FittedLinkParameters, ModelSummary, ParametricTermSummary, PredictInput, SmoothTermSummary,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
 };
 use gam::families::family_meta::{
@@ -925,7 +925,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     },
                     family_to_string(family).to_string(),
                 );
-                payload.unified = Some(fit_result.to_unified());
+                payload.unified = Some(fit_result.clone());
                 payload.fit_result = Some(fit_result);
                 payload.data_schema = Some(ds.schema.clone());
                 payload.link = Some(link_choice_to_string(choice));
@@ -1118,7 +1118,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             },
             family_to_string(family).to_string(),
         );
-        payload.unified = Some(saved_fit.to_unified());
+        payload.unified = Some(saved_fit.clone());
         payload.fit_result = Some(saved_fit.clone());
         payload.data_schema = Some(ds.schema.clone());
         payload.link = link_choice.as_ref().map(link_choice_to_string);
@@ -1561,9 +1561,9 @@ fn build_predict_input_for_model(
                 offset_noise: Some(Array1::zeros(n)),
             })
         }
-        PredictModelClass::Survival => {
-            Err("build_predict_input_for_model should not be called for survival models".to_string())
-        }
+        PredictModelClass::Survival => Err(
+            "build_predict_input_for_model should not be called for survival models".to_string(),
+        ),
     }
 }
 
@@ -1625,7 +1625,14 @@ fn run_predict_unified(
         let pm = predictor
             .predict_posterior_mean(pred_input, &fit_for_predict)
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        (pm.eta, pm.mean, Some(pm.eta_standard_error), None, None, None)
+        (
+            pm.eta,
+            pm.mean,
+            Some(pm.eta_standard_error),
+            None,
+            None,
+            None,
+        )
     } else {
         let pred = predictor
             .predict_response(pred_input)
@@ -1651,8 +1658,9 @@ fn run_predict_unified(
     match model_class {
         PredictModelClass::GaussianLocationScale => {
             // Gaussian location-scale always includes sigma.
-            let sigma = sigma_opt
-                .ok_or_else(|| "internal error: sigma missing for Gaussian LS prediction".to_string())?;
+            let sigma = sigma_opt.ok_or_else(|| {
+                "internal error: sigma missing for Gaussian LS prediction".to_string()
+            })?;
             write_gaussian_location_scale_prediction_csv(
                 &args.out,
                 eta.view(),
@@ -1729,13 +1737,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 training_headers,
             )?;
             progress.advance_workflow(3);
-            let result = run_predict_unified(
-                &mut progress,
-                &args,
-                &model,
-                &pred_input,
-                &*predictor,
-            );
+            let result =
+                run_predict_unified(&mut progress, &args, &model, &pred_input, &*predictor);
             if result.is_ok() {
                 progress.advance_workflow(5);
                 progress.finish_progress("prediction complete");
@@ -1969,23 +1972,26 @@ fn run_predict_survival(
             x_link_wiggle: x_link_wiggle.clone(),
             inverse_link: survival_inverse_link.clone(),
         };
-        let fit_stub = gam::survival_location_scale::SurvivalLocationScaleFitResult {
-            beta_time: beta_time.clone(),
-            beta_threshold: beta_threshold.clone(),
-            beta_log_sigma: beta_log_sigma.clone(),
-            beta_link_wiggle: beta_link_wiggle.clone(),
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit_stub = gam::survival_location_scale::survival_fit_from_parts(
+            gam::survival_location_scale::SurvivalLocationScaleFitResultParts {
+                beta_time: beta_time.clone(),
+                beta_threshold: beta_threshold.clone(),
+                beta_log_sigma: beta_log_sigma.clone(),
+                beta_link_wiggle: beta_link_wiggle.clone(),
+                lambdas_time: Array1::zeros(0),
+                lambdas_threshold: Array1::zeros(0),
+                lambdas_log_sigma: Array1::zeros(0),
+                lambdas_linkwiggle: beta_link_wiggle.as_ref().map(|_| Array1::zeros(0)),
+                log_likelihood: 0.0,
+                penalizedobjective: 0.0,
+                iterations: 0,
+                finalgrad_norm: 0.0,
+                converged: true,
+                covariance_conditional: None,
+                geometry: None,
+            },
+        )
+        .map_err(|e| format!("invalid survival location-scale fit stub: {e}"))?;
         let pred = predict_survival_location_scale(&pred_input, &fit_stub)
             .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
         let (mean, eta_se_default) = if args.mode == PredictModeArg::PosteriorMean {
@@ -4929,7 +4935,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
-            payload.unified = Some(fit_result.to_unified());
+            payload.unified = Some(fit_result.clone());
             payload.fit_result = Some(fit_result);
             payload.data_schema = Some(ds.schema.clone());
             payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
@@ -5275,7 +5281,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
             family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
         );
-        payload.unified = Some(fit_result.to_unified());
+        payload.unified = Some(fit_result.clone());
         payload.fit_result = Some(fit_result);
         payload.data_schema = Some(ds.schema.clone());
         payload.survival_entry = Some(args.entry);
@@ -5973,13 +5979,19 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                     "generate is not available for survival models in this command; \
                      use survival-specific simulation APIs"
                         .to_string(),
-                )
+                );
             }
             // GaussianLocationScale never needs special handling.
             PredictModelClass::GaussianLocationScale => unreachable!(),
         }
     } else {
-        run_generate_unified(&mut progress, &model, ds.values.view(), &col_map, training_headers)?
+        run_generate_unified(
+            &mut progress,
+            &model,
+            ds.values.view(),
+            &col_map,
+            training_headers,
+        )?
     };
     progress.advance_workflow(3);
 
@@ -6706,7 +6718,11 @@ fn freeze_term_collectionspec(
                 };
             }
             (
-                SmoothBasisSpec::ThinPlate { spec: s, ref mut input_scales, .. },
+                SmoothBasisSpec::ThinPlate {
+                    spec: s,
+                    ref mut input_scales,
+                    ..
+                },
                 BasisMetadata::ThinPlate {
                     centers,
                     identifiability_transform,
@@ -6724,7 +6740,11 @@ fn freeze_term_collectionspec(
                 *input_scales = meta_scales.clone();
             }
             (
-                SmoothBasisSpec::Matern { spec: s, ref mut input_scales, .. },
+                SmoothBasisSpec::Matern {
+                    spec: s,
+                    ref mut input_scales,
+                    ..
+                },
                 BasisMetadata::Matern {
                     centers,
                     length_scale,
@@ -6750,7 +6770,11 @@ fn freeze_term_collectionspec(
                 *input_scales = meta_scales.clone();
             }
             (
-                SmoothBasisSpec::Duchon { spec: s, ref mut input_scales, .. },
+                SmoothBasisSpec::Duchon {
+                    spec: s,
+                    ref mut input_scales,
+                    ..
+                },
                 BasisMetadata::Duchon {
                     centers,
                     length_scale,
@@ -7165,7 +7189,7 @@ fn build_location_scale_saved_model(
         },
         family,
     );
-    payload.unified = Some(fit_result.to_unified());
+    payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
     payload.link = link;
@@ -7273,19 +7297,9 @@ fn core_saved_fit_result(
         validate_all_finite("fit_result.beta_covariance_corrected", cov.iter().copied())
             .expect("core_saved_fit_result called with non-finite beta_covariance_corrected");
     }
-    FitResult {
-        beta,
-        lambdas,
-        standard_deviation,
-        iterations: summary.iterations,
-        finalgrad_norm: summary.finalgrad_norm,
-        pirls_status: summary.pirls_status,
-        deviance: summary.deviance,
-        stable_penalty_term: summary.stable_penalty_term,
-        max_abs_eta: summary.max_abs_eta,
-        constraint_kkt: None,
-        artifacts: gam::estimate::FitArtifacts { pirls: None },
-        inference: Some(gam::estimate::FitInference {
+    {
+        let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        let inf = gam::estimate::FitInference {
             edf_by_block: Vec::new(),
             edf_total: 0.0,
             smoothing_correction: None,
@@ -7297,9 +7311,41 @@ fn core_saved_fit_result(
             beta_standard_errors: None,
             beta_covariance_corrected,
             beta_standard_errors_corrected: None,
-        }),
-        reml_score: summary.reml_score,
-        fitted_link_parameters: FittedLinkParameters::Standard,
+        };
+        let covariance_conditional = inf.beta_covariance.clone();
+        let covariance_corrected = inf.beta_covariance_corrected.clone();
+        let penalized_objective =
+            -0.5 * summary.deviance + summary.stable_penalty_term + summary.reml_score;
+        FitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+            blocks: vec![gam::estimate::FittedBlock {
+                beta: beta.clone(),
+                role: gam::estimate::BlockRole::Mean,
+                edf: 0.0,
+                lambdas: lambdas.clone(),
+            }],
+            log_lambdas,
+            lambdas,
+            log_likelihood: -0.5 * summary.deviance,
+            reml_score: summary.reml_score,
+            stable_penalty_term: summary.stable_penalty_term,
+            penalized_objective,
+            outer_iterations: summary.iterations,
+            outer_converged: true,
+            outer_gradient_norm: summary.finalgrad_norm,
+            standard_deviation,
+            covariance_conditional,
+            covariance_corrected,
+            inference: Some(inf),
+            fitted_link: FittedLinkParameters::Standard,
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: summary.pirls_status,
+            max_abs_eta: summary.max_abs_eta,
+            constraint_kkt: None,
+            artifacts: gam::estimate::FitArtifacts { pirls: None },
+            inner_cycles: 0,
+        })
+        .expect("core_saved_fit_result called with invalid fit metrics")
     }
 }
 
@@ -7362,12 +7408,9 @@ impl SavedFitSummary {
     }
 
     fn from_joint_result(joint: &JointModelResult) -> Result<Self, String> {
-        // Joint flexible-link currently does not expose a terminal gradient norm.
-        // Treat a converged run as stationary and a non-converged run as non-stationary.
-        let finalgrad_norm = if joint.converged { 0.0 } else { 1.0 };
         Self {
             iterations: joint.backfit_iterations,
-            finalgrad_norm,
+            finalgrad_norm: joint.outer_gradient_norm,
             pirls_status: if joint.converged {
                 gam::pirls::PirlsStatus::Converged
             } else {
@@ -8730,13 +8773,21 @@ fn build_smooth_basis(
 fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
     for smooth in spec.smooth_terms.iter_mut() {
         match &mut smooth.basis {
-            SmoothBasisSpec::Matern { feature_cols, spec: matern, .. } => {
+            SmoothBasisSpec::Matern {
+                feature_cols,
+                spec: matern,
+                ..
+            } => {
                 if matern.aniso_log_scales.is_none() {
                     let d = feature_cols.len();
                     matern.aniso_log_scales = Some(vec![0.0; d]);
                 }
             }
-            SmoothBasisSpec::Duchon { feature_cols, spec: duchon, .. } => {
+            SmoothBasisSpec::Duchon {
+                feature_cols,
+                spec: duchon,
+                ..
+            } => {
                 // Only hybrid Duchon (has a length_scale) supports kappa optimisation.
                 if duchon.length_scale.is_some() && duchon.aniso_log_scales.is_none() {
                     let d = feature_cols.len();
@@ -9473,29 +9524,23 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
 }
 
 fn apply_inverse_link_state_to_fit_result(fit_result: &mut FitResult, inverse_link: &InverseLink) {
-    match inverse_link {
-        InverseLink::Sas(state) => {
-            fit_result.fitted_link_parameters = FittedLinkParameters::Sas {
-                state: state.clone(),
-                covariance: None,
-            };
-        }
-        InverseLink::BetaLogistic(state) => {
-            fit_result.fitted_link_parameters = FittedLinkParameters::BetaLogistic {
-                state: state.clone(),
-                covariance: None,
-            };
-        }
-        InverseLink::Mixture(state) => {
-            fit_result.fitted_link_parameters = FittedLinkParameters::Mixture {
-                state: state.clone(),
-                covariance: None,
-            };
-        }
-        InverseLink::Standard(_) => {
-            fit_result.fitted_link_parameters = FittedLinkParameters::Standard;
-        }
-    }
+    let link = match inverse_link {
+        InverseLink::Sas(state) => FittedLinkParameters::Sas {
+            state: state.clone(),
+            covariance: None,
+        },
+        InverseLink::BetaLogistic(state) => FittedLinkParameters::BetaLogistic {
+            state: state.clone(),
+            covariance: None,
+        },
+        InverseLink::Mixture(state) => FittedLinkParameters::Mixture {
+            state: state.clone(),
+            covariance: None,
+        },
+        InverseLink::Standard(_) => FittedLinkParameters::Standard,
+    };
+    fit_result.fitted_link = link.clone();
+    fit_result.fitted_link_parameters = link;
 }
 
 fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, String> {
@@ -9643,6 +9688,7 @@ fn load_joint_result(
         edf: 0.0,
         backfit_iterations: 0,
         converged: true,
+        outer_gradient_norm: fit_saved.finalgrad_norm,
         knot_range: (knot_min, knot_max),
         knot_vector: Array1::from_vec(knotvec.clone()),
         link_transform,
@@ -10215,22 +10261,59 @@ fn weighted_penalty_matrix(
 }
 
 fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
-    FitResult {
-        beta: ext.beta,
+    let log_lambdas = ext.lambdas.mapv(|v| v.max(1e-300).ln());
+    let edf = ext
+        .inference
+        .as_ref()
+        .map(|inf| inf.edf_total)
+        .unwrap_or(0.0);
+    let geometry = ext
+        .inference
+        .as_ref()
+        .map(|inf| gam::estimate::FitGeometry {
+            penalized_hessian: inf.penalized_hessian.clone(),
+            working_weights: inf.working_weights.clone(),
+            working_response: inf.working_response.clone(),
+        });
+    let covariance_conditional = ext
+        .inference
+        .as_ref()
+        .and_then(|inf| inf.beta_covariance.clone());
+    let covariance_corrected = ext
+        .inference
+        .as_ref()
+        .and_then(|inf| inf.beta_covariance_corrected.clone());
+    let penalized_objective = -0.5 * ext.deviance + ext.stable_penalty_term + ext.reml_score;
+    FitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+        blocks: vec![gam::estimate::FittedBlock {
+            beta: ext.beta.clone(),
+            role: gam::estimate::BlockRole::Mean,
+            edf,
+            lambdas: ext.lambdas.clone(),
+        }],
+        log_lambdas,
         lambdas: ext.lambdas,
-        standard_deviation: ext.standard_deviation,
-        iterations: ext.iterations,
-        finalgrad_norm: ext.finalgrad_norm,
-        pirls_status: ext.pirls_status,
-        deviance: ext.deviance,
+        log_likelihood: -0.5 * ext.deviance,
+        reml_score: ext.reml_score,
         stable_penalty_term: ext.stable_penalty_term,
+        penalized_objective,
+        outer_iterations: ext.iterations,
+        outer_converged: true,
+        outer_gradient_norm: ext.finalgrad_norm,
+        standard_deviation: ext.standard_deviation,
+        covariance_conditional,
+        covariance_corrected,
+        inference: ext.inference,
+        fitted_link: ext.fitted_link_parameters,
+        geometry,
+        block_states: Vec::new(),
+        pirls_status: ext.pirls_status,
         max_abs_eta: ext.max_abs_eta,
         constraint_kkt: ext.constraint_kkt,
         artifacts: ext.artifacts,
-        inference: ext.inference,
-        reml_score: ext.reml_score,
-        fitted_link_parameters: ext.fitted_link_parameters,
-    }
+        inner_cycles: 0,
+    })
+    .expect("external optimizer returned invalid fit metrics")
 }
 
 fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), String> {
@@ -10264,10 +10347,7 @@ fn survival_probability_from_eta(eta: ArrayView1<'_, f64>) -> Array1<f64> {
 /// element, formatting every value to 12 decimal places.
 ///
 /// All columns must have the same length.  An empty column list is an error.
-fn write_prediction_csv_unified(
-    path: &Path,
-    columns: &[(&str, &[f64])],
-) -> Result<(), String> {
+fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> Result<(), String> {
     if columns.is_empty() {
         return Err("internal error: write_prediction_csv_unified called with no columns".into());
     }
@@ -10293,7 +10373,10 @@ fn write_prediction_csv_unified(
         .map_err(|e| format!("failed writing csv header: {e}"))?;
 
     for i in 0..n {
-        let row: Vec<String> = columns.iter().map(|(_, data)| format!("{:.12}", data[i])).collect();
+        let row: Vec<String> = columns
+            .iter()
+            .map(|(_, data)| format!("{:.12}", data[i]))
+            .collect();
         wtr.write_record(&row)
             .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
     }
@@ -10325,10 +10408,14 @@ fn write_prediction_csv(
     if let Some(se) = eta_se {
         se_v = se.to_vec();
         lo_v = mean_lower
-            .ok_or_else(|| "internal error: mean_lower missing while effective_se is present".to_string())?
+            .ok_or_else(|| {
+                "internal error: mean_lower missing while effective_se is present".to_string()
+            })?
             .to_vec();
         hi_v = mean_upper
-            .ok_or_else(|| "internal error: mean_upper missing while effective_se is present".to_string())?
+            .ok_or_else(|| {
+                "internal error: mean_upper missing while effective_se is present".to_string()
+            })?
             .to_vec();
         cols.push(("effective_se", &se_v));
         cols.push(("mean_lower", &lo_v));
@@ -10352,18 +10439,17 @@ fn write_gaussian_location_scale_prediction_csv(
     let mean_v: Vec<f64> = mean.to_vec();
     let sigma_v: Vec<f64> = sigma.to_vec();
 
-    let mut cols: Vec<(&str, &[f64])> = vec![
-        ("eta", &eta_v),
-        ("mean", &mean_v),
-        ("sigma", &sigma_v),
-    ];
+    let mut cols: Vec<(&str, &[f64])> =
+        vec![("eta", &eta_v), ("mean", &mean_v), ("sigma", &sigma_v)];
 
     let lo_v: Vec<f64>;
     let hi_v: Vec<f64>;
     if let Some(lo) = mean_lower {
         lo_v = lo.to_vec();
         hi_v = mean_upper
-            .ok_or_else(|| "internal error: mean_upper missing while mean_lower is present".to_string())?
+            .ok_or_else(|| {
+                "internal error: mean_upper missing while mean_lower is present".to_string()
+            })?
             .to_vec();
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
@@ -10406,10 +10492,14 @@ fn write_survival_prediction_csv(
     if let Some(se) = eta_se {
         se_v = se.to_vec();
         lo_v = survival_lower
-            .ok_or_else(|| "internal error: survival_lower missing while effective_se is present".to_string())?
+            .ok_or_else(|| {
+                "internal error: survival_lower missing while effective_se is present".to_string()
+            })?
             .to_vec();
         hi_v = survival_upper
-            .ok_or_else(|| "internal error: survival_upper missing while effective_se is present".to_string())?
+            .ok_or_else(|| {
+                "internal error: survival_upper missing while effective_se is present".to_string()
+            })?
             .to_vec();
         cols.push(("effective_se", &se_v));
         cols.push(("mean_lower", &lo_v));
@@ -11319,7 +11409,7 @@ mod tests {
                             aniso_log_scales: None,
                         },
                         input_scales: None,
-                        },
+                    },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -11335,7 +11425,7 @@ mod tests {
                             aniso_log_scales: None,
                         },
                         input_scales: None,
-                        },
+                    },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -11351,7 +11441,7 @@ mod tests {
                             aniso_log_scales: None,
                         },
                         input_scales: None,
-                        },
+                    },
                     shape: ShapeConstraint::None,
                 },
             ],
@@ -11389,7 +11479,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -11416,7 +11506,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                         },
                         input_scales: None,
-                        },
+                    },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -11429,9 +11519,8 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                         },
                         input_scales: None,
-                        },
-                        input_scales: None,
-                        },
+                    },
+                    shape: ShapeConstraint::None,
                 },
             ],
         };
@@ -11470,7 +11559,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };

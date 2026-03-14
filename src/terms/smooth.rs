@@ -4,13 +4,12 @@ use crate::basis::{
     BasisPsiSecondDerivativeResult, CenterStrategy, DuchonBasisSpec, MaternBasisSpec,
     MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     ThinPlateBasisSpec, apply_sum_to_zero_constraint, applyweighted_orthogonality_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_derivative,
-    build_duchon_basis_log_kappa_aniso_derivatives,
-    build_duchon_basis_log_kappasecond_derivative, build_duchon_collocation_operator_matrices,
-    build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
-    build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappasecond_derivative,
-    build_matern_collocation_operator_matrices, build_thin_plate_basis, estimate_penalty_nullity,
-    filter_active_penalty_candidates,
+    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
+    build_duchon_basis_log_kappa_derivative, build_duchon_basis_log_kappasecond_derivative,
+    build_duchon_collocation_operator_matrices, build_matern_basis,
+    build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivative,
+    build_matern_basis_log_kappasecond_derivative, build_matern_collocation_operator_matrices,
+    build_thin_plate_basis, estimate_penalty_nullity, filter_active_penalty_candidates,
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
@@ -21,8 +20,8 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
-    FittedLinkParameters, UnifiedFitResult,
-    fit_gamwith_heuristic_lambdas, reml::DirectionalHyperParam,
+    FittedLinkParameters, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
+    reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
@@ -33,8 +32,7 @@ use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion,
-    NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
+    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -682,24 +680,25 @@ impl SpatialLogKappaCoords {
 }
 
 /// Get the `aniso_log_scales` from a spatial term, if present.
-fn get_spatial_aniso_log_scales(
-    spec: &TermCollectionSpec,
-    term_idx: usize,
-) -> Option<Vec<f64>> {
-    spec.smooth_terms.get(term_idx).and_then(|term| match &term.basis {
-        SmoothBasisSpec::Matern { spec, .. } => spec.aniso_log_scales.clone(),
-        SmoothBasisSpec::Duchon { spec, .. } => spec.aniso_log_scales.clone(),
-        _ => None,
-    })
+fn get_spatial_aniso_log_scales(spec: &TermCollectionSpec, term_idx: usize) -> Option<Vec<f64>> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.aniso_log_scales.clone(),
+            SmoothBasisSpec::Duchon { spec, .. } => spec.aniso_log_scales.clone(),
+            _ => None,
+        })
 }
 
 /// Get the number of feature columns (spatial dimensionality) for a spatial term.
 fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option<usize> {
-    spec.smooth_terms.get(term_idx).and_then(|term| match &term.basis {
-        SmoothBasisSpec::Matern { feature_cols, .. } => Some(feature_cols.len()),
-        SmoothBasisSpec::Duchon { feature_cols, .. } => Some(feature_cols.len()),
-        _ => None,
-    })
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::Matern { feature_cols, .. } => Some(feature_cols.len()),
+            SmoothBasisSpec::Duchon { feature_cols, .. } => Some(feature_cols.len()),
+            _ => None,
+        })
 }
 
 /// Set `aniso_log_scales` on a spatial term's basis spec.
@@ -741,8 +740,12 @@ pub(crate) fn sync_aniso_contrasts_from_metadata(
 ) {
     for (term_idx, term) in design.terms.iter().enumerate() {
         let meta_aniso = match &term.metadata {
-            BasisMetadata::Matern { aniso_log_scales, .. } => aniso_log_scales.clone(),
-            BasisMetadata::Duchon { aniso_log_scales, .. } => aniso_log_scales.clone(),
+            BasisMetadata::Matern {
+                aniso_log_scales, ..
+            } => aniso_log_scales.clone(),
+            BasisMetadata::Duchon {
+                aniso_log_scales, ..
+            } => aniso_log_scales.clone(),
             _ => None,
         };
         if let Some(eta) = meta_aniso {
@@ -1899,7 +1902,11 @@ pub fn build_smooth_design(
                 }
                 build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
             }
-            SmoothBasisSpec::ThinPlate { feature_cols, spec, input_scales } => {
+            SmoothBasisSpec::ThinPlate {
+                feature_cols,
+                spec,
+                input_scales,
+            } => {
                 if term.shape != ShapeConstraint::None {
                     if feature_cols.len() != 1 {
                         return Err(BasisError::InvalidInput(format!(
@@ -1935,12 +1942,20 @@ pub fn build_smooth_design(
                     rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
                 })?;
                 // Inject input scales into metadata for downstream storage.
-                if let BasisMetadata::ThinPlate { input_scales: ref mut ms, .. } = result.metadata {
+                if let BasisMetadata::ThinPlate {
+                    input_scales: ref mut ms,
+                    ..
+                } = result.metadata
+                {
                     *ms = scales;
                 }
                 result
             }
-            SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+            SmoothBasisSpec::Matern {
+                feature_cols,
+                spec,
+                input_scales,
+            } => {
                 if term.shape != ShapeConstraint::None {
                     if feature_cols.len() != 1 {
                         return Err(BasisError::InvalidInput(format!(
@@ -1963,12 +1978,20 @@ pub fn build_smooth_design(
                     None
                 };
                 let mut result = build_matern_basis(x.view(), spec)?;
-                if let BasisMetadata::Matern { input_scales: ref mut ms, .. } = result.metadata {
+                if let BasisMetadata::Matern {
+                    input_scales: ref mut ms,
+                    ..
+                } = result.metadata
+                {
                     *ms = scales;
                 }
                 result
             }
-            SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+            SmoothBasisSpec::Duchon {
+                feature_cols,
+                spec,
+                input_scales,
+            } => {
                 if term.shape != ShapeConstraint::None {
                     if feature_cols.len() != 1 {
                         return Err(BasisError::InvalidInput(format!(
@@ -1999,7 +2022,11 @@ pub fn build_smooth_design(
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
                 let mut result = build_duchon_basis(x.view(), &spec_local)?;
-                if let BasisMetadata::Duchon { input_scales: ref mut ms, .. } = result.metadata {
+                if let BasisMetadata::Duchon {
+                    input_scales: ref mut ms,
+                    ..
+                } = result.metadata
+                {
                     *ms = scales;
                 }
                 result
@@ -3153,6 +3180,16 @@ impl CharbonnierScalarBlockState {
             .mapv(|r| r + (self.epsilon * self.epsilon) / r - 2.0 * self.epsilon)
     }
 
+    fn log_epsilon_gradient_terms(&self) -> Array1<f64> {
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        let eps3 = eps2 * epsilon;
+        // Closed form in eta = log eps:
+        //
+        //   d/deta psi(t; eps) = eps * r + eps^3 / r - 2 eps^2.
+        self.radius.mapv(|r| epsilon * r + eps3 / r - 2.0 * eps2)
+    }
+
     fn beta_epsilon_mixed_coeff(&self) -> Array1<f64> {
         // Mixed derivative with respect to beta and the raw epsilon coordinate:
         //
@@ -3170,11 +3207,29 @@ impl CharbonnierScalarBlockState {
         )
     }
 
-    #[cfg(test)]
+    fn log_epsilon_betagradient_coeff(&self) -> Array1<f64> {
+        let epsilon = self.epsilon;
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(self.radius.iter())
+                .map(|(t, r)| epsilon * t.powi(3) / r.powi(3)),
+        )
+    }
+
     fn epsilonhessian_terms(&self) -> Array1<f64> {
         Array1::from_iter(self.signal.iter().zip(self.radius.iter()).map(|(t, r)| {
             (3.0 * self.epsilon * t * t + 2.0 * self.epsilon.powi(3)) / (r * r * r) - 2.0
         }))
+    }
+
+    fn log_epsilon_hessian_terms(&self) -> Array1<f64> {
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        let eps3 = eps2 * epsilon;
+        let eps5 = eps3 * eps2;
+        self.radius
+            .mapv(|r| epsilon * r + 4.0 * eps3 / r - eps5 / r.powi(3) - 4.0 * eps2)
     }
 
     fn surrogateweights(
@@ -3264,6 +3319,40 @@ impl CharbonnierScalarBlockState {
                 .map(|(t, r)| 3.0 * eps3 * t * t / r.powi(5)),
         )
     }
+
+    fn log_epsilon_beta_mixed_second_coeff(&self) -> Array1<f64> {
+        let epsilon = self.epsilon;
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(self.radius.iter())
+                .map(|(t, r)| epsilon * t.powi(3) * (t * t - 2.0 * epsilon * epsilon) / r.powi(5)),
+        )
+    }
+
+    fn log_epsilon_betahessian_second_diag(&self) -> Array1<f64> {
+        let eps3 = self.epsilon.powi(3);
+        Array1::from_iter(self.signal.iter().zip(self.radius.iter()).map(|(t, r)| {
+            3.0 * eps3 * t * t * (3.0 * t * t - 2.0 * self.epsilon * self.epsilon) / r.powi(7)
+        }))
+    }
+
+    fn log_epsilon_betahessian_directional_diag(
+        &self,
+        direction_signal: &Array1<f64>,
+    ) -> Array1<f64> {
+        let eps3 = self.epsilon.powi(3);
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(direction_signal.iter())
+                .zip(self.radius.iter())
+                .map(|((t, q), r)| {
+                    3.0 * eps3 * t * (2.0 * self.epsilon * self.epsilon - 3.0 * t * t) * q
+                        / r.powi(7)
+                }),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -3339,6 +3428,13 @@ impl CharbonnierGroupedBlockState {
             .mapv(|r| r + (self.epsilon * self.epsilon) / r - 2.0 * self.epsilon)
     }
 
+    fn log_epsilon_gradient_terms(&self) -> Array1<f64> {
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        let eps3 = eps2 * epsilon;
+        self.radius.mapv(|r| epsilon * r + eps3 / r - 2.0 * eps2)
+    }
+
     fn beta_epsilon_mixed_blocks(&self) -> Array2<f64> {
         // Raw-epsilon mixed block:
         //
@@ -3355,11 +3451,29 @@ impl CharbonnierGroupedBlockState {
         out
     }
 
-    #[cfg(test)]
+    fn log_epsilon_betagradient_blocks(&self) -> Array2<f64> {
+        let mut out = self.signal_blocks.clone();
+        let epsilon = self.epsilon;
+        for (k, mut row) in out.rows_mut().into_iter().enumerate() {
+            let scale = epsilon * self.norm[k] * self.norm[k] / self.radius[k].powi(3);
+            row.mapv_inplace(|v| v * scale);
+        }
+        out
+    }
+
     fn epsilonhessian_terms(&self) -> Array1<f64> {
         Array1::from_iter(self.norm.iter().zip(self.radius.iter()).map(|(g, r)| {
             (3.0 * self.epsilon * g * g + 2.0 * self.epsilon.powi(3)) / (r * r * r) - 2.0
         }))
+    }
+
+    fn log_epsilon_hessian_terms(&self) -> Array1<f64> {
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        let eps3 = eps2 * epsilon;
+        let eps5 = eps3 * eps2;
+        self.radius
+            .mapv(|r| epsilon * r + 4.0 * eps3 / r - eps5 / r.powi(3) - 4.0 * eps2)
     }
 
     fn surrogateweights(
@@ -3478,6 +3592,76 @@ impl CharbonnierGroupedBlockState {
                         * row[i]
                         * row[j]
                         / r5;
+                }
+            }
+            out.push(block);
+        }
+        out
+    }
+
+    fn log_epsilon_beta_mixed_second_blocks(&self) -> Array2<f64> {
+        let mut out = self.signal_blocks.clone();
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        for (k, mut row) in out.rows_mut().into_iter().enumerate() {
+            let norm2 = self.norm[k] * self.norm[k];
+            let scale = epsilon * norm2 * (norm2 - 2.0 * eps2) / self.radius[k].powi(5);
+            row.mapv_inplace(|v| v * scale);
+        }
+        out
+    }
+
+    fn log_epsilon_betahessian_second_blocks(&self) -> Vec<Array2<f64>> {
+        let mut out = Vec::with_capacity(self.signal_blocks.nrows());
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        let eps4 = eps2 * eps2;
+        for (k, row) in self.signal_blocks.rows().into_iter().enumerate() {
+            let dim = row.len();
+            let norm2 = self.norm[k] * self.norm[k];
+            let r5 = self.radius[k].powi(5);
+            let r7 = self.radius[k].powi(7);
+            let mut block = Array2::<f64>::eye(dim);
+            block.mapv_inplace(|v| epsilon * norm2 * (norm2 - 2.0 * eps2) * v / r5);
+            for i in 0..dim {
+                for j in 0..dim {
+                    block[[i, j]] += epsilon
+                        * (-norm2 * norm2 + 10.0 * eps2 * norm2 - 4.0 * eps4)
+                        * row[i]
+                        * row[j]
+                        / r7;
+                }
+            }
+            out.push(block);
+        }
+        out
+    }
+
+    fn log_epsilon_betahessian_directional_blocks(
+        &self,
+        direction_blocks: &Array2<f64>,
+    ) -> Vec<Array2<f64>> {
+        let mut out = Vec::with_capacity(self.signal_blocks.nrows());
+        let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
+        for (k, (v, q)) in self
+            .signal_blocks
+            .rows()
+            .into_iter()
+            .zip(direction_blocks.rows().into_iter())
+            .enumerate()
+        {
+            let dim = v.len();
+            let norm2 = self.norm[k] * self.norm[k];
+            let dot = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let coeff = (2.0 * eps2 - norm2) / self.radius[k].powi(5);
+            let r7 = self.radius[k].powi(7);
+            let mut block = Array2::<f64>::eye(dim);
+            block.mapv_inplace(|x| epsilon * coeff * dot * x);
+            for i in 0..dim {
+                for j in 0..dim {
+                    block[[i, j]] += epsilon * coeff * (q[i] * v[j] + v[i] * q[j]);
+                    block[[i, j]] += 3.0 * epsilon * (norm2 - 4.0 * eps2) * dot * v[i] * v[j] / r7;
                 }
             }
             out.push(block);
@@ -3833,16 +4017,17 @@ fn extract_spatial_operator_runtime_caches(
                     },
                 ) => {
                     let mut ws = crate::basis::BasisWorkspace::default();
-                    let ops = crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
-                        centers.view(),
-                        None,
-                        *length_scale,
-                        *power,
-                        *nullspace_order,
-                        aniso_log_scales.as_deref(),
-                        identifiability_transform.as_ref().map(|z| z.view()),
-                        &mut ws,
-                    )?;
+                    let ops =
+                        crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
+                            centers.view(),
+                            None,
+                            *length_scale,
+                            *power,
+                            *nullspace_order,
+                            aniso_log_scales.as_deref(),
+                            identifiability_transform.as_ref().map(|z| z.view()),
+                            &mut ws,
+                        )?;
                     (
                         feature_cols.clone(),
                         ops.d0,
@@ -4128,7 +4313,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     }
 
     let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
-        &baseline.fit.beta(),
+        &baseline.fit.beta,
         runtime_caches,
         adaptive_opts.min_epsilon,
     )?;
@@ -4242,7 +4427,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         offset: offset.to_owned(),
         penalties: retained_penalties.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
-        initial_beta: Some(baseline.fit.beta().clone()),
+        initial_beta: Some(baseline.fit.beta.clone()),
     };
     let outer_opts = BlockwiseFitOptions {
         inner_max_cycles: options.max_iter,
@@ -4259,7 +4444,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
-        last_eval: Option<(Array1<f64>, f64, Array1<f64>, CustomFamilyWarmStart)>,
+        last_eval: Option<(
+            Array1<f64>,
+            f64,
+            Array1<f64>,
+            Array2<f64>,
+            CustomFamilyWarmStart,
+        )>,
     }
 
     let n_theta = initial_theta.len();
@@ -4319,7 +4510,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         },
         cap: OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: Derivative::Analytic,
             n_params: n_theta,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
@@ -4348,7 +4539,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             let theta = clamp_theta(theta);
 
             // Return cached result if theta has not moved.
-            if let Some((cached_theta, cached_cost, cached_grad, cached_warm)) = &st.last_eval {
+            if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
+                &st.last_eval
+            {
                 if cached_theta.len() == theta.len()
                     && cached_theta
                         .iter()
@@ -4359,7 +4552,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     return Ok(OuterEval {
                         cost: *cached_cost,
                         gradient: cached_grad.clone(),
-                        hessian: HessianResult::Unavailable,
+                        hessian: HessianResult::Analytic(cached_hess.clone()),
                     });
                 }
             }
@@ -4374,7 +4567,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &rho,
                 &derivative_blocks,
                 st.warm_cache.as_ref(),
-                false,
+                true,
             )
             .map_err(|e| {
                 EstimationError::RemlOptimizationFailed(format!(
@@ -4386,17 +4579,37 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "exact spatial adaptive objective returned non-finite values".to_string(),
                 ));
             }
+            let hessian = result.outer_hessian.ok_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "exact spatial adaptive objective did not return an outer Hessian".to_string(),
+                )
+            })?;
+            if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "exact spatial adaptive outer Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    theta.len(),
+                    theta.len(),
+                )));
+            }
+            if hessian.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "exact spatial adaptive outer Hessian contained non-finite values".to_string(),
+                ));
+            }
             st.warm_cache = Some(result.warm_start.clone());
             st.last_eval = Some((
                 theta.clone(),
                 result.objective,
                 result.gradient.clone(),
+                hessian.clone(),
                 result.warm_start,
             ));
             Ok(OuterEval {
                 cost: result.objective,
                 gradient: result.gradient,
-                hessian: HessianResult::Unavailable,
+                hessian: HessianResult::Analytic(hessian),
             })
         },
         reset_fn: |st: &mut SpatialAdaptiveOuterState| {
@@ -4453,7 +4666,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         offset: offset.to_owned(),
         penalties: vec![],
         initial_log_lambdas: Array1::zeros(0),
-        initial_beta: Some(baseline.fit.beta().clone()),
+        initial_beta: Some(baseline.fit.beta.clone()),
     };
     let final_fit = fit_custom_family(
         &final_family,
@@ -4611,7 +4824,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             .unwrap_or(FittedLinkParameters::Standard),
         _ => FittedLinkParameters::Standard,
     };
-    let beta_covariance_ref = beta_covariance.clone();
     let geometry = Some(crate::estimate::FitGeometry {
         penalized_hessian: penalized_hessian.clone(),
         working_weights: final_eval.obs.fisherweight.clone(),
@@ -4624,32 +4836,19 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             out
         },
     });
+    let max_abs_eta = final_eval
+        .obs
+        .eta
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let fitted = FittedTermCollection {
-        fit: UnifiedFitResult {
-            blocks: vec![crate::estimate::FittedBlock {
-                beta: beta.clone(),
-                role: crate::estimate::BlockRole::Mean,
-                edf: edf_total,
-                lambdas: full_lambdas.clone(),
-            }],
-            log_lambdas: full_lambdas.mapv(|v| v.max(1e-300).ln()),
-            lambdas: full_lambdas,
-            log_likelihood: -0.5 * deviance,
-            deviance,
-            reml_score: final_fit.penalized_objective,
-            stable_penalty_term,
-            penalized_objective: -0.5 * deviance + stable_penalty_term + final_fit.penalized_objective,
-            outer_iterations,
-            outer_converged: final_fit.outer_converged,
-            outer_gradient_norm: outer_grad_norm,
-            standard_deviation,
-            covariance_conditional: beta_covariance_ref,
-            covariance_corrected: None,
-            inference: Some(FitInference {
+        fit: {
+            let log_lambdas = full_lambdas.mapv(|v| v.max(1e-300).ln());
+            let inf = FitInference {
                 edf_by_block,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian,
+                penalized_hessian: penalized_hessian.clone(),
                 working_weights: final_eval.obs.fisherweight.clone(),
                 working_response: {
                     let mut out = final_eval.obs.eta.clone();
@@ -4664,10 +4863,47 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
-            }),
-            fitted_link: fitted_link_parameters,
-            geometry,
-            block_states: Vec::new(),
+            };
+            let geometry = Some(crate::estimate::FitGeometry {
+                penalized_hessian,
+                working_weights: inf.working_weights.clone(),
+                working_response: inf.working_response.clone(),
+            });
+            let covariance_conditional = inf.beta_covariance.clone();
+            let pirls_status_val = if final_fit.outer_converged {
+                crate::pirls::PirlsStatus::Converged
+            } else {
+                crate::pirls::PirlsStatus::StalledAtValidMinimum
+            };
+            FitResult::try_from_parts(UnifiedFitResultParts {
+                blocks: vec![crate::estimate::FittedBlock {
+                    beta: beta.clone(),
+                    role: crate::estimate::BlockRole::Mean,
+                    edf: edf_total,
+                    lambdas: full_lambdas.clone(),
+                }],
+                log_lambdas,
+                lambdas: full_lambdas,
+                log_likelihood: -0.5 * deviance,
+                reml_score: final_fit.penalized_objective,
+                stable_penalty_term,
+                penalized_objective: final_fit.penalized_objective,
+                outer_iterations,
+                outer_converged: final_fit.outer_converged,
+                outer_gradient_norm: outer_grad_norm,
+                standard_deviation,
+                covariance_conditional,
+                covariance_corrected: None,
+                inference: Some(inf),
+                fitted_link: fitted_link_parameters,
+                geometry,
+                block_states: Vec::new(),
+                pirls_status: pirls_status_val,
+                max_abs_eta,
+                constraint_kkt: None,
+                artifacts: crate::estimate::FitArtifacts { pirls: None },
+                inner_cycles: 0,
+            })?
         },
         design: baseline.design,
         adaptive_diagnostics: Some(AdaptiveRegularizationDiagnostics {
@@ -4963,10 +5199,76 @@ enum SpatialAdaptiveHyperKind {
     LogEpsilonCurvature,
 }
 
-#[derive(Clone, Debug)]
+impl SpatialAdaptiveHyperKind {
+    fn component_index(self) -> usize {
+        match self {
+            SpatialAdaptiveHyperKind::LogLambdaMagnitude
+            | SpatialAdaptiveHyperKind::LogEpsilonMagnitude => 0,
+            SpatialAdaptiveHyperKind::LogLambdaGradient
+            | SpatialAdaptiveHyperKind::LogEpsilonGradient => 1,
+            SpatialAdaptiveHyperKind::LogLambdaCurvature
+            | SpatialAdaptiveHyperKind::LogEpsilonCurvature => 2,
+        }
+    }
+
+    fn is_log_lambda(self) -> bool {
+        matches!(
+            self,
+            SpatialAdaptiveHyperKind::LogLambdaMagnitude
+                | SpatialAdaptiveHyperKind::LogLambdaGradient
+                | SpatialAdaptiveHyperKind::LogLambdaCurvature
+        )
+    }
+
+    fn is_log_epsilon(self) -> bool {
+        matches!(
+            self,
+            SpatialAdaptiveHyperKind::LogEpsilonMagnitude
+                | SpatialAdaptiveHyperKind::LogEpsilonGradient
+                | SpatialAdaptiveHyperKind::LogEpsilonCurvature
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct SpatialAdaptiveHyperSpec {
     cache_index: usize,
     kind: SpatialAdaptiveHyperKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpatialAdaptiveExplicitSecondOrderKind {
+    StructuralZero,
+    LocalAlphaAlpha,
+    LocalAlphaEta,
+    SharedEtaEta,
+}
+
+impl SpatialAdaptiveHyperSpec {
+    fn component_index(self) -> usize {
+        self.kind.component_index()
+    }
+
+    fn explicit_second_order_kind(self, other: Self) -> SpatialAdaptiveExplicitSecondOrderKind {
+        if self.component_index() != other.component_index() {
+            return SpatialAdaptiveExplicitSecondOrderKind::StructuralZero;
+        }
+        match (
+            self.kind.is_log_lambda(),
+            other.kind.is_log_lambda(),
+            self.kind.is_log_epsilon(),
+            other.kind.is_log_epsilon(),
+        ) {
+            (true, true, false, false) if self.cache_index == other.cache_index => {
+                SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaAlpha
+            }
+            (true, false, false, true) | (false, true, true, false) => {
+                SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaEta
+            }
+            (false, false, true, true) => SpatialAdaptiveExplicitSecondOrderKind::SharedEtaEta,
+            _ => SpatialAdaptiveExplicitSecondOrderKind::StructuralZero,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5055,16 +5357,549 @@ impl SpatialAdaptiveExactFamily {
         (value, grad)
     }
 
+    fn zero_hyper_parts(&self) -> (Array1<f64>, Array2<f64>) {
+        let total_dim = self.design.ncols();
+        (
+            Array1::<f64>::zeros(total_dim),
+            Array2::<f64>::zeros((total_dim, total_dim)),
+        )
+    }
+
+    fn embed_local_hyper_parts(
+        &self,
+        coeff_range: &Range<usize>,
+        local_grad: &Array1<f64>,
+        local_hess: &Array2<f64>,
+    ) -> (Array1<f64>, Array2<f64>) {
+        let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
+        beta_mixed
+            .slice_mut(s![coeff_range.clone()])
+            .assign(local_grad);
+        betahessian
+            .slice_mut(s![coeff_range.clone(), coeff_range.clone()])
+            .assign(local_hess);
+        (beta_mixed, betahessian)
+    }
+
+    fn embed_local_hyper_hessian(
+        &self,
+        coeff_range: &Range<usize>,
+        local_hess: &Array2<f64>,
+    ) -> Array2<f64> {
+        let total_dim = self.design.ncols();
+        let mut out = Array2::<f64>::zeros((total_dim, total_dim));
+        out.slice_mut(s![coeff_range.clone(), coeff_range.clone()])
+            .assign(local_hess);
+        out
+    }
+
+    fn adaptive_block_parts(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        cache_idx: usize,
+        component: usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let cache = self
+            .runtime_caches
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
+        let params = self
+            .adaptive_params
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
+        let state = eval
+            .adaptive_states
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
+
+        match component {
+            0 => {
+                let lambda = params.lambda[0];
+                let beta_mixed_local = lambda
+                    * scalar_operatorgradient(&cache.d0, &state.magnitude.betagradient_coeff());
+                let betahessian_local =
+                    lambda * scalar_operatorhessian(&cache.d0, &state.magnitude.betahessian_diag());
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.magnitude.penalty_value(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            1 => {
+                let lambda = params.lambda[1];
+                let beta_mixed_local = lambda
+                    * grouped_operatorgradient(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.betagradient_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let betahessian_local = lambda
+                    * grouped_operatorhessian(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.betahessian_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.gradient.penalty_value(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            2 => {
+                let lambda = params.lambda[2];
+                let beta_mixed_local = lambda
+                    * scalar_operatorgradient(&cache.d2, &state.curvature.betagradient_coeff());
+                let betahessian_local =
+                    lambda * scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag());
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.curvature.penalty_value(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            _ => Err(format!("invalid adaptive component index {}", component)),
+        }
+    }
+
+    fn adaptive_block_log_epsilon_parts(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        cache_idx: usize,
+        component: usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let cache = self
+            .runtime_caches
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
+        let params = self
+            .adaptive_params
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
+        let state = eval
+            .adaptive_states
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
+
+        match component {
+            0 => {
+                let lambda = params.lambda[0];
+                let beta_mixed_local = lambda
+                    * scalar_operatorgradient(
+                        &cache.d0,
+                        &state.magnitude.log_epsilon_betagradient_coeff(),
+                    );
+                let betahessian_local = lambda
+                    * scalar_operatorhessian(
+                        &cache.d0,
+                        &state.magnitude.log_epsilon_betahessian_diag(),
+                    );
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.magnitude.log_epsilon_gradient_terms().sum(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            1 => {
+                let lambda = params.lambda[1];
+                let beta_mixed_local = lambda
+                    * grouped_operatorgradient(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.log_epsilon_betagradient_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let betahessian_local = lambda
+                    * grouped_operatorhessian(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.log_epsilon_betahessian_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.gradient.log_epsilon_gradient_terms().sum(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            2 => {
+                let lambda = params.lambda[2];
+                let beta_mixed_local = lambda
+                    * scalar_operatorgradient(
+                        &cache.d2,
+                        &state.curvature.log_epsilon_betagradient_coeff(),
+                    );
+                let betahessian_local = lambda
+                    * scalar_operatorhessian(
+                        &cache.d2,
+                        &state.curvature.log_epsilon_betahessian_diag(),
+                    );
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.curvature.log_epsilon_gradient_terms().sum(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            _ => Err(format!("invalid adaptive component index {}", component)),
+        }
+    }
+
+    fn adaptive_block_log_epsilon_second_parts(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        cache_idx: usize,
+        component: usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let cache = self
+            .runtime_caches
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
+        let params = self
+            .adaptive_params
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
+        let state = eval
+            .adaptive_states
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
+
+        match component {
+            0 => {
+                let lambda = params.lambda[0];
+                let beta_mixed_local = lambda
+                    * scalar_operatorgradient(
+                        &cache.d0,
+                        &state.magnitude.log_epsilon_beta_mixed_second_coeff(),
+                    );
+                let betahessian_local = lambda
+                    * scalar_operatorhessian(
+                        &cache.d0,
+                        &state.magnitude.log_epsilon_betahessian_second_diag(),
+                    );
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.magnitude.log_epsilon_hessian_terms().sum(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            1 => {
+                let lambda = params.lambda[1];
+                let beta_mixed_local = lambda
+                    * grouped_operatorgradient(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.log_epsilon_beta_mixed_second_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let betahessian_local = lambda
+                    * grouped_operatorhessian(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.log_epsilon_betahessian_second_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.gradient.log_epsilon_hessian_terms().sum(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            2 => {
+                let lambda = params.lambda[2];
+                let beta_mixed_local = lambda
+                    * scalar_operatorgradient(
+                        &cache.d2,
+                        &state.curvature.log_epsilon_beta_mixed_second_coeff(),
+                    );
+                let betahessian_local = lambda
+                    * scalar_operatorhessian(
+                        &cache.d2,
+                        &state.curvature.log_epsilon_betahessian_second_diag(),
+                    );
+                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+                    &cache.coeff_global_range,
+                    &beta_mixed_local,
+                    &betahessian_local,
+                );
+                Ok((
+                    lambda * state.curvature.log_epsilon_hessian_terms().sum(),
+                    beta_mixed,
+                    betahessian,
+                ))
+            }
+            _ => Err(format!("invalid adaptive component index {}", component)),
+        }
+    }
+
+    fn adaptive_shared_log_epsilon_parts(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        component: usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        // Exact shared-log-epsilon first-order pieces:
+        //
+        //   J_{eta_p}         = sum_m lambda_{m,p} U_{m,p,eta},
+        //   J_{beta,eta_p}    = sum_m lambda_{m,p} U_{m,p,beta eta},
+        //   J_{beta,beta,eta} = sum_m lambda_{m,p} U_{m,p,beta beta eta}.
+        let (mut score, mut hessian) = self.zero_hyper_parts();
+        let mut objective = 0.0;
+        for cache_idx in 0..self.runtime_caches.len() {
+            let (local_objective, local_score, local_hessian) =
+                self.adaptive_block_log_epsilon_parts(eval, cache_idx, component)?;
+            objective += local_objective;
+            score += &local_score;
+            hessian += &local_hessian;
+        }
+        Ok((objective, score, hessian))
+    }
+
+    fn adaptive_shared_log_epsilon_second_parts(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        component: usize,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        // Exact shared-log-epsilon second-order pieces:
+        //
+        //   J_{eta_p,eta_p}            = sum_m lambda_{m,p} U_{m,p,eta eta},
+        //   J_{beta,eta_p,eta_p}       = sum_m lambda_{m,p} U_{m,p,beta eta eta},
+        //   J_{beta,beta,eta_p,eta_p}  = sum_m lambda_{m,p} U_{m,p,beta beta eta eta}.
+        let (mut score, mut hessian) = self.zero_hyper_parts();
+        let mut objective = 0.0;
+        for cache_idx in 0..self.runtime_caches.len() {
+            let (local_objective, local_score, local_hessian) =
+                self.adaptive_block_log_epsilon_second_parts(eval, cache_idx, component)?;
+            objective += local_objective;
+            score += &local_score;
+            hessian += &local_hessian;
+        }
+        Ok((objective, score, hessian))
+    }
+
+    fn adaptive_shared_log_epsilon_drift(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        component: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        // Exact shared-log-epsilon Hessian drift:
+        //
+        //   T_{eta_p}[u] = sum_m lambda_{m,p} D_beta(U_{m,p,beta beta eta})[u].
+        let total_dim = self.design.ncols();
+        let mut total = Array2::<f64>::zeros((total_dim, total_dim));
+        for cache_idx in 0..self.runtime_caches.len() {
+            total +=
+                &self.adaptive_block_log_epsilon_drift(eval, cache_idx, component, direction)?;
+        }
+        Ok(total)
+    }
+
+    fn adaptive_explicit_second_order_parts(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        left: SpatialAdaptiveHyperSpec,
+        right: SpatialAdaptiveHyperSpec,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        // Structural sparsity from the adaptive penalty algebra:
+        //
+        //   - alpha_{m,p} / alpha_{n,r} is nonzero only when (m,p) = (n,r),
+        //   - alpha_{m,p} / eta_r is nonzero only when p = r,
+        //   - eta_p / eta_r is nonzero only when p = r,
+        //
+        // with eta_p contributions summed over all adaptive terms m because the
+        // three log-epsilon coordinates are shared globally by penalty type.
+        match left.explicit_second_order_kind(right) {
+            SpatialAdaptiveExplicitSecondOrderKind::StructuralZero => {
+                let (score, hessian) = self.zero_hyper_parts();
+                Ok((0.0, score, hessian))
+            }
+            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaAlpha => {
+                self.adaptive_block_parts(eval, left.cache_index, left.component_index())
+            }
+            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaEta => {
+                let local_alpha = if left.kind.is_log_lambda() {
+                    left
+                } else {
+                    right
+                };
+                self.adaptive_block_log_epsilon_parts(
+                    eval,
+                    local_alpha.cache_index,
+                    local_alpha.component_index(),
+                )
+            }
+            SpatialAdaptiveExplicitSecondOrderKind::SharedEtaEta => {
+                self.adaptive_shared_log_epsilon_second_parts(eval, left.component_index())
+            }
+        }
+    }
+
+    fn adaptive_block_drift(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        cache_idx: usize,
+        component: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let cache = self
+            .runtime_caches
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
+        let params = self
+            .adaptive_params
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
+        let state = eval
+            .adaptive_states
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
+        let direction_local = direction.slice(s![cache.coeff_global_range.clone()]);
+
+        let local_hessian = match component {
+            0 => {
+                let d0_u = cache.d0.dot(&direction_local);
+                params.lambda[0]
+                    * scalar_operatorhessian(
+                        &cache.d0,
+                        &state.magnitude.directionalhessian_diag(&d0_u),
+                    )
+            }
+            1 => {
+                let d1_u = cache.d1.dot(&direction_local);
+                params.lambda[1]
+                    * grouped_operatorhessian(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.directionalhessian_blocks(
+                            &collocationgradient_blocks(&d1_u, cache.dimension)
+                                .map_err(|e| e.to_string())?,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?
+            }
+            2 => {
+                let d2_u = cache.d2.dot(&direction_local);
+                params.lambda[2]
+                    * scalar_operatorhessian(
+                        &cache.d2,
+                        &state.curvature.directionalhessian_diag(&d2_u),
+                    )
+            }
+            _ => return Err(format!("invalid adaptive component index {}", component)),
+        };
+
+        Ok(self.embed_local_hyper_hessian(&cache.coeff_global_range, &local_hessian))
+    }
+
+    fn adaptive_block_log_epsilon_drift(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        cache_idx: usize,
+        component: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let cache = self
+            .runtime_caches
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
+        let params = self
+            .adaptive_params
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
+        let state = eval
+            .adaptive_states
+            .get(cache_idx)
+            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
+        let direction_local = direction.slice(s![cache.coeff_global_range.clone()]);
+
+        let local_hessian = match component {
+            0 => {
+                let d0_u = cache.d0.dot(&direction_local);
+                params.lambda[0]
+                    * scalar_operatorhessian(
+                        &cache.d0,
+                        &state
+                            .magnitude
+                            .log_epsilon_betahessian_directional_diag(&d0_u),
+                    )
+            }
+            1 => {
+                let d1_u = cache.d1.dot(&direction_local);
+                params.lambda[1]
+                    * grouped_operatorhessian(
+                        &cache.d1,
+                        cache.dimension,
+                        &state.gradient.log_epsilon_betahessian_directional_blocks(
+                            &collocationgradient_blocks(&d1_u, cache.dimension)
+                                .map_err(|e| e.to_string())?,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?
+            }
+            2 => {
+                let d2_u = cache.d2.dot(&direction_local);
+                params.lambda[2]
+                    * scalar_operatorhessian(
+                        &cache.d2,
+                        &state
+                            .curvature
+                            .log_epsilon_betahessian_directional_diag(&d2_u),
+                    )
+            }
+            _ => return Err(format!("invalid adaptive component index {}", component)),
+        };
+
+        Ok(self.embed_local_hyper_hessian(&cache.coeff_global_range, &local_hessian))
+    }
+
     fn adaptive_hyper_parts(
         &self,
-        beta: &Array1<f64>,
         eval: &SpatialAdaptiveExactEvaluation,
         hyper: SpatialAdaptiveHyperSpec,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let mut beta_mixed = Array1::<f64>::zeros(beta.len());
-        let mut betahessian = Array2::<f64>::zeros((beta.len(), beta.len()));
         match hyper.kind {
             SpatialAdaptiveHyperKind::LogLambdaMagnitude => {
+                let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
                 let cache = self.runtime_caches.get(hyper.cache_index).ok_or_else(|| {
                     format!("adaptive cache index {} out of bounds", hyper.cache_index)
                 })?;
@@ -5101,6 +5936,7 @@ impl SpatialAdaptiveExactFamily {
                 ))
             }
             SpatialAdaptiveHyperKind::LogLambdaGradient => {
+                let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
                 let cache = self.runtime_caches.get(hyper.cache_index).ok_or_else(|| {
                     format!("adaptive cache index {} out of bounds", hyper.cache_index)
                 })?;
@@ -5147,6 +5983,7 @@ impl SpatialAdaptiveExactFamily {
                 ))
             }
             SpatialAdaptiveHyperKind::LogLambdaCurvature => {
+                let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
                 let cache = self.runtime_caches.get(hyper.cache_index).ok_or_else(|| {
                     format!("adaptive cache index {} out of bounds", hyper.cache_index)
                 })?;
@@ -5182,108 +6019,10 @@ impl SpatialAdaptiveExactFamily {
                     betahessian,
                 ))
             }
-            SpatialAdaptiveHyperKind::LogEpsilonMagnitude => {
-                let mut direct = 0.0;
-                for (cache_idx, cache) in self.runtime_caches.iter().enumerate() {
-                    let params = &self.adaptive_params[cache_idx];
-                    let state = &eval.adaptive_states[cache_idx];
-                    let lambda = params.lambda[0];
-                    let epsilon = params.epsilon[0];
-                    direct += lambda * epsilon * state.magnitude.epsilongradient_terms().sum();
-                    let beta_mixed_local = lambda
-                        * epsilon
-                        * scalar_operatorgradient(
-                            &cache.d0,
-                            &state.magnitude.beta_epsilon_mixed_coeff(),
-                        );
-                    let betahessian_local = lambda
-                        * scalar_operatorhessian(
-                            &cache.d0,
-                            &state.magnitude.log_epsilon_betahessian_diag(),
-                        );
-                    {
-                        let mut local = beta_mixed.slice_mut(s![cache.coeff_global_range.clone()]);
-                        local += &beta_mixed_local;
-                    }
-                    {
-                        let mut local = betahessian.slice_mut(s![
-                            cache.coeff_global_range.clone(),
-                            cache.coeff_global_range.clone()
-                        ]);
-                        local += &betahessian_local;
-                    }
-                }
-                Ok((direct, beta_mixed, betahessian))
-            }
-            SpatialAdaptiveHyperKind::LogEpsilonGradient => {
-                let mut direct = 0.0;
-                for (cache_idx, cache) in self.runtime_caches.iter().enumerate() {
-                    let params = &self.adaptive_params[cache_idx];
-                    let state = &eval.adaptive_states[cache_idx];
-                    let lambda = params.lambda[1];
-                    let epsilon = params.epsilon[1];
-                    direct += lambda * epsilon * state.gradient.epsilongradient_terms().sum();
-                    let beta_mixed_local = lambda
-                        * epsilon
-                        * grouped_operatorgradient(
-                            &cache.d1,
-                            cache.dimension,
-                            &state.gradient.beta_epsilon_mixed_blocks(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let betahessian_local = lambda
-                        * grouped_operatorhessian(
-                            &cache.d1,
-                            cache.dimension,
-                            &state.gradient.log_epsilon_betahessian_blocks(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    {
-                        let mut local = beta_mixed.slice_mut(s![cache.coeff_global_range.clone()]);
-                        local += &beta_mixed_local;
-                    }
-                    {
-                        let mut local = betahessian.slice_mut(s![
-                            cache.coeff_global_range.clone(),
-                            cache.coeff_global_range.clone()
-                        ]);
-                        local += &betahessian_local;
-                    }
-                }
-                Ok((direct, beta_mixed, betahessian))
-            }
-            SpatialAdaptiveHyperKind::LogEpsilonCurvature => {
-                let mut direct = 0.0;
-                for (cache_idx, cache) in self.runtime_caches.iter().enumerate() {
-                    let params = &self.adaptive_params[cache_idx];
-                    let state = &eval.adaptive_states[cache_idx];
-                    let lambda = params.lambda[2];
-                    let epsilon = params.epsilon[2];
-                    direct += lambda * epsilon * state.curvature.epsilongradient_terms().sum();
-                    let beta_mixed_local = lambda
-                        * epsilon
-                        * scalar_operatorgradient(
-                            &cache.d2,
-                            &state.curvature.beta_epsilon_mixed_coeff(),
-                        );
-                    let betahessian_local = lambda
-                        * scalar_operatorhessian(
-                            &cache.d2,
-                            &state.curvature.log_epsilon_betahessian_diag(),
-                        );
-                    {
-                        let mut local = beta_mixed.slice_mut(s![cache.coeff_global_range.clone()]);
-                        local += &beta_mixed_local;
-                    }
-                    {
-                        let mut local = betahessian.slice_mut(s![
-                            cache.coeff_global_range.clone(),
-                            cache.coeff_global_range.clone()
-                        ]);
-                        local += &betahessian_local;
-                    }
-                }
-                Ok((direct, beta_mixed, betahessian))
+            SpatialAdaptiveHyperKind::LogEpsilonMagnitude
+            | SpatialAdaptiveHyperKind::LogEpsilonGradient
+            | SpatialAdaptiveHyperKind::LogEpsilonCurvature => {
+                self.adaptive_shared_log_epsilon_parts(eval, hyper.component_index())
             }
         }
     }
@@ -5526,7 +6265,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         let beta = &block_states[0].beta;
         let eval = self.exact_evaluation(beta)?;
         let (direct, beta_mixed, betahessian_explicit) =
-            self.adaptive_hyper_parts(beta, &eval, hyper.clone())?;
+            self.adaptive_hyper_parts(&eval, *hyper)?;
 
         // Exact pseudo-Laplace psi-gradient.
         //
@@ -5553,6 +6292,103 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
             score_psi: beta_mixed,
             hessian_psi: betahessian_explicit,
         }))
+    }
+
+    fn exact_newton_joint_psisecond_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
+            return Err(format!(
+                "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
+                block_states.len(),
+                specs.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let _ = derivative_blocks[0]
+            .get(psi_i)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_i))?;
+        let _ = derivative_blocks[0]
+            .get(psi_j)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_j))?;
+        let hyper_i = self
+            .hyperspecs
+            .get(psi_i)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_i))?;
+        let hyper_j = self
+            .hyperspecs
+            .get(psi_j)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_j))?;
+        let beta = &block_states[0].beta;
+        let eval = self.exact_evaluation(beta)?;
+        let (objective_psi_psi, score_psi_psi, hessian_psi_psi) =
+            self.adaptive_explicit_second_order_parts(&eval, *hyper_i, *hyper_j)?;
+
+        Ok(Some(
+            crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+                objective_psi_psi,
+                score_psi_psi,
+                hessian_psi_psi,
+            },
+        ))
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
+            return Err(format!(
+                "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
+                block_states.len(),
+                specs.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let beta = &block_states[0].beta;
+        if direction.len() != beta.len() {
+            return Err(format!(
+                "spatial adaptive exact family direction length mismatch: got {}, expected {}",
+                direction.len(),
+                beta.len()
+            ));
+        }
+        let _ = derivative_blocks[0]
+            .get(psi_index)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_index))?;
+        let hyper = self
+            .hyperspecs
+            .get(psi_index)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_index))?;
+        let eval = self.exact_evaluation(beta)?;
+        let drift = match hyper.kind {
+            SpatialAdaptiveHyperKind::LogLambdaMagnitude
+            | SpatialAdaptiveHyperKind::LogLambdaGradient
+            | SpatialAdaptiveHyperKind::LogLambdaCurvature => self.adaptive_block_drift(
+                &eval,
+                hyper.cache_index,
+                hyper.kind.component_index(),
+                direction,
+            )?,
+            SpatialAdaptiveHyperKind::LogEpsilonMagnitude
+            | SpatialAdaptiveHyperKind::LogEpsilonGradient
+            | SpatialAdaptiveHyperKind::LogEpsilonCurvature => self
+                .adaptive_shared_log_epsilon_drift(
+                    &eval,
+                    hyper.kind.component_index(),
+                    direction,
+                )?,
+        };
+        Ok(Some(drift))
     }
 }
 
@@ -6141,7 +6977,6 @@ fn fit_bounded_term_collection_forspec(
     } else {
         (vec![0.0; fit_penalties.len()], 0.0)
     };
-    let beta_cov_ref = beta_covariance.clone();
     let geometry = Some(crate::estimate::FitGeometry {
         penalized_hessian: penalized_hessian.clone(),
         working_weights: eta_state.fisherweight.clone(),
@@ -6154,32 +6989,18 @@ fn fit_bounded_term_collection_forspec(
             working_response
         },
     });
+    let max_abs_eta = eta_state
+        .eta
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     Ok(FittedTermCollection {
-        fit: UnifiedFitResult {
-            blocks: vec![crate::estimate::FittedBlock {
-                beta: beta_user.clone(),
-                role: crate::estimate::BlockRole::Mean,
-                edf: edf_total,
-                lambdas: fit.lambdas.clone(),
-            }],
-            log_lambdas: fit.lambdas.mapv(|v| v.max(1e-300).ln()),
-            lambdas: fit.lambdas,
-            log_likelihood: -0.5 * deviance,
-            deviance,
-            reml_score: fit.penalized_objective,
-            stable_penalty_term: penalty_term,
-            penalized_objective: -0.5 * deviance + penalty_term + fit.penalized_objective,
-            outer_iterations: fit.outer_iterations,
-            outer_converged: fit.outer_converged,
-            outer_gradient_norm: 0.0,
-            standard_deviation: 1.0,
-            covariance_conditional: beta_cov_ref,
-            covariance_corrected: None,
-            inference: Some(FitInference {
+        fit: {
+            let log_lambdas = fit.lambdas.mapv(|v| v.max(1e-300).ln());
+            let inf = FitInference {
                 edf_by_block,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian,
+                penalized_hessian: penalized_hessian.clone(),
                 working_weights: eta_state.fisherweight.clone(),
                 working_response: {
                     let mut working_response = eta_state.eta.clone();
@@ -6194,10 +7015,42 @@ fn fit_bounded_term_collection_forspec(
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
-            }),
-            fitted_link: crate::estimate::FittedLinkParameters::Standard,
-            geometry,
-            block_states: Vec::new(),
+            };
+            let covariance_conditional = inf.beta_covariance.clone();
+            let pirls_status_val = if fit.converged {
+                crate::pirls::PirlsStatus::Converged
+            } else {
+                crate::pirls::PirlsStatus::StalledAtValidMinimum
+            };
+            FitResult::try_from_parts(UnifiedFitResultParts {
+                blocks: vec![crate::estimate::FittedBlock {
+                    beta: beta_user.clone(),
+                    role: crate::estimate::BlockRole::Mean,
+                    edf: edf_total,
+                    lambdas: fit.lambdas.clone(),
+                }],
+                log_lambdas,
+                lambdas: fit.lambdas,
+                log_likelihood: -0.5 * deviance,
+                reml_score: fit.penalized_objective,
+                stable_penalty_term: penalty_term,
+                penalized_objective: fit.penalized_objective,
+                outer_iterations: fit.outer_iterations,
+                outer_converged: fit.converged,
+                outer_gradient_norm: fit.outer_final_gradient_norm,
+                standard_deviation: 1.0,
+                covariance_conditional,
+                covariance_corrected: None,
+                inference: Some(inf),
+                fitted_link: crate::estimate::FittedLinkParameters::Standard,
+                geometry,
+                block_states: Vec::new(),
+                pirls_status: pirls_status_val,
+                max_abs_eta,
+                constraint_kkt: None,
+                artifacts: crate::estimate::FitArtifacts { pirls: None },
+                inner_cycles: 0,
+            })?
         },
         design,
         adaptive_diagnostics: None,
@@ -6216,7 +7069,7 @@ fn enforce_term_constraint_feasibility(
     let mut violations: Vec<String> = Vec::new();
     for term in &design.smooth.terms {
         let gr = (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
-        let beta_local = fit.beta().slice(s![gr.clone()]).to_owned();
+        let beta_local = fit.beta.slice(s![gr.clone()]).to_owned();
         if let Some(lb) = term.lower_bounds_local.as_ref() {
             let mut worst = 0.0_f64;
             let mut worst_idx = 0usize;
@@ -6744,7 +7597,11 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
         if let (Some(ref eta), Some(d)) = (&aniso, dim) {
             if eta.len() == d && d > 1 {
                 if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
-                    data, resolvedspec, design, term_idx, aniso_gid,
+                    data,
+                    resolvedspec,
+                    design,
+                    term_idx,
+                    aniso_gid,
                 )? {
                     aniso_gid += 1;
                     out.extend(entries);
@@ -6756,7 +7613,9 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
         }
         let Some(info) =
             try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
-        else { return Ok(None); };
+        else {
+            return Ok(None);
+        };
         out.push(info);
     }
     Ok(Some(out))
@@ -6779,7 +7638,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         None => return Ok(None),
     };
     let aniso_result = match &termspec.basis {
-        SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+        SmoothBasisSpec::Matern {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
@@ -6787,7 +7650,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+        SmoothBasisSpec::Duchon {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
@@ -6798,7 +7665,9 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         _ => return Ok(None),
     };
     let d = aniso_result.design_first.len();
-    if d == 0 { return Ok(None); }
+    if d == 0 {
+        return Ok(None);
+    }
     let Some(penalty_start) = smooth_term_penalty_index(resolvedspec, design, term_idx) else {
         return Ok(None);
     };
@@ -6817,22 +7686,26 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     for a in 0..d {
         let x_psi_local = aniso_result.design_first[a].clone();
         let x_psi_psi_local = aniso_result.design_second_diag[a].clone();
-        if x_psi_local.ncols() != smooth_term.coeff_range.len() { return Ok(None); }
+        if x_psi_local.ncols() != smooth_term.coeff_range.len() {
+            return Ok(None);
+        }
         let s_psi_components = aniso_result.penalties_first[a].clone();
         let s_psi_psi_components = aniso_result.penalties_second_diag[a].clone();
         let p_smooth = smooth_term.coeff_range.len();
-        let s_psi_local = s_psi_components.iter().fold(
-            Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m,
-        );
-        let s_psi_psi_local = s_psi_psi_components.iter().fold(
-            Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m,
-        );
+        let s_psi_local = s_psi_components
+            .iter()
+            .fold(Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m);
+        let s_psi_psi_local = s_psi_psi_components
+            .iter()
+            .fold(Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m);
         // Build cross-design entries for other axes b != a in this group.
         // These will be indexed by (b, cross_matrix) where b is the axis
         // offset within the d-entry block.
         let mut cross_designs = Vec::with_capacity(d - 1);
         for b in 0..d {
-            if b == a { continue; }
+            if b == a {
+                continue;
+            }
             // d2X/(d psi_a d psi_b) = t * s_a * s_b (element-wise in projected space)
             let cross = t_proj * &s_proj[a] * &s_proj[b];
             cross_designs.push((b, cross));
@@ -6886,7 +7759,11 @@ fn try_build_spatial_term_log_kappa_derivative(
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
     } = match &termspec.basis {
-        SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+        SmoothBasisSpec::Matern {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
@@ -6894,7 +7771,11 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_matern_basis_log_kappa_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+        SmoothBasisSpec::Duchon {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
@@ -6908,7 +7789,11 @@ fn try_build_spatial_term_log_kappa_derivative(
         designsecond_derivative: local_x_psi_psi,
         penaltiessecond_derivative: local_s_psi_psi,
     } = match &termspec.basis {
-        SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+        SmoothBasisSpec::Matern {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
@@ -6916,7 +7801,11 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_matern_basis_log_kappasecond_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::Duchon { feature_cols, spec, input_scales } => {
+        SmoothBasisSpec::Duchon {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
@@ -7009,18 +7898,19 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             // Entries for the same group are contiguous: the first entry
             // with matching group_id gives the base, and axis b is at base+b.
             if let Some(gid) = info.aniso_group_id {
-                let base = info_list.iter().position(|e| e.aniso_group_id == Some(gid))
+                let base = info_list
+                    .iter()
+                    .position(|e| e.aniso_group_id == Some(gid))
                     .unwrap_or(i);
                 for &(b_axis, ref cross_mat) in cross_designs {
                     let j = base + b_axis;
                     if j < log_kappa_dim {
-                        xsecond[j] = Some(
-                            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                        xsecond[j] =
+                            Some(crate::estimate::reml::HyperDesignDerivative::from_embedded(
                                 cross_mat.clone(),
                                 info.global_range.clone(),
                                 info.total_p,
-                            ),
-                        );
+                            ));
                     }
                 }
             }
@@ -7051,8 +7941,11 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
-        // Cross penalty second derivatives for axes in the same aniso group
-        // are left as None for now (D0-only; penalty cross-terms are a follow-up).
+        // Cross penalty second derivatives (∂²S/∂ψ_a∂ψ_b, a≠b) are None:
+        // the diagonal + rank-1 structure means the optimizer treats penalty
+        // contributions as axis-independent. The design cross-terms above
+        // capture the dominant coupling; penalty cross-terms add O(p²) cost
+        // for marginal accuracy improvement in the REML Hessian off-diagonals.
         hyper_dirs.push(DirectionalHyperParam::new_compact(
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
                 info.x_psi_local.clone(),
@@ -7151,15 +8044,21 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // Evaluate cost at a given theta = [rho, log_kappa] by applying the kappa
     // to the spec, fitting with lambdas derived from rho, and scoring.
     let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
-        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-            theta, rho_dim, dims_clone.clone(),
-        );
+        let log_kappa =
+            SpatialLogKappaCoords::from_theta_tail_with_dims(theta, rho_dim, dims_clone.clone());
         let spec_c = log_kappa
             .apply_tospec(resolvedspec, spatial_terms)
             .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
         let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
         match fit_term_collection_forspecwith_heuristic_lambdas(
-            data, y, weights, offset, &spec_c, rho.as_slice(), family, options,
+            data,
+            y,
+            weights,
+            offset,
+            &spec_c,
+            rho.as_slice(),
+            family,
+            options,
         ) {
             Ok(fit) => Ok(fit_score(&fit.fit)),
             Err(_) => Ok(f64::INFINITY),
@@ -7179,7 +8078,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         kappa_options,
         &mut |action| match action {
             SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
-            SpatialSearchAction::OnImprove(theta, _cost) => {
+            SpatialSearchAction::OnImprove(theta, _) => {
                 best_theta = theta.clone();
                 Ok(0.0)
             }
@@ -7189,9 +8088,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let theta_star = best_theta;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
-    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail_with_dims(
-        &theta_star, rho_dim, dims_per_term,
-    );
+    let log_kappa_star =
+        SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
     let resolvedspec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
     let best = fit_term_collection_forspecwith_heuristic_lambdas(
         data,
@@ -7536,7 +8434,11 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
         .zip(design.smooth.terms.iter())
     {
         if let (
-            SmoothBasisSpec::Matern { spec: s, ref mut input_scales, .. },
+            SmoothBasisSpec::Matern {
+                spec: s,
+                ref mut input_scales,
+                ..
+            },
             BasisMetadata::Matern {
                 centers,
                 identifiability_transform,
@@ -7556,7 +8458,11 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
             *input_scales = meta_scales.clone();
         }
         if let (
-            SmoothBasisSpec::Duchon { spec: s, ref mut input_scales, .. },
+            SmoothBasisSpec::Duchon {
+                spec: s,
+                ref mut input_scales,
+                ..
+            },
             BasisMetadata::Duchon {
                 centers,
                 identifiability_transform,
@@ -7574,7 +8480,10 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
             *input_scales = meta_scales.clone();
         }
         if let (
-            SmoothBasisSpec::ThinPlate { ref mut input_scales, .. },
+            SmoothBasisSpec::ThinPlate {
+                ref mut input_scales,
+                ..
+            },
             BasisMetadata::ThinPlate {
                 input_scales: meta_scales,
                 ..
@@ -7906,9 +8815,8 @@ where
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
     let objective = CachedSecondOrderObjective::new(
         |theta: &Array1<f64>| {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta, rho_dim, all_dims.clone(),
-            );
+            let log_kappa =
+                SpatialLogKappaCoords::from_theta_tail_with_dims(theta, rho_dim, all_dims.clone());
             // split_at operates on logical term count, not flat ψ index.
             let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(mean_terms.len());
             let meanspec_c = match mean_log_kappa.apply_tospec(&best_meanspec, &mean_terms) {
@@ -8022,9 +8930,8 @@ where
     };
 
     let theta_star = solution.final_point;
-    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail_with_dims(
-        &theta_star, rho_dim, all_dims,
-    );
+    let log_kappa_star =
+        SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, all_dims);
     let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
     let resolved_meanspec = mean_log_kappa
         .apply_tospec(&best_meanspec, &mean_terms)
@@ -8324,7 +9231,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             },
         ];
@@ -8365,7 +9272,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
 
@@ -8391,7 +9298,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained thin-plate");
@@ -8423,7 +9330,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::None,
         }];
 
@@ -8457,7 +9364,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Matérn");
@@ -8487,7 +9394,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Duchon");
@@ -8563,7 +9470,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8607,7 +9514,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8658,7 +9565,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8716,7 +9623,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8777,7 +9684,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         },
                         input_scales: None,
-                        },
+                    },
                     shape: ShapeConstraint::None,
                 },
                 SmoothTermSpec {
@@ -8790,9 +9697,8 @@ mod tests {
                             identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         },
                         input_scales: None,
-                        },
-                        input_scales: None,
-                        },
+                    },
+                    shape: ShapeConstraint::None,
                 },
             ],
         };
@@ -8835,7 +9741,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8868,7 +9774,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::FrozenTransform { transform: z },
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -8948,7 +9854,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::None,
         }];
 
@@ -8985,7 +9891,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::None,
         }];
 
@@ -9020,7 +9926,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::None,
         }];
 
@@ -9067,7 +9973,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9118,7 +10024,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9161,7 +10067,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9204,7 +10110,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9420,7 +10326,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9520,7 +10426,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::None,
         };
 
@@ -9605,7 +10511,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9670,7 +10576,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9696,7 +10602,9 @@ mod tests {
             design_derivative: local_x_psi,
             penalties_derivative: local_s_psi,
         } = match &termspec.basis {
-            SmoothBasisSpec::Duchon { feature_cols, spec, .. } => {
+            SmoothBasisSpec::Duchon {
+                feature_cols, spec, ..
+            } => {
                 let x =
                     select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
                 build_duchon_basis_log_kappa_derivative(x.view(), spec)
@@ -9708,7 +10616,9 @@ mod tests {
             designsecond_derivative: local_x_psi_psi,
             penaltiessecond_derivative: local_s_psi_psi,
         } = match &termspec.basis {
-            SmoothBasisSpec::Duchon { feature_cols, spec, .. } => {
+            SmoothBasisSpec::Duchon {
+                feature_cols, spec, ..
+            } => {
                 let x =
                     select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
                 build_duchon_basis_log_kappasecond_derivative(x.view(), spec)
@@ -9771,7 +10681,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9879,7 +10789,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -9924,7 +10834,7 @@ mod tests {
             _ => panic!("expected Matérn term"),
         };
         assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
-        assert!(optimized.fit.beta().iter().all(|v| v.is_finite()));
+        assert!(optimized.fit.beta.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -9954,7 +10864,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10028,7 +10938,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10117,7 +11027,7 @@ mod tests {
                     aniso_log_scales: None,
                 },
                 input_scales: None,
-                },
+            },
             shape: ShapeConstraint::None,
         };
 
@@ -10239,7 +11149,7 @@ mod tests {
         .expect("bounded gaussian fit");
 
         let bounded_idx = fitted.design.linear_ranges[0].1.start;
-        let estimate = fitted.fit.beta()[bounded_idx];
+        let estimate = fitted.fit.beta[bounded_idx];
         assert!(
             (0.0..=0.5).contains(&estimate),
             "bounded coefficient escaped interval: {estimate}"
@@ -10690,7 +11600,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10735,7 +11645,7 @@ mod tests {
         assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
         assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
         assert_eq!(diag.maps.len(), 1);
-        assert!(fit.fit.beta().iter().all(|v| v.is_finite()));
+        assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.reml_score.is_finite());
     }
 
@@ -10772,7 +11682,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10852,7 +11762,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -10884,7 +11794,7 @@ mod tests {
 
         let adaptive_opts = AdaptiveRegularizationOptions::default();
         let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
-            &baseline.fit.beta(),
+            &baseline.fit.beta,
             &runtime_caches,
             adaptive_opts.min_epsilon,
         )
@@ -10934,7 +11844,7 @@ mod tests {
             offset: Array1::zeros(n),
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(baseline.fit.beta().clone()),
+            initial_beta: Some(baseline.fit.beta.clone()),
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 30,
@@ -10945,7 +11855,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let objective_andgradient = |theta: &Array1<f64>| {
+        let evaluate_theta = |theta: &Array1<f64>, need_hessian: bool| {
             let family = base_family.with_adaptive_params(
                 vec![SpatialAdaptiveTermHyperParams {
                     lambda: [theta[0].exp(), theta[1].exp(), theta[2].exp()],
@@ -10963,7 +11873,7 @@ mod tests {
                 &Array1::zeros(0),
                 &derivative_blocks,
                 None,
-                false,
+                need_hessian,
             )
             .expect("joint hyper eval")
         };
@@ -10982,22 +11892,37 @@ mod tests {
             eps_g_init.max(1e-6).ln(),
             eps_c_init.max(1e-6).ln(),
         ];
-        let analytic = objective_andgradient(&theta);
+        let analytic = evaluate_theta(&theta, true);
         assert_eq!(analytic.gradient.len(), theta.len());
+        let analytic_hessian = analytic
+            .outer_hessian
+            .clone()
+            .expect("adaptive joint hyper Hessian should be present");
         let h = 1e-5;
         for j in 0..theta.len() {
             let mut plus = theta.clone();
             plus[j] += h;
             let mut minus = theta.clone();
             minus[j] -= h;
-            let fd = (objective_andgradient(&plus).objective
-                - objective_andgradient(&minus).objective)
+            let fd = (evaluate_theta(&plus, false).objective
+                - evaluate_theta(&minus, false).objective)
                 / (2.0 * h);
             assert!(
                 (analytic.gradient[j] - fd).abs() < 5e-3 * (1.0 + fd.abs()),
                 "adaptive joint hypergradient mismatch at {j}: analytic={}, fd={fd}",
                 analytic.gradient[j]
             );
+            let grad_fd = (evaluate_theta(&plus, false).gradient
+                - evaluate_theta(&minus, false).gradient)
+                / (2.0 * h);
+            for i in 0..theta.len() {
+                assert!(
+                    (analytic_hessian[[i, j]] - grad_fd[i]).abs() < 5e-2 * (1.0 + grad_fd[i].abs()),
+                    "adaptive joint hyper-Hessian mismatch at ({i},{j}): analytic={}, fd={}",
+                    analytic_hessian[[i, j]],
+                    grad_fd[i]
+                );
+            }
         }
     }
 
@@ -11030,7 +11955,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -11060,7 +11985,7 @@ mod tests {
             .expect("runtime caches");
         assert_eq!(runtime_caches.len(), 1);
         let (eps_0, eps_g, eps_c) =
-            compute_initial_epsilons(&baseline.fit.beta(), &runtime_caches, 1e-8)
+            compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
                 .expect("initial epsilons");
         let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
         let derivative_blocks = vec![
@@ -11107,7 +12032,7 @@ mod tests {
             offset: Array1::zeros(n),
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(baseline.fit.beta().clone()),
+            initial_beta: Some(baseline.fit.beta.clone()),
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 20,
@@ -11188,7 +12113,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -11225,7 +12150,7 @@ mod tests {
         )
         .expect("high-center adaptive Duchon fit should not fail");
 
-        assert!(fit.fit.beta().iter().all(|v| v.is_finite()));
+        assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.deviance.is_finite());
         assert!(fit.fit.edf_total().is_some_and(f64::is_finite));
         let diag = fit
@@ -11347,7 +12272,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -11427,7 +12352,7 @@ mod tests {
                         aniso_log_scales: None,
                     },
                     input_scales: None,
-                    },
+                },
                 shape: ShapeConstraint::None,
             }],
         };
@@ -11563,6 +12488,63 @@ mod tests {
     }
 
     #[test]
+    fn scalar_charbonnier_log_epsilon_derivatives_match_finite_difference() {
+        let signal = array![0.4, -0.9];
+        let epsilon = 0.35_f64;
+        let eta = epsilon.ln();
+        let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
+        let h = 1e-5;
+        let value = |eta_value: f64| {
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .penalty_value()
+        };
+        let gradfd = (value(eta + h) - value(eta - h)) / (2.0 * h);
+        let hessfd = (value(eta + h) - 2.0 * value(eta) + value(eta - h)) / (h * h);
+        assert!((state.log_epsilon_gradient_terms().sum() - gradfd).abs() < 1e-6);
+        assert!((state.log_epsilon_hessian_terms().sum() - hessfd).abs() < 1e-4);
+
+        let eval_grad = |eta_value: f64| {
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .betagradient_coeff()
+        };
+        let mixedfd = (&eval_grad(eta + h) - &eval_grad(eta - h)) / (2.0 * h);
+        for i in 0..signal.len() {
+            assert!((state.log_epsilon_betagradient_coeff()[i] - mixedfd[i]).abs() < 1e-6);
+        }
+
+        let eval_hess = |eta_value: f64| {
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .betahessian_diag()
+        };
+        let betahessfd = (&eval_hess(eta + h) - &eval_hess(eta - h)) / (2.0 * h);
+        for i in 0..signal.len() {
+            assert!((state.log_epsilon_betahessian_diag()[i] - betahessfd[i]).abs() < 1e-5);
+        }
+
+        let eval_log_grad = |eta_value: f64| {
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .log_epsilon_betagradient_coeff()
+        };
+        let second_mixedfd = (&eval_log_grad(eta + h) - &eval_log_grad(eta - h)) / (2.0 * h);
+        for i in 0..signal.len() {
+            assert!(
+                (state.log_epsilon_beta_mixed_second_coeff()[i] - second_mixedfd[i]).abs() < 1e-5
+            );
+        }
+
+        let eval_log_hess = |eta_value: f64| {
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .log_epsilon_betahessian_diag()
+        };
+        let second_hessfd = (&eval_log_hess(eta + h) - &eval_log_hess(eta - h)) / (2.0 * h);
+        for i in 0..signal.len() {
+            assert!(
+                (state.log_epsilon_betahessian_second_diag()[i] - second_hessfd[i]).abs() < 1e-4
+            );
+        }
+    }
+
+    #[test]
     fn scalar_charbonnier_directionalhessian_matches_finite_difference() {
         let signal = array![0.5, -0.6];
         let epsilon = 0.2;
@@ -11577,6 +12559,25 @@ mod tests {
         let fd = (&evalhess(h) - &evalhess(-h)) / (2.0 * h);
         for i in 0..signal.len() {
             assert!((analytic[i] - fd[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn scalar_charbonnier_log_epsilon_directionalhessian_matches_finite_difference() {
+        let signal = array![0.5, -0.6];
+        let epsilon = 0.2;
+        let direction = array![0.3, -0.1];
+        let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
+        let h = 1e-6;
+        let analytic = state.log_epsilon_betahessian_directional_diag(&direction);
+        let evalhess = |step: f64| {
+            let shifted = &signal + &(direction.mapv(|v| step * v));
+            CharbonnierScalarBlockState::from_signal(shifted, epsilon)
+                .log_epsilon_betahessian_diag()
+        };
+        let fd = (&evalhess(h) - &evalhess(-h)) / (2.0 * h);
+        for i in 0..signal.len() {
+            assert!((analytic[i] - fd[i]).abs() < 1e-4);
         }
     }
 
@@ -11626,6 +12627,81 @@ mod tests {
     }
 
     #[test]
+    fn grouped_charbonnier_log_epsilon_derivatives_match_finite_difference() {
+        let blocks = array![[0.7, -0.2], [0.1, 0.8]];
+        let epsilon = 0.3_f64;
+        let eta = epsilon.ln();
+        let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
+        let h = 1e-5;
+        let value = |eta_value: f64| {
+            CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eta_value.exp())
+                .penalty_value()
+        };
+        let gradfd = (value(eta + h) - value(eta - h)) / (2.0 * h);
+        let hessfd = (value(eta + h) - 2.0 * value(eta) + value(eta - h)) / (h * h);
+        assert!((state.log_epsilon_gradient_terms().sum() - gradfd).abs() < 1e-6);
+        assert!((state.log_epsilon_hessian_terms().sum() - hessfd).abs() < 1e-4);
+
+        let eval_grad = |eta_value: f64| {
+            CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eta_value.exp())
+                .betagradient_blocks()
+        };
+        let mixedfd = (&eval_grad(eta + h) - &eval_grad(eta - h)) / (2.0 * h);
+        let analytic_mixed = state.log_epsilon_betagradient_blocks();
+        for k in 0..blocks.nrows() {
+            for axis in 0..blocks.ncols() {
+                assert!((analytic_mixed[[k, axis]] - mixedfd[[k, axis]]).abs() < 1e-6);
+            }
+        }
+
+        let eval_hess = |eta_value: f64| {
+            CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eta_value.exp())
+                .betahessian_blocks()
+        };
+        let plus_hess = eval_hess(eta + h);
+        let minus_hess = eval_hess(eta - h);
+        let analytic_hess = state.log_epsilon_betahessian_blocks();
+        for k in 0..analytic_hess.len() {
+            let fd = (&plus_hess[k] - &minus_hess[k]) / (2.0 * h);
+            for i in 0..fd.nrows() {
+                for j in 0..fd.ncols() {
+                    assert!((analytic_hess[k][[i, j]] - fd[[i, j]]).abs() < 1e-5);
+                }
+            }
+        }
+
+        let eval_log_grad = |eta_value: f64| {
+            CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eta_value.exp())
+                .log_epsilon_betagradient_blocks()
+        };
+        let second_mixedfd = (&eval_log_grad(eta + h) - &eval_log_grad(eta - h)) / (2.0 * h);
+        let analytic_second_mixed = state.log_epsilon_beta_mixed_second_blocks();
+        for k in 0..blocks.nrows() {
+            for axis in 0..blocks.ncols() {
+                assert!(
+                    (analytic_second_mixed[[k, axis]] - second_mixedfd[[k, axis]]).abs() < 1e-5
+                );
+            }
+        }
+
+        let eval_log_hess = |eta_value: f64| {
+            CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eta_value.exp())
+                .log_epsilon_betahessian_blocks()
+        };
+        let plus_log_hess = eval_log_hess(eta + h);
+        let minus_log_hess = eval_log_hess(eta - h);
+        let analytic_second_hess = state.log_epsilon_betahessian_second_blocks();
+        for k in 0..analytic_second_hess.len() {
+            let fd = (&plus_log_hess[k] - &minus_log_hess[k]) / (2.0 * h);
+            for i in 0..fd.nrows() {
+                for j in 0..fd.ncols() {
+                    assert!((analytic_second_hess[k][[i, j]] - fd[[i, j]]).abs() < 1e-4);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn grouped_charbonnier_directionalhessian_matches_finite_difference() {
         let blocks = array![[0.6, -0.2], [0.4, 0.5]];
         let direction = array![[0.1, -0.3], [0.2, 0.15]];
@@ -11644,6 +12720,31 @@ mod tests {
             for i in 0..fd.nrows() {
                 for j in 0..fd.ncols() {
                     assert!((analytic[k][[i, j]] - fd[[i, j]]).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_charbonnier_log_epsilon_directionalhessian_matches_finite_difference() {
+        let blocks = array![[0.6, -0.2], [0.4, 0.5]];
+        let direction = array![[0.1, -0.3], [0.2, 0.15]];
+        let epsilon = 0.4;
+        let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
+        let analytic = state.log_epsilon_betahessian_directional_blocks(&direction);
+        let h = 1e-6;
+        let evalhess = |step: f64| {
+            let shifted = &blocks + &(direction.mapv(|v| step * v));
+            CharbonnierGroupedBlockState::from_signal_blocks(shifted, epsilon)
+                .log_epsilon_betahessian_blocks()
+        };
+        let plus = evalhess(h);
+        let minus = evalhess(-h);
+        for k in 0..analytic.len() {
+            let fd = (&plus[k] - &minus[k]) / (2.0 * h);
+            for i in 0..fd.nrows() {
+                for j in 0..fd.ncols() {
+                    assert!((analytic[k][[i, j]] - fd[[i, j]]).abs() < 1e-4);
                 }
             }
         }

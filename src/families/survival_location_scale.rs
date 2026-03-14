@@ -15,7 +15,9 @@ use crate::mixture_link::{
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
-use crate::solver::estimate::FitGeometry;
+use crate::solver::estimate::{
+    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+};
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
 
@@ -263,8 +265,13 @@ pub struct SurvivalLocationScaleSpec {
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
 }
 
-#[derive(Clone)]
-pub struct SurvivalLocationScaleFitResult {
+/// Type alias: the old `SurvivalLocationScaleFitResult` is now `UnifiedFitResult`.
+pub type SurvivalLocationScaleFitResult = crate::solver::estimate::UnifiedFitResult;
+
+/// Helper struct mirroring the old `SurvivalLocationScaleFitResultParts` so
+/// callers can build a `SurvivalLocationScaleFitResult` from survival-specific
+/// fields without knowing about the unified layout.
+pub struct SurvivalLocationScaleFitResultParts {
     pub beta_time: Array1<f64>,
     pub beta_threshold: Array1<f64>,
     pub beta_log_sigma: Array1<f64>,
@@ -280,6 +287,185 @@ pub struct SurvivalLocationScaleFitResult {
     pub converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
     pub geometry: Option<FitGeometry>,
+}
+
+/// Build a `SurvivalLocationScaleFitResult` (= `UnifiedFitResult`) from
+/// survival-specific fields.
+pub fn survival_fit_from_parts(
+    parts: SurvivalLocationScaleFitResultParts,
+) -> Result<SurvivalLocationScaleFitResult, String> {
+    let SurvivalLocationScaleFitResultParts {
+        beta_time,
+        beta_threshold,
+        beta_log_sigma,
+        beta_link_wiggle,
+        lambdas_time,
+        lambdas_threshold,
+        lambdas_log_sigma,
+        lambdas_linkwiggle,
+        log_likelihood,
+        penalizedobjective,
+        iterations,
+        finalgrad_norm,
+        converged,
+        covariance_conditional,
+        geometry,
+    } = parts;
+
+    // Validation (preserved from the old impl).
+    validate_all_finite_estimation("survival_fit.beta_time", beta_time.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation(
+        "survival_fit.beta_threshold",
+        beta_threshold.iter().copied(),
+    )
+    .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation(
+        "survival_fit.beta_log_sigma",
+        beta_log_sigma.iter().copied(),
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(beta_wiggle) = beta_link_wiggle.as_ref() {
+        validate_all_finite_estimation(
+            "survival_fit.beta_link_wiggle",
+            beta_wiggle.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    validate_all_finite_estimation("survival_fit.lambdas_time", lambdas_time.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation(
+        "survival_fit.lambdas_threshold",
+        lambdas_threshold.iter().copied(),
+    )
+    .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation(
+        "survival_fit.lambdas_log_sigma",
+        lambdas_log_sigma.iter().copied(),
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(lambdas_wiggle) = lambdas_linkwiggle.as_ref() {
+        if beta_link_wiggle.is_none() {
+            return Err("survival_fit.lambdas_linkwiggle requires beta_link_wiggle".to_string());
+        }
+        validate_all_finite_estimation(
+            "survival_fit.lambdas_linkwiggle",
+            lambdas_wiggle.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    ensure_finite_scalar_estimation("survival_fit.log_likelihood", log_likelihood)
+        .map_err(|e| e.to_string())?;
+    ensure_finite_scalar_estimation("survival_fit.penalizedobjective", penalizedobjective)
+        .map_err(|e| e.to_string())?;
+    ensure_finite_scalar_estimation("survival_fit.finalgrad_norm", finalgrad_norm)
+        .map_err(|e| e.to_string())?;
+
+    let total_p = beta_time.len()
+        + beta_threshold.len()
+        + beta_log_sigma.len()
+        + beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    if let Some(cov) = covariance_conditional.as_ref() {
+        validate_all_finite_estimation("survival_fit.covariance_conditional", cov.iter().copied())
+            .map_err(|e| e.to_string())?;
+        let (rows, cols) = cov.dim();
+        if rows != total_p || cols != total_p {
+            return Err(format!(
+                "survival_fit.covariance_conditional must be {}x{}, got {}x{}",
+                total_p, total_p, rows, cols
+            ));
+        }
+    }
+    if let Some(geom) = geometry.as_ref() {
+        geom.validate_numeric_finiteness()
+            .map_err(|e| e.to_string())?;
+        let (rows, cols) = geom.penalized_hessian.dim();
+        if rows != total_p || cols != total_p {
+            return Err(format!(
+                "survival_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
+                total_p, total_p, rows, cols
+            ));
+        }
+        if geom.working_weights.len() != geom.working_response.len() {
+            return Err(format!(
+                "survival_fit.geometry working length mismatch: weights={}, response={}",
+                geom.working_weights.len(),
+                geom.working_response.len()
+            ));
+        }
+    }
+
+    // Build blocks for the unified representation.
+    use crate::solver::estimate::{
+        BlockRole, FittedBlock, FittedLinkParameters, UnifiedFitResultParts,
+    };
+    let mut blocks = vec![
+        FittedBlock {
+            beta: beta_time.clone(),
+            role: BlockRole::Time,
+            edf: 0.0,
+            lambdas: lambdas_time.clone(),
+        },
+        FittedBlock {
+            beta: beta_threshold.clone(),
+            role: BlockRole::Threshold,
+            edf: 0.0,
+            lambdas: lambdas_threshold.clone(),
+        },
+        FittedBlock {
+            beta: beta_log_sigma.clone(),
+            role: BlockRole::Scale,
+            edf: 0.0,
+            lambdas: lambdas_log_sigma.clone(),
+        },
+    ];
+    if let Some(ref bw) = beta_link_wiggle {
+        blocks.push(FittedBlock {
+            beta: bw.clone(),
+            role: BlockRole::LinkWiggle,
+            edf: 0.0,
+            lambdas: lambdas_linkwiggle
+                .clone()
+                .unwrap_or_else(|| Array1::zeros(0)),
+        });
+    }
+    let all_lambdas: Vec<f64> = blocks
+        .iter()
+        .flat_map(|b| b.lambdas.iter().copied())
+        .collect();
+    let log_lambdas = Array1::from_vec(
+        all_lambdas
+            .iter()
+            .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
+            .collect(),
+    );
+    let deviance = -2.0 * log_likelihood;
+
+    crate::solver::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+        blocks,
+        log_lambdas,
+        lambdas: Array1::from_vec(all_lambdas),
+        log_likelihood,
+        reml_score: penalizedobjective,
+        stable_penalty_term: 2.0 * penalizedobjective - deviance,
+        penalized_objective: penalizedobjective,
+        outer_iterations: iterations,
+        outer_converged: converged,
+        outer_gradient_norm: finalgrad_norm,
+        standard_deviation: 1.0,
+        covariance_conditional,
+        covariance_corrected: None,
+        inference: None,
+        fitted_link: FittedLinkParameters::Standard,
+        geometry,
+        block_states: Vec::new(),
+        pirls_status: crate::pirls::PirlsStatus::Converged,
+        max_abs_eta: 0.0,
+        constraint_kkt: None,
+        artifacts: crate::solver::estimate::FitArtifacts { pirls: None },
+        inner_cycles: 0,
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Clone)]
@@ -576,7 +762,9 @@ impl SurvivalLocationScaleFamily {
         let mut d_h_d = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let sigma_entry_i = entry_sigma_derivs.as_ref().map_or(sigma[i], |entry| entry.0[i]);
+            let sigma_entry_i = entry_sigma_derivs
+                .as_ref()
+                .map_or(sigma[i], |entry| entry.0[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
@@ -2911,9 +3099,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let entry_deltas = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
             // Compute entry-side deltas for both u and v directions.
             let compute_entry = |threshold_dir: &Array1<f64>,
-                                  log_sigma_dir: &Array1<f64>,
-                                  deltaw: &Array1<f64>,
-                                  delta_h0: &Array1<f64>|
+                                 log_sigma_dir: &Array1<f64>,
+                                 deltaw: &Array1<f64>,
+                                 delta_h0: &Array1<f64>|
              -> (
                 Array1<f64>,
                 Array1<f64>,
@@ -3064,9 +3252,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 + &d_d2_q_exit_v * &delta_q_exit_u * &q.dq_t.mapv(|v| v * v)
                 + &q.d2_q1 * &(2.0 * &delta_q_t_exit_u * &delta_q_t_exit_v);
             // Entry contribution.
-            let d2_w_entry = &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * &dq_t_en.mapv(|v| v * v)
-                + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * &dq_t_en.mapv(|v| v * v)
-                + &q.d2_q0 * &(2.0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v);
+            let d2_w_entry =
+                &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * &dq_t_en.mapv(|v| v * v)
+                    + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * &dq_t_en.mapv(|v| v * v)
+                    + &q.d2_q0 * &(2.0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v);
             let d2_h_tt =
                 weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_threshold_exit)?
                     + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_t_en)?;
@@ -3090,11 +3279,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 + &q.d2_q1 * &(2.0 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
                 + &d_d1_q_exit_u * &delta_q_ls_ls_exit_v
                 + &d_d1_q_exit_v * &delta_q_ls_ls_exit_u;
-            let d2_w_entry = &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * &dq_ls_en.mapv(|v| v * v)
-                + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * &dq_ls_en.mapv(|v| v * v)
-                + &q.d2_q0 * &(2.0 * &entry_deltas.delta_q_ls_u * &entry_deltas.delta_q_ls_v)
-                + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
-                + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u;
+            let d2_w_entry =
+                &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * &dq_ls_en.mapv(|v| v * v)
+                    + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * &dq_ls_en.mapv(|v| v * v)
+                    + &q.d2_q0 * &(2.0 * &entry_deltas.delta_q_ls_u * &entry_deltas.delta_q_ls_v)
+                    + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
+                    + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u;
             let d2_h_ll =
                 weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
                     + weighted_crossprod_dense(x_ls_en, &(-&d2_w_entry), x_ls_en)?;
@@ -3148,10 +3338,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                         + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_ls_en)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
             } else {
-                let d_d1_q_u =
-                    &q.d2_q * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u + &q.h_time_h1 * &delta_h1_u;
-                let d_d1_q_v =
-                    &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
+                let d_d1_q_u = &q.d2_q * &delta_q_exit_u
+                    + &q.h_time_h0 * &delta_h0_u
+                    + &q.h_time_h1 * &delta_h1_u;
+                let d_d1_q_v = &q.d2_q * &delta_q_exit_v
+                    + &q.h_time_h0 * &delta_h0_v
+                    + &q.h_time_h1 * &delta_h1_v;
                 let d2_d2_q = &q.d3_q * &(&delta_q_exit_u * &delta_q_exit_v)
                     - &q.d_h_h0 * &(&delta_h0_u * &delta_h0_v)
                     - &q.d_h_h1 * &(&delta_h1_u * &delta_h1_v);
@@ -3176,18 +3368,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             if let (Some(x_t_en), Some(dq_t_en)) =
                 (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
             {
-                let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v + &dh_h1_v * &delta_q_t_exit_u
+                let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v
+                    + &dh_h1_v * &delta_q_t_exit_u
                     + &q.h_time_h1 * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
                 let d2_w_entry = &dh_h0_u * &entry_deltas.delta_q_t_v
                     + &dh_h0_v * &entry_deltas.delta_q_t_u
                     + &q.h_time_h0
                         * &(&entry_deltas.delta_q_t_u * &xi_h0_v
                             + &entry_deltas.delta_q_t_v * &xi_h0_u);
-                let d2_h_ht_exit = weighted_crossprod_dense(
-                    &self.x_time_exit,
-                    &(-&d2_w_exit),
-                    &x_threshold_exit,
-                )?;
+                let d2_h_ht_exit =
+                    weighted_crossprod_dense(&self.x_time_exit, &(-&d2_w_exit), &x_threshold_exit)?;
                 let d2_h_ht_entry =
                     weighted_crossprod_dense(&self.x_time_entry, &(-&d2_w_entry), x_t_en)?;
                 assign_symmetric_block(
@@ -3197,23 +3387,24 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     &(d2_h_ht_exit + d2_h_ht_entry),
                 );
             } else {
-                let d2_w = &dh_h0_u * &delta_q_t_exit_v + &dh_h0_v * &delta_q_t_exit_u
-                    + &q.h_time_h0
-                        * &(&delta_q_t_exit_u * &xi_h0_v + &delta_q_t_exit_v * &xi_h0_u)
+                let d2_w = &dh_h0_u * &delta_q_t_exit_v
+                    + &dh_h0_v * &delta_q_t_exit_u
+                    + &q.h_time_h0 * &(&delta_q_t_exit_u * &xi_h0_v + &delta_q_t_exit_v * &xi_h0_u)
                     + &dh_h1_u * &delta_q_t_exit_v
                     + &dh_h1_v * &delta_q_t_exit_u
-                    + &q.h_time_h1
-                        * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
+                    + &q.h_time_h1 * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
                 let d2_h_ht_0 = weighted_crossprod_dense(
                     &self.x_time_entry,
-                    &(-&(&dh_h0_u * &delta_q_t_exit_v + &dh_h0_v * &delta_q_t_exit_u
+                    &(-&(&dh_h0_u * &delta_q_t_exit_v
+                        + &dh_h0_v * &delta_q_t_exit_u
                         + &q.h_time_h0
                             * &(&delta_q_t_exit_u * &xi_h0_v + &delta_q_t_exit_v * &xi_h0_u))),
                     &x_threshold_exit,
                 )?;
                 let d2_h_ht_1 = weighted_crossprod_dense(
                     &self.x_time_exit,
-                    &(-&(&dh_h1_u * &delta_q_t_exit_v + &dh_h1_v * &delta_q_t_exit_u
+                    &(-&(&dh_h1_u * &delta_q_t_exit_v
+                        + &dh_h1_v * &delta_q_t_exit_u
                         + &q.h_time_h1
                             * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u))),
                     &x_threshold_exit,
@@ -3236,7 +3427,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             if let (Some(x_ls_en), Some(dq_ls_en)) =
                 (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
             {
-                let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v + &dh_h1_v * &delta_q_ls_exit_u
+                let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v
+                    + &dh_h1_v * &delta_q_ls_exit_u
                     + &q.h_time_h1
                         * &(&delta_q_ls_exit_u * &xi_h1_v + &delta_q_ls_exit_v * &xi_h1_u);
                 let d2_w_entry = &dh_h0_u * &entry_deltas.delta_q_ls_v
@@ -3244,11 +3436,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     + &q.h_time_h0
                         * &(&entry_deltas.delta_q_ls_u * &xi_h0_v
                             + &entry_deltas.delta_q_ls_v * &xi_h0_u);
-                let d2_h_hl_exit = weighted_crossprod_dense(
-                    &self.x_time_exit,
-                    &(-&d2_w_exit),
-                    &x_log_sigma_exit,
-                )?;
+                let d2_h_hl_exit =
+                    weighted_crossprod_dense(&self.x_time_exit, &(-&d2_w_exit), &x_log_sigma_exit)?;
                 let d2_h_hl_entry =
                     weighted_crossprod_dense(&self.x_time_entry, &(-&d2_w_entry), x_ls_en)?;
                 assign_symmetric_block(
@@ -3260,14 +3449,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             } else {
                 let d2_h_hl_0 = weighted_crossprod_dense(
                     &self.x_time_entry,
-                    &(-&(&dh_h0_u * &delta_q_ls_exit_v + &dh_h0_v * &delta_q_ls_exit_u
+                    &(-&(&dh_h0_u * &delta_q_ls_exit_v
+                        + &dh_h0_v * &delta_q_ls_exit_u
                         + &q.h_time_h0
                             * &(&delta_q_ls_exit_u * &xi_h0_v + &delta_q_ls_exit_v * &xi_h0_u))),
                     &x_log_sigma_exit,
                 )?;
                 let d2_h_hl_1 = weighted_crossprod_dense(
                     &self.x_time_exit,
-                    &(-&(&dh_h1_u * &delta_q_ls_exit_v + &dh_h1_v * &delta_q_ls_exit_u
+                    &(-&(&dh_h1_u * &delta_q_ls_exit_v
+                        + &dh_h1_v * &delta_q_ls_exit_u
                         + &q.h_time_h1
                             * &(&delta_q_ls_exit_u * &xi_h1_v + &delta_q_ls_exit_v * &xi_h1_u))),
                     &x_log_sigma_exit,
@@ -3284,7 +3475,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // --- Wiggle cross-blocks D²H[u,v] ---
         if let (Some(xw_dense), Some(w_offset)) = (xw.as_ref(), offsets.get(3).copied()) {
             let d2_d2_q_combined = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
-                &d_d2_q_exit_u * &delta_q_exit_v + &d_d2_q_exit_v * &delta_q_exit_u
+                &d_d2_q_exit_u * &delta_q_exit_v
+                    + &d_d2_q_exit_v * &delta_q_exit_u
                     + &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v
                     + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u
             } else {
@@ -3301,23 +3493,19 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let d2_tw_exit = &d_d2_q_exit_u * &delta_q_exit_v * &q.dq_t
                     + &d_d2_q_exit_v * &delta_q_exit_u * &q.dq_t
                     + &q.d2_q1 * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
-                let d2_tw_entry =
-                    &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * dq_t_en
-                        + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * dq_t_en
-                        + &q.d2_q0
-                            * &(&entry_deltas.delta_q_t_u * &deltaw_v
-                                + &entry_deltas.delta_q_t_v * &deltaw_u);
-                let d2_h_tw = weighted_crossprod_dense(
-                    &x_threshold_exit,
-                    &(-&d2_tw_exit),
-                    xw_dense,
-                )? + weighted_crossprod_dense(x_t_en, &(-&d2_tw_entry), xw_dense)?;
+                let d2_tw_entry = &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * dq_t_en
+                    + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * dq_t_en
+                    + &q.d2_q0
+                        * &(&entry_deltas.delta_q_t_u * &deltaw_v
+                            + &entry_deltas.delta_q_t_v * &deltaw_u);
+                let d2_h_tw =
+                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw_exit), xw_dense)?
+                        + weighted_crossprod_dense(x_t_en, &(-&d2_tw_entry), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
             } else {
                 let d2_tw = &d2_d2_q_combined * &q.dq_t
                     + &q.d2_q * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
-                let d2_h_tw =
-                    weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw), xw_dense)?;
+                let d2_h_tw = weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
             }
 
@@ -3327,25 +3515,20 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             {
                 let d2_lw_exit = &d_d2_q_exit_u * &delta_q_exit_v * &q.dq_ls
                     + &d_d2_q_exit_v * &delta_q_exit_u * &q.dq_ls
-                    + &q.d2_q1
-                        * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
-                let d2_lw_entry =
-                    &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * dq_ls_en
-                        + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * dq_ls_en
-                        + &q.d2_q0
-                            * &(&entry_deltas.delta_q_ls_u * &deltaw_v
-                                + &entry_deltas.delta_q_ls_v * &deltaw_u);
-                let d2_h_lw = weighted_crossprod_dense(
-                    &x_log_sigma_exit,
-                    &(-&d2_lw_exit),
-                    xw_dense,
-                )? + weighted_crossprod_dense(x_ls_en, &(-&d2_lw_entry), xw_dense)?;
+                    + &q.d2_q1 * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
+                let d2_lw_entry = &entry_deltas.d_d2_q_u * &entry_deltas.delta_q_v * dq_ls_en
+                    + &entry_deltas.d_d2_q_v * &entry_deltas.delta_q_u * dq_ls_en
+                    + &q.d2_q0
+                        * &(&entry_deltas.delta_q_ls_u * &deltaw_v
+                            + &entry_deltas.delta_q_ls_v * &deltaw_u);
+                let d2_h_lw =
+                    weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense)?
+                        + weighted_crossprod_dense(x_ls_en, &(-&d2_lw_entry), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
             } else {
                 let d2_lw = &d2_d2_q_combined * &q.dq_ls
                     + &q.d2_q * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
-                let d2_h_lw =
-                    weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw), xw_dense)?;
+                let d2_h_lw = weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
             }
 
@@ -3356,10 +3539,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             // Time-wiggle D²H[u,v]: bilinear in (u,v) perturbation directions.
             let d2_tw_h0 = &q.d_h_h0 * &(&xi_h0_u * &xi_h0_v);
             let d2_tw_h1 = &q.d_h_h1 * &(&xi_h1_u * &xi_h1_v);
-            let d2_h0w =
-                weighted_crossprod_dense(&self.x_time_entry, &(-&d2_tw_h0), xw_dense)?;
-            let d2_h1w =
-                weighted_crossprod_dense(&self.x_time_exit, &(-&d2_tw_h1), xw_dense)?;
+            let d2_h0w = weighted_crossprod_dense(&self.x_time_entry, &(-&d2_tw_h0), xw_dense)?;
+            let d2_h1w = weighted_crossprod_dense(&self.x_time_exit, &(-&d2_tw_h1), xw_dense)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d2_h0w + d2_h1w));
         }
 
@@ -3842,7 +4023,7 @@ pub fn fit_survival_location_scale(
         lift_conditional_covariance(cov_reduced, z, p_t, p_ls, pw)
     });
 
-    Ok(SurvivalLocationScaleFitResult {
+    survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
         beta_time,
         beta_threshold,
         beta_log_sigma,
@@ -4421,6 +4602,33 @@ mod tests {
             SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
                 .expect("build sparse design"),
         )
+    }
+
+    fn test_survival_fit(
+        beta_time: Array1<f64>,
+        beta_threshold: Array1<f64>,
+        beta_log_sigma: Array1<f64>,
+        beta_link_wiggle: Option<Array1<f64>>,
+    ) -> SurvivalLocationScaleFitResult {
+        let lambdas_linkwiggle = beta_link_wiggle.as_ref().map(|_| Array1::zeros(0));
+        survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
+            beta_time,
+            beta_threshold,
+            beta_log_sigma,
+            beta_link_wiggle,
+            lambdas_time: Array1::zeros(0),
+            lambdas_threshold: Array1::zeros(0),
+            lambdas_log_sigma: Array1::zeros(0),
+            lambdas_linkwiggle,
+            log_likelihood: 0.0,
+            penalizedobjective: 0.0,
+            iterations: 0,
+            finalgrad_norm: 0.0,
+            converged: true,
+            covariance_conditional: None,
+            geometry: None,
+        })
+        .expect("valid survival test fit")
     }
 
     fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
@@ -5706,23 +5914,7 @@ mod tests {
             x_link_wiggle: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.4, -0.1],
-            beta_threshold: array![0.2, 0.3],
-            beta_log_sigma: array![-0.5, 0.1],
-            beta_link_wiggle: None,
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
         let deterministic = predict_survival_location_scale(&input, &fit).expect("predict");
         let expected =
             inverse_link_survival_prob_checked(&input.inverse_link, deterministic.eta[0])
@@ -5799,23 +5991,7 @@ mod tests {
 
     #[test]
     fn prediction_applies_threshold_and_log_sigma_offsets() {
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.4, -0.1],
-            beta_threshold: array![0.2, 0.3],
-            beta_log_sigma: array![-0.5, 0.1],
-            beta_link_wiggle: None,
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
@@ -5843,23 +6019,12 @@ mod tests {
 
     #[test]
     fn sparse_prediction_and_uncertainty_match_dense() {
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.4, -0.1],
-            beta_threshold: array![0.2, 0.3],
-            beta_log_sigma: array![-0.5, 0.1],
-            beta_link_wiggle: Some(array![0.05, -0.02]),
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: Some(Array1::zeros(0)),
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(
+            array![0.4, -0.1],
+            array![0.2, 0.3],
+            array![-0.5, 0.1],
+            Some(array![0.05, -0.02]),
+        );
         let x_threshold_dense = array![[1.0, -0.2], [0.0, 0.6]];
         let x_log_sigma_dense = array![[1.0, 0.3], [0.0, -0.4]];
         let xwiggle_dense = array![[1.0, 0.1], [0.0, -0.2]];
@@ -5957,23 +6122,12 @@ mod tests {
             x_link_wiggle: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.3, -0.2],
-            beta_threshold: array![0.1, 0.2],
-            beta_log_sigma: array![-0.4, 0.15],
-            beta_link_wiggle: None,
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(
+            array![0.3, -0.2],
+            array![0.1, 0.2],
+            array![-0.4, 0.15],
+            None,
+        );
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0],
             [0.01, 0.02, 0.0, 0.0, 0.0, 0.0],
@@ -6047,23 +6201,12 @@ mod tests {
             x_log_sigma: sparse_design_from_dense(&x_log_sigma_dense),
             ..dense_input.clone()
         };
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.3, -0.2],
-            beta_threshold: array![0.1, 0.2],
-            beta_log_sigma: array![-0.4, 0.15],
-            beta_link_wiggle: None,
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(
+            array![0.3, -0.2],
+            array![0.1, 0.2],
+            array![-0.4, 0.15],
+            None,
+        );
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0],
             [0.01, 0.02, 0.0, 0.0, 0.0, 0.0],
@@ -6097,23 +6240,12 @@ mod tests {
             x_link_wiggle: Some(DesignMatrix::Dense(array![[1.0, 0.1]])),
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.4, -0.1],
-            beta_threshold: array![0.2, 0.3],
-            beta_log_sigma: array![-0.5, 0.1],
-            beta_link_wiggle: Some(array![0.05, -0.02]),
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: Some(Array1::zeros(0)),
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(
+            array![0.4, -0.1],
+            array![0.2, 0.3],
+            array![-0.5, 0.1],
+            Some(array![0.05, -0.02]),
+        );
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0],
             [0.01, 0.02, 0.0, 0.0, 0.0, 0.0, -0.005, 0.0],
@@ -6193,23 +6325,7 @@ mod tests {
 
     #[test]
     fn predict_rejects_stateless_beta_logistic_inverse_link() {
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.4, -0.1],
-            beta_threshold: array![0.2, 0.3],
-            beta_log_sigma: array![-0.5, 0.1],
-            beta_link_wiggle: None,
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
@@ -6229,23 +6345,7 @@ mod tests {
 
     #[test]
     fn predict_supports_sas_beta_logistic_and_mixture_links() {
-        let fit = SurvivalLocationScaleFitResult {
-            beta_time: array![0.4, -0.1],
-            beta_threshold: array![0.2, 0.3],
-            beta_log_sigma: array![-0.5, 0.1],
-            beta_link_wiggle: None,
-            lambdas_time: Array1::zeros(0),
-            lambdas_threshold: Array1::zeros(0),
-            lambdas_log_sigma: Array1::zeros(0),
-            lambdas_linkwiggle: None,
-            log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
-            covariance_conditional: None,
-            geometry: None,
-        };
+        let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
         let base = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],

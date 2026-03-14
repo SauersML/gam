@@ -585,7 +585,10 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
         let barrier_corr = self.barrier_correction(v_k);
         match self.inner.hessian_derivative_correction(v_k) {
-            Some(mut ic) => { ic += &barrier_corr; Some(ic) }
+            Some(mut ic) => {
+                ic += &barrier_corr;
+                Some(ic)
+            }
             None => Some(barrier_corr),
         }
     }
@@ -596,9 +599,16 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Option<Array2<f64>> {
-        let barrier_total = &self.barrier_correction(u_kl) + &self.barrier_second_correction(v_k, v_l);
-        match self.inner.hessian_second_derivative_correction(v_k, v_l, u_kl) {
-            Some(mut ic) => { ic += &barrier_total; Some(ic) }
+        let barrier_total =
+            &self.barrier_correction(u_kl) + &self.barrier_second_correction(v_k, v_l);
+        match self
+            .inner
+            .hessian_second_derivative_correction(v_k, v_l, u_kl)
+        {
+            Some(mut ic) => {
+                ic += &barrier_total;
+                Some(ic)
+            }
             None => Some(barrier_total),
         }
     }
@@ -794,12 +804,10 @@ pub struct InnerSolution<'dp> {
     /// of external coordinates (or external × ρ cross pairs).
     /// Arguments: (ext_index_i, ext_index_j) → HyperCoordPair.
     /// When None, the outer Hessian is not computed for extended coordinates.
-    pub ext_coord_pair_fn:
-        Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
 
     /// Callback for ρ × ext cross pairs: (rho_index, ext_index) → HyperCoordPair.
-    pub rho_ext_pair_fn:
-        Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
 
     /// M_i[u] = D_β B_i[u] callback for extended coordinates.
     /// Arguments: (ext_index, direction) → correction matrix.
@@ -1204,11 +1212,7 @@ pub fn reml_laml_evaluate(
         };
 
         // Logdet S term: -½ ∂_i log|S|₊
-        let det_term = if incl_logdet_s {
-            0.5 * coord.ld_s
-        } else {
-            0.0
-        };
+        let det_term = if incl_logdet_s { 0.5 * coord.ld_s } else { 0.0 };
 
         grad[grad_idx] = penalty_term + trace_term - det_term;
     }
@@ -1359,11 +1363,8 @@ pub fn compute_firth_hessian_contribution(
 
             // D²(H_φ)[B_k, B_l]: second directional derivative.
             let eye = Array2::<f64>::eye(p);
-            let d2hphi_kl = firth_op.hphisecond_direction_apply(
-                &firth_dirs[kk],
-                &firth_dirs[ll],
-                &eye,
-            );
+            let d2hphi_kl =
+                firth_op.hphisecond_direction_apply(&firth_dirs[kk], &firth_dirs[ll], &eye);
 
             // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
             let ddot_kl = &dhphi_kl + &d2hphi_kl;
@@ -1514,12 +1515,8 @@ fn compute_outer_hessian(
             // Q_{kl}: a_{kl} − gₖᵀ H⁻¹ gₗ
             // a_{kl} = δ_{kl} · ½ β̂ᵀ Aₖ β̂  (since ∂²S/∂ρₖ² = Aₖ, cross = 0)
             // gₖᵀ H⁻¹ gₗ = (Aₖβ̂)ᵀ vₗ = (Aₗβ̂)ᵀ vₖ  (by symmetry of H⁻¹)
-            let q_kl_raw = -a_k_betas[ll].dot(&v_ks[kk])
-                + if kk == ll {
-                    rho_a_vals[kk]
-                } else {
-                    0.0
-                };
+            let q_kl_raw =
+                -a_k_betas[ll].dot(&v_ks[kk]) + if kk == ll { rho_a_vals[kk] } else { 0.0 };
             let q_kl = if is_profiled {
                 q_kl_raw / profiled_phi
                     - 2.0 * rho_a_vals[kk] * rho_a_vals[ll]
@@ -1566,11 +1563,7 @@ fn compute_outer_hessian(
                         let u_kk = hop.solve(&rhs);
                         if let Some(correction) = solution
                             .deriv_provider
-                            .hessian_second_derivative_correction(
-                                &v_ks[kk],
-                                &v_ks[kk],
-                                &u_kk,
-                            )
+                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[kk], &u_kk)
                         {
                             base + hop.trace_logdet_gradient(&correction)
                         } else {
@@ -1597,11 +1590,7 @@ fn compute_outer_hessian(
                         let u_kl = hop.solve(&rhs);
                         if let Some(correction) = solution
                             .deriv_provider
-                            .hessian_second_derivative_correction(
-                                &v_ks[kk],
-                                &v_ks[ll],
-                                &u_kl,
-                            )
+                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)
                         {
                             hop.trace_logdet_gradient(&correction)
                         } else {
@@ -1687,14 +1676,11 @@ fn compute_outer_hessian(
                     if solution.deriv_provider.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = solution
-                                .deriv_provider
-                                .fourth_derivative_trace(
-                                    &v_ks[rho_idx],
-                                    &ext_v[ext_idx],
-                                    hop,
-                                )
-                            {
+                            if let Some(d_trace) = solution.deriv_provider.fourth_derivative_trace(
+                                &v_ks[rho_idx],
+                                &ext_v[ext_idx],
+                                hop,
+                            ) {
                                 h2_trace += d_trace;
                             }
                         } else {
@@ -1717,11 +1703,7 @@ fn compute_outer_hessian(
                     0.0
                 };
 
-                let p_term = if incl_logdet_s {
-                    -0.5 * pair.ld_s
-                } else {
-                    0.0
-                };
+                let p_term = if incl_logdet_s { -0.5 * pair.ld_s } else { 0.0 };
 
                 let h_val = q_term + l_term + p_term;
                 hess[[rho_idx, k + ext_idx]] = h_val;
@@ -1745,18 +1727,15 @@ fn compute_outer_hessian(
                 let q_raw = pair.a - coord_i.g.dot(&ext_v[jj]);
                 let q_term = if is_profiled {
                     q_raw / profiled_phi
-                        - 2.0 * coord_i.a * coord_j.a
-                            / (profiled_nu * profiled_phi * profiled_phi)
+                        - 2.0 * coord_i.a * coord_j.a / (profiled_nu * profiled_phi * profiled_phi)
                 } else {
                     q_raw
                 };
 
                 let l_term = if incl_logdet_h {
                     // Γ-cross term via spectral divided-difference kernel.
-                    let cross_trace = hop.trace_logdet_hessian_cross(
-                        &ext_h_matrices[ii],
-                        &ext_h_matrices[jj],
-                    );
+                    let cross_trace =
+                        hop.trace_logdet_hessian_cross(&ext_h_matrices[ii], &ext_h_matrices[jj]);
 
                     // β_{ij} = H⁻¹(−g_ij + B_i v_j + B_j v_i − C[v_j] v_i)
                     //        = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
@@ -1792,11 +1771,7 @@ fn compute_outer_hessian(
                             h2_trace += rhs.dot(z_c);
                             if let Some(d_trace) = solution
                                 .deriv_provider
-                                .fourth_derivative_trace(
-                                    &ext_v[ii],
-                                    &ext_v[jj],
-                                    hop,
-                                )
+                                .fourth_derivative_trace(&ext_v[ii], &ext_v[jj], hop)
                             {
                                 h2_trace += d_trace;
                             }
@@ -1804,11 +1779,7 @@ fn compute_outer_hessian(
                             let u_ij = hop.solve(&rhs);
                             if let Some(correction) = solution
                                 .deriv_provider
-                                .hessian_second_derivative_correction(
-                                    &ext_v[ii],
-                                    &ext_v[jj],
-                                    &u_ij,
-                                )
+                                .hessian_second_derivative_correction(&ext_v[ii], &ext_v[jj], &u_ij)
                             {
                                 h2_trace += hop.trace_logdet_gradient(&correction);
                             }
@@ -1820,11 +1791,7 @@ fn compute_outer_hessian(
                     0.0
                 };
 
-                let p_term = if incl_logdet_s {
-                    -0.5 * pair.ld_s
-                } else {
-                    0.0
-                };
+                let p_term = if incl_logdet_s { -0.5 * pair.ld_s } else { 0.0 };
 
                 let h_val = q_term + l_term + p_term;
                 hess[[k + ii, k + jj]] = h_val;
@@ -1896,10 +1863,7 @@ const EFS_MAX_STEP: f64 = 5.0;
 /// overshooting. For τ coordinates with domain constraints, the caller
 /// should additionally clip `θ_i^new` to the valid range after applying
 /// the step.
-pub fn compute_efs_update(
-    solution: &InnerSolution<'_>,
-    rho: &[f64],
-) -> Vec<f64> {
+pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64> {
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
     let hop = &*solution.hessian_op;
@@ -1915,8 +1879,7 @@ pub fn compute_efs_update(
         DispersionHandling::ProfiledGaussian => {
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
             let (dp_c, _) = smooth_floor_dp(dp_raw);
-            let denom =
-                (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
+            let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             (dp_c / denom, true)
         }
         DispersionHandling::Fixed { phi, .. } => (*phi, false),
@@ -3111,11 +3074,7 @@ impl StochasticTraceEstimator {
     /// Estimate `tr(H⁻¹ A)` for a single matrix A.
     ///
     /// Convenience wrapper around [`estimate_traces`](Self::estimate_traces).
-    pub fn estimate_single_trace(
-        &self,
-        hop: &dyn HessianOperator,
-        a: &Array2<f64>,
-    ) -> f64 {
+    pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, a: &Array2<f64>) -> f64 {
         let matrices = [a];
         let refs: Vec<&Array2<f64>> = matrices.iter().copied().collect();
         self.estimate_traces(hop, &refs)[0]
@@ -3198,9 +3157,7 @@ impl Xoshiro256SS {
     /// Generate the next u64.
     #[inline]
     fn next_u64(&mut self) -> u64 {
-        let result = (self.s[1].wrapping_mul(5))
-            .rotate_left(7)
-            .wrapping_mul(9);
+        let result = (self.s[1].wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
 
         let t = self.s[1] << 17;
 
@@ -3536,21 +3493,9 @@ mod tests {
     fn test_stochastic_trace_estimator_accuracy() {
         // Build a small SPD matrix and compare stochastic trace estimate
         // against the exact DenseSpectralOperator trace.
-        let h = array![
-            [4.0, 1.0, 0.5],
-            [1.0, 3.0, 0.2],
-            [0.5, 0.2, 2.0],
-        ];
-        let a1 = array![
-            [1.0, 0.3, 0.0],
-            [0.3, 0.5, 0.1],
-            [0.0, 0.1, 0.2],
-        ];
-        let a2 = array![
-            [0.2, 0.0, 0.1],
-            [0.0, 1.0, 0.4],
-            [0.1, 0.4, 0.8],
-        ];
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.2], [0.5, 0.2, 2.0],];
+        let a1 = array![[1.0, 0.3, 0.0], [0.3, 0.5, 0.1], [0.0, 0.1, 0.2],];
+        let a2 = array![[0.2, 0.0, 0.1], [0.0, 1.0, 0.4], [0.1, 0.4, 0.8],];
 
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
@@ -3577,25 +3522,23 @@ mod tests {
         assert!(
             rel_err1 < 0.05,
             "Stochastic trace 1: est={:.6}, exact={:.6}, rel_err={:.4}",
-            estimates[0], exact1, rel_err1,
+            estimates[0],
+            exact1,
+            rel_err1,
         );
         assert!(
             rel_err2 < 0.05,
             "Stochastic trace 2: est={:.6}, exact={:.6}, rel_err={:.4}",
-            estimates[1], exact2, rel_err2,
+            estimates[1],
+            exact2,
+            rel_err2,
         );
     }
 
     #[test]
     fn test_stochastic_trace_single_convenience() {
-        let h = array![
-            [5.0, 1.0],
-            [1.0, 3.0],
-        ];
-        let a = array![
-            [1.0, 0.0],
-            [0.0, 1.0],
-        ];
+        let h = array![[5.0, 1.0], [1.0, 3.0],];
+        let a = array![[1.0, 0.0], [0.0, 1.0],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let exact = op.trace_hinv_product(&a);
 
@@ -3612,7 +3555,9 @@ mod tests {
         assert!(
             rel_err < 0.05,
             "Single trace: est={:.6}, exact={:.6}, rel_err={:.4}",
-            stochastic, exact, rel_err,
+            stochastic,
+            exact,
+            rel_err,
         );
     }
 

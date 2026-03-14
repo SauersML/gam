@@ -5,12 +5,14 @@ use crate::linalg::utils::{
 };
 use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::estimate::FitGeometry;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordPair, InnerSolutionBuilder,
     compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
     reml_laml_evaluate,
+};
+use crate::solver::estimate::{
+    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
@@ -667,8 +669,11 @@ struct ConstrainedWarmStart {
     active_sets: Vec<Option<Vec<usize>>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct BlockwiseFitResult {
+/// Type alias: the old `BlockwiseFitResult` is now `UnifiedFitResult`.
+pub type BlockwiseFitResult = crate::solver::estimate::UnifiedFitResult;
+
+/// Helper struct mirroring the old `BlockwiseFitResultParts`.
+pub struct BlockwiseFitResultParts {
     pub block_states: Vec<ParameterBlockState>,
     pub log_likelihood: f64,
     pub log_lambdas: Array1<f64>,
@@ -679,7 +684,185 @@ pub struct BlockwiseFitResult {
     pub outer_final_gradient_norm: f64,
     pub inner_cycles: usize,
     pub converged: bool,
-    pub geometry: Option<crate::solver::estimate::FitGeometry>,
+    pub geometry: Option<FitGeometry>,
+}
+
+fn validate_parameter_block_state_finiteness(
+    label: &str,
+    state: &ParameterBlockState,
+) -> Result<(), String> {
+    validate_all_finite_estimation(&format!("{label}.beta"), state.beta.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation(&format!("{label}.eta"), state.eta.iter().copied())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn validate_lambda_pair_consistency(
+    log_lambdas: &Array1<f64>,
+    lambdas: &Array1<f64>,
+    label: &str,
+) -> Result<(), String> {
+    if log_lambdas.len() != lambdas.len() {
+        return Err(format!(
+            "{label} length mismatch: log_lambdas={}, lambdas={}",
+            log_lambdas.len(),
+            lambdas.len()
+        ));
+    }
+    for (idx, (&log_lambda, &lambda)) in log_lambdas.iter().zip(lambdas.iter()).enumerate() {
+        let expected = log_lambda.exp();
+        let tolerance = 1e-10 * expected.abs().max(1.0);
+        if (lambda - expected).abs() > tolerance {
+            return Err(format!(
+                "{label}[{idx}] inconsistent with exp(log_lambda): got {lambda}, expected {expected}",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build a `BlockwiseFitResult` (= `UnifiedFitResult`) from blockwise-specific
+/// fields.
+pub fn blockwise_fit_from_parts(
+    parts: BlockwiseFitResultParts,
+) -> Result<BlockwiseFitResult, String> {
+    let BlockwiseFitResultParts {
+        block_states,
+        log_likelihood,
+        log_lambdas,
+        lambdas,
+        covariance_conditional,
+        penalizedobjective,
+        outer_iterations,
+        outer_final_gradient_norm,
+        inner_cycles,
+        converged,
+        geometry,
+    } = parts;
+
+    if block_states.is_empty() {
+        return Err("BlockwiseFitResult requires at least one block state".to_string());
+    }
+    ensure_finite_scalar_estimation("blockwise_fit.log_likelihood", log_likelihood)
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation("blockwise_fit.log_lambdas", log_lambdas.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation("blockwise_fit.lambdas", lambdas.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_lambda_pair_consistency(&log_lambdas, &lambdas, "blockwise_fit.lambdas")?;
+    ensure_finite_scalar_estimation("blockwise_fit.penalizedobjective", penalizedobjective)
+        .map_err(|e| e.to_string())?;
+    ensure_finite_scalar_estimation(
+        "blockwise_fit.outer_final_gradient_norm",
+        outer_final_gradient_norm,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let n = block_states[0].eta.len();
+    let total_p = block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum::<usize>();
+    for (idx, state) in block_states.iter().enumerate() {
+        validate_parameter_block_state_finiteness(
+            &format!("blockwise_fit.block_states[{idx}]"),
+            state,
+        )?;
+        if state.eta.len() != n {
+            return Err(format!(
+                "blockwise_fit.block_states[{idx}] eta length mismatch: got {}, expected {n}",
+                state.eta.len()
+            ));
+        }
+    }
+
+    if let Some(cov) = covariance_conditional.as_ref() {
+        validate_all_finite_estimation("blockwise_fit.covariance_conditional", cov.iter().copied())
+            .map_err(|e| e.to_string())?;
+        let (rows, cols) = cov.dim();
+        if rows != total_p || cols != total_p {
+            return Err(format!(
+                "blockwise_fit.covariance_conditional must be {}x{}, got {}x{}",
+                total_p, total_p, rows, cols
+            ));
+        }
+    }
+
+    if let Some(geom) = geometry.as_ref() {
+        geom.validate_numeric_finiteness()
+            .map_err(|e| e.to_string())?;
+        let (rows, cols) = geom.penalized_hessian.dim();
+        if rows != total_p || cols != total_p {
+            return Err(format!(
+                "blockwise_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
+                total_p, total_p, rows, cols
+            ));
+        }
+        if geom.working_weights.len() != n {
+            return Err(format!(
+                "blockwise_fit.geometry.working_weights length mismatch: got {}, expected {n}",
+                geom.working_weights.len()
+            ));
+        }
+        if geom.working_response.len() != n {
+            return Err(format!(
+                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n}",
+                geom.working_response.len()
+            ));
+        }
+    }
+
+    // Build unified blocks from the blockwise states.
+    use crate::solver::estimate::{
+        BlockRole, FittedBlock, FittedLinkParameters, UnifiedFitResultParts,
+    };
+    let blocks: Vec<FittedBlock> = block_states
+        .iter()
+        .enumerate()
+        .map(|(i, bs)| {
+            let role = if block_states.len() == 1 {
+                BlockRole::Mean
+            } else if i == 0 {
+                BlockRole::Location
+            } else {
+                BlockRole::Scale
+            };
+            FittedBlock {
+                beta: bs.beta.clone(),
+                role,
+                edf: 0.0,
+                lambdas: Array1::zeros(0),
+            }
+        })
+        .collect();
+    let deviance = -2.0 * log_likelihood;
+
+    crate::solver::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+        blocks,
+        log_lambdas: log_lambdas.clone(),
+        lambdas: lambdas.clone(),
+        log_likelihood,
+        reml_score: penalizedobjective,
+        stable_penalty_term: 2.0 * penalizedobjective - deviance,
+        penalized_objective: penalizedobjective,
+        outer_iterations,
+        outer_converged: converged,
+        outer_gradient_norm: outer_final_gradient_norm,
+        standard_deviation: 1.0,
+        covariance_conditional,
+        covariance_corrected: None,
+        inference: None,
+        fitted_link: FittedLinkParameters::Standard,
+        geometry,
+        block_states,
+        pirls_status: crate::pirls::PirlsStatus::Converged,
+        max_abs_eta: 0.0,
+        constraint_kkt: None,
+        artifacts: crate::solver::estimate::FitArtifacts { pirls: None },
+        inner_cycles,
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn finite_penalizedobjective(log_likelihood: f64, penalty_value: f64, reml_term: f64) -> f64 {
@@ -1907,34 +2090,37 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
         "joint exact-newton Hessian shape mismatch in outer gradient",
     )? {
         let beta_flat = flatten_state_betas(block_states, specs);
-        let synced = Arc::new(
-            synchronized_states_from_flat_beta(family, specs, block_states, &beta_flat)?,
-        );
+        let synced = Arc::new(synchronized_states_from_flat_beta(
+            family,
+            specs,
+            block_states,
+            &beta_flat,
+        )?);
 
         let synced_dh = Arc::clone(&synced);
-        let compute_dh = Box::new(move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-            let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                &synced_dh,
-                specs,
-                v_k,
-            )?;
-            match h_rho {
-                Some(h) => {
-                    if h.iter().all(|v| v.is_finite()) {
-                        Ok(Some(symmetrized_square_matrix(
-                            h,
-                            total,
-                            "joint exact-newton dH shape mismatch",
-                        )?))
-                    } else {
-                        Ok(Some(Array2::<f64>::zeros((total, total))))
+        let compute_dh = Box::new(
+            move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+                let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                    &synced_dh, specs, v_k,
+                )?;
+                match h_rho {
+                    Some(h) => {
+                        if h.iter().all(|v| v.is_finite()) {
+                            Ok(Some(symmetrized_square_matrix(
+                                h,
+                                total,
+                                "joint exact-newton dH shape mismatch",
+                            )?))
+                        } else {
+                            Ok(Some(Array2::<f64>::zeros((total, total))))
+                        }
                     }
+                    None => Err(
+                        "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
+                    ),
                 }
-                None => Err(
-                    "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
-                ),
-            }
-        });
+            },
+        );
         let synced_d2h = Arc::clone(&synced);
         let compute_d2h = Box::new(
             move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
@@ -1970,24 +2156,26 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
     {
         let beta_flat = flatten_state_betas(block_states, specs);
 
-        let compute_dh = Box::new(move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-            let h_rho = family
-                .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
-                    block_states,
-                    specs,
-                    v_k,
-                )?;
-            match h_rho {
-                Some(h) => Ok(Some(symmetrized_square_matrix(
-                    h,
-                    total,
-                    "joint surrogate dH shape mismatch",
-                )?)),
-                None => Err(
-                    "joint surrogate dH unavailable for analytic outer gradient".to_string(),
-                ),
-            }
-        });
+        let compute_dh =
+            Box::new(
+                move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+                    let h_rho = family
+                        .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                            block_states,
+                            specs,
+                            v_k,
+                        )?;
+                    match h_rho {
+                        Some(h) => Ok(Some(symmetrized_square_matrix(
+                            h,
+                            total,
+                            "joint surrogate dH shape mismatch",
+                        )?)),
+                        None => Err("joint surrogate dH unavailable for analytic outer gradient"
+                            .to_string()),
+                    }
+                },
+            );
         let compute_d2h = Box::new(
             move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
                 match family
@@ -2038,9 +2226,9 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
                     Ok(Some(Array2::<f64>::zeros((total, total))))
                 }
             }
-            None => Err(
-                "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
-            ),
+            None => {
+                Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
+            }
         }
     }
 }
@@ -2052,20 +2240,19 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     specs: &'a [ParameterBlockSpec],
     total: usize,
 ) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
-    move |u: &Array1<f64>, v: &Array1<f64>| {
-        match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+    move |u: &Array1<f64>, v: &Array1<f64>| match family
+        .exact_newton_joint_hessian_second_directional_derivative_with_specs(
             synced_states,
             specs,
             u,
             v,
         )? {
-            Some(m) => Ok(Some(symmetrized_square_matrix(
-                m,
-                total,
-                "joint exact-newton d2H shape mismatch",
-            )?)),
-            None => Ok(None),
-        }
+        Some(m) => Ok(Some(symmetrized_square_matrix(
+            m,
+            total,
+            "joint exact-newton d2H shape mismatch",
+        )?)),
+        None => Ok(None),
     }
 }
 
@@ -3997,9 +4184,7 @@ fn assemble_block_local_s_psi(
         }
         s
     } else if let Some(penalty_idx) = deriv.penalty_index {
-        deriv
-            .s_psi
-            .mapv(|v| per_block_rho[penalty_idx].exp() * v)
+        deriv.s_psi.mapv(|v| per_block_rho[penalty_idx].exp() * v)
     } else {
         Array2::<f64>::zeros((p_block, p_block))
     }
@@ -4081,10 +4266,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
 ) -> Result<Vec<HyperCoord>, String> {
     let ranges = block_param_ranges(specs);
     let total = beta_flat.len();
-    let per_block = split_log_lambdas(
-        &Array1::from_vec(rho.to_vec()),
-        penalty_counts,
-    )?;
+    let per_block = split_log_lambdas(&Array1::from_vec(rho.to_vec()), penalty_counts)?;
 
     let mut coords = Vec::new();
     let mut psi_global = 0usize;
@@ -4096,12 +4278,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
         for (local_idx, deriv) in block_derivs.iter().enumerate() {
             // 1. Get family-provided likelihood objects (joint flattened space).
             let psi_terms = family
-                .exact_newton_joint_psi_terms(
-                    synced_states,
-                    specs,
-                    derivative_blocks,
-                    psi_global,
-                )?
+                .exact_newton_joint_psi_terms(synced_states, specs, derivative_blocks, psi_global)?
                 .unwrap_or_else(|| ExactNewtonJointPsiTerms {
                     objective_psi: 0.0,
                     score_psi: Array1::zeros(total),
@@ -4109,8 +4286,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                 });
 
             // 2. Assemble S_ψ from penalty derivatives, embed into joint space.
-            let s_psi_local =
-                assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
+            let s_psi_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
             let s_psi = embed_block_local_matrix(&s_psi_local, start, end, total);
 
             // 3. Build HyperCoord.
@@ -4227,16 +4403,10 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         )>,
     > = Arc::new(if let Some(sp) = s_pinv {
         if let Ok((sp_eigs, sp_vecs)) = sp.eigh(faer::Side::Lower) {
-            let sp_max = sp_eigs
-                .iter()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                .max(1e-30);
+            let sp_max = sp_eigs.iter().copied().fold(0.0_f64, f64::max).max(1e-30);
             let sp_tol = (total.max(1) as f64) * f64::EPSILON * sp_max;
-            let pos_idx: Vec<usize> =
-                (0..total).filter(|&k| sp_eigs[k] > sp_tol).collect();
-            let null_idx: Vec<usize> =
-                (0..total).filter(|&k| sp_eigs[k] <= sp_tol).collect();
+            let pos_idx: Vec<usize> = (0..total).filter(|&k| sp_eigs[k] > sp_tol).collect();
+            let null_idx: Vec<usize> = (0..total).filter(|&k| sp_eigs[k] <= sp_tol).collect();
             if !null_idx.is_empty() && !pos_idx.is_empty() {
                 let n_pos = pos_idx.len();
                 let n_null = null_idx.len();
@@ -4249,12 +4419,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     u_null.column_mut(col_out).assign(&sp_vecs.column(col_in));
                 }
                 // sp eigenvalue = 1/σ, so S⁺² eigenvalue = 1/σ² = (sp eigenvalue)².
-                let sigma_pinv_sq = Array1::from_vec(
-                    pos_idx
-                        .iter()
-                        .map(|&k| sp_eigs[k] * sp_eigs[k])
-                        .collect(),
-                );
+                let sigma_pinv_sq =
+                    Array1::from_vec(pos_idx.iter().map(|&k| sp_eigs[k] * sp_eigs[k]).collect());
                 Some((u_pos, u_null, sigma_pinv_sq))
             } else {
                 None
@@ -4298,11 +4464,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
             let (obj_ll, score_ll, hess_ll) = match psi2 {
                 Some(t) => (t.objective_psi_psi, t.score_psi_psi, t.hessian_psi_psi),
-                None => (
-                    0.0,
-                    Array1::zeros(total),
-                    Array2::zeros((total, total)),
-                ),
+                None => (0.0, Array1::zeros(total), Array2::zeros((total, total))),
             };
 
             // Assemble S_{ψ_i ψ_j} in joint space.
@@ -4311,12 +4473,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 let (start, end) = ranges_arc[block_i];
                 let p_block = end - start;
                 let deriv_i = &derivative_blocks[block_i][local_i];
-                let s_local = assemble_block_local_s_psi_psi(
-                    deriv_i,
-                    local_j,
-                    &per_block[block_i],
-                    p_block,
-                );
+                let s_local =
+                    assemble_block_local_s_psi_psi(deriv_i, local_j, &per_block[block_i], p_block);
                 embed_block_local_matrix(&s_local, start, end, total)
             } else {
                 Array2::<f64>::zeros((total, total))
@@ -4374,9 +4532,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 // Uses precomputed U₊, U₀, Σ⁺² from the eigendecomposition of sp.
                 //   tr(S⁺² S_i P₀ S_j) = tr(Σ⁺² L_i L_jᵀ)
                 // where L_k = U₊ᵀ S_k U₀ is the "leakage" matrix.
-                if let Some((ref u_pos, ref u_null, ref spinv2)) =
-                    *nullspace_correction_arc
-                {
+                if let Some((ref u_pos, ref u_null, ref spinv2)) = *nullspace_correction_arc {
                     let l_i = u_pos.t().dot(&s_i.dot(u_null));
                     let l_j = u_pos.t().dot(&s_j.dot(u_null));
 
@@ -4650,8 +4806,8 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         };
 
         // 4. Build ψ HyperCoords, pair callbacks, and drift derivative callback.
-        let is_gaussian = family.exact_newton_outerobjective()
-            == ExactNewtonOuterObjective::QuadraticReml;
+        let is_gaussian =
+            family.exact_newton_outerobjective() == ExactNewtonOuterObjective::QuadraticReml;
 
         let psi_coords = build_psi_hyper_coords(
             family,
@@ -5513,7 +5669,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         };
         let no_pen = vec![Array1::zeros(0); specs.len()];
         let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen);
-        return Ok(BlockwiseFitResult {
+        return blockwise_fit_from_parts(BlockwiseFitResultParts {
             block_states: inner.block_states,
             log_likelihood: inner.log_likelihood,
             log_lambdas: Array1::zeros(0),
@@ -5596,7 +5752,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             0.0
         };
         let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
-        return Ok(BlockwiseFitResult {
+        return blockwise_fit_from_parts(BlockwiseFitResultParts {
             block_states: inner.block_states,
             log_likelihood: inner.log_likelihood,
             log_lambdas: rho0.clone(),
@@ -5839,7 +5995,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                     };
                     let geometry =
                         compute_joint_geometry(family, specs, &inner.block_states, &per_block);
-                    return Ok(BlockwiseFitResult {
+                    return blockwise_fit_from_parts(BlockwiseFitResultParts {
                         block_states: inner.block_states,
                         log_likelihood: inner.log_likelihood,
                         log_lambdas: rho0.clone(),
@@ -5887,7 +6043,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
-    Ok(BlockwiseFitResult {
+    blockwise_fit_from_parts(BlockwiseFitResultParts {
         block_states: inner.block_states,
         log_likelihood: inner.log_likelihood,
         log_lambdas: rho_star.clone(),

@@ -23,8 +23,9 @@ pub use families::survival;
 pub use families::survival_location_scale;
 
 pub use families::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
-    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
+    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, BlockwiseFitResultParts,
+    CustomFamily, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
+    blockwise_fit_from_parts, fit_custom_family,
 };
 pub use families::gamlss::{
     BinomialLocationScaleFamily, BinomialLocationScaleSpec, BinomialLocationScaleTermSpec,
@@ -47,12 +48,12 @@ pub use families::strategy::{
 };
 pub use families::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
-    ResidualDistributionOps, SurvivalLocationScaleFitResult, SurvivalLocationScalePredictInput,
-    SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
-    SurvivalLocationScaleSpec, TimeBlockInput, TimeDependentCovariateBlockInput,
-    fit_survival_location_scale, predict_survival_location_scale,
+    ResidualDistributionOps, SurvivalLocationScaleFitResult, SurvivalLocationScaleFitResultParts,
+    SurvivalLocationScalePredictInput, SurvivalLocationScalePredictResult,
+    SurvivalLocationScalePredictUncertaintyResult, SurvivalLocationScaleSpec, TimeBlockInput,
+    TimeDependentCovariateBlockInput, fit_survival_location_scale, predict_survival_location_scale,
     predict_survival_location_scale_posterior_mean,
-    predict_survival_location_scalewith_uncertainty,
+    predict_survival_location_scalewith_uncertainty, survival_fit_from_parts,
 };
 pub use inference::alo::{
     AloDiagnostics, AloInput, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
@@ -76,11 +77,11 @@ pub use inference::model::{
 };
 pub use solver::estimate::{
     BlockRole, CoefficientUncertaintyResult, FitArtifacts, FitGeometry, FitOptions, FitResult,
-    FittedBlock, InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
-    PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, UnifiedFitResult,
-    coefficient_uncertainty, coefficient_uncertaintywith_mode, fit_gam, optimize_external_design,
-    predict_gam, predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit,
-    predict_gamwith_uncertainty,
+    FitResultParts, FittedBlock, FittedLinkParameters, InferenceCovarianceMode, MeanIntervalMethod,
+    PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
+    UnifiedFitResult, UnifiedFitResultParts, coefficient_uncertainty,
+    coefficient_uncertaintywith_mode, fit_gam, optimize_external_design, predict_gam,
+    predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,

@@ -2081,61 +2081,60 @@ impl<'a> RemlState<'a> {
         // The sparse bundle caches a FirthDenseOperator built from the original
         // (non-reparameterized) design matrix in `firth_dense_operator_original`.
         // We reuse that cached operator here instead of rebuilding it each call.
-        let (firth_gradient, firth_hessian) = if firth_logdet != 0.0
-            && mode != super::unified::EvalMode::ValueOnly
-        {
-            if let Some(firth_op) = bundle.firth_dense_operator_original.as_ref() {
-                let k = penalty_roots.len();
-                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+        let (firth_gradient, firth_hessian) =
+            if firth_logdet != 0.0 && mode != super::unified::EvalMode::ValueOnly {
+                if let Some(firth_op) = bundle.firth_dense_operator_original.as_ref() {
+                    let k = penalty_roots.len();
+                    let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
 
-                // Precompute intermediates shared by gradient and Hessian.
-                let mut a_k_betas = Vec::with_capacity(k);
-                let mut v_ks = Vec::with_capacity(k);
-                let mut a_k_matrices = Vec::with_capacity(k);
-                for idx in 0..k {
-                    let r_k = &penalty_roots[idx];
-                    let lam_k = lambdas[idx];
-                    let r_beta = r_k.dot(&beta);
-                    let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
-                    let v_k = hessian_op.solve(&a_k_beta);
-                    let mut a_k = r_k.t().dot(r_k);
-                    a_k *= lam_k;
-                    a_k_betas.push(a_k_beta);
-                    v_ks.push(v_k);
-                    a_k_matrices.push(a_k);
-                }
+                    // Precompute intermediates shared by gradient and Hessian.
+                    let mut a_k_betas = Vec::with_capacity(k);
+                    let mut v_ks = Vec::with_capacity(k);
+                    let mut a_k_matrices = Vec::with_capacity(k);
+                    for idx in 0..k {
+                        let r_k = &penalty_roots[idx];
+                        let lam_k = lambdas[idx];
+                        let r_beta = r_k.dot(&beta);
+                        let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
+                        let v_k = hessian_op.solve(&a_k_beta);
+                        let mut a_k = r_k.t().dot(r_k);
+                        a_k *= lam_k;
+                        a_k_betas.push(a_k_beta);
+                        v_ks.push(v_k);
+                        a_k_matrices.push(a_k);
+                    }
 
-                // Firth gradient (same as before).
-                let mut fg = Array1::<f64>::zeros(k);
-                for idx in 0..k {
-                    let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
-                    let dir_k = firth_op.direction_from_deta(deta_k);
-                    let dhphi_k = firth_op.hphi_direction(&dir_k);
-                    fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
-                }
+                    // Firth gradient (same as before).
+                    let mut fg = Array1::<f64>::zeros(k);
+                    for idx in 0..k {
+                        let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
+                        let dir_k = firth_op.direction_from_deta(deta_k);
+                        let dhphi_k = firth_op.hphi_direction(&dir_k);
+                        fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
+                    }
 
-                // Firth Hessian (only when outer Hessian is requested).
-                let fh = if mode == super::unified::EvalMode::ValueGradientHessian {
-                    Some(super::unified::compute_firth_hessian_contribution(
-                        firth_op,
-                        &*hessian_op,
-                        &beta,
-                        &v_ks,
-                        &a_k_matrices,
-                        &a_k_betas,
-                        &a_k_matrices,
-                    ))
+                    // Firth Hessian (only when outer Hessian is requested).
+                    let fh = if mode == super::unified::EvalMode::ValueGradientHessian {
+                        Some(super::unified::compute_firth_hessian_contribution(
+                            firth_op,
+                            &*hessian_op,
+                            &beta,
+                            &v_ks,
+                            &a_k_matrices,
+                            &a_k_betas,
+                            &a_k_matrices,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    (Some(fg), fh)
                 } else {
-                    None
-                };
-
-                (Some(fg), fh)
+                    (None, None)
+                }
             } else {
                 (None, None)
-            }
-        } else {
-            (None, None)
-        };
+            };
 
         self.evaluate_unified_tail(
             rho,

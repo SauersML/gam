@@ -5279,11 +5279,11 @@ pub fn observed_weight_noncanonical(
     let w_f = h1_sq / phi_v;
 
     // c_F = (2 h₁ h₂ V − h₁³ V₁) / (φ V²)
-    let n0 = h1_sq;                      // numerator of w_F
-    let n1 = 2.0 * h1 * h2;             // ∂(h₁²)/∂η
+    let n0 = h1_sq; // numerator of w_F
+    let n1 = 2.0 * h1 * h2; // ∂(h₁²)/∂η
     let n2 = 2.0 * (h2 * h2 + h1 * h3); // ∂²(h₁²)/∂η²
-    let vd1 = h1 * v1;                   // ∂V/∂η = V'·h'
-    let vd2 = h2 * v1 + h1_sq * v2;     // ∂²V/∂η²
+    let vd1 = h1 * v1; // ∂V/∂η = V'·h'
+    let vd2 = h2 * v1 + h1_sq * v2; // ∂²V/∂η²
 
     let c_f = (n1 * v - n0 * vd1) / phi_v2;
 
@@ -5299,10 +5299,8 @@ pub fn observed_weight_noncanonical(
     let b = b_num / phi_v2;
 
     // B_η = (h₃ V² − 3 h₁ h₂ V V₁ − h₁³ V V₂ + 2 h₁³ V₁²) / (φ V³)
-    let b_eta_num = h3 * v * v
-        - 3.0 * h1 * h2 * v * v1
-        - h1_sq * h1 * v * v2
-        + 2.0 * h1_sq * h1 * v1 * v1;
+    let b_eta_num =
+        h3 * v * v - 3.0 * h1 * h2 * v * v1 - h1_sq * h1 * v * v2 + 2.0 * h1_sq * h1 * v1 * v1;
     let b_eta = b_eta_num / phi_v3;
 
     // B_ηη = ∂B_η/∂η.
@@ -5400,12 +5398,7 @@ pub fn compute_noncanonical_observed_weights(
 /// d_obs = ω μ(8μ − y) / φ
 /// ```
 #[inline]
-pub fn observed_weight_gaussian_log(
-    y: f64,
-    mu: f64,
-    phi: f64,
-    pw: f64,
-) -> (f64, f64, f64) {
+pub fn observed_weight_gaussian_log(y: f64, mu: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
     let inv_phi = pw / phi;
     let w = inv_phi * mu * (2.0 * mu - y);
     let c = inv_phi * mu * (4.0 * mu - y);
@@ -5419,11 +5412,7 @@ pub fn observed_weight_gaussian_log(
 /// w_F = ω μ² / φ,  c_F = ω 2μ² / φ,  d_F = ω 4μ² / φ
 /// ```
 #[inline]
-pub fn fisher_weight_gaussian_log(
-    mu: f64,
-    phi: f64,
-    pw: f64,
-) -> (f64, f64, f64) {
+pub fn fisher_weight_gaussian_log(mu: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
     let mu2 = mu * mu;
     let inv_phi = pw / phi;
     (inv_phi * mu2, inv_phi * 2.0 * mu2, inv_phi * 4.0 * mu2)
@@ -5439,12 +5428,7 @@ pub fn fisher_weight_gaussian_log(
 /// d_obs = 12ω (5 − 2ηy) / (φ η⁶)
 /// ```
 #[inline]
-pub fn observed_weight_gaussian_inverse(
-    y: f64,
-    eta: f64,
-    phi: f64,
-    pw: f64,
-) -> (f64, f64, f64) {
+pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
     let eta2 = eta * eta;
     let eta4 = eta2 * eta2;
     let eta5 = eta4 * eta;
@@ -5463,21 +5447,13 @@ pub fn observed_weight_gaussian_inverse(
 /// w_F = ω / (φ η⁴),  c_F = −4ω / (φ η⁵),  d_F = 20ω / (φ η⁶)
 /// ```
 #[inline]
-pub fn fisher_weight_gaussian_inverse(
-    eta: f64,
-    phi: f64,
-    pw: f64,
-) -> (f64, f64, f64) {
+pub fn fisher_weight_gaussian_inverse(eta: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
     let eta2 = eta * eta;
     let eta4 = eta2 * eta2;
     let eta5 = eta4 * eta;
     let eta6 = eta4 * eta2;
     let inv_phi = pw / phi;
-    (
-        inv_phi / eta4,
-        -4.0 * inv_phi / eta5,
-        20.0 * inv_phi / eta6,
-    )
+    (inv_phi / eta4, -4.0 * inv_phi / eta5, 20.0 * inv_phi / eta6)
 }
 
 /// Binomial(n, p) with canonical logit link.
@@ -5492,11 +5468,7 @@ pub fn fisher_weight_gaussian_inverse(
 /// d = ω n p(1−p)(1−6p+6p²)
 /// ```
 #[inline]
-pub fn observed_weight_binomial_logit(
-    n_trials: f64,
-    p: f64,
-    pw: f64,
-) -> (f64, f64, f64) {
+pub fn observed_weight_binomial_logit(n_trials: f64, p: f64, pw: f64) -> (f64, f64, f64) {
     let q = 1.0 - p;
     let pq = p * q;
     let npq = pw * n_trials * pq;
