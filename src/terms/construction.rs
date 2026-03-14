@@ -586,6 +586,9 @@ pub struct ReparamResult {
     /// These vectors span the structural null space used by positive-part
     /// log-determinant conventions.
     pub u_truncated: Array2<f64>,
+    /// The rho-independent shrinkage ridge magnitude that was added to each
+    /// eigenvalue of the penalized block. Zero means no shrinkage was applied.
+    pub penalty_shrinkage_ridge: f64,
 }
 
 /// Creates a lambda-independent balanced penalty root for stable rank detection
@@ -787,6 +790,17 @@ pub struct ReparamInvariant {
     split: SubspaceSplit,
     rs_transformed_base: Vec<Array2<f64>>,
     has_nonzero: bool,
+    /// Largest eigenvalue of the balanced (unit-Frobenius) penalty matrix.
+    /// Used as the scale reference for the shrinkage floor.
+    max_balanced_eigenvalue: f64,
+}
+
+impl ReparamInvariant {
+    /// Returns the largest eigenvalue of the balanced penalty matrix.
+    /// This is lambda-independent and provides a natural scale for shrinkage.
+    pub fn max_balanced_eigenvalue(&self) -> f64 {
+        self.max_balanced_eigenvalue
+    }
 }
 
 /// Precompute the lambda-invariant reparameterization structure from penalty roots.
@@ -803,6 +817,7 @@ pub fn precompute_reparam_invariant(
             split: SubspaceSplit::identity(p),
             rs_transformed_base: Vec::new(),
             has_nonzero: false,
+            max_balanced_eigenvalue: 0.0,
         });
     }
 
@@ -829,6 +844,7 @@ pub fn precompute_reparam_invariant(
             split: SubspaceSplit::identity(p),
             rs_transformed_base: rs_list.to_vec(),
             has_nonzero: false,
+            max_balanced_eigenvalue: 0.0,
         });
     }
 
@@ -886,6 +902,7 @@ pub fn precompute_reparam_invariant(
         split,
         rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
         has_nonzero,
+        max_balanced_eigenvalue: max_bal,
     })
 }
 
@@ -911,15 +928,24 @@ pub fn stable_reparameterization(
     p: usize,
 ) -> Result<ReparamResult, EstimationError> {
     let invariant = precompute_reparam_invariant(rs_list, p)?;
-    stable_reparameterizationwith_invariant(rs_list, lambdas, p, &invariant)
+    stable_reparameterizationwith_invariant(rs_list, lambdas, p, &invariant, None)
 }
 
 /// Apply stable reparameterization using precomputed lambda-invariant structures.
+///
+/// `penalty_shrinkage_floor`: optional relative shrinkage floor for eigenvalues
+/// of the penalized block. If `Some(epsilon)`, a rho-independent ridge of
+/// magnitude `epsilon * max_balanced_eigenvalue` is added to each eigenvalue
+/// of the combined penalty on the penalized block. This prevents barely-penalized
+/// directions from causing pathological non-Gaussianity in the posterior (e.g.,
+/// extreme skewness under logit link with high-dimensional spatial smooths).
+/// A typical value is `1e-6`. Set to `None` or `Some(0.0)` to disable.
 pub fn stable_reparameterizationwith_invariant(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     p: usize,
     invariant: &ReparamInvariant,
+    penalty_shrinkage_floor: Option<f64>,
 ) -> Result<ReparamResult, EstimationError> {
     let m = rs_list.len();
 
@@ -951,6 +977,7 @@ pub fn stable_reparameterizationwith_invariant(
             e_transformed: Array2::zeros((0, p)),
             // All modes truncated when no penalties; already in transformed frame.
             u_truncated: Array2::eye(p),
+            penalty_shrinkage_ridge: 0.0,
         });
     }
 
@@ -967,6 +994,7 @@ pub fn stable_reparameterizationwith_invariant(
             e_transformed: Array2::zeros((0, p)),
             // Stored in transformed frame for downstream trace/correction math.
             u_truncated, // All modes truncated when zero penalty
+            penalty_shrinkage_ridge: 0.0,
         });
     }
 
@@ -1034,7 +1062,38 @@ pub fn stable_reparameterizationwith_invariant(
     // - Runtime lambda dependence only appears in the penalized block eigenvalues.
     // This avoids basis mixing inside the degenerate zero-eigenspace.
     let structural_rank = penalized_rank;
-    let range_eigs_sorted: Vec<f64> = range_eigenvalues_sorted;
+    let mut range_eigs_sorted: Vec<f64> = range_eigenvalues_sorted;
+
+    // Shrinkage floor: add a rho-independent ridge to the penalized block eigenvalues.
+    // This prevents barely-penalized directions from causing pathological non-Gaussianity
+    // in the posterior (extreme skewness under non-canonical links like logit with
+    // high-dimensional spatial smooths). The ridge magnitude is proportional to the
+    // balanced penalty's max eigenvalue (lambda-independent scale), so LAML gradients
+    // w.r.t. rho remain correct: d(epsilon * I)/d(rho_k) = 0.
+    let shrinkage_ridge = penalty_shrinkage_floor
+        .filter(|&eps| eps > 0.0)
+        .map(|eps| eps * invariant.max_balanced_eigenvalue)
+        .unwrap_or(0.0);
+    if shrinkage_ridge > 0.0 {
+        let min_eig_before = range_eigs_sorted
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        for eig in range_eigs_sorted.iter_mut() {
+            *eig += shrinkage_ridge;
+        }
+        // Log when the floor materially changes the smallest eigenvalue (>1% relative shift).
+        if min_eig_before > 0.0 && shrinkage_ridge / min_eig_before > 0.01 {
+            log::info!(
+                "Penalty shrinkage floor active: ridge={:.3e} (min_eig_before={:.3e}, ratio={:.1e}, max_bal_eig={:.3e})",
+                shrinkage_ridge,
+                min_eig_before,
+                shrinkage_ridge / min_eig_before,
+                invariant.max_balanced_eigenvalue,
+            );
+        }
+    }
+
     let max_eig = range_eigs_sorted
         .iter()
         .copied()
@@ -1208,6 +1267,7 @@ pub fn stable_reparameterizationwith_invariant(
             .collect(),
         e_transformed: mat_to_array(&e_transformed_mat),
         u_truncated: mat_to_array(&u_truncated_mat),
+        penalty_shrinkage_ridge: shrinkage_ridge,
     })
 }
 
@@ -1239,8 +1299,9 @@ pub fn stable_reparameterizationwith_invariant_engine(
     lambdas: &[f64],
     dims: EngineDims,
     invariant: &ReparamInvariant,
+    penalty_shrinkage_floor: Option<f64>,
 ) -> Result<ReparamResult, EstimationError> {
-    stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, invariant)
+    stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, invariant, penalty_shrinkage_floor)
 }
 
 /// Calculate the 2-norm condition number of a matrix.

@@ -4008,6 +4008,7 @@ fn build_sparse_native_reparam_result(
         Array2::<f64>::eye(p)
     };
     ReparamResult {
+        penalty_shrinkage_ridge: base.penalty_shrinkage_ridge,
         s_transformed: s_original,
         log_det: base.log_det,
         det1: base.det1,
@@ -4034,6 +4035,11 @@ pub struct PenaltyConfig<'a> {
     pub p: usize,
     pub coefficient_lower_bounds: Option<&'a Array1<f64>>,
     pub linear_constraints_original: Option<&'a LinearInequalityConstraints>,
+    /// Relative shrinkage floor for eigenvalues of the penalized block.
+    /// If `Some(epsilon)`, a rho-independent ridge of `epsilon * max_balanced_eigenvalue`
+    /// is added to prevent barely-penalized directions from causing pathological
+    /// non-Gaussianity in the posterior. Typical value: `1e-6`. `None` disables.
+    pub penalty_shrinkage_floor: Option<f64>,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
@@ -4094,6 +4100,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             lambdas_slice,
             EngineDims::new(penalty.p, penalty.rs_original.len()),
             invariant,
+            penalty.penalty_shrinkage_floor,
         )?
     } else {
         stable_reparameterization_engine(

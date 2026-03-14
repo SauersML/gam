@@ -1525,6 +1525,24 @@ impl DesignMatrix {
         <Self as LinearOperator>::ncols(self)
     }
 
+    /// Element access: returns the value at row `i`, column `j`.
+    ///
+    /// For dense matrices this is O(1). For sparse matrices, this converts to
+    /// a dense cache first and then indexes, so callers doing per-row sweeps
+    /// should prefer `to_dense()` for bulk access.
+    #[inline]
+    pub fn get(&self, i: usize, j: usize) -> f64 {
+        match self {
+            Self::Dense(matrix) => matrix[[i, j]],
+            Self::Sparse(sp) => {
+                let dense = sp
+                    .try_to_dense_arc("DesignMatrix::get")
+                    .unwrap_or_else(|msg| panic!("{msg}"));
+                dense[[i, j]]
+            }
+        }
+    }
+
     /// Returns a reference to the inner dense array if this is a `Dense` variant.
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {

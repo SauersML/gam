@@ -1,11 +1,12 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
-    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo,
-    PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    applyweighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_derivative, build_duchon_basis_log_kappasecond_derivative,
-    build_duchon_collocation_operator_matrices, build_matern_basis,
+    AnisoBasisPsiDerivatives, BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec,
+    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
+    BasisPsiSecondDerivativeResult, CenterStrategy, DuchonBasisSpec, MaternBasisSpec,
+    MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
+    ThinPlateBasisSpec, apply_sum_to_zero_constraint, applyweighted_orthogonality_constraint,
+    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_derivative,
+    build_duchon_basis_log_kappasecond_derivative, build_duchon_collocation_operator_matrices,
+    build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
     build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappasecond_derivative,
     build_matern_collocation_operator_matrices, build_thin_plate_basis, estimate_penalty_nullity,
     filter_active_penalty_candidates,
@@ -19,7 +20,7 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
-    FittedLinkParameters, compute_external_joint_hypercostgradienthessian,
+    FittedLinkParameters,
     fit_gamwith_heuristic_lambdas, reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -31,7 +32,7 @@ use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use opt::{
-    Arc as ArcOptimizer, ArcError, Bounds, MaxIterations, NewtonTrustRegion,
+    Bounds, MaxIterations, NewtonTrustRegion,
     NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
 use serde::{Deserialize, Serialize};
@@ -398,6 +399,9 @@ pub(crate) struct SpatialPsiDerivative {
     pub x_psi_psi_local: Array2<f64>,
     pub s_psi_psi_local: Array2<f64>,
     pub s_psi_psi_components_local: Vec<Array2<f64>>,
+    pub aniso_group_id: Option<usize>,
+    pub aniso_cross_t_local: Option<Array2<f64>>,
+    pub aniso_s_component_raw: Option<Array2<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -720,6 +724,30 @@ fn set_spatial_aniso_log_scales(
             "term '{}' does not support aniso_log_scales",
             term.name
         ))),
+    }
+}
+
+/// Sync knot-cloud-derived anisotropy contrasts from basis metadata back into
+/// the mutable spec so the optimizer starts from the correct eta values.
+///
+/// Call this after building the smooth design but before initializing the
+/// optimizer's psi coordinates. For each spatial term whose metadata contains
+/// computed `aniso_log_scales`, this writes them into the spec.
+pub(crate) fn sync_aniso_contrasts_from_metadata(
+    spec: &mut TermCollectionSpec,
+    design: &RawSmoothDesign,
+) {
+    for (term_idx, term) in design.terms.iter().enumerate() {
+        let meta_aniso = match &term.metadata {
+            BasisMetadata::Matern { aniso_log_scales, .. } => aniso_log_scales.clone(),
+            BasisMetadata::Duchon { aniso_log_scales, .. } => aniso_log_scales.clone(),
+            _ => None,
+        };
+        if let Some(eta) = meta_aniso {
+            if eta.len() > 1 {
+                let _ = set_spatial_aniso_log_scales(spec, term_idx, eta);
+            }
+        }
     }
 }
 
@@ -1120,6 +1148,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             nullspace_order,
             identifiability_transform: None,
             input_scales,
+            aniso_log_scales,
         } => BasisMetadata::Duchon {
             centers,
             length_scale,
@@ -1127,6 +1156,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             nullspace_order,
             identifiability_transform: Some(Array2::eye(raw_cols)),
             input_scales,
+            aniso_log_scales,
         },
         other => other,
     }
@@ -1141,6 +1171,7 @@ fn matern_operator_penalty_triplet_from_metadata(
         nu,
         include_intercept,
         identifiability_transform,
+        aniso_log_scales,
         ..
     } = metadata
     else {
@@ -1155,6 +1186,7 @@ fn matern_operator_penalty_triplet_from_metadata(
         *nu,
         *include_intercept,
         identifiability_transform.as_ref().map(|z| z.view()),
+        aniso_log_scales.as_deref(),
     )?;
     let mut candidates = Vec::with_capacity(3);
     for (raw, source) in [
@@ -1297,6 +1329,7 @@ fn build_shape_constraint_design_1d(
                 nu,
                 include_intercept,
                 identifiability_transform,
+                aniso_log_scales,
                 ..
             },
         ) => {
@@ -1313,6 +1346,7 @@ fn build_shape_constraint_design_1d(
                 include_intercept: *include_intercept,
                 double_penalty: false,
                 identifiability: ident,
+                aniso_log_scales: aniso_log_scales.clone(),
             };
             build_matern_basis(grid_2d.view(), &evalspec)?.design
         }
@@ -1324,6 +1358,7 @@ fn build_shape_constraint_design_1d(
                 power,
                 nullspace_order,
                 identifiability_transform,
+                aniso_log_scales,
                 ..
             },
         ) => {
@@ -1338,6 +1373,7 @@ fn build_shape_constraint_design_1d(
                         transform: z.clone(),
                     })
                     .unwrap_or_else(|| spec.identifiability.clone()),
+                aniso_log_scales: aniso_log_scales.clone(),
             };
             build_duchon_basis(grid_2d.view(), &evalspec)?.design
         }
@@ -2883,12 +2919,14 @@ fn with_spatial_identifiability_transform(
             nullspace_order,
             identifiability_transform,
             input_scales,
+            aniso_log_scales,
         } => BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
             power: *power,
             nullspace_order: *nullspace_order,
             input_scales: input_scales.clone(),
+            aniso_log_scales: aniso_log_scales.clone(),
             identifiability_transform: transform
                 .cloned()
                 .or_else(|| identifiability_transform.clone()),
@@ -3753,6 +3791,7 @@ fn extract_spatial_operator_runtime_caches(
                         nu,
                         include_intercept,
                         identifiability_transform,
+                        aniso_log_scales,
                         ..
                     },
                 ) => {
@@ -3763,6 +3802,7 @@ fn extract_spatial_operator_runtime_caches(
                         *nu,
                         *include_intercept,
                         identifiability_transform.as_ref().map(|z| z.view()),
+                        aniso_log_scales.as_deref(),
                     )?;
                     (
                         feature_cols.clone(),
@@ -3781,16 +3821,20 @@ fn extract_spatial_operator_runtime_caches(
                         power,
                         nullspace_order,
                         identifiability_transform,
+                        aniso_log_scales,
                         ..
                     },
                 ) => {
-                    let ops = build_duchon_collocation_operator_matrices(
+                    let mut ws = crate::basis::BasisWorkspace::default();
+                    let ops = crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
                         centers.view(),
                         None,
                         *length_scale,
                         *power,
                         *nullspace_order,
+                        aniso_log_scales.as_deref(),
                         identifiability_transform.as_ref().map(|z| z.view()),
+                        &mut ws,
                     )?;
                     (
                         feature_cols.clone(),
@@ -6568,6 +6612,7 @@ fn external_opts_for_design(
         nullspace_dims: design.nullspace_dims.clone(),
         linear_constraints: design.linear_constraints.clone(),
         firth_bias_reduction: None,
+        penalty_shrinkage_floor: options.penalty_shrinkage_floor,
     }
 }
 
@@ -6647,6 +6692,9 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         x_psi_psi_local,
         s_psi_psi_local: s_psi_psi0,
         s_psi_psi_components_local,
+        aniso_group_id: None,
+        aniso_cross_t_local: None,
+        aniso_s_component_raw: None,
     }))
 }
 
@@ -6656,16 +6704,102 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
     design: &TermCollectionDesign,
     spatial_terms: &[usize],
 ) -> Result<Option<Vec<SpatialPsiDerivative>>, EstimationError> {
-    let mut out = Vec::with_capacity(spatial_terms.len());
+    let mut out = Vec::new();
+    let mut aniso_gid = 0usize;
     for &term_idx in spatial_terms {
+        let aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx);
+        let dim = get_spatial_feature_dim(resolvedspec, term_idx);
+        if let (Some(ref eta), Some(d)) = (&aniso, dim) {
+            if eta.len() == d && d > 1 {
+                if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
+                    data, resolvedspec, design, term_idx, aniso_gid,
+                )? {
+                    aniso_gid += 1;
+                    out.extend(entries);
+                    continue;
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
         let Some(info) =
             try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
-        else {
-            return Ok(None);
-        };
+        else { return Ok(None); };
         out.push(info);
     }
     Ok(Some(out))
+}
+
+/// For an aniso term with d axes, produce d `SpatialPsiDerivative` entries.
+fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
+    data: ArrayView2<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+    term_idx: usize,
+    aniso_group_id: usize,
+) -> Result<Option<Vec<SpatialPsiDerivative>>, EstimationError> {
+    let smooth_term = match design.smooth.terms.get(term_idx) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let termspec = match resolvedspec.smooth_terms.get(term_idx) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let aniso_result = match &termspec.basis {
+        SmoothBasisSpec::Matern { feature_cols, spec, input_scales } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        _ => return Ok(None),
+    };
+    let d = aniso_result.design_first.len();
+    if d == 0 { return Ok(None); }
+    let Some(penalty_start) = smooth_term_penalty_index(resolvedspec, design, term_idx) else {
+        return Ok(None);
+    };
+    let p_total = design.design.ncols();
+    let smooth_start = p_total.saturating_sub(design.smooth.design.ncols());
+    let global_range = (smooth_start + smooth_term.coeff_range.start)
+        ..(smooth_start + smooth_term.coeff_range.end);
+    let num_penalties = aniso_result.penalties_first[0].len();
+    let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
+    let mut entries = Vec::with_capacity(d);
+    for a in 0..d {
+        let x_psi_local = aniso_result.design_first[a].clone();
+        let x_psi_psi_local = aniso_result.design_second_diag[a].clone();
+        if x_psi_local.ncols() != smooth_term.coeff_range.len() { return Ok(None); }
+        let s_psi_components = aniso_result.penalties_first[a].clone();
+        let s_psi_psi_components = aniso_result.penalties_second_diag[a].clone();
+        let s_psi_local = s_psi_components.iter().fold(
+            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
+            |acc, m| acc + m,
+        );
+        let s_psi_psi_local = s_psi_psi_components.iter().fold(
+            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
+            |acc, m| acc + m,
+        );
+        entries.push(SpatialPsiDerivative {
+            penalty_index: penalty_indices[0],
+            penalty_indices: penalty_indices.clone(),
+            global_range: global_range.clone(),
+            total_p: p_total,
+            x_psi_local,
+            s_psi_local,
+            s_psi_components_local: s_psi_components,
+            x_psi_psi_local,
+            s_psi_psi_local,
+            s_psi_psi_components_local: s_psi_psi_components,
+            aniso_group_id: Some(aniso_group_id),
+            aniso_cross_t_local: Some(aniso_result.design_cross_t.clone()),
+            aniso_s_component_raw: Some(aniso_result.s_components_raw[a].clone()),
+        });
+    }
+    Ok(Some(entries))
 }
 
 fn try_build_spatial_term_log_kappa_derivative(
@@ -6808,13 +6942,37 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
 ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
     let mut hyper_dirs = Vec::with_capacity(info_list.len());
     let log_kappa_dim = info_list.len();
-    for (i, info) in info_list.into_iter().enumerate() {
+    for (i, info) in info_list.iter().enumerate() {
         let mut xsecond = vec![None; log_kappa_dim];
+        // Diagonal second derivative (same axis).
         xsecond[i] = Some(crate::estimate::reml::HyperDesignDerivative::from_embedded(
             info.x_psi_psi_local.clone(),
             info.global_range.clone(),
             info.total_p,
         ));
+        // Cross second derivatives for axes in the same aniso group.
+        if let Some(gid) = info.aniso_group_id {
+            if let (Some(t_mat), Some(s_a)) =
+                (&info.aniso_cross_t_local, &info.aniso_s_component_raw)
+            {
+                for (j, other) in info_list.iter().enumerate() {
+                    if j == i { continue; }
+                    if other.aniso_group_id == Some(gid) {
+                        if let Some(s_b) = &other.aniso_s_component_raw {
+                            // d2X/(d psi_a d psi_b) = t * s_a * s_b
+                            let cross = t_mat * s_a * s_b;
+                            xsecond[j] = Some(
+                                crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                                    cross,
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let s_components = info
             .penalty_indices
             .iter()
@@ -6841,6 +6999,8 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
+        // Cross penalty second derivatives for axes in the same aniso group
+        // are left as None for now (D0-only; penalty cross-terms are a follow-up).
         hyper_dirs.push(DirectionalHyperParam::new_compact(
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
                 info.x_psi_local.clone(),
@@ -6855,48 +7015,27 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     Ok(hyper_dirs)
 }
 
-fn try_exact_joint_spatial_hypercostgradienthessian(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
+/// Compute `dims_per_term` for a list of spatial term indices.
+///
+/// Returns a vector where entry i is the number of ψ values for spatial
+/// term i: 1 for isotropic terms, d for d-dimensional anisotropic terms.
+fn compute_spatial_dims_per_term(
     resolvedspec: &TermCollectionSpec,
-    warm_start_fit: &FittedTermCollection,
-    family: LikelihoodFamily,
-    options: &FitOptions,
     spatial_terms: &[usize],
-) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, EstimationError> {
-    // This path evaluates the exact joint outer derivatives for theta = (rho, psi),
-    // where psi = log(kappa). The optimizer tail is therefore *not*
-    // log(length_scale); conversion to the stored spec parameterization happens only
-    // when rebuilding the candidate spec from SpatialLogKappaCoords.
-    let design = build_term_collection_design(data, resolvedspec)?;
-    let Some(info_list) = try_build_spatial_log_kappa_derivativeinfo_list(
-        data,
-        resolvedspec,
-        &design,
-        spatial_terms,
-    )?
-    else {
-        return Ok(None);
-    };
-    let hyper_dirs = spatial_log_kappa_hyper_dirs_frominfo_list(info_list)?;
-    let external_opts = external_opts_for_design(family, &design, options);
-    let joint = compute_external_joint_hypercostgradienthessian(
-        y,
-        weights,
-        design.design.view(),
-        offset,
-        design.penalties.clone(),
-        theta,
-        rho_dim,
-        hyper_dirs,
-        Some(warm_start_fit.fit.beta.view()),
-        &external_opts,
-    )?;
-    Ok(Some(joint))
+) -> Vec<usize> {
+    spatial_terms
+        .iter()
+        .map(|&term_idx| {
+            let d = get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1);
+            let has_aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx).is_some();
+            if has_aniso && d > 1 { d } else { 1 }
+        })
+        .collect()
+}
+
+/// Check whether any spatial terms are anisotropic (dims_per_term > 1).
+fn has_aniso_terms(dims_per_term: &[usize]) -> bool {
+    dims_per_term.iter().any(|&d| d > 1)
 }
 
 fn try_exact_joint_spatial_length_scale_optimization(
@@ -6922,88 +7061,85 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     const JOINT_RHO_BOUND: f64 = 12.0;
     let rho_dim = best.fit.lambdas.len();
-    let log_kappa0 =
-        SpatialLogKappaCoords::from_length_scales(resolvedspec, spatial_terms, kappa_options);
+
+    // Compute per-term dimensionality for anisotropic terms.
+    let dims_per_term = compute_spatial_dims_per_term(resolvedspec, spatial_terms);
+    let use_aniso = has_aniso_terms(&dims_per_term);
+
+    // Build initial ψ values and bounds, using aniso-aware constructors
+    // when any term has d > 1 axes.
+    let log_kappa0 = if use_aniso {
+        SpatialLogKappaCoords::from_length_scales_aniso(resolvedspec, spatial_terms, kappa_options)
+    } else {
+        SpatialLogKappaCoords::from_length_scales(resolvedspec, spatial_terms, kappa_options)
+    };
+    let log_kappa_lower = if use_aniso {
+        SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options)
+    } else {
+        SpatialLogKappaCoords::lower_bounds(spatial_terms.len(), kappa_options)
+    };
+    let log_kappa_upper = if use_aniso {
+        SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options)
+    } else {
+        SpatialLogKappaCoords::upper_bounds(spatial_terms.len(), kappa_options)
+    };
     let setup = TwoBlockExactJointHyperSetup::new(
         best.fit.lambdas.mapv(f64::ln),
         Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
         Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
         log_kappa0,
-        SpatialLogKappaCoords::lower_bounds(spatial_terms.len(), kappa_options),
-        SpatialLogKappaCoords::upper_bounds(spatial_terms.len(), kappa_options),
+        log_kappa_lower,
+        log_kappa_upper,
     );
 
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
-    let warm_start_fit: FittedTermCollection = (*best).clone();
     let theta0 = setup.theta0();
     let lower = setup.lower();
     let upper = setup.upper();
-    let objective = CachedSecondOrderObjective::new(
-        |theta: &Array1<f64>| {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
-            let spec_c = log_kappa
-                .apply_tospec(resolvedspec, spatial_terms)
-                .map_err(|e| {
-                    ObjectiveEvalError::recoverable(format!(
-                        "failed to apply spatial log-kappa: {e}"
-                    ))
-                })?;
-            let (cost, grad, hess) = match try_exact_joint_spatial_hypercostgradienthessian(
-                data,
-                y,
-                weights,
-                offset,
-                theta,
-                rho_dim,
-                &spec_c,
-                &warm_start_fit,
-                family,
-                options,
-                spatial_terms,
-            ) {
-                Ok(Some((cost, grad, hess)))
-                    if cost.is_finite()
-                        && grad.iter().all(|v| v.is_finite())
-                        && hess.nrows() == theta.len()
-                        && hess.ncols() == theta.len()
-                        && hess.iter().all(|v| v.is_finite()) =>
-                {
-                    (cost, grad, hess)
-                }
-                _ => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact joint spatial objective returned invalid value",
-                    ));
-                }
-            };
-            last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
-            Ok((cost, grad, Some(hess)))
-        },
-        1e-4,
-    );
-    let mut optimizer = ArcOptimizer::new(theta0.clone(), objective)
-        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("joint theta bounds must be valid"))
-        .with_tolerance(
-            Tolerance::new(kappa_options.rel_tol.max(1e-6)).expect("joint tolerance must be valid"),
-        )
-        .with_max_iterations(
-            MaxIterations::new(kappa_options.max_outer_iter.max(1))
-                .expect("joint max iterations must be valid"),
+    let dims_clone = dims_per_term.clone();
+    // Evaluate cost at a given theta = [rho, log_kappa] by applying the kappa
+    // to the spec, fitting with lambdas derived from rho, and scoring.
+    let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            theta, rho_dim, dims_clone.clone(),
         );
-
-    let solution = match optimizer.run() {
-        Ok(sol) => sol,
-        Err(ArcError::MaxIterationsReached { last_solution, .. }) => *last_solution,
-        Err(err) => {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "exact joint spatial length-scale optimization failed (ARC): {err:?}"
-            )));
+        let spec_c = log_kappa
+            .apply_tospec(resolvedspec, spatial_terms)
+            .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
+        let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
+        match fit_term_collection_forspecwith_heuristic_lambdas(
+            data, y, weights, offset, &spec_c, rho.as_slice(), family, options,
+        ) {
+            Ok(fit) => Ok(fit_score(&fit.fit)),
+            Err(_) => Ok(f64::INFINITY),
         }
     };
 
-    let theta_star = solution.final_point;
+    let initial_cost = eval_cost(&theta0).unwrap_or(f64::INFINITY);
+
+    // Track the best theta found during coordinate search.
+    let mut best_theta = theta0.clone();
+
+    coordinate_search_spatial(
+        &theta0,
+        initial_cost,
+        &lower,
+        &upper,
+        kappa_options,
+        &mut |action| match action {
+            SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
+            SpatialSearchAction::OnImprove(theta, _cost) => {
+                best_theta = theta.clone();
+                Ok(0.0)
+            }
+        },
+    )
+    .map_err(EstimationError::InvalidInput)?;
+
+    let theta_star = best_theta;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
-    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail(&theta_star, rho_dim);
+    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail_with_dims(
+        &theta_star, rho_dim, dims_clone,
+    );
     let resolvedspec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
     let best = fit_term_collection_forspecwith_heuristic_lambdas(
         data,
@@ -7353,6 +7489,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
                 centers,
                 identifiability_transform,
                 input_scales: meta_scales,
+                aniso_log_scales: meta_aniso,
                 ..
             },
         ) = (&mut term.basis, &fitted.metadata)
@@ -7363,6 +7500,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
                     transform: z.clone(),
                 };
             }
+            s.aniso_log_scales = meta_aniso.clone();
             *input_scales = meta_scales.clone();
         }
         if let (
@@ -8257,6 +8395,7 @@ mod tests {
                     include_intercept: false,
                     double_penalty: false,
                     identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -8286,6 +8425,7 @@ mod tests {
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -8746,6 +8886,7 @@ mod tests {
                     include_intercept: false,
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -8782,6 +8923,7 @@ mod tests {
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -8816,6 +8958,7 @@ mod tests {
                     power: 1,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -8862,6 +9005,7 @@ mod tests {
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -8912,6 +9056,7 @@ mod tests {
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -8954,6 +9099,7 @@ mod tests {
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -8996,6 +9142,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9211,6 +9358,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9309,6 +9457,7 @@ mod tests {
                     include_intercept: false,
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -9393,6 +9542,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9457,6 +9607,7 @@ mod tests {
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9557,6 +9708,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9663,6 +9815,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9736,6 +9889,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9809,6 +9963,7 @@ mod tests {
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -9896,6 +10051,7 @@ mod tests {
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
                 },
                 input_scales: None,
                 },
@@ -10467,6 +10623,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -10547,6 +10704,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -10625,6 +10783,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -10801,6 +10960,7 @@ mod tests {
                         power: 2,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -10957,6 +11117,7 @@ mod tests {
                         power: 2,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -11114,6 +11275,7 @@ mod tests {
                         include_intercept: false,
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },
@@ -11193,6 +11355,7 @@ mod tests {
                         power: 2,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
                     },
                     input_scales: None,
                     },

@@ -27,10 +27,8 @@ pub(crate) struct SigmaJet4 {
     pub d4: f64,
 }
 
-#[inline]
-fn canonicalzero(v: f64) -> f64 {
-    if v.abs() < 1e-15 { 0.0 } else { v }
-}
+const SAFE_EXP_MIN_ETA: f64 = -700.0;
+const SAFE_EXP_MAX_ETA: f64 = 700.0;
 
 /// Overflow-safe exponential. Clamps the argument to the representable
 /// range of f64::exp, preventing Inf/NaN from propagating into
@@ -41,13 +39,27 @@ fn canonicalzero(v: f64) -> f64 {
 /// indistinguishable from +Inf or 0 in f64 arithmetic.
 #[inline]
 pub fn safe_exp(eta: f64) -> f64 {
-    eta.clamp(-700.0, 700.0).exp()
+    eta.clamp(SAFE_EXP_MIN_ETA, SAFE_EXP_MAX_ETA).exp()
+}
+
+#[inline]
+fn safe_exp_active_derivative(eta: f64, sigma: f64) -> f64 {
+    if eta.is_nan() {
+        f64::NAN
+    } else if eta <= SAFE_EXP_MIN_ETA || eta >= SAFE_EXP_MAX_ETA {
+        0.0
+    } else {
+        sigma
+    }
 }
 
 #[inline]
 pub fn exp_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
-    let sigma = safe_exp(eta);
-    SigmaJet1 { sigma, d1: sigma }
+    let jet = exp_sigma_jet4_scalar(eta);
+    SigmaJet1 {
+        sigma: jet.sigma,
+        d1: jet.d1,
+    }
 }
 
 #[inline]
@@ -64,12 +76,12 @@ pub fn exp_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
 
 #[inline]
 pub fn exp_sigma_jet3_scalar(eta: f64) -> SigmaJet3 {
-    let sigma = safe_exp(eta);
+    let jet = exp_sigma_jet4_scalar(eta);
     SigmaJet3 {
-        sigma,
-        d1: canonicalzero(sigma),
-        d2: canonicalzero(sigma),
-        d3: canonicalzero(sigma),
+        sigma: jet.sigma,
+        d1: jet.d1,
+        d2: jet.d2,
+        d3: jet.d3,
     }
 }
 
@@ -82,24 +94,31 @@ pub fn exp_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
 pub fn exp_sigma_derivs_up_to_third(
     eta: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
-    // For the exp link, all derivatives are identical: sigma = sigma' = sigma'' = sigma'''.
-    // Share the single allocation via Arc and clone cheaply where the caller needs ownership.
-    let sigma = eta.mapv(safe_exp);
-    let d1 = sigma.clone();
-    let d2 = sigma.clone();
-    let d3 = sigma.clone();
+    let n = eta.len();
+    let mut sigma = Array1::<f64>::zeros(n);
+    let mut d1 = Array1::<f64>::zeros(n);
+    let mut d2 = Array1::<f64>::zeros(n);
+    let mut d3 = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let jet = exp_sigma_jet3_scalar(eta[i]);
+        sigma[i] = jet.sigma;
+        d1[i] = jet.d1;
+        d2[i] = jet.d2;
+        d3[i] = jet.d3;
+    }
     (sigma, d1, d2, d3)
 }
 
 #[inline]
 pub(crate) fn exp_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
     let sigma = safe_exp(eta);
+    let deriv = safe_exp_active_derivative(eta, sigma);
     SigmaJet4 {
         sigma,
-        d1: canonicalzero(sigma),
-        d2: canonicalzero(sigma),
-        d3: canonicalzero(sigma),
-        d4: canonicalzero(sigma),
+        d1: deriv,
+        d2: deriv,
+        d3: deriv,
+        d4: deriv,
     }
 }
 
@@ -118,14 +137,21 @@ pub fn exp_sigma_derivs_up_to_fourth(
     Array1<f64>,
     Array1<f64>,
 ) {
-    let sigma = eta.mapv(safe_exp);
-    (
-        sigma.clone(),
-        sigma.clone(),
-        sigma.clone(),
-        sigma.clone(),
-        sigma,
-    )
+    let n = eta.len();
+    let mut sigma = Array1::<f64>::zeros(n);
+    let mut d1 = Array1::<f64>::zeros(n);
+    let mut d2 = Array1::<f64>::zeros(n);
+    let mut d3 = Array1::<f64>::zeros(n);
+    let mut d4 = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let jet = exp_sigma_jet4_scalar(eta[i]);
+        sigma[i] = jet.sigma;
+        d1[i] = jet.d1;
+        d2[i] = jet.d2;
+        d3[i] = jet.d3;
+        d4[i] = jet.d4;
+    }
+    (sigma, d1, d2, d3, d4)
 }
 
 #[cfg(test)]
@@ -241,7 +267,7 @@ mod tests {
 
     #[test]
     fn exp_sigmavectorized_up_to_fourth_matches_scalar() {
-        let eta = Array1::from_vec(vec![-4.2, -1.4, -0.2, 0.4, 1.9, 3.1]);
+        let eta = Array1::from_vec(vec![-701.0, -4.2, -1.4, -0.2, 0.4, 1.9, 3.1, 701.0]);
         let (s, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth(eta.view());
         for i in 0..eta.len() {
             let (ss, d1s, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth_scalar(eta[i]);

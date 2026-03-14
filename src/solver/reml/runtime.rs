@@ -452,11 +452,20 @@ impl<'a> RemlState<'a> {
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
+            penalty_shrinkage_floor: None,
             cache_manager: EvalCacheManager::new(),
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
         })
+    }
+
+    /// Sets the shrinkage floor for penalized block eigenvalues.
+    /// The ridge magnitude will be `epsilon * max_balanced_eigenvalue` (rho-independent).
+    /// This prevents barely-penalized directions from causing pathological
+    /// non-Gaussianity in the posterior. Typical value: `Some(1e-6)`.
+    pub(crate) fn set_penalty_shrinkage_floor(&mut self, floor: Option<f64>) {
+        self.penalty_shrinkage_floor = floor;
     }
 
     /// Creates a sanitized cache key from rho values.
@@ -1239,6 +1248,7 @@ impl<'a> RemlState<'a> {
                 p: self.p,
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
                 linear_constraints_original: self.linear_constraints.as_ref(),
+                penalty_shrinkage_floor: self.penalty_shrinkage_floor,
             };
             pirls::fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),

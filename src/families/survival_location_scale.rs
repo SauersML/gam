@@ -554,8 +554,8 @@ impl SurvivalLocationScaleFamily {
         // For joint Hessian / D_u H we use the EXIT evaluations of sigma and its
         // derivatives (the exit design is the solver's primary design).
         let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
-        let sigma_entry = if self.x_log_sigma_entry.is_some() {
-            Some(eta_ls_entry.mapv(crate::families::sigma_link::safe_exp))
+        let entry_sigma_derivs = if self.x_log_sigma_entry.is_some() {
+            Some(exp_sigma_derivs_up_to_third(eta_ls_entry.view()))
         } else {
             None
         };
@@ -576,7 +576,7 @@ impl SurvivalLocationScaleFamily {
         let mut d_h_d = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let sigma_entry_i = sigma_entry.as_ref().map_or(sigma[i], |se| se[i]);
+            let sigma_entry_i = entry_sigma_derivs.as_ref().map_or(sigma[i], |entry| entry.0[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
@@ -607,7 +607,7 @@ impl SurvivalLocationScaleFamily {
             d_h_d[i] = row.d_h_d;
         }
 
-        // q(eta_t, eta_ls, etaw) = -eta_t / sigma(eta_ls) + etaw.
+        // q(eta_t, eta_ls, etaw) = -eta_t / max(sigma(eta_ls), 1e-12) + etaw.
         //
         // For the joint Hessian and D_u H, the partial derivatives of q
         // w.r.t. the block parameters are evaluated at the EXIT linear predictor
@@ -616,14 +616,17 @@ impl SurvivalLocationScaleFamily {
         //
         // The exact derivatives used in the joint Hessian and D_u H are:
         //
-        //   q_t      = -1 / sigma
-        //   q_ls     = eta_t * sigma' / sigma^2
-        //   q_t,ls   = sigma' / sigma^2
-        //   q_ls,ls  = eta_t * (sigma''/sigma^2 - 2 sigma'^2/sigma^3)
-        //   q_t,ls,ls= sigma''/sigma^2 - 2 sigma'^2/sigma^3
+        //   q_t      = -1 / max(sigma, 1e-12)
+        //   q_ls     = eta_t * sigma' / max(sigma, 1e-12)^2
+        //   q_t,ls   = sigma' / max(sigma, 1e-12)^2
+        //   q_ls,ls  = eta_t * (sigma''/s^2 - 2 sigma'^2/s^3)
+        //   q_t,ls,ls= sigma''/s^2 - 2 sigma'^2/s^3
         //   q_ls,ls,ls
-        //            = eta_t * (sigma'''/sigma^2 - 6 sigma' sigma''/sigma^3
-        //                        + 6 sigma'^3/sigma^4).
+        //            = eta_t * (sigma'''/s^2 - 6 sigma' sigma''/s^3
+        //                        + 6 sigma'^3/s^4),
+        //
+        // where s = max(sigma, 1e-12). On the active floor branch the coded q
+        // is locally constant in eta_ls, so all eta_ls-derivatives vanish.
         //
         // These are the scalar q_{i,b}, q_{i,bc}, q_{i,bcd} objects from the
         // derivation, specialized to the threshold / scale / wiggle blocks.
@@ -636,10 +639,16 @@ impl SurvivalLocationScaleFamily {
         } else {
             None
         };
-        let entry_qd = if self.x_log_sigma_entry.is_some() {
-            let se = sigma_entry.as_ref().unwrap();
-            // For exp link: σ' = σ'' = σ''' = σ = exp(η_ls)
-            Some(compute_q_chain_derivs(&eta_t_entry, se, se, se, se))
+        let entry_qd = if let Some((sigma_entry, ds_entry, d2s_entry, d3s_entry)) =
+            entry_sigma_derivs.as_ref()
+        {
+            Some(compute_q_chain_derivs(
+                &eta_t_entry,
+                sigma_entry,
+                ds_entry,
+                d2s_entry,
+                d3s_entry,
+            ))
         } else {
             None
         };
@@ -956,7 +965,8 @@ impl SurvivalLocationScaleFamily {
     }
 }
 
-/// Scalar chain-rule derivatives of q(eta_t, eta_ls) = -eta_t / sigma(eta_ls).
+/// Scalar chain-rule derivatives of
+/// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12).
 ///
 /// Returns (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) — the full set of
 /// partials up to third order needed by both the survival and GAMLSS engines.
@@ -969,10 +979,14 @@ pub(crate) fn q_chain_derivs_scalar(
     d3sigma: f64,
 ) -> (f64, f64, f64, f64, f64, f64) {
     let s = sigma.max(1e-12);
-    let s2 = (s * s).max(1e-12);
-    let s3 = (s2 * s).max(1e-12);
-    let s4 = (s3 * s).max(1e-12);
     let q_t = -1.0 / s;
+    if sigma <= 1e-12 {
+        return (q_t, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let s4 = s3 * s;
     let q_tl = dsigma / s2;
     let q_ls = eta_t * q_tl;
     let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
@@ -981,18 +995,20 @@ pub(crate) fn q_chain_derivs_scalar(
     (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls)
 }
 
-/// All chain-rule partial derivatives of q(eta_t, eta_ls) = -eta_t / sigma(eta_ls)
+/// All chain-rule partial derivatives of
+/// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12)
 /// with respect to the block linear predictors eta_t and eta_ls.
 struct QChainDerivs {
-    dq_t: Array1<f64>,       // ∂q/∂eta_t = -1/σ
-    dq_ls: Array1<f64>,      // ∂q/∂eta_ls = eta_t · σ'/σ²
-    d2q_tls: Array1<f64>,    // ∂²q/∂eta_t∂eta_ls = σ'/σ²
-    d2q_ls: Array1<f64>,     // ∂²q/∂eta_ls² = eta_t · (σ''/σ² - 2σ'²/σ³)
-    d3q_tls_ls: Array1<f64>, // ∂³q/∂eta_t∂eta_ls² = σ''/σ² - 2σ'²/σ³
-    d3q_ls: Array1<f64>,     // ∂³q/∂eta_ls³ = eta_t · (σ'''/σ² - 6σ'σ''/σ³ + 6σ'³/σ⁴)
+    dq_t: Array1<f64>,       // ∂q/∂eta_t = -1/s with s = max(σ, 1e-12)
+    dq_ls: Array1<f64>,      // ∂q/∂eta_ls = eta_t · σ'/s²
+    d2q_tls: Array1<f64>,    // ∂²q/∂eta_t∂eta_ls = σ'/s²
+    d2q_ls: Array1<f64>,     // ∂²q/∂eta_ls² = eta_t · (σ''/s² - 2σ'²/s³)
+    d3q_tls_ls: Array1<f64>, // ∂³q/∂eta_t∂eta_ls² = σ''/s² - 2σ'²/s³
+    d3q_ls: Array1<f64>,     // ∂³q/∂eta_ls³ = eta_t · (σ'''/s² - 6σ'σ''/s³ + 6σ'³/s⁴)
 }
 
-/// Compute all chain-rule derivatives of q = -eta_t / sigma(eta_ls) as length-n arrays.
+/// Compute all chain-rule derivatives of
+/// q = -eta_t / max(sigma(eta_ls), 1e-12) as length-n arrays.
 fn compute_q_chain_derivs(
     eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
     sigma: &Array1<f64>,
