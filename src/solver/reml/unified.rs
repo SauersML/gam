@@ -1149,6 +1149,25 @@ pub fn reml_laml_evaluate(
 
     // ─── Gradient (uses SAME hop, SAME intermediates) ───
 
+    // When a barrier is active, wrap the inner derivative provider so that
+    // dH/dρ and d²H/dρ² include barrier-Hessian correction terms.
+    let barrier_deriv_holder: Option<BarrierDerivativeProvider<'_>> =
+        if let Some(ref barrier_cfg) = solution.barrier_config {
+            match BarrierDerivativeProvider::new(&*solution.deriv_provider, barrier_cfg, &solution.beta) {
+                Ok(bdp) => Some(bdp),
+                Err(e) => {
+                    log::warn!("BarrierDerivativeProvider skipped (infeasible): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let effective_deriv: &dyn HessianDerivativeProvider = match barrier_deriv_holder {
+        Some(ref bdp) => bdp,
+        None => &*solution.deriv_provider,
+    };
+
     // Extract logdet flags once (same for all coordinates).
     let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => (true, true),
@@ -1161,6 +1180,73 @@ pub fn reml_laml_evaluate(
 
     let ext_dim = solution.ext_coords.len();
     let mut grad = Array1::zeros(k + ext_dim);
+
+
+    // --- Stochastic trace estimation decision ---
+    //
+    // For large dense Hessians, exact tr(G_eps(H) H_k) costs O(p^2) per
+    // coordinate (eigendecomposition-based traces require AW products).
+    // Stochastic Hutchinson estimation reduces this to O(M*p) with M probe
+    // vectors (30-80), which is a substantial win when p > 500.
+    //
+    // Sparse Cholesky operators already have O(nnz) solve cost, so exact
+    // column-by-column traces are cheap -- stochastic estimation is skipped.
+    //
+    // The estimator computes tr(H^{-1} H_k) which approximates tr(G_eps(H) H_k)
+    // up to O(eps) -- negligible compared to the Monte Carlo tolerance (0.05)
+    // since eps = sqrt(machine_eps) * spectral_scale ~ 1.5e-8 * scale.
+    let total_p = hop.dim();
+    let use_stochastic_traces = total_p > 500 && hop.is_dense() && incl_logdet_h;
+
+    // When using stochastic traces, pre-collect all H_k matrices (both rho and
+    // ext coordinates) and batch them through a single StochasticTraceEstimator.
+    // This amortizes the H^{-1} solve cost: ONE solve per probe, shared across
+    // all k + ext_dim coordinates.
+    let stochastic_trace_values: Option<Vec<f64>> = if use_stochastic_traces {
+        let mut all_h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
+
+        // rho-coordinates: H_k = A_k + correction(v_k)
+        for idx in 0..k {
+            let r_k = &solution.penalty_roots[idx];
+            let mut a_k = r_k.t().dot(r_k);
+            a_k *= lambdas[idx];
+
+            if effective_deriv.has_corrections() {
+                let r_beta = r_k.dot(&solution.beta);
+                let s_k_beta = r_k.t().dot(&r_beta);
+                let a_k_beta = &s_k_beta * lambdas[idx];
+                let v_k = hop.solve(&a_k_beta);
+                if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k) {
+                    a_k += &corr;
+                }
+            }
+            all_h_k_matrices.push(a_k);
+        }
+
+        // ext-coordinates: dH_i = B_i + correction(v_i)
+        for coord in solution.ext_coords.iter() {
+            let mut h_i = coord.b_mat.clone();
+            if effective_deriv.has_corrections() {
+                let v_i = hop.solve(&coord.g);
+                if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                    h_i += &corr;
+                }
+            }
+            all_h_k_matrices.push(h_i);
+        }
+
+        let config = StochasticTraceConfig {
+            n_probes_min: 30,
+            n_probes_max: 80,
+            relative_tol: 0.05,
+            ..StochasticTraceConfig::default()
+        };
+        let estimator = StochasticTraceEstimator::new(config);
+        let refs: Vec<&Array2<f64>> = all_h_k_matrices.iter().collect();
+        Some(estimator.estimate_traces(hop, &refs))
+    } else {
+        None
+    };
 
     for idx in 0..k {
         let r_k = &solution.penalty_roots[idx];
@@ -1189,7 +1275,13 @@ pub fn reml_laml_evaluate(
         // Zero when include_logdet_h is false (MPL/PQL).
         let trace_term = if !incl_logdet_h {
             0.0
+        } else if let Some(ref stoch_traces) = stochastic_trace_values {
+            // Stochastic path: use pre-computed batched Hutchinson estimate.
+            // The estimator already computed tr(H⁻¹ Hₖ) for all k in a
+            // single pass, amortizing the H⁻¹ solve across coordinates.
+            0.5 * stoch_traces[idx]
         } else {
+            // Exact path: compute tr(G_ε(H) Hₖ) via the spectral operator.
             // Build Aₖ = λₖ RₖᵀRₖ
             let a_k_matrix = {
                 let mut m = r_k.t().dot(r_k);
@@ -1197,9 +1289,9 @@ pub fn reml_laml_evaluate(
                 m
             };
 
-            let correction = if solution.deriv_provider.has_corrections() {
+            let correction = if effective_deriv.has_corrections() {
                 let v_k = hop.solve(&a_k_beta);
-                solution.deriv_provider.hessian_derivative_correction(&v_k)
+                effective_deriv.hessian_derivative_correction(&v_k)
             } else {
                 None
             };
@@ -1227,15 +1319,19 @@ pub fn reml_laml_evaluate(
 
         // Trace term: ½ tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[β_i]
         // Uses the logdet gradient operator G_ε.
-        let trace_term = if incl_logdet_h {
-            let correction = if solution.deriv_provider.has_corrections() {
-                solution.deriv_provider.hessian_derivative_correction(&v_i)
+        let trace_term = if !incl_logdet_h {
+            0.0
+        } else if let Some(ref stoch_traces) = stochastic_trace_values {
+            // Stochastic path: ext traces are stored after the k ρ-traces.
+            0.5 * stoch_traces[k + ext_idx]
+        } else {
+            // Exact path.
+            let correction = if effective_deriv.has_corrections() {
+                effective_deriv.hessian_derivative_correction(&v_i)
             } else {
                 None
             };
             0.5 * hop.trace_logdet_h_k(&coord.b_mat, correction.as_ref())
-        } else {
-            0.0
         };
 
         // Penalty term: a_i (with profiled Gaussian rescaling if applicable)
@@ -1278,7 +1374,7 @@ pub fn reml_laml_evaluate(
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
-        let mut h = compute_outer_hessian(solution, rho, &lambdas, hop)?;
+        let mut h = compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv)?;
         // Add Firth Hessian (second derivatives of the Firth penalty on ρ, ρ-only).
         if let Some(ref fh) = solution.firth_hessian {
             let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
@@ -1428,6 +1524,7 @@ fn compute_outer_hessian(
     rho: &[f64],
     lambdas: &[f64],
     hop: &dyn HessianOperator,
+    effective_deriv: &dyn HessianDerivativeProvider,
 ) -> Result<Array2<f64>, String> {
     let k = rho.len();
     let ext_dim = solution.ext_coords.len();
@@ -1493,9 +1590,8 @@ fn compute_outer_hessian(
         a_k *= lambdas[idx];
         a_k_matrices.push(a_k.clone());
 
-        let correction = if solution.deriv_provider.has_corrections() {
-            solution
-                .deriv_provider
+        let correction = if effective_deriv.has_corrections() {
+            effective_deriv
                 .hessian_derivative_correction(&v_ks[idx])
         } else {
             None
@@ -1515,8 +1611,8 @@ fn compute_outer_hessian(
     // This replaces O(k²) linear solves for u_kl = H⁻¹ rhs with O(k²) dot
     // products, at the cost of ONE precomputed solve for z_c (plus computing
     // the hat diagonal). The net saving is large when k >> 1.
-    let adjoint_z_c = if solution.deriv_provider.has_corrections() && incl_logdet_h {
-        solution.deriv_provider.adjoint_trace_vector(hop)
+    let adjoint_z_c = if effective_deriv.has_corrections() && incl_logdet_h {
+        effective_deriv.adjoint_trace_vector(hop)
     } else {
         None
     };
@@ -1531,8 +1627,8 @@ fn compute_outer_hessian(
         let v_i = hop.solve(&coord.g);
 
         let mut h_i = coord.b_mat.clone();
-        if solution.deriv_provider.has_corrections() {
-            if let Some(corr) = solution.deriv_provider.hessian_derivative_correction(&v_i) {
+        if effective_deriv.has_corrections() {
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
                 h_i += &corr;
             }
         }
@@ -1578,7 +1674,7 @@ fn compute_outer_hessian(
                 // Diagonal: Ḧ_{kk} = Aₖ + correction(β_{kk}, vₖ, vₖ)
                 // Base is tr(G_ε Aₖ), NOT tr(G_ε Ḣₖ).
                 let base = hop.trace_logdet_gradient(&a_k_matrices[kk]);
-                if solution.deriv_provider.has_corrections() {
+                if effective_deriv.has_corrections() {
                     // β_{kk} RHS = Ḣₖ vₖ + Aₖ vₖ − Aₖ β̂
                     let mut rhs = h_k_matrices[kk].dot(&v_ks[kk]);
                     rhs += &a_k_matrices[kk].dot(&v_ks[kk]);
@@ -1587,15 +1683,13 @@ fn compute_outer_hessian(
                     if let Some(ref z_c) = adjoint_z_c {
                         // Adjoint shortcut: tr(H⁻¹ C[u_kk]) = rhs · z_c
                         let c_trace = rhs.dot(z_c);
-                        let d_trace = solution
-                            .deriv_provider
+                        let d_trace = effective_deriv
                             .fourth_derivative_trace(&v_ks[kk], &v_ks[kk], hop)
                             .unwrap_or(0.0);
                         base + c_trace + d_trace
                     } else {
                         let u_kk = hop.solve(&rhs);
-                        if let Some(correction) = solution
-                            .deriv_provider
+                        if let Some(correction) = effective_deriv
                             .hessian_second_derivative_correction(&v_ks[kk], &v_ks[kk], &u_kk)
                         {
                             base + hop.trace_logdet_gradient(&correction)
@@ -1608,21 +1702,19 @@ fn compute_outer_hessian(
                 }
             } else {
                 // Off-diagonal: Ḧ_{kl} = correction(β_{kl}, vₖ, vₗ) only (no Aₖ base).
-                if solution.deriv_provider.has_corrections() {
+                if effective_deriv.has_corrections() {
                     let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
                     rhs += &a_k_matrices[kk].dot(&v_ks[ll]);
 
                     if let Some(ref z_c) = adjoint_z_c {
                         let c_trace = rhs.dot(z_c);
-                        let d_trace = solution
-                            .deriv_provider
+                        let d_trace = effective_deriv
                             .fourth_derivative_trace(&v_ks[kk], &v_ks[ll], hop)
                             .unwrap_or(0.0);
                         c_trace + d_trace
                     } else {
                         let u_kl = hop.solve(&rhs);
-                        if let Some(correction) = solution
-                            .deriv_provider
+                        if let Some(correction) = effective_deriv
                             .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)
                         {
                             hop.trace_logdet_gradient(&correction)
@@ -1706,10 +1798,10 @@ fn compute_outer_hessian(
                     }
 
                     // C[u_re] + Q[v_rho, v_ext] via second_correction
-                    if solution.deriv_provider.has_corrections() {
+                    if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = solution.deriv_provider.fourth_derivative_trace(
+                            if let Some(d_trace) = effective_deriv.fourth_derivative_trace(
                                 &v_ks[rho_idx],
                                 &ext_v[ext_idx],
                                 hop,
@@ -1718,8 +1810,7 @@ fn compute_outer_hessian(
                             }
                         } else {
                             let u_re = hop.solve(&rhs);
-                            if let Some(correction) = solution
-                                .deriv_provider
+                            if let Some(correction) = effective_deriv
                                 .hessian_second_derivative_correction(
                                     &v_ks[rho_idx],
                                     &ext_v[ext_idx],
@@ -1799,19 +1890,17 @@ fn compute_outer_hessian(
                     }
 
                     // C[u_ij] + Q[v_i, v_j] via second_correction
-                    if solution.deriv_provider.has_corrections() {
+                    if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = solution
-                                .deriv_provider
+                            if let Some(d_trace) = effective_deriv
                                 .fourth_derivative_trace(&ext_v[ii], &ext_v[jj], hop)
                             {
                                 h2_trace += d_trace;
                             }
                         } else {
                             let u_ij = hop.solve(&rhs);
-                            if let Some(correction) = solution
-                                .deriv_provider
+                            if let Some(correction) = effective_deriv
                                 .hessian_second_derivative_correction(&ext_v[ii], &ext_v[jj], &u_ij)
                             {
                                 h2_trace += hop.trace_logdet_gradient(&correction);
