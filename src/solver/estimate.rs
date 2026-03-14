@@ -789,7 +789,6 @@ impl RemlConfig {
             max_iterations: self.max_iterations,
             convergence_tolerance: self.convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
-            penalty_shrinkage_floor: None,
         }
     }
 }
@@ -3245,16 +3244,35 @@ pub struct UnifiedFitResult {
     pub blocks: Vec<FittedBlock>,
     /// Log-smoothing parameters (all blocks concatenated in block order).
     pub log_lambdas: Array1<f64>,
+    /// Smoothing parameters (exp of log_lambdas).
+    pub lambdas: Array1<f64>,
     /// Log-likelihood at the converged mode.
     pub log_likelihood: f64,
+    /// Deviance = -2 * log_likelihood.
+    pub deviance: f64,
+    /// REML/LAML score (penalized objective used for smoothing selection).
+    pub reml_score: f64,
+    /// Stable penalty term (sum of lambda * beta' S beta terms).
+    pub stable_penalty_term: f64,
     /// Penalized objective value (−ℓ + penalty + REML terms).
     pub penalized_objective: f64,
-    /// Outer optimization convergence info.
+    /// Number of outer (smoothing parameter) iterations.
     pub outer_iterations: usize,
+    /// Whether the outer optimization converged.
     pub outer_converged: bool,
+    /// Final gradient norm of the outer optimization.
     pub outer_gradient_norm: f64,
+    /// Residual scale on the response scale.
+    ///
+    /// Contract: Gaussian identity models store residual standard deviation
+    /// sigma here. Non-Gaussian families keep the canonical fixed scale (1.0).
+    pub standard_deviation: f64,
     /// Conditional covariance Var(β | λ) for the joint coefficient vector.
     pub covariance_conditional: Option<Array2<f64>>,
+    /// Smoothing-parameter-corrected covariance Var*(β).
+    pub covariance_corrected: Option<Array2<f64>>,
+    /// Inference quantities from the inner solver (EDF, Hessian, etc.).
+    pub inference: Option<FitInference>,
     /// Fitted link parameters (SAS, BetaLogistic, Mixture).
     pub fitted_link: FittedLinkParameters,
     /// Working-set geometry at convergence (for ALO diagnostics).
@@ -3400,6 +3418,74 @@ impl FitResult {
 }
 
 impl UnifiedFitResult {
+    /// Get beta from the first (or only) block -- convenience for single-block models.
+    pub fn beta(&self) -> &Array1<f64> {
+        &self.blocks[0].beta
+    }
+
+    /// Get the beta covariance matrix (conditional) if available.
+    pub fn beta_covariance(&self) -> Option<&Array2<f64>> {
+        self.covariance_conditional.as_ref()
+    }
+
+    /// Get the smoothing-parameter-corrected beta covariance if available.
+    pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
+        self.covariance_corrected
+            .as_ref()
+            .or_else(|| {
+                self.inference
+                    .as_ref()
+                    .and_then(|inf| inf.beta_covariance_corrected.as_ref())
+            })
+    }
+
+    /// Get beta standard errors (conditional) if available.
+    pub fn beta_standard_errors(&self) -> Option<&Array1<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_standard_errors.as_ref())
+    }
+
+    /// Get smoothing-corrected beta standard errors if available.
+    pub fn beta_standard_errors_corrected(&self) -> Option<&Array1<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_standard_errors_corrected.as_ref())
+    }
+
+    /// Get the penalized Hessian if available.
+    pub fn penalized_hessian(&self) -> Option<&Array2<f64>> {
+        self.inference.as_ref().map(|inf| &inf.penalized_hessian)
+    }
+
+    /// Get working weights if available.
+    pub fn working_weights(&self) -> Option<&Array1<f64>> {
+        self.inference.as_ref().map(|inf| &inf.working_weights)
+    }
+
+    /// Get working response if available.
+    pub fn working_response(&self) -> Option<&Array1<f64>> {
+        self.inference.as_ref().map(|inf| &inf.working_response)
+    }
+
+    /// Total effective degrees of freedom.
+    pub fn edf_total(&self) -> Option<f64> {
+        self.inference.as_ref().map(|inf| inf.edf_total)
+    }
+
+    /// EDF by block.
+    pub fn edf_by_block(&self) -> &[f64] {
+        self.inference
+            .as_ref()
+            .map(|inf| inf.edf_by_block.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Find a block by role.
+    pub fn block_by_role(&self, role: BlockRole) -> Option<&FittedBlock> {
+        self.blocks.iter().find(|b| b.role == role)
+    }
+
     /// Flat coefficient vector (all blocks concatenated).
     pub fn beta_flat(&self) -> Array1<f64> {
         let total: usize = self.blocks.iter().map(|b| b.beta.len()).sum();
@@ -3414,11 +3500,6 @@ impl UnifiedFitResult {
         flat
     }
 
-    /// Total effective degrees of freedom.
-    pub fn edf_total(&self) -> f64 {
-        self.blocks.iter().map(|b| b.edf).sum()
-    }
-
     /// Number of coefficient blocks.
     pub fn n_blocks(&self) -> usize {
         self.blocks.len()
@@ -3427,6 +3508,70 @@ impl UnifiedFitResult {
     /// Block roles.
     pub fn block_roles(&self) -> Vec<BlockRole> {
         self.blocks.iter().map(|b| b.role.clone()).collect()
+    }
+
+    /// Resolve the fitted link state for a given family.
+    pub fn fitted_link_state(
+        &self,
+        family: crate::types::LikelihoodFamily,
+    ) -> Result<FittedLinkState, EstimationError> {
+        match family {
+            crate::types::LikelihoodFamily::GaussianIdentity => {
+                Ok(FittedLinkState::Standard(LinkFunction::Identity))
+            }
+            crate::types::LikelihoodFamily::BinomialLogit => {
+                Ok(FittedLinkState::Standard(LinkFunction::Logit))
+            }
+            crate::types::LikelihoodFamily::BinomialProbit => {
+                Ok(FittedLinkState::Standard(LinkFunction::Probit))
+            }
+            crate::types::LikelihoodFamily::BinomialCLogLog => {
+                Ok(FittedLinkState::Standard(LinkFunction::CLogLog))
+            }
+            crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link {
+                FittedLinkParameters::Sas { state, covariance } => Ok(FittedLinkState::Sas {
+                    state: state.clone(),
+                    covariance: covariance.clone(),
+                }),
+                _ => Err(EstimationError::InvalidInput(
+                    "BinomialSas requires fitted SAS link parameters".to_string(),
+                )),
+            },
+            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+                match &self.fitted_link {
+                    FittedLinkParameters::BetaLogistic { state, covariance } => {
+                        Ok(FittedLinkState::BetaLogistic {
+                            state: state.clone(),
+                            covariance: covariance.clone(),
+                        })
+                    }
+                    _ => Err(EstimationError::InvalidInput(
+                        "BinomialBetaLogistic requires fitted beta-logistic link parameters"
+                            .to_string(),
+                    )),
+                }
+            }
+            crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link {
+                FittedLinkParameters::Mixture { state, covariance } => {
+                    Ok(FittedLinkState::Mixture {
+                        state: state.clone(),
+                        covariance: covariance.clone(),
+                    })
+                }
+                _ => Err(EstimationError::InvalidInput(
+                    "BinomialMixture requires fitted mixture link parameters".to_string(),
+                )),
+            },
+            crate::types::LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
+                "fitted_link_state is not defined for PoissonLog".to_string(),
+            )),
+            crate::types::LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
+                "fitted_link_state is not defined for GammaLog".to_string(),
+            )),
+            crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+                "fitted_link_state is not defined for RoystonParmar".to_string(),
+            )),
+        }
     }
 }
 

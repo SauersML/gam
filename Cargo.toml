@@ -58,7 +58,7 @@ pest_derive = "2.8.3"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
-version = "0.8.0"
+version = "0.9.0"
 default-features = false
 
 [dev-dependencies]
