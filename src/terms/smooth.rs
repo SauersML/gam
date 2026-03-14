@@ -7773,38 +7773,15 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     let mut entries = Vec::with_capacity(d);
     for a in 0..d {
         let (x_psi_local, x_psi_psi_local) = if use_implicit {
-            // Implicit path: materialize per-axis design derivatives on the fly
-            // from the implicit operator. We materialize ONE axis at a time
-            // (O(n * p) peak), not all D simultaneously (which would be O(n * p * D)).
-            // This is the memory-efficient middle ground: the implicit operator
-            // stores compact O(n * k * D) radial jets, and we reconstruct each
-            // (n x p) matrix when needed then discard it.
-            let op = implicit_op_arc.as_ref().unwrap();
-            let x_first = op.materialize_first(a);
-            let x_second = op.materialize_second_diag(a);
-            // Cross-validate implicit transpose_mul against materialized.
-            // This exercises the matrix-free path and catches any divergence.
-            let ones_n = Array1::from_elem(op.n_data(), 1.0);
-            let implicit_xt_ones = op.transpose_mul_second_diag(a, &ones_n.view());
-            let materialized_xt_ones = x_second.t().dot(&ones_n);
-            let matvec_dev = implicit_xt_ones.iter().zip(materialized_xt_ones.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            assert!(
-                matvec_dev < 1e-8,
-                "implicit vs materialized second_diag mismatch: {matvec_dev:.4e}"
-            );
-            // Also validate forward_mul_second_diag.
-            let ones_p = Array1::from_elem(op.p_out(), 1.0);
-            let implicit_x_ones = op.forward_mul_second_diag(a, &ones_p.view());
-            let materialized_x_ones = x_second.dot(&ones_p);
-            let fwd_dev = implicit_x_ones.iter().zip(materialized_x_ones.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            assert!(
-                fwd_dev < 1e-8,
-                "implicit vs materialized forward second_diag mismatch: {fwd_dev:.4e}"
-            );
+            // Implicit path: design-derivative matvecs will be dispatched through
+            // the ImplicitDerivativeOp inside HyperDesignDerivative, so we do NOT
+            // need to materialize the dense (n x p) matrices here.  Store empty
+            // placeholders — they are never read when the implicit operator is
+            // present (spatial_log_kappa_hyper_dirs_frominfo_list uses from_implicit).
+            (
+                Array2::<f64>::zeros((0, 0)),
+                Array2::<f64>::zeros((0, 0)),
+            )
         } else {
             let x_first = aniso_result.design_first[a].clone();
             let x_second = aniso_result.design_second_diag[a].clone();
@@ -7828,15 +7805,16 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         // For the implicit path, cross designs are computed on the fly, so we
         // skip pre-materialization.
         let cross_designs = if use_implicit {
-            // Use the implicit operator's materialize_second_cross for cross-axis
-            // coupling matrices, avoiding the full t_proj * s_proj element-wise path.
-            let op = implicit_op_arc.as_ref().unwrap();
+            // Implicit path: cross-design matvecs will be dispatched through
+            // ImplicitDerivativeOp with SecondCross level, so we store empty
+            // placeholder matrices here. The axis indices are preserved so
+            // spatial_log_kappa_hyper_dirs_frominfo_list can route them.
             let mut cd = Vec::with_capacity(d - 1);
             for b in 0..d {
                 if b == a {
                     continue;
                 }
-                cd.push((b, op.materialize_second_cross(a, b)));
+                cd.push((b, Array2::<f64>::zeros((0, 0))));
             }
             cd
         } else {
@@ -8047,16 +8025,25 @@ fn try_build_spatial_log_kappa_hyper_dirs(
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
     info_list: Vec<SpatialPsiDerivative>,
 ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
+    use crate::estimate::reml::ImplicitDerivLevel;
+
     let mut hyper_dirs = Vec::with_capacity(info_list.len());
     let log_kappa_dim = info_list.len();
     for (i, info) in info_list.iter().enumerate() {
         let mut xsecond = vec![None; log_kappa_dim];
         // Diagonal second derivative (same axis).
-        xsecond[i] = Some(crate::estimate::reml::HyperDesignDerivative::from_embedded(
-            info.x_psi_psi_local.clone(),
-            info.global_range.clone(),
-            info.total_p,
-        ));
+        xsecond[i] = Some(if let Some(ref op) = info.implicit_operator {
+            crate::estimate::reml::HyperDesignDerivative::from_implicit(
+                op.clone(),
+                ImplicitDerivLevel::SecondDiag(info.implicit_axis),
+            )
+        } else {
+            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                info.x_psi_psi_local.clone(),
+                info.global_range.clone(),
+                info.total_p,
+            )
+        });
         // Cross second derivatives for axes in the same aniso group.
         if let Some(ref cross_designs) = info.aniso_cross_designs {
             // Find the base index of this aniso group in the info_list.
@@ -8070,12 +8057,18 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                 for &(b_axis, ref cross_mat) in cross_designs {
                     let j = base + b_axis;
                     if j < log_kappa_dim {
-                        xsecond[j] =
-                            Some(crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                        xsecond[j] = Some(if let Some(ref op) = info.implicit_operator {
+                            crate::estimate::reml::HyperDesignDerivative::from_implicit(
+                                op.clone(),
+                                ImplicitDerivLevel::SecondCross(info.implicit_axis, b_axis),
+                            )
+                        } else {
+                            crate::estimate::reml::HyperDesignDerivative::from_embedded(
                                 cross_mat.clone(),
                                 info.global_range.clone(),
                                 info.total_p,
-                            ));
+                            )
+                        });
                     }
                 }
             }
@@ -8133,12 +8126,22 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                 }
             }
         }
-        hyper_dirs.push(DirectionalHyperParam::new_compact(
+        // First derivative: use implicit operator when available to avoid
+        // storing dense (n x p) matrices for all D axes simultaneously.
+        let x_first_hyper = if let Some(ref op) = info.implicit_operator {
+            crate::estimate::reml::HyperDesignDerivative::from_implicit(
+                op.clone(),
+                ImplicitDerivLevel::First(info.implicit_axis),
+            )
+        } else {
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
                 info.x_psi_local.clone(),
                 info.global_range.clone(),
                 info.total_p,
-            ),
+            )
+        };
+        hyper_dirs.push(DirectionalHyperParam::new_compact(
+            x_first_hyper,
             s_components,
             Some(xsecond),
             Some(ssecond_components),

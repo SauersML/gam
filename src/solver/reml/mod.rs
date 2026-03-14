@@ -1121,6 +1121,70 @@ trait PenalizedGeometry {
 enum DerivativeMatrixStorage {
     Dense(Array2<f64>),
     Embedded(EmbeddedDerivativeMatrix),
+    Implicit(ImplicitDerivativeOp),
+}
+
+/// Which derivative level the implicit operator should compute.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImplicitDerivLevel {
+    /// ∂X/∂ψ_d
+    First(usize),
+    /// ∂²X/∂ψ_d²
+    SecondDiag(usize),
+    /// ∂²X/∂ψ_d∂ψ_e
+    SecondCross(usize, usize),
+}
+
+/// Lazy implicit operator storage: delegates matvecs to the
+/// `ImplicitDesignPsiDerivative` and materializes dense form only on demand.
+#[derive(Clone)]
+struct ImplicitDerivativeOp {
+    operator: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    level: ImplicitDerivLevel,
+    /// Cached dense materialization (lazy, populated on first call to ops that need the full matrix).
+    cached_dense: std::sync::Arc<std::sync::OnceLock<Array2<f64>>>,
+}
+
+impl ImplicitDerivativeOp {
+    fn materialize_dense(&self) -> &Array2<f64> {
+        self.cached_dense.get_or_init(|| match self.level {
+            ImplicitDerivLevel::First(axis) => self.operator.materialize_first(axis),
+            ImplicitDerivLevel::SecondDiag(axis) => self.operator.materialize_second_diag(axis),
+            ImplicitDerivLevel::SecondCross(d, e) => self.operator.materialize_second_cross(d, e),
+        })
+    }
+
+    fn nrows(&self) -> usize {
+        self.operator.n_data()
+    }
+
+    fn ncols(&self) -> usize {
+        self.operator.p_out()
+    }
+
+    fn forward_mul_vec(&self, u: &Array1<f64>) -> Array1<f64> {
+        match self.level {
+            ImplicitDerivLevel::First(axis) => self.operator.forward_mul(axis, &u.view()),
+            ImplicitDerivLevel::SecondDiag(axis) => {
+                self.operator.forward_mul_second_diag(axis, &u.view())
+            }
+            ImplicitDerivLevel::SecondCross(d, e) => {
+                self.operator.forward_mul_second_cross(d, e, &u.view())
+            }
+        }
+    }
+
+    fn transpose_mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        match self.level {
+            ImplicitDerivLevel::First(axis) => self.operator.transpose_mul(axis, &v.view()),
+            ImplicitDerivLevel::SecondDiag(axis) => {
+                self.operator.transpose_mul_second_diag(axis, &v.view())
+            }
+            ImplicitDerivLevel::SecondCross(d, e) => {
+                self.operator.transpose_mul_second_cross(d, e, &v.view())
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1160,10 +1224,24 @@ impl HyperDesignDerivative {
         }
     }
 
+    pub(crate) fn from_implicit(
+        operator: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        level: ImplicitDerivLevel,
+    ) -> Self {
+        Self {
+            storage: DerivativeMatrixStorage::Implicit(ImplicitDerivativeOp {
+                operator,
+                level,
+                cached_dense: std::sync::Arc::new(std::sync::OnceLock::new()),
+            }),
+        }
+    }
+
     pub(crate) fn nrows(&self) -> usize {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.nrows(),
             DerivativeMatrixStorage::Embedded(embedded) => embedded.local.nrows(),
+            DerivativeMatrixStorage::Implicit(op) => op.nrows(),
         }
     }
 
@@ -1171,6 +1249,7 @@ impl HyperDesignDerivative {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.ncols(),
             DerivativeMatrixStorage::Embedded(embedded) => embedded.total_dim,
+            DerivativeMatrixStorage::Implicit(op) => op.ncols(),
         }
     }
 
@@ -1184,6 +1263,7 @@ impl HyperDesignDerivative {
                     .assign(&embedded.local);
                 dense
             }
+            DerivativeMatrixStorage::Implicit(op) => op.materialize_dense().clone(),
         }
     }
 
@@ -1191,6 +1271,7 @@ impl HyperDesignDerivative {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.iter().any(|v| *v != 0.0),
             DerivativeMatrixStorage::Embedded(embedded) => embedded.local.iter().any(|v| *v != 0.0),
+            DerivativeMatrixStorage::Implicit(..) => true,
         }
     }
 
@@ -1203,6 +1284,7 @@ impl HyperDesignDerivative {
                     .assign(&embedded.local.t().dot(rhs));
                 out
             }
+            DerivativeMatrixStorage::Implicit(op) => op.transpose_mul_vec(rhs),
         }
     }
 
@@ -1212,6 +1294,7 @@ impl HyperDesignDerivative {
             DerivativeMatrixStorage::Embedded(embedded) => embedded
                 .local
                 .dot(&rhs.slice(s![embedded.global_range.clone(), ..])),
+            DerivativeMatrixStorage::Implicit(op) => op.materialize_dense().dot(rhs),
         }
     }
 
@@ -1224,6 +1307,7 @@ impl HyperDesignDerivative {
                     .assign(&embedded.local.t().dot(rhs));
                 out
             }
+            DerivativeMatrixStorage::Implicit(op) => op.materialize_dense().t().dot(rhs),
         }
     }
 
@@ -1240,6 +1324,9 @@ impl HyperDesignDerivative {
                         .assign(&embedded.local.slice(s![start..end, ..]).t());
                 }
                 out
+            }
+            DerivativeMatrixStorage::Implicit(op) => {
+                op.materialize_dense().slice(s![rows, ..]).t().to_owned()
             }
         }
     }
@@ -1277,6 +1364,19 @@ impl HyperDesignDerivative {
                     .slice_mut(s![.., embedded.global_range.clone()])
                     .scaled_add(amp, &embedded.local);
             }
+            DerivativeMatrixStorage::Implicit(op) => {
+                let dense = op.materialize_dense();
+                if target.raw_dim() != dense.raw_dim() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "implicit hyper design derivative shape mismatch: target={}x{}, matrix={}x{}",
+                        target.nrows(),
+                        target.ncols(),
+                        dense.nrows(),
+                        dense.ncols()
+                    )));
+                }
+                target.scaled_add(amp, dense);
+            }
         }
         Ok(())
     }
@@ -1308,6 +1408,13 @@ impl HyperDesignDerivative {
                     .with_optional_factor(free_basis_opt)
                     .materialize())
             }
+            DerivativeMatrixStorage::Implicit(op) => {
+                let dense = op.materialize_dense();
+                Ok(crate::matrix::DenseRightProductView::new(dense)
+                    .with_factor(qs)
+                    .with_optional_factor(free_basis_opt)
+                    .materialize())
+            }
         }
     }
 
@@ -1317,6 +1424,7 @@ impl HyperDesignDerivative {
             DerivativeMatrixStorage::Embedded(embedded) => embedded
                 .local
                 .dot(&rhs.slice(s![embedded.global_range.clone()])),
+            DerivativeMatrixStorage::Implicit(op) => op.forward_mul_vec(rhs),
         }
     }
 }
@@ -1353,6 +1461,7 @@ impl HyperPenaltyDerivative {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.nrows(),
             DerivativeMatrixStorage::Embedded(embedded) => embedded.total_dim,
+            DerivativeMatrixStorage::Implicit(op) => op.nrows(),
         }
     }
 
@@ -1389,6 +1498,14 @@ impl HyperPenaltyDerivative {
                 Ok(transformed)
             }
             DerivativeMatrixStorage::Dense(dense) => {
+                let mut transformed = qs.t().dot(dense).dot(qs);
+                if let Some(z) = free_basis_opt {
+                    transformed = z.t().dot(&transformed).dot(z);
+                }
+                Ok(transformed)
+            }
+            DerivativeMatrixStorage::Implicit(op) => {
+                let dense = op.materialize_dense();
                 let mut transformed = qs.t().dot(dense).dot(qs);
                 if let Some(z) = free_basis_opt {
                     transformed = z.t().dot(&transformed).dot(z);
@@ -1432,6 +1549,19 @@ impl HyperPenaltyDerivative {
                         embedded.global_range.clone()
                     ])
                     .scaled_add(amp, &embedded.local);
+            }
+            DerivativeMatrixStorage::Implicit(op) => {
+                let dense = op.materialize_dense();
+                if target.raw_dim() != dense.raw_dim() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "implicit hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
+                        target.nrows(),
+                        target.ncols(),
+                        dense.nrows(),
+                        dense.ncols()
+                    )));
+                }
+                target.scaled_add(amp, dense);
             }
         }
         Ok(())
