@@ -3,7 +3,6 @@ use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
-use crate::solver::estimate::FitGeometry;
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
@@ -16,6 +15,7 @@ use crate::mixture_link::{
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
+use crate::solver::estimate::FitGeometry;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
 

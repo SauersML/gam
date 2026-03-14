@@ -4,12 +4,12 @@ use crate::linalg::utils::{
     StableSolver, boundary_hit_step_fraction, default_slq_parameters, stochastic_lanczos_logdet_spd,
 };
 use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
-use crate::solver::estimate::FitGeometry;
 use crate::pirls::LinearInequalityConstraints;
+use crate::solver::estimate::FitGeometry;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DispersionHandling, EvalMode,
-    HessianDerivativeProvider, InnerSolutionBuilder, compute_block_penalty_logdet_derivs,
-    embed_penalty_root, penalty_matrix_root, reml_laml_evaluate,
+    BlockCoupledOperator, DispersionHandling, EvalMode, HessianDerivativeProvider,
+    InnerSolutionBuilder, compute_block_penalty_logdet_derivs, embed_penalty_root,
+    penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
@@ -2505,7 +2505,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 struct BorrowedJointDerivProvider<'a> {
     compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    compute_d2h: Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>>,
+    compute_d2h:
+        Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>>,
 }
 
 // SAFETY: Only used synchronously within the same stack frame that creates it.
@@ -2708,8 +2709,9 @@ fn joint_outer_evaluate(
     }
 
     // Build derivative provider from the caller-supplied closures.
-    let compute_d2h_ref: Option<&dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>> =
-        Some(compute_d2h);
+    let compute_d2h_ref: Option<
+        &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    > = Some(compute_d2h);
     let provider = BorrowedJointDerivProvider {
         compute_dh,
         compute_d2h: compute_d2h_ref,
@@ -4624,37 +4626,54 @@ fn compute_joint_geometry<F: CustomFamily>(
     let mut all_working_responses = Vec::new();
     for ws in &eval.blockworking_sets {
         match ws {
-            BlockWorkingSet::Diagonal { working_response, working_weights } => {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
                 all_working_weights.push(working_weights.clone());
                 all_working_responses.push(working_response.clone());
             }
             BlockWorkingSet::ExactNewton { .. } => return None,
         }
     }
-    if all_working_weights.is_empty() { return None; }
+    if all_working_weights.is_empty() {
+        return None;
+    }
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    if total == 0 { return None; }
+    if total == 0 {
+        return None;
+    }
     let mut h = Array2::<f64>::zeros((total, total));
     for (b, spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
         let w = &all_working_weights[b];
         let xtw = spec.design.diag_xtw_x(w).ok()?;
-        h.slice_mut(ndarray::s![start..end, start..end]).assign(&xtw);
+        h.slice_mut(ndarray::s![start..end, start..end])
+            .assign(&xtw);
         let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
         for (k, s) in spec.penalties.iter().enumerate() {
-            h.slice_mut(ndarray::s![start..end, start..end]).scaled_add(lambdas[k], s);
+            h.slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(lambdas[k], s);
         }
     }
     let n = all_working_weights[0].len();
     let n_blocks = all_working_weights.len();
     let mut joint_w = Array1::<f64>::zeros(n * n_blocks);
     let mut joint_z = Array1::<f64>::zeros(n * n_blocks);
-    for (b, (w, z)) in all_working_weights.iter().zip(all_working_responses.iter()).enumerate() {
+    for (b, (w, z)) in all_working_weights
+        .iter()
+        .zip(all_working_responses.iter())
+        .enumerate()
+    {
         joint_w.slice_mut(ndarray::s![b * n..(b + 1) * n]).assign(w);
         joint_z.slice_mut(ndarray::s![b * n..(b + 1) * n]).assign(z);
     }
-    Some(FitGeometry { penalized_hessian: h, working_weights: joint_w, working_response: joint_z })
+    Some(FitGeometry {
+        penalized_hessian: h,
+        working_weights: joint_w,
+        working_response: joint_z,
+    })
 }
 
 pub fn fit_custom_family<F: CustomFamily>(
@@ -5012,7 +5031,8 @@ pub fn fit_custom_family<F: CustomFamily>(
                     } else {
                         0.0
                     };
-                    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
+                    let geometry =
+                        compute_joint_geometry(family, specs, &inner.block_states, &per_block);
                     return Ok(BlockwiseFitResult {
                         block_states: inner.block_states,
                         log_likelihood: inner.log_likelihood,

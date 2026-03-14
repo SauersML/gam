@@ -8,7 +8,6 @@ use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Par};
 use ndarray::{Array1, Array2, ArrayView1, s};
-use std::cmp::Ordering;
 
 /// Approximate leave-one-out diagnostics derived from a fitted model.
 #[derive(Debug, Clone)]
@@ -52,6 +51,29 @@ fn sandwichvar_eta(phi: f64, x_hinv_x: f64, es_norm2: f64, ridge: f64, s_norm2: 
 fn variance_negative_tolerance(scale: f64) -> f64 {
     // Tight relative tolerance for cancellation from x'H^{-1}x - ||E t||^2 - ridge||t||^2.
     1e-12 * scale.abs().max(1.0)
+}
+
+const LEVERAGE_HIGH_THRESHOLD: f64 = 0.99;
+const LEVERAGE_VERY_HIGH_THRESHOLD: f64 = 0.999;
+const LEVERAGE_RATE_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
+const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
+
+#[inline]
+fn percentile_index(sample_size: usize, quantile: f64) -> usize {
+    if sample_size <= 1 {
+        return 0;
+    }
+    let max_index = sample_size - 1;
+    ((quantile * max_index as f64).round() as usize).min(max_index)
+}
+
+#[inline]
+fn percentile_from_sorted(sorted: &[f64], quantile: f64) -> f64 {
+    if sorted.is_empty() {
+        0.0
+    } else {
+        sorted[percentile_index(sorted.len(), quantile)]
+    }
 }
 
 fn compute_alo_diagnostics_from_pirls_impl(
@@ -147,40 +169,30 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
         return;
     }
 
-    let mut sum_aii = 0.0_f64;
-    let mut max_aii = f64::NEG_INFINITY;
     let mut invalid_count = 0usize;
     let mut high_leverage_count = 0usize;
-    let mut a_hi_90 = 0usize;
-    let mut a_hi_95 = 0usize;
-    let mut a_hi_99 = 0usize;
+    let mut threshold_counts = [0usize; LEVERAGE_RATE_THRESHOLDS.len()];
+    let mut finite_leverage = Vec::with_capacity(n);
 
     for (obs, &ai) in leverage.iter().enumerate() {
         if ai.is_finite() {
-            sum_aii += ai;
-            max_aii = max_aii.max(ai);
-        } else {
-            sum_aii = f64::NAN;
+            finite_leverage.push(ai);
         }
 
         if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
             invalid_count += 1;
             log::warn!("[GAM ALO] invalid leverage at i={}, a_ii={:.6e}", obs, ai);
-        } else if ai > 0.99 {
+        } else if ai > LEVERAGE_HIGH_THRESHOLD {
             high_leverage_count += 1;
-            if ai > 0.999 {
+            if ai > LEVERAGE_VERY_HIGH_THRESHOLD {
                 log::warn!("[GAM ALO] very high leverage at i={}, a_ii={:.6e}", obs, ai);
             }
         }
 
-        if ai > 0.90 {
-            a_hi_90 += 1;
-        }
-        if ai > 0.95 {
-            a_hi_95 += 1;
-        }
-        if ai > 0.99 {
-            a_hi_99 += 1;
+        for (idx, threshold) in LEVERAGE_RATE_THRESHOLDS.iter().enumerate() {
+            if ai > *threshold {
+                threshold_counts[idx] += 1;
+            }
         }
     }
 
@@ -192,40 +204,18 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
         );
     }
 
-    let mut percentiles_data: Vec<f64> = leverage.to_vec();
+    finite_leverage.sort_by(f64::total_cmp);
 
-    let p50_idx = if n > 1 {
-        ((0.50_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
+    let finite_n = finite_leverage.len();
+    let a_mean = if finite_n > 0 {
+        finite_leverage.iter().copied().sum::<f64>() / finite_n as f64
     } else {
-        0
+        0.0
     };
-    let p95_idx = if n > 1 {
-        ((0.95_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
-    } else {
-        0
-    };
-    let p99_idx = if n > 1 {
-        ((0.99_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
-    } else {
-        0
-    };
-
-    let mut percentilevalue = |idx: usize| -> f64 {
-        if percentiles_data.is_empty() {
-            0.0
-        } else {
-            let target = idx.min(percentiles_data.len() - 1);
-            let (_, nth, _) = percentiles_data
-                .select_nth_unstable_by(target, |a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            *nth
-        }
-    };
-
-    let a_mean: f64 = sum_aii / (n as f64);
-    let a_median = percentilevalue(p50_idx);
-    let a_p95 = percentilevalue(p95_idx);
-    let a_p99 = percentilevalue(p99_idx);
-    let a_max = if max_aii.is_finite() { max_aii } else { 0.0 };
+    let a_median = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[0]);
+    let a_p95 = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[1]);
+    let a_p99 = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[2]);
+    let a_max = finite_leverage.last().copied().unwrap_or(0.0);
 
     log::warn!(
         "[GAM ALO] leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
@@ -238,9 +228,9 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
     );
     log::warn!(
         "[GAM ALO] high-leverage: a>0.90: {:.2}%, a>0.95: {:.2}%, a>0.99: {:.2}%, dispersion phi={:.3e}",
-        100.0 * (a_hi_90 as f64) / (n as f64).max(1.0),
-        100.0 * (a_hi_95 as f64) / (n as f64).max(1.0),
-        100.0 * (a_hi_99 as f64) / (n as f64).max(1.0),
+        100.0 * (threshold_counts[0] as f64) / n as f64,
+        100.0 * (threshold_counts[1] as f64) / n as f64,
+        100.0 * (threshold_counts[2] as f64) / n as f64,
         phi
     );
 }
@@ -503,7 +493,10 @@ pub fn compute_alo_diagnostics_from_pirls(
 
 #[cfg(test)]
 mod tests {
-    use super::{alo_eta_updatewith_offset, bayesvar_eta, sandwichvar_eta};
+    use super::{
+        alo_eta_updatewith_offset, bayesvar_eta, percentile_from_sorted, percentile_index,
+        sandwichvar_eta,
+    };
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {
@@ -553,5 +546,21 @@ mod tests {
         let got = sandwichvar_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
         let expected = phi * (x_hinv_x - es_norm2 - ridge * s_norm2);
         assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn percentile_index_matches_expected_rounding() {
+        assert_eq!(percentile_index(0, 0.95), 0);
+        assert_eq!(percentile_index(1, 0.95), 0);
+        assert_eq!(percentile_index(10, 0.50), 5);
+        assert_eq!(percentile_index(10, 0.95), 9);
+    }
+
+    #[test]
+    fn percentile_from_sorted_returns_order_statistic() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(percentile_from_sorted(&values, 0.50), 3.0);
+        assert_eq!(percentile_from_sorted(&values, 0.95), 5.0);
+        assert_eq!(percentile_from_sorted(&[], 0.95), 0.0);
     }
 }

@@ -3885,30 +3885,29 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         }
     };
 
-    let decode_theta =
-        |theta: &Array1<f64>| -> (Array1<f64>, Vec<SpatialAdaptiveTermHyperParams>) {
-            let rho = theta.slice(s![..rho_dim]).to_owned();
-            let adaptive_lambda_start = rho_dim;
-            let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
-            let eps = [
-                theta[adaptive_lambda_end].exp(),
-                theta[adaptive_lambda_end + 1].exp(),
-                theta[adaptive_lambda_end + 2].exp(),
-            ];
-            let adaptive_params = runtime_caches
-                .iter()
-                .enumerate()
-                .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
-                    lambda: [
-                        theta[adaptive_lambda_start + cache_idx * 3].exp(),
-                        theta[adaptive_lambda_start + cache_idx * 3 + 1].exp(),
-                        theta[adaptive_lambda_start + cache_idx * 3 + 2].exp(),
-                    ],
-                    epsilon: eps,
-                })
-                .collect::<Vec<_>>();
-            (rho, adaptive_params)
-        };
+    let decode_theta = |theta: &Array1<f64>| -> (Array1<f64>, Vec<SpatialAdaptiveTermHyperParams>) {
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        let adaptive_lambda_start = rho_dim;
+        let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
+        let eps = [
+            theta[adaptive_lambda_end].exp(),
+            theta[adaptive_lambda_end + 1].exp(),
+            theta[adaptive_lambda_end + 2].exp(),
+        ];
+        let adaptive_params = runtime_caches
+            .iter()
+            .enumerate()
+            .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
+                lambda: [
+                    theta[adaptive_lambda_start + cache_idx * 3].exp(),
+                    theta[adaptive_lambda_start + cache_idx * 3 + 1].exp(),
+                    theta[adaptive_lambda_start + cache_idx * 3 + 2].exp(),
+                ],
+                epsilon: eps,
+            })
+            .collect::<Vec<_>>();
+        (rho, adaptive_params)
+    };
 
     let outer_config = OuterConfig {
         tolerance: options.tol,
