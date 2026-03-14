@@ -759,7 +759,7 @@ pub fn run_outer(
                         Ok(e) => e,
                         Err(e) => {
                             log::debug!(
-                                "[OUTER] EFS iteration {_iter} failed: {e}; using last rho"
+                                "[OUTER] EFS iteration {iter} failed: {e}; using last rho"
                             );
                             break;
                         }
@@ -767,7 +767,7 @@ pub fn run_outer(
 
                     if !efs_eval.cost.is_finite() {
                         log::debug!(
-                            "[OUTER] EFS iteration {_iter}: non-finite cost; stopping"
+                            "[OUTER] EFS iteration {iter}: non-finite cost; stopping"
                         );
                         break;
                     }
@@ -789,7 +789,7 @@ pub fn run_outer(
 
                     let step_norm = step_sq_sum.sqrt();
                     log::trace!(
-                        "[OUTER] EFS iter {_iter}: cost={:.6e}, step_norm={:.4e}",
+                        "[OUTER] EFS iter {iter}: cost={:.6e}, step_norm={:.4e}",
                         last_cost,
                         step_norm
                     );

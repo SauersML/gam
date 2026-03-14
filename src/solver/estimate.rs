@@ -3009,7 +3009,7 @@ impl std::fmt::Debug for FitArtifacts {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitInference {
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
