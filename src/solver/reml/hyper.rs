@@ -1548,7 +1548,7 @@ impl<'a> RemlState<'a> {
                             .map(|aij| Self::trace_product(&s_dag, aij))
                             .unwrap_or(0.0);
                 // Moving nullspace correction for ψ-ψ pairs.
-                if let (Some(ref leak), Some(ref sp2)) = (&leakage_old, &spinv2_old) {
+                if let (Some(leak), Some(sp2)) = (&leakage_old, &spinv2_old) {
                     let l_i = &leak[i];
                     let l_j = &leak[j];
                     let mut corr = 0.0_f64;
