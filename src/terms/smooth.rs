@@ -7156,7 +7156,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let theta_star = best_theta;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let log_kappa_star = SpatialLogKappaCoords::from_theta_tail_with_dims(
-        &theta_star, rho_dim, dims_clone,
+        &theta_star, rho_dim, dims_per_term,
     );
     let resolvedspec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
     let best = fit_term_collection_forspecwith_heuristic_lambdas(
