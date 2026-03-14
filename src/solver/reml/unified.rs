@@ -226,10 +226,28 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 ///   Cₖ = Xᵀ diag(c ⊙ X vₖ) X
 /// where c is the first eta-derivative of the working curvature W(η),
 /// and vₖ = H⁻¹(Aₖβ̂) is the mode response.
+///
+/// TODO(observed-hessian): For non-canonical links (probit, cloglog, SAS,
+/// mixture), `c_array` and `d_array` currently store the **Fisher** weight
+/// derivatives (c_F, d_F). Exact REML/LAML requires the **observed**
+/// information derivatives:
+///   c_obs = c_F + h'·B − (y−μ)·B_η
+///   d_obs = d_F + h''·B + 2h'·B_η − (y−μ)·B_ηη
+/// where B = (h''V − h'²V') / (φV²). For canonical links (logit for
+/// binomial, log for Poisson), observed = Fisher so the current code is
+/// exact. For non-canonical links, the ρ-direction Hessian drift
+/// dH/dρ_k inherits a Fisher approximation. The link-parameter ext_coord
+/// path (build_sas_link_ext_coords / build_mixture_link_ext_coords) has
+/// already been corrected to use observed weight derivatives.
 pub struct SinglePredictorGlmDerivatives {
-    /// c_array: −∂³ℓᵢ/∂ηᵢ³, the third-derivative of the negative log-likelihood.
+    /// c_array: dW/dη, the first eta-derivative of the working curvature.
+    ///
+    /// Currently stores Fisher c_F for all links. For non-canonical links
+    /// this is approximate; see the TODO on the struct for details.
     pub c_array: Array1<f64>,
-    /// d_array: fourth-derivative (for second-order Hessian corrections).
+    /// d_array: d²W/dη², the second eta-derivative (for Hessian corrections).
+    ///
+    /// Currently stores Fisher d_F; same caveat as c_array.
     pub d_array: Option<Array1<f64>>,
     /// Design matrix X in the transformed basis.
     pub x_transformed: DesignMatrix,
