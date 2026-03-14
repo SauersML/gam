@@ -3040,10 +3040,15 @@ impl<'a> RemlState<'a> {
     /// | `B`     | `X^T diag(∂W_explicit/∂θ_j) X` (working-weight drift) |
     /// | `ld_s`  | `0` (penalties don't depend on link parameters) |
     ///
-    /// The working-weight derivative `∂W_explicit/∂θ_j` is the change in
-    /// `W_i = w_i d1²/(μ(1−μ))` due to θ changing the link function at
-    /// fixed η, without the IFT-mediated `c ⊙ X dβ/dθ` part (that is
-    /// handled by the unified evaluator's third-derivative correction).
+    /// The working-weight derivative `∂W/∂θ_j` uses **observed information**
+    /// weights, not Fisher. For a non-canonical link:
+    ///   W_obs = W_F − (y−μ)·B,  B = (h''V − h'²V') / V²
+    /// so the θ-derivative includes the residual correction:
+    ///   ∂W_obs/∂θ = ∂W_F/∂θ + (dμ/dθ)·B − (y−μ)·∂B/∂θ
+    ///
+    /// This is exact for REML/LAML evaluation with learnable link
+    /// parameters. The IFT-mediated `c ⊙ X dβ/dθ` part is handled
+    /// separately by the unified evaluator's third-derivative correction.
     ///
     /// SAS epsilon reparameterization (tanh bounding) is NOT applied here;
     /// the caller should apply the chain rule `grad[ε_raw] *= d_eps/d_raw`
@@ -3167,7 +3172,7 @@ impl<'a> RemlState<'a> {
                 //              = (db_num − 2·B·dV) / V²
                 let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
 
-                dw_explicit_by_j[j][i] = dw_fisher + dmu * b_val - resid * db_val;
+                dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
             }
         }
 
@@ -3215,6 +3220,10 @@ impl<'a> RemlState<'a> {
     /// Similar structure to SAS coords but with K−1 free logits instead of
     /// (ε, log δ). Each logit ρ_j controls the softmax weight of the j-th
     /// component link function.
+    ///
+    /// Uses **observed information** weight derivatives (not Fisher) for
+    /// exact REML/LAML with non-canonical links. See the doc comment on
+    /// `build_sas_link_ext_coords` for the mathematical derivation.
     pub(crate) fn build_mixture_link_ext_coords(
         &self,
         bundle: &EvalShared,
@@ -3328,7 +3337,7 @@ impl<'a> RemlState<'a> {
                     - numerator * d_vprime;
                 let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
 
-                dw_explicit_by_j[j][i] = dw_fisher + dmu * b_val - resid * db_val;
+                dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
             }
         }
 

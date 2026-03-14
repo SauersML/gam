@@ -4671,6 +4671,21 @@ fn standard_inverse_link_jet(
     )
 }
 
+/// Compute working IRLS geometry for a single Bernoulli observation.
+///
+/// The weight returned is the **Fisher** (expected information) weight
+/// W_F = h'(η)² / V(μ). The c and d fields are likewise the Fisher
+/// derivatives c_F = dW_F/dη and d_F = d²W_F/dη².
+///
+/// TODO(observed-hessian): For non-canonical links (probit, cloglog, SAS,
+/// mixture), the observed weight differs:
+///   W_obs = W_F − (y−μ) · B,  B = (h''V − h'²V') / V²
+/// The observed c/d include residual-dependent corrections. The PIRLS
+/// inner solver correctly uses Fisher scoring for convergence, but the
+/// outer REML/LAML evaluator ideally needs the observed c/d at the
+/// converged point for exact ρ-direction Hessian drifts with non-canonical
+/// links. Currently only the link-parameter ext_coord path has been
+/// corrected; the ρ path still uses these Fisher c/d.
 #[inline]
 fn bernoulli_geometry_from_jet(
     eta_raw: f64,

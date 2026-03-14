@@ -151,37 +151,53 @@ impl<'a> RemlState<'a> {
 
     /// Compute the Tierney-Kadane correction to the Laplace approximation.
     ///
-    /// The TK correction is a third-order refinement:
+    /// The TK correction value is the third-order Bartlett refinement:
     ///
     /// ```text
     /// TK = -(1/6) Σ_j (H⁻¹)_jj³ · d3_j
     /// ```
     ///
-    /// where H is the penalized Hessian and d3_j = Σ_i c_i · X_ij³ is the
-    /// third-derivative projection of the negative log-likelihood.
+    /// where H = H_pen is the penalized Hessian and d3_j = Σ_i c_i · X_ij³
+    /// is the third-derivative projection of the negative log-likelihood.
     ///
     /// When `gradient_info` is `Some((penalty_roots, lambdas))`, also computes
-    /// the gradient d(TK)/dρ_k. The derivative uses:
+    /// the TK gradient using a basis-invariant trace formula:
     ///
     /// ```text
-    /// d(H⁻¹)_jj / dρ_k = −(H⁻¹ Aₖ H⁻¹)_jj,   Aₖ = λₖ Sₖ = λₖ Rₖᵀ Rₖ
+    /// ∂V_TK/∂ρ_k = -½ tr(H_obs⁻¹ A_k^obs)
     /// ```
     ///
-    /// so that:
+    /// where H_obs = X^T W X (observation Hessian without penalty) and
+    /// A_k^obs = X^T diag(c ⊙ dη_k) X with dη_k = -X v_k the mode
+    /// sensitivity direction (v_k = H_pen⁻¹(λ_k S_k β̂)).
+    ///
+    /// The main REML gradient already includes ½ tr(H_pen⁻¹ A_k^pen), so
+    /// this TK gradient adds only the observation-Hessian part that the
+    /// main gradient does not cover.
+    ///
+    /// Computing H_obs⁻¹ exactly requires a separate factorization of the
+    /// (potentially rank-deficient) observation Hessian. We use the
+    /// approximation H_obs⁻¹ ≈ H_pen⁻¹, which is valid when the penalty
+    /// is small relative to the data information (well-identified regime).
+    /// This gives:
     ///
     /// ```text
-    /// d(TK)/dρ_k = (λₖ / 2) Σ_j (H⁻¹)_jj² · d3_j · ‖Rₖ fⱼ‖²
+    /// ∂V_TK/∂ρ_k ≈ -½ tr(H_pen⁻¹ A_k^obs)
+    ///             = ½ Σ_i c_i · (X v_k)_i · hat_ii
     /// ```
     ///
-    /// where fⱼ = H⁻¹ eⱼ is the j-th column of H⁻¹. This reuses the same
-    /// Cholesky/eigensolve columns already needed for the correction value,
-    /// so the marginal cost is O(K·p·rank(Rₖ)) multiplies.
+    /// where hat_ii = (X H_pen⁻¹ X^T)_{ii} are the leverages.
+    ///
+    /// NOTE: This is an approximation. The exact formula requires
+    /// factorizing H_obs = X^T W X separately. For well-conditioned
+    /// problems with moderate penalization the error is O(||S||/||H_obs||).
     fn tierney_kadane_laml_correction(
         &self,
         pirls_result: &PirlsResult,
         h_eff_eval: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
         gradient_info: Option<(&[Array2<f64>], &[f64])>,
+        beta: &Array1<f64>,
     ) -> Result<(f64, Option<Array1<f64>>), EstimationError> {
         let mut d_vec = pirls_result.solve_c_array.clone();
         if d_vec.is_empty() {
@@ -198,8 +214,7 @@ impl<'a> RemlState<'a> {
             return Ok((0.0, gradient_info.map(|(roots, _)| Array1::zeros(roots.len()))));
         }
 
-        // Compute the third-derivative projection first, so we can accumulate
-        // the gradient in the same column-solve loop below.
+        // Compute the third-derivative projection for the TK value.
         let third_deriv = if let Some(z) = free_basis_opt {
             let mut out = Array1::<f64>::zeros(z.ncols());
             for j in 0..z.ncols() {
@@ -218,10 +233,30 @@ impl<'a> RemlState<'a> {
         };
 
         let num_penalties = gradient_info.map_or(0, |(roots, _)| roots.len());
-        let mut tk_grad = Array1::<f64>::zeros(num_penalties);
         let compute_gradient = gradient_info.is_some();
 
+        // The effective design matrix: X_eff = X Z when projected, else X.
+        // Needed for computing hat leverages and mode response projections.
+        let x_eff_dense = if compute_gradient {
+            if let Some(z) = free_basis_opt {
+                Some(std::sync::Arc::new(pirls_result.x_transformed.to_dense().dot(z)))
+            } else {
+                Some(pirls_result.x_transformed.to_dense_arc())
+            }
+        } else {
+            None
+        };
+
+        let n_obs = d_vec.len();
         let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
+        // hat_leverages[i] = (X_eff H_pen⁻¹ X_eff^T)_{ii}, accumulated
+        // column-by-column during the H⁻¹ diagonal computation.
+        let mut hat_leverages = if compute_gradient {
+            Array1::<f64>::zeros(n_obs)
+        } else {
+            Array1::<f64>::zeros(0)
+        };
+
         if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
             for j in 0..p_eff {
                 let mut e_j = Array1::<f64>::zeros(p_eff);
@@ -229,19 +264,56 @@ impl<'a> RemlState<'a> {
                 let f_j = chol.solvevec(&e_j);
                 h_inv_diag[j] = f_j[j];
 
-                // Accumulate TK gradient contribution from column j.
-                // d(TK)/dρ_k += (λ_k/2) · (H⁻¹)_jj² · d3_j · ‖R_k f_j‖²
+                // Accumulate hat leverage: hat[i] += X_eff[i,j] * (X_eff f_j)[i]
                 if compute_gradient {
-                    let (roots, lambdas) = gradient_info.unwrap();
-                    let hjj_sq_d3 = h_inv_diag[j] * h_inv_diag[j] * third_deriv[j];
-                    if hjj_sq_d3.abs() > 0.0 {
-                        for k in 0..num_penalties {
-                            let r_k_f_j = roots[k].dot(&f_j);
-                            let norm_sq: f64 = r_k_f_j.iter().map(|v| v * v).sum();
-                            tk_grad[k] += lambdas[k] * hjj_sq_d3 * norm_sq;
-                        }
+                    let x_dense = x_eff_dense.as_ref().unwrap();
+                    let x_fj: Array1<f64> = x_dense.dot(&f_j);
+                    for i in 0..n_obs {
+                        hat_leverages[i] += x_dense[[i, j]] * x_fj[i];
                     }
                 }
+            }
+
+            // Compute the trace-based TK gradient using the Cholesky factor.
+            if compute_gradient {
+                let (roots, lambdas) = gradient_info.unwrap();
+                let x_dense = x_eff_dense.as_ref().unwrap();
+                let mut tk_grad = Array1::<f64>::zeros(num_penalties);
+
+                for k in 0..num_penalties {
+                    // Mode sensitivity: v_k = H_pen⁻¹(λ_k S_k β̂)
+                    let r_beta = roots[k].dot(beta);
+                    let s_k_beta = fast_atv(&roots[k], &r_beta);
+                    let a_k_beta = &s_k_beta * lambdas[k];
+                    let v_k = chol.solvevec(&a_k_beta);
+
+                    // X v_k (n-vector): the predicted change in η per unit ρ_k
+                    let x_v_k: Array1<f64> = x_dense.dot(&v_k);
+
+                    // TK gradient[k] = ½ Σ_i c_i · (X v_k)_i · hat_ii
+                    // (derived from -½ tr(H_obs⁻¹ A_k^obs) with H_obs⁻¹ ≈ H_pen⁻¹)
+                    let mut acc = 0.0;
+                    for i in 0..n_obs {
+                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
+                    }
+                    tk_grad[k] = 0.5 * acc;
+                }
+
+                // Zero out non-finite entries for robustness.
+                for v in tk_grad.iter_mut() {
+                    if !v.is_finite() {
+                        *v = 0.0;
+                    }
+                }
+
+                let correction = -h_inv_diag
+                    .iter()
+                    .zip(third_deriv.iter())
+                    .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
+                    .sum::<f64>()
+                    / 6.0;
+                let correction = if correction.is_finite() { correction } else { 0.0 };
+                return Ok((correction, Some(tk_grad)));
             }
         } else {
             let (evals, evecs) = h_eff_eval
@@ -249,9 +321,6 @@ impl<'a> RemlState<'a> {
                 .map_err(EstimationError::EigendecompositionFailed)?;
             let floor = 1e-12;
 
-            // For the eigendecomposition path, we need the full columns of H⁻¹
-            // when computing the gradient. H⁻¹ e_j = Σ_m (1/σ_m) u_m u_m[j].
-            // We reconstruct f_j on the fly if the gradient is requested.
             for j in 0..p_eff {
                 let mut acc = 0.0;
                 for m in 0..evals.len() {
@@ -263,32 +332,81 @@ impl<'a> RemlState<'a> {
                 }
                 h_inv_diag[j] = acc;
 
+                // Accumulate hat leverage from eigendecomposition path.
                 if compute_gradient {
-                    let (roots, lambdas) = gradient_info.unwrap();
-                    let hjj_sq_d3 = h_inv_diag[j] * h_inv_diag[j] * third_deriv[j];
-                    if hjj_sq_d3.abs() > 0.0 {
-                        // Reconstruct f_j = H⁻¹ e_j from the eigendecomposition.
-                        let mut f_j = Array1::<f64>::zeros(p_eff);
-                        for m in 0..evals.len() {
-                            let ev = evals[m];
-                            if ev > floor {
-                                let u_jm = evecs[[j, m]];
-                                let scale = u_jm / ev;
-                                for i in 0..p_eff {
-                                    f_j[i] += scale * evecs[[i, m]];
-                                }
+                    // Reconstruct f_j = H⁻¹ e_j for hat leverage accumulation.
+                    let mut f_j = Array1::<f64>::zeros(p_eff);
+                    for m in 0..evals.len() {
+                        let ev = evals[m];
+                        if ev > floor {
+                            let u_jm = evecs[[j, m]];
+                            let scale = u_jm / ev;
+                            for ii in 0..p_eff {
+                                f_j[ii] += scale * evecs[[ii, m]];
                             }
                         }
-                        for k in 0..num_penalties {
-                            let r_k_f_j = roots[k].dot(&f_j);
-                            let norm_sq: f64 = r_k_f_j.iter().map(|v| v * v).sum();
-                            tk_grad[k] += lambdas[k] * hjj_sq_d3 * norm_sq;
-                        }
+                    }
+                    let x_dense = x_eff_dense.as_ref().unwrap();
+                    let x_fj: Array1<f64> = x_dense.dot(&f_j);
+                    for i in 0..n_obs {
+                        hat_leverages[i] += x_dense[[i, j]] * x_fj[i];
                     }
                 }
             }
+
+            // Compute the trace-based TK gradient using the eigendecomposition.
+            if compute_gradient {
+                let (roots, lambdas) = gradient_info.unwrap();
+                let x_dense = x_eff_dense.as_ref().unwrap();
+                let mut tk_grad = Array1::<f64>::zeros(num_penalties);
+
+                // Reconstruct H_pen⁻¹ for solving v_k.
+                let mut h_inv = Array2::<f64>::zeros((p_eff, p_eff));
+                for m in 0..evals.len() {
+                    let ev = evals[m];
+                    if ev > floor {
+                        let col = evecs.column(m);
+                        for i in 0..p_eff {
+                            for j in 0..p_eff {
+                                h_inv[[i, j]] += col[i] * col[j] / ev;
+                            }
+                        }
+                    }
+                }
+
+                for k in 0..num_penalties {
+                    let r_beta = roots[k].dot(beta);
+                    let s_k_beta = fast_atv(&roots[k], &r_beta);
+                    let a_k_beta = &s_k_beta * lambdas[k];
+                    let v_k = h_inv.dot(&a_k_beta);
+
+                    let x_v_k: Array1<f64> = x_dense.dot(&v_k);
+
+                    let mut acc = 0.0;
+                    for i in 0..n_obs {
+                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
+                    }
+                    tk_grad[k] = 0.5 * acc;
+                }
+
+                for v in tk_grad.iter_mut() {
+                    if !v.is_finite() {
+                        *v = 0.0;
+                    }
+                }
+
+                let correction = -h_inv_diag
+                    .iter()
+                    .zip(third_deriv.iter())
+                    .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
+                    .sum::<f64>()
+                    / 6.0;
+                let correction = if correction.is_finite() { correction } else { 0.0 };
+                return Ok((correction, Some(tk_grad)));
+            }
         }
 
+        // Value-only path (no gradient requested).
         let correction = -h_inv_diag
             .iter()
             .zip(third_deriv.iter())
@@ -296,23 +414,8 @@ impl<'a> RemlState<'a> {
             .sum::<f64>()
             / 6.0;
 
-        // Scale the accumulated gradient by 1/2 (from the chain rule on h_jj^3).
-        tk_grad *= 0.5;
-
         let correction = if correction.is_finite() { correction } else { 0.0 };
-        let gradient = if compute_gradient {
-            // Zero out non-finite entries for robustness.
-            for v in tk_grad.iter_mut() {
-                if !v.is_finite() {
-                    *v = 0.0;
-                }
-            }
-            Some(tk_grad)
-        } else {
-            None
-        };
-
-        Ok((correction, gradient))
+        Ok((correction, None))
     }
 
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -443,6 +546,15 @@ impl<'a> RemlState<'a> {
     /// Therefore the curvature used in LAML is
     ///   H_eff = X'WX + S_λ + ridge I,
     /// and adding another ridge here places the Laplace expansion on a different surface.
+    ///
+    /// TODO(observed-hessian): W here is the Fisher (expected information)
+    /// weight W_F = h'(η)²/V(μ). For non-canonical links (probit, cloglog,
+    /// SAS, mixture), the Laplace approximation is more accurate when using
+    /// the observed Hessian W_obs = W_F − (y−μ)·B at the converged β̂.
+    /// For canonical links (logit for binomial, log for Poisson), W_obs = W_F
+    /// so the current code is exact. The link-parameter ext_coord derivatives
+    /// have already been corrected to use observed weights; this TODO covers
+    /// upgrading H itself and the ρ-direction c/d arrays.
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
@@ -1998,6 +2110,7 @@ impl<'a> RemlState<'a> {
                 &h_eff_eval,
                 free_basis_opt.as_ref(),
                 grad_ref,
+                &beta,
             )?
         } else {
             (0.0, None)
@@ -2652,6 +2765,7 @@ impl<'a> RemlState<'a> {
                 &h_eff_eval,
                 free_basis_opt.as_ref(),
                 grad_ref,
+                &beta,
             )?
         } else {
             (0.0, None)
@@ -2994,6 +3108,7 @@ impl<'a> RemlState<'a> {
                 &h_eff_eval,
                 free_basis_opt.as_ref(),
                 None,
+                &beta,
             )?
         } else {
             (0.0, None)
