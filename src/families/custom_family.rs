@@ -2495,7 +2495,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
 /// non-`'static` lifetimes.
 ///
 /// The closures borrow data from the calling stack frame (family, synced states,
-/// specs), so we cannot use the `'static`-requiring `JointModelDerivProvider`.
+/// specs), so we use borrowed closures with a non-`'static` lifetime.
 /// Instead we borrow the closures and implement `HessianDerivativeProvider` directly.
 ///
 /// # Sign convention
@@ -2562,7 +2562,7 @@ fn unified_joint_cost_gradient(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
-    deriv_provider: Box<dyn HessianDerivativeProvider>,
+    deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     eval_mode: EvalMode,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
     // Build BlockCoupledOperator from the joint Hessian with block structure.
@@ -2595,7 +2595,7 @@ fn unified_joint_cost_gradient(
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
     // Build InnerSolution via builder and call unified evaluator.
-    let mut builder = InnerSolutionBuilder::new(
+    let builder = InnerSolutionBuilder::new(
         inner.log_likelihood,
         inner.penalty_value,
         beta_flat.clone(),
@@ -2646,10 +2646,8 @@ fn joint_outer_evaluate(
     include_logdet_h: bool,
     include_logdet_s: bool,
     strict_spd: bool,
-    _allow_semidefinite: bool,
     need_hessian: bool,
     options: &BlockwiseFitOptions,
-    _tangent_basis: Option<&Array2<f64>>,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
 ) -> Result<OuterObjectiveEvalResult, String> {
@@ -2716,7 +2714,7 @@ fn joint_outer_evaluate(
         compute_dh,
         compute_d2h: compute_d2h_ref,
     };
-    let provider_box: Box<dyn HessianDerivativeProvider> = Box::new(provider);
+    let provider_box: Box<dyn HessianDerivativeProvider + '_> = Box::new(provider);
 
     let eval_mode = if need_hessian {
         EvalMode::ValueGradientHessian
@@ -2777,7 +2775,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     let include_logdet_h = include_exact_newton_logdet_h(family);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
-    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinitehessian();
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     let ridge = effective_solverridge(options.ridge_floor);
@@ -2871,9 +2868,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         let beta_flat = flatten_state_betas(&inner.block_states, specs);
         let synced_joint_states =
             synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
-        let joint_tangent_basis =
-            joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
-
         let compute_dh = |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
             let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
                 &synced_joint_states,
@@ -2929,10 +2923,8 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             include_logdet_h,
             include_logdet_s,
             strict_spd,
-            allow_semidefinite,
             need_hessian,
             options,
-            joint_tangent_basis.as_ref(),
             &compute_dh,
             &compute_d2h,
         );
@@ -3001,10 +2993,8 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             include_logdet_h,
             include_logdet_s,
             strict_spd,
-            allow_semidefinite,
             need_hessian,
             options,
-            None, // no tangent basis for surrogate path
             &compute_dh,
             &compute_d2h,
         );
@@ -3093,29 +3083,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
             h_for_logdet[[d, d]] += extra_logdet_ridge;
         }
     }
-
-    // Compute mode inverse for sensitivity solves (against unaugmented h_mode).
-    let h_mode_inv = if include_logdet_h {
-        if strict_spd || extra_logdet_ridge == 0.0 {
-            logdet_trace_inverse_with_ridge_policy(
-                &h_for_logdet,
-                options.ridge_floor,
-                options.ridge_policy,
-                strict_spd,
-                allow_semidefinite,
-            )?
-        } else {
-            logdet_trace_inverse_with_ridge_policy(
-                &h_mode,
-                options.ridge_floor,
-                options.ridge_policy,
-                strict_spd,
-                allow_semidefinite,
-            )?
-        }
-    } else {
-        Array2::<f64>::zeros((p, p))
-    };
 
     // Build a derivative provider that computes D_β H_L[direction] on demand.
     let beta = &inner.block_states[b].beta;
