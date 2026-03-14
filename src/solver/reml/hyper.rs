@@ -2252,14 +2252,14 @@ impl<'a> RemlState<'a> {
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
-            return Ok((0..psi_dim).map(|_| {
+            return Ok((0..psi_dim).map(|j| {
                 super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
                     b_mat: Array2::zeros((0, 0)),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
-                    is_penalty_like: true,
+                    is_penalty_like: hyper_dirs[j].is_penalty_like,
                 }
             }).collect::<Vec<_>>());
         }
@@ -2386,9 +2386,7 @@ impl<'a> RemlState<'a> {
                 b_mat: b_j,
                 ld_s: ld_s_j,
                 b_depends_on_beta,
-                // τ coordinates are penalty parameters — their B matrices
-                // derive from penalty derivatives and are PSD.
-                is_penalty_like: true,
+                is_penalty_like: hyper_dirs[j].is_penalty_like,
             });
         }
 

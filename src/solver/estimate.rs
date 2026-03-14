@@ -1821,7 +1821,28 @@ where
                     cfg_eval.link_kind.mixture_state().cloned(),
                     cfg_eval.link_kind.sas_state().copied(),
                 );
-                let mut cost = state.compute_cost(&rho)?;
+
+                // Use the unified REML evaluator with link ext_coords.
+                // This computes ρ gradient AND link parameter gradient jointly
+                // through the same HyperCoord infrastructure used for aniso ψ.
+                let eval_mode = crate::solver::reml::unified::EvalMode::ValueAndGradient;
+                let result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
+
+                let mut cost = result.cost;
+                let mut grad = result.gradient.ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "unified evaluator returned no gradient in ValueAndGradient mode"
+                            .to_string(),
+                    )
+                })?;
+
+                // The unified evaluator returns gradient of length k + aux_dim.
+                // Pad to theta_dim if needed (should already match).
+                debug_assert_eq!(grad.len(), theta_dim,
+                    "unified evaluator gradient length {} != theta_dim {}",
+                    grad.len(), theta_dim);
+
+                // SAS ridge/barrier cost and gradient corrections.
                 let sasridge = if use_sas && !use_beta_logistic {
                     sasridgeweight
                 } else {
@@ -1835,261 +1856,13 @@ where
                         cost += barriercost;
                     }
                 }
-                let cost_sec = tcost.elapsed().as_secs_f64();
 
-                let tgrad = Instant::now();
-                let mut grad = Array1::<f64>::zeros(theta_dim);
-                let grad_rho = state.compute_gradient(&rho)?;
-                grad.slice_mut(s![..k]).assign(&grad_rho);
-                let (pirls_mix, h_posw) = state.pirls_result_and_hpos_for_rho(&rho)?;
-                if cfg_eval.firth_bias_reduction {
-                    return Err(EstimationError::InvalidInput(
-                        "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
-                            .to_string(),
-                    ));
-                }
-                let eta = &pirls_mix.final_eta;
-                let x_t = &pirls_mix.x_transformed;
-                let nobs = eta.len();
-                let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                let mut leverage_buf = Array1::<f64>::zeros(nobs);
-                let mut score_beta_jacobian_diag_buf = Array1::<f64>::zeros(nobs);
-                let mut direct_ll_buf = vec![0.0_f64; aux_dim];
-                let mut du_by_j_buf: Vec<Array1<f64>> =
-                    (0..aux_dim).map(|_| Array1::<f64>::zeros(nobs)).collect();
-                let mut dw_explicit_by_j_buf: Vec<Array1<f64>> =
-                    (0..aux_dim).map(|_| Array1::<f64>::zeros(nobs)).collect();
-                let mut mix_partials_buf_reuse = if use_mixture {
-                    vec![
-                        crate::mixture_link::InverseLinkJet {
-                            mu: 0.0,
-                            d1: 0.0,
-                            d2: 0.0,
-                            d3: 0.0,
-                        };
-                        aux_dim
-                    ]
-                } else {
-                    Vec::new()
-                };
-                if h_posw.ncols() > 0 {
-                    match x_t {
-                        DesignMatrix::Dense(x_dense) => {
-                            let xw = x_dense.dot(h_posw.as_ref());
-                            for i in 0..xw.nrows() {
-                                leverage_buf[i] = xw.row(i).iter().map(|v| v * v).sum();
-                            }
-                        }
-                        DesignMatrix::Sparse(_) => {
-                            for col in 0..h_posw.ncols() {
-                                let w_col = h_posw.column(col).to_owned();
-                                let xw_col = x_t.matrixvectormultiply(&w_col);
-                                Zip::from(&mut leverage_buf)
-                                    .and(&xw_col)
-                                    .for_each(|h, &v| *h += v * v);
-                            }
-                        }
-                    }
-                }
-                for j in 0..aux_dim {
-                    direct_ll_buf[j] = 0.0;
-                    du_by_j_buf[j].fill(0.0);
-                    dw_explicit_by_j_buf[j].fill(0.0);
-                }
-                if use_mixture {
-                    let mix_state = cfg_eval.link_kind.mixture_state().ok_or_else(|| {
-                        EstimationError::InvalidInput("missing mixture state".to_string())
-                    })?;
-                    for i in 0..nobs {
-                        let jet = mixture_inverse_link_jetwith_rho_partials_into(
-                            mix_state,
-                            eta[i],
-                            &mut mix_partials_buf_reuse,
-                        );
-                        let mu = jet.mu;
-                        let d1 = jet.d1;
-                        let d2 = jet.d2;
-                        let yi = y_o[i];
-                        let wi = w_o[i].max(0.0);
-                        let aux = stabilized_binomial_aux_terms(yi, wi, mu);
-                        score_beta_jacobian_diag_buf[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
-                        for j in 0..aux_dim {
-                            let dj = mix_partials_buf_reuse[j];
-                            let dmu = dj.mu;
-                            let dd1 = dj.d1;
-                            direct_ll_buf[j] += aux.a1 * dmu;
-                            du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                            let variance_param = aux.variancemu_scale * dmu;
-                            let numerator = d1 * d1;
-                            let numerator_param = 2.0 * d1 * dd1;
-                            dw_explicit_by_j_buf[j][i] = wi
-                                * (numerator_param * aux.variance - numerator * variance_param)
-                                / (aux.variance * aux.variance);
-                        }
-                    }
-                } else {
-                    let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
-                        EstimationError::InvalidInput(
-                            "missing parameterized link state".to_string(),
-                        )
-                    })?;
-                    for i in 0..nobs {
-                        let eta_i = eta[i].clamp(-30.0, 30.0);
-                        let jets = if use_beta_logistic {
-                            beta_logistic_inverse_link_jetwith_param_partials(
-                                eta_i,
-                                sas.log_delta,
-                                sas.epsilon,
-                            )
-                        } else {
-                            sas_inverse_link_jetwith_param_partials(
-                                eta_i,
-                                sas.epsilon,
-                                sas.log_delta,
-                            )
-                        };
-                        let mu = jets.jet.mu;
-                        let d1 = jets.jet.d1;
-                        let d2 = jets.jet.d2;
-                        let yi = y_o[i];
-                        let wi = w_o[i].max(0.0);
-                        let aux = stabilized_binomial_aux_terms(yi, wi, mu);
-                        score_beta_jacobian_diag_buf[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
-                        for j in 0..aux_dim {
-                            let dj = if j == 0 {
-                                jets.djet_depsilon
-                            } else {
-                                jets.djet_dlog_delta
-                            };
-                            let dmu = dj.mu;
-                            let dd1 = dj.d1;
-                            direct_ll_buf[j] += aux.a1 * dmu;
-                            du_by_j_buf[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-                            let variance_param = aux.variancemu_scale * dmu;
-                            let numerator = d1 * d1;
-                            let numerator_param = 2.0 * d1 * dd1;
-                            dw_explicit_by_j_buf[j][i] = wi
-                                * (numerator_param * aux.variance - numerator * variance_param)
-                                / (aux.variance * aux.variance);
-                        }
-                    }
-                }
-                let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
-                    x_t,
-                    &score_beta_jacobian_diag_buf,
-                    &pirls_mix.reparam_result.s_transformed,
-                    pirls_mix.ridge_used,
-                )?;
-                let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
-                let jacobianridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
-
-                // ---- TK gradient correction for auxiliary link params ----
-                // The LAML cost includes a Tierney-Kadane skewness correction
-                //   TK = -(1/6) Σ_m s_m³ T_m.
-                // The gradient -∂TK/∂θ_j contributes:
-                //   Term A: -(1/2)(dW_total_j' h_G)
-                //   Term B: +(1/6)(f' dβ/dθ_j)
-                // where h_G_i = diag(X M X')_i, M = WGW',
-                //       G = W' diag(s²⊙T) W,  W = h_posw,
-                //       f = X'(d⊙g), g_i = Σ_m s³_m x_{im}³.
-                let tk_infra: Option<(Array1<f64>, Array1<f64>)> = {
-                    let c_arr = &pirls_mix.solve_c_array;
-                    let d_arr = &pirls_mix.solve_d_array;
-                    let rank = h_posw.ncols();
-                    let p_eff = h_posw.nrows();
-                    if !c_arr.is_empty() && rank > 0 && p_eff > 0 {
-                        let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
-                        for m in 0..p_eff {
-                            for a in 0..rank {
-                                h_inv_diag[m] += h_posw[[m, a]].powi(2);
-                            }
-                        }
-                        let c_clean = Array1::from_shape_fn(c_arr.len(), |i| {
-                            if c_arr[i].is_finite() { c_arr[i] } else { 0.0 }
-                        });
-                        let third_deriv =
-                            state.third_derivative_projection_from_design(x_t, &c_clean)?;
-                        let s_cubed = h_inv_diag.mapv(|s| s * s * s);
-                        let tk_value: f64 = s_cubed
-                            .iter()
-                            .zip(third_deriv.iter())
-                            .map(|(&s3, &t)| s3 * t)
-                            .sum::<f64>()
-                            * (-1.0 / 6.0);
-                        if tk_value.abs() > 1e-12 {
-                            let s_squared = h_inv_diag.mapv(|s| s * s);
-                            let w_weight = &s_squared * &third_deriv;
-                            let mut g_mat = ndarray::Array2::<f64>::zeros((rank, rank));
-                            for a in 0..rank {
-                                for b in a..rank {
-                                    let mut acc = 0.0;
-                                    for m in 0..p_eff {
-                                        acc += w_weight[m] * h_posw[[m, a]] * h_posw[[m, b]];
-                                    }
-                                    g_mat[[a, b]] = acc;
-                                    g_mat[[b, a]] = acc;
-                                }
-                            }
-                            let wg = h_posw.dot(&g_mat);
-                            let m_mat = wg.dot(&h_posw.t());
-                            let h_g = RemlState::quadratic_form_diag_signed(x_t, &m_mat)?;
-                            let g_vec = RemlState::cubed_forward_multiply_rows(x_t, &s_cubed)?;
-                            let dg = Array1::from_shape_fn(nobs, |i| {
-                                let di = if i < d_arr.len() { d_arr[i] } else { 0.0 };
-                                let gi = g_vec[i];
-                                if di.is_finite() && gi.is_finite() {
-                                    di * gi
-                                } else {
-                                    0.0
-                                }
-                            });
-                            let f_vec = x_t.transpose_vector_multiply(&dg);
-                            Some((h_g, f_vec))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                for j in 0..aux_dim {
-                    let rhs_j = x_t.transpose_vector_multiply(&du_by_j_buf[j]);
-                    let dbeta_j = solver
-                        .solvevectorwithridge_retries(
-                            &score_beta_jacobian,
-                            &rhs_j,
-                            jacobianridge_floor,
-                        )
-                        .ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "failed to solve exact parametric beta sensitivity system"
-                                    .to_string(),
-                            )
-                        })?;
-                    let eta_dot_j = x_t.matrixvectormultiply(&dbeta_j);
-                    let mut trace_term = 0.0_f64;
-                    let mut tk_dw_dot_hg = 0.0_f64;
-                    for i in 0..nobs {
-                        let dw_total =
-                            dw_explicit_by_j_buf[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
-                        trace_term += leverage_buf[i] * dw_total;
-                        if let Some((ref h_g, _)) = tk_infra {
-                            tk_dw_dot_hg += dw_total * h_g[i];
-                        }
-                    }
-                    grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
-                    if let Some((_, ref f_vec)) = tk_infra {
-                        let tk_correction = -0.5 * tk_dw_dot_hg + f_vec.dot(&dbeta_j) / 6.0;
-                        if tk_correction.is_finite() {
-                            grad[k + j] += tk_correction;
-                        }
-                    }
-                }
+                // SAS epsilon reparameterization chain rule.
                 if use_sas && !use_beta_logistic {
                     let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
                     grad[k] *= d_eps_d_raw;
                 }
+                // SAS log_delta ridge + barrier gradient.
                 if use_sas && sasridge > 0.0 {
                     let log_delta = theta[k + 1];
                     grad[k + 1] += sasridge * log_delta;
@@ -2098,13 +1871,14 @@ where
                         grad[k + 1] += barriergrad;
                     }
                 }
-                let grad_sec = tgrad.elapsed().as_secs_f64();
+
+                let cost_sec = tcost.elapsed().as_secs_f64();
+                let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
                 log::debug!(
-                    "[outer-eval {eval_idx}] theta_dim={} aux_dim={} hessian=false time_sec(cost={:.3}, grad={:.3})",
+                    "[outer-eval {eval_idx}] theta_dim={} aux_dim={} unified_link_ext time_sec={:.3}",
                     theta_dim,
                     aux_dim,
                     cost_sec,
-                    grad_sec
                 );
                 Ok(OuterEval {
                     cost,
