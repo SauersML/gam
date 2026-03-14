@@ -2107,7 +2107,6 @@ impl<'a> RemlState<'a> {
     /// For each τ direction j, holding β fixed at β̂:
     ///
     /// | Field   | Formula |
-    /// |---------|---------|
     /// | `a`     | `−u^T X_{τ_j} β̂ + 0.5 β̂^T S_{τ_j} β̂ [+ Φ_{τ_j}\|_β]` |
     /// | `g`     | `X_{τ_j}^T u − X^T diag(w) X_{τ_j} β̂ − S_{τ_j} β̂ [− (g_φ)_{τ_j}]` |
     /// | `B`     | `X_{τ_j}^T W X + X^T W X_{τ_j} + X^T diag(c ⊙ X_{τ_j} β̂) X + S_{τ_j} [− Firth drifts]` |
@@ -2325,7 +2324,6 @@ impl<'a> RemlState<'a> {
     /// # Field derivation (τ_i × τ_j pair)
     ///
     /// | Field   | Formula |
-    /// |---------|---------|
     /// | `a`     | `β̂^T S_{τ_i} β_{τ_j} + 0.5 β̂^T S_{τ_i τ_j} β̂` |
     /// | `g`     | second score involving X_{τ_i}, X_{τ_j}, X_{τ_i τ_j}, S_{τ_i τ_j}` |
     /// | `B`     | cross-design + cross-curvature + second-design + S_{τ_i τ_j}` |

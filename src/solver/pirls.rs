@@ -5134,9 +5134,7 @@ fn computeworkingweight_derivatives_from_eta(
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
 }
 
-// ---------------------------------------------------------------------------
 // General noncanonical observed-information weight corrections
-// ---------------------------------------------------------------------------
 //
 // For an exponential-dispersion family with noncanonical link g, where
 // h(η) = g⁻¹(η) is the inverse link and μ = h(η):
@@ -5171,7 +5169,6 @@ fn computeworkingweight_derivatives_from_eta(
 // This function unifies all per-link hardcoded c/d computations: given the
 // inverse-link jet (h₁…h₄) and the variance-function jet (V…V₃), it returns
 // (w_obs, c_obs, d_obs) without any family- or link-specific dispatch.
-// ---------------------------------------------------------------------------
 
 /// Variance-function jet evaluated at μ: V(μ), V'(μ), V''(μ), V'''(μ).
 #[derive(Clone, Copy, Debug)]
@@ -5382,11 +5379,9 @@ pub fn compute_noncanonical_observed_weights(
     (w, c, d)
 }
 
-// ---------------------------------------------------------------------------
 // Direct (closed-form) observed-information weights for specific family-link
 // combinations.  These avoid the overhead of the generic noncanonical formula
 // when the algebra simplifies.
-// ---------------------------------------------------------------------------
 
 /// Gaussian family with log link: y ~ N(μ, φ), μ = exp(η).
 ///

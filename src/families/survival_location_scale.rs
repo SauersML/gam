@@ -3413,7 +3413,7 @@ impl SurvivalLocationScaleDerivProvider {
     }
 }
 
-impl crate::solver::reml::unified::HessianDerivativeProvider
+impl crate::solver::estimate::reml::unified::HessianDerivativeProvider
     for SurvivalLocationScaleDerivProvider
 {
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
