@@ -2900,7 +2900,7 @@ where
     eval(&reml_state, &hyper_dirs)
 }
 
-pub fn compute_external_joint_hypercostgradienthessian<X>(
+pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
