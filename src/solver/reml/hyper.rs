@@ -1371,6 +1371,41 @@ impl<'a> RemlState<'a> {
         }
         let sdag_a: Vec<Array2<f64>> = a_tau.iter().map(|a| s_dag.dot(a)).collect();
 
+        // Moving nullspace correction data for τ-τ penalty pseudo-logdet.
+        // See build_tau_pair_callbacks for the full derivation.
+        let pos_indices_old: Vec<usize> =
+            (0..p_dim).filter(|&idx| s_eigs[idx] > s_tol).collect();
+        let null_indices_old: Vec<usize> =
+            (0..p_dim).filter(|&idx| s_eigs[idx] <= s_tol).collect();
+        let n_null_old = null_indices_old.len();
+        let n_pos_old = pos_indices_old.len();
+        let has_moving_nullspace_old = n_null_old > 0 && n_pos_old > 0;
+
+        // Build U₊, U₀, Σ⁺², and leakage matrices for each τ direction.
+        let (leakage_old, spinv2_old) = if has_moving_nullspace_old {
+            let mut u_p = Array2::<f64>::zeros((p_dim, n_pos_old));
+            for (col_out, &col_in) in pos_indices_old.iter().enumerate() {
+                u_p.column_mut(col_out).assign(&svecs.column(col_in));
+            }
+            let mut u_n = Array2::<f64>::zeros((p_dim, n_null_old));
+            for (col_out, &col_in) in null_indices_old.iter().enumerate() {
+                u_n.column_mut(col_out).assign(&svecs.column(col_in));
+            }
+            let spinv2: Array1<f64> = Array1::from_vec(
+                pos_indices_old
+                    .iter()
+                    .map(|&idx| 1.0 / (s_eigs[idx] * s_eigs[idx]))
+                    .collect(),
+            );
+            let leakage: Vec<Array2<f64>> = a_tau
+                .iter()
+                .map(|s_tau_k| u_p.t().dot(&s_tau_k.dot(&u_n)))
+                .collect();
+            (Some(leakage), Some(spinv2))
+        } else {
+            (None, None)
+        };
+
         for i in 0..psi_dim {
             let x_tau_i = transform_x_tau(&hyper_dirs[i]);
             for j in i..psi_dim {
@@ -1501,13 +1536,31 @@ impl<'a> RemlState<'a> {
                         - d2_trace_correction
                         - dtau_trace_correction
                         - trace_hdag_b_hdag_c(&h_tau[j], &h_tau[i]));
-                // P_{ij} = -0.5[ tr(S^+ S_{ij}) - tr(S^+ S_j S^+ S_i) ].
-                let p_term = 0.5 * Self::trace_product(&sdag_a[j], &sdag_a[i])
+                // P_{ij} = -0.5[ tr(S^+ S_{ij}) - tr(S^+ S_j S^+ S_i)
+                //                + tr(S⁺² S_i P₀ S_j) + tr(S⁺² S_j P₀ S_i) ].
+                //
+                // The last two terms are the moving nullspace correction.
+                // In the sign convention here, p_term = -P_{ij}, so:
+                //   p_term = 0.5*[tr(S⁺ S_j S⁺ S_i) - tr(S⁺ S_ij)
+                //            - tr(S⁺² S_i P₀ S_j) - tr(S⁺² S_j P₀ S_i)]
+                let mut p_term = 0.5 * Self::trace_product(&sdag_a[j], &sdag_a[i])
                     - 0.5
                         * a_tau_tau[i][j]
                             .as_ref()
                             .map(|aij| Self::trace_product(&s_dag, aij))
                             .unwrap_or(0.0);
+                // Moving nullspace correction for ψ-ψ pairs.
+                if let (Some(ref leak), Some(ref sp2)) = (&leakage_old, &spinv2_old) {
+                    let l_i = &leak[i];
+                    let l_j = &leak[j];
+                    let mut corr = 0.0_f64;
+                    for a in 0..sp2.len() {
+                        corr += sp2[a] * l_i.row(a).dot(&l_j.row(a));
+                    }
+                    // Both correction terms are equal by symmetry, so subtract 2×corr.
+                    // The sign is negative because we are computing −P_{ij}.
+                    p_term -= corr;
+                }
                 let val = q + l + p_term;
                 h_tt[[i, j]] = val;
                 h_tt[[j, i]] = val;
@@ -2399,6 +2452,81 @@ impl<'a> RemlState<'a> {
             }
         }
 
+        // ── Moving nullspace correction data ──
+        //
+        // When ψ coordinates rotate the positive eigenspace of S, the nullspace
+        // moves and the fixed-nullspace formula for ℓˢ_ij is incomplete.
+        // The full second derivative is:
+        //
+        //   ∂²_ij log|S|₊ = tr(S⁺ S_ij) - tr(S⁺ S_i S⁺ S_j)
+        //                   + tr(S⁺² S_i P₀ S_j) + tr(S⁺² S_j P₀ S_i)
+        //
+        // where P₀ = I - S S⁺ is the nullspace projector and S⁺² = (S⁺)².
+        //
+        // Efficient computation in the eigenbasis:
+        //   tr(S⁺² S_i P₀ S_j) = tr(Σ⁺² (U₊ᵀ S_i U₀)(U₀ᵀ S_j U₊))
+        // where U₊ are positive eigenvectors and U₀ are null eigenvectors.
+        //
+        // For ρ coordinates, P₀ A_k = A_k P₀ = 0 (they preserve the nullspace),
+        // so the correction vanishes for ρ-ρ and ρ-τ pairs. It is only needed
+        // for τ-τ pairs.
+
+        // Collect positive and null eigenvector indices.
+        let pos_indices: Vec<usize> = (0..p_dim).filter(|&i| s_eigs[i] > s_tol).collect();
+        let null_indices: Vec<usize> = (0..p_dim).filter(|&i| s_eigs[i] <= s_tol).collect();
+        let n_null = null_indices.len();
+        let n_pos = pos_indices.len();
+
+        // Build U₊ (p_dim × n_pos) and U₀ (p_dim × n_null) matrices, and Σ⁺² diagonal.
+        let has_moving_nullspace = n_null > 0 && n_pos > 0;
+        let u_pos = if has_moving_nullspace {
+            let mut u = Array2::<f64>::zeros((p_dim, n_pos));
+            for (col_out, &col_in) in pos_indices.iter().enumerate() {
+                u.column_mut(col_out).assign(&svecs.column(col_in));
+            }
+            Some(u)
+        } else {
+            None
+        };
+        let u_null = if has_moving_nullspace {
+            let mut u = Array2::<f64>::zeros((p_dim, n_null));
+            for (col_out, &col_in) in null_indices.iter().enumerate() {
+                u.column_mut(col_out).assign(&svecs.column(col_in));
+            }
+            Some(u)
+        } else {
+            None
+        };
+        // Σ⁺² = diag(1/σ_i²) for positive eigenvalues.
+        let sigma_pinv_sq: Option<Array1<f64>> = if has_moving_nullspace {
+            Some(
+                Array1::from_vec(
+                    pos_indices
+                        .iter()
+                        .map(|&i| 1.0 / (s_eigs[i] * s_eigs[i]))
+                        .collect(),
+                ),
+            )
+        } else {
+            None
+        };
+
+        // Pre-compute "leakage" matrices for each τ direction:
+        //   L_j = U₊ᵀ S_{τ_j} U₀   (n_pos × n_null)
+        // These measure how much S_{τ_j} couples positive and null subspaces.
+        let s_tau_leakage: Option<Vec<Array2<f64>>> = if has_moving_nullspace {
+            let u_p = u_pos.as_ref().unwrap();
+            let u_n = u_null.as_ref().unwrap();
+            Some(
+                s_tau_list
+                    .iter()
+                    .map(|s_tau| u_p.t().dot(&s_tau.dot(u_n)))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
         // Pre-compute S_+^{-1} S_{τ_j} products for the quadratic trace term.
         let sdag_s_tau: Vec<Array2<f64>> =
             s_tau_list.iter().map(|s| s_dag.dot(s)).collect();
@@ -2520,11 +2648,15 @@ impl<'a> RemlState<'a> {
         let c_array = Arc::new(c_array);
         let d_array = Arc::new(d_array);
         let a_k_tau_j_mats = Arc::new(a_k_tau_j_mats);
+        let s_tau_leakage = Arc::new(s_tau_leakage);
+        let sigma_pinv_sq = Arc::new(sigma_pinv_sq);
 
         // ─── τ×τ pair callback ───────────────────────────────────────────
         let s_tau_tau_tt = Arc::clone(&s_tau_tau);
         let s_dag_tt = Arc::clone(&s_dag);
         let sdag_s_tau_tt = Arc::clone(&sdag_s_tau);
+        let s_tau_leakage_tt = Arc::clone(&s_tau_leakage);
+        let sigma_pinv_sq_tt = Arc::clone(&sigma_pinv_sq);
         let beta_tt = Arc::clone(&beta_eval);
         let x_dense_tt = Arc::clone(&x_dense);
         let x_tau_list_tt = Arc::clone(&x_tau_list);
@@ -2538,7 +2670,19 @@ impl<'a> RemlState<'a> {
         let is_gaussian_tt = is_gaussian_identity;
 
         let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
-            // ld_s_{ij} = tr(S_+^{-1} S_{τ_j} S_+^{-1} S_{τ_i}) − tr(S_+^{-1} S_{τ_i τ_j})
+            // ld_s_{ij}: second derivative of −log|S|₊ w.r.t. τ_i, τ_j.
+            //
+            // Fixed-nullspace formula:
+            //   ld_s_{ij} = tr(S⁺ S_j S⁺ S_i) − tr(S⁺ S_ij)
+            //
+            // Moving-nullspace correction (added when null(S) is nonzero):
+            //   ld_s_{ij} -= tr(S⁺² S_i P₀ S_j) + tr(S⁺² S_j P₀ S_i)
+            //
+            // where P₀ = U₀ U₀ᵀ is the nullspace projector and S⁺² = (S⁺)².
+            //
+            // Efficient form in eigenbasis:
+            //   tr(S⁺² S_i P₀ S_j) = tr(Σ⁺² L_i L_jᵀ)
+            // where L_k = U₊ᵀ S_k U₀ is the "leakage" matrix.
             //
             // First term: tr(sdag_s_tau[j] . sdag_s_tau[i]^T) by trace-product identity.
             let ld_s_quad = Self::trace_product(&sdag_s_tau_tt[j], &sdag_s_tau_tt[i]);
@@ -2546,7 +2690,36 @@ impl<'a> RemlState<'a> {
                 .as_ref()
                 .map(|s_ij| Self::trace_product(&s_dag_tt, s_ij))
                 .unwrap_or(0.0);
-            let ld_s_ij = ld_s_quad - ld_s_linear;
+            let mut ld_s_ij = ld_s_quad - ld_s_linear;
+
+            // Moving nullspace correction for ψ-ψ pairs.
+            //
+            // When the penalty nullspace is nonempty, S_{τ_j} may couple the
+            // positive and null subspaces. The extra terms capture how the
+            // projector onto the positive eigenspace rotates as τ changes.
+            //
+            // For ρ coordinates A_k = λ_k S_k, we have P₀ A_k = 0 (the penalty
+            // derivative preserves the nullspace), so these terms vanish for
+            // ρ-ρ and ρ-τ pairs. They are only needed here in τ-τ pairs.
+            if let (Some(leakage), Some(spinv2)) =
+                (s_tau_leakage_tt.as_ref(), sigma_pinv_sq_tt.as_ref())
+            {
+                let l_i = &leakage[i]; // n_pos × n_null
+                let l_j = &leakage[j]; // n_pos × n_null
+
+                // tr(Σ⁺² L_i L_jᵀ) = Σ_a (1/σ_a²) Σ_b L_i[a,b] L_j[a,b]
+                //                    = Σ_a (1/σ_a²) (L_i[a,:] · L_j[a,:])
+                //
+                // By symmetry of the dot product, tr(Σ⁺² L_i L_jᵀ) = tr(Σ⁺² L_j L_iᵀ),
+                // so the two correction terms are equal.
+                let n_pos_dim = spinv2.len();
+                let mut corr = 0.0_f64;
+                for a in 0..n_pos_dim {
+                    corr += spinv2[a] * l_i.row(a).dot(&l_j.row(a));
+                }
+                // Subtract both correction terms: −2 × tr(Σ⁺² L_i L_jᵀ)
+                ld_s_ij -= 2.0 * corr;
+            }
 
             // a_ij — fixed-β second-order cost derivative.
             //

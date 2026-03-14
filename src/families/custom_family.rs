@@ -4135,6 +4135,57 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     }
     let rho_map = Arc::new(rho_map);
 
+    // Precompute moving nullspace correction data from the pseudo-inverse.
+    // If the penalty has a nullspace (rank-deficient S), ψ coordinates may
+    // rotate that nullspace, requiring correction terms in the second
+    // derivative of log|S|₊. We precompute U₊, U₀, and Σ⁺² once.
+    let nullspace_correction: Arc<
+        Option<(
+            Array2<f64>, // u_pos: (total × n_pos)
+            Array2<f64>, // u_null: (total × n_null)
+            Array1<f64>, // sigma_pinv_sq: n_pos eigenvalues of S⁺ squared
+        )>,
+    > = Arc::new(if let Some(sp) = s_pinv {
+        if let Ok((sp_eigs, sp_vecs)) = sp.eigh(faer::Side::Lower) {
+            let sp_max = sp_eigs
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max)
+                .max(1e-30);
+            let sp_tol = (total.max(1) as f64) * f64::EPSILON * sp_max;
+            let pos_idx: Vec<usize> =
+                (0..total).filter(|&k| sp_eigs[k] > sp_tol).collect();
+            let null_idx: Vec<usize> =
+                (0..total).filter(|&k| sp_eigs[k] <= sp_tol).collect();
+            if !null_idx.is_empty() && !pos_idx.is_empty() {
+                let n_pos = pos_idx.len();
+                let n_null = null_idx.len();
+                let mut u_pos = Array2::<f64>::zeros((total, n_pos));
+                for (col_out, &col_in) in pos_idx.iter().enumerate() {
+                    u_pos.column_mut(col_out).assign(&sp_vecs.column(col_in));
+                }
+                let mut u_null = Array2::<f64>::zeros((total, n_null));
+                for (col_out, &col_in) in null_idx.iter().enumerate() {
+                    u_null.column_mut(col_out).assign(&sp_vecs.column(col_in));
+                }
+                // sp eigenvalue = 1/σ, so S⁺² eigenvalue = 1/σ² = (sp eigenvalue)².
+                let sigma_pinv_sq = Array1::from_vec(
+                    pos_idx
+                        .iter()
+                        .map(|&k| sp_eigs[k] * sp_eigs[k])
+                        .collect(),
+                );
+                Some((u_pos, u_null, sigma_pinv_sq))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    });
+
     // ψ-ψ pair callback
     let ext_ext = {
         let per_block = Arc::clone(&per_block);
@@ -4146,6 +4197,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let ranges_arc = Arc::clone(&ranges_arc);
         let psi_map = Arc::clone(&psi_map);
         let family_arc = Arc::clone(&family_arc);
+        let nullspace_correction_arc = Arc::clone(&nullspace_correction);
         let total = total;
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
@@ -4195,23 +4247,21 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let g = score_ll + &s_ij_beta;
             let b_mat = hess_ll + &s_ij;
 
-            // ld_s_{ij} = -tr(S⁺⁻¹ S_j S⁺⁻¹ S_i) + tr(S⁺⁻¹ S_{ij})
+            // ld_s_{ij}: full second derivative of log|S|₊ w.r.t. ψ_i, ψ_j.
             //
-            // For simplicity and correctness we compute tr(S⁺⁻¹ S_{ij})
-            // directly.  The quadratic tr(S⁺⁻¹ S_j S⁺⁻¹ S_i) term is NOT
-            // included here because it is assembled by the unified outer
-            // evaluator from the first-order ld_s values.  The convention is:
+            //   ∂²_ij log|S|₊
+            //     = tr(S⁺ S_{ij}) - tr(S⁺ S_j S⁺ S_i)
+            //       + tr(S⁺² S_i P₀ S_j) + tr(S⁺² S_j P₀ S_i)
             //
-            //   HyperCoordPair::ld_s = ∂²_ij log|S|₊
-            //                        = tr(S⁺⁻¹ S_{ij}) - tr(S⁺⁻¹ S_j S⁺⁻¹ S_i)
-            //
-            // We store the full second derivative here.
+            // The last two terms are the moving nullspace correction, needed
+            // when ψ rotates the nullspace of S. They vanish when the
+            // nullspace is fixed (as for ρ coordinates).
             let ld_s = if let Some(ref sp) = *s_pinv_arc {
                 let tr_spinv_sij = trace_product(sp, &s_ij);
 
                 // Compute the quadratic piece.
                 // First reconstruct S_i and S_j in joint space to compute
-                // tr(S⁺⁻¹ S_j S⁺⁻¹ S_i).
+                // tr(S⁺ S_j S⁺ S_i).
                 let s_i_local = assemble_block_local_s_psi(
                     &derivative_blocks[block_i][local_i],
                     &per_block[block_i],
@@ -4238,7 +4288,27 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 let spinv_si = sp.dot(&s_i);
                 let spinv_sj = sp.dot(&s_j);
                 let tr_quad = trace_product(&spinv_sj, &spinv_si);
-                tr_spinv_sij - tr_quad
+                let mut ld_s_val = tr_spinv_sij - tr_quad;
+
+                // Moving nullspace correction for ψ-ψ pairs.
+                // Uses precomputed U₊, U₀, Σ⁺² from the eigendecomposition of sp.
+                //   tr(S⁺² S_i P₀ S_j) = tr(Σ⁺² L_i L_jᵀ)
+                // where L_k = U₊ᵀ S_k U₀ is the "leakage" matrix.
+                if let Some((ref u_pos, ref u_null, ref spinv2)) =
+                    *nullspace_correction_arc
+                {
+                    let l_i = u_pos.t().dot(&s_i.dot(u_null));
+                    let l_j = u_pos.t().dot(&s_j.dot(u_null));
+
+                    let mut corr = 0.0_f64;
+                    for a in 0..spinv2.len() {
+                        corr += spinv2[a] * l_i.row(a).dot(&l_j.row(a));
+                    }
+                    // Both correction terms are equal by symmetry.
+                    ld_s_val += 2.0 * corr;
+                }
+
+                ld_s_val
             } else {
                 0.0
             };
