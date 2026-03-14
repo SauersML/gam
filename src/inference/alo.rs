@@ -1322,7 +1322,6 @@ mod tests {
     fn multiblock_cook_and_variance_basic() {
         // B=1 with known values: verify Cook's distance and variance.
         let n = 1;
-        let p = 1;
         let x = Array2::from_elem((1, 1), 1.0);
         // H⁻¹ = [[0.5]]
         let h_inv = Array2::from_elem((1, 1), 0.5);
@@ -1345,7 +1344,6 @@ mod tests {
         let result = compute_multiblock_alo(&input).unwrap();
 
         // A_i = x H⁻¹ xᵀ = 1 * 0.5 * 1 = 0.5
-        let a_i = 0.5;
         // (I - W A)⁻¹ = 1 / (1 - 2.0 * 0.5) = 1/0 => regularised
         // Actually 1 - w*a = 1 - 1.0 = 0.0, so det < 1e-12 => regularised with eps=1e-6
         // (I - W A + eps) = 1e-6, so v = s / 1e-6 = 4e5

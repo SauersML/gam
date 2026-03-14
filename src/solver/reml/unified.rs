@@ -3455,7 +3455,7 @@ mod tests {
     /// Helper: build an InnerSolution for a Gaussian model at a given rho.
     /// The Hessian H = X'X + Σ λₖ Sₖ depends on rho through the penalty,
     /// so we must rebuild InnerSolution for each rho evaluation.
-    fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution {
+    fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
         let p = 3; // 3 coefficients
         let n = 50; // 50 observations
 
@@ -4039,8 +4039,6 @@ mod tests {
 
         // Both formulas should match FD
         let with_correction = without_correction + correction;
-        let rel_err_with = (with_correction - fd_second).abs() / fd_second.abs().max(1e-12);
-        let rel_err_without = (without_correction - fd_second).abs() / fd_second.abs().max(1e-12);
 
         // For diag(e^a, e^b, 0), d^2/dt^2 log|S|_+ = 0, so use absolute error
         // since fd_second ~ 0.
