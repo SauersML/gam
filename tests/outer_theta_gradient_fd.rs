@@ -82,7 +82,7 @@ fn full_outer_thetagradient_matchesfd_for_blended_link() {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         };
 
         let theta = array![0.15, -0.2, 0.1];
@@ -168,7 +168,7 @@ fn full_outer_thetagradient_matchesfd_for_sas_link() {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];

@@ -56,7 +56,7 @@ fn analytic_gradient_matchescost_trend() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
 
     let (analytic, _) = evaluate_externalgradients(
@@ -140,7 +140,7 @@ fn hypothesis_analytic_gradient_matchescost_trend() {
         nullspace_dims: vec![1],
         linear_constraints: None,
         firth_bias_reduction: None,
-    penalty_shrinkage_floor: None,
+        penalty_shrinkage_floor: None,
     };
 
     let mut same_sign = 0usize;
