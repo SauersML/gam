@@ -780,7 +780,7 @@ fn set_spatial_aniso_log_scales(
 /// computed `aniso_log_scales`, this writes them into the spec.
 pub(crate) fn sync_aniso_contrasts_from_metadata(
     spec: &mut TermCollectionSpec,
-    design: &RawSmoothDesign,
+    design: &SmoothDesign,
 ) {
     for (term_idx, term) in design.terms.iter().enumerate() {
         let meta_aniso = match &term.metadata {

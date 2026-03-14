@@ -3515,7 +3515,6 @@ fn binomial_location_scale_working_sets(
 /// Built-in Gaussian location-scale family:
 /// - Block 0: location μ(·) with identity link
 /// - Block 1: log-scale log σ(·) with log link
-#[derive(Clone)]
 pub struct GaussianLocationScaleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -3524,6 +3523,20 @@ pub struct GaussianLocationScaleFamily {
     /// Cached per-observation row scalars keyed by (eta_mu[0], eta_ls[0]) fingerprint.
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
     cached_row_scalars: std::sync::RwLock<Option<(f64, f64, GaussianJointRowScalars)>>,
+}
+
+impl Clone for GaussianLocationScaleFamily {
+    fn clone(&self) -> Self {
+        Self {
+            y: self.y.clone(),
+            weights: self.weights.clone(),
+            mu_design: self.mu_design.clone(),
+            log_sigma_design: self.log_sigma_design.clone(),
+            cached_row_scalars: std::sync::RwLock::new(
+                self.cached_row_scalars.read().expect("lock poisoned").clone(),
+            ),
+        }
+    }
 }
 
 struct GaussianLocationScaleJointPsiDirection {

@@ -2431,6 +2431,10 @@ impl<'a> JointRemlState<'a> {
             .filter(|v| v.is_finite())
             .unwrap_or(f64::NAN);
 
+        // Re-bind state for the remainder of this method (immutable borrow is fine
+        // since compute_unified_eval is done).
+        let state = &self.core.state;
+
         // Compute base-coefficient covariance: (X' W_eff X + S_λ + δI)^{-1}
         // where W_eff = w_glm * g_prime^2, accounting for the chain rule through
         // the link wiggle.
