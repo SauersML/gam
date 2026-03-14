@@ -1,5 +1,7 @@
 use crate::estimate::{BlockRole, FitResult, FittedLinkParameters, UnifiedFitResult};
-use crate::inference::predict::{PredictableModel, StandardPredictor};
+use crate::inference::predict::{
+    GaussianLocationScalePredictor, PredictableModel, StandardPredictor,
+};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, BoundedCoefficientPriorSpec, LinearCoefficientGeometry,
@@ -537,28 +539,38 @@ impl FittedModel {
     /// covariance from the unified result). Otherwise falls back to the
     /// legacy `FitResult` path.
     pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
-        if !matches!(self, FittedModel::Standard { .. }) {
-            return None;
-        }
-        let family = self.family_state.likelihood();
-        let link_kind = self.resolved_inverse_link().ok().flatten();
+        match self.predict_model_class() {
+            PredictModelClass::GaussianLocationScale => {
+                let unified = self.unified()?;
+                let response_scale = self.gaussian_response_scale.unwrap_or(1.0);
+                GaussianLocationScalePredictor::from_unified(unified, response_scale)
+                    .ok()
+                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::Standard => {
+                let family = self.family_state.likelihood();
+                let link_kind = self.resolved_inverse_link().ok().flatten();
 
-        // Prefer unified path when available.
-        if let Some(unified) = self.unified() {
-            return Some(Box::new(StandardPredictor::from_unified(
-                unified, family, link_kind,
-            )));
-        }
+                // Prefer unified path when available.
+                if let Some(unified) = self.unified() {
+                    return Some(Box::new(StandardPredictor::from_unified(
+                        unified, family, link_kind,
+                    )));
+                }
 
-        // Legacy path: extract from FitResult.
-        let fit = self.fit_result.as_ref()?;
-        let covariance = fit.beta_covariance().cloned();
-        Some(Box::new(StandardPredictor {
-            beta: fit.beta.clone(),
-            family,
-            link_kind,
-            covariance,
-        }))
+                // Legacy path: extract from FitResult.
+                let fit = self.fit_result.as_ref()?;
+                let covariance = fit.beta_covariance().cloned();
+                Some(Box::new(StandardPredictor {
+                    beta: fit.beta.clone(),
+                    family,
+                    link_kind,
+                    covariance,
+                }))
+            }
+            // Binomial location-scale and survival predictors not yet implemented.
+            _ => None,
+        }
     }
 
     /// Returns the block roles for this model via the `PredictableModel` trait.

@@ -270,6 +270,147 @@ impl PredictableModel for StandardPredictor {
     }
 }
 
+/// Gaussian location-scale predictor: two blocks (mean + log-sigma).
+///
+/// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
+/// `sigma = exp(X_noise @ beta_noise) * response_scale`.
+pub struct GaussianLocationScalePredictor {
+    pub beta_mu: Array1<f64>,
+    pub beta_noise: Array1<f64>,
+    pub response_scale: f64,
+    pub covariance: Option<Array2<f64>>,
+}
+
+impl GaussianLocationScalePredictor {
+    pub(crate) fn from_unified(
+        unified: &UnifiedFitResult,
+        response_scale: f64,
+    ) -> Result<Self, EstimationError> {
+        let beta_mu = unified
+            .blocks
+            .iter()
+            .find(|b| matches!(b.role, BlockRole::Location | BlockRole::Mean))
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Gaussian location-scale model missing location/mean block".to_string(),
+                )
+            })?;
+        let beta_noise = unified
+            .blocks
+            .iter()
+            .find(|b| matches!(b.role, BlockRole::Scale))
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Gaussian location-scale model missing scale block".to_string(),
+                )
+            })?;
+        Ok(Self {
+            beta_mu,
+            beta_noise,
+            response_scale,
+            covariance: unified.covariance_conditional.clone(),
+        })
+    }
+
+    /// Compute sigma = exp(eta_noise) * response_scale for each observation.
+    fn compute_sigma(&self, design_noise: &DesignMatrix) -> Array1<f64> {
+        let eta_noise = design_noise.dot(&self.beta_noise);
+        eta_noise.mapv(|eta| eta.exp() * self.response_scale)
+    }
+}
+
+impl PredictableModel for GaussianLocationScalePredictor {
+    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
+        let eta = input.design.dot(&self.beta_mu) + &input.offset;
+        // Gaussian identity link: mean = eta.
+        let mean = eta.clone();
+        Ok(PredictResult { eta, mean })
+    }
+
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError> {
+        let result = self.predict_response(input)?;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian location-scale prediction requires noise design matrix".to_string(),
+            )
+        })?;
+        let sigma = self.compute_sigma(design_noise);
+        // For Gaussian LS, the "SE" on the mean scale is sigma (the distribution parameter).
+        // This is an observation-level interval, not an estimator interval.
+        Ok(PredictionWithSE {
+            eta: result.eta,
+            mean: result.mean,
+            eta_se: Some(sigma.clone()),
+            mean_se: Some(sigma),
+        })
+    }
+
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
+        _fit: &FitResult,
+        options: &PredictUncertaintyOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError> {
+        let pred = self.predict_with_uncertainty(input)?;
+        let sigma = pred.mean_se.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing sigma for Gaussian LS intervals".to_string())
+        })?;
+        let z = crate::probability::standard_normal_quantile(
+            0.5 + options.confidence_level * 0.5,
+        )
+        .map_err(|e| EstimationError::InvalidInput(e))?;
+        let eta_lower = &pred.eta - &sigma.mapv(|s| z * s);
+        let eta_upper = &pred.eta + &sigma.mapv(|s| z * s);
+        Ok(PredictUncertaintyResult {
+            eta: pred.eta.clone(),
+            mean: pred.mean.clone(),
+            eta_standard_error: sigma.clone(),
+            mean_standard_error: sigma.clone(),
+            eta_lower: eta_lower.clone(),
+            eta_upper: eta_upper.clone(),
+            mean_lower: eta_lower,
+            mean_upper: eta_upper,
+            observation_lower: None,
+            observation_upper: None,
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: false,
+        })
+    }
+
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        _fit: &FitResult,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        // Gaussian identity link: posterior mean = point estimate (no nonlinearity).
+        let result = self.predict_response(input)?;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian location-scale posterior mean requires noise design matrix".to_string(),
+            )
+        })?;
+        let sigma = self.compute_sigma(design_noise);
+        Ok(PredictPosteriorMeanResult {
+            eta: result.eta,
+            eta_standard_error: sigma,
+            mean: result.mean,
+        })
+    }
+
+    fn n_blocks(&self) -> usize {
+        2
+    }
+
+    fn block_roles(&self) -> Vec<BlockRole> {
+        vec![BlockRole::Location, BlockRole::Scale]
+    }
+}
+
 /// Compute eta standard errors from design matrix and coefficient covariance.
 fn eta_standard_errors_from_design(
     x: &DesignMatrix,
