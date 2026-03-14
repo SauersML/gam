@@ -46,6 +46,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             nullspace_dims: vec![1],
             adaptive_regularization: None,
             linear_constraints: None,
+            penalty_shrinkage_floor: None,
         },
     )
     .expect("fit should succeed");
@@ -115,6 +116,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
             nullspace_dims: vec![1],
             adaptive_regularization: None,
             linear_constraints: None,
+            penalty_shrinkage_floor: None,
         },
     )
     .expect("fit should succeed");
@@ -191,6 +193,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
             nullspace_dims: vec![1],
             adaptive_regularization: None,
             linear_constraints: None,
+            penalty_shrinkage_floor: None,
         },
     )
     .expect("fit should succeed");
@@ -257,6 +260,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
             nullspace_dims: vec![1],
             adaptive_regularization: None,
             linear_constraints: None,
+            penalty_shrinkage_floor: None,
         },
     )
     .expect("fit should succeed");
@@ -331,6 +335,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             nullspace_dims: vec![1],
             adaptive_regularization: None,
             linear_constraints: None,
+            penalty_shrinkage_floor: None,
         },
     )
     .expect("base fit should succeed");

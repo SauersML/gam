@@ -19,6 +19,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
         nullspace_dims: Vec::new(),
         linear_constraints: None,
         adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
     };
 
     let err = match fit_gam(

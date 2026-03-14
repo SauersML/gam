@@ -66,7 +66,7 @@ fn fit_unpenalized(
             p: x.ncols(),
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
-        penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: None,
         },
         &cfg,
         None,

@@ -789,6 +789,7 @@ impl RemlConfig {
             max_iterations: self.max_iterations,
             convergence_tolerance: self.convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
+            penalty_shrinkage_floor: None,
         }
     }
 }
@@ -2882,6 +2883,7 @@ where
         None,
         fit_linear_constraints,
     )?;
+    reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
