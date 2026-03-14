@@ -4556,6 +4556,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: n_theta,
+            all_penalty_like: false,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
@@ -4660,6 +4661,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             st.warm_cache = None;
             st.last_eval = None;
         },
+        efs_fn: None::<fn(&mut SpatialAdaptiveOuterState, &Array1<f64>) -> Result<crate::solver::strategy::EfsEval, EstimationError>>,
     };
 
     let outer_result = crate::solver::strategy::run_outer(

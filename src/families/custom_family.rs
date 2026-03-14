@@ -5821,6 +5821,9 @@ pub fn fit_custom_family<F: CustomFamily>(
             gradient: Derivative::Analytic,
             hessian: hessian_deriv,
             n_params: n_rho,
+            // Custom families may have psi (design-moving) coordinates that
+            // are not penalty-like. Conservatively set false.
+            all_penalty_like: false,
         },
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = if has_exact_hess {
@@ -5949,6 +5952,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             outer.last_eval = None;
             outer.last_error = None;
         },
+        efs_fn: None::<fn(&mut CustomOuterState, &Array1<f64>) -> Result<crate::solver::strategy::EfsEval, crate::estimate::EstimationError>>,
     };
 
     let outer_result = crate::solver::strategy::run_outer(&mut obj, &outer_config, "custom family");

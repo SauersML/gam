@@ -4733,6 +4733,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     gradient: Derivative::Unavailable,
                     hessian: Derivative::Unavailable,
                     n_params: dim,
+                    all_penalty_like: false,
                 },
                 cost_fn: |state: &mut (), rho: &Array1<f64>| {
                     let _ = state;
@@ -4750,6 +4751,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 reset_fn: |state: &mut ()| {
                     let _ = state;
                 },
+                efs_fn: None::<fn(&mut (), &Array1<f64>) -> Result<gam::solver::strategy::EfsEval, gam::estimate::EstimationError>>,
             };
             match gam::solver::strategy::run_outer(&mut obj, &outer_config, name) {
                 Ok(result) => {
@@ -10448,6 +10450,19 @@ fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> Resu
     let headers: Vec<&str> = columns.iter().map(|(name, _)| *name).collect();
     wtr.write_record(&headers)
         .map_err(|e| format!("failed writing csv header: {e}"))?;
+
+    // Validate all prediction values are finite before writing.
+    // NaN or Inf in clinical output would be dangerous.
+    for (col_name, data) in &columns {
+        for (i, val) in data.iter().enumerate() {
+            if !val.is_finite() {
+                return Err(format!(
+                    "non-finite prediction value in column '{}' at row {}: {}",
+                    col_name, i, val
+                ));
+            }
+        }
+    }
 
     for i in 0..n {
         let row: Vec<String> = columns

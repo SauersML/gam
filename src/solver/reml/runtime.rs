@@ -2313,6 +2313,250 @@ impl<'a> RemlState<'a> {
             .map_err(|e| EstimationError::InvalidInput(e))
     }
 
+    /// Shared tail for EFS: builds InnerSolution, computes cost (ValueOnly),
+    /// and returns EFS step vector via `compute_efs_update`.
+    fn evaluate_unified_tail_efs(
+        &self,
+        rho: &Array1<f64>,
+        hessian_op: Box<dyn super::unified::HessianOperator>,
+        beta: Array1<f64>,
+        penalty_roots: Vec<Array2<f64>>,
+        penalty_logdet: super::unified::PenaltyLogdetDerivs,
+        deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
+        tk_correction: f64,
+        firth_logdet: f64,
+        nullspace_dim: f64,
+        dispersion: super::unified::DispersionHandling,
+        log_likelihood: f64,
+        penalty_quadratic: f64,
+        barrier_config: Option<super::unified::BarrierConfig>,
+    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+        use super::unified::{InnerSolutionBuilder, compute_efs_update, reml_laml_evaluate};
+
+        let n_observations = self.y.len();
+        let inner_solution = InnerSolutionBuilder::new(
+            log_likelihood,
+            penalty_quadratic,
+            beta,
+            n_observations,
+            hessian_op,
+            penalty_roots,
+            penalty_logdet,
+            dispersion,
+        )
+        .deriv_provider(deriv_provider)
+        .tk(tk_correction, None)
+        .firth(firth_logdet, None)
+        .nullspace_dim_override(nullspace_dim)
+        .barrier_config(barrier_config)
+        .build();
+
+        // Cost (ValueOnly — no gradient or Hessian needed for EFS).
+        let prior = {
+            let pc = self.compute_soft_priorcost(rho);
+            if pc.abs() > 0.0 {
+                Some((pc, Array1::zeros(rho.len()), None))
+            } else {
+                None
+            }
+        };
+        let cost_result = reml_laml_evaluate(
+            &inner_solution,
+            rho.as_slice().unwrap(),
+            super::unified::EvalMode::ValueOnly,
+            prior,
+        )
+        .map_err(|e| EstimationError::InvalidInput(e))?;
+
+        // EFS steps from inner solution.
+        let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
+
+        Ok(crate::solver::strategy::EfsEval {
+            cost: cost_result.cost,
+            steps,
+        })
+    }
+
+    /// Compute EFS (Extended Fellner-Schall) evaluation: runs the inner solve
+    /// at the given rho, computes the REML/LAML cost, and returns the EFS
+    /// step vector from `compute_efs_update`.
+    ///
+    /// This is the entry point called by the EFS branch of `run_outer` via
+    /// the `OuterObjective::eval_efs` method.
+    pub fn compute_efs_steps(
+        &self,
+        p: &Array1<f64>,
+    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+        let bundle = match self.obtain_eval_bundle(p) {
+            Ok(bundle) => bundle,
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                self.cache_manager.invalidate_eval_bundle();
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "inner solve ill-conditioned during EFS evaluation".to_string(),
+                ));
+            }
+            Err(e) => {
+                self.cache_manager.invalidate_eval_bundle();
+                return Err(e);
+            }
+        };
+
+        // EFS currently only supports the dense spectral geometry backend.
+        // Sparse Cholesky would need its own InnerSolution construction path.
+        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "EFS is not yet supported with sparse geometry backend".to_string(),
+            ));
+        }
+
+        // Reuse the same setup as evaluate_unified but call the EFS tail.
+        self.evaluate_unified_for_efs(p, &bundle)
+    }
+
+    /// Builds the InnerSolution from an eval bundle and returns EFS steps.
+    /// Mirrors `evaluate_unified` but delegates to `evaluate_unified_tail_efs`.
+    fn evaluate_unified_for_efs(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+        use super::unified::{
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives,
+            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives,
+        };
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+
+        // Constraint projection (same as evaluate_unified).
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
+            (
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                pirls_result.reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_total.as_ref().clone(),
+                pirls_result.reparam_result.e_transformed.clone(),
+            )
+        };
+
+        let hessian_op = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from PIRLS Hessian (EFS): {e}"
+                ))
+            })?,
+        );
+
+        let (penalty_rank, log_det_s) =
+            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
+
+        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
+            pirls_result
+                .reparam_result
+                .rs_transformed
+                .iter()
+                .map(|r| r.dot(z))
+                .collect()
+        } else {
+            pirls_result.reparam_result.rs_transformed.clone()
+        };
+
+        // EFS only needs ValueOnly — no second derivatives of penalty logdet.
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: log_det_s,
+            first: pirls_result.reparam_result.det1.clone(),
+            second: None,
+        };
+
+        let beta = if let Some(z) = free_basis_opt.as_ref() {
+            z.t()
+                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+        } else {
+            pirls_result.beta_transformed.as_ref().clone()
+        };
+
+        let p_eff_dim = h_for_operator.ncols();
+        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
+
+        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
+            if is_gaussian_identity {
+                Box::new(GaussianDerivatives)
+            } else {
+                let c_array = pirls_result.solve_c_array.clone();
+                let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
+                    let x_dense = pirls_result.x_transformed.to_dense();
+                    crate::linalg::matrix::DesignMatrix::Dense(x_dense.dot(z))
+                } else {
+                    pirls_result.x_transformed.clone()
+                };
+                Box::new(SinglePredictorGlmDerivatives {
+                    c_array,
+                    d_array: Some(pirls_result.solve_d_array.clone()),
+                    x_transformed,
+                })
+            };
+
+        let dispersion = if is_gaussian_identity {
+            DispersionHandling::ProfiledGaussian
+        } else {
+            DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            }
+        };
+
+        let tk_correction = if !is_gaussian_identity {
+            let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
+                Self::projectwith_basis(bundle.h_eff.as_ref(), z)
+            } else {
+                bundle.h_eff.as_ref().clone()
+            };
+            self.tierney_kadane_laml_correction(pirls_result, &h_eff_eval, free_basis_opt.as_ref())?
+        } else {
+            0.0
+        };
+
+        let firth_logdet = if self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+        {
+            pirls_result.firth_log_det().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let log_likelihood = -0.5 * pirls_result.deviance;
+
+        let barrier_config = if free_basis_opt.is_none() {
+            pirls_result
+                .linear_constraints_transformed
+                .as_ref()
+                .and_then(Self::barrier_config_from_constraints)
+        } else {
+            None
+        };
+
+        self.evaluate_unified_tail_efs(
+            rho,
+            hessian_op,
+            beta,
+            penalty_roots,
+            penalty_logdet,
+            deriv_provider,
+            tk_correction,
+            firth_logdet,
+            nullspace_dim,
+            dispersion,
+            log_likelihood,
+            pirls_result.stable_penalty_term,
+            barrier_config,
+        )
+    }
+
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.arena
             .lastgradient_used_stochastic_fallback
