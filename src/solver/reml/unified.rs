@@ -3433,6 +3433,7 @@ mod tests {
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
+            barrier_config: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -3561,6 +3562,7 @@ mod tests {
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
+            barrier_config: None,
         }
     }
 
