@@ -2414,19 +2414,17 @@ impl<'a> JointRemlState<'a> {
         let cached_edf = self.eval.cached_edf;
         let cached_iters = self.eval.last_backfit_iterations;
         let cached_converged = self.eval.last_converged;
-        let state = &mut self.core.state;
-        let rho = state.rho.clone();
-        let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
-        let knot_vector = state
+        let rho = self.core.state.rho.clone();
+        let knot_range = self.core.state.knot_range.unwrap_or((0.0, 1.0));
+        let knot_vector = self.core.state
             .knot_vector
             .clone()
             .unwrap_or_else(|| Array1::zeros(0));
-        let u = state.base_linear_predictor();
-        let bwiggle = state.build_link_basis_from_state(&u);
-        let eta = state.compute_eta_full(&u, &bwiggle);
-        let deviance = state.recompute_deviance_from_eta(&eta);
+        let u = self.core.state.base_linear_predictor();
+        let bwiggle = self.core.state.build_link_basis_from_state(&u);
+        let eta = self.core.state.compute_eta_full(&u, &bwiggle);
+        let deviance = self.core.state.recompute_deviance_from_eta(&eta);
         let outer_gradient_norm = self
-            .eval
             .compute_unified_eval(&rho)
             .ok()
             .map(|eval| eval.gradient.dot(&eval.gradient).sqrt())

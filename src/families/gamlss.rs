@@ -1288,7 +1288,7 @@ impl BlockwiseTermFitResult {
             noise_design,
         } = parts;
 
-        fit.validate_numeric_finiteness()?;
+        fit.validate_numeric_finiteness().map_err(|e| format!("{e}"))?;
         if fit.block_states.len() < 2 {
             return Err(format!(
                 "BlockwiseTermFitResult requires at least 2 block states, got {}",
@@ -1362,7 +1362,7 @@ impl BlockwiseTermWiggleFitResult {
             wiggle_degree,
         } = parts;
 
-        fit.validate_numeric_finiteness()?;
+        fit.validate_numeric_finiteness().map_err(|e| format!("{e}"))?;
         if fit.fit.block_states.len() < 3 {
             return Err(format!(
                 "BlockwiseTermWiggleFitResult requires at least 3 block states, got {}",
@@ -1473,7 +1473,7 @@ pub fn fit_gaussian_location_scale(
         weights,
         mu_design: Some(muspec.design.clone()),
         log_sigma_design: Some(log_sigmaspec.design.clone()),
-        cached_row_scalars: std::cell::RefCell::new(None),
+        cached_row_scalars: std::sync::RwLock::new(None),
     };
     let blocks = vec![muspec, log_sigmaspec];
     Ok(fit_custom_family(&family, &blocks, options)?)
@@ -2264,7 +2264,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
             log_sigma_design: Some(DesignMatrix::Dense(preparednoise_design)),
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         }
     }
 
@@ -3523,7 +3523,7 @@ pub struct GaussianLocationScaleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     /// Cached per-observation row scalars keyed by (eta_mu[0], eta_ls[0]) fingerprint.
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
-    cached_row_scalars: std::cell::RefCell<Option<(f64, f64, GaussianJointRowScalars)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, GaussianJointRowScalars)>>,
 }
 
 struct GaussianLocationScaleJointPsiDirection {
@@ -4023,7 +4023,7 @@ impl GaussianLocationScaleFamily {
             eta_ls.get(0).copied().unwrap_or(f64::NAN),
         );
         {
-            let cache = self.cached_row_scalars.borrow();
+            let cache = self.cached_row_scalars.read().expect("cached_row_scalars lock poisoned");
             if let Some((k0, k1, ref scalars)) = *cache {
                 if k0 == key.0 && k1 == key.1 {
                     return Ok(scalars.clone());
@@ -4031,7 +4031,7 @@ impl GaussianLocationScaleFamily {
             }
         }
         let scalars = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
-        *self.cached_row_scalars.borrow_mut() = Some((key.0, key.1, scalars.clone()));
+        *self.cached_row_scalars.write().expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, scalars.clone()));
         Ok(scalars)
     }
 
@@ -11146,7 +11146,7 @@ mod tests {
             weights: weights.clone(),
             mu_design: None,
             log_sigma_design: None,
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         };
         let gaussian_eval = gaussian
             .evaluate(&[
@@ -11292,7 +11292,7 @@ mod tests {
             weights: Array1::from_vec(vec![1.0]),
             mu_design: None,
             log_sigma_design: None,
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         };
         let states = vec![
             ParameterBlockState {
@@ -11324,7 +11324,7 @@ mod tests {
             weights: Array1::from_vec(vec![1.0]),
             mu_design: None,
             log_sigma_design: None,
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         };
         let etamu = Array1::from_vec(vec![0.1]);
         let eta_ls = Array1::from_vec(vec![0.4]);
@@ -11431,7 +11431,7 @@ mod tests {
             weights: array![1.0],
             mu_design: None,
             log_sigma_design: None,
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         };
         let eta_mu = array![0.0];
         let eta_ls0 = 701.0_f64;
@@ -13576,7 +13576,7 @@ mod tests {
             weights: weights.clone(),
             mu_design: Some(DesignMatrix::Dense(x_mu0_mat.clone())),
             log_sigma_design: Some(DesignMatrix::Dense(x_ls0_mat.clone())),
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         };
         let specs = vec![
             gaussian_psi_test_spec("mu", x_mu0_mat.clone()),
@@ -13767,7 +13767,7 @@ mod tests {
             weights: weights.clone(),
             mu_design: Some(DesignMatrix::Dense(x_mu0_mat.clone())),
             log_sigma_design: Some(DesignMatrix::Dense(x_ls0_mat.clone())),
-            cached_row_scalars: std::cell::RefCell::new(None),
+            cached_row_scalars: std::sync::RwLock::new(None),
         };
         let specs = vec![
             gaussian_psi_test_spec("mu", x_mu0_mat.clone()),

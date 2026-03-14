@@ -822,7 +822,7 @@ impl SurvivalLocationScaleFamily {
 
         // Entry-side chain rule derivatives for time-varying blocks.
         let dq_t_entry = if self.x_threshold_entry.is_some() {
-            let se = sigma_entry.as_ref().unwrap();
+            let se = entry_sigma_derivs.as_ref().map(|(s, _, _, _)| s).unwrap();
             Some(se.mapv(|s| -1.0 / s.max(1e-12)))
         } else {
             None

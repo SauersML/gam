@@ -13715,7 +13715,7 @@ mod tests {
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
-        for &r in &[0.1, 0.5, 1.0, 2.0] {
+        for &r in &[0.1_f64, 0.5, 1.0, 2.0] {
             let h = 1e-5 * r.max(1e-8);
             let jets_plus =
                 duchon_radial_jets(r + h, length_scale, p_order, s_order, k_dim, &coeffs)
