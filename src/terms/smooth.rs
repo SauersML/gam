@@ -8554,6 +8554,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
                 centers,
                 identifiability_transform,
                 input_scales: meta_scales,
+                aniso_log_scales: meta_aniso,
                 ..
             },
         ) = (&mut term.basis, &fitted.metadata)
@@ -8564,6 +8565,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
                     transform: z.clone(),
                 };
             }
+            s.aniso_log_scales = meta_aniso.clone();
             *input_scales = meta_scales.clone();
         }
         if let (
