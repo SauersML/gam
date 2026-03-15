@@ -818,8 +818,8 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
 #[cfg(test)]
 mod tests {
     use super::{
-        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, NutsConfig, NutsFamily,
-        NutsPosterior, SharedData, firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling,
+        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, NutsConfig, NutsFamily, NutsPosterior,
+        SharedData, firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling,
         run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
