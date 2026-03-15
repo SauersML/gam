@@ -15,11 +15,11 @@ use gam::basis::{
 };
 use gam::construction::kronecker_product;
 use gam::estimate::{
-    AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
-    ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
-    UnifiedFitResultParts, compute_continuous_smoothness_order, fit_gam, optimize_external_design,
-    predict_gam, predict_gam_posterior_mean, predict_gamwith_uncertainty,
+    AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, ExternalOptimOptions,
+    ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary, ParametricTermSummary,
+    PredictInput, SmoothTermSummary, UnifiedFitResult, UnifiedFitResultParts,
+    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
+    predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -29,8 +29,9 @@ use gam::families::scale_design::{
     infer_non_intercept_start,
 };
 use gam::gamlss::{
-    BinomialLocationScaleTermSpec, GaussianLocationScaleTermSpec, ParameterBlockInput,
-    WiggleBlockConfig, buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
+    BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
+    ParameterBlockInput, WiggleBlockConfig, buildwiggle_block_input_from_knots,
+    buildwiggle_block_input_from_seed,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -57,9 +58,6 @@ use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
     build_term_collection_design,
-};
-use gam::solver::strategy::{
-    ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
@@ -858,6 +856,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if args.scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
+    let has_spatial_length_scale_terms = (0..spec.smooth_terms.len())
+        .any(|term_idx| gam::smooth::get_spatial_length_scale(&spec, term_idx).is_some());
+    let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
+        matches!(choice.mode, LinkMode::Flexible)
+            && choice.mixture_components.is_none()
+            && (!has_spatial_length_scale_terms || choice.link == LinkFunction::Probit)
+    });
     progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("dataset parsed and terms resolved");
     progress.advance_workflow(2);
@@ -902,92 +907,94 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     "flexible(...) links currently require a binomial family/link".to_string(),
                 );
             }
-            let config = JointModelConfig {
-                firth_bias_reduction: args.firth,
-                ..JointModelConfig::default()
-            };
-            let geometry = JointLinkGeometry {
-                n_link_knots: config.n_link_knots,
-                degree: 3,
-            };
-            progress.teardown();
-            let joint =
-                match fit_model(FitModelRequest::FlexibleLink(FlexibleLinkWorkflowRequest {
-                    y: y.view(),
-                    weights: weights.view(),
-                    data: ds.values.view(),
-                    spec: spec.clone(),
-                    link: choice.link,
-                    geometry,
-                    config,
-                    include_base_covariance: args.out.is_some(),
-                })) {
-                    Ok(FitModelResult::FlexibleLink(result)) => result,
-                    Ok(_) => {
-                        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                        return Err(
-                            "internal flexible-link workflow returned the wrong result variant"
-                                .to_string(),
-                        );
-                    }
-                    Err(e) => {
-                        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                        return Err(format!("flexible-link fit failed: {e}"));
-                    }
+            if !route_flexible_through_standard {
+                let config = JointModelConfig {
+                    firth_bias_reduction: args.firth,
+                    ..JointModelConfig::default()
                 };
-            let initial_frozenspec = freeze_term_collectionspec(&joint.spec, &joint.design)?;
-            let joint = joint.fit;
-
-            println!(
-                "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
-                family_to_string(family),
-                linkname(choice.link),
-                joint.converged,
-                joint.backfit_iterations,
-                joint.edf
-            );
-            println!(
-                "flexible-link geometry | knots={} | degree={} | ridge={:.3e}",
-                joint.knot_vector.len(),
-                joint.degree,
-                joint.ridge_used
-            );
-
-            if let Some(out) = args.out {
-                let fit_result = core_saved_fit_result(
-                    joint.beta_base.clone(),
-                    Array1::from_vec(joint.lambdas.clone()),
-                    1.0,
-                    joint.beta_base_covariance.clone(),
-                    None,
-                    SavedFitSummary::from_joint_result(&joint)?,
-                );
-                let mut payload = FittedModelPayload::new(
-                    MODEL_VERSION,
-                    formula_text,
-                    ModelKind::FlexibleLink,
-                    FittedFamily::FlexibleLink {
-                        likelihood: family,
+                let geometry = JointLinkGeometry {
+                    n_link_knots: config.n_link_knots,
+                    degree: 3,
+                };
+                progress.teardown();
+                let joint =
+                    match fit_model(FitModelRequest::FlexibleLink(FlexibleLinkWorkflowRequest {
+                        y: y.view(),
+                        weights: weights.view(),
+                        data: ds.values.view(),
+                        spec: spec.clone(),
                         link: choice.link,
-                    },
-                    family_to_string(family).to_string(),
+                        geometry,
+                        config,
+                        include_base_covariance: args.out.is_some(),
+                    })) {
+                        Ok(FitModelResult::FlexibleLink(result)) => result,
+                        Ok(_) => {
+                            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                            return Err(
+                                "internal flexible-link workflow returned the wrong result variant"
+                                    .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                            return Err(format!("flexible-link fit failed: {e}"));
+                        }
+                    };
+                let initial_frozenspec = freeze_term_collectionspec(&joint.spec, &joint.design)?;
+                let joint = joint.fit;
+
+                println!(
+                    "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
+                    family_to_string(family),
+                    linkname(choice.link),
+                    joint.converged,
+                    joint.backfit_iterations,
+                    joint.edf
                 );
-                payload.unified = Some(fit_result.clone());
-                payload.fit_result = Some(fit_result);
-                payload.data_schema = Some(ds.schema.clone());
-                payload.link = Some(link_choice_to_string(choice));
-                payload.joint_beta_link = Some(joint.beta_link.to_vec());
-                payload.joint_knot_range = Some(joint.knot_range);
-                payload.joint_knot_vector = Some(joint.knot_vector.to_vec());
-                payload.joint_link_transform = Some(array2_to_nestedvec(&joint.link_transform));
-                payload.joint_degree = Some(joint.degree);
-                payload.jointridge_used = Some(joint.ridge_used);
-                payload.training_headers = Some(ds.headers.clone());
-                payload.resolved_termspec = Some(initial_frozenspec.clone());
-                write_payload_json(&out, payload)?;
+                println!(
+                    "flexible-link geometry | knots={} | degree={} | ridge={:.3e}",
+                    joint.knot_vector.len(),
+                    joint.degree,
+                    joint.ridge_used
+                );
+
+                if let Some(out) = args.out {
+                    let fit_result = core_saved_fit_result(
+                        joint.beta_base.clone(),
+                        Array1::from_vec(joint.lambdas.clone()),
+                        1.0,
+                        joint.beta_base_covariance.clone(),
+                        None,
+                        SavedFitSummary::from_joint_result(&joint)?,
+                    );
+                    let mut payload = FittedModelPayload::new(
+                        MODEL_VERSION,
+                        formula_text,
+                        ModelKind::FlexibleLink,
+                        FittedFamily::FlexibleLink {
+                            likelihood: family,
+                            link: choice.link,
+                        },
+                        family_to_string(family).to_string(),
+                    );
+                    payload.unified = Some(fit_result.clone());
+                    payload.fit_result = Some(fit_result);
+                    payload.data_schema = Some(ds.schema.clone());
+                    payload.link = Some(link_choice_to_string(choice));
+                    payload.joint_beta_link = Some(joint.beta_link.to_vec());
+                    payload.joint_knot_range = Some(joint.knot_range);
+                    payload.joint_knot_vector = Some(joint.knot_vector.to_vec());
+                    payload.joint_link_transform = Some(array2_to_nestedvec(&joint.link_transform));
+                    payload.joint_degree = Some(joint.degree);
+                    payload.jointridge_used = Some(joint.ridge_used);
+                    payload.training_headers = Some(ds.headers.clone());
+                    payload.resolved_termspec = Some(initial_frozenspec.clone());
+                    write_payload_json(&out, payload)?;
+                }
+                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                return Ok(());
             }
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-            return Ok(());
         }
     }
     progress.advance_workflow(3);
@@ -1016,30 +1023,32 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         adaptive_regularization: adaptive_opts,
         penalty_shrinkage_floor: Some(1e-6),
     };
-    let standard_wiggle =
-        if learn_linkwiggle && args.predict_noise.is_none() && !mean_only_flexible_linkwiggle {
-            let wiggle_cfg = effective_linkwiggle
-                .as_ref()
-                .expect("learn_linkwiggle guarantees wiggle config");
-            let link_kind = resolve_binomial_inverse_link_for_fit(
-                family,
-                effective_link,
-                mixture_linkspec.as_ref(),
-                sas_linkspec.as_ref(),
-                "binomial mean-only link wiggle",
-            )?;
-            Some(StandardBinomialWiggleWorkflowConfig {
-                link_kind,
-                wiggle: LinkWiggleWorkflowConfig {
-                    degree: wiggle_cfg.degree,
-                    num_internal_knots: wiggle_cfg.num_internal_knots,
-                    penalty_orders: wiggle_cfg.penalty_orders.clone(),
-                    double_penalty: wiggle_cfg.double_penalty,
-                },
-            })
-        } else {
-            None
-        };
+    let standard_wiggle = if learn_linkwiggle
+        && args.predict_noise.is_none()
+        && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)
+    {
+        let wiggle_cfg = effective_linkwiggle
+            .as_ref()
+            .expect("learn_linkwiggle guarantees wiggle config");
+        let link_kind = resolve_binomial_inverse_link_for_fit(
+            family,
+            effective_link,
+            mixture_linkspec.as_ref(),
+            sas_linkspec.as_ref(),
+            "binomial mean-only link wiggle",
+        )?;
+        Some(StandardBinomialWiggleWorkflowConfig {
+            link_kind,
+            wiggle: LinkWiggleWorkflowConfig {
+                degree: wiggle_cfg.degree,
+                num_internal_knots: wiggle_cfg.num_internal_knots,
+                penalty_orders: wiggle_cfg.penalty_orders.clone(),
+                double_penalty: wiggle_cfg.double_penalty,
+            },
+        })
+    } else {
+        None
+    };
 
     let (
         fit,
@@ -1103,7 +1112,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             wiggle: standard_wiggle,
             wiggle_options: if learn_linkwiggle
                 && args.predict_noise.is_none()
-                && !mean_only_flexible_linkwiggle
+                && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)
             {
                 Some(blockwise_options_from_fit_args(&args)?)
             } else {
@@ -1282,12 +1291,6 @@ fn run_fitwith_predict_noise(
     emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
     if family == LikelihoodFamily::GaussianIdentity {
-        if formula_linkwiggle.is_some() {
-            return Err(
-                "link wiggle is not supported for Gaussian --predict-noise fits; use binomial location-scale or binomial mean-only logit/probit/cloglog/flexible fitting"
-                    .to_string(),
-            );
-        }
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
         let options = blockwise_options_from_fit_args(args)?;
@@ -1301,6 +1304,14 @@ fn run_fitwith_predict_noise(
                     meanspec: meanspec.clone(),
                     log_sigmaspec: noisespec.clone(),
                 },
+                wiggle: formula_linkwiggle
+                    .cloned()
+                    .map(|cfg| LinkWiggleWorkflowConfig {
+                        degree: cfg.degree,
+                        num_internal_knots: cfg.num_internal_knots,
+                        penalty_orders: cfg.penalty_orders,
+                        double_penalty: cfg.double_penalty,
+                    }),
                 options,
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
             },
@@ -1319,18 +1330,26 @@ fn run_fitwith_predict_noise(
             }
         };
         progress.advance_workflow(3);
-        let fit = solved.fit;
-        let frozen_meanspec =
-            freeze_term_collectionspec(&solved.meanspec_resolved, &solved.mean_design)?;
-        let frozen_noisespec =
-            freeze_term_collectionspec(&solved.noisespec_resolved, &solved.noise_design)?;
+        let wiggle_meta = match (solved.wiggle_knots, solved.wiggle_degree, solved.betawiggle) {
+            (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
+            _ => None,
+        };
+        let BlockwiseTermFitResult {
+            fit,
+            meanspec_resolved,
+            noisespec_resolved,
+            mean_design,
+            noise_design,
+        } = solved.fit;
+        let frozen_meanspec = freeze_term_collectionspec(&meanspec_resolved, &mean_design)?;
+        let frozen_noisespec = freeze_term_collectionspec(&noisespec_resolved, &noise_design)?;
         progress.advance_workflow(4);
         println!(
             "model fit complete | family={} | outer_iter={} | converged={}",
             FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.outer_converged
         );
-        print_spatial_aniso_scales(&solved.meanspec_resolved);
-        print_spatial_aniso_scales(&solved.noisespec_resolved);
+        print_spatial_aniso_scales(&meanspec_resolved);
+        print_spatial_aniso_scales(&noisespec_resolved);
         if let Some(out) = args.out.as_ref() {
             progress.set_stage("fit", "writing gaussian location-scale model");
             let beta_mean = fit
@@ -1357,17 +1376,16 @@ fn run_fitwith_predict_noise(
                     .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
             let gaussian_noise_transform = build_scale_deviation_transform(
-                &solved.mean_design.design,
-                &solved.noise_design.design,
+                &mean_design.design,
+                &noise_design.design,
                 &Array1::ones(y.len()),
-                solved
-                    .noise_design
+                noise_design
                     .intercept_range
                     .end
-                    .min(solved.noise_design.design.ncols()),
+                    .min(noise_design.design.ncols()),
             )
             .map_err(|e| format!("failed to encode Gaussian noise transform: {e}"))?;
-            let model = build_location_scale_saved_model(
+            let mut model = build_location_scale_saved_model(
                 formula_text.to_string(),
                 FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
                 link_choice.map(link_choice_to_string),
@@ -1381,6 +1399,16 @@ fn run_fitwith_predict_noise(
                 Some(&gaussian_noise_transform),
                 Some(response_scale),
             );
+            if let Some((knots, degree, betawiggle)) = wiggle_meta {
+                model.probitwiggle_knots = Some(knots.mapv(|v| v * response_scale).to_vec());
+                model.probitwiggle_degree = Some(degree);
+                model.betawiggle = Some(
+                    betawiggle
+                        .into_iter()
+                        .map(|coef| coef * response_scale)
+                        .collect(),
+                );
+            }
             write_model_json(out, &model)?;
             progress.advance_workflow(fit_total_steps);
         }
@@ -4822,213 +4850,37 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 linkwiggle_block: None,
             }
         };
-        let fit_survival_model =
-            |inverse_link: InverseLink,
-             wiggle: Option<LinkWiggleWorkflowConfig>|
-             -> Result<gam::workflow::SurvivalLocationScaleWorkflowResult, String> {
-                match fit_model(FitModelRequest::SurvivalLocationScale(
-                SurvivalLocationScaleWorkflowRequest {
-                    data: ds.values.view(),
-                    spec: buildtermspec(inverse_link),
-                    wiggle,
-                    kappa_options: kappa_options.clone(),
-                },
-            )) {
-                Ok(FitModelResult::SurvivalLocationScale(result)) => Ok(result),
-                Ok(_) => Err(
+        progress.set_stage("fit", "running survival location-scale optimization");
+        let fit = match fit_model(FitModelRequest::SurvivalLocationScale(
+            SurvivalLocationScaleWorkflowRequest {
+                data: ds.values.view(),
+                spec: buildtermspec(survival_inverse_link.clone()),
+                wiggle: effective_linkwiggle
+                    .clone()
+                    .map(|cfg| LinkWiggleWorkflowConfig {
+                        degree: cfg.degree,
+                        num_internal_knots: cfg.num_internal_knots,
+                        penalty_orders: cfg.penalty_orders,
+                        double_penalty: cfg.double_penalty,
+                    }),
+                kappa_options: kappa_options.clone(),
+                optimize_inverse_link: true,
+            },
+        )) {
+            Ok(FitModelResult::SurvivalLocationScale(result)) => result,
+            Ok(_) => {
+                return Err(classify_cli_error(
                     "internal survival location-scale workflow returned the wrong result variant"
                         .to_string(),
-                ),
-                Err(e) => Err(e),
+                ));
             }
-            };
-
-        let mut fitted_inverse_link = survival_inverse_link.clone();
-        // Optimize link parameters via run_outer for parametric inverse-link families.
-        let optimize_link_parameters = |init: Array1<f64>,
-                                        name: &str,
-                                        mut objective: Box<
-            dyn FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
-        >,
-                                        recover: Box<
-            dyn Fn(&Array1<f64>) -> Option<InverseLink>,
-        >|
-         -> Option<InverseLink> {
-            let dim = init.len();
-            let mut seed_config = gam::seeding::SeedConfig::default();
-            seed_config.max_seeds = 8;
-            seed_config.screening_budget = 3;
-            seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
-            let outer_config = OuterConfig {
-                tolerance: 1e-4,
-                max_iter: 30,
-                fd_step: 1e-3,
-                bounds: None,
-                seed_config,
-                rho_bound: 30.0,
-                heuristic_lambdas: Some(init.to_vec()),
-                initial_rho: None,
-                fallback_sequence: Vec::new(),
-            };
-            let mut obj = ClosureObjective {
-                state: (),
-                cap: OuterCapability {
-                    gradient: Derivative::FiniteDifference,
-                    hessian: Derivative::Unavailable,
-                    n_params: dim,
-                    all_penalty_like: false,
-                    barrier_config: None,
-                },
-                cost_fn: |state: &mut (), rho: &Array1<f64>| {
-                    let _ = state;
-                    objective(rho)
-                },
-                eval_fn: |state: &mut (),
-                          rho: &Array1<f64>|
-                 -> Result<OuterEval, EstimationError> {
-                    let _ = state;
-                    let _ = rho;
-                    Err(EstimationError::InvalidInput(
-                        "strategy should use finite-difference gradients for survival link optimization"
-                            .to_string(),
-                    ))
-                },
-                reset_fn: None::<fn(&mut ())>,
-                efs_fn: None::<
-                    fn(
-                        &mut (),
-                        &Array1<f64>,
-                    )
-                        -> Result<gam::solver::strategy::EfsEval, gam::estimate::EstimationError>,
-                >,
-            };
-            match gam::solver::strategy::run_outer(&mut obj, &outer_config, name) {
-                Ok(result) => {
-                    if let Some(link) = recover(&result.rho) {
-                        eprintln!(
-                            "[survival link opt] optimized {name} params: dim={} iters={} converged={} finalobj={:.6e}",
-                            result.rho.len(),
-                            result.iterations,
-                            result.converged,
-                            result.final_value
-                        );
-                        Some(link)
-                    } else {
-                        None
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[survival link opt] {name} optimization failed; using initial params: {err}"
-                    );
-                    None
-                }
+            Err(e) => {
+                return Err(classify_cli_error(format!(
+                    "survival location-scale fit failed: {e}"
+                )));
             }
         };
-        if let InverseLink::Sas(state0) = fitted_inverse_link.clone() {
-            let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-            if let Some(link) = optimize_link_parameters(
-                init,
-                "SAS",
-                Box::new(|theta: &Array1<f64>| {
-                    let state = state_from_sasspec(SasLinkSpec {
-                        initial_epsilon: theta[0],
-                        initial_log_delta: theta[1],
-                    })
-                    .map_err(EstimationError::InvalidInput)?;
-                    Ok(fit_survival_model(InverseLink::Sas(state), None)
-                        .map_err(EstimationError::InvalidInput)?
-                        .fit
-                        .fit
-                        .reml_score)
-                }),
-                Box::new(|rho| {
-                    state_from_sasspec(SasLinkSpec {
-                        initial_epsilon: rho[0],
-                        initial_log_delta: rho[1],
-                    })
-                    .ok()
-                    .map(InverseLink::Sas)
-                }),
-            ) {
-                fitted_inverse_link = link;
-            }
-        }
-        if let InverseLink::BetaLogistic(state0) = fitted_inverse_link.clone() {
-            let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-            if let Some(link) = optimize_link_parameters(
-                init,
-                "BetaLogistic",
-                Box::new(|theta: &Array1<f64>| {
-                    let state = state_from_beta_logisticspec(SasLinkSpec {
-                        initial_epsilon: theta[0],
-                        initial_log_delta: theta[1],
-                    })
-                    .map_err(EstimationError::InvalidInput)?;
-                    Ok(fit_survival_model(InverseLink::BetaLogistic(state), None)
-                        .map_err(EstimationError::InvalidInput)?
-                        .fit
-                        .fit
-                        .reml_score)
-                }),
-                Box::new(|rho| {
-                    state_from_beta_logisticspec(SasLinkSpec {
-                        initial_epsilon: rho[0],
-                        initial_log_delta: rho[1],
-                    })
-                    .ok()
-                    .map(InverseLink::BetaLogistic)
-                }),
-            ) {
-                fitted_inverse_link = link;
-            }
-        }
-        if let InverseLink::Mixture(state0) = fitted_inverse_link.clone()
-            && state0.rho.len() > 0
-        {
-            let components = state0.components.clone();
-            let init = state0.rho.clone();
-            let components2 = components.clone();
-            if let Some(link) = optimize_link_parameters(
-                init,
-                "mixture",
-                Box::new(move |rho: &Array1<f64>| {
-                    let state = state_fromspec(&MixtureLinkSpec {
-                        components: components.clone(),
-                        initial_rho: rho.clone(),
-                    })
-                    .map_err(EstimationError::InvalidInput)?;
-                    Ok(fit_survival_model(InverseLink::Mixture(state), None)
-                        .map_err(EstimationError::InvalidInput)?
-                        .fit
-                        .fit
-                        .reml_score)
-                }),
-                Box::new(move |rho| {
-                    state_fromspec(&MixtureLinkSpec {
-                        components: components2.clone(),
-                        initial_rho: rho.to_owned(),
-                    })
-                    .ok()
-                    .map(InverseLink::Mixture)
-                }),
-            ) {
-                fitted_inverse_link = link;
-            }
-        }
-        progress.set_stage("fit", "running survival location-scale optimization");
-        let fit = fit_survival_model(
-            fitted_inverse_link.clone(),
-            effective_linkwiggle
-                .clone()
-                .map(|cfg| LinkWiggleWorkflowConfig {
-                    degree: cfg.degree,
-                    num_internal_knots: cfg.num_internal_knots,
-                    penalty_orders: cfg.penalty_orders,
-                    double_penalty: cfg.double_penalty,
-                }),
-        )
-        .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
+        let fitted_inverse_link = fit.inverse_link.clone();
         println!(
             "survival location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
             fit.fit.fit.outer_converged,

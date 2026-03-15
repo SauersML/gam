@@ -29,17 +29,13 @@ pub use families::custom_family::{
 pub use families::gamlss::{
     BinomialLocationScaleFamily, BinomialLocationScaleSpec, BinomialLocationScaleTermSpec,
     BinomialLocationScaleWiggleFamily, BinomialLocationScaleWiggleTermSpec,
-    BinomialLocationScaleWiggleWorkflowConfig, BinomialLocationScaleWorkflowResult,
-    BinomialMeanWiggleFamily, BinomialMeanWiggleSpec, BinomialMeanWiggleTermFitResult,
-    BlockwiseTermFitResult, BlockwiseTermWiggleFitResult, FamilyMetadata, GammaLogFamily,
-    GammaLogSpec, GaussianLocationScaleFamily, GaussianLocationScaleSpec,
-    GaussianLocationScaleTermSpec, ParameterBlockInput, ParameterLink, PoissonLogFamily,
-    PoissonLogSpec, WiggleBlockConfig, buildwiggle_block_input_from_knots,
-    buildwiggle_block_input_from_seed, fit_binomial_location_scale,
-    fit_binomial_location_scale_terms, fit_binomial_location_scale_termsworkflow,
-    fit_binomial_location_scalewiggle_terms, fit_binomial_location_scalewiggle_terms_auto,
-    fit_binomial_mean_wiggle, fit_binomial_mean_wiggle_terms_auto_from_pilot,
-    fit_gaussian_location_scale, fit_gaussian_location_scale_terms,
+    BinomialLocationScaleWorkflowResult, BinomialMeanWiggleFamily, BinomialMeanWiggleSpec,
+    BinomialMeanWiggleTermFitResult, BlockwiseTermFitResult, BlockwiseTermWiggleFitResult,
+    FamilyMetadata, GammaLogFamily, GammaLogSpec, GaussianLocationScaleFamily,
+    GaussianLocationScaleSpec, GaussianLocationScaleTermSpec, GaussianLocationScaleWiggleFamily,
+    GaussianLocationScaleWiggleTermSpec, GaussianLocationScaleWorkflowResult, ParameterBlockInput,
+    ParameterLink, PoissonLogFamily, PoissonLogSpec, WiggleBlockConfig,
+    buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
 };
 pub use families::strategy::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
@@ -50,8 +46,7 @@ pub use families::survival_location_scale::{
     SurvivalLocationScaleFitResultParts, SurvivalLocationScalePredictInput,
     SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
     SurvivalLocationScaleSpec, SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
-    TimeBlockInput, TimeDependentCovariateBlockInput, fit_survival_location_scale,
-    fit_survival_location_scale_terms, predict_survival_location_scale,
+    TimeBlockInput, TimeDependentCovariateBlockInput, predict_survival_location_scale,
     predict_survival_location_scale_posterior_mean,
     predict_survival_location_scalewith_uncertainty, survival_fit_from_parts,
 };
@@ -108,8 +103,7 @@ pub use terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothDesign, SmoothTerm, SmoothTermSpec,
     SpatialLengthScaleOptimizationOptions, TensorBSplineSpec, TermCollectionDesign,
     TermCollectionSpec, TwoBlockSpatialLengthScaleOptimizationResult, build_smooth_design,
-    build_term_collection_design, fit_term_collection,
-    fit_term_collectionwith_spatial_length_scale_optimization, get_spatial_aniso_log_scales,
-    get_spatial_length_scale, log_spatial_aniso_scales,
+    build_term_collection_design, get_spatial_aniso_log_scales, get_spatial_length_scale,
+    log_spatial_aniso_scales,
 };
 pub use types::{LikelihoodFamily, LinkFunction};

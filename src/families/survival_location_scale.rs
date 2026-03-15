@@ -5627,7 +5627,7 @@ pub fn fit_survival_location_scale(
     finalize_survival_location_scale_fit(&prepared, &fit)
 }
 
-pub fn fit_survival_location_scale_terms(
+pub(crate) fn fit_survival_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: SurvivalLocationScaleTermSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
