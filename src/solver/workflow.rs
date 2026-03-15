@@ -2,12 +2,12 @@ use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::BlockwiseFitOptions;
 use crate::estimate::{EstimationError, FitOptions, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
-    BinomialLocationScaleTermSpec, BinomialLocationScaleWorkflowResult, BlockwiseTermFitResult,
-    BlockwiseTermFitResultParts, GaussianLocationScaleTermSpec,
-    GaussianLocationScaleWorkflowResult, ParameterBlockInput, WiggleBlockConfig,
-    buildwiggle_block_input_from_seed, fit_binomial_location_scale_terms,
-    fit_binomial_location_scalewiggle_terms_auto, fit_binomial_mean_wiggle_terms_auto_from_pilot,
-    fit_gaussian_location_scale_terms, fit_gaussian_location_scalewiggle_terms_auto,
+    BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
+    BlockwiseTermFitResultParts, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
+    ParameterBlockInput, WiggleBlockConfig, buildwiggle_block_input_from_seed,
+    fit_binomial_location_scale_terms, fit_binomial_location_scalewiggle_terms_auto,
+    fit_binomial_mean_wiggle_terms_auto_from_pilot, fit_gaussian_location_scale_terms,
+    fit_gaussian_location_scalewiggle_terms_auto,
 };
 use crate::families::survival_location_scale::{
     LinkWiggleBlockInput, SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
@@ -25,7 +25,7 @@ use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, ArrayView2};
 
 #[derive(Clone, Debug)]
-pub struct LinkWiggleWorkflowConfig {
+pub struct LinkWiggleConfig {
     pub degree: usize,
     pub num_internal_knots: usize,
     pub penalty_orders: Vec<usize>,
@@ -33,12 +33,12 @@ pub struct LinkWiggleWorkflowConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct StandardBinomialWiggleWorkflowConfig {
+pub struct StandardBinomialWiggleConfig {
     pub link_kind: InverseLink,
-    pub wiggle: LinkWiggleWorkflowConfig,
+    pub wiggle: LinkWiggleConfig,
 }
 
-pub struct StandardFitWorkflowRequest<'a> {
+pub struct StandardFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -47,42 +47,42 @@ pub struct StandardFitWorkflowRequest<'a> {
     pub family: LikelihoodFamily,
     pub options: FitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
-    pub wiggle: Option<StandardBinomialWiggleWorkflowConfig>,
+    pub wiggle: Option<StandardBinomialWiggleConfig>,
     pub wiggle_options: Option<BlockwiseFitOptions>,
 }
 
-pub struct GaussianLocationScaleWorkflowRequest<'a> {
+pub struct GaussianLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: GaussianLocationScaleTermSpec,
-    pub wiggle: Option<LinkWiggleWorkflowConfig>,
+    pub wiggle: Option<LinkWiggleConfig>,
     pub options: BlockwiseFitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
-pub struct BinomialLocationScaleWorkflowRequest<'a> {
+pub struct BinomialLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: BinomialLocationScaleTermSpec,
-    pub wiggle: Option<LinkWiggleWorkflowConfig>,
+    pub wiggle: Option<LinkWiggleConfig>,
     pub options: BlockwiseFitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
-pub struct SurvivalLocationScaleWorkflowRequest<'a> {
+pub struct SurvivalLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalLocationScaleTermSpec,
-    pub wiggle: Option<LinkWiggleWorkflowConfig>,
+    pub wiggle: Option<LinkWiggleConfig>,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub optimize_inverse_link: bool,
 }
 
-pub enum FitModelRequest<'a> {
-    Standard(StandardFitWorkflowRequest<'a>),
-    GaussianLocationScale(GaussianLocationScaleWorkflowRequest<'a>),
-    BinomialLocationScale(BinomialLocationScaleWorkflowRequest<'a>),
-    SurvivalLocationScale(SurvivalLocationScaleWorkflowRequest<'a>),
+pub enum FitRequest<'a> {
+    Standard(StandardFitRequest<'a>),
+    GaussianLocationScale(GaussianLocationScaleFitRequest<'a>),
+    BinomialLocationScale(BinomialLocationScaleFitRequest<'a>),
+    SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
 }
 
-pub struct StandardFitWorkflowResult {
+pub struct StandardFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
@@ -90,21 +90,21 @@ pub struct StandardFitWorkflowResult {
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
-    pub betawiggle: Option<Vec<f64>>,
+    pub beta_link_wiggle: Option<Vec<f64>>,
 }
 
-pub struct SurvivalLocationScaleWorkflowResult {
+pub struct SurvivalLocationScaleFitResult {
     pub fit: SurvivalLocationScaleTermFitResult,
     pub inverse_link: InverseLink,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
 }
 
-pub enum FitModelResult {
-    Standard(StandardFitWorkflowResult),
-    GaussianLocationScale(GaussianLocationScaleWorkflowResult),
-    BinomialLocationScale(BinomialLocationScaleWorkflowResult),
-    SurvivalLocationScale(SurvivalLocationScaleWorkflowResult),
+pub enum FitResult {
+    Standard(StandardFitResult),
+    GaussianLocationScale(GaussianLocationScaleFitResult),
+    BinomialLocationScale(BinomialLocationScaleFitResult),
+    SurvivalLocationScale(SurvivalLocationScaleFitResult),
 }
 
 fn augment_wiggle_penalties(
@@ -140,9 +140,7 @@ fn resolved_wiggle_inverse_link(
     }
 }
 
-fn fit_standard_model(
-    request: StandardFitWorkflowRequest<'_>,
-) -> Result<StandardFitWorkflowResult, String> {
+fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResult, String> {
     let fitted = fit_term_collectionwith_spatial_length_scale_optimization(
         request.data,
         request.y.clone(),
@@ -155,7 +153,7 @@ fn fit_standard_model(
     )
     .map_err(|e| e.to_string())?;
 
-    let result = StandardFitWorkflowResult {
+    let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
         fit: fitted.fit,
         design: fitted.design,
@@ -163,7 +161,7 @@ fn fit_standard_model(
         adaptive_diagnostics: fitted.adaptive_diagnostics,
         wiggle_knots: None,
         wiggle_degree: None,
-        betawiggle: None,
+        beta_link_wiggle: None,
     };
 
     let Some(wiggle) = request.wiggle else {
@@ -194,7 +192,7 @@ fn fit_standard_model(
         &request.kappa_options,
     )?;
 
-    let betawiggle = solved
+    let beta_link_wiggle = solved
         .fit
         .block_states
         .get(1)
@@ -202,7 +200,7 @@ fn fit_standard_model(
         .beta
         .to_vec();
 
-    Ok(StandardFitWorkflowResult {
+    Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
         fit: solved.fit,
         design: solved.design,
@@ -210,13 +208,13 @@ fn fit_standard_model(
         adaptive_diagnostics: None,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
-        betawiggle: Some(betawiggle),
+        beta_link_wiggle: Some(beta_link_wiggle),
     })
 }
 
 fn fit_gaussian_location_scale_model(
-    request: GaussianLocationScaleWorkflowRequest<'_>,
-) -> Result<GaussianLocationScaleWorkflowResult, String> {
+    request: GaussianLocationScaleFitRequest<'_>,
+) -> Result<GaussianLocationScaleFitResult, String> {
     if let Some(wiggle_cfg) = request.wiggle {
         let solved = fit_gaussian_location_scalewiggle_terms_auto(
             request.data,
@@ -232,8 +230,8 @@ fn fit_gaussian_location_scale_model(
             &request.kappa_options,
         )?;
         let fit = solved.fit.fit;
-        let betawiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
-        Ok(GaussianLocationScaleWorkflowResult {
+        let beta_link_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
+        Ok(GaussianLocationScaleFitResult {
             fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
                 fit,
                 meanspec_resolved: solved.fit.meanspec_resolved,
@@ -243,7 +241,7 @@ fn fit_gaussian_location_scale_model(
             })?,
             wiggle_knots: Some(solved.wiggle_knots),
             wiggle_degree: Some(solved.wiggle_degree),
-            betawiggle,
+            beta_link_wiggle,
         })
     } else {
         let fit = fit_gaussian_location_scale_terms(
@@ -252,18 +250,18 @@ fn fit_gaussian_location_scale_model(
             &request.options,
             &request.kappa_options,
         )?;
-        Ok(GaussianLocationScaleWorkflowResult {
+        Ok(GaussianLocationScaleFitResult {
             fit,
             wiggle_knots: None,
             wiggle_degree: None,
-            betawiggle: None,
+            beta_link_wiggle: None,
         })
     }
 }
 
 fn fit_binomial_location_scale_model(
-    request: BinomialLocationScaleWorkflowRequest<'_>,
-) -> Result<BinomialLocationScaleWorkflowResult, String> {
+    request: BinomialLocationScaleFitRequest<'_>,
+) -> Result<BinomialLocationScaleFitResult, String> {
     if let Some(wiggle_cfg) = request.wiggle {
         let solved = fit_binomial_location_scalewiggle_terms_auto(
             request.data,
@@ -279,8 +277,8 @@ fn fit_binomial_location_scale_model(
             &request.kappa_options,
         )?;
         let fit = solved.fit.fit;
-        let betawiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
-        Ok(BinomialLocationScaleWorkflowResult {
+        let beta_link_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
+        Ok(BinomialLocationScaleFitResult {
             fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
                 fit,
                 meanspec_resolved: solved.fit.meanspec_resolved,
@@ -290,7 +288,7 @@ fn fit_binomial_location_scale_model(
             })?,
             wiggle_knots: Some(solved.wiggle_knots),
             wiggle_degree: Some(solved.wiggle_degree),
-            betawiggle,
+            beta_link_wiggle,
         })
     } else {
         let solved = fit_binomial_location_scale_terms(
@@ -299,22 +297,22 @@ fn fit_binomial_location_scale_model(
             &request.options,
             &request.kappa_options,
         )?;
-        Ok(BinomialLocationScaleWorkflowResult {
+        Ok(BinomialLocationScaleFitResult {
             fit: solved,
             wiggle_knots: None,
             wiggle_degree: None,
-            betawiggle: None,
+            beta_link_wiggle: None,
         })
     }
 }
 
 fn fit_survival_location_scale_model(
-    request: SurvivalLocationScaleWorkflowRequest<'_>,
-) -> Result<SurvivalLocationScaleWorkflowResult, String> {
+    request: SurvivalLocationScaleFitRequest<'_>,
+) -> Result<SurvivalLocationScaleFitResult, String> {
     fn fit_survival_with_link(
         data: ArrayView2<'_, f64>,
         spec: SurvivalLocationScaleTermSpec,
-        wiggle: Option<LinkWiggleWorkflowConfig>,
+        wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
     ) -> Result<
         (
@@ -574,7 +572,7 @@ fn fit_survival_location_scale_model(
     let (fit, wiggle_knots, wiggle_degree) =
         fit_survival_with_link(request.data, spec, request.wiggle, &request.kappa_options)?;
 
-    Ok(SurvivalLocationScaleWorkflowResult {
+    Ok(SurvivalLocationScaleFitResult {
         fit,
         inverse_link,
         wiggle_knots,
@@ -582,19 +580,17 @@ fn fit_survival_location_scale_model(
     })
 }
 
-pub fn fit_model(request: FitModelRequest<'_>) -> Result<FitModelResult, String> {
+pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     match request {
-        FitModelRequest::Standard(request) => {
-            fit_standard_model(request).map(FitModelResult::Standard)
+        FitRequest::Standard(request) => fit_standard_model(request).map(FitResult::Standard),
+        FitRequest::GaussianLocationScale(request) => {
+            fit_gaussian_location_scale_model(request).map(FitResult::GaussianLocationScale)
         }
-        FitModelRequest::GaussianLocationScale(request) => {
-            fit_gaussian_location_scale_model(request).map(FitModelResult::GaussianLocationScale)
+        FitRequest::BinomialLocationScale(request) => {
+            fit_binomial_location_scale_model(request).map(FitResult::BinomialLocationScale)
         }
-        FitModelRequest::BinomialLocationScale(request) => {
-            fit_binomial_location_scale_model(request).map(FitModelResult::BinomialLocationScale)
-        }
-        FitModelRequest::SurvivalLocationScale(request) => {
-            fit_survival_location_scale_model(request).map(FitModelResult::SurvivalLocationScale)
+        FitRequest::SurvivalLocationScale(request) => {
+            fit_survival_location_scale_model(request).map(FitResult::SurvivalLocationScale)
         }
     }
 }

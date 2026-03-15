@@ -68,21 +68,21 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
     #[serde(default)]
-    pub probitwiggle_knots: Option<Vec<f64>>,
+    pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
-    pub probitwiggle_degree: Option<usize>,
+    pub linkwiggle_degree: Option<usize>,
     #[serde(default)]
-    pub betawiggle: Option<Vec<f64>>,
+    pub beta_link_wiggle: Option<Vec<f64>>,
     #[serde(default)]
-    pub timewiggle_knots: Option<Vec<f64>>,
+    pub baseline_timewiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
-    pub timewiggle_degree: Option<usize>,
+    pub baseline_timewiggle_degree: Option<usize>,
     #[serde(default)]
-    pub timewiggle_penalty_orders: Option<Vec<usize>>,
+    pub baseline_timewiggle_penalty_orders: Option<Vec<usize>>,
     #[serde(default)]
-    pub timewiggle_double_penalty: Option<bool>,
+    pub baseline_timewiggle_double_penalty: Option<bool>,
     #[serde(default)]
-    pub betatimewiggle: Option<Vec<f64>>,
+    pub beta_baseline_timewiggle: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -168,14 +168,14 @@ impl FittedModelPayload {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: None,
-            probitwiggle_degree: None,
-            betawiggle: None,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: None,
+            linkwiggle_degree: None,
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -753,11 +753,11 @@ impl FittedModel {
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v)?;
         }
-        if let Some(v) = self.betawiggle.as_ref() {
-            validate_all_finite("betawiggle", v.iter().copied())?;
+        if let Some(v) = self.beta_link_wiggle.as_ref() {
+            validate_all_finite("beta_link_wiggle", v.iter().copied())?;
         }
-        if let Some(v) = self.betatimewiggle.as_ref() {
-            validate_all_finite("betatimewiggle", v.iter().copied())?;
+        if let Some(v) = self.beta_baseline_timewiggle.as_ref() {
+            validate_all_finite("beta_baseline_timewiggle", v.iter().copied())?;
         }
         if let Some(v) = self.survival_beta_time.as_ref() {
             validate_all_finite("survival_beta_time", v.iter().copied())?;

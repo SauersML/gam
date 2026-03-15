@@ -5,4 +5,4 @@ pub mod seeding;
 pub mod smoothing;
 pub mod strategy;
 pub mod visualizer;
-pub mod workflow;
+pub(crate) mod workflow;

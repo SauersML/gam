@@ -1109,15 +1109,6 @@ fn try_binomial_alpha_betawarm_start(
     Ok((beta_t, beta_log_sigma, betaobs))
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-struct GaussianLocationScaleSpec {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub mu_block: ParameterBlockInput,
-    pub log_sigma_block: ParameterBlockInput,
-}
-
 #[derive(Clone)]
 struct BinomialMeanWiggleSpec {
     pub y: Array1<f64>,
@@ -1143,16 +1134,6 @@ pub struct GammaLogSpec {
     /// Gamma shape parameter (k > 0).
     pub shape: f64,
     pub eta_block: ParameterBlockInput,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct BinomialLocationScaleSpec {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub link_kind: InverseLink,
-    pub threshold_block: ParameterBlockInput,
-    pub log_sigma_block: ParameterBlockInput,
 }
 
 #[derive(Clone)]
@@ -1490,67 +1471,6 @@ fn slice_log_lambda_block(
     Ok(log_lambdas.slice(s![start..end]).to_owned())
 }
 
-#[cfg(test)]
-fn fit_gaussian_location_scale(
-    spec: GaussianLocationScaleSpec,
-    options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
-    let n = spec.y.len();
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, "fit_gaussian_location_scale")?;
-    validate_blockrows("mu", n, &spec.mu_block)?;
-    validate_blockrows("log_sigma", n, &spec.log_sigma_block)?;
-
-    let GaussianLocationScaleSpec {
-        y,
-        weights,
-        mu_block,
-        log_sigma_block,
-    } = spec;
-    let mut muspec = mu_block.intospec("mu")?;
-    let mut log_sigmaspec = log_sigma_block.intospec("log_sigma")?;
-    let mu_dense = muspec.design.to_dense();
-    let raw_log_sigma_dense = log_sigmaspec.design.to_dense();
-    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_dense, &weights);
-    log_sigmaspec.design = DesignMatrix::Dense(prepared_gaussian_log_sigma_design(
-        &mu_dense,
-        &raw_log_sigma_dense,
-        &weights,
-        non_intercept_start,
-    )?);
-    if muspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
-        let (betamu0, beta_ls0, sigma0) = gaussian_location_scalewarm_start(
-            &y,
-            &weights,
-            &muspec,
-            &log_sigmaspec,
-            options.ridge_floor,
-            muspec.initial_beta.as_ref(),
-            log_sigmaspec.initial_beta.as_ref(),
-        )?;
-        if muspec.initial_beta.is_none() {
-            muspec.initial_beta = Some(betamu0);
-        }
-        if log_sigmaspec.initial_beta.is_none() {
-            log_sigmaspec.initial_beta = Some(beta_ls0);
-        }
-        log::info!(
-            "[GAMLSS][fit_gaussian_location_scale] initialized at residual sigma {:.6e}",
-            sigma0
-        );
-    }
-
-    let family = GaussianLocationScaleFamily {
-        y,
-        weights,
-        mu_design: Some(muspec.design.clone()),
-        log_sigma_design: Some(log_sigmaspec.design.clone()),
-        cached_row_scalars: std::sync::RwLock::new(None),
-    };
-    let blocks = vec![muspec, log_sigmaspec];
-    Ok(fit_custom_family(&family, &blocks, options)?)
-}
-
 fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
     options: &BlockwiseFitOptions,
@@ -1593,133 +1513,6 @@ fn fit_binomial_mean_wiggle(
         spec.wiggle_block.intospec("wiggle")?,
     ];
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-fn fit_binomial_location_scale(
-    spec: BinomialLocationScaleSpec,
-    options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
-    let n = spec.y.len();
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, "fit_binomial_location_scale")?;
-    validate_binomial_response(&spec.y, "fit_binomial_location_scale")?;
-    validate_blockrows("threshold", n, &spec.threshold_block)?;
-    validate_blockrows("log_sigma", n, &spec.log_sigma_block)?;
-
-    let BinomialLocationScaleSpec {
-        y,
-        weights,
-        link_kind,
-        mut threshold_block,
-        mut log_sigma_block,
-    } = spec;
-    let threshold_dense = threshold_block.design.to_dense();
-    let raw_log_sigma_dense = log_sigma_block.design.to_dense();
-    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_dense, &weights);
-    log_sigma_block.design = DesignMatrix::Dense(prepared_scale_design(
-        &threshold_dense,
-        &raw_log_sigma_dense,
-        &weights,
-        non_intercept_start,
-    )?);
-    append_binomial_log_sigma_shrinkage_penalty_input(&mut log_sigma_block);
-
-    if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-        match try_binomial_alpha_betawarm_start(
-            &y,
-            &weights,
-            &threshold_block,
-            &log_sigma_block,
-            options,
-        ) {
-            Ok((beta_t0, beta_ls0, betawarm)) => {
-                threshold_block.initial_beta = Some(beta_t0);
-                log_sigma_block.initial_beta = Some(beta_ls0);
-                emit_binomial_alpha_betawarnings("warm-start", &betawarm, &y, &weights);
-            }
-            Err(err) => {
-                log::warn!(
-                    "[GAMLSS][fit_binomial_location_scale] alpha/beta warm start failed, falling back to direct initialization: {}",
-                    err
-                );
-            }
-        }
-    }
-
-    let blocks = vec![
-        threshold_block.intospec("threshold")?,
-        log_sigma_block.intospec("log_sigma")?,
-    ];
-    let family = BinomialLocationScaleFamily {
-        y: y.clone(),
-        weights: weights.clone(),
-        link_kind: link_kind.clone(),
-        threshold_design: Some(blocks[0].design.clone()),
-        log_sigma_design: Some(blocks[1].design.clone()),
-    };
-    let fit = fit_custom_family(&family, &blocks, options)?;
-    let beta_final = fit.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
-        .eta
-        .mapv(|eta| 1.0 / exp_sigma_from_eta_scalar(eta).max(1e-12));
-    emit_binomial_alpha_betawarnings("final-fit", &beta_final, &y, &weights);
-    Ok(fit)
-}
-
-trait LocationScaleFamilyBuilder {
-    type Family: CustomFamily + Clone + Send + Sync + 'static;
-
-    fn meanspec(&self) -> &TermCollectionSpec;
-    fn noisespec(&self) -> &TermCollectionSpec;
-    fn exact_spatial_joint_supported(&self) -> bool {
-        true
-    }
-    fn require_exact_spatial_joint(&self) -> bool {
-        false
-    }
-    fn mean_penalty_count(&self, mean_design: &TermCollectionDesign) -> usize {
-        mean_design.penalties.len()
-    }
-    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
-        noise_design.penalties.len()
-    }
-    fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
-    fn extra_rho0(&self) -> Result<Array1<f64>, String> {
-        Ok(Array1::zeros(0))
-    }
-    fn build_blocks(
-        &self,
-        theta: &Array1<f64>,
-        mean_design: &TermCollectionDesign,
-        noise_design: &TermCollectionDesign,
-        mean_beta_hint: Option<Array1<f64>>,
-        noise_beta_hint: Option<Array1<f64>>,
-    ) -> Result<Vec<ParameterBlockSpec>, String>;
-    fn build_family(
-        &self,
-        mean_design: &TermCollectionDesign,
-        noise_design: &TermCollectionDesign,
-    ) -> Self::Family;
-    fn extract_primary_betas(
-        &self,
-        fit: &UnifiedFitResult,
-    ) -> Result<(Array1<f64>, Array1<f64>), String>;
-    fn build_psiderivative_blocks(
-        &self,
-        data: ndarray::ArrayView2<'_, f64>,
-        meanspec_resolved: &TermCollectionSpec,
-        noisespec_resolved: &TermCollectionSpec,
-        mean_design: &TermCollectionDesign,
-        noise_design: &TermCollectionDesign,
-    ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
-        let mean_derivs =
-            build_block_spatial_psi_derivatives(data, meanspec_resolved, mean_design)?
-                .ok_or_else(|| "missing mean spatial psi derivatives".to_string())?;
-        let noise_derivs =
-            build_block_spatial_psi_derivatives(data, noisespec_resolved, noise_design)?
-                .ok_or_else(|| "missing noise spatial psi derivatives".to_string())?;
-        Ok(vec![mean_derivs, noise_derivs])
-    }
 }
 
 fn compose_theta_from_hints(
@@ -14456,87 +14249,6 @@ mod tests {
         assert!((dw[0] - fd).abs() < 1e-6, "dw={} fd={}", dw[0], fd);
     }
 
-    #[test]
-    fn fit_binomial_location_scale_runswithwarm_start_path() {
-        let n = 32usize;
-        let y = Array1::from_vec((0..n).map(|i| if i % 4 == 0 { 1.0 } else { 0.0 }).collect());
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let spec = BinomialLocationScaleSpec {
-            y,
-            weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_block: intercept_block(n),
-            log_sigma_block: intercept_block(n),
-        };
-
-        let fit = fit_binomial_location_scale(spec, &BlockwiseFitOptions::default())
-            .expect("binomial location-scale family should fit");
-        assert_eq!(fit.block_states.len(), 2);
-        assert!(fit.log_likelihood.is_finite());
-    }
-
-    #[test]
-    fn fit_binomial_location_scale_applies_shrinkage_to_log_sigma_block() {
-        let n = 64usize;
-        let y = Array1::from_vec(
-            (0..n)
-                .map(|i| if i % 5 == 0 || i % 7 == 0 { 1.0 } else { 0.0 })
-                .collect(),
-        );
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let spec = BinomialLocationScaleSpec {
-            y,
-            weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_block: intercept_block(n),
-            log_sigma_block: intercept_block(n),
-        };
-
-        let fit = fit_binomial_location_scale(
-            spec,
-            &BlockwiseFitOptions {
-                compute_covariance: true,
-                ..BlockwiseFitOptions::default()
-            },
-        )
-        .expect("binomial location-scale family should fit with shrinkage penalty");
-        assert_eq!(fit.log_lambdas.len(), 1);
-        assert_eq!(fit.lambdas.len(), 1);
-        let covariance = fit
-            .covariance_conditional
-            .as_ref()
-            .expect("conditional covariance");
-        assert!(
-            covariance[[1, 1]].is_finite() && covariance[[1, 1]] < 50.0,
-            "log_sigma variance should be regularized, got {}",
-            covariance[[1, 1]]
-        );
-    }
-
-    #[test]
-    fn fit_binomial_location_scale_sas_runs() {
-        let n = 28usize;
-        let y = Array1::from_vec((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect());
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let sas = crate::mixture_link::state_from_sasspec(crate::types::SasLinkSpec {
-            initial_epsilon: 0.15,
-            initial_log_delta: -0.05,
-        })
-        .expect("sas state");
-        let spec = BinomialLocationScaleSpec {
-            y,
-            weights,
-            link_kind: InverseLink::Sas(sas),
-            threshold_block: intercept_block(n),
-            log_sigma_block: intercept_block(n),
-        };
-
-        let fit = fit_binomial_location_scale(spec, &BlockwiseFitOptions::default())
-            .expect("binomial location-scale sas should fit");
-        assert_eq!(fit.block_states.len(), 2);
-        assert!(fit.log_likelihood.is_finite());
-    }
-
     fn simple_matern_term_collection(
         feature_cols: &[usize],
         length_scale: f64,
@@ -17921,60 +17633,6 @@ mod tests {
                 _ => panic!("expected Diagonal block"),
             },
             Err(_) => {}
-        }
-    }
-
-    #[test]
-    fn gaussian_location_scale_extreme_log_sigma_survives() {
-        use crate::families::custom_family::BlockwiseFitOptions;
-        let n = 20;
-        let y = Array1::from_shape_fn(n, |i| (i as f64) * 0.5 + 0.1);
-        let weights = Array1::ones(n);
-        let mu_design = Array2::from_shape_fn((n, 2), |(_, j)| if j == 0 { 1.0 } else { 0.5 });
-        let ls_design = Array2::from_shape_fn((n, 2), |(_, j)| if j == 0 { 1.0 } else { 0.1 });
-        let spec = GaussianLocationScaleSpec {
-            y,
-            weights,
-            mu_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(mu_design),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                initial_log_lambdas: None,
-                initial_beta: Some(array![0.0, 1.0]),
-            },
-            log_sigma_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(ls_design),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                initial_log_lambdas: None,
-                initial_beta: Some(array![500.0, 0.0]),
-            },
-        };
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 3,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = fit_gaussian_location_scale(spec, &options);
-        match result {
-            Ok(fit) => {
-                let all_finite = fit
-                    .block_states
-                    .iter()
-                    .all(|state| state.beta.iter().all(|v| v.is_finite()));
-                assert!(
-                    all_finite,
-                    "fit succeeded but produced non-finite coefficients"
-                );
-            }
-            Err(ref e) => {
-                let msg = format!("{e}");
-                assert!(
-                    !msg.contains("eigendecomposition failed"),
-                    "the fit crashed with the eigendecomposition bug: {msg}"
-                );
-            }
         }
     }
 }

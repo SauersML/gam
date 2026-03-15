@@ -39,6 +39,9 @@ use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
     load_csvwith_schema,
 };
+use gam::inference::formula_dsl::{
+    CallArgSpec, FunctionCallSpec, parse_formula_dsl, parse_function_call,
+};
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
     ModelKind, PredictModelClass,
@@ -575,8 +578,10 @@ fn run() -> CliResult<()> {
     }
 }
 
-fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOptions, String> {
-    let mut options = gam::BlockwiseFitOptions::default();
+fn blockwise_options_from_fit_args(
+    args: &FitArgs,
+) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
+    let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
     let _ = args;
     options.compute_covariance = true;
     Ok(options)
@@ -1766,11 +1771,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
 
     // ── Unified path via PredictableModel ──────────────────────────────────
     //
-    // Models that don't require special handling (link wiggles, joint flexible
-    // link, survival time basis) go through build_predict_input_for_model() +
-    // model.predictor(). This replaces the previous 4-way match for the
-    // common cases (Standard without wiggle/joint, GaussianLocationScale,
-    // BinomialLocationScale without wiggles).
+    // Models that do not require specialized saved-model handling go through
+    // build_predict_input_for_model() + model.predictor(). This covers the
+    // common cases: plain Standard, GaussianLocationScale, and
+    // BinomialLocationScale without wiggles.
     if !needs_special_predict_handling(&model) {
         if let Some(predictor) = model.predictor() {
             let pred_input = build_predict_input_for_model(
@@ -1789,7 +1793,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             return result;
         }
         // predictor() returned None (e.g. missing UnifiedFitResult) — fall
-        // through to model-specific paths which can use the legacy path.
+        // through to the specialized model-specific paths below.
     }
 
     // ── Special-case dispatch ──────────────────────────────────────────────
@@ -1802,7 +1806,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     //   on top of the identity-link location-scale path.
     // - BinomialLocationScale with link wiggles: probit-wiggle q0 path with
     //   conditional integration over wiggle coefficients.
-    // - Standard with link wiggles or joint flexible link.
+    // - Standard with link wiggles.
     let result = match model.predict_model_class() {
         PredictModelClass::Survival => run_predict_survival(
             &mut progress,
@@ -1838,7 +1842,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_mixture_param_cov.as_ref(),
             saved_sas_param_cov.as_ref(),
         ),
-        PredictModelClass::Standard => run_predict_standard_or_flexible(
+        PredictModelClass::Standard => run_predict_standard(
             &mut progress,
             &args,
             &model,
@@ -2693,7 +2697,7 @@ fn run_predict_gaussian_location_scale(
 ///
 /// For plain standard models (no wiggle), the unified path in
 /// `run_predict` handles prediction via `StandardPredictor`.
-fn run_predict_standard_or_flexible(
+fn run_predict_standard(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
@@ -5648,9 +5652,9 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("generate", "building predictive state");
-    // Unified path: delegate to PredictableModel for models that don't need
-    // special handling (link wiggles). Fall back to the legacy per-class
-    // helpers for those special cases.
+    // Unified path: delegate to PredictableModel for models that do not need
+    // specialized saved-model handling. Use per-class helpers only for the
+    // remaining saved-model special cases.
     let spec = if needs_special_predict_handling(&model) {
         match model.predict_model_class() {
             PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
@@ -5660,7 +5664,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 &col_map,
                 training_headers,
             )?,
-            PredictModelClass::Standard => run_generate_standard_or_flexible(
+            PredictModelClass::Standard => run_generate_standard(
                 &mut progress,
                 &model,
                 ds.values.view(),
@@ -5713,9 +5717,9 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Unified generate path: uses `PredictableModel` to produce a `GenerativeSpec`
-/// for any model class that doesn't require special handling (link wiggles,
-/// joint flexible links).
+/// Unified generate path: uses `PredictableModel` to produce a
+/// `GenerativeSpec` for any model class that does not require specialized
+/// saved-model handling.
 ///
 /// Covers: Standard (plain), GaussianLocationScale, BinomialLocationScale
 /// (without wiggles).  For Gaussian LS the sigma vector is extracted via
@@ -5927,7 +5931,7 @@ fn run_generate_binomial_location_scale(
     })
 }
 
-fn run_generate_standard_or_flexible(
+fn run_generate_standard(
     progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -7323,7 +7327,7 @@ fn write_payload_json(path: &Path, payload: FittedModelPayload) -> Result<(), St
 }
 
 fn formula_rhs_text(formula: &str) -> Result<String, String> {
-    let parsed = gam::parse_formula_dsl(formula)?;
+    let parsed = parse_formula_dsl(formula)?;
     if parsed.rhs_terms.is_empty() {
         return Err("formula right-hand side cannot be empty".to_string());
     }
@@ -7332,7 +7336,7 @@ fn formula_rhs_text(formula: &str) -> Result<String, String> {
 
 fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, String> {
     let trimmed = lhs.trim();
-    let call = match gam::parse_function_call(trimmed) {
+    let call = match parse_function_call(trimmed) {
         Ok(call) => call,
         Err(_) => return Ok(None),
     };
@@ -7343,8 +7347,8 @@ fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, St
         .args
         .iter()
         .filter_map(|arg| match arg {
-            gam::CallArgSpec::Positional(v) => Some(v.trim().to_string()),
-            gam::CallArgSpec::Named { .. } => None,
+            CallArgSpec::Positional(v) => Some(v.trim().to_string()),
+            CallArgSpec::Named { .. } => None,
         })
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
@@ -7384,7 +7388,7 @@ fn load_datasetwith_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, 
 }
 
 fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
-    let parsed_dsl = gam::parse_formula_dsl(formula)?;
+    let parsed_dsl = parse_formula_dsl(formula)?;
     let lhs = parsed_dsl.response_expr.trim();
     if lhs.is_empty() {
         return Err("formula response (left-hand side) cannot be empty".to_string());
@@ -7444,13 +7448,13 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
 }
 
 fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
-    fn split_call_args(call: &gam::FunctionCallSpec) -> (Vec<String>, BTreeMap<String, String>) {
+    fn split_call_args(call: &FunctionCallSpec) -> (Vec<String>, BTreeMap<String, String>) {
         let mut vars = Vec::<String>::new();
         let mut options = BTreeMap::<String, String>::new();
         for arg in &call.args {
             match arg {
-                gam::CallArgSpec::Positional(v) => vars.push(v.trim().to_string()),
-                gam::CallArgSpec::Named { key, value } => {
+                CallArgSpec::Positional(v) => vars.push(v.trim().to_string()),
+                CallArgSpec::Named { key, value } => {
                     options.insert(key.to_ascii_lowercase(), strip_quotes(value).to_string());
                 }
             }
@@ -7458,7 +7462,7 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
         (vars, options)
     }
 
-    let call = gam::parse_function_call(raw).ok();
+    let call = parse_function_call(raw).ok();
     if let Some(call) = call {
         let name = call.name.to_ascii_lowercase();
         let (vars, mut options) = split_call_args(&call);
@@ -7795,7 +7799,7 @@ fn parse_linkwiggle_formulaspec(
 }
 
 fn augmentwiggle_penaltieswith_orders(
-    block: &mut gam::ParameterBlockInput,
+    block: &mut ParameterBlockInput,
     penalty_orders: &[usize],
 ) -> Result<(), String> {
     let p = block.design.ncols();
@@ -9453,27 +9457,31 @@ fn build_model_summary(
             //   lambda_tilde_k * S_tilde_k = (lambda_tilde_k / c_k) * S_k.
             // Therefore physical lambda used by continuous-order diagnostics is
             //   lambda_k = lambda_tilde_k / c_k.
-            // If legacy metadata is missing/corrupt, fallback c_k=1 preserves
-            // backward-compatible behavior.
-            let scale_or_one = |idx: usize| {
+            let normalized_scale = |idx: usize| {
                 let c = design.penaltyinfo[idx].penalty.normalization_scale;
-                if c.is_finite() && c > 0.0 { c } else { 1.0 }
+                if c.is_finite() && c > 0.0 {
+                    Some(c)
+                } else {
+                    None
+                }
             };
             let lambda_tilde = [
                 fit.lambdas[term_penalty_start],
                 fit.lambdas[term_penalty_start + 1],
                 fit.lambdas[term_penalty_start + 2],
             ];
-            let scales = [
-                scale_or_one(term_penalty_start),
-                scale_or_one(term_penalty_start + 1),
-                scale_or_one(term_penalty_start + 2),
-            ];
-            Some(compute_continuous_smoothness_order(
-                lambda_tilde,
-                scales,
-                CONTINUOUS_ORDER_EPS,
-            ))
+            match (
+                normalized_scale(term_penalty_start),
+                normalized_scale(term_penalty_start + 1),
+                normalized_scale(term_penalty_start + 2),
+            ) {
+                (Some(c0), Some(c1), Some(c2)) => Some(compute_continuous_smoothness_order(
+                    lambda_tilde,
+                    [c0, c1, c2],
+                    CONTINUOUS_ORDER_EPS,
+                )),
+                _ => None,
+            }
         } else {
             None
         };
@@ -10021,7 +10029,7 @@ mod tests {
         parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_binomial_linkwiggle, pretty_familyname,
-        run_generate_gaussian_location_scale, run_generate_standard_or_flexible,
+        run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
@@ -10034,7 +10042,7 @@ mod tests {
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
-    use gam::buildwiggle_block_input_from_knots;
+    use gam::gamlss::buildwiggle_block_input_from_knots;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
@@ -10045,7 +10053,6 @@ mod tests {
         SmoothTermSpec, TermCollectionSpec,
     };
     use gam::types::{InverseLink, LinkComponent, LinkFunction};
-    use gam::{FittedFamily, ModelKind};
     use ndarray::{Array1, Array2, ArrayView1, array};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -10602,7 +10609,7 @@ mod tests {
             2,
         );
         let mut progress = gam::visualizer::VisualizerSession::new(false);
-        let spec = run_generate_standard_or_flexible(
+        let spec = run_generate_standard(
             &mut progress,
             &model,
             ndarray::Array2::<f64>::zeros((3, 0)).view(),
@@ -11514,8 +11521,7 @@ mod tests {
     #[test]
     fn gaussian_location_scale_predict_restores_sigma_to_response_units() {
         // Directly test the CSV output for Gaussian location-scale predictions.
-        // The legacy run_predict_gaussian_location_scale was removed; this model
-        // class now always goes through the unified PredictableModel path.
+        // This model class now always goes through the unified PredictableModel path.
         let beta_mu: f64 = 12.0;
         let beta_log_sigma: f64 = (0.5f64).ln();
         let response_scale: f64 = 10.0;
