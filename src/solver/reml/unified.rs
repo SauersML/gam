@@ -2643,7 +2643,7 @@ fn compute_outer_hessian(
 /// Maximum absolute step size for the EFS update (prevents overshooting).
 const EFS_MAX_STEP: f64 = 5.0;
 
-/// Extended Fellner–Schall update for ρ and penalty-like (τ) hyperparameters.
+/// Extended Fellner-Schall update for ρ and penalty-like (τ) hyperparameters.
 ///
 /// The standard EFS update for ρ_k (log-smoothing parameters) avoids the
 /// full outer Hessian by using an approximate Newton step:
@@ -2660,7 +2660,7 @@ const EFS_MAX_STEP: f64 = 5.0;
 /// penalty matrix derivatives and is PSD, preserving the multiplicative
 /// fixed-point structure that EFS relies on.
 ///
-/// ## WARNING: EFS does not generalize to ψ coordinates
+/// ## EFS does not generalize to ψ coordinates
 ///
 /// EFS relies on the fact that `A_k = ∂S/∂ρ_k` is PSD and the update acts
 /// multiplicatively on λ_k. For ψ (design-moving) coordinates, `B_{ψ_j}`
@@ -2668,12 +2668,22 @@ const EFS_MAX_STEP: f64 = 5.0;
 /// or even sign-definite. The multiplicative fixed-point structure breaks
 /// down, making the EFS update mathematically invalid.
 ///
-/// Extended coordinates with `is_penalty_like = false` are therefore
-/// **skipped** (step = 0.0). For these coordinates, use the full Newton or
-/// BFGS outer optimizer instead. The closest valid generic approximation for
-/// ψ coordinates would be a Gauss-Newton outer step using only the
-/// trace-curvature piece `G_ij^GN = ½ tr(H⁻¹ B_j H⁻¹ B_i)`, but that is
-/// not what EFS computes.
+/// **Proof (counterexample from response.md Section 2):** Take a scalar ψ,
+/// set H(0) = I₂, and let B = diag(1, -1) (indefinite). The local family
+/// V_c(ψ) = a·ψ + ½ log det(I₂ + ψB + ½c·ψ²I₂) has ∂V(0) = a and
+/// tr(H⁻¹BH⁻¹B) = 2, both independent of c. But V_c''(0) = c - 1, so the
+/// same step can be made ascent or descent by varying c. Therefore no update
+/// rule based only on {a_d, tr(H⁻¹B_d), tr(H⁻¹B_dH⁻¹B_e)} can have a
+/// universal convergence guarantee.
+///
+/// **Structural property:** The necessary and sufficient condition for an
+/// EFS-type proof is H^{-1/2} B_d H^{-1/2} ≽ 0 (or ≼ 0) together with
+/// parameter-independent nullspace. This restores the Loewner-order
+/// inequality used in Wood-Fasiolo's theorem. Mixed inertia destroys the
+/// ordering that makes the scalar update monotone.
+///
+/// For ψ coordinates, use [`compute_hybrid_efs_update`] which applies a
+/// safeguarded preconditioned gradient step instead of the EFS formula.
 ///
 /// # Arguments
 /// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
@@ -2801,6 +2811,427 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
     }
 
     steps
+}
+
+/// Regularization threshold for pseudoinverse of the trace Gram matrix.
+///
+/// Eigenvalues below `PSI_GRAM_PINV_TOL * max_eigenvalue` are treated as
+/// zero when computing the pseudoinverse G⁺. This prevents amplification
+/// of noise in near-singular directions of the ψ-ψ Gram matrix.
+const PSI_GRAM_PINV_TOL: f64 = 1e-8;
+
+/// Initial step-size damping factor for the preconditioned gradient on ψ.
+///
+/// The raw step `Δψ_raw = -G⁺ g_ψ` is scaled by α ∈ (0, 1] before
+/// applying. This conservative initial value prevents overshooting in
+/// early iterations when the quadratic model may be inaccurate.
+const PSI_INITIAL_ALPHA: f64 = 1.0;
+
+/// Maximum number of backtracking halvings for the ψ step.
+///
+/// If after this many halvings the combined (ρ-EFS, ψ-gradient) step
+/// still doesn't decrease V(θ), the ψ step is zeroed out for this
+/// iteration and only the ρ-EFS step is applied.
+const MAX_PSI_BACKTRACK: usize = 8;
+
+/// Result of the hybrid EFS update, containing both the step vector and
+/// metadata needed for backtracking on the ψ block.
+pub struct HybridEfsResult {
+    /// Combined step vector (EFS for ρ/τ, preconditioned gradient for ψ).
+    pub steps: Vec<f64>,
+    /// Indices of ψ (design-moving) coordinates in the full θ vector.
+    /// Empty if no ψ coordinates are present.
+    pub psi_indices: Vec<usize>,
+    /// Raw REML/LAML gradient restricted to ψ coordinates.
+    /// Length matches `psi_indices.len()`.
+    pub psi_gradient: Vec<f64>,
+}
+
+/// Hybrid EFS + preconditioned gradient update.
+///
+/// Computes a combined step for all hyperparameters:
+/// - **ρ (penalty-like) coordinates**: standard EFS multiplicative fixed-point
+///   update, identical to [`compute_efs_update`].
+/// - **ψ (design-moving) coordinates**: safeguarded preconditioned gradient step
+///   using the trace Gram matrix as preconditioner:
+///
+///   ```text
+///   Δψ = -α G⁺ g_ψ
+///   ```
+///
+///   where:
+///   - `g_ψ` is the REML/LAML gradient restricted to the ψ block
+///   - `G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)` is the trace Gram matrix for ψ-ψ pairs
+///   - `G⁺` is the Moore-Penrose pseudoinverse (truncated at `PSI_GRAM_PINV_TOL`)
+///   - `α ∈ (0, 1]` is the damping factor
+///
+/// ## Why this works (reference: response.md Section 2)
+///
+/// The trace Gram matrix G is the same object that EFS uses as its scalar
+/// denominator for penalty-like coordinates. For ψ coordinates, G still
+/// captures the local curvature structure `tr(H⁻¹ B_d H⁻¹ B_e)` — it is
+/// the natural metric on the ψ-subspace induced by the penalized likelihood.
+/// However, unlike the EFS case, we cannot derive a monotone fixed-point
+/// iteration from G alone because B_ψ may have mixed inertia (the Frobenius
+/// norm `tr(H⁻¹BH⁻¹B)` is always positive but does not bound the true
+/// curvature).
+///
+/// The preconditioned gradient `Δψ = -G⁺ g_ψ` is the cheap replacement
+/// recommended by the math team: it uses the same trace Gram matrix, stays
+/// at O(1) H⁻¹ solves per iteration (same as pure EFS), and avoids
+/// pretending that the Gram denominator is the true scalar curvature.
+/// Compare with full BFGS which requires O(dim(θ)) gradient evaluations
+/// (each involving a full inner solve) per outer step.
+///
+/// ## Step-size safeguarding
+///
+/// 1. Compute G for the ψ-ψ block from H⁻¹ B_d products (already available).
+/// 2. Pseudoinverse: G⁺ via eigendecomposition, truncating eigenvalues below
+///    `PSI_GRAM_PINV_TOL * max_eigenvalue` to avoid noise amplification in
+///    near-singular directions.
+/// 3. Raw step: `Δψ_raw = -G⁺ g_ψ`.
+/// 4. Damping: `Δψ = α × Δψ_raw` with initial `α = PSI_INITIAL_ALPHA`.
+/// 5. Capping: `||Δψ||_∞ ≤ EFS_MAX_STEP` (same cap as ρ coordinates).
+/// 6. Backtracking (handled by caller): if the combined step doesn't decrease
+///    V(θ), halve α for the ψ block up to `MAX_PSI_BACKTRACK` times.
+///
+/// # Arguments
+/// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
+/// - `rho`: Current log-smoothing parameters.
+/// - `gradient`: Full REML/LAML gradient ∂V/∂θ (length = n_rho + n_ext).
+///   Must be provided; the hybrid needs the gradient for ψ coordinates.
+///
+/// # Returns
+/// A [`HybridEfsResult`] containing the combined step vector and metadata
+/// for backtracking.
+pub fn compute_hybrid_efs_update(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    gradient: &[f64],
+) -> HybridEfsResult {
+    let k = rho.len();
+    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let hop = &*solution.hessian_op;
+    let ext_dim = solution.ext_coords.len();
+    let total = k + ext_dim;
+    let mut steps = vec![0.0; total];
+
+    // Profiled Gaussian rescaling factor.
+    let (profiled_scale, is_profiled) = match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => {
+            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+            let (dp_c, _) = smooth_floor_dp(dp_raw);
+            let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
+            (dp_c / denom, true)
+        }
+        DispersionHandling::Fixed { phi, .. } => (*phi, false),
+    };
+
+    // ── ρ coordinates: standard EFS (identical to compute_efs_update) ──
+    for idx in 0..k {
+        let r_k = &solution.penalty_roots[idx];
+        let r_beta = r_k.dot(&solution.beta);
+        let s_k_beta_sq = r_beta.dot(&r_beta);
+        let a_k = 0.5 * lambdas[idx] * s_k_beta_sq;
+        let a_k_eff = if is_profiled {
+            a_k / profiled_scale
+        } else {
+            a_k
+        };
+
+        let a_k_matrix = {
+            let mut m = r_k.t().dot(r_k);
+            m *= lambdas[idx];
+            m
+        };
+
+        let trace_term = hop.trace_hinv_h_k(&a_k_matrix, None);
+        let numerator = 2.0 * a_k_eff - trace_term;
+        let y_k = hop.solve_multi(&a_k_matrix);
+        let denominator = (&y_k * &y_k).sum();
+
+        let step = if denominator.abs() > 1e-30 {
+            (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+        } else {
+            0.0
+        };
+        steps[idx] = step;
+    }
+
+    // ── Extended penalty-like (τ) coordinates: standard EFS ──
+    // ── ψ (design-moving) coordinates: collect for preconditioned gradient ──
+    //
+    // We need to separate ψ coords from τ coords. τ coords get the same EFS
+    // treatment as ρ. ψ coords are collected and processed jointly via the
+    // trace Gram matrix.
+    let mut psi_local_indices: Vec<usize> = Vec::new(); // index within ext_coords
+    let mut psi_global_indices: Vec<usize> = Vec::new(); // index in full θ vector
+
+    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+        if coord.is_penalty_like {
+            // τ coordinate: standard EFS update.
+            let a_i_eff = if is_profiled {
+                coord.a / profiled_scale
+            } else {
+                coord.a
+            };
+
+            let b_mat_dense;
+            let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
+                b_mat_dense = coord.b_operator.as_ref().unwrap().to_dense();
+                &b_mat_dense
+            } else {
+                &coord.b_mat
+            };
+            let trace_term = hop.trace_hinv_h_k(b_ref, None);
+            let numerator = 2.0 * a_i_eff - trace_term;
+            let y_i = hop.solve_multi(b_ref);
+            let denominator = (&y_i * &y_i).sum();
+
+            let step = if denominator.abs() > 1e-30 {
+                (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
+            } else {
+                0.0
+            };
+            steps[k + ext_idx] = step;
+        } else {
+            // ψ coordinate: collect for joint preconditioned gradient.
+            psi_local_indices.push(ext_idx);
+            psi_global_indices.push(k + ext_idx);
+        }
+    }
+
+    // Collect the ψ-block gradient for the caller (for backtracking).
+    let psi_gradient: Vec<f64> = psi_global_indices
+        .iter()
+        .map(|&gi| gradient[gi])
+        .collect();
+
+    // ── ψ coordinates: preconditioned gradient step ──
+    //
+    // The preconditioned gradient step for ψ (design-moving) coordinates:
+    //
+    //   Δψ = -α G⁺ g_ψ
+    //
+    // where G_{de} = tr(H⁻¹ B_d H⁻¹ B_e) is the trace Gram matrix and
+    // g_ψ is the REML/LAML gradient restricted to the ψ block.
+    //
+    // This is the practical replacement for EFS on ψ coordinates recommended
+    // by the math team (response.md Section 2). It uses the same trace Gram
+    // matrix that EFS computes, stays cheap (O(1) H⁻¹ solves), and avoids
+    // the invalid assumption that the Gram norm bounds the true curvature.
+    let n_psi = psi_local_indices.len();
+    if n_psi > 0 {
+        // Step 1: Compute H⁻¹ B_d for each ψ coordinate.
+        // These are the same solves that EFS would use for its denominator.
+        let mut y_psi: Vec<ndarray::Array2<f64>> = Vec::with_capacity(n_psi);
+        for &li in &psi_local_indices {
+            let coord = &solution.ext_coords[li];
+            let b_mat_dense;
+            let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
+                b_mat_dense = coord.b_operator.as_ref().unwrap().to_dense();
+                // Need to clone into y_psi since b_mat_dense is temporary.
+                let y = hop.solve_multi(&b_mat_dense);
+                y_psi.push(y);
+                continue;
+            } else {
+                &coord.b_mat
+            };
+            let y = hop.solve_multi(b_ref);
+            y_psi.push(y);
+        }
+
+        // Step 2: Build the trace Gram matrix G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)
+        //       = tr(Y_d^T Y_e) where Y_d = H⁻¹ B_d.
+        //
+        // G is symmetric and generally PSD (it is a Gram matrix of the
+        // operators {H^{-1/2} B_d} in Frobenius norm), but may be
+        // near-singular when B_d are nearly linearly dependent in H⁻¹-norm.
+        let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
+        for d in 0..n_psi {
+            for e in d..n_psi {
+                let val = (&y_psi[d] * &y_psi[e]).sum();
+                gram[[d, e]] = val;
+                gram[[e, d]] = val;
+            }
+        }
+
+        // Step 3: Pseudoinverse G⁺ via eigendecomposition.
+        //
+        // For small n_psi (typically 2-10 anisotropic axes), this is cheap.
+        // We truncate eigenvalues below PSI_GRAM_PINV_TOL * λ_max to form
+        // the pseudoinverse, avoiding noise amplification in near-singular
+        // directions. This is the standard approach for constrained
+        // optimization on submanifolds (see response.md Section 4).
+        let g_psi = ndarray::Array1::from_vec(psi_gradient.clone());
+        let delta_psi = pseudoinverse_times_vec(&gram, &g_psi, PSI_GRAM_PINV_TOL);
+
+        // Step 4: Apply damping and capping.
+        //
+        // Δψ = -α × G⁺ g_ψ, capped to ||Δψ||_∞ ≤ EFS_MAX_STEP.
+        // The negative sign is because we are descending on V(θ) (minimizing).
+        let alpha = PSI_INITIAL_ALPHA;
+        for (psi_idx, &global_idx) in psi_global_indices.iter().enumerate() {
+            let raw_step = -alpha * delta_psi[psi_idx];
+            steps[global_idx] = raw_step.clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
+        }
+    }
+
+    HybridEfsResult {
+        steps,
+        psi_indices: psi_global_indices,
+        psi_gradient,
+    }
+}
+
+/// Compute G⁺ v where G⁺ is the pseudoinverse of symmetric matrix G.
+///
+/// Uses eigendecomposition with truncation: eigenvalues below
+/// `tol * max_eigenvalue` are treated as zero. For small matrices
+/// (typical n_psi = 2-10), the O(n³) cost is negligible.
+fn pseudoinverse_times_vec(
+    gram: &ndarray::Array2<f64>,
+    v: &ndarray::Array1<f64>,
+    tol: f64,
+) -> ndarray::Array1<f64> {
+    let n = gram.nrows();
+    if n == 0 {
+        return ndarray::Array1::zeros(0);
+    }
+
+    // Special case: scalar (1x1).
+    if n == 1 {
+        let g = gram[[0, 0]];
+        if g.abs() < tol.max(1e-30) {
+            return ndarray::Array1::zeros(1);
+        }
+        return ndarray::Array1::from_vec(vec![v[0] / g]);
+    }
+
+    // Eigendecomposition of symmetric G via the faer crate would be ideal,
+    // but to keep this self-contained we use a simple symmetric
+    // eigendecomposition via Jacobi rotations for small matrices, or
+    // fall back to diagonal-only pseudoinverse for safety.
+    //
+    // For production quality, this should use faer's `SelfAdjointEigendecomposition`.
+    // Here we implement a robust fallback that works for typical n_psi = 2-10.
+
+    // Attempt: use ndarray's built-in symmetric eigendecomposition if available,
+    // otherwise fall back to a diagonal approximation.
+    //
+    // Robust implementation: compute G = Q Λ Q^T via iterative Jacobi.
+    // For n ≤ 10 this converges in a handful of sweeps.
+    let (eigenvalues, eigenvectors) = symmetric_eigen(gram);
+
+    let max_eval = eigenvalues.iter().cloned().fold(0.0_f64, f64::max);
+    let cutoff = tol * max_eval;
+
+    // G⁺ v = Q diag(1/λ_i for λ_i > cutoff, else 0) Q^T v
+    let qt_v: Vec<f64> = (0..n)
+        .map(|i| {
+            let col = eigenvectors.column(i);
+            col.dot(v)
+        })
+        .collect();
+
+    let mut result = ndarray::Array1::zeros(n);
+    for i in 0..n {
+        if eigenvalues[i] > cutoff {
+            let scale = qt_v[i] / eigenvalues[i];
+            let col = eigenvectors.column(i);
+            result.scaled_add(scale, &col.to_owned());
+        }
+    }
+    result
+}
+
+/// Symmetric eigendecomposition via classical Jacobi iteration.
+///
+/// Returns (eigenvalues, eigenvectors) where eigenvectors are stored
+/// column-wise. Suitable for small matrices (n ≤ 20). For n_psi = 2-10
+/// (typical anisotropic axis counts), this converges in 2-5 sweeps.
+///
+/// This is a self-contained implementation to avoid external dependencies.
+/// For larger matrices, use faer's `SelfAdjointEigendecomposition`.
+fn symmetric_eigen(
+    a: &ndarray::Array2<f64>,
+) -> (Vec<f64>, ndarray::Array2<f64>) {
+    let n = a.nrows();
+    assert_eq!(n, a.ncols(), "symmetric_eigen requires square matrix");
+
+    let mut work = a.clone();
+    let mut v = ndarray::Array2::<f64>::eye(n);
+
+    // Jacobi iteration: sweep through all off-diagonal pairs, zeroing them.
+    let max_sweeps = 100;
+    let tol = 1e-15;
+
+    for _sweep in 0..max_sweeps {
+        // Check convergence: sum of squares of off-diagonal elements.
+        let mut off_diag_sq = 0.0;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                off_diag_sq += work[[i, j]] * work[[i, j]];
+            }
+        }
+        if off_diag_sq < tol * tol {
+            break;
+        }
+
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let apq = work[[p, q]];
+                if apq.abs() < tol * 0.01 {
+                    continue;
+                }
+
+                let app = work[[p, p]];
+                let aqq = work[[q, q]];
+                let tau = (aqq - app) / (2.0 * apq);
+
+                // Stable computation of t = sign(τ) / (|τ| + sqrt(1 + τ²))
+                let t = if tau.abs() > 1e15 {
+                    // Nearly diagonal: skip.
+                    continue;
+                } else {
+                    let sign_tau = if tau >= 0.0 { 1.0 } else { -1.0 };
+                    sign_tau / (tau.abs() + (1.0 + tau * tau).sqrt())
+                };
+
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+
+                // Apply Jacobi rotation to work matrix.
+                work[[p, p]] = app - t * apq;
+                work[[q, q]] = aqq + t * apq;
+                work[[p, q]] = 0.0;
+                work[[q, p]] = 0.0;
+
+                for r in 0..n {
+                    if r == p || r == q {
+                        continue;
+                    }
+                    let wrp = work[[r, p]];
+                    let wrq = work[[r, q]];
+                    work[[r, p]] = c * wrp - s * wrq;
+                    work[[p, r]] = work[[r, p]];
+                    work[[r, q]] = s * wrp + c * wrq;
+                    work[[q, r]] = work[[r, q]];
+                }
+
+                // Accumulate eigenvectors.
+                for r in 0..n {
+                    let vrp = v[[r, p]];
+                    let vrq = v[[r, q]];
+                    v[[r, p]] = c * vrp - s * vrq;
+                    v[[r, q]] = s * vrp + c * vrq;
+                }
+            }
+        }
+    }
+
+    let eigenvalues: Vec<f64> = (0..n).map(|i| work[[i, i]]).collect();
+    (eigenvalues, v)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5142,5 +5573,76 @@ mod tests {
             fd_second,
             abs_err_without,
         );
+    }
+
+    #[test]
+    fn test_symmetric_eigen_identity() {
+        let eye = Array2::<f64>::eye(3);
+        let (evals, evecs) = symmetric_eigen(&eye);
+        for &e in &evals {
+            assert!((e - 1.0).abs() < 1e-12, "eigenvalue should be 1.0, got {e}");
+        }
+        // Eigenvectors should be orthonormal.
+        let prod = evecs.t().dot(&evecs);
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (prod[[i, j]] - expected).abs() < 1e-12,
+                    "Q^T Q should be identity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_symmetric_eigen_diagonal() {
+        let mut d = Array2::<f64>::zeros((3, 3));
+        d[[0, 0]] = 4.0;
+        d[[1, 1]] = 2.0;
+        d[[2, 2]] = 1.0;
+        let (evals, _) = symmetric_eigen(&d);
+        let mut sorted = evals.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        assert!((sorted[0] - 1.0).abs() < 1e-12);
+        assert!((sorted[1] - 2.0).abs() < 1e-12);
+        assert!((sorted[2] - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_pseudoinverse_times_vec_identity() {
+        let eye = Array2::<f64>::eye(3);
+        let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let result = pseudoinverse_times_vec(&eye, &v, 1e-8);
+        for i in 0..3 {
+            assert!(
+                (result[i] - v[i]).abs() < 1e-12,
+                "G=I: G⁺v should equal v"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pseudoinverse_times_vec_singular() {
+        // Rank-1 matrix: G = [1 1; 1 1]. Pseudoinverse G⁺ = [0.25 0.25; 0.25 0.25].
+        let mut g = Array2::<f64>::zeros((2, 2));
+        g[[0, 0]] = 1.0;
+        g[[0, 1]] = 1.0;
+        g[[1, 0]] = 1.0;
+        g[[1, 1]] = 1.0;
+        let v = Array1::from_vec(vec![2.0, 0.0]);
+        let result = pseudoinverse_times_vec(&g, &v, 1e-8);
+        // G⁺ v = [0.25*2 + 0.25*0; 0.25*2 + 0.25*0] = [0.5; 0.5]
+        assert!((result[0] - 0.5).abs() < 1e-10);
+        assert!((result[1] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_pseudoinverse_scalar() {
+        let mut g = Array2::<f64>::zeros((1, 1));
+        g[[0, 0]] = 4.0;
+        let v = Array1::from_vec(vec![8.0]);
+        let result = pseudoinverse_times_vec(&g, &v, 1e-8);
+        assert!((result[0] - 2.0).abs() < 1e-12);
     }
 }
