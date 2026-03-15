@@ -23,8 +23,8 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
-use crate::estimate::reml::unified::compute_block_penalty_logdet_derivs;
 use crate::estimate::reml::FirthDenseOperator;
+use crate::estimate::reml::unified::compute_block_penalty_logdet_derivs;
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;
@@ -818,10 +818,10 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
 #[cfg(test)]
 mod tests {
     use super::{
-        FamilyNutsInputs, GlmFlatInputs, JointLinkPosterior, JointSplineArtifacts, NutsConfig,
-        JointBetaRhoInputs, NutsFamily, NutsPosterior, SharedData,
-        firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling,
-        run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
+        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointLinkPosterior,
+        JointSplineArtifacts, NutsConfig, NutsFamily, NutsPosterior, SharedData,
+        firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
+        run_nuts_sampling_flattened_family,
     };
     use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
@@ -1203,9 +1203,7 @@ mod tests {
         .expect_err("Poisson Firth should be rejected explicitly");
 
         assert!(
-            err.contains(
-                "NUTS with Firth is only supported for Binomial Logit"
-            ),
+            err.contains("NUTS with Firth is only supported for Binomial Logit"),
             "unexpected error: {err}"
         );
     }

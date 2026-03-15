@@ -8786,7 +8786,8 @@ pub fn optimize_two_block_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn
     noisespec: &TermCollectionSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     joint_setup: &TwoBlockExactJointHyperSetup,
-    analytic_joint_derivatives_available: bool,
+    analytic_joint_gradient_available: bool,
+    analytic_joint_hessian_available: bool,
     mut cost_fn: CostFn,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
@@ -8951,7 +8952,15 @@ where
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: if analytic_joint_derivatives_available {
+        fallback_sequence: if analytic_joint_hessian_available {
+            vec![OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+            }]
+        } else if !analytic_joint_gradient_available {
             vec![OuterCapability {
                 gradient: Derivative::FiniteDifference,
                 hessian: Derivative::Unavailable,
@@ -8967,12 +8976,12 @@ where
     let mut obj = ClosureObjective {
         state: &mut state,
         cap: OuterCapability {
-            gradient: if analytic_joint_derivatives_available {
+            gradient: if analytic_joint_gradient_available {
                 Derivative::Analytic
             } else {
                 Derivative::FiniteDifference
             },
-            hessian: if analytic_joint_derivatives_available {
+            hessian: if analytic_joint_hessian_available {
                 Derivative::Analytic
             } else {
                 Derivative::Unavailable
@@ -10601,6 +10610,7 @@ mod tests {
             &kappa_options,
             &joint_setup,
             true,
+            true,
             |rho, _, _, mean_design, noise_design| {
                 assert!(rho.is_empty());
                 Ok(mean_design.design.ncols() as f64
@@ -10615,7 +10625,7 @@ mod tests {
                     + mean_design.penalties.len() as f64
                     + noise_design.penalties.len() as f64)
             },
-            |_rho, _, _, _, _, need_hessian| {
+            |_, _, _, _, _, need_hessian| {
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),
@@ -11252,6 +11262,7 @@ mod tests {
             &kappa_options,
             &joint_setup,
             true,
+            true,
             |rho, _, _, mean_design, noise_design| {
                 assert!(rho.is_empty());
                 Ok(mean_design.design.ncols() as f64
@@ -11266,7 +11277,7 @@ mod tests {
                     + mean_design.penalties.len() as f64
                     + noise_design.penalties.len() as f64)
             },
-            |_rho, _, _, _, _, need_hessian| {
+            |_, _, _, _, _, need_hessian| {
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),

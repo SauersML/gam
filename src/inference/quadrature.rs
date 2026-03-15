@@ -962,7 +962,9 @@ fn logit_large_sigma_probit_asymptotic(mu: f64, sigma: f64) -> IntegratedMeanDer
     //
     // This is the standard probit approximation recommended for the
     // high-variance regime in the task notes.
-    let kappa = (1.0 + std::f64::consts::PI * sigma * sigma / 8.0).sqrt().recip();
+    let kappa = (1.0 + std::f64::consts::PI * sigma * sigma / 8.0)
+        .sqrt()
+        .recip();
     let z = mu * kappa;
     IntegratedMeanDerivative {
         mean: crate::probability::normal_cdf(z),
@@ -1193,7 +1195,11 @@ fn cloglog_large_sigma_transition_tail(mu: f64, sigma: f64) -> f64 {
     let b = (mu + sigma * sigma) / sigma;
     let log_tail = mu + 0.5 * sigma * sigma + log_normal_cdf_stable(-b);
     if !log_tail.is_finite() {
-        if log_tail.is_sign_negative() { 0.0 } else { 1.0 }
+        if log_tail.is_sign_negative() {
+            0.0
+        } else {
+            1.0
+        }
     } else if log_tail <= -745.0 {
         0.0
     } else {
@@ -2336,8 +2342,7 @@ fn integrated_mixture_jet(
     }
     if mixture_state.components.len() != mixture_state.pi.len() {
         return Err(EstimationError::InvalidInput(
-            "integrated mixture-link jet requires matching component and weight counts"
-                .to_string(),
+            "integrated mixture-link jet requires matching component and weight counts".to_string(),
         ));
     }
 
@@ -2875,7 +2880,7 @@ fn integrated_cloglog_jet_ghq(
 }
 
 #[inline]
-fn integrated_jet_fd_step(_mu: f64, sigma: f64) -> f64 {
+fn integrated_jet_fd_step(sigma: f64) -> f64 {
     (1e-4 * (1.0 + sigma.abs())).clamp(1e-5, 5e-2)
 }
 
@@ -2903,17 +2908,16 @@ fn integrate_inverse_link_jet_from_scalar_backend(
     // and its first mu-derivative exactly or via controlled asymptotics. PIRLS
     // also consumes d2 and d3, so we differentiate that same scalar backend in
     // mu with a fourth-order symmetric stencil rather than re-enter GHQ.
-    let h = integrated_jet_fd_step(mu, sigma);
+    let h = integrated_jet_fd_step(sigma);
     let c0 = eval(mu, sigma)?;
     let cm1 = eval(mu - h, sigma)?;
     let cp1 = eval(mu + h, sigma)?;
     let cm2 = eval(mu - 2.0 * h, sigma)?;
     let cp2 = eval(mu + 2.0 * h, sigma)?;
 
-    let d2 = (cm2.dmean_dmu - 8.0 * cm1.dmean_dmu + 8.0 * cp1.dmean_dmu - cp2.dmean_dmu)
-        / (12.0 * h);
-    let d3 = (-cp2.dmean_dmu + 16.0 * cp1.dmean_dmu - 30.0 * c0.dmean_dmu
-        + 16.0 * cm1.dmean_dmu
+    let d2 =
+        (cm2.dmean_dmu - 8.0 * cm1.dmean_dmu + 8.0 * cp1.dmean_dmu - cp2.dmean_dmu) / (12.0 * h);
+    let d3 = (-cp2.dmean_dmu + 16.0 * cp1.dmean_dmu - 30.0 * c0.dmean_dmu + 16.0 * cm1.dmean_dmu
         - cm2.dmean_dmu)
         / (12.0 * h * h);
 

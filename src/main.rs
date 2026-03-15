@@ -29,11 +29,8 @@ use gam::families::scale_design::{
     infer_non_intercept_start,
 };
 use gam::gamlss::{
-    BinomialLocationScaleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
-    GaussianLocationScaleTermSpec, ParameterBlockInput, WiggleBlockConfig,
-    buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
-    fit_binomial_location_scale_termsworkflow, fit_binomial_mean_wiggle,
-    fit_gaussian_location_scale_terms,
+    BinomialLocationScaleTermSpec, GaussianLocationScaleTermSpec, ParameterBlockInput,
+    WiggleBlockConfig, buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -48,9 +45,7 @@ use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
     ModelKind, PredictModelClass,
 };
-use gam::joint::{
-    JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine, predict_joint,
-};
+use gam::joint::{JointLinkGeometry, JointModelConfig, JointModelResult, predict_joint};
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
@@ -61,23 +56,28 @@ use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
-    build_term_collection_design, fit_term_collectionwith_spatial_length_scale_optimization,
+    build_term_collection_design,
 };
 use gam::solver::strategy::{
     ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
-    CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
-    SurvivalLocationScalePredictInput, SurvivalLocationScaleSpec, TimeBlockInput,
-    TimeDependentCovariateBlockInput, fit_survival_location_scale, predict_survival_location_scale,
+    ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
+    SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
     residual_distribution_inverse_link,
 };
 use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
     SasLinkSpec, SasLinkState,
 };
-use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use gam::workflow::{
+    BinomialLocationScaleWorkflowRequest, FitModelRequest, FitModelResult,
+    FlexibleLinkWorkflowRequest, GaussianLocationScaleWorkflowRequest, LinkWiggleWorkflowConfig,
+    StandardBinomialWiggleWorkflowConfig, StandardFitWorkflowRequest,
+    SurvivalLocationScaleWorkflowRequest, fit_model,
+};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, HashMap};
@@ -879,15 +879,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })?;
-    progress.set_stage("fit", "building design matrices");
-    progress.start_secondary_workflow("Design Matrices", 2);
-    let initial_design = build_term_collection_design(ds.values.view(), &spec)
-        .map_err(|e| format!("failed to build term collection design: {e}"))?;
-    progress.advance_secondary_workflow(1);
-    let initial_frozenspec = freeze_term_collectionspec(&spec, &initial_design)?;
-    progress.finish_secondary_progress("design matrices assembled");
-    progress.advance_workflow(3);
-
     let fit_max_iter = 200usize;
     let fit_tol = 1e-6f64;
     let weights = Array1::ones(ds.values.nrows());
@@ -920,20 +911,32 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 degree: 3,
             };
             progress.teardown();
-            let joint = fit_joint_model_engine(
-                y.view(),
-                weights.view(),
-                initial_design.design.view(),
-                initial_design.penalties.clone(),
-                choice.link,
-                geometry,
-                config,
-                args.out.is_some(),
-            )
-            .map_err(|e| {
-                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                format!("flexible-link fit failed: {e}")
-            })?;
+            let joint =
+                match fit_model(FitModelRequest::FlexibleLink(FlexibleLinkWorkflowRequest {
+                    y: y.view(),
+                    weights: weights.view(),
+                    data: ds.values.view(),
+                    spec: spec.clone(),
+                    link: choice.link,
+                    geometry,
+                    config,
+                    include_base_covariance: args.out.is_some(),
+                })) {
+                    Ok(FitModelResult::FlexibleLink(result)) => result,
+                    Ok(_) => {
+                        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                        return Err(
+                            "internal flexible-link workflow returned the wrong result variant"
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                        return Err(format!("flexible-link fit failed: {e}"));
+                    }
+                };
+            let initial_frozenspec = freeze_term_collectionspec(&joint.spec, &joint.design)?;
+            let joint = joint.fit;
 
             println!(
                 "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
@@ -987,11 +990,71 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             return Ok(());
         }
     }
-    let (fit, design, resolvedspec, adaptive_regularization_diagnostics): (
+    progress.advance_workflow(3);
+    let adaptive_opts = if args.adaptive_regularization {
+        Some(AdaptiveRegularizationOptions {
+            enabled: true,
+            ..AdaptiveRegularizationOptions::default()
+        })
+    } else {
+        None
+    };
+    let base_fit_options = FitOptions {
+        mixture_link: mixture_linkspec.clone(),
+        optimize_mixture: true,
+        sas_link: sas_linkspec,
+        optimize_sas: sas_linkspec.is_some()
+            && matches!(
+                effective_link,
+                LinkFunction::Sas | LinkFunction::BetaLogistic
+            ),
+        compute_inference: true,
+        max_iter: fit_max_iter,
+        tol: fit_tol,
+        nullspace_dims: vec![],
+        linear_constraints: None,
+        adaptive_regularization: adaptive_opts,
+        penalty_shrinkage_floor: Some(1e-6),
+    };
+    let standard_wiggle =
+        if learn_linkwiggle && args.predict_noise.is_none() && !mean_only_flexible_linkwiggle {
+            let wiggle_cfg = effective_linkwiggle
+                .as_ref()
+                .expect("learn_linkwiggle guarantees wiggle config");
+            let link_kind = resolve_binomial_inverse_link_for_fit(
+                family,
+                effective_link,
+                mixture_linkspec.as_ref(),
+                sas_linkspec.as_ref(),
+                "binomial mean-only link wiggle",
+            )?;
+            Some(StandardBinomialWiggleWorkflowConfig {
+                link_kind,
+                wiggle: LinkWiggleWorkflowConfig {
+                    degree: wiggle_cfg.degree,
+                    num_internal_knots: wiggle_cfg.num_internal_knots,
+                    penalty_orders: wiggle_cfg.penalty_orders.clone(),
+                    double_penalty: wiggle_cfg.double_penalty,
+                },
+            })
+        } else {
+            None
+        };
+
+    let (
+        fit,
+        design,
+        resolvedspec,
+        adaptive_regularization_diagnostics,
+        standard_saved_link_state,
+        standard_wiggle_meta,
+    ): (
         UnifiedFitResult,
         gam::smooth::TermCollectionDesign,
         TermCollectionSpec,
         Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
+        FittedLinkState,
+        Option<(Vec<f64>, usize, Vec<f64>)>,
     ) = if args.firth {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -1018,77 +1081,45 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
-        (fit_result_from_external(ext), design, spec.clone(), None)
+        (
+            fit_result_from_external(ext),
+            design,
+            spec.clone(),
+            None,
+            FittedLinkState::Standard(None),
+            None,
+        )
     } else {
-        let adaptive_opts = if args.adaptive_regularization {
-            Some(AdaptiveRegularizationOptions {
-                enabled: true,
-                ..AdaptiveRegularizationOptions::default()
-            })
-        } else {
-            None
-        };
-        let base_fit_options = FitOptions {
-            mixture_link: mixture_linkspec.clone(),
-            optimize_mixture: true,
-            sas_link: sas_linkspec,
-            optimize_sas: sas_linkspec.is_some()
-                && matches!(
-                    effective_link,
-                    LinkFunction::Sas | LinkFunction::BetaLogistic
-                ),
-            compute_inference: true,
-            max_iter: fit_max_iter,
-            tol: fit_tol,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            adaptive_regularization: adaptive_opts,
-            penalty_shrinkage_floor: Some(1e-6),
-        };
         progress.set_stage("fit", "optimizing penalized likelihood");
-        let fitted = match fit_term_collectionwith_spatial_length_scale_optimization(
-            ds.values.view(),
-            y.clone(),
-            weights.clone(),
-            offset.clone(),
-            &spec,
+        let fitted = match fit_model(FitModelRequest::Standard(StandardFitWorkflowRequest {
+            data: ds.values.view(),
+            y: y.clone(),
+            weights: weights.clone(),
+            offset: offset.clone(),
+            spec: spec.clone(),
             family,
-            &base_fit_options,
-            &SpatialLengthScaleOptimizationOptions::default(),
-        ) {
-            Ok(fitted) => fitted,
-            Err(first_err) => {
-                // SAS-link outer auxiliary optimization can occasionally stall on
-                // boundary-heavy datasets. Retry once with fixed SAS params.
-                if base_fit_options.optimize_sas
-                    && base_fit_options.sas_link.is_some()
-                    && matches!(first_err, EstimationError::PirlsDidNotConverge { .. })
-                {
-                    eprintln!(
-                        "[fit] SAS outer optimization failed to converge; retrying with --optimize-sas disabled"
-                    );
-                    let mut retry_options = base_fit_options.clone();
-                    retry_options.optimize_sas = false;
-                    fit_term_collectionwith_spatial_length_scale_optimization(
-                        ds.values.view(),
-                        y.clone(),
-                        weights.clone(),
-                        offset.clone(),
-                        &spec,
-                        family,
-                        &retry_options,
-                        &SpatialLengthScaleOptimizationOptions::default(),
-                    )
-                    .map_err(|retry_err| {
-                        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                        format!(
-                            "fit_term_collection failed (SAS optimize->fixed retry also failed): initial={first_err}; retry={retry_err}"
-                        )
-                    })?
-                } else {
-                    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                    return Err(format!("fit_term_collection failed: {first_err}"));
-                }
+            options: base_fit_options,
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            wiggle: standard_wiggle,
+            wiggle_options: if learn_linkwiggle
+                && args.predict_noise.is_none()
+                && !mean_only_flexible_linkwiggle
+            {
+                Some(blockwise_options_from_fit_args(&args)?)
+            } else {
+                None
+            },
+        })) {
+            Ok(FitModelResult::Standard(result)) => result,
+            Ok(_) => {
+                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                return Err(
+                    "internal standard workflow returned the wrong result variant".to_string(),
+                );
+            }
+            Err(e) => {
+                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                return Err(format!("standard term fit failed: {e}"));
             }
         };
         (
@@ -1096,6 +1127,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             fitted.design,
             fitted.resolvedspec,
             fitted.adaptive_diagnostics,
+            fitted.saved_link_state,
+            match (fitted.wiggle_knots, fitted.wiggle_degree, fitted.betawiggle) {
+                (Some(knots), Some(degree), Some(betawiggle)) => {
+                    Some((knots.to_vec(), degree, betawiggle))
+                }
+                _ => None,
+            },
         )
     };
     progress.advance_workflow(4);
@@ -1103,25 +1141,20 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let frozenspec = freeze_term_collectionspec(&resolvedspec, &design)?;
     let mut saved_fit = fit.clone();
-    let mut standard_wiggle_meta: Option<(Vec<f64>, usize, Vec<f64>)> = None;
-    if learn_linkwiggle && args.predict_noise.is_none() && !mean_only_flexible_linkwiggle {
-        let wiggle_cfg = effective_linkwiggle
-            .as_ref()
-            .expect("learn_linkwiggle guarantees wiggle config");
-        let link_kind = resolve_binomial_inverse_link_for_fit(
-            family,
-            effective_link,
-            mixture_linkspec.as_ref(),
-            sas_linkspec.as_ref(),
-            "binomial mean-only link wiggle",
-        )?;
-        let wiggle_fit =
-            fit_standard_binomial_linkwiggle(&design, &fit, &y, link_kind, wiggle_cfg, &args)?;
-        let q0_final = design.design.dot(&wiggle_fit.fit_result.beta);
+    saved_fit.fitted_link = standard_saved_link_state.clone();
+    let saved_termspec = frozenspec.clone();
+    if let Some((wiggle_knots, wiggle_degree, _)) = standard_wiggle_meta.as_ref() {
+        let beta_eta = fit
+            .block_states
+            .first()
+            .ok_or_else(|| "standard wiggle fit is missing eta block".to_string())?
+            .beta
+            .clone();
+        let q0_final = design.design.dot(&beta_eta);
         let domain = summarizewiggle_domain(
             q0_final.view(),
-            ArrayView1::from(&wiggle_fit.wiggle_knots),
-            wiggle_fit.wiggle_degree,
+            ArrayView1::from(wiggle_knots),
+            *wiggle_degree,
         )?;
         if domain.outside_count > 0 {
             eprintln!(
@@ -1133,12 +1166,15 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 domain.domain_max
             );
         }
-        saved_fit = wiggle_fit.fit_result;
-        standard_wiggle_meta = Some((
-            wiggle_fit.wiggle_knots,
-            wiggle_fit.wiggle_degree,
-            wiggle_fit.betawiggle,
-        ));
+        saved_fit = core_saved_fit_result(
+            beta_eta,
+            fit.lambdas.clone(),
+            1.0,
+            fit.covariance_conditional.clone(),
+            fit.covariance_conditional.clone(),
+            SavedFitSummary::from_blockwise_fit(&fit)?,
+        );
+        saved_fit.fitted_link = standard_saved_link_state.clone();
     } else {
         compact_fit_result_for_batch(&mut saved_fit);
     }
@@ -1152,8 +1188,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedFamily::Standard {
                 likelihood: family,
                 link: Some(effective_link),
-                mixture_state: saved_mixture_state_from_fit(&fit),
-                sas_state: saved_sas_state_from_fit(&fit),
+                mixture_state: saved_mixture_state_from_fit(&saved_fit),
+                sas_state: saved_sas_state_from_fit(&saved_fit),
             },
             family_to_string(family).to_string(),
         );
@@ -1166,7 +1202,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             payload.probitwiggle_degree = Some(wiggle_degree);
             payload.betawiggle = Some(betawiggle);
         }
-        match &fit.fitted_link {
+        match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {
                 payload.mixture_link_param_covariance =
                     covariance.as_ref().map(array2_to_nestedvec);
@@ -1178,7 +1214,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedLinkState::Standard(_) => {}
         }
         payload.training_headers = Some(ds.headers.clone());
-        payload.resolved_termspec = Some(frozenspec);
+        payload.resolved_termspec = Some(saved_termspec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
         write_payload_json(&out, payload)?;
         progress.advance_workflow(5);
@@ -1256,21 +1292,32 @@ fn run_fitwith_predict_noise(
         let y_scaled = y.mapv(|v| v / response_scale);
         let options = blockwise_options_from_fit_args(args)?;
         progress.set_stage("fit", "optimizing gaussian location-scale model");
-        let solved = fit_gaussian_location_scale_terms(
-            ds.values.view(),
-            GaussianLocationScaleTermSpec {
-                y: y_scaled,
-                weights: Array1::ones(y.len()),
-                meanspec: meanspec.clone(),
-                log_sigmaspec: noisespec.clone(),
+        let solved = match fit_model(FitModelRequest::GaussianLocationScale(
+            GaussianLocationScaleWorkflowRequest {
+                data: ds.values.view(),
+                spec: GaussianLocationScaleTermSpec {
+                    y: y_scaled,
+                    weights: Array1::ones(y.len()),
+                    meanspec: meanspec.clone(),
+                    log_sigmaspec: noisespec.clone(),
+                },
+                options,
+                kappa_options: SpatialLengthScaleOptimizationOptions::default(),
             },
-            &options,
-            &SpatialLengthScaleOptimizationOptions::default(),
-        )
-        .map_err(|e| {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-            format!("fit_gaussian_location_scale_terms failed: {e}")
-        })?;
+        )) {
+            Ok(FitModelResult::GaussianLocationScale(result)) => result,
+            Ok(_) => {
+                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                return Err(
+                    "internal gaussian location-scale workflow returned the wrong result variant"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                return Err(format!("gaussian location-scale fit failed: {e}"));
+            }
+        };
         progress.advance_workflow(3);
         let fit = solved.fit;
         let frozen_meanspec =
@@ -1381,30 +1428,41 @@ fn run_fitwith_predict_noise(
 
     let options = blockwise_options_from_fit_args(args)?;
     progress.set_stage("fit", "optimizing binomial location-scale model");
-    let solved = fit_binomial_location_scale_termsworkflow(
-        ds.values.view(),
-        BinomialLocationScaleTermSpec {
-            y: y.clone(),
-            weights: Array1::ones(y.len()),
-            link_kind: location_scale_link_kind.clone(),
-            thresholdspec: meanspec.clone(),
-            log_sigmaspec: noisespec.clone(),
+    let solved = match fit_model(FitModelRequest::BinomialLocationScale(
+        BinomialLocationScaleWorkflowRequest {
+            data: ds.values.view(),
+            spec: BinomialLocationScaleTermSpec {
+                y: y.clone(),
+                weights: Array1::ones(y.len()),
+                link_kind: location_scale_link_kind.clone(),
+                thresholdspec: meanspec.clone(),
+                log_sigmaspec: noisespec.clone(),
+            },
+            wiggle: formula_linkwiggle
+                .cloned()
+                .map(|cfg| LinkWiggleWorkflowConfig {
+                    degree: cfg.degree,
+                    num_internal_knots: cfg.num_internal_knots,
+                    penalty_orders: cfg.penalty_orders,
+                    double_penalty: cfg.double_penalty,
+                }),
+            options,
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
         },
-        formula_linkwiggle
-            .cloned()
-            .map(|cfg| BinomialLocationScaleWiggleWorkflowConfig {
-                degree: cfg.degree,
-                num_internal_knots: cfg.num_internal_knots,
-                penalty_orders: cfg.penalty_orders,
-                double_penalty: cfg.double_penalty,
-            }),
-        &options,
-        &SpatialLengthScaleOptimizationOptions::default(),
-    )
-    .map_err(|e| {
-        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-        e
-    })?;
+    )) {
+        Ok(FitModelResult::BinomialLocationScale(result)) => result,
+        Ok(_) => {
+            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            return Err(
+                "internal binomial location-scale workflow returned the wrong result variant"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            return Err(e);
+        }
+    };
     progress.advance_workflow(3);
     if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
         let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit)?;
@@ -1500,6 +1558,9 @@ fn run_fitwith_predict_noise(
 /// Special cases:
 /// - **Survival**: time basis construction, entry/exit handling, location-scale
 ///   sub-branch, and time wiggles are deeply model-specific.
+/// - **GaussianLocationScale** with link wiggles: the saved-model wiggle
+///   correction moves the mean off the plain identity-link predictor, which is
+///   not captured by `GaussianLocationScalePredictor`.
 /// - **BinomialLocationScale** with link wiggles: the wiggle-augmented q0
 ///   prediction path (probit-wiggle, joint conditional integration) is not
 ///   captured by `BinomialLocationScalePredictor`.
@@ -1518,8 +1579,7 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
             let has_joint = model.joint_beta_link.is_some();
             has_wiggle || has_joint
         }
-        // GaussianLocationScale always goes through the unified path.
-        PredictModelClass::GaussianLocationScale => false,
+        PredictModelClass::GaussianLocationScale => model.betawiggle.is_some(),
     }
 }
 
@@ -1527,8 +1587,9 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
 /// `PredictableModel` path.
 ///
 /// - **Standard**: single design from `resolved_termspec`, zero offset, no noise design.
-/// - **GaussianLocationScale**: mean design from `resolved_termspec`, noise design
-///   from `resolved_termspec_noise`, with scale deviation transform applied.
+/// - **GaussianLocationScale** (without link wiggles): mean design from
+///   `resolved_termspec`, noise design from `resolved_termspec_noise`, with
+///   scale deviation transform applied.
 /// - **BinomialLocationScale** (no wiggle): threshold design from `resolved_termspec`,
 ///   noise design from `resolved_termspec_noise`, with scale deviation transform applied.
 ///
@@ -1798,6 +1859,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     // PredictableModel does not (yet) cover:
     // - Survival: time basis construction, entry/exit columns, baseline offsets,
     //   time wiggles, and the LocationScale sub-branch.
+    // - GaussianLocationScale with link wiggles: saved-model mean correction
+    //   on top of the identity-link location-scale path.
     // - BinomialLocationScale with link wiggles: probit-wiggle q0 path with
     //   conditional integration over wiggle coefficients.
     // - Standard with link wiggles or joint flexible link.
@@ -1815,9 +1878,13 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_mixture_param_cov.as_ref(),
             saved_sas_param_cov.as_ref(),
         ),
-        PredictModelClass::GaussianLocationScale => unreachable!(
-            "GaussianLocationScale is always handled by the unified PredictableModel path; \
-             needs_special_predict_handling() returns false for this model class"
+        PredictModelClass::GaussianLocationScale => run_predict_gaussian_location_scale(
+            &mut progress,
+            &args,
+            &model,
+            ds.values.view(),
+            &col_map,
+            training_headers,
         ),
         PredictModelClass::BinomialLocationScale => run_predict_binomial_location_scale(
             &mut progress,
@@ -1948,8 +2015,22 @@ fn run_predict_survival(
                 "saved location-scale survival model missing survival_beta_log_sigma".to_string()
             })?);
         let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
-        let eta_t =
-            DesignMatrix::Dense(cov_design.design.clone()).matrixvectormultiply(&beta_threshold);
+        let thresholdspec = resolve_termspec_for_prediction(
+            &model.resolved_termspec,
+            training_headers,
+            col_map,
+            "resolved_termspec",
+        )?;
+        let threshold_design = build_term_collection_design(data, &thresholdspec)
+            .map_err(|e| format!("failed to build survival threshold design: {e}"))?;
+        let log_sigmaspec = resolve_termspec_for_prediction(
+            &model.resolved_termspec_noise,
+            training_headers,
+            col_map,
+            "resolved_termspec_noise",
+        )?;
+        let raw_sigma_design = build_term_collection_design(data, &log_sigmaspec)
+            .map_err(|e| format!("failed to build survival log-sigma design: {e}"))?;
         let survival_noise_transform = scale_transform_from_payload(
             &model.survival_noise_projection,
             &model.survival_noise_center,
@@ -1967,22 +2048,24 @@ fn run_predict_survival(
             time_build.x_exit_time.clone()
         };
         let mut survival_primary_design =
-            Array2::<f64>::zeros((n, x_time_exit.ncols() + cov_design.design.ncols()));
+            Array2::<f64>::zeros((n, x_time_exit.ncols() + threshold_design.design.ncols()));
         survival_primary_design
             .slice_mut(s![.., 0..x_time_exit.ncols()])
             .assign(&x_time_exit);
         survival_primary_design
             .slice_mut(s![.., x_time_exit.ncols()..])
-            .assign(&cov_design.design);
+            .assign(&threshold_design.design);
         let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
             apply_scale_deviation_transform(
                 &survival_primary_design,
-                &cov_design.design,
+                &raw_sigma_design.design,
                 transform,
             )?
         } else {
-            cov_design.design.clone()
+            raw_sigma_design.design.clone()
         };
+        let eta_t = DesignMatrix::Dense(threshold_design.design.clone())
+            .matrixvectormultiply(&beta_threshold);
         let eta_ls = DesignMatrix::Dense(prepared_sigma_design.clone())
             .matrixvectormultiply(&beta_log_sigma);
         let sigma = eta_ls.mapv(f64::exp);
@@ -2004,7 +2087,7 @@ fn run_predict_survival(
         let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
-            x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
+            x_threshold: DesignMatrix::Dense(threshold_design.design.clone()),
             eta_threshold_offset: Array1::zeros(n),
             x_log_sigma: DesignMatrix::Dense(prepared_sigma_design),
             eta_log_sigma_offset: Array1::zeros(n),
@@ -2022,6 +2105,8 @@ fn run_predict_survival(
                 lambdas_log_sigma: Array1::zeros(0),
                 lambdas_linkwiggle: beta_link_wiggle.as_ref().map(|_| Array1::zeros(0)),
                 log_likelihood: 0.0,
+                reml_score: 0.0,
+                stable_penalty_term: 0.0,
                 penalized_objective: 0.0,
                 outer_iterations: 0,
                 outer_gradient_norm: 0.0,
@@ -2521,6 +2606,142 @@ fn run_predict_binomial_location_scale(
         "wrote predictions: {} (rows={})",
         args.out.display(),
         mean.len()
+    );
+    Ok(())
+}
+
+/// Special-case Gaussian location-scale prediction with saved link wiggles.
+///
+/// Plain Gaussian location-scale models are handled by
+/// `GaussianLocationScalePredictor`. This path exists only for saved models
+/// whose mean block carries a learned link-wiggle correction
+/// `eta = q0 + wiggle(q0)`, with `q0 = X_mu beta_mu`.
+fn run_predict_gaussian_location_scale(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+) -> Result<(), String> {
+    progress.set_stage(
+        "predict",
+        "building gaussian location-scale prediction design",
+    );
+    let spec_mu = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let design_mu = build_term_collection_design(data, &spec_mu)
+        .map_err(|e| format!("failed to build gaussian mean prediction design: {e}"))?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let beta_mu = fit_saved.beta.clone();
+    if beta_mu.len() != design_mu.design.ncols() {
+        return Err(format!(
+            "gaussian mean model/design mismatch: beta has {} coefficients but design has {} columns",
+            beta_mu.len(),
+            design_mu.design.ncols()
+        ));
+    }
+    let spec_noise = resolve_termspec_for_prediction(
+        &model.resolved_termspec_noise,
+        training_headers,
+        col_map,
+        "resolved_termspec_noise",
+    )?;
+    let design_noise = build_term_collection_design(data, &spec_noise)
+        .map_err(|e| format!("failed to build gaussian noise prediction design: {e}"))?;
+    progress.advance_workflow(3);
+    let beta_noise = Array1::from_vec(
+        model
+            .beta_noise
+            .clone()
+            .ok_or_else(|| "gaussian-location-scale model is missing beta_noise".to_string())?,
+    );
+    if beta_noise.len() != design_noise.design.ncols() {
+        return Err(format!(
+            "gaussian noise model/design mismatch: beta has {} coefficients but design has {} columns",
+            beta_noise.len(),
+            design_noise.design.ncols()
+        ));
+    }
+
+    let noise_transform = scale_transform_from_payload(
+        &model.noise_projection,
+        &model.noise_center,
+        &model.noise_scale,
+        model.noise_non_intercept_start,
+    )?;
+    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+        apply_scale_deviation_transform(&design_mu.design, &design_noise.design, transform)?
+    } else {
+        design_noise.design.clone()
+    };
+
+    let eta_mu_base = design_mu.design.dot(&beta_mu);
+    let eta_noise = prepared_noise_design.dot(&beta_noise);
+    let response_scale = gaussian_response_scale_from_saved_model(model)?;
+    let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
+    let eta = apply_saved_probitwiggle(&eta_mu_base, model)?;
+
+    let mut mean_lo = None;
+    let mut mean_hi = None;
+    if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
+        let wiggle_design = saved_probitwiggle_design(&eta_mu_base, model)?;
+        let dq_dq0 = saved_probitwiggle_derivative_q0(&eta_mu_base, model)?;
+        let p_mu = beta_mu.len();
+        let p_sigma = beta_noise.len();
+        let p_w = wiggle_design.as_ref().map(|m| m.ncols()).unwrap_or(0);
+        let p_total = p_mu + p_sigma + p_w;
+        let cov_mat = covariance_from_model(model, args.covariance_mode)?;
+        if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
+            return Err(format!(
+                "covariance shape mismatch for gaussian-location-scale wiggle: got {}x{}, expected {}x{}",
+                cov_mat.nrows(),
+                cov_mat.ncols(),
+                p_total,
+                p_total
+            ));
+        }
+        let mut grad = Array2::<f64>::zeros((eta.len(), p_total));
+        for i in 0..eta.len() {
+            let scale = dq_dq0[i];
+            for j in 0..p_mu {
+                grad[[i, j]] = scale * design_mu.design[[i, j]];
+            }
+            if let Some(wd) = wiggle_design.as_ref() {
+                for j in 0..p_w {
+                    grad[[i, p_mu + p_sigma + j]] = wd[[i, j]];
+                }
+            }
+        }
+        let eta_se = linear_predictor_se(grad.view(), &cov_mat);
+        if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
+            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+            mean_lo = Some(&eta - &eta_se.mapv(|s| z * s));
+            mean_hi = Some(&eta + &eta_se.mapv(|s| z * s));
+        }
+    }
+
+    progress.advance_workflow(4);
+    progress.set_stage("predict", "writing gaussian location-scale predictions");
+    write_gaussian_location_scale_prediction_csv(
+        &args.out,
+        eta.view(),
+        eta.view(),
+        sigma.view(),
+        mean_lo.as_ref().map(|a| a.view()),
+        mean_hi.as_ref().map(|a| a.view()),
+    )?;
+    println!(
+        "wrote predictions: {} (rows={})",
+        args.out.display(),
+        eta.len()
     );
     Ok(())
 }
@@ -4252,16 +4473,13 @@ fn saved_survival_timewiggle_components(
 /// The B-spline time basis is evaluated at `log(t_entry)` and `log(t_exit)`.
 /// Kronecker penalties are constructed for the covariate and time marginals
 /// following the standard tensor product penalty structure.
-fn build_time_varying_covariate_block(
-    cov_design: &Array2<f64>,
+fn build_time_varying_survival_covariate_template(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     time_k: usize,
     time_degree: usize,
     block_name: &str,
-) -> Result<CovariateBlockKind, String> {
-    let n = cov_design.nrows();
-    let p_cov = cov_design.ncols();
+) -> Result<SurvivalCovariateTermBlockTemplate, String> {
     if time_k < time_degree + 1 {
         return Err(format!(
             "--{block_name}-time-k must be >= degree + 1 = {}, got {time_k}",
@@ -4293,7 +4511,7 @@ fn build_time_varying_covariate_block(
     let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
         .map_err(|e| format!("failed to build {block_name} time-margin B-spline basis: {e}"))?;
     let time_design_exit = time_build.design;
-    let p_time = time_design_exit.ncols();
+    let _p_time = time_design_exit.ncols();
 
     // Extract the knot vector so we can evaluate the basis at entry times too.
     let knots = match &time_build.metadata {
@@ -4319,38 +4537,11 @@ fn build_time_varying_covariate_block(
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
     let time_design_entry = time_build_entry.design;
 
-    // Tensor product Kronecker penalties:
-    //   S_cov = S_cov_marginal ⊗ I_time
-    //   S_time = I_cov ⊗ S_time_marginal
-    // The covariate marginal gets a small ridge penalty (identity) since the
-    // covariates typically have no dedicated penalty at this point.
-    let i_cov = Array2::<f64>::eye(p_cov);
-    let i_time = Array2::<f64>::eye(p_time);
-
-    // Time marginal penalty
-    let s_time = time_build
-        .penalties
-        .first()
-        .cloned()
-        .unwrap_or_else(|| Array2::<f64>::zeros((p_time, p_time)));
-    let penalty_time = kronecker_product(&i_cov, &s_time);
-
-    // Covariate marginal penalty (ridge on covariate dimension)
-    let penalty_cov = kronecker_product(&i_cov, &i_time);
-
-    let penalties = vec![penalty_time, penalty_cov];
-
-    Ok(CovariateBlockKind::TimeVarying(
-        TimeDependentCovariateBlockInput {
-            design_covariates: DesignMatrix::Dense(cov_design.clone()),
-            time_basis_entry: time_design_entry,
-            time_basis_exit: time_design_exit,
-            penalties,
-            initial_log_lambdas: None,
-            initial_beta: None,
-            offset: Array1::zeros(n),
-        },
-    ))
+    Ok(SurvivalCovariateTermBlockTemplate::TimeVarying {
+        time_basis_entry: time_design_entry,
+        time_basis_exit: time_design_exit,
+        time_penalties: time_build.penalties,
+    })
 }
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
@@ -4499,7 +4690,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     };
     let mut inference_notes = Vec::new();
     progress.set_stage("fit", "building survival design matrices");
-    let termspec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    let mut termspec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    if args.scale_dimensions {
+        enable_scale_dimensions(&mut termspec);
+    }
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
     let frozen_termspec = freeze_term_collectionspec(&termspec, &cov_design)?;
@@ -4565,15 +4759,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             time_initial_log_lambdas = Some(Array1::from_elem(time_penalties.len(), lambda0));
         }
 
-        // Build threshold block: time-varying if --threshold-time-k is specified,
-        // otherwise time-invariant (covariate-only).
-        let threshold_block = if let Some(tk) = effective_args.threshold_time_k {
+        let threshold_template = if let Some(tk) = effective_args.threshold_time_k {
             eprintln!(
                 "[survival location-scale] building time-varying threshold: k={tk}, degree={}",
                 effective_args.threshold_time_degree
             );
-            build_time_varying_covariate_block(
-                &cov_design.design,
+            build_time_varying_survival_covariate_template(
                 &age_entry,
                 &age_exit,
                 tk,
@@ -4581,23 +4772,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "threshold",
             )?
         } else {
-            CovariateBlockKind::Static(CovariateBlockInput {
-                design: DesignMatrix::Dense(cov_design.design.clone()),
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                initial_log_lambdas: None,
-                initial_beta: None,
-            })
+            SurvivalCovariateTermBlockTemplate::Static
         };
 
-        // Build log-sigma block: time-varying if --sigma-time-k is specified.
-        let log_sigma_block = if let Some(sk) = effective_args.sigma_time_k {
+        let log_sigma_template = if let Some(sk) = effective_args.sigma_time_k {
             eprintln!(
                 "[survival location-scale] building time-varying sigma: k={sk}, degree={}",
                 effective_args.sigma_time_degree
             );
-            build_time_varying_covariate_block(
-                &cov_design.design,
+            build_time_varying_survival_covariate_template(
                 &age_entry,
                 &age_exit,
                 sk,
@@ -4605,19 +4788,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "sigma",
             )?
         } else {
-            CovariateBlockKind::Static(CovariateBlockInput {
-                design: DesignMatrix::Dense(cov_design.design.clone()),
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                initial_log_lambdas: None,
-                initial_beta: None,
-            })
+            SurvivalCovariateTermBlockTemplate::Static
         };
 
-        let buildspec = |inverse_link: InverseLink,
-                         linkwiggle_block: Option<LinkWiggleBlockInput>|
-         -> SurvivalLocationScaleSpec {
-            SurvivalLocationScaleSpec {
+        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let buildtermspec = |inverse_link: InverseLink| -> SurvivalLocationScaleTermSpec {
+            SurvivalLocationScaleTermSpec {
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
                 event_target: event_target.mapv(f64::from),
@@ -4639,11 +4815,33 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
                     initial_beta: None,
                 },
-                threshold_block: threshold_block.clone(),
-                log_sigma_block: log_sigma_block.clone(),
-                linkwiggle_block,
+                thresholdspec: termspec.clone(),
+                log_sigmaspec: termspec.clone(),
+                threshold_template: threshold_template.clone(),
+                log_sigma_template: log_sigma_template.clone(),
+                linkwiggle_block: None,
             }
         };
+        let fit_survival_model =
+            |inverse_link: InverseLink,
+             wiggle: Option<LinkWiggleWorkflowConfig>|
+             -> Result<gam::workflow::SurvivalLocationScaleWorkflowResult, String> {
+                match fit_model(FitModelRequest::SurvivalLocationScale(
+                SurvivalLocationScaleWorkflowRequest {
+                    data: ds.values.view(),
+                    spec: buildtermspec(inverse_link),
+                    wiggle,
+                    kappa_options: kappa_options.clone(),
+                },
+            )) {
+                Ok(FitModelResult::SurvivalLocationScale(result)) => Ok(result),
+                Ok(_) => Err(
+                    "internal survival location-scale workflow returned the wrong result variant"
+                        .to_string(),
+                ),
+                Err(e) => Err(e),
+            }
+            };
 
         let mut fitted_inverse_link = survival_inverse_link.clone();
         // Optimize link parameters via run_outer for parametric inverse-link families.
@@ -4738,11 +4936,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         initial_log_delta: theta[1],
                     })
                     .map_err(EstimationError::InvalidInput)?;
-                    Ok(
-                        fit_survival_location_scale(buildspec(InverseLink::Sas(state), None))
-                            .map_err(EstimationError::InvalidInput)?
-                            .penalized_objective,
-                    )
+                    Ok(fit_survival_model(InverseLink::Sas(state), None)
+                        .map_err(EstimationError::InvalidInput)?
+                        .fit
+                        .fit
+                        .reml_score)
                 }),
                 Box::new(|rho| {
                     state_from_sasspec(SasLinkSpec {
@@ -4767,12 +4965,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         initial_log_delta: theta[1],
                     })
                     .map_err(EstimationError::InvalidInput)?;
-                    Ok(fit_survival_location_scale(buildspec(
-                        InverseLink::BetaLogistic(state),
-                        None,
-                    ))
-                    .map_err(EstimationError::InvalidInput)?
-                    .penalized_objective)
+                    Ok(fit_survival_model(InverseLink::BetaLogistic(state), None)
+                        .map_err(EstimationError::InvalidInput)?
+                        .fit
+                        .fit
+                        .reml_score)
                 }),
                 Box::new(|rho| {
                     state_from_beta_logisticspec(SasLinkSpec {
@@ -4801,11 +4998,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         initial_rho: rho.clone(),
                     })
                     .map_err(EstimationError::InvalidInput)?;
-                    Ok(
-                        fit_survival_location_scale(buildspec(InverseLink::Mixture(state), None))
-                            .map_err(EstimationError::InvalidInput)?
-                            .penalized_objective,
-                    )
+                    Ok(fit_survival_model(InverseLink::Mixture(state), None)
+                        .map_err(EstimationError::InvalidInput)?
+                        .fit
+                        .fit
+                        .reml_score)
                 }),
                 Box::new(move |rho| {
                     state_fromspec(&MixtureLinkSpec {
@@ -4819,65 +5016,42 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 fitted_inverse_link = link;
             }
         }
-        let mut wiggle_knots: Option<Array1<f64>> = None;
         progress.set_stage("fit", "running survival location-scale optimization");
-        let fit = if learn_linkwiggle {
-            let wiggle_cfg = effective_linkwiggle
+        let fit = fit_survival_model(
+            fitted_inverse_link.clone(),
+            effective_linkwiggle
                 .clone()
-                .expect("learn_linkwiggle guarantees wiggle config");
-            let pilot = fit_survival_location_scale(buildspec(fitted_inverse_link.clone(), None))
-                .map_err(|e| format!("survival location-scale pilot fit failed: {e}"))?;
-            let eta_t = cov_design.design.dot(&pilot.beta_threshold());
-            let eta_ls = cov_design.design.dot(&pilot.beta_log_sigma());
-            let sigma = eta_ls.mapv(f64::exp);
-            let q_seed = Array1::from_iter(
-                eta_t
-                    .iter()
-                    .zip(sigma.iter())
-                    .map(|(&t, &s)| -t / s.max(1e-12)),
-            );
-            let cfg = WiggleBlockConfig {
-                degree: wiggle_cfg.degree,
-                num_internal_knots: wiggle_cfg.num_internal_knots,
-                penalty_order: 2,
-                double_penalty: wiggle_cfg.double_penalty,
-            };
-            let (mut wiggle_block, knots) = buildwiggle_block_input_from_seed(q_seed.view(), &cfg)
-                .map_err(|e| format!("failed to build survival link wiggle block: {e}"))?;
-            augmentwiggle_penaltieswith_orders(&mut wiggle_block, &wiggle_cfg.penalty_orders)?;
-            wiggle_knots = Some(knots);
-            let wiggle_input = LinkWiggleBlockInput {
-                design: wiggle_block.design,
-                penalties: wiggle_block.penalties,
-                initial_log_lambdas: wiggle_block.initial_log_lambdas,
-                initial_beta: wiggle_block.initial_beta,
-            };
-            fit_survival_location_scale(buildspec(fitted_inverse_link.clone(), Some(wiggle_input)))
-                .map_err(|e| format!("survival location-scale wiggle fit failed: {e}"))?
-        } else {
-            fit_survival_location_scale(buildspec(fitted_inverse_link.clone(), None))
-                .map_err(|e| format!("survival location-scale fit failed: {e}"))?
-        };
+                .map(|cfg| LinkWiggleWorkflowConfig {
+                    degree: cfg.degree,
+                    num_internal_knots: cfg.num_internal_knots,
+                    penalty_orders: cfg.penalty_orders,
+                    double_penalty: cfg.double_penalty,
+                }),
+        )
+        .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
         println!(
             "survival location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
-            fit.outer_converged, fit.outer_iterations, fit.log_likelihood, fit.penalized_objective
+            fit.fit.fit.outer_converged,
+            fit.fit.fit.outer_iterations,
+            fit.fit.fit.log_likelihood,
+            fit.fit.fit.reml_score
         );
         progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival model");
-            let mut lambdas = fit.lambdas_time().to_vec();
-            lambdas.extend(fit.lambdas_threshold().iter().copied());
-            lambdas.extend(fit.lambdas_log_sigma().iter().copied());
-            if let Some(lw) = fit.lambdas_linkwiggle() {
+            let mut lambdas = fit.fit.fit.lambdas_time().to_vec();
+            lambdas.extend(fit.fit.fit.lambdas_threshold().iter().copied());
+            lambdas.extend(fit.fit.fit.lambdas_log_sigma().iter().copied());
+            if let Some(lw) = fit.fit.fit.lambdas_linkwiggle() {
                 lambdas.extend(lw.iter().copied());
             }
             let mut fit_result = core_saved_fit_result(
-                fit.beta_time(),
+                fit.fit.fit.beta_time(),
                 Array1::from_vec(lambdas.clone()),
                 1.0,
-                fit.covariance_conditional.clone(),
-                fit.covariance_conditional.clone(),
-                SavedFitSummary::from_survival_location_scale_fit(&fit)?,
+                fit.fit.fit.covariance_conditional.clone(),
+                fit.fit.fit.covariance_conditional.clone(),
+                SavedFitSummary::from_survival_location_scale_fit(&fit.fit.fit)?,
             );
             apply_inverse_link_state_to_fit_result(&mut fit_result, &fitted_inverse_link);
             let mut payload = FittedModelPayload::new(
@@ -4897,11 +5071,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.fit_result = Some(fit_result);
             payload.data_schema = Some(ds.schema.clone());
             payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
-            payload.probitwiggle_degree = wiggle_knots
-                .as_ref()
-                .map(|_| effective_linkwiggle.as_ref().map(|w| w.degree).unwrap_or(3));
-            payload.betawiggle = fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
-            payload.probitwiggle_knots = wiggle_knots.as_ref().map(|k| k.to_vec());
+            payload.probitwiggle_degree = fit.wiggle_degree;
+            payload.betawiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
+            payload.probitwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
             payload.timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
             payload.timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
             payload.timewiggle_penalty_orders = effective_timewiggle
@@ -4910,7 +5082,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.timewiggle_double_penalty =
                 effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
             payload.betatimewiggle = timewiggle_build.as_ref().map(|_| {
-                fit.beta_time()
+                fit.fit
+                    .fit
+                    .beta_time()
                     .slice(s![time_build.x_exit_time.ncols()..])
                     .to_vec()
             });
@@ -4932,22 +5106,24 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
-            payload.survival_beta_time = Some(fit.beta_time().to_vec());
-            payload.survival_beta_threshold = Some(fit.beta_threshold().to_vec());
-            payload.survival_beta_log_sigma = Some(fit.beta_log_sigma().to_vec());
-            let mut survival_primary_design =
-                Array2::<f64>::zeros((n, time_design_exit.ncols() + cov_design.design.ncols()));
+            payload.survival_beta_time = Some(fit.fit.fit.beta_time().to_vec());
+            payload.survival_beta_threshold = Some(fit.fit.fit.beta_threshold().to_vec());
+            payload.survival_beta_log_sigma = Some(fit.fit.fit.beta_log_sigma().to_vec());
+            let mut survival_primary_design = Array2::<f64>::zeros((
+                n,
+                time_design_exit.ncols() + fit.fit.threshold_design.design.ncols(),
+            ));
             survival_primary_design
                 .slice_mut(s![.., 0..time_design_exit.ncols()])
                 .assign(&time_design_exit);
             survival_primary_design
                 .slice_mut(s![.., time_design_exit.ncols()..])
-                .assign(&cov_design.design);
+                .assign(&fit.fit.threshold_design.design);
             let survival_noise_transform = build_scale_deviation_transform(
                 &survival_primary_design,
-                &cov_design.design,
+                &fit.fit.log_sigma_design.design,
                 &weights,
-                infer_non_intercept_start(&cov_design.design, &weights),
+                infer_non_intercept_start(&fit.fit.log_sigma_design.design, &weights),
             )
             .map_err(|e| format!("failed to encode survival noise transform: {e}"))?;
             payload.survival_noise_projection = Some(
@@ -4966,7 +5142,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_distribution =
                 Some(inverse_link_to_saved_string(&fitted_inverse_link));
             payload.training_headers = Some(ds.headers.clone());
-            payload.resolved_termspec = Some(frozen_termspec);
+            payload.resolved_termspec = Some(fit.fit.resolved_thresholdspec.clone());
+            payload.resolved_termspec_noise = Some(fit.fit.resolved_log_sigmaspec.clone());
             write_payload_json(&out, payload)?;
             progress.advance_workflow(survival_total_steps);
         }
@@ -5939,8 +6116,13 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            // GaussianLocationScale never needs special handling.
-            PredictModelClass::GaussianLocationScale => unreachable!(),
+            PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
+                &mut progress,
+                &model,
+                ds.values.view(),
+                &col_map,
+                training_headers,
+            )?,
         }
     } else {
         run_generate_unified(
@@ -6091,7 +6273,7 @@ fn run_generate_gaussian_location_scale(
         &model.noise_scale,
         model.noise_non_intercept_start,
     )?;
-    let mean = design.design.dot(&betamu);
+    let mean_base = design.design.dot(&betamu);
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
         apply_scale_deviation_transform(&design.design, &design_noise.design, transform)?
     } else {
@@ -6100,6 +6282,7 @@ fn run_generate_gaussian_location_scale(
     let eta_noise = preparednoise_design.dot(&beta_noise);
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
     let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
+    let mean = apply_saved_probitwiggle(&mean_base, model)?;
     Ok(gam::generative::GenerativeSpec {
         mean,
         noise: gam::generative::NoiseModel::Gaussian { sigma },
@@ -6881,78 +7064,6 @@ fn summarizewiggle_domain(
     })
 }
 
-struct StandardBinomialLinkWiggleFitResult {
-    fit_result: UnifiedFitResult,
-    betawiggle: Vec<f64>,
-    wiggle_knots: Vec<f64>,
-    wiggle_degree: usize,
-}
-
-fn fit_standard_binomial_linkwiggle(
-    design: &gam::smooth::TermCollectionDesign,
-    base_fit: &UnifiedFitResult,
-    y: &Array1<f64>,
-    link_kind: InverseLink,
-    wiggle_cfg: &LinkWiggleFormulaSpec,
-    args: &FitArgs,
-) -> Result<StandardBinomialLinkWiggleFitResult, String> {
-    let q_seed = design.design.dot(&base_fit.beta);
-    let (mut wiggle_block, wiggle_knots) = buildwiggle_block_input_from_seed(
-        q_seed.view(),
-        &WiggleBlockConfig {
-            degree: wiggle_cfg.degree,
-            num_internal_knots: wiggle_cfg.num_internal_knots,
-            penalty_order: 2,
-            double_penalty: wiggle_cfg.double_penalty,
-        },
-    )?;
-    augmentwiggle_penaltieswith_orders(&mut wiggle_block, &wiggle_cfg.penalty_orders)?;
-    let blockwise = fit_binomial_mean_wiggle(
-        gam::BinomialMeanWiggleSpec {
-            y: y.clone(),
-            weights: Array1::ones(y.len()),
-            link_kind,
-            wiggle_knots: wiggle_knots.clone(),
-            wiggle_degree: wiggle_cfg.degree,
-            eta_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(design.design.clone()),
-                offset: Array1::zeros(y.len()),
-                penalties: design.penalties.clone(),
-                initial_log_lambdas: Some(base_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
-                initial_beta: Some(base_fit.beta.clone()),
-            },
-            wiggle_block,
-        },
-        &blockwise_options_from_fit_args(args)?,
-    )?;
-    let beta_eta = blockwise
-        .block_states
-        .first()
-        .ok_or_else(|| "standard binomial wiggle fit is missing eta block".to_string())?
-        .beta
-        .clone();
-    let beta_wiggle = blockwise
-        .block_states
-        .get(1)
-        .ok_or_else(|| "standard binomial wiggle fit is missing wiggle block".to_string())?
-        .beta
-        .to_vec();
-    let fit_result = core_saved_fit_result(
-        beta_eta,
-        blockwise.lambdas.clone(),
-        1.0,
-        blockwise.covariance_conditional.clone(),
-        blockwise.covariance_conditional.clone(),
-        SavedFitSummary::from_blockwise_fit(&blockwise)?,
-    );
-    Ok(StandardBinomialLinkWiggleFitResult {
-        fit_result,
-        betawiggle: beta_wiggle,
-        wiggle_knots: wiggle_knots.to_vec(),
-        wiggle_degree: wiggle_cfg.degree,
-    })
-}
-
 fn is_standard_binomial_linkwiggle_model(
     model: &SavedModel,
     family: LikelihoodFamily,
@@ -7363,7 +7474,7 @@ impl SavedFitSummary {
 
     fn from_blockwise_fit(fit: &gam::estimate::UnifiedFitResult) -> Result<Self, String> {
         let deviance = -2.0 * fit.log_likelihood;
-        let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
+        let stable_penalty_term = fit.stable_penalty_term;
         let max_abs_eta = fit
             .block_states
             .iter()
@@ -7380,7 +7491,7 @@ impl SavedFitSummary {
             deviance,
             stable_penalty_term,
             max_abs_eta,
-            reml_score: fit.penalized_objective,
+            reml_score: fit.reml_score,
         }
         .validated()
     }

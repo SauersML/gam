@@ -1924,7 +1924,7 @@ pub fn coefficient_uncertaintywith_mode(
 mod tests {
     use super::*;
     use crate::estimate::{
-        BlockRole, FittedBlock, FittedLinkState, FitArtifacts, UnifiedFitResult,
+        BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
     use crate::pirls::PirlsStatus;

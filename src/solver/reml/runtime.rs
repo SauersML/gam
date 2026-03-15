@@ -1993,7 +1993,6 @@ impl<'a> RemlState<'a> {
     /// - `include_firth_derivs`: whether to wrap the derivative provider with
     ///   Firth-aware derivatives (false for the EFS path which does not need
     ///   Firth corrections in trace-based updates)
-    #[allow(clippy::type_complexity)]
     fn build_dense_derivative_context(
         &self,
         pirls_result: &PirlsResult,
@@ -2149,7 +2148,6 @@ impl<'a> RemlState<'a> {
     ///
     /// TK correction is NOT included here because the sparse paths compute
     /// it via sparse Cholesky solves with completely different logic.
-    #[allow(clippy::type_complexity)]
     fn build_sparse_derivative_context(
         &self,
         pirls_result: &PirlsResult,
@@ -3157,7 +3155,7 @@ impl<'a> RemlState<'a> {
             deriv_provider,
             dispersion,
             tk_correction,
-            _tk_gradient,
+            _,
             firth_logdet,
             log_likelihood,
             firth_op,

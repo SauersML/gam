@@ -7517,8 +7517,6 @@ fn build_matern_design_psi_aniso_derivatives(
         let mut q_values = Array1::<f64>::zeros(nk);
         let mut t_values = Array1::<f64>::zeros(nk);
         let mut axis_fractions = Array2::<f64>::zeros((nk, dim));
-        // s_components_raw is still needed for penalty derivatives (k×k, manageable).
-        let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
 
         let row_results: Result<Vec<_>, BasisError> = (0..n)
             .into_par_iter()
@@ -7553,7 +7551,6 @@ fn build_matern_design_psi_aniso_derivatives(
                 t_values[base + j] = t_row[j];
                 for a in 0..dim {
                     axis_fractions[[base + j, a]] = s_row[a][j];
-                    s_components_raw[a][[i, j]] = s_row[a][j];
                 }
             }
         }
@@ -7579,7 +7576,7 @@ fn build_matern_design_psi_aniso_derivatives(
             design_first: Vec::new(),
             design_second_diag: Vec::new(),
             design_cross_t: Array2::zeros((0, 0)),
-            s_components_raw,
+            s_components_raw: Vec::new(),
             s_components_projected: Vec::new(),
             penalties_first,
             penalties_second_diag,
@@ -7919,7 +7916,6 @@ fn build_duchon_design_psi_aniso_derivatives(
         let mut q_values = Array1::<f64>::zeros(nk);
         let mut t_values = Array1::<f64>::zeros(nk);
         let mut axis_fractions = Array2::<f64>::zeros((nk, dim));
-        let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
 
         let row_results: Result<Vec<_>, BasisError> = (0..n)
             .into_par_iter()
@@ -7954,7 +7950,6 @@ fn build_duchon_design_psi_aniso_derivatives(
                 t_values[base + j] = t_row[j];
                 for a in 0..dim {
                     axis_fractions[[base + j, a]] = s_row[a][j];
-                    s_components_raw[a][[i, j]] = s_row[a][j];
                 }
             }
         }
@@ -7989,7 +7984,7 @@ fn build_duchon_design_psi_aniso_derivatives(
             design_first: Vec::new(),
             design_second_diag: Vec::new(),
             design_cross_t: Array2::zeros((0, 0)),
-            s_components_raw,
+            s_components_raw: Vec::new(),
             s_components_projected: Vec::new(),
             penalties_first,
             penalties_second_diag,
@@ -14570,7 +14565,10 @@ mod tests {
             .sum::<f64>()
             .sqrt();
 
-        assert!(design_err < 1e-5, "ThinPlate design derivative mismatch: {design_err}");
+        assert!(
+            design_err < 1e-5,
+            "ThinPlate design derivative mismatch: {design_err}"
+        );
         assert!(
             primary_err < 1e-5,
             "ThinPlate primary penalty derivative mismatch: {primary_err}"
@@ -14610,9 +14608,9 @@ mod tests {
         let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
 
         let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
-        let fd_primary =
-            (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0) + &minus.penalties[0])
-                / (eps * eps);
+        let fd_primary = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
+            + &minus.penalties[0])
+            / (eps * eps);
         let design_err = (&analytic.designsecond_derivative - &fd_design)
             .iter()
             .map(|v| v * v)

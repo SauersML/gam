@@ -7,8 +7,8 @@ use crate::basis::{
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
-    evaluate_custom_family_joint_hyper, fit_custom_family,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper,
+    fit_custom_family, resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -570,6 +570,9 @@ fn build_block_spatial_psi_derivatives(
                             .collect();
                         rows
                     }),
+                    implicit_operator: info.implicit_operator.clone(),
+                    implicit_axis: info.implicit_axis,
+                    implicit_group_id: info.aniso_group_id,
                 }
             })
             .collect(),
@@ -1126,18 +1129,6 @@ pub struct BinomialLocationScaleSpec {
 }
 
 #[derive(Clone)]
-pub struct BinomialLocationScaleWiggleSpec {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub link_kind: InverseLink,
-    pub wiggle_knots: Array1<f64>,
-    pub wiggle_degree: usize,
-    pub threshold_block: ParameterBlockInput,
-    pub log_sigma_block: ParameterBlockInput,
-    pub wiggle_block: ParameterBlockInput,
-}
-
-#[derive(Clone)]
 pub struct GaussianLocationScaleTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -1185,6 +1176,14 @@ struct BlockwiseTermFitResultParts {
 
 pub struct BlockwiseTermWiggleFitResult {
     pub fit: BlockwiseTermFitResult,
+    pub wiggle_knots: Array1<f64>,
+    pub wiggle_degree: usize,
+}
+
+pub struct BinomialMeanWiggleTermFitResult {
+    pub fit: UnifiedFitResult,
+    pub resolvedspec: TermCollectionSpec,
+    pub design: TermCollectionDesign,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
 }
@@ -1386,6 +1385,38 @@ impl BlockwiseTermWiggleFitResult {
             wiggle_knots,
             wiggle_degree,
         })
+    }
+}
+
+fn single_block_spatial_dims_per_term(
+    spec: &TermCollectionSpec,
+    spatial_terms: &[usize],
+) -> Vec<usize> {
+    spatial_terms
+        .iter()
+        .map(|&term_idx| {
+            crate::smooth::get_spatial_aniso_log_scales(spec, term_idx)
+                .map(|eta| eta.len())
+                .filter(|&dim| dim > 1)
+                .unwrap_or(1)
+        })
+        .collect()
+}
+
+fn enforce_spatial_psi_sum_to_zero(
+    theta: &mut Array1<f64>,
+    rho_dim: usize,
+    dims_per_term: &[usize],
+) {
+    let mut offset = rho_dim;
+    for &dim in dims_per_term {
+        if dim > 1 {
+            let mean = theta.slice(s![offset..offset + dim]).mean().unwrap_or(0.0);
+            for axis in 0..dim {
+                theta[offset + axis] -= mean;
+            }
+        }
+        offset += dim;
     }
 }
 
@@ -1596,102 +1627,6 @@ pub fn fit_binomial_location_scale(
     Ok(fit)
 }
 
-pub fn fit_binomial_location_scalewiggle(
-    spec: BinomialLocationScaleWiggleSpec,
-    options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
-    let n = spec.y.len();
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, "fit_binomial_location_scalewiggle")?;
-    validate_binomial_response(&spec.y, "fit_binomial_location_scalewiggle")?;
-    validate_blockrows("threshold", n, &spec.threshold_block)?;
-    validate_blockrows("log_sigma", n, &spec.log_sigma_block)?;
-    validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    if spec.wiggle_degree < 1 {
-        return Err(format!(
-            "fit_binomial_location_scalewiggle: wiggle_degree must be >= 1, got {}",
-            spec.wiggle_degree
-        ));
-    }
-    if spec.wiggle_knots.len() < spec.wiggle_degree + 2 {
-        return Err(format!(
-            "fit_binomial_location_scalewiggle: wiggle_knots length {} is too short for degree {}",
-            spec.wiggle_knots.len(),
-            spec.wiggle_degree
-        ));
-    }
-
-    let BinomialLocationScaleWiggleSpec {
-        y,
-        weights,
-        link_kind,
-        wiggle_knots,
-        wiggle_degree,
-        mut threshold_block,
-        mut log_sigma_block,
-        wiggle_block,
-    } = spec;
-    let threshold_dense = threshold_block.design.to_dense();
-    let raw_log_sigma_dense = log_sigma_block.design.to_dense();
-    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_dense, &weights);
-    log_sigma_block.design = DesignMatrix::Dense(prepared_scale_design(
-        &threshold_dense,
-        &raw_log_sigma_dense,
-        &weights,
-        non_intercept_start,
-    )?);
-    append_binomial_log_sigma_shrinkage_penalty_input(&mut log_sigma_block);
-
-    if (threshold_block.initial_beta.is_none() || log_sigma_block.initial_beta.is_none())
-        && matches!(link_kind, InverseLink::Standard(LinkFunction::Probit))
-    {
-        match try_binomial_alpha_betawarm_start(
-            &y,
-            &weights,
-            &threshold_block,
-            &log_sigma_block,
-            options,
-        ) {
-            Ok((beta_t0, beta_ls0, betawarm)) => {
-                if threshold_block.initial_beta.is_none() {
-                    threshold_block.initial_beta = Some(beta_t0);
-                }
-                if log_sigma_block.initial_beta.is_none() {
-                    log_sigma_block.initial_beta = Some(beta_ls0);
-                }
-                emit_binomial_alpha_betawarnings("warm-start-wiggle", &betawarm, &y, &weights);
-            }
-            Err(err) => {
-                log::warn!(
-                    "[GAMLSS][fit_binomial_location_scalewiggle] alpha/beta warm start failed, falling back to direct initialization: {}",
-                    err
-                );
-            }
-        }
-    }
-
-    let family = BinomialLocationScaleWiggleFamily {
-        y: y.clone(),
-        weights: weights.clone(),
-        link_kind: link_kind.clone(),
-        threshold_design: Some(threshold_block.design.clone()),
-        log_sigma_design: Some(log_sigma_block.design.clone()),
-        wiggle_knots,
-        wiggle_degree,
-    };
-    let blocks = vec![
-        threshold_block.intospec("threshold")?,
-        log_sigma_block.intospec("log_sigma")?,
-        wiggle_block.intospec("wiggle")?,
-    ];
-    let fit = fit_custom_family(&family, &blocks, options)?;
-    let beta_final = fit.block_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA]
-        .eta
-        .mapv(|eta| 1.0 / exp_sigma_from_eta_scalar(eta).max(1e-12));
-    emit_binomial_alpha_betawarnings("final-fit-wiggle", &beta_final, &y, &weights);
-    Ok(fit)
-}
-
 trait LocationScaleFamilyBuilder {
     type Family: CustomFamily + Clone + Send + Sync + 'static;
 
@@ -1848,6 +1783,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 builder.noisespec(),
                 kappa_options,
                 &joint_setup,
+                analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
                 |rho, _, _, mean_design, noise_design| {
                     let fit = {
@@ -2461,26 +2397,6 @@ pub fn fit_binomial_location_scalewiggle_terms_auto(
             .zip(sigma.iter())
             .map(|(&t, &s)| -t / s.max(1e-12)),
     );
-    let identifiednoise_design = identified_binomial_log_sigma_design(
-        &pilot.mean_design,
-        &pilot.noise_design,
-        &spec.weights,
-    )?;
-
-    let threshold_penalty_count = pilot.mean_design.penalties.len();
-    let noise_penalty_count = pilot.noise_design.penalties.len();
-    let threshold_log_lambdas = slice_log_lambda_block(
-        &pilot.fit.log_lambdas,
-        0,
-        threshold_penalty_count,
-        "threshold",
-    )?;
-    let noise_log_lambdas = slice_log_lambda_block(
-        &pilot.fit.log_lambdas,
-        threshold_penalty_count,
-        noise_penalty_count,
-        "log_sigma",
-    )?;
 
     let (mut wiggle_block, wiggle_knots) =
         buildwiggle_block_input_from_seed(q_seed.view(), &wiggle_cfg)?;
@@ -2492,41 +2408,365 @@ pub fn fit_binomial_location_scalewiggle_terms_auto(
         let s = create_difference_penalty_matrix(pw, ord, None).map_err(|e| e.to_string())?;
         wiggle_block.penalties.push(s);
     }
-
-    let fit = fit_binomial_location_scalewiggle(
-        BinomialLocationScaleWiggleSpec {
+    let solved = fit_binomial_location_scalewiggle_terms(
+        data,
+        BinomialLocationScaleWiggleTermSpec {
             y: spec.y,
             weights: spec.weights,
             link_kind: spec.link_kind,
+            thresholdspec: spec.thresholdspec,
+            log_sigmaspec: spec.log_sigmaspec,
             wiggle_knots: wiggle_knots.clone(),
             wiggle_degree: wiggle_cfg.degree,
-            threshold_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(pilot.mean_design.design.clone()),
-                offset: Array1::zeros(pilot.mean_design.design.nrows()),
-                penalties: pilot.mean_design.penalties.clone(),
-                initial_log_lambdas: Some(threshold_log_lambdas),
-                initial_beta: pilot.fit.block_states.first().map(|b| b.beta.clone()),
-            },
-            log_sigma_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(identifiednoise_design),
-                offset: Array1::zeros(pilot.noise_design.design.nrows()),
-                penalties: pilot.noise_design.penalties.clone(),
-                initial_log_lambdas: Some(noise_log_lambdas),
-                initial_beta: pilot.fit.block_states.get(1).map(|b| b.beta.clone()),
-            },
             wiggle_block,
+        },
+        options,
+        kappa_options,
+    )?;
+
+    BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
+        fit: solved,
+        wiggle_knots,
+        wiggle_degree: wiggle_cfg.degree,
+    })
+}
+
+pub fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
+    data: ndarray::ArrayView2<'_, f64>,
+    pilot_spec: &TermCollectionSpec,
+    pilot_design: &TermCollectionDesign,
+    pilot_fit: &UnifiedFitResult,
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    link_kind: InverseLink,
+    wiggle_cfg: WiggleBlockConfig,
+    wiggle_penalty_orders: &[usize],
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BinomialMeanWiggleTermFitResult, String> {
+    const RHO_BOUND: f64 = 12.0;
+
+    validate_term_weights(
+        data,
+        y.len(),
+        weights,
+        "fit_binomial_mean_wiggle_terms_auto_from_pilot",
+    )?;
+    validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_auto_from_pilot")?;
+    if !matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        return Err(
+            "fit_binomial_mean_wiggle_terms_auto_from_pilot currently requires the standard probit link"
+                .to_string(),
+        );
+    }
+
+    let q_seed = pilot_design.design.dot(&pilot_fit.beta);
+    let (mut wiggle_block, wiggle_knots) =
+        buildwiggle_block_input_from_seed(q_seed.view(), &wiggle_cfg)?;
+    let pw = wiggle_block.design.ncols();
+    for &ord in wiggle_penalty_orders {
+        if ord <= 1 || ord >= pw {
+            continue;
+        }
+        let s = create_difference_penalty_matrix(pw, ord, None).map_err(|e| e.to_string())?;
+        wiggle_block.penalties.push(s);
+    }
+
+    let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
+    if spatial_terms.is_empty() {
+        let fit = fit_binomial_mean_wiggle(
+            BinomialMeanWiggleSpec {
+                y: y.clone(),
+                weights: weights.clone(),
+                link_kind,
+                wiggle_knots: wiggle_knots.clone(),
+                wiggle_degree: wiggle_cfg.degree,
+                eta_block: ParameterBlockInput {
+                    design: DesignMatrix::Dense(pilot_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: pilot_design.penalties.clone(),
+                    initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
+                    initial_beta: Some(pilot_fit.beta.clone()),
+                },
+                wiggle_block,
+            },
+            options,
+        )?;
+        return Ok(BinomialMeanWiggleTermFitResult {
+            fit,
+            resolvedspec: pilot_spec.clone(),
+            design: pilot_design.clone(),
+            wiggle_knots,
+            wiggle_degree: wiggle_cfg.degree,
+        });
+    }
+
+    let dims_per_term = single_block_spatial_dims_per_term(pilot_spec, &spatial_terms);
+    let log_kappa0 =
+        SpatialLogKappaCoords::from_length_scales_aniso(pilot_spec, &spatial_terms, kappa_options);
+    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options);
+    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options);
+
+    let eta_penalty_count = pilot_design.penalties.len();
+    let wiggle_log_lambdas0 = initial_log_lambdas_orzeros(&wiggle_block)?;
+    let rho_dim = eta_penalty_count + wiggle_log_lambdas0.len();
+    let theta_dim = rho_dim + log_kappa0.len();
+    let mut theta0 = Array1::<f64>::zeros(theta_dim);
+    theta0
+        .slice_mut(s![0..eta_penalty_count])
+        .assign(&pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln()));
+    theta0
+        .slice_mut(s![eta_penalty_count..rho_dim])
+        .assign(&wiggle_log_lambdas0);
+    theta0
+        .slice_mut(s![rho_dim..theta_dim])
+        .assign(log_kappa0.as_array());
+
+    let mut lower = Array1::<f64>::from_elem(theta_dim, -RHO_BOUND);
+    let mut upper = Array1::<f64>::from_elem(theta_dim, RHO_BOUND);
+    lower
+        .slice_mut(s![rho_dim..theta_dim])
+        .assign(log_kappa_lower.as_array());
+    upper
+        .slice_mut(s![rho_dim..theta_dim])
+        .assign(log_kappa_upper.as_array());
+
+    let pilot_spec_cloned = pilot_spec.clone();
+    let pilot_beta = pilot_fit.beta.clone();
+    let wiggle_design = wiggle_block.design.clone();
+    let wiggle_offset = wiggle_block.offset.clone();
+    let wiggle_penalties = wiggle_block.penalties.clone();
+    let wiggle_initial_beta = wiggle_block.initial_beta.clone();
+    let wiggle_knots_cloned = wiggle_knots.clone();
+    let y_cloned = y.clone();
+    let weights_cloned = weights.clone();
+    let link_kind_cloned = link_kind.clone();
+
+    struct MeanWiggleOuterState {
+        warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
+        last_eval: Option<(
+            Array1<f64>,
+            f64,
+            Array1<f64>,
+            Array2<f64>,
+            crate::custom_family::CustomFamilyWarmStart,
+        )>,
+    }
+
+    let build_eval = |theta: &Array1<f64>,
+                      warm_cache: Option<&crate::custom_family::CustomFamilyWarmStart>,
+                      need_hessian: bool|
+     -> Result<
+        (
+            crate::custom_family::CustomFamilyJointHyperResult,
+            TermCollectionSpec,
+            TermCollectionDesign,
+        ),
+        String,
+    > {
+        let log_kappa =
+            SpatialLogKappaCoords::from_theta_tail_with_dims(theta, rho_dim, dims_per_term.clone());
+        let resolvedspec = log_kappa
+            .apply_tospec(&pilot_spec_cloned, &spatial_terms)
+            .map_err(|e| e.to_string())?;
+        let design =
+            build_term_collection_design(data, &resolvedspec).map_err(|e| e.to_string())?;
+        let eta_derivs = build_block_spatial_psi_derivatives(data, &resolvedspec, &design)?
+            .ok_or_else(|| {
+                "missing eta spatial psi derivatives for binomial mean wiggle".to_string()
+            })?;
+        let blocks = vec![
+            ParameterBlockSpec {
+                name: "eta".to_string(),
+                design: DesignMatrix::Dense(design.design.clone()),
+                offset: Array1::zeros(y_cloned.len()),
+                penalties: design.penalties.clone(),
+                initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
+                initial_beta: Some(pilot_beta.clone()),
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: wiggle_design.clone(),
+                offset: wiggle_offset.clone(),
+                penalties: wiggle_penalties.clone(),
+                initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
+                initial_beta: wiggle_initial_beta.clone(),
+            },
+        ];
+        let family = BinomialMeanWiggleFamily {
+            y: y_cloned.clone(),
+            weights: weights_cloned.clone(),
+            link_kind: link_kind_cloned.clone(),
+            wiggle_knots: wiggle_knots_cloned.clone(),
+            wiggle_degree: wiggle_cfg.degree,
+        };
+        let eval = evaluate_custom_family_joint_hyper(
+            &family,
+            &blocks,
+            options,
+            &theta.slice(s![0..rho_dim]).to_owned(),
+            &[eta_derivs, Vec::new()],
+            warm_cache,
+            need_hessian,
+        )?;
+        Ok((eval, resolvedspec, design))
+    };
+
+    use crate::estimate::EstimationError;
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+    };
+
+    let mut obj = ClosureObjective {
+        state: MeanWiggleOuterState {
+            warm_cache: None,
+            last_eval: None,
+        },
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: theta_dim,
+            all_penalty_like: false,
+            barrier_config: None,
+        },
+        cost_fn: |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
+            if let Some((cached_theta, cached_cost, _, _, cached_warm)) = &state.last_eval
+                && cached_theta == theta
+            {
+                state.warm_cache = Some(cached_warm.clone());
+                return Ok(*cached_cost);
+            }
+            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
+                .map_err(EstimationError::InvalidInput)?;
+            state.warm_cache = Some(eval.warm_start);
+            Ok(eval.objective)
+        },
+        eval_fn: |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
+            if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
+                &state.last_eval
+                && cached_theta == theta
+            {
+                state.warm_cache = Some(cached_warm.clone());
+                return Ok(OuterEval {
+                    cost: *cached_cost,
+                    gradient: cached_grad.clone(),
+                    hessian: HessianResult::Analytic(cached_hess.clone()),
+                });
+            }
+            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), true)
+                .map_err(EstimationError::InvalidInput)?;
+            let hessian = eval.outer_hessian.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "binomial mean wiggle exact outer evaluation did not return a Hessian"
+                        .to_string(),
+                )
+            })?;
+            state.last_eval = Some((
+                theta.clone(),
+                eval.objective,
+                eval.gradient.clone(),
+                hessian.clone(),
+                eval.warm_start.clone(),
+            ));
+            state.warm_cache = Some(eval.warm_start);
+            Ok(OuterEval {
+                cost: state
+                    .last_eval
+                    .as_ref()
+                    .map(|x| x.1)
+                    .unwrap_or(f64::INFINITY),
+                gradient: state
+                    .last_eval
+                    .as_ref()
+                    .map(|x| x.2.clone())
+                    .unwrap_or_else(|| Array1::zeros(theta.len())),
+                hessian: HessianResult::Analytic(hessian),
+            })
+        },
+        reset_fn: None::<fn(&mut MeanWiggleOuterState)>,
+        efs_fn: None::<
+            fn(
+                &mut MeanWiggleOuterState,
+                &Array1<f64>,
+            ) -> Result<crate::solver::strategy::EfsEval, EstimationError>,
+        >,
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: options.outer_tol,
+        max_iter: options.outer_max_iter,
+        fd_step: 1e-4,
+        bounds: Some((lower, upper)),
+        seed_config: crate::seeding::SeedConfig::default(),
+        rho_bound: RHO_BOUND,
+        heuristic_lambdas: None,
+        initial_rho: Some(theta0),
+        fallback_sequence: vec![
+            OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+            },
+            OuterCapability {
+                gradient: Derivative::FiniteDifference,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+            },
+        ],
+    };
+
+    let outer = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "binomial mean wiggle exact spatial hyper",
+    )
+    .map_err(|e| e.to_string())?;
+    let mut theta_star = outer.rho;
+    enforce_spatial_psi_sum_to_zero(&mut theta_star, rho_dim, &dims_per_term);
+
+    let log_kappa =
+        SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
+    let resolvedspec = log_kappa
+        .apply_tospec(&pilot_spec_cloned, &spatial_terms)
+        .map_err(|e| e.to_string())?;
+    let design = build_term_collection_design(data, &resolvedspec).map_err(|e| e.to_string())?;
+    let resolvedspec = freeze_spatial_length_scale_terms_from_design(&resolvedspec, &design)
+        .map_err(|e| e.to_string())?;
+    let fit = fit_binomial_mean_wiggle(
+        BinomialMeanWiggleSpec {
+            y: y_cloned,
+            weights: weights_cloned,
+            link_kind: link_kind_cloned,
+            wiggle_knots: wiggle_knots.clone(),
+            wiggle_degree: wiggle_cfg.degree,
+            eta_block: ParameterBlockInput {
+                design: DesignMatrix::Dense(design.design.clone()),
+                offset: Array1::zeros(y.len()),
+                penalties: design.penalties.clone(),
+                initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
+                initial_beta: Some(pilot_beta),
+            },
+            wiggle_block: ParameterBlockInput {
+                design: wiggle_design,
+                offset: wiggle_offset,
+                penalties: wiggle_penalties,
+                initial_log_lambdas: Some(
+                    theta_star.slice(s![eta_penalty_count..rho_dim]).to_owned(),
+                ),
+                initial_beta: wiggle_initial_beta,
+            },
         },
         options,
     )?;
 
-    BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
-        fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
-            fit,
-            meanspec_resolved: pilot.meanspec_resolved,
-            noisespec_resolved: pilot.noisespec_resolved,
-            mean_design: pilot.mean_design,
-            noise_design: pilot.noise_design,
-        })?,
+    Ok(BinomialMeanWiggleTermFitResult {
+        fit,
+        resolvedspec,
+        design,
         wiggle_knots,
         wiggle_degree: wiggle_cfg.degree,
     })
@@ -4173,28 +4413,20 @@ impl GaussianLocationScaleFamily {
                     let mut x_ls_psi = Array2::<f64>::zeros((n, p_ls));
                     match block_idx {
                         Self::BLOCK_MU => {
-                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pmu {
-                                return Err(format!(
-                                    "GaussianLocationScaleFamily mu x_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    deriv.x_psi.nrows(),
-                                    deriv.x_psi.ncols(),
-                                    n,
-                                    pmu
-                                ));
-                            }
-                            xmu_psi.assign(&deriv.x_psi);
+                            xmu_psi.assign(&resolve_custom_family_x_psi(
+                                deriv,
+                                n,
+                                pmu,
+                                "GaussianLocationScaleFamily mu",
+                            )?);
                         }
                         Self::BLOCK_LOG_SIGMA => {
-                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != p_ls {
-                                return Err(format!(
-                                    "GaussianLocationScaleFamily log-sigma x_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    deriv.x_psi.nrows(),
-                                    deriv.x_psi.ncols(),
-                                    n,
-                                    p_ls
-                                ));
-                            }
-                            x_ls_psi.assign(&deriv.x_psi);
+                            x_ls_psi.assign(&resolve_custom_family_x_psi(
+                                deriv,
+                                n,
+                                p_ls,
+                                "GaussianLocationScaleFamily log-sigma",
+                            )?);
                         }
                         _ => return Ok(None),
                     }
@@ -4231,36 +4463,25 @@ impl GaussianLocationScaleFamily {
         let mut x_ls_ab = Array2::<f64>::zeros((n, p_ls));
         if psi_a.block_idx == psi_b.block_idx {
             let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            if let Some(x_psi_psi) = deriv.x_psi_psi.as_ref() {
-                if let Some(x_ab) = x_psi_psi.get(psi_b.local_idx) {
-                    match psi_a.block_idx {
-                        Self::BLOCK_MU => {
-                            if x_ab.nrows() != n || x_ab.ncols() != pmu {
-                                return Err(format!(
-                                    "GaussianLocationScaleFamily mu x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    x_ab.nrows(),
-                                    x_ab.ncols(),
-                                    n,
-                                    pmu
-                                ));
-                            }
-                            xmu_ab.assign(x_ab);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            if x_ab.nrows() != n || x_ab.ncols() != p_ls {
-                                return Err(format!(
-                                    "GaussianLocationScaleFamily log-sigma x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    x_ab.nrows(),
-                                    x_ab.ncols(),
-                                    n,
-                                    p_ls
-                                ));
-                            }
-                            x_ls_ab.assign(x_ab);
-                        }
-                        _ => {}
-                    }
-                }
+            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
+            match psi_a.block_idx {
+                Self::BLOCK_MU => xmu_ab.assign(&resolve_custom_family_x_psi_psi(
+                    deriv,
+                    deriv_b,
+                    psi_b.local_idx,
+                    n,
+                    pmu,
+                    "GaussianLocationScaleFamily mu",
+                )?),
+                Self::BLOCK_LOG_SIGMA => x_ls_ab.assign(&resolve_custom_family_x_psi_psi(
+                    deriv,
+                    deriv_b,
+                    psi_b.local_idx,
+                    n,
+                    p_ls,
+                    "GaussianLocationScaleFamily log-sigma",
+                )?),
+                _ => {}
             }
         }
         let zmu_ab = xmu_ab.dot(betamu);
@@ -5120,16 +5341,6 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 },
             ],
         })
-    }
-
-    fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
-        match self.link_kind {
-            InverseLink::Standard(base_link) => Some(KnownLinkWiggle {
-                base_link,
-                wiggle_block: Some(Self::BLOCK_WIGGLE),
-            }),
-            _ => None,
-        }
     }
 
     fn block_geometry(
@@ -6183,28 +6394,20 @@ impl BinomialLocationScaleFamily {
                     let mut x_ls_psi = Array2::<f64>::zeros((n, pls));
                     match block_idx {
                         Self::BLOCK_T => {
-                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pt {
-                                return Err(format!(
-                                    "BinomialLocationScaleFamily threshold x_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    deriv.x_psi.nrows(),
-                                    deriv.x_psi.ncols(),
-                                    n,
-                                    pt
-                                ));
-                            }
-                            x_t_psi.assign(&deriv.x_psi);
+                            x_t_psi.assign(&resolve_custom_family_x_psi(
+                                deriv,
+                                n,
+                                pt,
+                                "BinomialLocationScaleFamily threshold",
+                            )?);
                         }
                         Self::BLOCK_LOG_SIGMA => {
-                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pls {
-                                return Err(format!(
-                                    "BinomialLocationScaleFamily log-sigma x_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    deriv.x_psi.nrows(),
-                                    deriv.x_psi.ncols(),
-                                    n,
-                                    pls
-                                ));
-                            }
-                            x_ls_psi.assign(&deriv.x_psi);
+                            x_ls_psi.assign(&resolve_custom_family_x_psi(
+                                deriv,
+                                n,
+                                pls,
+                                "BinomialLocationScaleFamily log-sigma",
+                            )?);
                         }
                         _ => return Ok(None),
                     }
@@ -6249,37 +6452,25 @@ impl BinomialLocationScaleFamily {
         // design derivatives are therefore zero unless explicitly provided.
         if psi_a.block_idx == psi_b.block_idx {
             let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            if let Some(x_psi_psi) = deriv.x_psi_psi.as_ref() {
-                let maybe = x_psi_psi.get(psi_b.local_idx);
-                if let Some(x_ab) = maybe {
-                    match psi_a.block_idx {
-                        Self::BLOCK_T => {
-                            if x_ab.nrows() != n || x_ab.ncols() != pt {
-                                return Err(format!(
-                                    "BinomialLocationScaleFamily threshold x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    x_ab.nrows(),
-                                    x_ab.ncols(),
-                                    n,
-                                    pt
-                                ));
-                            }
-                            x_t_ab.assign(x_ab);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            if x_ab.nrows() != n || x_ab.ncols() != pls {
-                                return Err(format!(
-                                    "BinomialLocationScaleFamily log-sigma x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    x_ab.nrows(),
-                                    x_ab.ncols(),
-                                    n,
-                                    pls
-                                ));
-                            }
-                            x_ls_ab.assign(x_ab);
-                        }
-                        _ => {}
-                    }
-                }
+            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
+            match psi_a.block_idx {
+                Self::BLOCK_T => x_t_ab.assign(&resolve_custom_family_x_psi_psi(
+                    deriv,
+                    deriv_b,
+                    psi_b.local_idx,
+                    n,
+                    pt,
+                    "BinomialLocationScaleFamily threshold",
+                )?),
+                Self::BLOCK_LOG_SIGMA => x_ls_ab.assign(&resolve_custom_family_x_psi_psi(
+                    deriv,
+                    deriv_b,
+                    psi_b.local_idx,
+                    n,
+                    pls,
+                    "BinomialLocationScaleFamily log-sigma",
+                )?),
+                _ => {}
             }
         }
 
@@ -7845,28 +8036,20 @@ impl BinomialLocationScaleWiggleFamily {
                     let mut x_ls_psi = Array2::<f64>::zeros((n, pls));
                     match block_idx {
                         Self::BLOCK_T => {
-                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pt {
-                                return Err(format!(
-                                    "BinomialLocationScaleWiggleFamily threshold x_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    deriv.x_psi.nrows(),
-                                    deriv.x_psi.ncols(),
-                                    n,
-                                    pt
-                                ));
-                            }
-                            x_t_psi.assign(&deriv.x_psi);
+                            x_t_psi.assign(&resolve_custom_family_x_psi(
+                                deriv,
+                                n,
+                                pt,
+                                "BinomialLocationScaleWiggleFamily threshold",
+                            )?);
                         }
                         Self::BLOCK_LOG_SIGMA => {
-                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pls {
-                                return Err(format!(
-                                    "BinomialLocationScaleWiggleFamily log-sigma x_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    deriv.x_psi.nrows(),
-                                    deriv.x_psi.ncols(),
-                                    n,
-                                    pls
-                                ));
-                            }
-                            x_ls_psi.assign(&deriv.x_psi);
+                            x_ls_psi.assign(&resolve_custom_family_x_psi(
+                                deriv,
+                                n,
+                                pls,
+                                "BinomialLocationScaleWiggleFamily log-sigma",
+                            )?);
                         }
                         Self::BLOCK_WIGGLE => return Ok(None),
                         _ => return Ok(None),
@@ -7904,36 +8087,25 @@ impl BinomialLocationScaleWiggleFamily {
         let mut x_ls_ab = Array2::<f64>::zeros((n, pls));
         if psi_a.block_idx == psi_b.block_idx {
             let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            if let Some(x_psi_psi) = deriv.x_psi_psi.as_ref() {
-                if let Some(x_ab) = x_psi_psi.get(psi_b.local_idx) {
-                    match psi_a.block_idx {
-                        Self::BLOCK_T => {
-                            if x_ab.nrows() != n || x_ab.ncols() != pt {
-                                return Err(format!(
-                                    "BinomialLocationScaleWiggleFamily threshold x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    x_ab.nrows(),
-                                    x_ab.ncols(),
-                                    n,
-                                    pt
-                                ));
-                            }
-                            x_t_ab.assign(x_ab);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            if x_ab.nrows() != n || x_ab.ncols() != pls {
-                                return Err(format!(
-                                    "BinomialLocationScaleWiggleFamily log-sigma x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                                    x_ab.nrows(),
-                                    x_ab.ncols(),
-                                    n,
-                                    pls
-                                ));
-                            }
-                            x_ls_ab.assign(x_ab);
-                        }
-                        _ => {}
-                    }
-                }
+            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
+            match psi_a.block_idx {
+                Self::BLOCK_T => x_t_ab.assign(&resolve_custom_family_x_psi_psi(
+                    deriv,
+                    deriv_b,
+                    psi_b.local_idx,
+                    n,
+                    pt,
+                    "BinomialLocationScaleWiggleFamily threshold",
+                )?),
+                Self::BLOCK_LOG_SIGMA => x_ls_ab.assign(&resolve_custom_family_x_psi_psi(
+                    deriv,
+                    deriv_b,
+                    psi_b.local_idx,
+                    n,
+                    pls,
+                    "BinomialLocationScaleWiggleFamily log-sigma",
+                )?),
+                _ => {}
             }
         }
         let z_t_ab = x_t_ab.dot(beta_t);
@@ -10538,13 +10710,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             psi_index,
             d_beta_flat,
         )
-    }
-
-    fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
-        Some(KnownLinkWiggle {
-            base_link: self.link_kind.link_function(),
-            wiggle_block: Some(Self::BLOCK_WIGGLE),
-        })
     }
 
     fn block_geometry(
@@ -13422,6 +13587,9 @@ mod tests {
                 x_psi_psi: Some(vec![x_ls_psi_psi.clone().insert_axis(Axis(1))]),
                 s_psi_psi: Some(vec![Array2::zeros((1, 1))]),
                 s_psi_psi_components: None,
+                implicit_operator: None,
+                implicit_axis: 0,
+                implicit_group_id: None,
             }],
         ];
 
@@ -13613,6 +13781,9 @@ mod tests {
                 x_psi_psi: Some(vec![x_ls_psi_psi.clone().insert_axis(Axis(1))]),
                 s_psi_psi: Some(vec![Array2::zeros((1, 1))]),
                 s_psi_psi_components: None,
+                implicit_operator: None,
+                implicit_axis: 0,
+                implicit_group_id: None,
             }],
         ];
 
@@ -14900,28 +15071,10 @@ mod tests {
         }
     }
 
-    // ── Root-cause reproduction: binomial location-scale exact REML
-    //    vulnerability when stabilization path is not active ─────────
-
-    /// **Sufficiency – BinomialLocationScaleFamily's exact Newton
-    /// Hessian becomes non-finite when fitted probabilities are extreme.**
+    /// Binomial location-scale exact Hessian degenerates at extreme fitted values.
     ///
-    /// When probit-link eta values are large (|η| > 30), the working
-    /// weights effectively become zero, making the exact Hessian
-    /// ill-conditioned.  At extreme enough values the Hessian entries
-    /// overflow or underflow to non-finite values.
-    ///
-    /// This is the mechanism that causes the `rust_gamlss_flexible /
-    /// bone_gamair` benchmark failure: the pilot fit uses
-    /// `BinomialLocationScaleFamily` which does NOT have
-    /// `known_link_wiggle()` (returns None), so the stabilization path
-    /// at `fit_custom_family` line 5142 is skipped.  The outer Newton
-    /// evaluates the exact REML objective (including `log|H_mode|`)
-    /// at the initial rho and gets non-finite values before the outer solver
-    /// can retreat to a safer trial point.
-    ///
-    /// This test directly verifies that the Hessian becomes non-finite
-    /// under extreme fitted values — proving the mechanism.
+    /// This remains a useful stress test for the exact curvature itself even
+    /// though solver policy no longer special-cases wiggle families.
     #[test]
     fn binomial_location_scale_hessian_nonfinite_at_extreme_fitted_values() {
         use crate::families::custom_family::{CustomFamily, ParameterBlockState};
@@ -14989,55 +15142,6 @@ mod tests {
                 );
             }
         }
-
-        // Verify the structural vulnerability: known_link_wiggle is None,
-        // meaning the stabilization path in fit_custom_family is NOT active.
-        assert!(
-            family.known_link_wiggle().is_none(),
-            "BinomialLocationScaleFamily should NOT have known_link_wiggle (that's the vulnerability)"
-        );
-    }
-
-    /// **Necessity – the wiggle variant IS protected by the stabilization path.**
-    ///
-    /// `BinomialLocationScaleWiggleFamily` overrides `known_link_wiggle()`
-    /// to return `Some(...)`, which activates the stabilization path in
-    /// `fit_custom_family` that skips the fragile outer REML optimization.
-    /// This is why the wiggle variant does not suffer the same failure.
-    #[test]
-    fn binomial_location_scale_wiggle_has_stabilization() {
-        use crate::families::custom_family::CustomFamily;
-        let n = 4usize;
-        let y = array![1.0, 1.0, 0.0, 0.0];
-        let weights = Array1::ones(n);
-
-        // Non-wiggle: no stabilization (the vulnerability)
-        let family = BinomialLocationScaleFamily {
-            y: y.clone(),
-            weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_design: None,
-            log_sigma_design: None,
-        };
-        assert!(
-            family.known_link_wiggle().is_none(),
-            "BinomialLocationScaleFamily should NOT have stabilization"
-        );
-
-        // Wiggle variant: has stabilization (the fix)
-        let wiggle_family = BinomialLocationScaleWiggleFamily {
-            y,
-            weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_design: None,
-            log_sigma_design: None,
-            wiggle_knots: array![0.0, 0.5, 1.0],
-            wiggle_degree: 3,
-        };
-        assert!(
-            wiggle_family.known_link_wiggle().is_some(),
-            "BinomialLocationScaleWiggleFamily SHOULD have stabilization"
-        );
     }
 
     #[test]
