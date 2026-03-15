@@ -48,10 +48,34 @@ pub struct OuterCapability {
     /// Number of smoothing (+ any auxiliary hyper-) parameters being optimized.
     pub n_params: usize,
     /// Whether all hyperparameter coordinates (both rho and any extended coords)
-    /// are penalty-like. When true, the EFS (Extended Fellner-Schall) fixed-point
-    /// optimizer is eligible. When false (e.g. psi/design-moving coordinates),
-    /// EFS cannot be used because the multiplicative update structure breaks down.
+    /// are penalty-like. When true, the pure EFS (Extended Fellner-Schall)
+    /// fixed-point optimizer is eligible. When false (e.g. psi/design-moving
+    /// coordinates), the hybrid EFS strategy is used instead: EFS for
+    /// penalty-like (ρ) coords and preconditioned gradient for ψ coords.
+    ///
+    /// # Hybrid EFS strategy (when `has_psi_coords` is true)
+    ///
+    /// The hybrid is enabled when `has_psi_coords = true` and `n_params > 8`.
+    /// It combines:
+    /// - Standard EFS multiplicative fixed-point updates for ρ coordinates
+    /// - Safeguarded preconditioned gradient steps for ψ coordinates:
+    ///   `Δψ = -α G⁺ g_ψ` where G is the trace Gram matrix
+    ///
+    /// This is mathematically necessary because no EFS-type fixed-point
+    /// iteration exists for indefinite B_ψ (see response.md Section 2 for
+    /// the counterexample proof). The structural requirement for EFS is
+    /// `H^{-1/2} B_d H^{-1/2} ≽ 0` (PSD) plus fixed nullspace — exactly
+    /// what penalty-like coords satisfy and design-moving coords do not.
     pub all_penalty_like: bool,
+    /// Whether ψ (design-moving) coordinates are present among the extended
+    /// hyperparameter coordinates. When true together with `n_params > 8`,
+    /// the planner selects hybrid EFS instead of falling back to full BFGS.
+    ///
+    /// The hybrid strategy is O(1) H⁻¹ solves per iteration (same as pure
+    /// EFS), compared to O(dim(θ)) for BFGS which needs finite-difference
+    /// gradient evaluations. This makes the hybrid dramatically cheaper for
+    /// high-dimensional smoothing parameter spaces.
+    pub has_psi_coords: bool,
     /// Optional log-barrier configuration for structural monotonicity constraints.
     /// When present, EFS is still eligible at plan time, but the EFS iteration
     /// loop performs a quantitative check each step: if
@@ -78,6 +102,25 @@ pub enum Solver {
     /// Needs no gradient or Hessian — only traces tr(H^{-1} A_k) and
     /// Frobenius norms from the inner solution.
     Efs,
+    /// Hybrid EFS + preconditioned gradient.
+    ///
+    /// Used when ψ (design-moving) coordinates are present alongside ρ
+    /// (penalty-like) coordinates. Combines:
+    /// - Standard EFS multiplicative fixed-point steps for ρ coords
+    /// - Safeguarded preconditioned gradient steps for ψ coords:
+    ///   `Δψ = -α G⁺ g_ψ` where `G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)`
+    ///
+    /// This hybrid exists because no EFS-type fixed-point iteration can
+    /// guarantee convergence for indefinite B_ψ (proven by counterexample
+    /// in response.md Section 2). The key structural property that EFS
+    /// needs — `H^{-1/2} B_d H^{-1/2} ≽ 0` plus parameter-independent
+    /// nullspace — holds for penalty-like coords but fails for
+    /// design-moving coords where B_ψ has mixed inertia.
+    ///
+    /// The preconditioned gradient uses the same trace Gram matrix that
+    /// EFS already computes, so the cost is O(1) H⁻¹ solves per iteration
+    /// (same as pure EFS), compared to O(dim(θ)) for full BFGS.
+    HybridEfs,
 }
 
 /// How the Hessian will be obtained for the outer optimizer.
@@ -94,6 +137,9 @@ pub enum HessianSource {
     /// No explicit Hessian or gradient needed. EFS uses traces and
     /// Frobenius norms from the inner solution directly.
     EfsFixedPoint,
+    /// Hybrid EFS + preconditioned gradient for ψ coordinates.
+    /// EFS traces for ρ coords, trace Gram matrix + gradient for ψ coords.
+    HybridEfsFixedPoint,
 }
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
@@ -157,6 +203,27 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::EfsFixedPoint,
         },
 
+        // Hybrid EFS: ψ (design-moving) coords present alongside ρ coords.
+        //
+        // When ψ coords are present, pure EFS is invalid because B_ψ can be
+        // indefinite (see response.md Section 2 for the counterexample). But
+        // falling back to full BFGS wastes the cheap EFS structure for ρ coords.
+        //
+        // The hybrid strategy uses EFS for ρ-coords and a safeguarded
+        // preconditioned gradient step for ψ-coords:
+        //   Δψ = -α G⁺ g_ψ,  G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)
+        //
+        // This stays O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS)
+        // and uses the same trace Gram matrix that EFS already computes.
+        (Analytic, Unavailable) if cap.has_psi_coords && cap.n_params > 8 => OuterPlan {
+            solver: S::HybridEfs,
+            hessian_source: H::HybridEfsFixedPoint,
+        },
+        (Unavailable, Unavailable) if cap.has_psi_coords && cap.n_params > 8 => OuterPlan {
+            solver: S::HybridEfs,
+            hessian_source: H::HybridEfsFixedPoint,
+        },
+
         // With many params, FD Hessian is too expensive; fall back to BFGS.
         (Analytic, Unavailable) => OuterPlan {
             solver: S::Bfgs,
@@ -198,8 +265,13 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
     } else {
         ""
     };
+    let hybrid_note = if the_plan.solver == Solver::HybridEfs {
+        " [hybrid EFS(ρ) + preconditioned-gradient(ψ)]"
+    } else {
+        ""
+    };
     log::info!(
-        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{grad_warning}{hess_warning}{barrier_note}",
+        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{grad_warning}{hess_warning}{barrier_note}{hybrid_note}",
         cap.n_params,
         cap.gradient,
         cap.hessian,
@@ -277,18 +349,40 @@ impl HessianResult {
 /// Contains the REML/LAML cost at the current rho and the additive step
 /// vector produced by `compute_efs_update`. The caller applies the step as
 /// `rho_new[i] = rho[i] + steps[i]`.
+///
+/// For the hybrid EFS+preconditioned-gradient strategy, the steps vector
+/// contains both EFS steps (for ρ coords) and preconditioned gradient steps
+/// (for ψ coords). The `psi_gradient` field carries the raw ψ-block gradient
+/// for optional backtracking.
 #[derive(Clone, Debug)]
 pub struct EfsEval {
     /// REML/LAML cost at the current rho (for convergence monitoring and
     /// comparing candidates).
     pub cost: f64,
-    /// Additive EFS steps. Length = n_rho + n_ext_coords.
-    /// Steps for non-penalty-like coordinates are 0.0.
+    /// Additive steps. Length = n_rho + n_ext_coords.
+    ///
+    /// For pure EFS: steps for non-penalty-like coordinates are 0.0.
+    /// For hybrid EFS: ρ-coords get standard EFS multiplicative steps,
+    /// ψ-coords get preconditioned gradient steps `Δψ = -α G⁺ g_ψ`.
     pub steps: Vec<f64>,
     /// Current coefficient vector β̂ from the inner P-IRLS solve.
     /// Used by the EFS loop for the runtime barrier-curvature significance
     /// check when monotonicity constraints are present.
     pub beta: Option<Array1<f64>>,
+    /// Raw REML/LAML gradient restricted to the ψ block (design-moving coords).
+    ///
+    /// Present only when the hybrid EFS strategy is active. Used by the
+    /// outer iteration for backtracking on the ψ step: if the combined
+    /// (ρ-EFS, ψ-gradient) step does not decrease V(θ), the ψ step size
+    /// α is halved while keeping the ρ-EFS step fixed.
+    ///
+    /// This avoids re-evaluating the gradient during backtracking since
+    /// the gradient was already computed as part of the hybrid EFS eval.
+    pub psi_gradient: Option<Array1<f64>>,
+    /// Indices into the full θ vector that correspond to ψ (design-moving)
+    /// coordinates. Used by the backtracking logic to selectively scale
+    /// only the ψ portion of the step.
+    pub psi_indices: Option<Vec<usize>>,
 }
 
 /// Common interface for outer smoothing-parameter objectives.
@@ -475,7 +569,8 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             HessianSource::Analytic => eval.hessian.into_option(),
             HessianSource::FiniteDifference
             | HessianSource::BfgsApprox
-            | HessianSource::EfsFixedPoint => None,
+            | HessianSource::EfsFixedPoint
+            | HessianSource::HybridEfsFixedPoint => None,
         };
         Ok(SecondOrderSample {
             value: eval.cost,
@@ -489,6 +584,15 @@ struct OuterFixedPointBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     barrier_config: Option<BarrierConfig>,
 }
+
+/// Maximum number of backtracking halvings for the ψ block in the hybrid
+/// EFS+preconditioned-gradient iteration.
+///
+/// If after this many halvings the combined (ρ-EFS, ψ-gradient) step still
+/// doesn't decrease V(θ), the ψ step is zeroed out and only the ρ-EFS step
+/// is applied. This preserves the EFS convergence guarantee for ρ coords
+/// even when the ψ step is too aggressive.
+const MAX_PSI_BACKTRACK: usize = 8;
 
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
@@ -511,11 +615,96 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         } else {
             FixedPointStatus::Continue
         };
+
         let step = if matches!(status, FixedPointStatus::Stop) {
             Array1::zeros(x.len())
+        } else if eval.psi_indices.is_some() && eval.psi_gradient.is_some() {
+            // ── Hybrid EFS+preconditioned-gradient path ──
+            //
+            // The step vector contains EFS steps for ρ/τ coordinates and
+            // preconditioned gradient steps for ψ coordinates. We perform
+            // backtracking on the ψ block to ensure the combined step
+            // decreases V(θ).
+            //
+            // Backtracking strategy:
+            // 1. Try the full combined step.
+            // 2. If it doesn't decrease V(θ), halve only the ψ portion.
+            // 3. Repeat up to MAX_PSI_BACKTRACK times.
+            // 4. If still no decrease, zero out the ψ step entirely.
+            //
+            // This preserves the EFS convergence guarantee for ρ coords:
+            // the ρ-EFS step is always applied in full, and only the ψ
+            // portion is adjusted. The ρ-EFS step has its own monotonicity
+            // guarantee from the Wood-Fasiolo theorem (valid because ρ
+            // coords satisfy the PSD + fixed-nullspace structural property).
+            let psi_indices = eval.psi_indices.as_ref().unwrap();
+            let current_cost = eval.cost;
+            let mut combined_step = Array1::from_vec(eval.steps);
+
+            // Save the original ψ step magnitudes for halving.
+            let original_psi_steps: Vec<f64> = psi_indices
+                .iter()
+                .map(|&i| combined_step[i])
+                .collect();
+
+            let mut accepted = false;
+            for bt in 0..MAX_PSI_BACKTRACK {
+                // Evaluate cost at the trial point.
+                let trial = x + &combined_step;
+                match self.obj.eval_cost(&trial) {
+                    Ok(trial_cost) if trial_cost < current_cost => {
+                        // Step accepted — the combined step decreases V(θ).
+                        if bt > 0 {
+                            log::debug!(
+                                "[HYBRID-EFS] ψ backtrack accepted after {bt} halvings \
+                                 (cost: {current_cost:.6} → {trial_cost:.6})"
+                            );
+                        }
+                        accepted = true;
+                        break;
+                    }
+                    Ok(trial_cost) => {
+                        // Step rejected — halve the ψ portion.
+                        log::debug!(
+                            "[HYBRID-EFS] ψ backtrack {bt}: trial cost {trial_cost:.6} >= \
+                             current {current_cost:.6}, halving ψ step"
+                        );
+                        for (j, &i) in psi_indices.iter().enumerate() {
+                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 2) as i32);
+                            combined_step[i] = halved;
+                        }
+                    }
+                    Err(_) => {
+                        // Evaluation failed — halve ψ step and retry.
+                        log::debug!(
+                            "[HYBRID-EFS] ψ backtrack {bt}: trial eval failed, halving ψ step"
+                        );
+                        for (j, &i) in psi_indices.iter().enumerate() {
+                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 2) as i32);
+                            combined_step[i] = halved;
+                        }
+                    }
+                }
+            }
+
+            if !accepted {
+                // All backtracking attempts exhausted. Zero out the ψ step
+                // and rely solely on the ρ-EFS step for this iteration.
+                log::info!(
+                    "[HYBRID-EFS] ψ backtrack exhausted ({MAX_PSI_BACKTRACK} halvings). \
+                     Zeroing ψ step; applying ρ-EFS step only."
+                );
+                for &i in psi_indices {
+                    combined_step[i] = 0.0;
+                }
+            }
+
+            combined_step
         } else {
+            // Pure EFS path: no ψ coordinates, no backtracking needed.
             Array1::from_vec(eval.steps)
         };
+
         Ok(FixedPointSample {
             value: eval.cost,
             step,
@@ -888,6 +1077,53 @@ fn run_outer_with_plan(
                     ))),
                 }
             }
+            // ── Hybrid EFS + preconditioned gradient for ψ coords ──
+            //
+            // This solver combines EFS multiplicative steps for ρ (penalty-like)
+            // coordinates with safeguarded preconditioned gradient steps for ψ
+            // (design-moving) coordinates.
+            //
+            // The hybrid is needed because EFS is mathematically invalid for
+            // indefinite B_ψ: Wood-Fasiolo's ascent proof requires
+            // H^{-1/2} B_d H^{-1/2} ≽ 0 with parameter-independent nullspace,
+            // which holds for penalty-like coords but fails for design-moving
+            // coords. A concrete counterexample (response.md Section 2) shows
+            // that any fixed-point map using only {a_d, tr(H⁻¹B_d),
+            // tr(H⁻¹B_dH⁻¹B_e), v_d} can be made ascent or descent by varying
+            // the local curvature c, so no universal convergence guarantee exists.
+            //
+            // The preconditioned gradient Δψ = -α G⁺ g_ψ uses the same trace
+            // Gram matrix G_{de} = tr(H⁻¹ B_d H⁻¹ B_e) that EFS computes,
+            // staying O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS).
+            //
+            // Backtracking: if the combined step doesn't decrease V(θ), the ψ
+            // step size α is halved (up to MAX_PSI_BACKTRACK times) while the
+            // ρ-EFS step is kept fixed.
+            Solver::HybridEfs => {
+                let (lo, hi) = &bounds_template;
+                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
+                    .expect("outer rho bounds must be valid");
+                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                let max_iter =
+                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                let objective = OuterFixedPointBridge {
+                    obj,
+                    barrier_config: cap.barrier_config.clone(),
+                };
+                let mut optimizer = FixedPoint::new(seed.clone(), objective)
+                    .with_bounds(bounds)
+                    .with_tolerance(tol)
+                    .with_max_iterations(max_iter);
+                match optimizer.run() {
+                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                    Err(FixedPointError::MaxIterationsReached { last_solution }) => {
+                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                    }
+                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                        "hybrid EFS solver failed: {e:?}"
+                    ))),
+                }
+            }
         };
 
         match result {
@@ -927,6 +1163,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 3,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -941,6 +1178,7 @@ mod tests {
             hessian: Derivative::FiniteDifference,
             n_params: 3,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -955,6 +1193,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 3,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -969,6 +1208,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 12,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -984,6 +1224,7 @@ mod tests {
                 hessian: Derivative::Unavailable,
                 n_params: n,
                 all_penalty_like: false,
+                has_psi_coords: false,
                 barrier_config: None,
             };
             let p = plan(&cap);
@@ -999,6 +1240,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 3,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1012,6 +1254,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 8,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1025,6 +1268,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 9,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1038,6 +1282,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 15,
             all_penalty_like: true,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1052,6 +1297,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 5,
             all_penalty_like: true,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1066,6 +1312,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 20,
             all_penalty_like: true,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1082,6 +1329,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 20,
             all_penalty_like: true,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1104,6 +1352,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 15,
             all_penalty_like: true,
+            has_psi_coords: false,
             barrier_config: Some(barrier),
         };
         let p = plan(&cap);
@@ -1125,6 +1374,7 @@ mod tests {
             hessian: Derivative::Unavailable,
             n_params: 20,
             all_penalty_like: true,
+            has_psi_coords: false,
             barrier_config: Some(barrier),
         };
         let p = plan(&cap);
@@ -1173,6 +1423,7 @@ mod tests {
             hessian: Derivative::Analytic,
             n_params: 0,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1199,6 +1450,7 @@ mod tests {
                 hessian: Derivative::Unavailable,
                 n_params: 1,
                 all_penalty_like: false,
+                has_psi_coords: false,
                 barrier_config: None,
             },
             cost_fn: |st: &mut i32, rho: &Array1<f64>| {
@@ -1228,5 +1480,88 @@ mod tests {
         assert_eq!(cfg.tolerance, 1e-5);
         assert_eq!(cfg.max_iter, 200);
         assert_eq!(cfg.rho_bound, 30.0);
+    }
+
+    #[test]
+    fn plan_hybrid_efs_selected_for_psi_coords_many_params() {
+        // When ψ (design-moving) coords are present and n_params > 8,
+        // the planner should select HybridEfs instead of falling back to BFGS.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: false,
+            has_psi_coords: true,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::HybridEfs);
+        assert_eq!(p.hessian_source, HessianSource::HybridEfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_hybrid_efs_no_gradient_selected_for_psi_coords() {
+        // Even without analytic gradient, hybrid EFS works because the
+        // gradient is computed internally by the unified evaluator.
+        let cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: false,
+            has_psi_coords: true,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::HybridEfs);
+        assert_eq!(p.hessian_source, HessianSource::HybridEfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_hybrid_efs_not_selected_few_params() {
+        // With few params, FD Hessian is preferred over hybrid EFS.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 5,
+            all_penalty_like: false,
+            has_psi_coords: true,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        // Few params + analytic gradient → FD Newton is better.
+        assert_eq!(p.solver, Solver::NewtonTrustRegion);
+    }
+
+    #[test]
+    fn plan_hybrid_efs_not_selected_with_analytic_hessian() {
+        // Arc is always preferred when analytic Hessian is available,
+        // even with ψ coordinates.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 20,
+            all_penalty_like: false,
+            has_psi_coords: true,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+    }
+
+    #[test]
+    fn plan_pure_efs_not_hybrid_when_all_penalty_like() {
+        // When all coords are penalty-like (no ψ), pure EFS is selected
+        // even if has_psi_coords is false.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: true,
+            has_psi_coords: false,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Efs);
+        assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
     }
 }

@@ -412,6 +412,7 @@ fn fit_survival_location_scale_model(
                     hessian: Derivative::Unavailable,
                     n_params: dim,
                     all_penalty_like: false,
+                    has_psi_coords: false,
                     barrier_config: None,
                 },
                 cost_fn: |state: &mut (), rho: &Array1<f64>| {

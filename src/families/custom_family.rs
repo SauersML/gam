@@ -5028,6 +5028,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         // Custom-family outer objectives do not currently provide `eval_efs`,
         // so strategy should remain within Newton/BFGS-style plans here.
         all_penalty_like: false,
+        has_psi_coords: false,
         // Custom families enforce constraints via active-set QP in the inner
         // loop, not via log-barrier in the outer evaluator.
         barrier_config: None,
@@ -5037,6 +5038,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         hessian: Derivative::Unavailable,
         n_params: n_rho,
         all_penalty_like: false,
+        has_psi_coords: false,
         barrier_config: None,
     };
     let fd_gradient_fallback = OuterCapability {
@@ -5044,6 +5046,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         hessian: Derivative::Unavailable,
         n_params: n_rho,
         all_penalty_like: false,
+        has_psi_coords: false,
         barrier_config: None,
     };
     let fallback_sequence = if has_exact_hess {

@@ -4661,6 +4661,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             hessian: Derivative::Analytic,
             n_params: n_theta,
             all_penalty_like: false,
+            has_psi_coords: true,
             barrier_config: None,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
@@ -8267,6 +8268,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             hessian: Derivative::Unavailable,
             n_params: theta_dim,
             all_penalty_like: false,
+            has_psi_coords: true,
             barrier_config: None,
         }],
     };
@@ -8280,6 +8282,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             // ψ coordinates are NOT penalty-like (they move the design),
             // so EFS is not appropriate.
             all_penalty_like: false,
+            has_psi_coords: true,
             barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
@@ -8879,6 +8882,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             hessian: Derivative::Unavailable,
             n_params: theta_dim,
             all_penalty_like: false,
+            has_psi_coords: true,
             barrier_config: None,
         }],
     };
@@ -8892,6 +8896,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             // κ coordinates move the design (like ψ in aniso), so EFS is
             // not appropriate.
             all_penalty_like: false,
+            has_psi_coords: true,
             barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
@@ -9260,6 +9265,7 @@ where
                 hessian: Derivative::Unavailable,
                 n_params: theta_dim,
                 all_penalty_like: false,
+                has_psi_coords: true,
                 barrier_config: None,
             }]
         } else if !analytic_joint_gradient_available {
@@ -9268,6 +9274,7 @@ where
                 hessian: Derivative::Unavailable,
                 n_params: theta_dim,
                 all_penalty_like: false,
+                has_psi_coords: true,
                 barrier_config: None,
             }]
         } else {
@@ -9290,6 +9297,7 @@ where
             },
             n_params: theta_dim,
             all_penalty_like: false,
+            has_psi_coords: true,
             barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
