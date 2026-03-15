@@ -34,7 +34,10 @@ use gam::gamlss::{
     buildwiggle_block_input_from_seed,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
-use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
+use gam::hmc::{
+    FamilyNutsInputs, GlmFlatInputs, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily,
+    run_link_wiggle_nuts_sampling, run_nuts_sampling_flattened_family,
+};
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
     load_csvwith_schema,
@@ -5557,9 +5560,15 @@ fn run_sample_standard(
     family: LikelihoodFamily,
     cfg: &NutsConfig,
 ) -> Result<gam::hmc::NutsResult, String> {
-    if model.beta_link_wiggle.is_some() {
-        return Err(
-            "sample for standard binomial link-wiggle models is not implemented yet".to_string(),
+    if model.has_link_wiggle() {
+        return run_sample_standard_link_wiggle(
+            progress,
+            model,
+            data,
+            col_map,
+            training_headers,
+            family,
+            cfg,
         );
     }
     progress.set_stage("sample", "building sampling design");
@@ -5624,6 +5633,205 @@ fn run_sample_standard(
         cfg,
     )
     .map_err(|e| format!("NUTS sampling failed: {e}"))
+}
+
+/// NUTS sampling for standard models with a link wiggle component.
+///
+/// Uses the saved fit result (joint mode + Hessian over [β_eta; β_wiggle])
+/// rather than re-fitting, because the two-block custom-family fit cannot be
+/// re-run through the single-block `fit_gam` path.
+fn run_sample_standard_link_wiggle(
+    progress: &mut gam::visualizer::VisualizerSession,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    family: LikelihoodFamily,
+    cfg: &NutsConfig,
+) -> Result<gam::hmc::NutsResult, String> {
+    progress.set_stage("sample", "building link-wiggle sampling design");
+
+    // Response vector
+    let parsed = parse_formula(&model.formula)?;
+    let y_col = *col_map
+        .get(&parsed.response)
+        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y = data.column(y_col).to_owned();
+
+    // Main design matrix (base η block)
+    let spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build term collection design: {e}"))?;
+    let p_main = design.design.ncols();
+
+    // Saved fit result (joint [β_eta; β_wiggle])
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let beta_link_wiggle = model
+        .beta_link_wiggle
+        .as_ref()
+        .ok_or_else(|| "link-wiggle model is missing beta_link_wiggle".to_string())?;
+    let p_wiggle = beta_link_wiggle.len();
+    let p_total = p_main + p_wiggle;
+
+    if fit.beta.len() != p_total {
+        return Err(format!(
+            "link-wiggle sample: saved beta has {} coefficients but design has {} main + {} wiggle = {} total",
+            fit.beta.len(),
+            p_main,
+            p_wiggle,
+            p_total,
+        ));
+    }
+
+    let mode_beta = fit.beta.slice(ndarray::s![0..p_main]).to_owned();
+    let mode_theta = fit.beta.slice(ndarray::s![p_main..]).to_owned();
+
+    // Joint Hessian from saved inference
+    let hessian = fit
+        .penalized_hessian()
+        .ok_or_else(|| {
+            "link-wiggle model is missing penalized Hessian; refit with inference enabled"
+                .to_string()
+        })?;
+    if hessian.nrows() != p_total || hessian.ncols() != p_total {
+        return Err(format!(
+            "link-wiggle sample: Hessian is {}x{} but expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            p_total,
+            p_total,
+        ));
+    }
+
+    // Build block-diagonal penalties from saved lambdas.
+    // The main block penalties come from the design, and the wiggle block
+    // penalties are difference penalties on the wiggle basis. We extract the
+    // block structure from the joint lambdas: first n_base_penalties belong to
+    // the main block, the rest to the wiggle block.
+    let n_base_penalties = design.penalties.len();
+    let n_total_lambdas = fit.lambdas.len();
+    if n_total_lambdas < n_base_penalties {
+        return Err(format!(
+            "link-wiggle sample: {} saved lambdas but {} base penalties",
+            n_total_lambdas,
+            n_base_penalties,
+        ));
+    }
+
+    // Base penalty: Σ λ_k S_k (p_main × p_main)
+    let base_lambdas = fit.lambdas.slice(ndarray::s![0..n_base_penalties]);
+    let penalty_base = weighted_penalty_matrix(&design.penalties, base_lambdas)?;
+
+    // Wiggle penalty: extract from the saved joint Hessian's wiggle block.
+    // The wiggle penalty is the (p_wiggle × p_wiggle) lower-right block of
+    // the full penalty minus the likelihood contribution.
+    // Simpler approach: build difference penalties for the wiggle basis and
+    // weight by saved wiggle lambdas.
+    let wiggle_lambdas = fit.lambdas.slice(ndarray::s![n_base_penalties..]);
+    let knots = model
+        .linkwiggle_knots
+        .as_ref()
+        .ok_or_else(|| "missing linkwiggle_knots".to_string())?;
+    let degree = model
+        .linkwiggle_degree
+        .ok_or_else(|| "missing linkwiggle_degree".to_string())?;
+
+    // Build wiggle penalty matrices (constrained difference penalties)
+    let knot_arr = Array1::from_vec(knots.clone());
+    let (z_transform, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
+        .map_err(|e| format!("wiggle constraint transform failed: {e}"))?;
+    let p_constrained = z_transform.ncols();
+    if p_constrained != p_wiggle {
+        return Err(format!(
+            "wiggle constraint dimension mismatch: transform gives {} but beta_link_wiggle has {}",
+            p_constrained,
+            p_wiggle,
+        ));
+    }
+
+    // Build difference penalty matrices in the constrained basis
+    let n_raw = knot_arr.len().saturating_sub(degree + 1);
+    let mut wiggle_penalties = Vec::new();
+    let default_orders = [2usize]; // standard 2nd-order difference penalty
+    let n_wiggle_lambdas = wiggle_lambdas.len();
+    for k in 0..n_wiggle_lambdas {
+        let order = if k < default_orders.len() {
+            default_orders[k]
+        } else {
+            k + 1
+        };
+        if order >= n_raw {
+            continue;
+        }
+        let raw_penalty = create_difference_penalty_matrix(n_raw, order, None)
+            .map_err(|e| format!("wiggle difference penalty failed: {e}"))?;
+        // Transform to constrained space: Z^T S Z
+        let constrained_penalty = z_transform.t().dot(&raw_penalty).dot(&z_transform);
+        wiggle_penalties.push(constrained_penalty);
+    }
+
+    // If we have more lambdas than penalties, pad with zero matrices
+    while wiggle_penalties.len() < n_wiggle_lambdas {
+        wiggle_penalties.push(Array2::zeros((p_wiggle, p_wiggle)));
+    }
+
+    let penalty_link = weighted_penalty_matrix(&wiggle_penalties, wiggle_lambdas)?;
+
+    // Build spline artifacts for the posterior target
+    let q0 = design.design.dot(&mode_beta);
+    let (q0_min, q0_max) = q0
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+
+    let spline = LinkWiggleSplineArtifacts {
+        knot_range: (q0_min, q0_max),
+        knot_vector: knot_arr,
+        link_transform: z_transform,
+        degree,
+    };
+
+    // Map family to NutsFamily
+    let nuts_family = match family {
+        LikelihoodFamily::BinomialLogit => NutsFamily::BinomialLogit,
+        LikelihoodFamily::BinomialProbit => NutsFamily::BinomialProbit,
+        LikelihoodFamily::BinomialCLogLog => NutsFamily::BinomialCLogLog,
+        LikelihoodFamily::GaussianIdentity => NutsFamily::Gaussian,
+        LikelihoodFamily::PoissonLog => NutsFamily::PoissonLog,
+        LikelihoodFamily::GammaLog => NutsFamily::GammaLog,
+        _ => {
+            return Err(format!(
+                "NUTS sampling with link wiggle is not supported for family {}",
+                family.pretty_name()
+            ))
+        }
+    };
+
+    let weights = Array1::ones(data.nrows());
+    let scale = fit.standard_deviation;
+
+    progress.set_stage("sample", "running link-wiggle NUTS");
+    run_link_wiggle_nuts_sampling(
+        design.design.view(),
+        y.view(),
+        weights.view(),
+        penalty_base.view(),
+        penalty_link.view(),
+        mode_beta.view(),
+        mode_theta.view(),
+        hessian.view(),
+        spline,
+        nuts_family,
+        scale,
+        cfg,
+    )
+    .map_err(|e| format!("link-wiggle NUTS sampling failed: {e}"))
 }
 
 fn run_generate(args: GenerateArgs) -> Result<(), String> {
@@ -6607,7 +6815,7 @@ fn is_standard_binomial_linkwiggle_model(
     family: LikelihoodFamily,
     saved_link_kind: Option<&InverseLink>,
 ) -> bool {
-    model.beta_link_wiggle.is_some()
+    model.has_link_wiggle()
         && model.predict_model_class() == PredictModelClass::Standard
         && is_binomial_family(family)
         && saved_link_kind.is_some()

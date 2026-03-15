@@ -205,7 +205,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         fit: solved.fit,
         design: solved.design,
         resolvedspec: solved.resolvedspec,
-        adaptive_diagnostics: None,
+        adaptive_diagnostics: result.adaptive_diagnostics,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
         beta_link_wiggle: Some(beta_link_wiggle),
