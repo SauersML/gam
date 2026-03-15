@@ -1,0 +1,160 @@
+
+--------------------------------------------------
+PG(1, 0.5)  —  sample size = 1000000
+# A tibble: 2 × 7
+      z which      mean    var    sd  skew  kurt
+  <dbl> <chr>     <dbl>  <dbl> <dbl> <dbl> <dbl>
+1   0.5 Rust      0.245 0.0396 0.199  1.96  5.80
+2   0.5 Reference 0.245 0.0397 0.199  1.99  6.14
+Theoretical mean  = 0.244919
+
+Two–sample t-test:
+
+	Welch Two Sample t-test
+
+data:  rust and ref
+t = 1.5199, df = 2e+06, p-value = 0.1285
+alternative hypothesis: true difference in means is not equal to 0
+95 percent confidence interval:
+ -0.0001239156  0.0009798680
+sample estimates:
+mean of x mean of y 
+ 0.244961  0.244533 
+
+
+Kolmogorov–Smirnov test:
+
+	Asymptotic two-sample Kolmogorov-Smirnov test
+
+data:  rust and ref
+D = 0.001694, p-value = 0.1134
+alternative hypothesis: two-sided
+
+
+--------------------------------------------------
+PG(1, 1)  —  sample size = 1000000
+# A tibble: 2 × 7
+      z which      mean    var    sd  skew  kurt
+  <dbl> <chr>     <dbl>  <dbl> <dbl> <dbl> <dbl>
+1     1 Rust      0.231 0.0344 0.185  1.95  5.82
+2     1 Reference 0.231 0.0344 0.185  1.94  5.66
+Theoretical mean  = 0.231059
+
+Two–sample t-test:
+
+	Welch Two Sample t-test
+
+data:  rust and ref
+t = -1.2391, df = 2e+06, p-value = 0.2153
+alternative hypothesis: true difference in means is not equal to 0
+95 percent confidence interval:
+ -0.0008389434  0.0001890405
+sample estimates:
+mean of x mean of y 
+0.2310390 0.2313639 
+
+
+Kolmogorov–Smirnov test:
+
+	Asymptotic two-sample Kolmogorov-Smirnov test
+
+data:  rust and ref
+D = 0.00132, p-value = 0.3483
+alternative hypothesis: two-sided
+
+
+--------------------------------------------------
+PG(1, 2)  —  sample size = 1000000
+# A tibble: 2 × 7
+      z which      mean    var    sd  skew  kurt
+  <dbl> <chr>     <dbl>  <dbl> <dbl> <dbl> <dbl>
+1     2 Rust      0.190 0.0212 0.146  1.92  5.62
+2     2 Reference 0.190 0.0214 0.146  1.94  5.77
+Theoretical mean  = 0.190399
+
+Two–sample t-test:
+
+	Welch Two Sample t-test
+
+data:  rust and ref
+t = -1.0817, df = 1999950, p-value = 0.2794
+alternative hypothesis: true difference in means is not equal to 0
+95 percent confidence interval:
+ -0.0006276779  0.0001812345
+sample estimates:
+mean of x mean of y 
+0.1900586 0.1902819 
+
+
+Kolmogorov–Smirnov test:
+
+	Asymptotic two-sample Kolmogorov-Smirnov test
+
+data:  rust and ref
+D = 0.000969, p-value = 0.7357
+alternative hypothesis: two-sided
+
+
+--------------------------------------------------
+PG(1, 3.2)  —  sample size = 1000000
+# A tibble: 2 × 7
+      z which      mean    var    sd  skew  kurt
+  <dbl> <chr>     <dbl>  <dbl> <dbl> <dbl> <dbl>
+1   3.2 Rust      0.144 0.0104 0.102  1.87  5.36
+2   3.2 Reference 0.144 0.0104 0.102  1.88  5.55
+Theoretical mean  = 0.144011
+
+Two–sample t-test:
+
+	Welch Two Sample t-test
+
+data:  rust and ref
+t = 1.0286, df = 2e+06, p-value = 0.3036
+alternative hypothesis: true difference in means is not equal to 0
+95 percent confidence interval:
+ -0.0001342274  0.0004307385
+sample estimates:
+mean of x mean of y 
+0.1441117 0.1439634 
+
+
+Kolmogorov–Smirnov test:
+
+	Asymptotic two-sample Kolmogorov-Smirnov test
+
+data:  rust and ref
+D = 0.001892, p-value = 0.05577
+alternative hypothesis: two-sided
+
+
+--------------------------------------------------
+PG(1, 5)  —  sample size = 1000000
+# A tibble: 2 × 7
+      z which       mean     var     sd  skew  kurt
+  <dbl> <chr>      <dbl>   <dbl>  <dbl> <dbl> <dbl>
+1     5 Rust      0.0987 0.00369 0.0607  1.75  4.89
+2     5 Reference 0.0987 0.00369 0.0607  1.76  4.96
+Theoretical mean  = 0.098661
+
+Two–sample t-test:
+
+	Welch Two Sample t-test
+
+data:  rust and ref
+t = -0.2074, df = 2e+06, p-value = 0.8357
+alternative hypothesis: true difference in means is not equal to 0
+95 percent confidence interval:
+ -0.0001861291  0.0001505074
+sample estimates:
+ mean of x  mean of y 
+0.09869523 0.09871304 
+
+
+Kolmogorov–Smirnov test:
+
+	Asymptotic two-sample Kolmogorov-Smirnov test
+
+data:  rust and ref
+D = 0.001506, p-value = 0.2068
+alternative hypothesis: two-sided
+

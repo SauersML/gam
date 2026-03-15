@@ -1,0 +1,52 @@
+[package]
+name = "polya-gamma"
+version = "0.5.3"
+edition = "2024"
+authors = ["Daniel Lyng <lyng@varchar.one>"]
+license = "MIT OR Apache-2.0"
+description = "Efficient sampler for Polya-Gamma random variates"
+homepage = "https://github.com/varchar-llc/polya-gamma"
+
+[features]
+default = ["rayon"]
+rayon = ["dep:rayon"]
+regression = ["dep:ndarray", "dep:ndarray-linalg", "dep:mini-mcmc", "dep:rand_chacha"]
+
+[dependencies]
+nalgebra = { version = "0.32", default-features = false, features = ["std"] }
+rand = "0.8.5"
+rand_chacha = {version = "0.3.1", optional = true}
+rayon = { version = "1.10.0", optional = true }
+statrs = "0.18.0"
+mini-mcmc = {version = "0.5.2", optional = true}
+ndarray = {version = "0.16.1",optional = true}
+ndarray-linalg = { version = "0.17.0", features = ["openblas"], optional = true, default-features = false }
+
+[dev-dependencies]
+approx = "0.5.1"
+criterion = "0.5"
+proptest = "1.6.0"
+
+[[bench]]
+name = "vec_par"
+path = "benches/vec_par.rs"
+harness = false
+
+[[bench]]
+name = "comparison"
+path = "benches/comparison/benchmark.rs"
+harness = false
+
+[[example]]
+name = "reference_implementation"
+path = "examples/reference_implementation/reference.rs"
+
+[[example]]
+name = "logistic_regression"
+required-features = ["regression"]
+path = "examples/logistic_regression.rs"
+
+[[example]]
+name = "negbin_regression"
+required-features = ["regression"]
+path = "examples/negbin_regression.rs"
