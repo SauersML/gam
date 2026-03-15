@@ -333,8 +333,7 @@ impl TermCollectionSpec {
                     ));
                 }
                 match prior {
-                    BoundedCoefficientPriorSpec::None
-                    | BoundedCoefficientPriorSpec::Uniform => {}
+                    BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
                             return Err(format!(
@@ -4629,6 +4628,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     // Clamp theta to the asymmetric epsilon bounds that run_outer's symmetric
     // rho_bound cannot express directly.
+    let theta_bounds = Some((eps_lower.clone(), eps_upper.clone()));
     let clamp_theta = {
         let lo = eps_lower;
         let hi = eps_upper;
@@ -4669,6 +4669,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         tolerance: options.tol,
         max_iter: options.max_iter,
         fd_step: 1e-4,
+        bounds: theta_bounds,
         seed_config: crate::seeding::SeedConfig::default(),
         rho_bound: 30.0,
         heuristic_lambdas: None,
@@ -4687,7 +4688,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             n_params: n_theta,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
@@ -8182,7 +8182,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval, Solver,
+        OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8304,6 +8304,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         tolerance: 1e-6,
         max_iter: 50,
         fd_step: 1e-5,
+        bounds: Some((lower.clone(), upper.clone())),
         seed_config: crate::seeding::SeedConfig {
             max_seeds: 1,
             screening_budget: 1,
@@ -8314,12 +8315,11 @@ fn try_exact_joint_spatial_aniso_optimization(
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
         fallback_sequence: vec![OuterCapability {
-            gradient: Derivative::Analytic,
+            gradient: Derivative::FiniteDifference,
             hessian: Derivative::Unavailable,
             n_params: theta_dim,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: Some(Solver::Bfgs),
         }],
     };
 
@@ -8333,30 +8333,32 @@ fn try_exact_joint_spatial_aniso_optimization(
             // so EFS is not appropriate.
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         },
         cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
             ctx.track_best(theta, cost);
             Ok(cost)
         },
-        eval_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-            match ctx.eval_full(theta) {
-                Ok((cost, grad, hess)) => {
-                    ctx.track_best(theta, cost);
-                    Ok(OuterEval {
-                        cost,
-                        gradient: grad,
-                        hessian: HessianResult::Analytic(hess),
-                    })
-                }
-                Err(_) => {
-                    // On failure, return +inf cost to make optimizer retreat.
-                    Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    })
+        eval_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx
+            .eval_full(theta)
+        {
+            Ok((cost, grad, hess)) => {
+                ctx.track_best(theta, cost);
+                Ok(OuterEval {
+                    cost,
+                    gradient: grad,
+                    hessian: HessianResult::Analytic(hess),
+                })
+            }
+            Err(e) => {
+                let cost = ctx.eval_cost(theta);
+                ctx.track_best(theta, cost);
+                if cost.is_finite() {
+                    Err(EstimationError::RemlOptimizationFailed(format!(
+                        "anisotropic exact-joint derivative evaluation failed at a feasible theta: {e}"
+                    )))
+                } else {
+                    Ok(OuterEval::infeasible(theta.len()))
                 }
             }
         },
@@ -8366,13 +8368,16 @@ fn try_exact_joint_spatial_aniso_optimization(
         >,
     };
 
-    let result =
-        crate::solver::strategy::run_outer(&mut obj, &outer_config, "aniso-psi joint REML")
-            .map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-                ))
-            })?;
+    let result = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "aniso-psi joint REML",
+    )
+    .map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+        ))
+    })?;
     log::trace!(
         "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
         result.iterations,
@@ -8436,7 +8441,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval, Solver,
+        OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8557,6 +8562,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         tolerance: 1e-6,
         max_iter: 50,
         fd_step: 1e-5,
+        bounds: Some((lower.clone(), upper.clone())),
         seed_config: crate::seeding::SeedConfig {
             max_seeds: 1,
             screening_budget: 1,
@@ -8566,18 +8572,13 @@ fn try_exact_joint_spatial_isotropic_optimization(
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![
-            // Explicit degradation to gradient-only BFGS after the primary
-            // analytic-Hessian attempt fails.
-            OuterCapability {
-                gradient: Derivative::Analytic,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                barrier_config: None,
-                force_solver: Some(Solver::Bfgs),
-            },
-        ],
+        fallback_sequence: vec![OuterCapability {
+            gradient: Derivative::FiniteDifference,
+            hessian: Derivative::Unavailable,
+            n_params: theta_dim,
+            all_penalty_like: false,
+            barrier_config: None,
+        }],
     };
 
     let mut obj = ClosureObjective {
@@ -8590,7 +8591,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
             // not appropriate.
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         },
         cost_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
@@ -8608,11 +8608,17 @@ fn try_exact_joint_spatial_isotropic_optimization(
                     hessian: HessianResult::Analytic(hess),
                 })
             }
-            Err(_) => Ok(OuterEval {
-                cost: f64::INFINITY,
-                gradient: Array1::zeros(theta.len()),
-                hessian: HessianResult::Unavailable,
-            }),
+            Err(e) => {
+                let cost = ctx.eval_cost(theta);
+                ctx.track_best(theta, cost);
+                if cost.is_finite() {
+                    Err(EstimationError::RemlOptimizationFailed(format!(
+                        "isotropic exact-joint derivative evaluation failed at a feasible theta: {e}"
+                    )))
+                } else {
+                    Ok(OuterEval::infeasible(theta.len()))
+                }
+            }
         },
         reset_fn: None::<fn(&mut &mut IsoJointContext<'_>)>,
         efs_fn: None::<
@@ -8620,13 +8626,16 @@ fn try_exact_joint_spatial_isotropic_optimization(
         >,
     };
 
-    let result =
-        crate::solver::strategy::run_outer(&mut obj, &outer_config, "iso-kappa joint REML")
-            .map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-                ))
-            })?;
+    let result = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "iso-kappa joint REML",
+    )
+    .map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+        ))
+    })?;
     log::trace!(
         "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
         result.iterations,
@@ -8771,17 +8780,26 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
     Ok(frozen)
 }
 
-pub fn optimize_two_block_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn>(
+pub fn optimize_two_block_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn, ExactFn>(
     data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     joint_setup: &TwoBlockExactJointHyperSetup,
+    analytic_joint_derivatives_available: bool,
+    mut cost_fn: CostFn,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
 ) -> Result<TwoBlockSpatialLengthScaleOptimizationResult<FitOut>, String>
 where
     FitOut: Clone,
+    CostFn: FnMut(
+        &Array1<f64>,
+        &TermCollectionSpec,
+        &TermCollectionSpec,
+        &TermCollectionDesign,
+        &TermCollectionDesign,
+    ) -> Result<f64, String>,
     FitFn: FnMut(
         &Array1<f64>,
         &TermCollectionSpec,
@@ -8888,7 +8906,7 @@ where
 
     use crate::solver::strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval, Solver,
+        OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8923,6 +8941,7 @@ where
         tolerance: kappa_options.rel_tol.max(1e-6),
         max_iter: kappa_options.max_outer_iter.max(1),
         fd_step: 1e-4,
+        bounds: Some((lower.clone(), upper.clone())),
         seed_config: crate::seeding::SeedConfig {
             max_seeds: 1,
             screening_budget: 1,
@@ -8932,25 +8951,35 @@ where
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
-            n_params: theta_dim,
-            all_penalty_like: false,
-            barrier_config: None,
-            force_solver: Some(Solver::Bfgs),
-        }],
+        fallback_sequence: if analytic_joint_derivatives_available {
+            vec![OuterCapability {
+                gradient: Derivative::FiniteDifference,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+            }]
+        } else {
+            Vec::new()
+        },
     };
 
     let mut obj = ClosureObjective {
         state: &mut state,
         cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            gradient: if analytic_joint_derivatives_available {
+                Derivative::Analytic
+            } else {
+                Derivative::FiniteDifference
+            },
+            hessian: if analytic_joint_derivatives_available {
+                Derivative::Analytic
+            } else {
+                Derivative::Unavailable
+            },
             n_params: theta_dim,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         },
         cost_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
             let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
@@ -8971,17 +9000,10 @@ where
                 Ok(v) => v,
                 Err(_) => return Ok(f64::INFINITY),
             };
-            match (&mut *exact_fn_cell.borrow_mut())(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                &ms,
-                &ns,
-                &md,
-                &nd,
-                false,
-            ) {
-                Ok((c, _, _)) => {
-                    ctx.track_best(theta, c);
-                    Ok(c)
+            match cost_fn(&theta.slice(s![..rho_dim]).to_owned(), &ms, &ns, &md, &nd) {
+                Ok(cost) => {
+                    ctx.track_best(theta, cost);
+                    Ok(cost)
                 }
                 Err(_) => Ok(f64::INFINITY),
             }
@@ -8995,33 +9017,15 @@ where
             let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
             let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
                 Ok(v) => v,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
+                Err(_) => return Ok(OuterEval::infeasible(theta.len())),
             };
             let ns = match noise_lk.apply_tospec(best_noisespec_ref, noise_terms_ref) {
                 Ok(v) => v,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
+                Err(_) => return Ok(OuterEval::infeasible(theta.len())),
             };
             let (md, nd) = match build_pair_ref(&ms, &ns) {
                 Ok(v) => v,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
+                Err(_) => return Ok(OuterEval::infeasible(theta.len())),
             };
             match (&mut *exact_fn_cell.borrow_mut())(
                 &theta.slice(s![..rho_dim]).to_owned(),
@@ -9033,6 +9037,15 @@ where
             ) {
                 Ok((cost, grad, hess)) => {
                     ctx.track_best(theta, cost);
+                    if !cost.is_finite() {
+                        return Ok(OuterEval::infeasible(theta.len()));
+                    }
+                    if grad.iter().any(|v| !v.is_finite()) {
+                        return Err(EstimationError::RemlOptimizationFailed(
+                            "two-block exact-joint gradient contained non-finite values"
+                                .to_string(),
+                        ));
+                    }
                     let hessian_result = match hess {
                         Some(h)
                             if h.nrows() == theta.len()
@@ -9049,11 +9062,9 @@ where
                         hessian: hessian_result,
                     })
                 }
-                Err(_) => Ok(OuterEval {
-                    cost: f64::INFINITY,
-                    gradient: Array1::zeros(theta.len()),
-                    hessian: HessianResult::Unavailable,
-                }),
+                Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                    "two-block exact-joint derivative evaluation failed: {e}"
+                ))),
             }
         },
         reset_fn: None::<fn(&mut &mut TwoBlockExactJointState)>,
@@ -10589,6 +10600,14 @@ mod tests {
             &noisespec,
             &kappa_options,
             &joint_setup,
+            true,
+            |rho, _, _, mean_design, noise_design| {
+                assert!(rho.is_empty());
+                Ok(mean_design.design.ncols() as f64
+                    + noise_design.design.ncols() as f64
+                    + mean_design.penalties.len() as f64
+                    + noise_design.penalties.len() as f64)
+            },
             |rho, _, _, mean_design, noise_design| {
                 assert!(rho.is_empty());
                 Ok(mean_design.design.ncols() as f64
@@ -11232,6 +11251,14 @@ mod tests {
             &noisespec,
             &kappa_options,
             &joint_setup,
+            true,
+            |rho, _, _, mean_design, noise_design| {
+                assert!(rho.is_empty());
+                Ok(mean_design.design.ncols() as f64
+                    + noise_design.design.ncols() as f64
+                    + mean_design.penalties.len() as f64
+                    + noise_design.penalties.len() as f64)
+            },
             |rho, _, _, mean_design, noise_design| {
                 assert!(rho.is_empty());
                 Ok(mean_design.design.ncols() as f64

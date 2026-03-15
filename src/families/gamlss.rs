@@ -1778,6 +1778,18 @@ fn compose_theta_from_hints(
     theta
 }
 
+fn gamlss_fit_score(fit: &UnifiedFitResult) -> f64 {
+    if fit.reml_score.is_finite() {
+        return fit.reml_score;
+    }
+    let score = 0.5 * fit.deviance + 0.5 * fit.stable_penalty_term;
+    if score.is_finite() {
+        score
+    } else {
+        f64::INFINITY
+    }
+}
+
 fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     data: ndarray::ArrayView2<'_, f64>,
     builder: B,
@@ -1801,15 +1813,21 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         freeze_spatial_length_scale_terms_from_design(builder.noisespec(), &noise_boot_design)
             .map_err(|e| e.to_string())?;
 
-    let exact_joint_ready = builder.exact_spatial_joint_supported();
-
     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
+    let analytic_joint_derivatives_available = builder.exact_spatial_joint_supported()
+        && builder
+            .build_psiderivative_blocks(
+                data,
+                &mean_bootspec,
+                &noise_bootspec,
+                &mean_boot_design,
+                &noise_boot_design,
+            )
+            .is_ok();
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
     // Macro to invoke the exact-joint spatial optimizer with shared closures.
-    // Both the required-exact and opportunistic-exact branches use identical
-    // inner-fit and outer-eval logic; only the error-handling wrapper differs.
     // The exact path evaluates the full profiled/Laplace objective over
     // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.
     macro_rules! run_exact_joint_spatial {
@@ -1830,6 +1848,21 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 builder.noisespec(),
                 kappa_options,
                 &joint_setup,
+                analytic_joint_derivatives_available,
+                |rho, _, _, mean_design, noise_design| {
+                    let fit = {
+                        let blocks = builder.build_blocks(
+                            rho,
+                            mean_design,
+                            noise_design,
+                            mean_beta_hint_cell.borrow().clone(),
+                            noise_beta_hint_cell.borrow().clone(),
+                        )?;
+                        let family = builder.build_family(mean_design, noise_design);
+                        fit_custom_family(&family, &blocks, options)?
+                    };
+                    Ok(gamlss_fit_score(&fit))
+                },
                 |rho, _, _, mean_design, noise_design| {
                     let fit = {
                         let blocks = builder.build_blocks(
@@ -1863,6 +1896,12 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                  mean_design,
                  noise_design,
                  need_hessian| {
+                    if !analytic_joint_derivatives_available {
+                        return Err(
+                            "analytic spatial psi derivatives are unavailable for this exact two-block path"
+                                .to_string(),
+                        );
+                    }
                     let blocks = builder.build_blocks(
                         rho,
                         mean_design,
@@ -1899,26 +1938,14 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         }};
     }
 
-    let mut solved = if require_exact_spatial_joint {
-        if !exact_joint_ready {
-            return Err(
-                "exact two-block spatial optimization is required for this family, but analytic spatial psi derivatives are unavailable"
-                    .to_string(),
-            );
-        }
-        run_exact_joint_spatial!().map_err(|err| {
-            format!("exact two-block spatial optimization failed: {err}")
-        })?
-    } else {
-        if !exact_joint_ready {
-            return Err(
-                "exact two-block spatial optimization is unavailable for this family".to_string(),
-            );
-        }
-        run_exact_joint_spatial!().map_err(|err| {
-            format!("exact two-block spatial optimization failed: {err}")
-        })?
-    };
+    if require_exact_spatial_joint && !analytic_joint_derivatives_available {
+        log::info!(
+            "[GAMLSS] exact two-block spatial path is required; analytic psi derivatives are unavailable, so outer strategy will start from FD gradients"
+        );
+    }
+
+    let mut solved = run_exact_joint_spatial!()
+        .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
 
     builder.augment_result_designs(&mut solved.mean_design, &mut solved.noise_design);
 
@@ -14890,8 +14917,8 @@ mod tests {
     /// `known_link_wiggle()` (returns None), so the stabilization path
     /// at `fit_custom_family` line 5142 is skipped.  The outer Newton
     /// evaluates the exact REML objective (including `log|H_mode|`)
-    /// at the initial rho, gets non-finite values, and
-    /// `CachedSecondOrderObjective` has no cache fallback at iter=0.
+    /// at the initial rho and gets non-finite values before the outer solver
+    /// can retreat to a safer trial point.
     ///
     /// This test directly verifies that the Hessian becomes non-finite
     /// under extreme fitted values — proving the mechanism.

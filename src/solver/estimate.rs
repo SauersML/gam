@@ -1216,7 +1216,8 @@ pub struct ExternalOptimOptions {
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
     pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
-    /// Optional explicit Firth override for binomial-logit external fitting.
+    /// Optional explicit Firth override for external fitting families that
+    /// support Jeffreys/Firth bias reduction.
     /// - `Some(true)`: force Firth on
     /// - `Some(false)`: force Firth off
     /// - `None`: use family default behavior
@@ -1230,54 +1231,25 @@ fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
     firth_override: Option<bool>,
 ) -> Result<(LinkFunction, bool), EstimationError> {
-    let reject_unsupported_firth = |label: &str| {
-        if firth_override == Some(true) {
-            Err(EstimationError::InvalidInput(format!(
-                "firth_bias_reduction is only implemented for BinomialLogit fitting; {label} does not support it"
-            )))
-        } else {
-            Ok(())
-        }
-    };
-
-    match family {
-        crate::types::LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
-        crate::types::LikelihoodFamily::BinomialLogit => {
-            Ok((LinkFunction::Logit, firth_override.unwrap_or(true)))
-        }
-        crate::types::LikelihoodFamily::BinomialProbit => {
-            reject_unsupported_firth("BinomialProbit")?;
-            Ok((LinkFunction::Probit, false))
-        }
-        crate::types::LikelihoodFamily::BinomialCLogLog => {
-            reject_unsupported_firth("BinomialCLogLog")?;
-            Ok((LinkFunction::CLogLog, false))
-        }
-        crate::types::LikelihoodFamily::BinomialSas => {
-            reject_unsupported_firth("BinomialSas")?;
-            Ok((LinkFunction::Sas, false))
-        }
-        crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-            reject_unsupported_firth("BinomialBetaLogistic")?;
-            Ok((LinkFunction::BetaLogistic, false))
-        }
-        crate::types::LikelihoodFamily::BinomialMixture => {
-            reject_unsupported_firth("BinomialMixture")?;
-            Ok((LinkFunction::Logit, false))
-        }
-        crate::types::LikelihoodFamily::PoissonLog => {
-            reject_unsupported_firth("PoissonLog")?;
-            Ok((LinkFunction::Log, false))
-        }
-        crate::types::LikelihoodFamily::GammaLog => {
-            reject_unsupported_firth("GammaLog")?;
-            Ok((LinkFunction::Log, false))
-        }
-        crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
+        return Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
-        )),
+        ));
     }
+
+    if firth_override == Some(true) && !family.supports_firth() {
+        return Err(EstimationError::InvalidInput(format!(
+            "firth_bias_reduction is currently implemented only for {}; {} does not support it",
+            crate::types::LikelihoodFamily::BinomialLogit.pretty_name(),
+            family.pretty_name()
+        )));
+    }
+
+    Ok((
+        family.link_function(),
+        firth_override.unwrap_or_else(|| family.supports_firth()) && family.supports_firth(),
+    ))
 }
 
 #[inline]
@@ -1601,6 +1573,7 @@ where
             tolerance: smoothing_options.tol,
             max_iter: smoothing_options.max_iter,
             fd_step: smoothing_options.finite_diff_step,
+            bounds: None,
             seed_config: smoothing_options.seed_config.clone(),
             rho_bound: crate::estimate::RHO_BOUND,
             heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
@@ -1618,7 +1591,6 @@ where
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
-                force_solver: None,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
@@ -1708,6 +1680,7 @@ where
             tolerance: smoothing_options_mix.tol,
             max_iter: smoothing_options_mix.max_iter,
             fd_step: smoothing_options_mix.finite_diff_step,
+            bounds: None,
             seed_config: smoothing_options_mix.seed_config.clone(),
             rho_bound: crate::estimate::RHO_BOUND,
             heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
@@ -1725,7 +1698,6 @@ where
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
-                force_solver: None,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let rho = theta.slice(s![..k]).to_owned();
@@ -2209,162 +2181,27 @@ where
 
         let (max_skewness, skewness_vec) =
             crate::hmc::laplace_skewness_diagnostic(&h_inv_diag, &third_deriv);
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum EstimationApproach {
+            Reml,
+            JointHmc,
+        }
 
-        if max_skewness > crate::hmc::SKEWNESS_HMC_THRESHOLD {
+        // `run_outer` handles solver selection inside the REML approach.
+        // This loop only handles cross-paradigm escalation from REML to joint HMC.
+        let approaches = if max_skewness > crate::hmc::SKEWNESS_HMC_THRESHOLD {
             log::warn!(
                 "[REML] High posterior skewness detected (max |s_j| = {:.3}). \
-                 Falling back to joint (β, ρ) HMC to refine smoothing parameters.",
+                 Escalating from REML to joint (β, ρ) HMC refinement.",
                 max_skewness,
             );
-
-            // Log which coefficients are skewed
             let n_skewed = skewness_vec.iter().filter(|s| s.abs() > 0.3).count();
             log::info!(
                 "[Joint HMC] {}/{} coefficients have |skewness| > 0.3",
                 n_skewed,
                 p_eff,
             );
-
-            // Build inputs for joint HMC.
-            // We need the design matrix in dense form for HMC.
-            let x_dense = pirls_res.x_transformed.to_dense_arc();
-            let x_view = x_dense.view();
-
-            // Weights and response from PIRLS
-            let y_view = y_o.view();
-            let w_view = w_o.view();
-
-            // Beta mode (transformed)
-            let mode_view = pirls_res.beta_transformed.view();
-
-            // Hessian (stabilized, transformed)
-            let hessian_view = pirls_res.stabilizedhessian_transformed.view();
-
-            let rho_view = final_rho.view();
-
-            let joint_nuts_family = match opts.family {
-                crate::types::LikelihoodFamily::GaussianIdentity => {
-                    crate::hmc::NutsFamily::Gaussian
-                }
-                crate::types::LikelihoodFamily::BinomialLogit
-                | crate::types::LikelihoodFamily::BinomialSas
-                | crate::types::LikelihoodFamily::BinomialBetaLogistic
-                | crate::types::LikelihoodFamily::BinomialMixture => {
-                    crate::hmc::NutsFamily::BinomialLogit
-                }
-                crate::types::LikelihoodFamily::BinomialProbit => {
-                    crate::hmc::NutsFamily::BinomialProbit
-                }
-                crate::types::LikelihoodFamily::BinomialCLogLog => {
-                    crate::hmc::NutsFamily::BinomialCLogLog
-                }
-                crate::types::LikelihoodFamily::PoissonLog => crate::hmc::NutsFamily::PoissonLog,
-                crate::types::LikelihoodFamily::GammaLog => crate::hmc::NutsFamily::GammaLog,
-                crate::types::LikelihoodFamily::RoystonParmar => {
-                    // Survival models use a separate HMC pathway;
-                    // fall back to Gaussian as a safe default.
-                    crate::hmc::NutsFamily::Gaussian
-                }
-            };
-
-            let hmc_inputs = crate::hmc::JointBetaRhoInputs {
-                x: x_view,
-                y: y_view,
-                weights: w_view,
-                mode: mode_view,
-                hessian: hessian_view,
-                penalty_roots: pirls_res.reparam_result.rs_transformed.clone(),
-                rho_mode: rho_view,
-                nuts_family: joint_nuts_family,
-                firth_bias_reduction: pirls_res.firth_log_det().is_some(),
-                trigger_skewness: max_skewness,
-            };
-
-            // Adaptive config: scale samples with dimension
-            let total_dim = p_eff + final_rho.len();
-            let hmc_config = crate::hmc::NutsConfig {
-                n_samples: (400 + 50 * total_dim).min(4000),
-                nwarmup: (400 + 50 * total_dim).min(4000),
-                n_chains: 2,
-                target_accept: 0.8,
-                seed: 31_415,
-            };
-
-            match crate::hmc::run_joint_beta_rho_sampling(&hmc_inputs, &hmc_config) {
-                Ok(result) if result.converged => {
-                    log::info!(
-                        "[Joint HMC] Converged (R-hat={:.3}, ESS={:.1}). \
-                         Updating smoothing parameters from posterior mean.",
-                        result.rhat,
-                        result.ess,
-                    );
-
-                    // Use posterior mean ρ as the new smoothing parameters
-                    let new_rho = result.rho_mean;
-
-                    // Re-run final PIRLS at the HMC-informed ρ
-                    match pirls::fit_model_for_fixed_rho(
-                        LogSmoothingParamsView::new(new_rho.view()),
-                        pirls::PirlsProblem {
-                            x: reml_state.x(),
-                            offset: offset_o.view(),
-                            y: y_o.view(),
-                            priorweights: w_o.view(),
-                            covariate_se: None,
-                        },
-                        pirls::PenaltyConfig {
-                            rs_original: &rs_list,
-                            balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
-                            reparam_invariant: None,
-                            p,
-                            coefficient_lower_bounds: None,
-                            linear_constraints_original: fit_linear_constraints.as_ref(),
-                            penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-                        },
-                        &pirls::PirlsConfig {
-                            link_kind: if let Some(state) = final_mixture_state.clone() {
-                                InverseLink::Mixture(state)
-                            } else if let Some(state) = final_sas_state.clone() {
-                                if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
-                                    InverseLink::BetaLogistic(state)
-                                } else {
-                                    InverseLink::Sas(state)
-                                }
-                            } else {
-                                cfg.link_kind.clone()
-                            },
-                            ..cfg.as_pirls_config()
-                        },
-                        None,
-                    ) {
-                        Ok((new_pirls_res, _)) => (new_rho, new_pirls_res),
-                        Err(e) => {
-                            log::warn!(
-                                "[Joint HMC] Re-PIRLS at posterior ρ failed ({:?}); \
-                                 keeping LAML estimates.",
-                                e,
-                            );
-                            (final_rho, pirls_res)
-                        }
-                    }
-                }
-                Ok(result) => {
-                    log::warn!(
-                        "[Joint HMC] Did not converge (R-hat={:.3}, ESS={:.1}); \
-                         keeping LAML estimates.",
-                        result.rhat,
-                        result.ess,
-                    );
-                    (final_rho, pirls_res)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[Joint HMC] Sampling failed ({}); keeping LAML estimates.",
-                        e,
-                    );
-                    (final_rho, pirls_res)
-                }
-            }
+            vec![EstimationApproach::Reml, EstimationApproach::JointHmc]
         } else {
             if max_skewness > 0.1 {
                 log::info!(
@@ -2373,8 +2210,152 @@ where
                     max_skewness,
                 );
             }
-            (final_rho, pirls_res)
+            vec![EstimationApproach::Reml]
+        };
+
+        let mut selected_rho = final_rho;
+        let mut selected_pirls_res = pirls_res;
+
+        for approach in approaches {
+            match approach {
+                EstimationApproach::Reml => {}
+                EstimationApproach::JointHmc => {
+                    let firth_bias_reduction = selected_pirls_res.firth_log_det().is_some();
+                    if firth_bias_reduction && !opts.family.supports_firth() {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "joint HMC Firth refinement requires a Firth-supported family; {} does not support it",
+                            opts.family.pretty_name()
+                        )));
+                    }
+
+                    let sampling_result = {
+                        let x_dense = selected_pirls_res.x_transformed.to_dense_arc();
+                        let hmc_inputs = crate::hmc::JointBetaRhoInputs {
+                            x: x_dense.view(),
+                            y: y_o.view(),
+                            weights: w_o.view(),
+                            likelihood_family: opts.family,
+                            mode: selected_pirls_res.beta_transformed.view(),
+                            hessian: selected_pirls_res.stabilizedhessian_transformed.view(),
+                            penalty_roots: selected_pirls_res.reparam_result.rs_transformed.clone(),
+                            rho_mode: selected_rho.view(),
+                            nuts_family: match opts.family {
+                                crate::types::LikelihoodFamily::GaussianIdentity => {
+                                    crate::hmc::NutsFamily::Gaussian
+                                }
+                                crate::types::LikelihoodFamily::BinomialLogit
+                                | crate::types::LikelihoodFamily::BinomialSas
+                                | crate::types::LikelihoodFamily::BinomialBetaLogistic
+                                | crate::types::LikelihoodFamily::BinomialMixture => {
+                                    crate::hmc::NutsFamily::BinomialLogit
+                                }
+                                crate::types::LikelihoodFamily::BinomialProbit => {
+                                    crate::hmc::NutsFamily::BinomialProbit
+                                }
+                                crate::types::LikelihoodFamily::BinomialCLogLog => {
+                                    crate::hmc::NutsFamily::BinomialCLogLog
+                                }
+                                crate::types::LikelihoodFamily::PoissonLog => {
+                                    crate::hmc::NutsFamily::PoissonLog
+                                }
+                                crate::types::LikelihoodFamily::GammaLog => {
+                                    crate::hmc::NutsFamily::GammaLog
+                                }
+                                crate::types::LikelihoodFamily::RoystonParmar => {
+                                    crate::hmc::NutsFamily::Gaussian
+                                }
+                            },
+                            firth_bias_reduction,
+                            trigger_skewness: max_skewness,
+                        };
+
+                        let total_dim = p_eff + selected_rho.len();
+                        let hmc_config = crate::hmc::NutsConfig {
+                            n_samples: (400 + 50 * total_dim).min(4000),
+                            nwarmup: (400 + 50 * total_dim).min(4000),
+                            n_chains: 2,
+                            target_accept: 0.8,
+                            seed: 31_415,
+                        };
+                        crate::hmc::run_joint_beta_rho_sampling(&hmc_inputs, &hmc_config)
+                    };
+                    match sampling_result {
+                        Ok(result) if result.converged => {
+                            log::info!(
+                                "[Joint HMC] Converged (R-hat={:.3}, ESS={:.1}). \
+                                 Updating smoothing parameters from posterior mean.",
+                                result.rhat,
+                                result.ess,
+                            );
+                            let new_rho = result.rho_mean;
+                            match pirls::fit_model_for_fixed_rho(
+                                LogSmoothingParamsView::new(new_rho.view()),
+                                pirls::PirlsProblem {
+                                    x: reml_state.x(),
+                                    offset: offset_o.view(),
+                                    y: y_o.view(),
+                                    priorweights: w_o.view(),
+                                    covariate_se: None,
+                                },
+                                pirls::PenaltyConfig {
+                                    rs_original: &rs_list,
+                                    balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
+                                    reparam_invariant: None,
+                                    p,
+                                    coefficient_lower_bounds: None,
+                                    linear_constraints_original: fit_linear_constraints.as_ref(),
+                                    penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+                                },
+                                &pirls::PirlsConfig {
+                                    link_kind: if let Some(state) = final_mixture_state.clone() {
+                                        InverseLink::Mixture(state)
+                                    } else if let Some(state) = final_sas_state.clone() {
+                                        if matches!(cfg.link_function(), LinkFunction::BetaLogistic)
+                                        {
+                                            InverseLink::BetaLogistic(state)
+                                        } else {
+                                            InverseLink::Sas(state)
+                                        }
+                                    } else {
+                                        cfg.link_kind.clone()
+                                    },
+                                    ..cfg.as_pirls_config()
+                                },
+                                None,
+                            ) {
+                                Ok((new_pirls_res, _)) => {
+                                    selected_rho = new_rho;
+                                    selected_pirls_res = new_pirls_res;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[Joint HMC] Re-PIRLS at posterior ρ failed ({:?}); \
+                                         keeping REML estimates.",
+                                        e,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(result) => {
+                            log::warn!(
+                                "[Joint HMC] Did not converge (R-hat={:.3}, ESS={:.1}); \
+                                 keeping REML estimates.",
+                                result.rhat,
+                                result.ess,
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[Joint HMC] Sampling failed ({}); keeping REML estimates.",
+                                e,
+                            );
+                        }
+                    }
+                }
+            }
         }
+
+        (selected_rho, selected_pirls_res)
     } else {
         (final_rho, pirls_res)
     };
@@ -5011,7 +4992,7 @@ mod fd_policy_tests {
             .expect_err("Poisson fitting should reject unsupported Firth requests explicitly");
         assert!(
             err.to_string()
-                .contains("firth_bias_reduction is only implemented for BinomialLogit fitting"),
+                .contains("firth_bias_reduction is currently implemented only for"),
             "unexpected error: {err}"
         );
     }

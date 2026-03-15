@@ -510,6 +510,52 @@ struct LinkChoice {
     mixture_components: Option<Vec<LinkComponent>>,
 }
 
+struct CliFirthValidation<'a> {
+    enabled: bool,
+    family: LikelihoodFamily,
+    predict_noise: bool,
+    has_bounded_terms: bool,
+    is_survival: bool,
+    link_choice: Option<&'a LinkChoice>,
+}
+
+fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), String> {
+    if !ctx.enabled {
+        return Ok(());
+    }
+
+    if ctx.is_survival {
+        return Err(
+            "Surv(...) formulas use survival fitting mode; remove binomial/location-scale-only flags (--predict-noise, --firth)"
+                .to_string(),
+        );
+    }
+    if ctx.predict_noise {
+        return Err(
+            "--firth is not supported with --predict-noise location-scale fitting".to_string(),
+        );
+    }
+    if ctx.has_bounded_terms {
+        return Err("--firth is not yet supported with bounded() coefficients".to_string());
+    }
+    if ctx.family.supports_firth() {
+        return Ok(());
+    }
+
+    if ctx
+        .link_choice
+        .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
+    {
+        return Err("--firth with flexible(...) currently requires logit base link".to_string());
+    }
+
+    Err(format!(
+        "--firth currently requires {}; resolved family is {}",
+        pretty_familyname(LikelihoodFamily::BinomialLogit),
+        pretty_familyname(ctx.family)
+    ))
+}
+
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
 const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
 
@@ -563,7 +609,15 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .as_ref()
         .and_then(|s| s.beta_logistic_init.clone());
     if let Some((entry, exit, event)) = parse_surv_response(&parsed.response)? {
-        if args.predict_noise.is_some() || args.firth {
+        validate_cli_firth_configuration(CliFirthValidation {
+            enabled: args.firth,
+            family: LikelihoodFamily::RoystonParmar,
+            predict_noise: args.predict_noise.is_some(),
+            has_bounded_terms: false,
+            is_survival: true,
+            link_choice: None,
+        })?;
+        if args.predict_noise.is_some() {
             return Err(
                 "Surv(...) formulas use survival fitting mode; remove binomial/location-scale-only flags (--predict-noise, --firth)"
                     .to_string(),
@@ -757,12 +811,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         family = LikelihoodFamily::BinomialProbit;
         effective_link = family_to_link(family);
     }
-
-    if args.firth && args.predict_noise.is_some() {
-        return Err(
-            "--firth is not supported with --predict-noise location-scale fitting".to_string(),
-        );
-    }
     let formula_linkwiggle = parsed.linkwiggle.clone();
     if parsed.timewiggle.is_some() {
         return Err("timewiggle(...) is only supported for survival models".to_string());
@@ -784,13 +832,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             "link wiggle without --predict-noise currently supports binomial mean fitting with non-flexible links and binomial flexible(...) mean fitting"
                 .to_string(),
         );
-    }
-    if args.firth
-        && (effective_link != LinkFunction::Logit
-            || mixture_linkspec.is_some()
-            || sas_linkspec.is_some())
-    {
-        return Err("--firth requires logit link".to_string());
     }
     if let Some(noise_formula_raw) = &args.predict_noise {
         return run_fitwith_predict_noise(
@@ -830,9 +871,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(&inference_notes);
     let has_bounded_terms = termspec_has_bounded_terms(&spec);
-    if has_bounded_terms && args.firth {
-        return Err("--firth is not yet supported with bounded() coefficients".to_string());
-    }
+    validate_cli_firth_configuration(CliFirthValidation {
+        enabled: args.firth,
+        family,
+        predict_noise: args.predict_noise.is_some(),
+        has_bounded_terms,
+        is_survival: false,
+        link_choice: link_choice.as_ref(),
+    })?;
     progress.set_stage("fit", "building design matrices");
     progress.start_secondary_workflow("Design Matrices", 2);
     let initial_design = build_term_collection_design(ds.values.view(), &spec)
@@ -863,11 +909,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             if !is_binomial_family(family) {
                 return Err(
                     "flexible(...) links currently require a binomial family/link".to_string(),
-                );
-            }
-            if args.firth && choice.link != LinkFunction::Logit {
-                return Err(
-                    "--firth with flexible(...) currently requires logit base link".to_string(),
                 );
             }
             let config = JointModelConfig {
@@ -954,12 +995,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     ) = if args.firth {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
-        if family != LikelihoodFamily::BinomialLogit {
-            return Err(
-                "--firth currently requires a binomial-logit mean model (set link(type=logit))"
-                    .to_string(),
-            );
-        }
         progress.set_stage("fit", "optimizing penalized likelihood");
         let ext = optimize_external_design(
             y.view(),
@@ -4612,12 +4647,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
         let mut fitted_inverse_link = survival_inverse_link.clone();
         // Optimize link parameters via run_outer for parametric inverse-link families.
-        let optimize_link_bfgs = |init: Array1<f64>,
-                                  name: &str,
-                                  mut objective: Box<
+        let optimize_link_parameters = |init: Array1<f64>,
+                                        name: &str,
+                                        mut objective: Box<
             dyn FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
         >,
-                                  recover: Box<dyn Fn(&Array1<f64>) -> Option<InverseLink>>|
+                                        recover: Box<
+            dyn Fn(&Array1<f64>) -> Option<InverseLink>,
+        >|
          -> Option<InverseLink> {
             let dim = init.len();
             let mut seed_config = gam::seeding::SeedConfig::default();
@@ -4628,6 +4665,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 tolerance: 1e-4,
                 max_iter: 30,
                 fd_step: 1e-3,
+                bounds: None,
                 seed_config,
                 rho_bound: 30.0,
                 heuristic_lambdas: Some(init.to_vec()),
@@ -4637,12 +4675,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let mut obj = ClosureObjective {
                 state: (),
                 cap: OuterCapability {
-                    gradient: Derivative::Unavailable,
+                    gradient: Derivative::FiniteDifference,
                     hessian: Derivative::Unavailable,
                     n_params: dim,
                     all_penalty_like: false,
                     barrier_config: None,
-                    force_solver: None,
                 },
                 cost_fn: |state: &mut (), rho: &Array1<f64>| {
                     let _ = state;
@@ -4654,7 +4691,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     let _ = state;
                     let _ = rho;
                     Err(EstimationError::InvalidInput(
-                        "eval not available for cost-only survival link optimization".to_string(),
+                        "strategy should use finite-difference gradients for survival link optimization"
+                            .to_string(),
                     ))
                 },
                 reset_fn: None::<fn(&mut ())>,
@@ -4691,7 +4729,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         if let InverseLink::Sas(state0) = fitted_inverse_link.clone() {
             let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-            if let Some(link) = optimize_link_bfgs(
+            if let Some(link) = optimize_link_parameters(
                 init,
                 "SAS",
                 Box::new(|theta: &Array1<f64>| {
@@ -4720,7 +4758,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
         if let InverseLink::BetaLogistic(state0) = fitted_inverse_link.clone() {
             let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-            if let Some(link) = optimize_link_bfgs(
+            if let Some(link) = optimize_link_parameters(
                 init,
                 "BetaLogistic",
                 Box::new(|theta: &Array1<f64>| {
@@ -4754,7 +4792,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let components = state0.components.clone();
             let init = state0.rho.clone();
             let components2 = components.clone();
-            if let Some(link) = optimize_link_bfgs(
+            if let Some(link) = optimize_link_parameters(
                 init,
                 "mixture",
                 Box::new(move |rho: &Array1<f64>| {
@@ -10401,10 +10439,11 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, FAMILY_GAUSSIAN_LOCATION_SCALE,
-        LikelihoodFamily, LinkMode, MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel,
-        SurvivalArgs, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
-        apply_saved_probitwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
+        BoundedCoefficientPriorSpec, CliFirthValidation, ColumnKindTag, DataSchema,
+        FAMILY_GAUSSIAN_LOCATION_SCALE, LikelihoodFamily, LinkChoice, LinkMode, MODEL_VERSION,
+        ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalBaselineConfig,
+        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_probitwiggle,
+        build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
@@ -10415,7 +10454,8 @@ mod tests {
         run_predict_binomial_location_scale, saved_probitwiggle_derivative_q0,
         saved_probitwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
-        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
+        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+        write_survival_prediction_csv,
     };
     use crate::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
     use csv::StringRecord;
@@ -10485,6 +10525,43 @@ mod tests {
         rows[row_idx]["sigma"]
             .parse::<f64>()
             .expect("sigma should parse")
+    }
+
+    #[test]
+    fn cli_firth_validation_uses_shared_family_support_rule() {
+        let err = validate_cli_firth_configuration(CliFirthValidation {
+            enabled: true,
+            family: LikelihoodFamily::PoissonLog,
+            predict_noise: false,
+            has_bounded_terms: false,
+            is_survival: false,
+            link_choice: None,
+        })
+        .expect_err("Poisson Firth should be rejected through the shared family policy");
+
+        assert!(
+            err.contains("Binomial Logit"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn cli_firth_validation_allows_flexible_logit_base_link() {
+        let choice = LinkChoice {
+            mode: LinkMode::Flexible,
+            link: LinkFunction::Logit,
+            mixture_components: None,
+        };
+
+        validate_cli_firth_configuration(CliFirthValidation {
+            enabled: true,
+            family: LikelihoodFamily::BinomialLogit,
+            predict_noise: false,
+            has_bounded_terms: false,
+            is_survival: false,
+            link_choice: Some(&choice),
+        })
+        .expect("flexible logit should remain eligible for Firth");
     }
 
     #[test]

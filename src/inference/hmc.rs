@@ -24,7 +24,8 @@
 //! sharing across chains without duplication when general-mcmc clones the target.
 
 use crate::estimate::reml::unified::compute_block_penalty_logdet_derivs;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_ata_into, fast_atv};
+use crate::estimate::reml::FirthDenseOperator;
+use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -321,10 +322,8 @@ struct SharedData {
     x: Arc<Array2<f64>>,
     /// Response vector y [n_samples]
     y: Arc<Array1<f64>>,
-    /// Prior weights [n_samples]
+    /// Observation/case weights [n_samples]
     weights: Arc<Array1<f64>>,
-    /// Prior-weighted reduced design on the identifiable Firth subspace.
-    firth_reduced_x: Option<Arc<Array2<f64>>>,
     /// Combined penalty matrix S [dim, dim]
     penalty: Arc<Array2<f64>>,
     /// MAP estimate (mode) μ [dim]
@@ -348,6 +347,20 @@ pub enum NutsFamily {
     BinomialCLogLog,
     PoissonLog,
     GammaLog,
+}
+
+impl NutsFamily {
+    #[inline]
+    fn likelihood_family(self) -> LikelihoodFamily {
+        match self {
+            Self::Gaussian => LikelihoodFamily::GaussianIdentity,
+            Self::BinomialLogit => LikelihoodFamily::BinomialLogit,
+            Self::BinomialProbit => LikelihoodFamily::BinomialProbit,
+            Self::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
+            Self::PoissonLog => LikelihoodFamily::PoissonLog,
+            Self::GammaLog => LikelihoodFamily::GammaLog,
+        }
+    }
 }
 
 pub struct NutsPosterior {
@@ -389,7 +402,7 @@ impl NutsPosterior {
     /// # Arguments
     /// * `x` - Design matrix [n_samples, dim]
     /// * `y` - Response vector [n_samples]
-    /// * `weights` - Prior weights [n_samples]
+    /// * `weights` - Observation/case weights [n_samples]
     /// * `penalty_matrix` - Combined penalty S [dim, dim]
     /// * `mode` - MAP estimate μ [dim]
     /// * `hessian` - Hessian H [dim, dim] (NOT the inverse!)
@@ -423,11 +436,6 @@ impl NutsPosterior {
         }
 
         validate_firth_support(nuts_family, firth_enabled)?;
-        let firth_reduced_x = if firth_enabled {
-            Some(Arc::new(build_firth_reduced_design(x, weights)?))
-        } else {
-            None
-        };
 
         // Use faer for numerically stable Cholesky decomposition of H
         // H = L_H L_H^T where L_H is lower triangular
@@ -450,7 +458,6 @@ impl NutsPosterior {
             x: Arc::new(x.to_owned()),
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
-            firth_reduced_x,
             penalty: Arc::new(penalty_matrix.to_owned()),
             mode: Arc::new(mode.to_owned()),
             n_samples,
@@ -560,208 +567,49 @@ fn log_ndtr(x: f64) -> f64 {
 }
 
 #[inline]
-fn nuts_family_supports_firth(family: NutsFamily) -> bool {
-    matches!(
-        family,
-        NutsFamily::BinomialLogit | NutsFamily::BinomialProbit | NutsFamily::PoissonLog
-    )
-}
-
-#[inline]
 fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(), String> {
-    if firth_enabled && !nuts_family_supports_firth(family) {
-        return Err(
-            "NUTS with Firth is only supported for Logit, Probit, and Poisson families".to_string(),
-        );
+    if firth_enabled && !family.likelihood_family().supports_firth() {
+        return Err(format!(
+            "NUTS with Firth is only supported for {}; {} does not support it",
+            LikelihoodFamily::BinomialLogit.pretty_name(),
+            family.likelihood_family().pretty_name()
+        ));
     }
     Ok(())
 }
 
-fn build_firth_reduced_design(
-    x: ArrayView2<f64>,
-    prior_weights: ArrayView1<f64>,
-) -> Result<Array2<f64>, String> {
-    let n = x.nrows();
-    let p = x.ncols();
-    if prior_weights.len() != n {
-        return Err(format!(
-            "Firth reduced design weight length {} != number of rows {}",
-            prior_weights.len(),
-            n
-        ));
-    }
-    if n == 0 || p == 0 {
-        return Ok(Array2::zeros((n, 0)));
-    }
-
-    let mut x_weighted = x.to_owned();
-    for i in 0..n {
-        let weight = prior_weights[i];
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(format!(
-                "Firth reduced design requires finite nonnegative prior weights, got {} at row {}",
-                weight, i
-            ));
-        }
-        let scale = weight.sqrt();
-        for j in 0..p {
-            x_weighted[[i, j]] *= scale;
-        }
-    }
-
-    let mut gram = Array2::<f64>::zeros((p, p));
-    fast_ata_into(&x_weighted, &mut gram);
-    if gram.cholesky(Side::Lower).is_ok() {
-        return Ok(x_weighted);
-    }
-
-    let (evals, evecs) = gram
-        .eigh(Side::Lower)
-        .map_err(|e| format!("Firth reduced-design eigendecomposition failed: {:?}", e))?;
-    let max_eval = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-    let tol = (p.max(1) as f64) * f64::EPSILON * max_eval;
-    let keep: Vec<usize> = evals
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
-        .collect();
-    if keep.is_empty() {
-        return Ok(Array2::zeros((n, 0)));
-    }
-
-    let r = keep.len();
-    let mut q_basis = Array2::<f64>::zeros((p, r));
-    for (col_idx, &eig_idx) in keep.iter().enumerate() {
-        q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
-    }
-    Ok(fast_ab(&x_weighted, &q_basis))
-}
-
-#[inline]
-fn firth_observation_terms(family: NutsFamily, eta: f64) -> (f64, f64) {
-    match family {
-        NutsFamily::BinomialLogit => {
-            let eta = eta.clamp(-700.0, 700.0);
-            let mu = NutsPosterior::sigmoid_stable(eta);
-            let fisher_weight = mu * (1.0 - mu);
-            let fisher_weight_prime = fisher_weight * (1.0 - 2.0 * mu);
-            (fisher_weight, fisher_weight_prime)
-        }
-        NutsFamily::BinomialProbit => {
-            // Probit Fisher weights decay super-exponentially in the tails.
-            // Clamp to keep them strictly positive in floating point so the
-            // Jeffreys information remains numerically factorizable.
-            let eta = eta.clamp(-38.0, 38.0);
-            let log_phi = standard_normal_log_pdf(eta);
-            let log_mu = log_ndtr(eta);
-            let log_one_minus_mu = log_ndtr(-eta);
-            let ratio_pos = (log_phi - log_mu).exp();
-            let ratio_neg = (log_phi - log_one_minus_mu).exp();
-            let fisher_weight = (2.0 * log_phi - log_mu - log_one_minus_mu).exp();
-            let fisher_weight_prime = fisher_weight * (-2.0 * eta - ratio_pos + ratio_neg);
-            (fisher_weight, fisher_weight_prime)
-        }
-        NutsFamily::PoissonLog => {
-            let eta = eta.clamp(-700.0, 700.0);
-            let mu = eta.exp();
-            let fisher_weight = mu;
-            (fisher_weight, fisher_weight)
-        }
-        _ => unreachable!("unsupported Firth family should be rejected before evaluation"),
-    }
-}
-
 /// Compute the Jeffreys/Firth contribution 0.5 log|I(β)| and its β-gradient.
 ///
-/// The gradient uses
-///   ∂/∂β_j [0.5 log|I|] = 0.5 Σ_i leverage_i · ∂w_i/∂η_i · x_ij
-/// with leverage_i = x_i' I(β)^{-1} x_i and I(β) = X' diag(w_i) X.
-///
-/// The hot path factors only the reduced identifiable Fisher block, so the
-/// leverage solve is O(n r^2) per leapfrog step with r = rank(X_active).
-/// That is acceptable for the small/moderate-p Firth regimes where separation
-/// matters, but it will still dominate cost at large n.
-///
-/// Validation strategy:
-/// For a near-separated logit model (for example n=50, p=5), compare the HMC
-/// posterior using this Jeffreys term against a 50K-sample Monte Carlo
-/// approximation to the Jeffreys posterior. The posterior mean should align
-/// with the Firth estimate, the chain should remain proper without divergent
-/// behavior, and the target should converge back to the unpenalized posterior
-/// as the Jeffreys contribution vanishes.
+/// HMC uses the same `FirthDenseOperator` as the REML exact-gradient path.
+/// The operator owns the reduced identifiable Fisher factorization, the
+/// Jeffreys log-determinant, and the analytic β-gradient.
 fn firth_jeffreys_logp_and_grad(
     family: NutsFamily,
     data: &SharedData,
     eta: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>), String> {
-    let n = data.n_samples;
-    let p = data.dim;
-    let x_reduced = data
-        .firth_reduced_x
-        .as_ref()
-        .ok_or_else(|| "Firth Jeffreys term requested without reduced design".to_string())?;
-    let r = x_reduced.ncols();
-
-    if eta.len() != n {
+    if eta.len() != data.n_samples {
         return Err(format!(
             "Firth Jeffreys term eta length {} != number of samples {}",
             eta.len(),
-            n
+            data.n_samples
         ));
     }
-    if p == 0 || n == 0 || r == 0 {
-        return Ok((0.0, Array1::zeros(p)));
+    if data.dim == 0 || data.n_samples == 0 {
+        return Ok((0.0, Array1::zeros(data.dim)));
+    }
+    validate_firth_support(family, true)?;
+    if data.weights.iter().all(|w| *w == 0.0) {
+        return Ok((0.0, Array1::zeros(data.dim)));
     }
 
-    let mut family_fisher_weights = Array1::<f64>::zeros(n);
-    let mut total_fisher_weight_primes = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let prior_weight = data.weights[i];
-        if !prior_weight.is_finite() || prior_weight < 0.0 {
-            return Err(format!(
-                "Firth Jeffreys term requires finite nonnegative prior weights, got {} at row {}",
-                prior_weight, i
-            ));
-        }
-        let (weight, derivative) = firth_observation_terms(family, eta[i]);
-        family_fisher_weights[i] = weight;
-        total_fisher_weight_primes[i] = prior_weight * derivative;
-    }
-
-    let mut weighted_x = Array2::<f64>::zeros((n, r));
-    for i in 0..n {
-        let sqrt_weight = family_fisher_weights[i].sqrt();
-        if sqrt_weight == 0.0 {
-            continue;
-        }
-        for j in 0..r {
-            weighted_x[[i, j]] = x_reduced[[i, j]] * sqrt_weight;
-        }
-    }
-
-    let mut fisher = Array2::<f64>::zeros((r, r));
-    fast_ata_into(&weighted_x, &mut fisher);
-
-    let chol = fisher.cholesky(Side::Lower).map_err(|e| {
-        format!(
-            "Jeffreys information Cholesky failed for {:?}: {:?}",
-            family, e
-        )
-    })?;
-    let half_log_det = chol.diag().iter().map(|d| d.ln()).sum::<f64>();
-
-    let solved_xt = chol.solve_mat(&x_reduced.t().to_owned());
-    let mut leverage_weighted_score = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut leverage = 0.0;
-        for j in 0..r {
-            leverage += x_reduced[[i, j]] * solved_xt[[j, i]];
-        }
-        leverage_weighted_score[i] = 0.5 * leverage * total_fisher_weight_primes[i];
-    }
-
-    let grad_beta = fast_atv(data.x.as_ref(), &leverage_weighted_score);
-    Ok((half_log_det, grad_beta))
+    let op = FirthDenseOperator::build_with_observation_weights(
+        data.x.as_ref(),
+        eta,
+        data.weights.view(),
+    )
+    .map_err(|e| format!("Firth Jeffreys operator failed: {e}"))?;
+    Ok(op.jeffreys_logdet_and_beta_gradient())
 }
 
 // ============================================================================
@@ -971,9 +819,9 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
 mod tests {
     use super::{
         FamilyNutsInputs, GlmFlatInputs, JointLinkPosterior, JointSplineArtifacts, NutsConfig,
-        NutsFamily, NutsPosterior, SharedData, build_firth_reduced_design,
-        firth_jeffreys_logp_and_grad, run_logit_polya_gamma_gibbs,
-        run_nuts_sampling_flattened_family,
+        JointBetaRhoInputs, NutsFamily, NutsPosterior, SharedData,
+        firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling,
+        run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
     use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
@@ -1058,17 +906,13 @@ mod tests {
             [1.0, -1.2, 1.0],
         ];
         let y = array![1.0, 0.0, 1.0, 0.0];
-        let weights = array![1.0, 1.0, 1.0, 1.0];
+        let weights = array![1.0, 2.0, 0.5, 1.5];
         let eta = array![0.2, -0.1, 0.4, -0.3];
-        let reduced = build_firth_reduced_design(x.view(), weights.view()).expect("reduced design");
-
-        assert!(reduced.ncols() < x.ncols());
 
         let data = SharedData {
             x: Arc::new(x.clone()),
             y: Arc::new(y),
             weights: Arc::new(weights.clone()),
-            firth_reduced_x: Some(Arc::new(reduced)),
             penalty: Arc::new(Array2::zeros((x.ncols(), x.ncols()))),
             mode: Arc::new(Array1::zeros(x.ncols())),
             n_samples: x.nrows(),
@@ -1328,9 +1172,9 @@ mod tests {
     }
 
     #[test]
-    fn family_dispatch_rejects_unsupported_firth_family() {
+    fn family_dispatch_rejects_nonlogit_firth_family() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
-        let y = array![1.0, 0.5, 1.2, 0.7];
+        let y = array![1.0, 2.0, 0.0, 3.0];
         let w = array![1.0, 1.0, 1.0, 1.0];
         let penalty = array![[0.2, 0.0], [0.0, 0.4]];
         let mode = array![0.0, 0.0];
@@ -1344,7 +1188,7 @@ mod tests {
         };
 
         let err = run_nuts_sampling_flattened_family(
-            LikelihoodFamily::GammaLog,
+            LikelihoodFamily::PoissonLog,
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
                 y: y.view(),
@@ -1356,12 +1200,52 @@ mod tests {
             }),
             &cfg,
         )
-        .expect_err("Gamma Firth should be rejected explicitly");
+        .expect_err("Poisson Firth should be rejected explicitly");
 
         assert!(
             err.contains(
-                "NUTS with Firth is only supported for Logit, Probit, and Poisson families"
+                "NUTS with Firth is only supported for Binomial Logit"
             ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn joint_hmc_boundary_rejects_nonlogit_firth_family() {
+        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
+        let y = array![1.0, 2.0, 0.0, 3.0];
+        let w = array![1.0, 1.0, 1.0, 1.0];
+        let hessian = array![[1.5, 0.1], [0.1, 1.2]];
+        let penalty_root = array![[0.4, 0.0], [0.0, 0.6]];
+        let mode = array![0.0, 0.0];
+        let rho_mode = array![0.0];
+        let cfg = NutsConfig {
+            n_samples: 20,
+            nwarmup: 20,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 111,
+        };
+
+        let inputs = JointBetaRhoInputs {
+            x: x.view(),
+            y: y.view(),
+            weights: w.view(),
+            likelihood_family: LikelihoodFamily::PoissonLog,
+            mode: mode.view(),
+            hessian: hessian.view(),
+            penalty_roots: vec![penalty_root],
+            rho_mode: rho_mode.view(),
+            nuts_family: NutsFamily::PoissonLog,
+            firth_bias_reduction: true,
+            trigger_skewness: 0.75,
+        };
+
+        let err = run_joint_beta_rho_sampling(&inputs, &cfg)
+            .expect_err("Poisson joint HMC Firth should be rejected explicitly");
+
+        assert!(
+            err.contains("Joint HMC with Firth is only supported for Binomial Logit"),
             "unexpected error: {err}"
         );
     }
@@ -2265,7 +2149,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 /// # Arguments
 /// * `x` - Design matrix [n_samples, dim]
 /// * `y` - Response vector [n_samples]
-/// * `weights` - Prior weights [n_samples]
+/// * `weights` - Observation/case weights [n_samples]
 /// * `penalty_matrix` - Combined penalty S [dim, dim]
 /// * `mode` - MAP estimate μ [dim]
 /// * `hessian` - Penalized Hessian H [dim, dim] (NOT the inverse!)
@@ -2421,6 +2305,16 @@ pub fn run_nuts_sampling_flattened_family(
     inputs: FamilyNutsInputs<'_>,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
+    if let FamilyNutsInputs::Glm(glm) = &inputs {
+        if glm.firth_bias_reduction && !family.supports_firth() {
+            return Err(format!(
+                "NUTS with Firth is only supported for {}; {} does not support it",
+                LikelihoodFamily::BinomialLogit.pretty_name(),
+                family.pretty_name()
+            ));
+        }
+    }
+
     match (family, inputs) {
         (LikelihoodFamily::GaussianIdentity, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
             glm.x,
@@ -2664,11 +2558,6 @@ impl JointBetaRhoPosterior {
         let n_rho = penalty_roots.len();
 
         validate_firth_support(nuts_family, firth_enabled)?;
-        let firth_reduced_x = if firth_enabled {
-            Some(Arc::new(build_firth_reduced_design(x, weights)?))
-        } else {
-            None
-        };
 
         if rho_mode.len() != n_rho {
             return Err(format!(
@@ -2702,7 +2591,6 @@ impl JointBetaRhoPosterior {
             x: Arc::new(x.to_owned()),
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
-            firth_reduced_x,
             penalty: Arc::new(s_combined),
             mode: Arc::new(mode.to_owned()),
             n_samples,
@@ -2858,6 +2746,10 @@ pub struct JointBetaRhoInputs<'a> {
     pub x: ArrayView2<'a, f64>,
     pub y: ArrayView1<'a, f64>,
     pub weights: ArrayView1<'a, f64>,
+    /// Original engine-level likelihood family. This remains the compatibility
+    /// authority even when the HMC target internally reuses a simpler
+    /// `NutsFamily` likelihood kernel.
+    pub likelihood_family: LikelihoodFamily,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<Array2<f64>>,
@@ -2877,6 +2769,13 @@ pub fn run_joint_beta_rho_sampling(
     inputs: &JointBetaRhoInputs<'_>,
     config: &NutsConfig,
 ) -> Result<JointBetaRhoResult, String> {
+    if inputs.firth_bias_reduction && !inputs.likelihood_family.supports_firth() {
+        return Err(format!(
+            "Joint HMC with Firth is only supported for {}; {} does not support it",
+            LikelihoodFamily::BinomialLogit.pretty_name(),
+            inputs.likelihood_family.pretty_name()
+        ));
+    }
     validate_firth_support(inputs.nuts_family, inputs.firth_bias_reduction)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();

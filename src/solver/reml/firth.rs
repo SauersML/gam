@@ -308,6 +308,22 @@ impl FirthDenseOperator {
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
+        Self::build_with_observation_weights_impl(x_dense, eta, None)
+    }
+
+    pub(crate) fn build_with_observation_weights(
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+        observation_weights: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        Self::build_with_observation_weights_impl(x_dense, eta, Some(observation_weights))
+    }
+
+    fn build_with_observation_weights_impl(
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+        observation_weights: Option<ndarray::ArrayView1<'_, f64>>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
         // Precompute dense Firth objects at current β̂ for:
         //   Φ(β) = 0.5 log|I(β)|, I = Xᵀ W X.
         //
@@ -341,6 +357,14 @@ impl FirthDenseOperator {
         //   D H_φ[u],
         //   D² H_φ[u,v]
         // exactly via reduced-space products (no explicit high-order tensors).
+        //
+        // Fixed observation weights:
+        // When callers provide nonnegative case weights a_i that are constant in
+        // β, the Jeffreys information is
+        //   I(β) = Xᵀ diag(a_i w_i(η)) X.
+        // We fold those fixed a_i into the identifiable basis and reduced design
+        // via X̃ = diag(sqrt(a_i)) X, so all derivative formulas continue to use
+        // the same η-derivatives of the family Fisher weights w(η), w'(η), ....
         let n = x_dense.nrows();
         if eta.len() != n {
             return Err(EstimationError::InvalidInput(format!(
@@ -349,6 +373,29 @@ impl FirthDenseOperator {
                 eta.len()
             )));
         }
+        let observation_weight_sqrt = if let Some(weights) = observation_weights {
+            if weights.len() != n {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Firth operator observation weight length {} != number of rows {}",
+                    weights.len(),
+                    n
+                )));
+            }
+            let mut sqrt = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let weight = weights[i];
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "Firth operator requires finite nonnegative observation weights, got {} at row {}",
+                        weight, i
+                    )));
+                }
+                sqrt[i] = weight.sqrt();
+            }
+            Some(sqrt)
+        } else {
+            None
+        };
         let p = x_dense.ncols();
         let mut w = Array1::<f64>::zeros(n);
         let mut w1 = Array1::<f64>::zeros(n);
@@ -401,18 +448,27 @@ impl FirthDenseOperator {
                 wi * ti * ti * ti * ti - 22.0 * wi2 * ti * ti + 16.0 * wi3
             };
         }
-        // Build a fixed identifiable basis Q for Col(Xᵀ).
+        let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
+            RemlState::row_scale(x_dense, scale)
+        } else {
+            x_dense.clone()
+        };
+
+        // Build a fixed identifiable basis Q for Col(Xᵀ) or, with fixed case
+        // weights a_i, Col(Xᵀ diag(a_i)^{1/2}).
         //
-        // Exact fast path: if XᵀX is already SPD, then X has full column rank and
-        // the identifiable subspace is the whole coefficient space. In that case
-        // we can set Q = I exactly and skip the expensive eigendecomposition.
-        // This preserves the same Jeffreys/Firth objective because
-        //   Col(Xᵀ) = R^p, I_+^† = I^{-1}, and log|XᵀWX|_+ = log|XᵀWX|.
+        // Exact fast path: if the basis Gram is already SPD, then the weighted
+        // identifiable design has full column rank and the identifiable subspace
+        // is the whole coefficient space. In that case we can set Q = I exactly
+        // and skip the expensive eigendecomposition.
+        // This preserves the same Jeffreys/Firth objective because the
+        // weighted identifiable subspace is all of R^p, so I_+^† = I^{-1} and
+        // the pseudodeterminant reduces to the ordinary determinant.
         //
         // We only fall back to the spectral route when X is rank-deficient.
-        let gram = fast_atb(x_dense, x_dense);
+        let gram = fast_atb(&basis_design, &basis_design);
         let (q_basis, x_reduced) = if gram.cholesky(Side::Lower).is_ok() {
-            (Array2::<f64>::eye(p), x_dense.clone())
+            (Array2::<f64>::eye(p), basis_design.clone())
         } else {
             let (evals, evecs) = gram
                 .eigh(Side::Lower)
@@ -435,7 +491,7 @@ impl FirthDenseOperator {
             for (col_idx, &eig_idx) in keep.iter().enumerate() {
                 q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
             }
-            let x_reduced = fast_ab(x_dense, &q_basis);
+            let x_reduced = fast_ab(&basis_design, &q_basis);
             (q_basis, x_reduced)
         };
         let r = q_basis.ncols();
@@ -471,6 +527,7 @@ impl FirthDenseOperator {
         }
 
         let mut k_reduced = Array2::<f64>::zeros((r, r));
+        let mut half_log_det = 0.0_f64;
         if r > 0 {
             // Exact reduced-space inverse: I_r should be SPD for finite-logit eta
             // with full-rank X_r. We intentionally avoid diagonal ridge here.
@@ -481,6 +538,7 @@ impl FirthDenseOperator {
                     condition_number: f64::INFINITY,
                 }
             })?;
+            half_log_det = chol.diag().iter().map(|d| d.ln()).sum::<f64>();
             for col in 0..r {
                 let mut e_col = Array1::<f64>::zeros(r);
                 e_col[col] = 1.0;
@@ -488,9 +546,9 @@ impl FirthDenseOperator {
                 k_reduced.column_mut(col).assign(&solved);
             }
         }
-        // Unweighted reduced design enters M = X_r K_r X_r' and P = M⊙M.
-        // Keep this object unweighted to match the analytic formulas used in
-        // Hphi, D(Hphi), and D²(Hphi).
+        // Reduced design enters M = Z K_r Z' and P = M⊙M.
+        // Without fixed observation weights, Z = X_r. With fixed observation
+        // weights a_i, Z = diag(sqrt(a_i)) X_r.
         let z_reduced = x_reduced.clone();
         let h_diag = if r > 0 {
             RemlState::reduced_diag_gram(&z_reduced, &k_reduced)
@@ -507,7 +565,9 @@ impl FirthDenseOperator {
             q_basis,
             x_reduced,
             z_reduced,
+            observation_weight_sqrt,
             k_reduced,
+            half_log_det,
             h_diag,
             w,
             w1,
@@ -519,12 +579,58 @@ impl FirthDenseOperator {
         })
     }
 
+    #[inline]
+    pub(crate) fn jeffreys_logdet(&self) -> f64 {
+        self.half_log_det
+    }
+
+    #[inline]
+    pub(crate) fn jeffreys_beta_gradient(&self) -> Array1<f64> {
+        // For I(β) = Xᵀ A W(η) X with fixed observation weights A,
+        //   ∂/∂β_j [0.5 log|I|]
+        //   = 0.5 Σ_i h_i w_i'(η_i) x_{ij},
+        // where h_i = [A^{1/2} X I^{-1} Xᵀ A^{1/2}]_{ii}.
+        0.5 * self.x_dense_t.dot(&(&self.w1 * &self.h_diag))
+    }
+
+    #[inline]
+    pub(crate) fn jeffreys_logdet_and_beta_gradient(&self) -> (f64, Array1<f64>) {
+        (self.jeffreys_logdet(), self.jeffreys_beta_gradient())
+    }
+
+    #[inline]
+    fn assert_unweighted_directional_support(&self, method: &str) {
+        assert!(
+            self.observation_weight_sqrt.is_none(),
+            "FirthDenseOperator::{method} currently supports only the unweighted exact REML path; weighted operators are limited to Jeffreys value/gradient accessors"
+        );
+    }
+
+    #[inline]
+    fn reduce_explicit_design(&self, x: &Array2<f64>) -> Array2<f64> {
+        let mut reduced = fast_ab(x, &self.q_basis);
+        if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+            reduced = RemlState::row_scale(&reduced, scale);
+        }
+        reduced
+    }
+
+    #[inline]
+    fn reduce_compact_design(&self, x: &HyperDesignDerivative) -> Array2<f64> {
+        let mut reduced = x.dot_mat(&self.q_basis);
+        if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+            reduced = RemlState::row_scale(&reduced, scale);
+        }
+        reduced
+    }
+
     pub(crate) fn direction(&self, u: &Array1<f64>) -> FirthDirection {
         let deta = self.x_dense.dot(u);
         self.direction_from_deta(deta)
     }
 
     pub(crate) fn direction_from_deta(&self, deta: Array1<f64>) -> FirthDirection {
+        self.assert_unweighted_directional_support("direction_from_deta");
         // Directional building blocks for u:
         //   δη_u = X u
         //   I_u  = Xᵀ diag(w' ⊙ δη_u) X
@@ -846,6 +952,7 @@ impl FirthDenseOperator {
         beta: &Array1<f64>,
         include_hphi_tau_kernel: bool,
     ) -> FirthTauExactKernel {
+        self.assert_unweighted_directional_support("exact_tau_kernel");
         // Shared exact tau-partial bundle used by both dense and sparse paths:
         //   (gphi)_tau | beta-fixed,
         //   Phi_tau | beta-fixed,
@@ -865,7 +972,7 @@ impl FirthDenseOperator {
         //
         // These are the literal trace/hat closed forms for Phi_tau and Phi_beta,tau.
         let deta_partial = x_tau.dot(beta);
-        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
+        let x_tau_reduced = self.reduce_explicit_design(x_tau);
         let (dot_i_partial, dot_h_partial) =
             self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
 
@@ -899,8 +1006,9 @@ impl FirthDenseOperator {
         beta: &Array1<f64>,
         include_hphi_tau_kernel: bool,
     ) -> FirthTauExactKernel {
+        self.assert_unweighted_directional_support("exact_tau_kernel_compact");
         let deta_partial = x_tau.dot(beta);
-        let x_tau_reduced = x_tau.dot_mat(&self.q_basis);
+        let x_tau_reduced = self.reduce_compact_design(x_tau);
         let (dot_i_partial, dot_h_partial) =
             self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
 
@@ -934,8 +1042,9 @@ impl FirthDenseOperator {
         x_tau: &Array2<f64>,
         beta: &Array1<f64>,
     ) -> FirthTauPartialKernel {
+        self.assert_unweighted_directional_support("hphi_tau_partial_prepare");
         let deta_partial = x_tau.dot(beta);
-        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
+        let x_tau_reduced = self.reduce_explicit_design(x_tau);
         let (dot_i_partial, dot_h_partial) =
             self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
         self.hphi_tau_partial_prepare_from_partials(
@@ -1160,17 +1269,25 @@ mod tests {
     fn firthphivalue(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
         let eta = x.dot(beta);
         let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
-        let fisher = fast_atb(&op.x_reduced, &RemlState::row_scale(&op.x_reduced, &op.w));
-        let (evals, _) = fisher
-            .eigh(Side::Lower)
-            .expect("reduced Fisher eigendecomp");
-        0.5 * evals.iter().map(|v| v.ln()).sum::<f64>()
+        op.jeffreys_logdet()
     }
 
     fn firthgradphi(x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
         let eta = x.dot(beta);
         let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
-        0.5 * x.t().dot(&(&op.w1 * &op.h_diag))
+        op.jeffreys_beta_gradient()
+    }
+
+    fn weighted_firthphivalue(
+        x: &Array2<f64>,
+        beta: &Array1<f64>,
+        observation_weights: &Array1<f64>,
+    ) -> f64 {
+        let eta = x.dot(beta);
+        let op =
+            FirthDenseOperator::build_with_observation_weights(x, &eta, observation_weights.view())
+                .expect("weighted firth operator");
+        op.jeffreys_logdet()
     }
 
     #[test]
@@ -1208,6 +1325,45 @@ mod tests {
             assert!((op.w2[i] - w2fd).abs() < 2e-5);
             assert!((op.w3[i] - w3fd).abs() < 4e-4);
             assert!((op.w4[i] - w4fd).abs() < 2e-3);
+        }
+    }
+
+    #[test]
+    fn weighted_firth_jeffreys_gradient_matches_finite_difference() {
+        let x = array![
+            [1.0, -0.7, 0.3],
+            [1.0, -0.2, -0.4],
+            [1.0, 0.5, 0.1],
+            [1.0, 1.1, -0.6],
+            [1.0, 1.6, 0.8],
+        ];
+        let beta = array![0.2, -0.45, 0.25];
+        let observation_weights = array![1.0, 0.5, 2.0, 1.5, 0.75];
+        let eta = x.dot(&beta);
+        let op = FirthDenseOperator::build_with_observation_weights(
+            &x,
+            &eta,
+            observation_weights.view(),
+        )
+        .expect("weighted firth operator");
+        let grad = op.jeffreys_beta_gradient();
+        let h = 1e-6;
+
+        for j in 0..beta.len() {
+            let mut beta_plus = beta.clone();
+            beta_plus[j] += h;
+            let mut beta_minus = beta.clone();
+            beta_minus[j] -= h;
+            let fd = (weighted_firthphivalue(&x, &beta_plus, &observation_weights)
+                - weighted_firthphivalue(&x, &beta_minus, &observation_weights))
+                / (2.0 * h);
+            assert!(
+                (grad[j] - fd).abs() < 1e-5,
+                "weighted Firth gradient mismatch at {}: analytic={}, fd={}",
+                j,
+                grad[j],
+                fd
+            );
         }
     }
 

@@ -4907,45 +4907,37 @@ pub fn fit_custom_family<F: CustomFamily>(
     // Known-link wiggle families formerly took an early exit here (rho fixed
     // at initial values, no outer optimization). That was a stabilization hack:
     // full Newton outer REML was fragile for these families due to ill-conditioned
-    // exact block solves. We now fall through to the normal outer loop, which
-    // selects EFS for penalty-like coordinates — a multiplicative fixed-point
-    // that avoids the fragile Hessian path entirely. Wiggle λ coordinates are
-    // penalty-like (B-spline difference penalties), so EFS applies directly.
-    let force_efs_for_wiggle =
+    // exact block solves. We now keep them inside `run_outer`, but still avoid
+    // advertising an exact Hessian capability for the wiggle path.
+    let skip_exact_hessian_for_wiggle =
         include_exact_newton_logdet_h(family) && family.known_link_wiggle().is_some();
 
     use crate::estimate::EstimationError;
     use crate::solver::strategy::{
-        plan, ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig,
-        OuterEval, Solver,
+        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
     };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
-    // previously behind Mutex (required by Fn closures in
-    // CachedSecondOrderObjective) but ClosureObjective uses FnMut, so plain
-    // fields suffice.
+    // previously behind Mutex because the old optimizer bridge used `Fn`
+    // adapters; `ClosureObjective` uses `FnMut`, so plain fields suffice.
     struct CustomOuterState {
         warm_cache: Option<ConstrainedWarmStart>,
-        last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)>,
         last_error: Option<String>,
     }
 
     let has_exact_hess = include_exact_newton_logdet_h(family);
     let n_rho = rho0.len();
 
-    let outer_max_iter = if force_efs_for_wiggle {
-        // EFS converges fast for penalty-like coords; allow enough iterations
-        // but don't waste time on an already-cheap fixed-point.
-        options.outer_max_iter.min(20).max(5)
-    } else if has_exact_hess {
+    let outer_max_iter = if has_exact_hess && !skip_exact_hessian_for_wiggle {
         options.outer_max_iter.min(3).max(1)
     } else {
         options.outer_max_iter
     };
 
-    let hessian_deriv = if force_efs_for_wiggle {
-        // For wiggle families, skip the fragile exact Hessian. EFS doesn't
-        // need it — it uses only cost + gradient for the fixed-point step.
+    let hessian_deriv = if skip_exact_hessian_for_wiggle {
+        // Known-link wiggle families keep the outer solve in first-order mode;
+        // they do not currently expose the `eval_efs` callback required for an
+        // actual EFS fixed-point iteration.
         Derivative::Unavailable
     } else if has_exact_hess {
         Derivative::Analytic
@@ -4957,31 +4949,37 @@ pub fn fit_custom_family<F: CustomFamily>(
         gradient: Derivative::Analytic,
         hessian: hessian_deriv,
         n_params: n_rho,
-        // Wiggle families have only penalty-like λ coordinates (B-spline
-        // difference penalties), so EFS applies. Non-wiggle custom families
-        // may have ψ (design-moving) coordinates — conservatively false.
-        all_penalty_like: force_efs_for_wiggle,
+        // Custom-family outer objectives do not currently provide `eval_efs`,
+        // so strategy should remain within Newton/BFGS-style plans here.
+        all_penalty_like: false,
         // Custom families enforce constraints via active-set QP in the inner
         // loop, not via log-barrier in the outer evaluator.
         barrier_config: None,
-        force_solver: None,
     };
-    let fallback_sequence = if plan(&primary_cap).solver == Solver::Bfgs {
-        Vec::new()
+    let gradient_fallback = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: Derivative::Unavailable,
+        n_params: n_rho,
+        all_penalty_like: false,
+        barrier_config: None,
+    };
+    let fd_gradient_fallback = OuterCapability {
+        gradient: Derivative::FiniteDifference,
+        hessian: Derivative::Unavailable,
+        n_params: n_rho,
+        all_penalty_like: false,
+        barrier_config: None,
+    };
+    let fallback_sequence = if has_exact_hess && !skip_exact_hessian_for_wiggle {
+        vec![gradient_fallback, fd_gradient_fallback]
     } else {
-        vec![OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
-            n_params: n_rho,
-            all_penalty_like: false,
-            barrier_config: None,
-            force_solver: Some(Solver::Bfgs),
-        }]
+        vec![fd_gradient_fallback]
     };
     let outer_config = OuterConfig {
         tolerance: options.outer_tol,
         max_iter: outer_max_iter,
         fd_step: 1e-4,
+        bounds: None,
         seed_config: crate::seeding::SeedConfig::default(),
         rho_bound: 30.0,
         heuristic_lambdas: None,
@@ -4992,7 +4990,6 @@ pub fn fit_custom_family<F: CustomFamily>(
     let mut obj = ClosureObjective {
         state: CustomOuterState {
             warm_cache: None,
-            last_eval: None,
             last_error: None,
         },
         cap: primary_cap,
@@ -5066,48 +5063,15 @@ pub fn fit_custom_family<F: CustomFamily>(
                     outer.last_error = Some(
                         "custom-family outer objective/derivatives became non-finite".to_string(),
                     );
-                    // For exact-Newton families, reuse the last good eval to
-                    // give the optimizer a safe fallback value.
-                    if has_exact_hess {
-                        if let Some((ref xp, cp, ref gp, ref hp)) = outer.last_eval {
-                            if xp.len() == rho.len() {
-                                let hess = match hp {
-                                    Some(h) => HessianResult::Analytic(h.clone()),
-                                    None => HessianResult::Unavailable,
-                                };
-                                return Ok(OuterEval {
-                                    cost: cp,
-                                    gradient: gp.clone(),
-                                    hessian: hess,
-                                });
-                            }
-                        }
-                    }
                     return Err(EstimationError::RemlOptimizationFailed(
                         "custom-family outer objective/derivatives became non-finite".to_string(),
                     ));
                 }
                 Err(e) => {
                     outer.last_error = Some(e.clone());
-                    if has_exact_hess {
-                        if let Some((ref xp, cp, ref gp, ref hp)) = outer.last_eval {
-                            if xp.len() == rho.len() {
-                                let hess = match hp {
-                                    Some(h) => HessianResult::Analytic(h.clone()),
-                                    None => HessianResult::Unavailable,
-                                };
-                                return Ok(OuterEval {
-                                    cost: cp,
-                                    gradient: gp.clone(),
-                                    hessian: hess,
-                                });
-                            }
-                        }
-                    }
                     return Err(EstimationError::RemlOptimizationFailed(e));
                 }
             };
-            outer.last_eval = Some((rho.clone(), cost, grad.clone(), hess_opt.clone()));
             let hessian = match hess_opt {
                 Some(h) => HessianResult::Analytic(h),
                 None => HessianResult::Unavailable,
@@ -5120,7 +5084,6 @@ pub fn fit_custom_family<F: CustomFamily>(
         },
         reset_fn: Some(|outer: &mut CustomOuterState| {
             outer.warm_cache = None;
-            outer.last_eval = None;
             outer.last_error = None;
         }),
         efs_fn: None::<
