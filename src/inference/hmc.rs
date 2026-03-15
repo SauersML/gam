@@ -2689,9 +2689,12 @@ impl JointBetaRhoPosterior {
         // log|S|₊ and ∂/∂ρ_k log|S|₊ = tr(S₊⁻¹ A_k) from the same decomposition.
         //
         // All penalty matrices live in a single block (no multi-block structure).
+        // Per-penalty nullities: use zero when structural nullity is unknown.
+        let nullity_vec = vec![0usize; self.penalty_matrices.len()];
         let penalty_logdet = compute_block_penalty_logdet_derivs(
             &[rho.clone()],
             &[self.penalty_matrices.as_slice()],
+            &[nullity_vec.as_slice()],
             0.0,
         );
         let (log_det_s, logdet_grad) = match penalty_logdet {

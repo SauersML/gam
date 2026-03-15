@@ -2389,39 +2389,47 @@ fn strict_logdet_spd_with_semidefinite_option(
     strict_logdet_spd(matrix)
 }
 
-fn pinv_positive_part_with_floor(
-    matrix: &Array2<f64>,
-    positive_floor: f64,
-) -> Result<Array2<f64>, String> {
+/// Compute the smooth δ-regularized inverse (S + δI)⁻¹ of a symmetric matrix.
+///
+/// Replaces the hard-truncated pseudoinverse `pinv_positive_part_with_floor`.
+/// The regularization parameter δ is chosen proportional to machine epsilon
+/// times the spectral scale, ensuring the inverse is always full rank and
+/// C∞ smooth in the matrix entries.
+///
+/// Reference: response.md Section 7.
+fn delta_regularized_inverse(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
+    use crate::estimate::reml::unified::smooth_logdet_delta;
+
     let (evals, evecs) = match FaerEigh::eigh(matrix, Side::Lower) {
         Ok(ok) => ok,
         Err(_) => {
+            // Fallback: diagonal approximation with δ-regularization.
             let p = matrix.nrows();
-            let mut diag_pinv = Array2::<f64>::zeros((p, p));
+            let max_diag = (0..p)
+                .map(|i| matrix[[i, i]].abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let delta = 1e-10 * max_diag;
+            let mut inv = Array2::<f64>::zeros((p, p));
             for i in 0..p {
-                let di = matrix[[i, i]];
-                if di > positive_floor {
-                    diag_pinv[[i, i]] = 1.0 / di;
-                }
+                inv[[i, i]] = 1.0 / (matrix[[i, i]] + delta);
             }
-            return Ok(diag_pinv);
+            return Ok(inv);
         }
     };
     let p = matrix.nrows();
-    let mut pinv = Array2::<f64>::zeros((p, p));
+    let delta = smooth_logdet_delta(evals.as_slice().unwrap());
+    let mut inv = Array2::<f64>::zeros((p, p));
     for k in 0..p {
-        let ev = evals[k];
-        if ev > positive_floor {
-            let inv_ev = 1.0 / ev;
-            for i in 0..p {
-                let uik = evecs[(i, k)];
-                for j in 0..p {
-                    pinv[[i, j]] += inv_ev * uik * evecs[(j, k)];
-                }
+        let inv_ev = 1.0 / (evals[k] + delta);
+        for i in 0..p {
+            let uik = evecs[(i, k)];
+            for j in 0..p {
+                inv[[i, j]] += inv_ev * uik * evecs[(j, k)];
             }
         }
     }
-    Ok(pinv)
+    Ok(inv)
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
@@ -3027,13 +3035,27 @@ fn unified_joint_cost_gradient(
     // Compute penalty logdet derivatives.
     let per_block_penalties: Vec<&[Array2<f64>]> =
         specs.iter().map(|s| s.penalties.as_slice()).collect();
+    // Per-block nullities: use zero nullity for each penalty when structural
+    // nullity info is not available from the block specs.
+    let per_block_nullity_vecs: Vec<Vec<usize>> = specs
+        .iter()
+        .map(|s| vec![0; s.penalties.len()])
+        .collect();
+    let per_block_nullity_refs: Vec<&[usize]> = per_block_nullity_vecs
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
     let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
         ridge
     } else {
         0.0
     };
-    let penalty_logdet =
-        compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?;
+    let penalty_logdet = compute_block_penalty_logdet_derivs(
+        per_block,
+        &per_block_penalties,
+        &per_block_nullity_refs,
+        penalty_logdet_ridge,
+    )?;
 
     // Number of observations.
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
@@ -3114,7 +3136,14 @@ fn joint_outer_evaluate(
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<OuterObjectiveEvalResult, String> {
-    // Assemble joint penalty matrix S(ρ) and its pseudo-inverse S⁺.
+    // Assemble joint penalty matrix S(ρ) and its smooth δ-regularized inverse (S + δI)⁻¹.
+    //
+    // Instead of the hard-truncated pseudoinverse S⁺ (which creates non-smooth
+    // derivatives and requires explicit leakage correction), we use the
+    // smooth δ-regularized inverse. This is C∞ in all outer parameters and
+    // automatically captures the moving-nullspace correction.
+    //
+    // Reference: response.md Section 7.
     let mut s_joint = Array2::<f64>::zeros((total, total));
     let mut s_pinv_joint = if include_logdet_s {
         Some(Array2::<f64>::zeros((total, total)))
@@ -3144,16 +3173,11 @@ fn joint_outer_evaluate(
                     s_for_logdet[[d, d]] += ridge;
                 }
             }
-            let s_floor = if options.ridge_policy.include_penalty_logdet {
-                ridge
-            } else {
-                0.0
-            }
-            .max(1e-14);
-            let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
+            // Use δ-regularized inverse (S + δI)⁻¹ instead of pseudoinverse.
+            let s_reg_inv = delta_regularized_inverse(&s_for_logdet)?;
             s_pinv
                 .slice_mut(ndarray::s![start..end, start..end])
-                .assign(&s_part);
+                .assign(&s_reg_inv);
         }
     }
 
@@ -3903,46 +3927,17 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     }
     let rho_map = Arc::new(rho_map);
 
-    // Precompute moving nullspace correction data from the pseudo-inverse.
-    // If the penalty has a nullspace (rank-deficient S), ψ coordinates may
-    // rotate that nullspace, requiring correction terms in the second
-    // derivative of log|S|₊. We precompute U₊, U₀, and Σ⁺² once.
-    let nullspace_correction: Arc<
-        Option<(
-            Array2<f64>, // u_pos: (total × n_pos)
-            Array2<f64>, // u_null: (total × n_null)
-            Array1<f64>, // sigma_pinv_sq: n_pos eigenvalues of S⁺ squared
-        )>,
-    > = Arc::new(if let Some(sp) = s_pinv {
-        if let Ok((sp_eigs, sp_vecs)) = sp.eigh(faer::Side::Lower) {
-            let sp_max = sp_eigs.iter().copied().fold(0.0_f64, f64::max).max(1e-30);
-            let sp_tol = (total.max(1) as f64) * f64::EPSILON * sp_max;
-            let pos_idx: Vec<usize> = (0..total).filter(|&k| sp_eigs[k] > sp_tol).collect();
-            let null_idx: Vec<usize> = (0..total).filter(|&k| sp_eigs[k] <= sp_tol).collect();
-            if !null_idx.is_empty() && !pos_idx.is_empty() {
-                let n_pos = pos_idx.len();
-                let n_null = null_idx.len();
-                let mut u_pos = Array2::<f64>::zeros((total, n_pos));
-                for (col_out, &col_in) in pos_idx.iter().enumerate() {
-                    u_pos.column_mut(col_out).assign(&sp_vecs.column(col_in));
-                }
-                let mut u_null = Array2::<f64>::zeros((total, n_null));
-                for (col_out, &col_in) in null_idx.iter().enumerate() {
-                    u_null.column_mut(col_out).assign(&sp_vecs.column(col_in));
-                }
-                // sp eigenvalue = 1/σ, so S⁺² eigenvalue = 1/σ² = (sp eigenvalue)².
-                let sigma_pinv_sq =
-                    Array1::from_vec(pos_idx.iter().map(|&k| sp_eigs[k] * sp_eigs[k]).collect());
-                Some((u_pos, u_null, sigma_pinv_sq))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    });
+    // ── Smooth δ-regularized inverse for ld_s pair computations ──
+    //
+    // Instead of the pseudoinverse S⁺ with hard eigenvalue threshold and
+    // explicit moving-nullspace correction (U₊, U₀, Σ⁺² leakage), we use
+    // the smooth δ-regularized inverse (S + δI)⁻¹.
+    //
+    // This is C∞ in all outer parameters and automatically captures the
+    // leakage correction that was previously needed when ψ coordinates
+    // rotated the penalty nullspace.
+    //
+    // Reference: response.md Section 7.
 
     // ψ-ψ pair callback
     let ext_ext = {
@@ -3955,7 +3950,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let ranges_arc = Arc::clone(&ranges_arc);
         let psi_map = Arc::clone(&psi_map);
         let family_arc = Arc::clone(&family_arc);
-        let nullspace_correction_arc = Arc::clone(&nullspace_correction);
         let total = total;
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
@@ -3997,21 +3991,22 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let g = score_ll + &s_ij_beta;
             let b_mat = hess_ll + &s_ij;
 
-            // ld_s_{ij}: full second derivative of log|S|₊ w.r.t. ψ_i, ψ_j.
+            // ld_s_{ij}: second derivative of L_δ(S) = log det(S + δI) − m₀ log δ
+            // w.r.t. ψ_i, ψ_j.
             //
-            //   ∂²_ij log|S|₊
-            //     = tr(S⁺ S_{ij}) - tr(S⁺ S_j S⁺ S_i)
-            //       + tr(S⁺² S_i P₀ S_j) + tr(S⁺² S_j P₀ S_i)
+            // Using the smooth δ-regularized inverse (S + δI)⁻¹:
+            //   ∂²_ij L_δ = tr((S+δI)⁻¹ S_{ij}) − tr((S+δI)⁻¹ S_j (S+δI)⁻¹ S_i)
             //
-            // The last two terms are the moving nullspace correction, needed
-            // when ψ rotates the nullspace of S. They vanish when the
-            // nullspace is fixed (as for ρ coordinates).
+            // No leakage/moving-nullspace correction is needed because (S + δI)
+            // is always full rank. The full-rank inverse automatically captures
+            // what previously required explicit U₊/U₀ partitioning and leakage
+            // matrix computation.
+            //
+            // Reference: response.md Section 7.
             let ld_s = if let Some(ref sp) = *s_pinv_arc {
                 let tr_spinv_sij = trace_product(sp, &s_ij);
 
                 // Compute the quadratic piece.
-                // First reconstruct S_i and S_j in joint space to compute
-                // tr(S⁺ S_j S⁺ S_i).
                 let s_i_local = assemble_block_local_s_psi(
                     &derivative_blocks[block_i][local_i],
                     &per_block[block_i],
@@ -4038,25 +4033,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 let spinv_si = sp.dot(&s_i);
                 let spinv_sj = sp.dot(&s_j);
                 let tr_quad = trace_product(&spinv_sj, &spinv_si);
-                let mut ld_s_val = tr_spinv_sij - tr_quad;
-
-                // Moving nullspace correction for ψ-ψ pairs.
-                // Uses precomputed U₊, U₀, Σ⁺² from the eigendecomposition of sp.
-                //   tr(S⁺² S_i P₀ S_j) = tr(Σ⁺² L_i L_jᵀ)
-                // where L_k = U₊ᵀ S_k U₀ is the "leakage" matrix.
-                if let Some((ref u_pos, ref u_null, ref spinv2)) = *nullspace_correction_arc {
-                    let l_i = u_pos.t().dot(&s_i.dot(u_null));
-                    let l_j = u_pos.t().dot(&s_j.dot(u_null));
-
-                    let mut corr = 0.0_f64;
-                    for a in 0..spinv2.len() {
-                        corr += spinv2[a] * l_i.row(a).dot(&l_j.row(a));
-                    }
-                    // Both correction terms are equal by symmetry.
-                    ld_s_val += 2.0 * corr;
-                }
-
-                ld_s_val
+                tr_spinv_sij - tr_quad
             } else {
                 0.0
             };
@@ -4112,7 +4089,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let g = s_kj_beta;
             let b_mat = s_kj.clone();
 
-            // ld_s for ρ-ψ cross: tr(S⁺⁻¹ S_{kj}) - tr(S⁺⁻¹ S_j S⁺⁻¹ S_k)
+            // ld_s for ρ-ψ cross: tr((S+δI)⁻¹ S_{kj}) − tr((S+δI)⁻¹ S_j (S+δI)⁻¹ S_k)
+            // No leakage correction needed — (S + δI) is full rank.
+            // Reference: response.md Section 7.
             let ld_s = if let Some(ref sp) = *s_pinv_arc {
                 let tr_spinv_skj = trace_product(sp, &s_kj);
 
@@ -4289,7 +4268,12 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         let synced_joint_states =
             synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
 
-        // Compute S⁺⁻¹ (penalty pseudo-inverse) for the ψ builders.
+        // Compute smooth δ-regularized inverse (S + δI)⁻¹ for the ψ builders.
+        //
+        // Replaces the hard-truncated pseudoinverse S⁺, making the objective C∞
+        // and eliminating the need for leakage/moving-nullspace corrections.
+        //
+        // Reference: response.md Section 7.
         let s_pinv_joint = if include_logdet_s {
             let mut sp = Array2::<f64>::zeros((total, total));
             for (b, spec) in specs.iter().enumerate() {
@@ -4306,13 +4290,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
                         s_for_logdet[[d, d]] += ridge;
                     }
                 }
-                let s_floor = if options.ridge_policy.include_penalty_logdet {
-                    ridge
-                } else {
-                    0.0
-                }
-                .max(1e-14);
-                let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
+                let s_part = delta_regularized_inverse(&s_for_logdet)?;
                 sp.slice_mut(ndarray::s![start..end, start..end])
                     .assign(&s_part);
             }

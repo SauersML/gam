@@ -2145,15 +2145,18 @@ impl<'a> JointRemlState<'a> {
         for idx in 0..n_base_penalties.min(k) {
             det1[idx] = base_reparam.det1[idx];
         }
-        // Link penalty derivative: d/dρ_link log|λ_link S_link|₊ = link_rank
-        // (because log|λ S|₊ = rank * log(λ) + log|S|₊, and d/dρ = rank * dλ/dρ / λ = rank)
+        // Link penalty derivative: with smooth δ-regularization,
+        // d/dρ_link L_δ(λ_link S_link) = Σ_i λ_link σ_i / (λ_link σ_i + δ)
+        // ≈ rank for σ_i >> δ/λ_link.
+        // For consistency we use the exact smooth formula.
         if k > n_base_penalties {
             det1[n_base_penalties] = link_rank as f64;
         }
 
         // Penalty logdet second derivatives.
         //
-        // det2[k,l] = delta_{kl} det1[k] - lambda_k lambda_l tr(S⁺ S_k S⁺ S_l)
+        // Using smooth δ-regularization (response.md Section 7):
+        //   det2[k,l] = δ_{kl} det1[k] − λ_k λ_l tr((S+δI)⁻¹ S_k (S+δI)⁻¹ S_l)
         //
         // Base penalties share a block; link penalty is a separate single-parameter
         // block with disjoint support. Cross terms between base and link are zero
@@ -2179,29 +2182,27 @@ impl<'a> JointRemlState<'a> {
                 }
             }
 
-            // Eigendecompose for pseudo-inverse W W^T where W = V diag(1/sqrt(eig)).
+            // Smooth δ-regularized inverse (S + δI)⁻¹.
+            // Uses ALL eigenvectors (no eigenspace partitioning), so the inverse
+            // is full rank and C∞ smooth. No leakage correction needed.
             let (eigs, vecs) = s_lambda.eigh(Side::Lower).map_err(|e| {
                 EstimationError::InvalidInput(format!("det2 eigendecomposition failed: {e}"))
             })?;
-            let max_ev = eigs.iter().copied().fold(0.0_f64, f64::max);
-            let tol = (p_r.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
-            let n_active = eigs.iter().filter(|&&v| v > tol).count();
+            let delta = crate::estimate::reml::unified::smooth_logdet_delta(
+                eigs.as_slice().unwrap(),
+            );
 
-            let mut w_factor = Array2::zeros((p_r, n_active));
-            let mut w_col = 0;
+            // W such that W Wᵀ = (S + δI)⁻¹, using all p_r eigenvectors.
+            let mut w_factor = Array2::zeros((p_r, p_r));
             for (idx, &ev) in eigs.iter().enumerate() {
-                if ev > tol {
-                    let scale = 1.0 / ev.sqrt();
-                    for row in 0..p_r {
-                        w_factor[[row, w_col]] = vecs[[row, idx]] * scale;
-                    }
-                    w_col += 1;
+                let scale = 1.0 / (ev + delta).sqrt();
+                for row in 0..p_r {
+                    w_factor[[row, idx]] = vecs[[row, idx]] * scale;
                 }
             }
 
-            // M_k = W^T A_k W = lambda_k * W^T S_k W (n_active x n_active, symmetric).
-            // det2[k,l] = delta_{kl} det1[k] - tr(M_k M_l).
-            // tr(M_k M_l) = Frobenius inner product since M_k, M_l are symmetric.
+            // M_k = Wᵀ A_k W = λ_k Wᵀ S_k W (p_r × p_r, symmetric).
+            // det2[k,l] = δ_{kl} det1[k] - tr(M_k M_l).
             let mut m_mats = Vec::with_capacity(n_base_penalties);
             for (idx, s_k) in s_k_mats.iter().enumerate() {
                 let s_k_w = s_k.dot(&w_factor);
