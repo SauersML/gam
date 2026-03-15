@@ -2698,12 +2698,14 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             warm_cache: None,
             last_eval: None,
         },
-        // Exact first-order [rho, psi] calculus is available for all inverse
-        // links via the shared jet formulas. Exact outer Hessians additionally
-        // need family-provided second-order psi terms; keep those opt-in.
+        // Exact first-order AND second-order [rho, psi] calculus is available
+        // for all inverse links via the shared jet formulas and the five-term
+        // second-order Hessian correction in LinkWiggleDerivProvider. This
+        // enables exact Newton for the outer REML optimization, eliminating
+        // the BFGS fallback that was previously required.
         cap: OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
+            hessian: Derivative::Analytic,
             n_params: theta_dim,
             all_penalty_like: false,
             has_psi_coords: false,
@@ -2736,28 +2738,29 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
                         .unwrap_or(HessianResult::Unavailable),
                 });
             }
-            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
+            // Request Hessian from the unified evaluator. The five-term
+            // second-order correction in LinkWiggleDerivProvider (or the
+            // BorrowedJointDerivProvider fallback) provides exact ∂²H/∂ρ_k∂ρ_l,
+            // enabling the outer Newton step.
+            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), true)
                 .map_err(EstimationError::InvalidInput)?;
+            let hessian_result = eval
+                .outer_hessian
+                .clone()
+                .map(HessianResult::Analytic)
+                .unwrap_or(HessianResult::Unavailable);
             state.last_eval = Some((
                 theta.clone(),
                 eval.objective,
                 eval.gradient.clone(),
-                None,
+                eval.outer_hessian.clone(),
                 eval.warm_start.clone(),
             ));
             state.warm_cache = Some(eval.warm_start);
             Ok(OuterEval {
-                cost: state
-                    .last_eval
-                    .as_ref()
-                    .map(|x| x.1)
-                    .unwrap_or(f64::INFINITY),
-                gradient: state
-                    .last_eval
-                    .as_ref()
-                    .map(|x| x.2.clone())
-                    .unwrap_or_else(|| Array1::zeros(theta.len())),
-                hessian: HessianResult::Unavailable,
+                cost: eval.objective,
+                gradient: eval.gradient,
+                hessian: hessian_result,
             })
         },
         reset_fn: None::<fn(&mut MeanWiggleOuterState)>,
@@ -2778,6 +2781,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
         rho_bound: RHO_BOUND,
         heuristic_lambdas: None,
         initial_rho: Some(theta0),
+        // With analytic Hessian available, the primary path is Arc/Newton.
+        // Fallback sequence: BFGS (analytic gradient, no Hessian) → FD gradient.
         fallback_sequence: vec![
             OuterCapability {
                 gradient: Derivative::Analytic,

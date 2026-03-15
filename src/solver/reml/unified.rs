@@ -667,6 +667,480 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Link-wiggle derivative provider (exact second-order Hessian corrections)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Derivative provider for link-wiggle models that restores exact second-order
+/// Hessian corrections for the outer REML/LAML evaluator.
+///
+/// # Background
+///
+/// In link-wiggle models, the Gauss-Newton Hessian H = J'WJ has a coupled
+/// Jacobian J that depends on the coefficients β through the link function.
+/// Differentiating H twice with respect to the outer smoothing parameters
+/// (via the implicit function theorem) produces FIVE distinct contributions.
+/// Without these, the unified REML evaluator cannot compute the exact outer
+/// Hessian and must fall back to BFGS for the outer optimization.
+///
+/// This provider stores pre-computed ingredients from the converged P-IRLS
+/// inner loop and implements both first-order (∂H/∂ρ_k) and second-order
+/// (∂²H/∂ρ_k∂ρ_l) Hessian corrections analytically, enabling exact Newton
+/// for the outer REML and eliminating the BFGS fallback.
+///
+/// # Mathematical framework (response.md Sections 3 and 6)
+///
+/// The link-wiggle predictor is q = g(η; θ_link) where g is a flexible
+/// link function parameterized by θ_link. The joint Jacobian J maps the
+/// combined parameter vector (β_base, β_link) to the predictor derivatives:
+///
+///   J[:,0..p_base] = diag(g'(η)) · X_base        (base block)
+///   J[:,p_base..]  = B(z) · Z                      (link block)
+///
+/// where z = (η - min)/(max - min) is the normalized base predictor, B(z)
+/// is the B-spline basis evaluated at z, and Z is the geometric constraint
+/// transform ensuring monotonicity.
+///
+/// The Gauss-Newton Hessian is H = J'WJ where W = diag(w_i) are the
+/// working weights from the negative log-likelihood second derivative.
+///
+/// Differentiating H with respect to ρ_k (via the chain rule through
+/// the implicit function theorem β̂(ρ)) requires:
+///
+///   ∂H/∂ρ_k = D_β H[-v_k]  where v_k = H⁻¹(A_k β̂)
+///
+/// and for the second derivative:
+///
+///   ∂²H/∂ρ_k∂ρ_l = D_β H[u_kl] + D²_β H[-v_k, -v_l]
+///
+/// where u_kl = H⁻¹(−g_kl + Ḣ_l v_k + Ḣ_k v_l) is the second-order
+/// IFT mode response.
+///
+/// # Relationship to Faà di Bruno
+///
+/// The five-term decomposition arises from the Faà di Bruno formula for the
+/// second derivative of the composed map ρ → β̂(ρ) → J(β̂) → J'WJ. Each
+/// differentiation of J'WJ produces terms from:
+/// - Differentiating J (Jacobian drift, terms 2-4)
+/// - Differentiating W (weight drift, terms 3-5)
+/// - Cross terms between the two differentiations (terms 2, 3, 4)
+/// - The curvature of W itself through w'' (term 5)
+pub struct LinkWiggleDerivProvider {
+    /// Joint Jacobian J (n × p_total) at the converged mode.
+    /// Columns [0..p_base] correspond to the base predictor block,
+    /// columns [p_base..p_total] to the link wiggle block.
+    j_mat: Array2<f64>,
+
+    /// Pre-weighted Jacobian: diag(√W) · J (n × p_total).
+    /// Used for the √W factorization trick in symmetric products.
+    jweighted: Array2<f64>,
+
+    /// √W per observation (n-vector). Square root of the working weights
+    /// from the converged Gauss-Newton Hessian.
+    sqrtw: Array1<f64>,
+
+    /// dW/dη per observation (n-vector). Third derivative of the negative
+    /// log-likelihood w.r.t. the predictor η. Controls how the working
+    /// weights shift as β changes along a direction.
+    w_prime: Array1<f64>,
+
+    /// d²W/dη² per observation (n-vector). Fourth derivative of the negative
+    /// log-likelihood w.r.t. η. Needed for term 5 of the second-order
+    /// correction, where the curvature of W itself contributes.
+    w_double_prime: Array1<f64>,
+
+    /// Base design matrix X (n × p_base) in the transformed coefficient space.
+    x_base: Array2<f64>,
+
+    /// g''(η) per observation (n-vector). Second derivative of the link
+    /// function at the converged η values. Controls how the Jacobian's
+    /// base block changes as η shifts.
+    gsecond: Array1<f64>,
+
+    /// B'(z) · Z (n × p_link). Product of the B-spline basis first
+    /// derivative (evaluated at the normalized predictor z) with the
+    /// geometric constraint transform Z.
+    b_prime_u: Array2<f64>,
+
+    /// B'(z) raw (n × n_raw). B-spline basis first derivative before
+    /// the constraint transform. Used for computing the link-block
+    /// Jacobian drift dJ[:,p_base..].
+    b_prime: Array2<f64>,
+
+    /// Z matrix (n_raw × p_link). Geometric constraint transform that
+    /// maps unconstrained link coefficients to the monotonicity-constrained
+    /// parameter space.
+    link_transform: Array2<f64>,
+
+    /// 1/range_width for z-coordinate scaling. When the base predictor η
+    /// shifts by dη, the normalized coordinate z shifts by dη · invrw.
+    invrw: f64,
+
+    /// Number of base predictor coefficients.
+    p_base: usize,
+
+    /// Number of link wiggle coefficients (after constraint transform).
+    p_link: usize,
+
+    /// Total number of joint coefficients: p_base + p_link.
+    p_total: usize,
+
+    /// Number of observations.
+    n: usize,
+}
+
+impl LinkWiggleDerivProvider {
+    /// Create a new provider from pre-computed ingredients at the converged mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        j_mat: Array2<f64>,
+        sqrtw: Array1<f64>,
+        w_prime: Array1<f64>,
+        w_double_prime: Array1<f64>,
+        x_base: Array2<f64>,
+        gsecond: Array1<f64>,
+        b_prime_u: Array2<f64>,
+        b_prime: Array2<f64>,
+        link_transform: Array2<f64>,
+        invrw: f64,
+    ) -> Self {
+        let n = j_mat.nrows();
+        let p_total = j_mat.ncols();
+        let p_base = x_base.ncols();
+        let p_link = p_total - p_base;
+
+        // Pre-compute √W · J once (used in multiple places).
+        let mut jweighted = j_mat.clone();
+        for i in 0..n {
+            let w = sqrtw[i];
+            for j in 0..p_total {
+                jweighted[[i, j]] *= w;
+            }
+        }
+
+        Self {
+            j_mat,
+            jweighted,
+            sqrtw,
+            w_prime,
+            w_double_prime,
+            x_base,
+            gsecond,
+            b_prime_u,
+            b_prime,
+            link_transform,
+            invrw,
+            p_base,
+            p_link,
+            p_total,
+            n,
+        }
+    }
+
+    /// Compute first-order quantities for a given direction δ in the joint
+    /// parameter space.
+    ///
+    /// Returns:
+    /// - `dot_eta`: J · δ  (n-vector, predictor change)
+    /// - `dot_j`:   ∂J/∂β[δ]  (n × p_total, Jacobian directional derivative)
+    ///
+    /// The Jacobian derivative ∂J/∂β[δ] captures how J changes when β moves
+    /// along direction δ:
+    ///
+    ///   dot_J[:, 0..p_base] = diag(dot_g_prime) · X_base
+    ///   dot_J[:, p_base..]  = B'(z) · Z · diag(dot_u · invrw)
+    ///
+    /// where dot_g_prime = g'' · dot_u + B'Z · δ_theta is the change in the
+    /// link function's first derivative.
+    fn compute_first_order(&self, delta: &Array1<f64>) -> (Array1<f64>, Array2<f64>) {
+        let delta_beta = delta.slice(ndarray::s![0..self.p_base]);
+        let delta_theta = delta.slice(ndarray::s![self.p_base..self.p_total]);
+
+        // dot_eta = J · delta: how the predictor changes along direction delta.
+        let dot_eta = self.j_mat.dot(delta);
+
+        // dot_u = X_base · delta_beta: base predictor change.
+        let dot_u = self.x_base.dot(&delta_beta);
+
+        // dot_g_prime = g'' · dot_u + B'Z · delta_theta:
+        // Change in the link function's first derivative g'(η).
+        // - g'' · dot_u: curvature of the link function times base predictor shift
+        // - B'Z · delta_theta: direct change from link coefficients
+        let b_prime_z_delta_theta = self.b_prime_u.dot(&delta_theta);
+        let mut dot_g_prime = Array1::<f64>::zeros(self.n);
+        Zip::from(&mut dot_g_prime)
+            .and(&self.gsecond)
+            .and(&dot_u)
+            .and(&b_prime_z_delta_theta)
+            .for_each(|dgp, &gs, &du, &bpzdt| {
+                *dgp = gs * du + bpzdt;
+            });
+
+        // Assemble dot_J: the directional derivative of the joint Jacobian.
+        let mut dot_j = Array2::<f64>::zeros((self.n, self.p_total));
+
+        // Base block: dot_J[:, 0..p_base] = diag(dot_g_prime) · X_base
+        for i in 0..self.n {
+            let dgp = dot_g_prime[i];
+            if dgp.abs() > 0.0 {
+                for j in 0..self.p_base {
+                    dot_j[[i, j]] = dgp * self.x_base[[i, j]];
+                }
+            }
+        }
+
+        // Link block: dot_J[:, p_base..] = B'(z) · Z · (dot_u · invrw)
+        // The z-coordinate shifts by dz = dot_u · invrw when the base
+        // predictor changes, causing the B-spline basis to shift.
+        //
+        // dot_J_link[i, :] = dot_u[i] * invrw * (B'[i,:] · Z)
+        //                   = dot_u[i] * invrw * b_prime_u[i,:]
+        //
+        // Note: This uses the pre-computed b_prime_u = B' · Z to avoid
+        // the intermediate B' · Z product.
+        for i in 0..self.n {
+            let scale = dot_u[i] * self.invrw;
+            if scale.abs() > 0.0 {
+                for j in 0..self.p_link {
+                    dot_j[[i, self.p_base + j]] = scale * self.b_prime_u[[i, j]];
+                }
+            }
+        }
+
+        (dot_eta, dot_j)
+    }
+
+    /// Build the first-order Hessian correction matrix from dot_eta and dot_J.
+    ///
+    /// The correction is:
+    ///
+    ///   C = dot_J' W J + J' W dot_J + J' diag(w' · dot_eta) J
+    ///
+    /// This decomposes into:
+    /// - Jacobian symmetry term: (√W · dot_J)' (√W · J) + transpose
+    /// - Weight drift term: J' diag(w' · dot_eta) J
+    ///
+    /// The Jacobian symmetry term uses the √W factorization trick for
+    /// numerical stability: dot_J'WJ = (√W · dot_J)' (√W · J).
+    fn build_first_order_correction(
+        &self,
+        dot_eta: &Array1<f64>,
+        dot_j: &Array2<f64>,
+    ) -> Array2<f64> {
+        let p = self.p_total;
+
+        // Jacobian symmetry term: dot_J'WJ + J'W·dot_J
+        // = (√W·dot_J)'(√W·J) + ((√W·dot_J)'(√W·J))'
+        let mut w_dot_j = dot_j.clone();
+        for i in 0..self.n {
+            let w = self.sqrtw[i];
+            for j in 0..p {
+                w_dot_j[[i, j]] *= w;
+            }
+        }
+        let atb = w_dot_j.t().dot(&self.jweighted);
+        let mut result = &atb + &atb.t();
+
+        // Weight drift term: J' diag(w' · dot_eta) J
+        // w_dot[i] = w'[i] · dot_eta[i] is the weight change due to
+        // the predictor shift. This term captures how the working weights
+        // themselves move as β changes, contributing the third-derivative
+        // (w') curvature to the Hessian correction.
+        //
+        // Uses direct outer product accumulation (O(n·p²)) since w_dot
+        // can be negative and the √W factorization trick requires
+        // non-negative weights.
+        for i in 0..self.n {
+            let w_dot = self.w_prime[i] * dot_eta[i];
+            if w_dot.abs() > 0.0 {
+                let ji = self.j_mat.row(i);
+                for a in 0..p {
+                    let wa = w_dot * ji[a];
+                    for b in a..p {
+                        let val = wa * ji[b];
+                        result[[a, b]] += val;
+                        if a != b {
+                            result[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+}
+
+impl HessianDerivativeProvider for LinkWiggleDerivProvider {
+    /// First-order Hessian derivative correction: ∂H/∂ρ_k − A_k.
+    ///
+    /// Given the mode response v_k = H⁻¹(A_k β̂), the IFT direction is
+    /// δ = -v_k (since dβ̂/dρ_k = -v_k). This method computes:
+    ///
+    ///   D_β(J'WJ)[-v_k] = dot_J'WJ + J'W·dot_J + J'diag(w'·dot_eta)J
+    ///
+    /// where dot_eta = J·(-v_k) and dot_J = ∂J/∂β[-v_k].
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+        let delta = -v_k;
+        let (dot_eta, dot_j) = self.compute_first_order(&delta);
+        Some(self.build_first_order_correction(&dot_eta, &dot_j))
+    }
+
+    /// Second-order Hessian derivative correction for the outer Hessian.
+    ///
+    /// Computes ∂²H/∂ρ_k∂ρ_l via the FIVE-TERM decomposition that arises
+    /// from differentiating J'WJ twice through the implicit function theorem.
+    ///
+    /// # The five terms (response.md Section 6)
+    ///
+    /// **Term 1: D_β H[u_kl]** — First-order correction structure applied to
+    /// the second-order IFT mode response u_kl = H⁻¹(−g_kl + Ḣ_l v_k + Ḣ_k v_l).
+    /// This captures how H changes when β moves along the compound direction u_kl.
+    ///
+    /// **Term 2: Cross-Jacobian** — (∂J/∂β[δ_k])' W (∂J/∂β[δ_l]) + transpose.
+    /// The Jacobian derivatives from directions k and l interact through the
+    /// working weights W. Uses the √W factorization trick since W ≥ 0.
+    ///
+    /// **Term 3: Weight-drift × Jacobian_k** — The weight derivative w' couples
+    /// with the predictor change from direction l, acting on the Jacobian
+    /// derivative from direction k:
+    ///   dot_J_k' diag(w' · dot_η_l) J + J' diag(w' · dot_η_l) dot_J_k
+    ///
+    /// **Term 4: Weight-drift × Jacobian_l** — Same as term 3 with k↔l swapped:
+    ///   dot_J_l' diag(w' · dot_η_k) J + J' diag(w' · dot_η_k) dot_J_l
+    ///
+    /// **Term 5: Second-order weight + mixed predictor** — Two sub-contributions:
+    ///   J' diag(w'' · dot_η_k · dot_η_l + w' · dot_η_kl) J
+    ///
+    /// where w'' = d²W/dη² is the fourth derivative of the neg-log-likelihood.
+    /// - w'' · dot_η_k · dot_η_l: captures the curvature of W itself (how the
+    ///   rate of weight change varies with the predictor). This is the fourth
+    ///   derivative entering through the Faà di Bruno chain rule.
+    /// - w' · dot_η_kl: captures the mixed predictor acceleration, where
+    ///   dot_η_kl = dot_J_k · δ_l + J · u_kl accounts for how the predictor
+    ///   change in direction k is itself modified by moving in direction l.
+    ///
+    /// **Why the √W trick cannot be used for term 5:** The combined weight
+    /// w_ddot[i] = w''[i] · dot_η_k[i] · dot_η_l[i] + w'[i] · dot_η_kl[i]
+    /// can be negative (w'' is the fourth derivative which has no sign
+    /// constraint), so we cannot factor it as (√w_ddot)² and must use
+    /// direct outer product accumulation O(n·p²).
+    ///
+    /// # Restoring exact Newton
+    ///
+    /// Together, these five terms give the exact Q[v_k, v_l] correction that
+    /// the unified REML evaluator needs for the outer Hessian. With this,
+    /// the evaluator can compute the exact outer Hessian ∂²V/∂ρ_k∂ρ_l,
+    /// enabling Newton's method for the outer optimization and eliminating
+    /// the BFGS fallback.
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        let delta_k = -v_k;
+        let delta_l = -v_l;
+        let p = self.p_total;
+
+        // Compute first-order quantities for both directions.
+        let (dot_eta_k, dot_j_k) = self.compute_first_order(&delta_k);
+        let (dot_eta_l, dot_j_l) = self.compute_first_order(&delta_l);
+
+        // ── Term 1: D_β H[u_kl] ──────────────────────────────────────────
+        // Same structure as first-order correction, applied to the compound
+        // IFT direction u_kl.
+        let (dot_eta_ukl, dot_j_ukl) = self.compute_first_order(u_kl);
+        let term1 = self.build_first_order_correction(&dot_eta_ukl, &dot_j_ukl);
+
+        // ── Term 2: Cross-Jacobian ────────────────────────────────────────
+        // (∂J/∂β[δ_k])' W (∂J/∂β[δ_l]) + transpose
+        // = (√W·dot_J_k)' (√W·dot_J_l) + ((√W·dot_J_k)' (√W·dot_J_l))'
+        //
+        // Uses √W factorization since W ≥ 0.
+        let mut w_dot_j_k = dot_j_k.clone();
+        let mut w_dot_j_l = dot_j_l.clone();
+        for i in 0..self.n {
+            let w = self.sqrtw[i];
+            for j in 0..p {
+                w_dot_j_k[[i, j]] *= w;
+                w_dot_j_l[[i, j]] *= w;
+            }
+        }
+        let atb2 = w_dot_j_k.t().dot(&w_dot_j_l);
+        let term2 = &atb2 + &atb2.t();
+
+        // ── Term 3: Weight-drift × Jacobian_k ────────────────────────────
+        // dot_J_k' diag(w' · dot_η_l) J + J' diag(w' · dot_η_l) dot_J_k
+        //
+        // = (diag(w' · dot_η_l) · dot_J_k)' · J + transpose
+        let mut wl_dot_j_k = dot_j_k.clone();
+        for i in 0..self.n {
+            let wl = self.w_prime[i] * dot_eta_l[i];
+            for j in 0..p {
+                wl_dot_j_k[[i, j]] *= wl;
+            }
+        }
+        let atb3 = wl_dot_j_k.t().dot(&self.j_mat);
+        let term3 = &atb3 + &atb3.t();
+
+        // ── Term 4: Weight-drift × Jacobian_l ────────────────────────────
+        // Same as term 3 with k↔l swapped.
+        let mut wk_dot_j_l = dot_j_l.clone();
+        for i in 0..self.n {
+            let wk = self.w_prime[i] * dot_eta_k[i];
+            for j in 0..p {
+                wk_dot_j_l[[i, j]] *= wk;
+            }
+        }
+        let atb4 = wk_dot_j_l.t().dot(&self.j_mat);
+        let term4 = &atb4 + &atb4.t();
+
+        // ── Term 5: Second-order weight + mixed predictor ─────────────────
+        // J' diag(w_ddot) J  where
+        //   w_ddot[i] = w''[i] · dot_η_k[i] · dot_η_l[i] + w'[i] · dot_η_kl[i]
+        //
+        // dot_η_kl = dot_J_k · δ_l + J · u_kl
+        // This is the mixed predictor acceleration: how the predictor change
+        // from direction k is itself modified by moving in direction l.
+        //
+        // w'' (the fourth derivative of -log L w.r.t. η) is needed here because
+        // differentiating the third-derivative weight w' once more w.r.t. η gives
+        // w''. This is the deepest derivative layer in the chain — the Faà di
+        // Bruno formula for (ℓ ∘ g)'''' effectively produces this term.
+        //
+        // IMPORTANT: w_ddot can be negative (w'' has no sign constraint), so
+        // we CANNOT use the √W factorization trick here. Instead we accumulate
+        // the J'diag(w_ddot)J product directly via an O(n·p²) outer product loop.
+        let dot_eta_kl_full = dot_j_k.dot(&delta_l) + self.j_mat.dot(u_kl);
+        let mut term5 = Array2::<f64>::zeros((p, p));
+        for i in 0..self.n {
+            let w_ddot = self.w_double_prime[i] * dot_eta_k[i] * dot_eta_l[i]
+                + self.w_prime[i] * dot_eta_kl_full[i];
+            if w_ddot.abs() > 0.0 {
+                let ji = self.j_mat.row(i);
+                for a in 0..p {
+                    let wa = w_ddot * ji[a];
+                    for b in a..p {
+                        let val = wa * ji[b];
+                        term5[[a, b]] += val;
+                        if a != b {
+                            term5[[b, a]] += val;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sum all five terms.
+        Some(term1 + &term2 + &term3 + &term4 + &term5)
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Extended hyperparameter coordinate types
 // ═══════════════════════════════════════════════════════════════════════════
 
