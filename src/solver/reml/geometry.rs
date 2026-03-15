@@ -451,10 +451,11 @@ impl<'a> RemlState<'a> {
             };
         }
         if bundle.active_subspace_unstable {
-            // Hard-truncated logdet identities are only branch-local in rho.
-            // Once the retained H_+ eigenspace is near a threshold crossing,
-            // we stop calling the spectral Hessian "exact" and fall back to
-            // the safer analytic policy.
+            // The Hessian eigenspace may be near a threshold crossing.
+            // While the penalty pseudo-logdet now uses smooth δ-regularization
+            // (eliminating kinks from the penalty side), the H_+ eigenspace
+            // for the Laplace log|H| term may still be unstable. Fall back to
+            // the safer analytic policy for the Hessian-eigenspace-dependent block.
             return HessianStrategyDecision {
                 strategy: HessianEvalStrategyKind::AnalyticFallback,
                 reason: "active_subspace_unstable",
