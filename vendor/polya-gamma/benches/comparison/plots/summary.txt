@@ -1,0 +1,47 @@
+POLYA-GAMMA BENCHMARK SUMMARY
+===========================
+
+OVERALL STATISTICS
+-----------------
+Total comparisons: 16
+Average speedup: 25.73x
+Median speedup: 16.21x
+Standard deviation: 27.69x
+Minimum speedup: 1.13x
+25th percentile: 2.32x
+75th percentile: 40.52x
+Maximum speedup: 69.38x
+
+BREAKDOWN BY SHAPE PARAMETER (b)
+-------------------------------
+b = 0.5: 2.70x median (2.70x - 2.71x)
+b = 1.0: 1.15x median (1.13x - 1.19x)
+b = 5.0: 68.16x median (61.45x - 69.38x)
+b = 10.0: 32.96x median (29.72x - 33.55x)
+
+BREAKDOWN BY TILT PARAMETER (c)
+-------------------------------
+c = 0.0: 18.13x median (1.14x - 69.38x)
+c = 0.5: 18.00x median (1.16x - 68.93x)
+c = 1.0: 17.65x median (1.19x - 67.38x)
+c = 2.0: 16.21x median (1.13x - 61.45x)
+
+PERFORMANCE SUMMARY
+------------------
+Rust faster than R: 16 cases (100.0%)
+Rust slower than R: 0 cases (0.0%)
+Equal performance: 0 cases (0.0%)
+
+BEST CASE (for Rust)
+- Parameters: b=5.0, c=0.0
+- R time: 635116.14 µs
+- Rust time: 9154.32 µs
+- Speedup: 69.38x
+
+WORST CASE (for Rust)
+- Parameters: b=1.0, c=2.0
+- R time: 2367.59 µs
+- Rust time: 2101.17 µs
+- Speedup: 1.13x
+
+Generated at: 2025-05-21 20:44:00

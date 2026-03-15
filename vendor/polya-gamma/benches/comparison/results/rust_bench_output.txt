@@ -1,0 +1,64 @@
+test draw_n10000_b0.5_c0.0 ... bench:   312042625 ns/iter (+/- 310221)
+
+test draw_n10000_b0.5_c0.5 ... bench:   311970250 ns/iter (+/- 4681601)
+
+test draw_n10000_b0.5_c1.0 ... bench:   312048395 ns/iter (+/- 5375757)
+
+test draw_n10000_b0.5_c2.0 ... bench:   311993948 ns/iter (+/- 5184132)
+
+test draw_n10000_b1.0_c0.0 ... bench:     1865116 ns/iter (+/- 2449)
+
+test draw_n10000_b1.0_c0.5 ... bench:     1872530 ns/iter (+/- 1474)
+
+test draw_n10000_b1.0_c1.0 ... bench:     1919977 ns/iter (+/- 36968)
+
+test draw_n10000_b1.0_c2.0 ... bench:     2101167 ns/iter (+/- 8070)
+
+test draw_n10000_b5.0_c0.0 ... bench:     9154321 ns/iter (+/- 12564)
+
+test draw_n10000_b5.0_c0.5 ... bench:     9202056 ns/iter (+/- 132030)
+
+test draw_n10000_b5.0_c1.0 ... bench:     9402052 ns/iter (+/- 13720)
+
+test draw_n10000_b5.0_c2.0 ... bench:    10306559 ns/iter (+/- 45238)
+
+test draw_n10000_b10.0_c0.0 ... bench:    18261255 ns/iter (+/- 329490)
+
+test draw_n10000_b10.0_c0.5 ... bench:    18352611 ns/iter (+/- 221284)
+
+test draw_n10000_b10.0_c1.0 ... bench:    18766799 ns/iter (+/- 38085)
+
+test draw_n10000_b10.0_c2.0 ... bench:    20584205 ns/iter (+/- 218863)
+
+test draw_par_n10000_b0.5_c0.0 ... bench:    50170797 ns/iter (+/- 4218359)
+
+test draw_par_n10000_b0.5_c0.5 ... bench:    48919409 ns/iter (+/- 2001221)
+
+test draw_par_n10000_b0.5_c1.0 ... bench:    55997871 ns/iter (+/- 6104967)
+
+test draw_par_n10000_b0.5_c2.0 ... bench:    48849053 ns/iter (+/- 1765208)
+
+test draw_par_n10000_b1.0_c0.0 ... bench:      384682 ns/iter (+/- 36237)
+
+test draw_par_n10000_b1.0_c0.5 ... bench:      381933 ns/iter (+/- 7549)
+
+test draw_par_n10000_b1.0_c1.0 ... bench:      391329 ns/iter (+/- 37588)
+
+test draw_par_n10000_b1.0_c2.0 ... bench:      404138 ns/iter (+/- 21902)
+
+test draw_par_n10000_b5.0_c0.0 ... bench:     1522504 ns/iter (+/- 527864)
+
+test draw_par_n10000_b5.0_c0.5 ... bench:     1568799 ns/iter (+/- 85393)
+
+test draw_par_n10000_b5.0_c1.0 ... bench:     1571369 ns/iter (+/- 137200)
+
+test draw_par_n10000_b5.0_c2.0 ... bench:     1735384 ns/iter (+/- 123038)
+
+test draw_par_n10000_b10.0_c0.0 ... bench:     2761010 ns/iter (+/- 327748)
+
+test draw_par_n10000_b10.0_c0.5 ... bench:     2769966 ns/iter (+/- 209798)
+
+test draw_par_n10000_b10.0_c1.0 ... bench:     2737587 ns/iter (+/- 49751)
+
+test draw_par_n10000_b10.0_c2.0 ... bench:     2867469 ns/iter (+/- 316888)
+
