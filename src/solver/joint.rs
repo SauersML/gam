@@ -60,6 +60,7 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<GlmLikelih
         LinkFunction::Logit => Some(GlmLikelihoodFamily::BinomialLogit),
         LinkFunction::Probit => Some(GlmLikelihoodFamily::BinomialProbit),
         LinkFunction::CLogLog => Some(GlmLikelihoodFamily::BinomialCLogLog),
+        LinkFunction::Log => None,
         // Joint model currently carries only state-less LinkFunction.
         // SAS requires explicit (epsilon, log_delta) state for mathematically
         // correct integrated moments, so do not dispatch state-less SAS here.
@@ -83,6 +84,7 @@ fn joint_prediction_supported(link: LinkFunction) -> Result<(), EstimationError>
 fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
     match link {
         LinkFunction::Identity => eta,
+        LinkFunction::Log => eta.clamp(-700.0, 700.0).exp(),
         LinkFunction::Logit => {
             let e = eta.clamp(-700.0, 700.0);
             1.0 / (1.0 + (-e).exp())
@@ -102,7 +104,7 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
 fn seed_risk_profile_for_joint_link(link: LinkFunction) -> SeedRiskProfile {
     match link {
         LinkFunction::Identity => SeedRiskProfile::Gaussian,
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+        LinkFunction::Log | LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
             SeedRiskProfile::GeneralizedLinear
         }
         LinkFunction::Sas | LinkFunction::BetaLogistic => SeedRiskProfile::GeneralizedLinear,
@@ -1880,6 +1882,7 @@ impl<'a> JointRemlState<'a> {
     > {
         use crate::estimate::reml::unified::{
             DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder, PenaltyLogdetDerivs,
+            embed_penalty_root, penalty_matrix_root,
         };
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
@@ -1909,6 +1912,7 @@ impl<'a> JointRemlState<'a> {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
+                    LinkFunction::Log => LikelihoodFamily::PoissonLog,
                     LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
@@ -2120,42 +2124,15 @@ impl<'a> JointRemlState<'a> {
         let mut penalty_roots: Vec<Array2<f64>> = Vec::with_capacity(k);
         for rs in base_rs_list.iter() {
             // Embed base penalty root into joint space: [R_k | 0]
-            let rank_k = rs.nrows();
-            let mut joint_root = Array2::zeros((rank_k, p_total));
-            joint_root.slice_mut(ndarray::s![.., ..p_base]).assign(rs);
-            penalty_roots.push(joint_root);
+            penalty_roots.push(embed_penalty_root(rs, 0, p_base, p_total));
         }
         // Link penalty root (if present).
         if p_link > 0 && k > n_base_penalties {
-            // Simple Cholesky-like root of link penalty.
-            match link_penalty.eigh(Side::Lower) {
-                Ok((eigs, vecs)) => {
-                    let tol = 1e-12;
-                    let mut rank_entries = Vec::new();
-                    for j in 0..eigs.len() {
-                        if eigs[j] > tol {
-                            rank_entries.push(j);
-                        }
-                    }
-                    let rank_k = rank_entries.len();
-                    let mut link_root = Array2::zeros((rank_k, p_total));
-                    for (row, &j) in rank_entries.iter().enumerate() {
-                        let scale = eigs[j].sqrt();
-                        for col in 0..p_link {
-                            link_root[[row, p_base + col]] = scale * vecs[[col, j]];
-                        }
-                    }
-                    penalty_roots.push(link_root);
-                }
-                Err(_) => {
-                    // Fallback: identity-like root
-                    let mut link_root = Array2::zeros((p_link, p_total));
-                    for j in 0..p_link {
-                        link_root[[j, p_base + j]] = 1.0;
-                    }
-                    penalty_roots.push(link_root);
-                }
-            }
+            let link_root = penalty_matrix_root(&link_penalty).unwrap_or_else(|_| {
+                // Fallback: identity-like root
+                Array2::eye(p_link)
+            });
+            penalty_roots.push(embed_penalty_root(&link_root, p_base, p_base + p_link, p_total));
         }
 
         // Concatenated beta.
@@ -2617,6 +2594,8 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         rho_bound: 30.0,
         heuristic_lambdas: heuristic_lambdas,
         initial_rho: None,
+        fallback_sequence: Vec::new(),
+        coordinate_search: None,
     };
 
     let mut obj = ClosureObjective {

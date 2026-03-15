@@ -4626,6 +4626,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 rho_bound: 30.0,
                 heuristic_lambdas: Some(init.to_vec()),
                 initial_rho: None,
+                fallback_sequence: Vec::new(),
+                coordinate_search: None,
             };
             let mut obj = ClosureObjective {
                 state: (),
@@ -7606,136 +7608,7 @@ fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,
     label: &str,
 ) -> Result<(), String> {
-    for linear in &spec.linear_terms {
-        if let (Some(min), Some(max)) = (linear.coefficient_min, linear.coefficient_max)
-            && (!min.is_finite() || !max.is_finite() || min > max)
-        {
-            return Err(format!(
-                "{label} linear term '{}' has invalid coefficient constraint [{min}, {max}]",
-                linear.name
-            ));
-        }
-        if let Some(min) = linear.coefficient_min
-            && !min.is_finite()
-        {
-            return Err(format!(
-                "{label} linear term '{}' has non-finite coefficient minimum {min}",
-                linear.name
-            ));
-        }
-        if let Some(max) = linear.coefficient_max
-            && !max.is_finite()
-        {
-            return Err(format!(
-                "{label} linear term '{}' has non-finite coefficient maximum {max}",
-                linear.name
-            ));
-        }
-        if let LinearCoefficientGeometry::Bounded { min, max, prior } = &linear.coefficient_geometry
-        {
-            if !min.is_finite() || !max.is_finite() || min >= max {
-                return Err(format!(
-                    "{label} bounded term '{}' has invalid bounds [{min}, {max}]",
-                    linear.name
-                ));
-            }
-            match prior {
-                BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
-                BoundedCoefficientPriorSpec::Beta { a, b } => {
-                    if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
-                        return Err(format!(
-                            "{label} bounded term '{}' has invalid Beta prior ({a}, {b})",
-                            linear.name
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for st in &spec.smooth_terms {
-        match &st.basis {
-            SmoothBasisSpec::BSpline1D { spec, .. } => {
-                if !matches!(spec.knotspec, BSplineKnotSpec::Provided(_)) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: BSpline knotspec must be Provided",
-                        st.name
-                    ));
-                }
-            }
-            SmoothBasisSpec::ThinPlate { spec, .. } => {
-                if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: ThinPlate centers must be UserProvided",
-                        st.name
-                    ));
-                }
-                if matches!(
-                    spec.identifiability,
-                    SpatialIdentifiability::OrthogonalToParametric
-                ) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: ThinPlate identifiability must be FrozenTransform or None",
-                        st.name
-                    ));
-                }
-            }
-            SmoothBasisSpec::Matern { spec, .. } => {
-                if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: Matern centers must be UserProvided",
-                        st.name
-                    ));
-                }
-            }
-            SmoothBasisSpec::Duchon { spec, .. } => {
-                if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: Duchon centers must be UserProvided",
-                        st.name
-                    ));
-                }
-                if matches!(
-                    spec.identifiability,
-                    SpatialIdentifiability::OrthogonalToParametric
-                ) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
-                        st.name
-                    ));
-                }
-            }
-            SmoothBasisSpec::TensorBSpline { spec, .. } => {
-                for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
-                    if !matches!(marginal.knotspec, BSplineKnotSpec::Provided(_)) {
-                        return Err(format!(
-                            "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided",
-                            st.name, dim
-                        ));
-                    }
-                }
-                if matches!(
-                    spec.identifiability,
-                    TensorBSplineIdentifiability::SumToZero
-                ) {
-                    return Err(format!(
-                        "{label} term '{}' is not frozen: tensor identifiability must be FrozenTransform or None",
-                        st.name
-                    ));
-                }
-            }
-        }
-    }
-
-    for rt in &spec.random_effect_terms {
-        if rt.frozen_levels.is_none() {
-            return Err(format!(
-                "{label} random-effect term '{}' is not frozen: missing frozen_levels",
-                rt.name
-            ));
-        }
-    }
-
-    Ok(())
+    spec.validate_frozen(label)
 }
 
 fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
@@ -9203,13 +9076,14 @@ fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
 fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
     match v.trim() {
         "identity" => Ok(LinkFunction::Identity),
+        "log" => Ok(LinkFunction::Log),
         "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
         "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
         "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
         "sas" => Ok(LinkFunction::Sas),
         "beta-logistic" => Ok(LinkFunction::BetaLogistic),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+            "unsupported --link '{other}'; use identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
         )),
     }
 }
@@ -9217,6 +9091,7 @@ fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
 fn linkname(link: LinkFunction) -> &'static str {
     match link {
         LinkFunction::Identity => "identity",
+        LinkFunction::Log => "log",
         LinkFunction::Logit => "logit",
         LinkFunction::Probit => "probit",
         LinkFunction::CLogLog => "cloglog",

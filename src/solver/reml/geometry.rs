@@ -18,6 +18,7 @@ impl<'a> RemlState<'a> {
             // engine instead, where joint block curvature is handled explicitly.
             LinkFunction::Identity => SparseExactLikelihoodStructure::GaussianProfiledScale,
             LinkFunction::Logit
+            | LinkFunction::Log
             | LinkFunction::Probit
             | LinkFunction::CLogLog
             | LinkFunction::Sas

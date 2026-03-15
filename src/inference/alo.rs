@@ -90,6 +90,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
     // Compute dispersion parameter.
     let phi = match link {
+        LinkFunction::Log => 1.0,
         LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog

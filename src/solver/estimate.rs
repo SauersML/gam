@@ -28,7 +28,11 @@ use std::fmt;
 use std::time::Instant;
 
 // Crate-level imports
-use crate::construction::compute_penalty_square_roots;
+use crate::construction::{
+    ReparamInvariant, compute_penalty_square_roots, create_balanced_penalty_root,
+    precompute_reparam_invariant,
+};
+use crate::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
@@ -43,15 +47,19 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState, SasLinkState,
+    Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
+    RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
 // faer: high-performance dense solvers
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
+use crate::faer_ndarray::{
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_atb,
+};
 use faer::{MatRef, Side};
+use rayon::prelude::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -1563,6 +1571,8 @@ where
             rho_bound: crate::estimate::RHO_BOUND,
             heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
             initial_rho: None,
+            fallback_sequence: Vec::new(),
+            coordinate_search: None,
         };
 
         let mut obj = ClosureObjective {
@@ -1669,6 +1679,8 @@ where
             rho_bound: crate::estimate::RHO_BOUND,
             heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
             initial_rho: None,
+            fallback_sequence: Vec::new(),
+            coordinate_search: None,
         };
         let mut obj = ClosureObjective {
             state: &mut reml_state,
@@ -2203,12 +2215,16 @@ where
                     crate::hmc::NutsFamily::Gaussian
                 }
                 crate::types::LikelihoodFamily::BinomialLogit
-                | crate::types::LikelihoodFamily::BinomialProbit
-                | crate::types::LikelihoodFamily::BinomialCLogLog
                 | crate::types::LikelihoodFamily::BinomialSas
                 | crate::types::LikelihoodFamily::BinomialBetaLogistic
                 | crate::types::LikelihoodFamily::BinomialMixture => {
                     crate::hmc::NutsFamily::BinomialLogit
+                }
+                crate::types::LikelihoodFamily::BinomialProbit => {
+                    crate::hmc::NutsFamily::BinomialProbit
+                }
+                crate::types::LikelihoodFamily::BinomialCLogLog => {
+                    crate::hmc::NutsFamily::BinomialCLogLog
                 }
                 crate::types::LikelihoodFamily::PoissonLog => crate::hmc::NutsFamily::PoissonLog,
                 crate::types::LikelihoodFamily::GammaLog => crate::hmc::NutsFamily::GammaLog,
@@ -2411,6 +2427,7 @@ where
             (weighted_rss / denom).sqrt()
         }
         LinkFunction::Logit
+        | LinkFunction::Log
         | LinkFunction::Probit
         | LinkFunction::CLogLog
         | LinkFunction::Sas

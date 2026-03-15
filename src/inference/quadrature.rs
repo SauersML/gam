@@ -1925,6 +1925,14 @@ pub fn integrated_inverse_link_mean_and_derivative(
     // mathematics local to one module instead of leaking into PIRLS or
     // prediction code.
     match link {
+        LinkFunction::Log => {
+            let mean = (mu + 0.5 * sigma * sigma).exp();
+            Ok(IntegratedMeanDerivative {
+                mean,
+                dmean_dmu: mean,
+                mode: IntegratedExpectationMode::ExactClosedForm,
+            })
+        }
         LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
         // The in-repo logit special-function backend is useful as a research
         // implementation and local oracle, but it is not yet uniformly accurate
@@ -1965,6 +1973,16 @@ pub fn integrated_inverse_link_jet(
     sigma: f64,
 ) -> Result<IntegratedInverseLinkJet, EstimationError> {
     match link {
+        LinkFunction::Log => {
+            let mean = (mu + 0.5 * sigma * sigma).exp();
+            Ok(IntegratedInverseLinkJet {
+                mean,
+                d1: mean,
+                d2: mean,
+                d3: mean,
+                mode: IntegratedExpectationMode::ExactClosedForm,
+            })
+        }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
         LinkFunction::Logit => Ok(integrated_logit_jet_ghq(quadctx, mu, sigma)),
         LinkFunction::CLogLog => Ok(integrated_cloglog_jet_ghq(quadctx, mu, sigma)),

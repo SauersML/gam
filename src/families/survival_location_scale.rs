@@ -1938,6 +1938,9 @@ fn assign_symmetric_block(
 
 fn validate_predict_inverse_link(inverse_link: &InverseLink) -> Result<(), String> {
     match inverse_link {
+        InverseLink::Standard(LinkFunction::Log) => Err(
+            "prediction does not support Standard(Log) for survival models".to_string(),
+        ),
         InverseLink::Standard(LinkFunction::Sas) => Err(
             "prediction requires explicit SasLinkState; state-less Standard(Sas) is unsupported"
                 .to_string(),
@@ -1972,6 +1975,9 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
             (-e.exp()).exp().clamp(0.0, 1.0)
         }
         InverseLink::Standard(LinkFunction::Identity) => (1.0 - eta).clamp(0.0, 1.0),
+        InverseLink::Standard(LinkFunction::Log) => {
+            panic!("state-less log inverse link is invalid for survival prediction")
+        }
         InverseLink::Sas(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
             inverse_link_survival_prob_checked(inverse_link, eta)
                 .expect("validated inverse link should evaluate during prediction")

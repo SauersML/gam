@@ -3267,8 +3267,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
                 .to_string(),
         );
     }
-    // Generic fallback: single-block only. Build the per-block Hessian as the
-    // "joint" system and route through the unified evaluator.
+    // Generic fallback: single-block only. Extract the per-block unpenalized
+    // Hessian and route through joint_outer_evaluate — the same unified path
+    // used by the multi-block exact Newton and surrogate paths.
     assert!(
         specs.len() == 1,
         "generic fallback path requires exactly one block"
@@ -3278,7 +3279,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     let work = &eval.blockworking_sets[b];
     let p = spec.design.ncols();
     let mut diagonal_design = None::<DesignMatrix>;
-    let xtwx = match work {
+    let h_joint_unpen = match work {
         BlockWorkingSet::Diagonal {
             working_response: _,
             working_weights,
@@ -3305,28 +3306,9 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         }
     };
 
-    let lambdas = per_block[b].mapv(f64::exp);
-    let mut s_lambda = Array2::<f64>::zeros((p, p));
-    for (k, s_pen) in spec.penalties.iter().enumerate() {
-        s_lambda.scaled_add(lambdas[k], s_pen);
-    }
-
-    let mut h_mode = xtwx;
-    h_mode += &s_lambda;
-    if moderidge > 0.0 {
-        for d in 0..p {
-            h_mode[[d, d]] += moderidge;
-        }
-    }
-    let mut h_for_logdet = h_mode.clone();
-    if !strict_spd && extra_logdet_ridge > 0.0 {
-        for d in 0..p {
-            h_for_logdet[[d, d]] += extra_logdet_ridge;
-        }
-    }
+    let beta = &inner.block_states[b].beta;
 
     // Build a derivative provider that computes D_β H_L[direction] on demand.
-    let beta = &inner.block_states[b].beta;
     let compute_dh = |direction: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
         if !include_logdet_h {
             return Ok(None);
@@ -3415,49 +3397,32 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         }
     };
 
-    let provider = BorrowedJointDerivProvider {
-        compute_dh: &compute_dh,
-        compute_d2h: None,
-    };
+    // No d²H provider for the generic single-block fallback.
+    let compute_d2h =
+        |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
 
-    // Route through unified evaluator: build InnerSolution for this single block.
-    let (objective, grad, _) = {
-        let per_block_single = vec![per_block[b].clone()];
-        let ranges_single = vec![(0usize, p)];
-        unified_joint_cost_gradient(
-            &inner,
-            &[spec.clone()],
-            &per_block_single,
-            rho,
-            beta,
-            &h_for_logdet,
-            &ranges_single,
-            p,
-            ridge,
-            include_logdet_h,
-            include_logdet_s,
-            options,
-            Box::new(provider),
-            EvalMode::ValueAndGradient,
-            None, // no ext_coords for single-block fallback
-        )?
-    };
-
-    let warm = ConstrainedWarmStart {
-        rho: rho.clone(),
-        block_beta: inner
-            .block_states
-            .iter()
-            .map(|st| st.beta.clone())
-            .collect(),
-        active_sets: inner.active_sets.clone(),
-    };
-    Ok(OuterObjectiveEvalResult {
-        objective,
-        gradient: grad,
-        outer_hessian: None,
-        warm_start: warm,
-    })
+    // Route through joint_outer_evaluate — same unified path as the multi-block case.
+    joint_outer_evaluate(
+        &inner,
+        specs,
+        &per_block,
+        rho,
+        beta,
+        h_joint_unpen,
+        &ranges,
+        total,
+        ridge,
+        moderidge,
+        extra_logdet_ridge,
+        include_logdet_h,
+        include_logdet_s,
+        strict_spd,
+        need_hessian,
+        options,
+        &compute_dh,
+        &compute_d2h,
+        None, // no ext_coords for single-block fallback
+    )
 }
 
 fn outerobjectivegradienthessian<F: CustomFamily>(
@@ -4157,40 +4122,44 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         .into());
     }
 
+    // ── Common setup: inner solve, ridge, refresh, ranges ──
+    let include_logdet_h = include_exact_newton_logdet_h(family);
+    let include_logdet_s = include_exact_newton_logdet_s(family, options);
+    let strict_spd = use_exact_newton_strict_spd(family);
+    let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
+    let mut inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        options,
+        warm_start.map(|w| &w.inner),
+    )?;
+    let ridge = effective_solverridge(options.ridge_floor);
+    let moderidge = if options.ridge_policy.include_quadratic_penalty {
+        ridge
+    } else {
+        0.0
+    };
+    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
+        && !options.ridge_policy.include_quadratic_penalty
+    {
+        ridge
+    } else {
+        0.0
+    };
+
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+
+    // ── Try to obtain a joint Hessian and route through the unified evaluator ──
+    //
+    // When psi_dim > 0, exact Newton is required because the ψ derivative
+    // callbacks use exact Newton trait methods. When psi_dim == 0,
+    // build_joint_hessian_closures handles both exact Newton and surrogate.
     if psi_dim > 0 {
-        // ── Unified path: evaluate ρ + ψ together via the unified evaluator ──
-        //
-        // 1. Inner solve (PIRLS).
-        let include_logdet_h = include_exact_newton_logdet_h(family);
-        let include_logdet_s = include_exact_newton_logdet_s(family, options);
-        let strict_spd = use_exact_newton_strict_spd(family);
-        let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
-        let mut inner = inner_blockwise_fit(
-            family,
-            specs,
-            &per_block,
-            options,
-            warm_start.map(|w| &w.inner),
-        )?;
-        let ridge = effective_solverridge(options.ridge_floor);
-        let moderidge = if options.ridge_policy.include_quadratic_penalty {
-            ridge
-        } else {
-            0.0
-        };
-        let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
-            && !options.ridge_policy.include_quadratic_penalty
-        {
-            ridge
-        } else {
-            0.0
-        };
-
-        refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-        let ranges = block_param_ranges(specs);
-        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-
-        // 2. Joint exact-Newton Hessian (required for ψ evaluation).
+        // ψ coordinates present: require exact Newton Hessian for consistency
+        // with the psi derivative callbacks.
         let h_joint_unpen = exact_newton_joint_hessian_symmetrized(
             family,
             &inner.block_states,
@@ -4208,7 +4177,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         let synced_joint_states =
             synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
 
-        // 3. Compute S⁺⁻¹ (penalty pseudo-inverse) for the ψ builders.
+        // Compute S⁺⁻¹ (penalty pseudo-inverse) for the ψ builders.
         let s_pinv_joint = if include_logdet_s {
             let mut sp = Array2::<f64>::zeros((total, total));
             for (b, spec) in specs.iter().enumerate() {
@@ -4240,7 +4209,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             None
         };
 
-        // 4. Build ψ HyperCoords, pair callbacks, and drift derivative callback.
+        // Build ψ HyperCoords, pair callbacks, and drift derivative callback.
         let is_gaussian =
             family.exact_newton_outerobjective() == ExactNewtonOuterObjective::QuadraticReml;
 
@@ -4282,11 +4251,11 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             drift_fn,
         };
 
-        // 5. Build derivative provider for the ρ coordinates (D_β H[v]).
+        // Build derivative provider for the ρ coordinates (D_β H[v]).
         let compute_dh = exact_newton_dh_closure(family, &synced_joint_states, specs, total);
         let compute_d2h = exact_newton_d2h_closure(family, &synced_joint_states, specs, total);
 
-        // 6. Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
+        // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
         let eval_result = joint_outer_evaluate(
             &inner,
             specs,
@@ -4322,30 +4291,221 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         });
     }
 
-    // ── ρ-only path (psi_dim == 0): no extended coordinates needed ──
-    let result = outerobjectivegradienthessian_internal(
-        family,
+    // ── ρ-only path (psi_dim == 0): route through unified evaluator ──
+    //
+    // Try build_joint_hessian_closures which handles both exact Newton and
+    // surrogate Hessian sources, then call joint_outer_evaluate with no
+    // extended coordinates.
+    if let Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)) =
+        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+    {
+        let eval_result = joint_outer_evaluate(
+            &inner,
+            specs,
+            &per_block,
+            rho_current,
+            &beta_flat,
+            h_joint_unpen,
+            &ranges,
+            total,
+            ridge,
+            moderidge,
+            extra_logdet_ridge,
+            include_logdet_h,
+            include_logdet_s,
+            strict_spd,
+            need_hessian,
+            options,
+            &compute_dh,
+            &compute_d2h,
+            None, // no ext_coords when psi_dim == 0
+        )?;
+
+        return Ok(CustomFamilyJointHyperResult {
+            objective: eval_result.objective,
+            gradient: eval_result.gradient,
+            outer_hessian: eval_result.outer_hessian,
+            warm_start: CustomFamilyWarmStart {
+                inner: eval_result.warm_start,
+            },
+        });
+    }
+
+    // Joint Hessian unavailable via either exact Newton or surrogate.
+    // The generic fallback is only mathematically defensible for single-block
+    // families — multi-block families with coupled likelihood curvature require
+    // the joint path.
+    if family.requires_joint_outer_hyper_path() {
+        return Err(
+            "outer hyper-derivative evaluation requires a joint exact path for this family"
+                .to_string()
+                .into(),
+        );
+    }
+
+    // Generic fallback: single-block only. Extract the per-block Hessian and
+    // route through joint_outer_evaluate with the single block as the "joint"
+    // system.
+    assert!(
+        specs.len() == 1,
+        "generic fallback path requires exactly one block"
+    );
+    let eval = family.evaluate(&inner.block_states)?;
+    let b = 0;
+    let spec = &specs[b];
+    let work = &eval.blockworking_sets[b];
+    let p = spec.design.ncols();
+    let mut diagonal_design = None::<DesignMatrix>;
+    let h_joint_unpen = match work {
+        BlockWorkingSet::Diagonal {
+            working_response: _,
+            working_weights,
+        } => with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
+            let w = floor_positiveworking_weights(working_weights, options.minweight);
+            let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+            diagonal_design = Some(x_dyn.clone());
+            Ok(xtwx)
+        })?,
+        BlockWorkingSet::ExactNewton {
+            gradient: _,
+            hessian,
+        } => {
+            if hessian.nrows() != p || hessian.ncols() != p {
+                return Err(format!(
+                    "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    p,
+                    p
+                ).into());
+            }
+            hessian.to_dense()
+        }
+    };
+
+    let beta_flat = inner.block_states[b].beta.clone();
+
+    // Build a derivative provider that computes D_β H_L[direction] on demand.
+    let compute_dh = |direction: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+        if !include_logdet_h {
+            return Ok(None);
+        }
+        match work {
+            BlockWorkingSet::ExactNewton { .. } => {
+                match family.exact_newton_hessian_directional_derivative(
+                    &inner.block_states,
+                    b,
+                    direction,
+                )? {
+                    Some(h_exact) => Ok(Some(symmetrized_square_matrix(
+                        h_exact,
+                        p,
+                        &format!("block {b} exact-newton dH shape mismatch"),
+                    )?)),
+                    None => Err(format!(
+                        "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
+                    )),
+                }
+            }
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => {
+                let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                    format!("missing dynamic design for block {b} diagonal correction")
+                })?;
+                let wwork = floor_positiveworking_weights(working_weights, options.minweight);
+                let x_dense = x_dyn.to_dense();
+                let n = x_dense.nrows();
+
+                let mut d_eta = x_dyn.matrixvectormultiply(direction);
+                let geom = family.block_geometry_directional_derivative(
+                    &inner.block_states,
+                    b,
+                    spec,
+                    direction,
+                )?;
+                let mut correction_mat = Array2::<f64>::zeros((p, p));
+
+                if let Some(geom_dir) = geom {
+                    d_eta += &geom_dir.d_offset;
+                    if let Some(dx) = geom_dir.d_design {
+                        d_eta += &dx.dot(&beta_flat);
+                        let mut wx = x_dense.clone();
+                        let mut wdx = dx.clone();
+                        for i in 0..n {
+                            let wi = wwork[i];
+                            if wi != 1.0 {
+                                wx.row_mut(i).mapv_inplace(|v| v * wi);
+                                wdx.row_mut(i).mapv_inplace(|v| v * wi);
+                            }
+                        }
+                        correction_mat += &dx.t().dot(&wx);
+                        correction_mat += &x_dense.t().dot(&wdx);
+                    }
+                }
+
+                let dw = family
+                    .diagonalworking_weights_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        &d_eta,
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "missing diagonal dW callback for block {b} while REML gradient requires H_beta term"
+                        )
+                    })?;
+                if dw.len() != n {
+                    return Err(format!(
+                        "block {b} diagonal dW length mismatch: got {}, expected {}",
+                        dw.len(),
+                        n
+                    ));
+                }
+                let mut scaled_x = x_dense.clone();
+                for i in 0..n {
+                    scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
+                }
+                correction_mat += &x_dense.t().dot(&scaled_x);
+
+                Ok(Some(correction_mat))
+            }
+        }
+    };
+
+    // No d²H provider for the generic single-block fallback.
+    let compute_d2h =
+        |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
+
+    let eval_result = joint_outer_evaluate(
+        &inner,
         specs,
-        options,
-        &penalty_counts,
+        &per_block,
         rho_current,
-        warm_start.map(|w| &w.inner),
+        &beta_flat,
+        h_joint_unpen,
+        &ranges,
+        total,
+        ridge,
+        moderidge,
+        extra_logdet_ridge,
+        include_logdet_h,
+        include_logdet_s,
+        strict_spd,
         need_hessian,
+        options,
+        &compute_dh,
+        &compute_d2h,
+        None, // no ext_coords for generic single-block fallback
     )?;
 
-    let mut gradient = Array1::<f64>::zeros(rho_dim);
-    gradient.assign(&result.gradient);
-
     Ok(CustomFamilyJointHyperResult {
-        objective: result.objective,
-        gradient,
-        outer_hessian: if need_hessian {
-            result.outer_hessian
-        } else {
-            None
-        },
+        objective: eval_result.objective,
+        gradient: eval_result.gradient,
+        outer_hessian: eval_result.outer_hessian,
         warm_start: CustomFamilyWarmStart {
-            inner: result.warm_start,
+            inner: eval_result.warm_start,
         },
     })
 }
@@ -4790,6 +4950,8 @@ pub fn fit_custom_family<F: CustomFamily>(
         rho_bound: 30.0,
         heuristic_lambdas: None,
         initial_rho: Some(rho0.clone()),
+        fallback_sequence: Vec::new(),
+        coordinate_search: None,
     };
 
     let hessian_deriv = if force_efs_for_wiggle {
