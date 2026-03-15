@@ -1,5 +1,5 @@
 use gam::estimate::{
-    BlockRole, FitArtifacts, FitResult, FittedBlock, FittedLinkState, UnifiedFitResultParts,
+    BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
 };
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::pirls::PirlsStatus;
@@ -7,8 +7,8 @@ use gam::types::{LikelihoodFamily, LinkFunction, SasLinkState};
 use ndarray::{Array1, Array2};
 use tempfile::tempdir;
 
-fn minimal_fit_result(fitted_link_parameters: FittedLinkState) -> FitResult {
-    FitResult::try_from_parts(UnifiedFitResultParts {
+fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
+    UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: Array1::from_vec(vec![0.0]),
             role: BlockRole::Mean,
@@ -28,7 +28,7 @@ fn minimal_fit_result(fitted_link_parameters: FittedLinkState) -> FitResult {
         covariance_conditional: None,
         covariance_corrected: None,
         inference: None,
-        fitted_link: fitted_link_parameters,
+        fitted_link,
         geometry: None,
         block_states: Vec::new(),
         pirls_status: PirlsStatus::Converged,

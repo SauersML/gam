@@ -23,7 +23,7 @@ pub use families::survival;
 pub use families::survival_location_scale;
 
 pub use families::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, BlockwiseFitResultParts,
+    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResultParts,
     CustomFamily, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
     blockwise_fit_from_parts, fit_custom_family,
 };
@@ -39,16 +39,15 @@ pub use families::gamlss::{
     buildwiggle_block_input_from_seed, fit_binomial_location_scale,
     fit_binomial_location_scale_terms, fit_binomial_location_scale_termsworkflow,
     fit_binomial_location_scalewiggle, fit_binomial_location_scalewiggle_terms,
-    fit_binomial_location_scalewiggle_terms_auto, fit_binomial_mean_wiggle, fit_gamma_log,
-    fit_gaussian_location_scale, fit_gaussian_location_scale_terms, fit_poisson_log,
-    initializewiggle_knots_from_seed,
+    fit_binomial_location_scalewiggle_terms_auto, fit_binomial_mean_wiggle,
+    fit_gaussian_location_scale, fit_gaussian_location_scale_terms,
 };
 pub use families::strategy::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
 };
 pub use families::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
-    ResidualDistributionOps, SurvivalLocationScaleFitResult, SurvivalLocationScaleFitResultParts,
+    ResidualDistributionOps, SurvivalLocationScaleFitResultParts,
     SurvivalLocationScalePredictInput, SurvivalLocationScalePredictResult,
     SurvivalLocationScalePredictUncertaintyResult, SurvivalLocationScaleSpec, TimeBlockInput,
     TimeDependentCovariateBlockInput, fit_survival_location_scale, predict_survival_location_scale,
@@ -76,8 +75,8 @@ pub use inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, ModelKind, SchemaColumn,
 };
 pub use solver::estimate::{
-    BlockRole, CoefficientUncertaintyResult, FitArtifacts, FitGeometry, FitOptions, FitResult,
-    FitResultParts, FittedBlock, FittedLinkParameters, FittedLinkState, InferenceCovarianceMode, MeanIntervalMethod,
+    BlockRole, CoefficientUncertaintyResult, FitArtifacts, FitGeometry, FitOptions,
+    FittedBlock, FittedLinkState, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     UnifiedFitResult, UnifiedFitResultParts, coefficient_uncertainty,
     coefficient_uncertaintywith_mode,
@@ -106,7 +105,7 @@ pub use terms::smooth::{
     build_term_collection_design, fit_term_collection,
     fit_term_collectionwith_matern_kappa_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization, optimize_two_block_matern_kappa,
-    optimize_two_block_spatial_length_scale,
+    optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_bfgs,
     get_spatial_aniso_log_scales, get_spatial_length_scale,
     log_spatial_aniso_scales,
 };

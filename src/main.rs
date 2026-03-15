@@ -1751,7 +1751,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             return result;
         }
         // predictor() returned None (e.g. missing UnifiedFitResult) — fall
-        // through to model-specific paths which can use the legacy FitResult.
+        // through to model-specific paths which can use the legacy path.
     }
 
     // ── Special-case dispatch ──────────────────────────────────────────────
@@ -7370,25 +7370,7 @@ impl SavedFitSummary {
     }
 }
 
-fn ensure_finite_scalar(name: &str, value: f64) -> Result<(), String> {
-    if value.is_finite() {
-        Ok(())
-    } else {
-        Err(format!("{name} must be finite, got {value}"))
-    }
-}
-
-fn validate_all_finite<I>(label: &str, values: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = f64>,
-{
-    for (idx, v) in values.into_iter().enumerate() {
-        if !v.is_finite() {
-            return Err(format!("{label}[{idx}] must be finite, got {v}"));
-        }
-    }
-    Ok(())
-}
+use gam::estimate::{ensure_finite_scalar, validate_all_finite};
 
 fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::MixtureLinkState> {
     match &fit.fitted_link {
@@ -10280,7 +10262,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
         covariance_conditional,
         covariance_corrected,
         inference: ext.inference,
-        fitted_link: ext.fitted_link_parameters,
+        fitted_link: ext.fitted_link,
         geometry,
         block_states: Vec::new(),
         pirls_status: ext.pirls_status,

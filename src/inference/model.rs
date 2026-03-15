@@ -834,25 +834,7 @@ fn array2_to_nestedvec(a: &ndarray::Array2<f64>) -> Vec<Vec<f64>> {
     a.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
-fn ensure_finite_scalar(name: &str, value: f64) -> Result<(), String> {
-    if value.is_finite() {
-        Ok(())
-    } else {
-        Err(format!("{name} must be finite, got {value}"))
-    }
-}
-
-fn validate_all_finite<I>(label: &str, values: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = f64>,
-{
-    for (idx, v) in values.into_iter().enumerate() {
-        if !v.is_finite() {
-            return Err(format!("{label}[{idx}] must be finite, got {v}"));
-        }
-    }
-    Ok(())
-}
+use crate::solver::estimate::{ensure_finite_scalar, validate_all_finite};
 
 fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,

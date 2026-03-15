@@ -669,9 +669,6 @@ struct ConstrainedWarmStart {
     active_sets: Vec<Option<Vec<usize>>>,
 }
 
-/// Type alias: the old `BlockwiseFitResult` is now `UnifiedFitResult`.
-pub type BlockwiseFitResult = crate::solver::estimate::UnifiedFitResult;
-
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
 pub struct BlockwiseFitResultParts {
     pub block_states: Vec<ParameterBlockState>,
@@ -722,11 +719,10 @@ fn validate_lambda_pair_consistency(
     Ok(())
 }
 
-/// Build a `BlockwiseFitResult` (= `UnifiedFitResult`) from blockwise-specific
-/// fields.
+/// Build a `UnifiedFitResult` from blockwise-specific fields.
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<crate::solver::estimate::UnifiedFitResult, String> {
     let BlockwiseFitResultParts {
         block_states,
         log_likelihood,
@@ -742,7 +738,7 @@ pub fn blockwise_fit_from_parts(
     } = parts;
 
     if block_states.is_empty() {
-        return Err("BlockwiseFitResult requires at least one block state".to_string());
+        return Err("blockwise fit requires at least one block state".to_string());
     }
     ensure_finite_scalar_estimation("blockwise_fit.log_likelihood", log_likelihood)
         .map_err(|e| e.to_string())?;
@@ -4706,7 +4702,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, CustomFamilyError> {
+) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     let rho0 = flatten_log_lambdas(specs);
 
