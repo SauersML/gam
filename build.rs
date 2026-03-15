@@ -109,6 +109,11 @@ struct PlaceholderStubCollector {
     file_content: String,
 }
 
+struct DegenerateBooleanCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -823,6 +828,42 @@ impl PlaceholderStubCollector {
             .push_str("   These exist solely to satisfy the compiler without doing actual work.\n");
         error_msg
             .push_str("   Implement the function properly instead of using empty placeholders.\n");
+
+        Some(error_msg)
+    }
+}
+
+impl DegenerateBooleanCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let filename = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} degenerate boolean composites in {}:\n",
+            self.violations.len(),
+            filename
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Tautological, contradictory, or trivially reducible boolean composites are forbidden.\n",
+        );
+        error_msg.push_str(
+            "   These patterns often exist only to fake-use variables or hide dead logic.\n",
+        );
+        error_msg.push_str("   Rewrite the condition directly or delete it.\n");
 
         Some(error_msg)
     }
@@ -1621,6 +1662,16 @@ fn main() {
     );
     emit_stage_detail(&fake_usage_report);
     allviolations.extend(fake_usageviolations);
+
+    update_stage("scan degenerate boolean composites");
+    let degenerate_booleanviolations = scan_for_degenerate_boolean_expressions();
+    let degenerate_boolean_report = format!(
+        "degenerate boolean scan identified {} violation groups",
+        degenerate_booleanviolations.len()
+    );
+    emit_stage_detail(&degenerate_boolean_report);
+    allviolations.extend(degenerate_booleanviolations);
+
     // Scan for #[allow(clippy::no_effect)] attributes
     update_stage("scan #[allow(clippy::no_effect)] attributes");
     let no_effectviolations = scan_for_no_effect_allow();
@@ -3575,6 +3626,617 @@ fn scan_for_fake_usage() -> Vec<String> {
     allviolations
 }
 
+fn scan_for_degenerate_boolean_expressions() -> Vec<String> {
+    let mut allviolations = Vec::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !is_in_ignored_directory(e.path()))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let source = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        let mut collector = DegenerateBooleanCollector::new(path);
+        collector
+            .violations
+            .extend(find_degenerate_boolean_expressions(&source));
+
+        if let Some(error_message) = collector.check_and_get_error_message() {
+            allviolations.push(error_message);
+        }
+    }
+
+    allviolations
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BooleanJoin {
+    Or,
+    And,
+}
+
+impl BooleanJoin {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Or => "||",
+            Self::And => "&&",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComparisonOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl ComparisonOp {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredicateKind {
+    Some,
+    None,
+    Ok,
+    Err,
+}
+
+impl PredicateKind {
+    fn is_complement_of(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Some, Self::None)
+                | (Self::None, Self::Some)
+                | (Self::Ok, Self::Err)
+                | (Self::Err, Self::Ok)
+        )
+    }
+}
+
+struct BooleanMacroTarget {
+    line_number: usize,
+    macro_name: &'static str,
+    expression: String,
+}
+
+struct ParsedBoolAtom {
+    raw: String,
+    negated_inner: Option<String>,
+    comparison: Option<ParsedComparison>,
+    predicate: Option<ParsedPredicate>,
+}
+
+struct ParsedComparison {
+    left: String,
+    op: ComparisonOp,
+    right: String,
+}
+
+struct ParsedPredicate {
+    subject: String,
+    kind: PredicateKind,
+}
+
+fn find_degenerate_boolean_expressions(source: &str) -> Vec<String> {
+    let sanitized_bytes = strip_comments_and_strings_for_content(source);
+    let sanitized = String::from_utf8_lossy(&sanitized_bytes);
+    let mut violations = Vec::new();
+
+    for target in collect_boolean_macro_targets(&sanitized) {
+        let Some(reason) = analyze_degenerate_boolean_expression(&target.expression) else {
+            continue;
+        };
+
+        let snippet = truncate_for_display(&collapse_whitespace(&target.expression), 160);
+        violations.push(format!(
+            "{}:{}({}) -> {}",
+            target.line_number, target.macro_name, snippet, reason
+        ));
+    }
+
+    violations
+}
+
+fn collect_boolean_macro_targets(source: &str) -> Vec<BooleanMacroTarget> {
+    let mut targets = Vec::new();
+    collect_macro_first_argument_targets(source, "assert!", &mut targets);
+    collect_macro_first_argument_targets(source, "debug_assert!", &mut targets);
+    targets
+}
+
+fn collect_macro_first_argument_targets(
+    source: &str,
+    macro_name: &'static str,
+    targets: &mut Vec<BooleanMacroTarget>,
+) {
+    let bytes = source.as_bytes();
+    let pattern = macro_name.as_bytes();
+    let mut idx = 0usize;
+
+    while idx + pattern.len() <= bytes.len() {
+        if &bytes[idx..idx + pattern.len()] != pattern {
+            idx += 1;
+            continue;
+        }
+
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            idx += 1;
+            continue;
+        }
+
+        let mut cursor = idx + pattern.len();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        if cursor >= bytes.len() || !matches!(bytes[cursor], b'(' | b'[' | b'{') {
+            idx += 1;
+            continue;
+        }
+
+        let Some(close_idx) = find_matching_delimiter(bytes, cursor) else {
+            idx += 1;
+            continue;
+        };
+
+        let arg_start = cursor + 1;
+        let arg_end = find_first_top_level_comma(bytes, arg_start, close_idx).unwrap_or(close_idx);
+        let expression = source[arg_start..arg_end].trim();
+        if !expression.is_empty() {
+            let line_number = 1 + bytes[..idx].iter().filter(|&&b| b == b'\n').count();
+            targets.push(BooleanMacroTarget {
+                line_number,
+                macro_name,
+                expression: expression.to_string(),
+            });
+        }
+
+        idx = close_idx + 1;
+    }
+}
+
+fn analyze_degenerate_boolean_expression(expression: &str) -> Option<String> {
+    analyze_degenerate_boolean_expression_inner(expression, 0)
+}
+
+fn analyze_degenerate_boolean_expression_inner(expression: &str, depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+
+    let stripped = strip_outer_groups(expression);
+
+    for join in [BooleanJoin::Or, BooleanJoin::And] {
+        let clauses = split_top_level_boolean(stripped, join);
+        if clauses.len() <= 1 {
+            continue;
+        }
+
+        let atoms: Vec<ParsedBoolAtom> = clauses
+            .iter()
+            .map(|clause| parse_bool_atom(clause))
+            .collect();
+        for left_idx in 0..atoms.len() {
+            for right_idx in left_idx + 1..atoms.len() {
+                if let Some(reason) =
+                    diagnose_boolean_pair(join, &atoms[left_idx], &atoms[right_idx])
+                {
+                    return Some(reason);
+                }
+            }
+        }
+
+        for clause in clauses {
+            if let Some(reason) = analyze_degenerate_boolean_expression_inner(clause, depth + 1) {
+                return Some(reason);
+            }
+        }
+
+        return None;
+    }
+
+    let without_negation = strip_leading_negation(stripped)?;
+    analyze_degenerate_boolean_expression_inner(without_negation, depth + 1)
+}
+
+fn diagnose_boolean_pair(
+    join: BooleanJoin,
+    left: &ParsedBoolAtom,
+    right: &ParsedBoolAtom,
+) -> Option<String> {
+    if left.raw == right.raw {
+        return Some(format!(
+            "duplicate clause repeated on both sides of `{}`",
+            join.symbol()
+        ));
+    }
+
+    if left.negated_inner.as_deref() == Some(right.raw.as_str())
+        || right.negated_inner.as_deref() == Some(left.raw.as_str())
+    {
+        return Some(match join {
+            BooleanJoin::Or => "boolean complement pair is always true".to_string(),
+            BooleanJoin::And => "boolean complement pair can never be true".to_string(),
+        });
+    }
+
+    if let (Some(left_predicate), Some(right_predicate)) = (&left.predicate, &right.predicate) {
+        if left_predicate.subject == right_predicate.subject
+            && left_predicate.kind.is_complement_of(right_predicate.kind)
+        {
+            return Some(match join {
+                BooleanJoin::Or => "complementary predicate pair is always true".to_string(),
+                BooleanJoin::And => "complementary predicate pair can never be true".to_string(),
+            });
+        }
+    }
+
+    let (Some(left_comparison), Some(right_comparison)) = (&left.comparison, &right.comparison)
+    else {
+        return None;
+    };
+
+    let Some((left_operand, right_operand)) =
+        shared_comparison_operands(left_comparison, right_comparison)
+    else {
+        return None;
+    };
+
+    let result_mask = match join {
+        BooleanJoin::Or => {
+            comparison_mask(left_comparison.op) | comparison_mask(right_comparison.op)
+        }
+        BooleanJoin::And => {
+            comparison_mask(left_comparison.op) & comparison_mask(right_comparison.op)
+        }
+    };
+
+    if result_mask == 0 {
+        return Some("comparison pair can never be true".to_string());
+    }
+    if result_mask == 0b111 {
+        return Some("comparison pair is always true".to_string());
+    }
+
+    let equivalent_op = comparison_from_mask(result_mask)?;
+    let equivalent = format_comparison_expression(&left_operand, equivalent_op, &right_operand);
+    Some(format!("comparison pair collapses to `{equivalent}`"))
+}
+
+fn parse_bool_atom(expression: &str) -> ParsedBoolAtom {
+    let stripped = strip_outer_groups(expression);
+    let raw = normalize_boolean_text(stripped);
+    let negated_inner = strip_leading_negation(stripped).map(normalize_boolean_text);
+    let comparison = parse_comparison(stripped);
+    let predicate = parse_complementary_predicate(&raw);
+
+    ParsedBoolAtom {
+        raw,
+        negated_inner,
+        comparison,
+        predicate,
+    }
+}
+
+fn parse_comparison(expression: &str) -> Option<ParsedComparison> {
+    let stripped = strip_outer_groups(expression);
+    let bytes = stripped.as_bytes();
+    let mut stack = Vec::new();
+    let mut idx = 0usize;
+    let mut found: Option<(usize, ComparisonOp, usize)> = None;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'(' | b'[' | b'{' => {
+                stack.push(bytes[idx]);
+                idx += 1;
+                continue;
+            }
+            b')' | b']' | b'}' => {
+                if stack.pop().is_none() {
+                    return None;
+                }
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if !stack.is_empty() {
+            idx += 1;
+            continue;
+        }
+
+        let candidate = if bytes[idx..].starts_with(b"==") {
+            Some((ComparisonOp::Eq, 2))
+        } else if bytes[idx..].starts_with(b"!=") {
+            Some((ComparisonOp::Ne, 2))
+        } else if bytes[idx..].starts_with(b"<=") {
+            Some((ComparisonOp::Le, 2))
+        } else if bytes[idx..].starts_with(b">=") {
+            Some((ComparisonOp::Ge, 2))
+        } else if bytes[idx] == b'<' {
+            Some((ComparisonOp::Lt, 1))
+        } else if bytes[idx] == b'>' {
+            Some((ComparisonOp::Gt, 1))
+        } else {
+            None
+        };
+
+        let Some((op, width)) = candidate else {
+            idx += 1;
+            continue;
+        };
+
+        if found.is_some() {
+            return None;
+        }
+
+        found = Some((idx, op, width));
+        idx += width;
+    }
+
+    let (operator_idx, operator, operator_width) = found?;
+    let left = normalize_boolean_text(&stripped[..operator_idx]);
+    let right = normalize_boolean_text(&stripped[operator_idx + operator_width..]);
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+
+    Some(ParsedComparison {
+        left,
+        op: operator,
+        right,
+    })
+}
+
+fn parse_complementary_predicate(normalized_expression: &str) -> Option<ParsedPredicate> {
+    const PREDICATE_SUFFIXES: [(&str, PredicateKind); 4] = [
+        (".is_some()", PredicateKind::Some),
+        (".is_none()", PredicateKind::None),
+        (".is_ok()", PredicateKind::Ok),
+        (".is_err()", PredicateKind::Err),
+    ];
+
+    for (suffix, kind) in PREDICATE_SUFFIXES {
+        let Some(subject) = normalized_expression.strip_suffix(suffix) else {
+            continue;
+        };
+        if subject.is_empty() {
+            continue;
+        }
+        return Some(ParsedPredicate {
+            subject: subject.to_string(),
+            kind,
+        });
+    }
+
+    None
+}
+
+fn shared_comparison_operands(
+    left: &ParsedComparison,
+    right: &ParsedComparison,
+) -> Option<(String, String)> {
+    if left.left == right.left && left.right == right.right {
+        return Some((left.left.clone(), left.right.clone()));
+    }
+
+    if matches!(left.op, ComparisonOp::Eq | ComparisonOp::Ne)
+        && matches!(right.op, ComparisonOp::Eq | ComparisonOp::Ne)
+        && left.left == right.right
+        && left.right == right.left
+    {
+        return if left.left <= left.right {
+            Some((left.left.clone(), left.right.clone()))
+        } else {
+            Some((left.right.clone(), left.left.clone()))
+        };
+    }
+
+    None
+}
+
+fn comparison_mask(operator: ComparisonOp) -> u8 {
+    match operator {
+        ComparisonOp::Eq => 0b010,
+        ComparisonOp::Ne => 0b101,
+        ComparisonOp::Lt => 0b001,
+        ComparisonOp::Le => 0b011,
+        ComparisonOp::Gt => 0b100,
+        ComparisonOp::Ge => 0b110,
+    }
+}
+
+fn comparison_from_mask(mask: u8) -> Option<ComparisonOp> {
+    match mask {
+        0b001 => Some(ComparisonOp::Lt),
+        0b010 => Some(ComparisonOp::Eq),
+        0b011 => Some(ComparisonOp::Le),
+        0b100 => Some(ComparisonOp::Gt),
+        0b101 => Some(ComparisonOp::Ne),
+        0b110 => Some(ComparisonOp::Ge),
+        _ => None,
+    }
+}
+
+fn format_comparison_expression(left: &str, operator: ComparisonOp, right: &str) -> String {
+    format!("{left} {} {right}", operator.symbol())
+}
+
+fn split_top_level_boolean(expression: &str, join: BooleanJoin) -> Vec<&str> {
+    let bytes = expression.as_bytes();
+    let mut parts = Vec::new();
+    let mut stack = Vec::new();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let symbol = join.symbol().as_bytes();
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'(' | b'[' | b'{' => stack.push(bytes[idx]),
+            b')' | b']' | b'}' => {
+                let _ = stack.pop();
+            }
+            _ => {}
+        }
+
+        if stack.is_empty()
+            && idx + symbol.len() <= bytes.len()
+            && &bytes[idx..idx + symbol.len()] == symbol
+        {
+            parts.push(expression[start..idx].trim());
+            start = idx + symbol.len();
+            idx += symbol.len();
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    if start == 0 {
+        return vec![expression.trim()];
+    }
+
+    parts.push(expression[start..].trim());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
+fn strip_outer_groups(mut expression: &str) -> &str {
+    loop {
+        let trimmed = expression.trim();
+        let bytes = trimmed.as_bytes();
+        if bytes.len() < 2 || !matches!(bytes[0], b'(' | b'[' | b'{') {
+            return trimmed;
+        }
+
+        let Some(close_idx) = find_matching_delimiter(bytes, 0) else {
+            return trimmed;
+        };
+        if close_idx != bytes.len() - 1 {
+            return trimmed;
+        }
+
+        expression = &trimmed[1..trimmed.len() - 1];
+    }
+}
+
+fn strip_leading_negation(expression: &str) -> Option<&str> {
+    let trimmed = expression.trim_start();
+    let remainder = trimmed.strip_prefix('!')?;
+    Some(strip_outer_groups(remainder))
+}
+
+fn normalize_boolean_text(expression: &str) -> String {
+    strip_outer_groups(expression)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut collapsed = String::new();
+    let mut saw_whitespace = false;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            saw_whitespace = true;
+            continue;
+        }
+
+        if saw_whitespace && !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        saw_whitespace = false;
+        collapsed.push(ch);
+    }
+
+    collapsed
+}
+
+fn truncate_for_display(text: &str, max_len: usize) -> String {
+    let mut truncated = String::new();
+    for ch in text.chars() {
+        if truncated.len() + ch.len_utf8() > max_len {
+            truncated.push_str("...");
+            return truncated;
+        }
+        truncated.push(ch);
+    }
+    truncated
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn find_matching_delimiter(bytes: &[u8], open_idx: usize) -> Option<usize> {
+    let mut stack = Vec::new();
+
+    for (offset, byte) in bytes.iter().enumerate().skip(open_idx) {
+        match *byte {
+            b'(' | b'[' | b'{' => stack.push(*byte),
+            b')' | b']' | b'}' => {
+                let open = stack.pop()?;
+                if !delimiters_match(open, *byte) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn delimiters_match(open: u8, close: u8) -> bool {
+    matches!((open, close), (b'(', b')') | (b'[', b']') | (b'{', b'}'))
+}
+
+fn find_first_top_level_comma(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut idx = start;
+
+    while idx < end {
+        match bytes[idx] {
+            b'(' | b'[' | b'{' => stack.push(bytes[idx]),
+            b')' | b']' | b'}' => {
+                if stack.pop().is_none() {
+                    return None;
+                }
+            }
+            b',' if stack.is_empty() => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
 struct FakeUsageCandidateCollector {
     candidates: Vec<(String, u64, String)>, // var_raw, line_num, line_text
 }
@@ -4054,6 +4716,58 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
             eprintln!("{msg}");
         } else {
             allviolations.push(msg);
+        }
+    }
+
+    allviolations
+}
+
+/// Enforce that `use opt::` imports only appear in strategy.rs and opt_objective.rs.
+/// All optimizer access must go through `run_outer` in strategy.rs.
+fn scan_for_direct_opt_imports() -> Vec<String> {
+    let allowed_files: &[&str] = &["src/solver/strategy.rs", "src/solver/opt_objective.rs"];
+    let mut allviolations = Vec::new();
+
+    for entry in WalkDir::new("src")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+
+        if allowed_files
+            .iter()
+            .any(|allowed| path_str.ends_with(allowed))
+        {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut violation_lines = Vec::new();
+        for (line_num, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            // Skip comments
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            if trimmed.contains("use opt::") {
+                violation_lines.push(format!("  line {}: {}", line_num + 1, trimmed));
+            }
+        }
+
+        if !violation_lines.is_empty() {
+            allviolations.push(format!(
+                "\n\u{274c} ERROR: Direct `use opt::` import in {}.\n\
+                 All optimizer access must go through `run_outer` in strategy.rs.\n\
+                 {}\n",
+                path.display(),
+                violation_lines.join("\n"),
+            ));
         }
     }
 

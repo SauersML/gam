@@ -1924,7 +1924,9 @@ impl ImplicitDesignPsiDerivative {
         // Step 2: pad with polynomial zeros.
         let p_padded = constrained.len() + self.n_poly;
         let mut padded = Array1::<f64>::zeros(p_padded);
-        padded.slice_mut(s![..constrained.len()]).assign(&constrained);
+        padded
+            .slice_mut(s![..constrained.len()])
+            .assign(&constrained);
 
         // Step 3: apply full identifiability transform (if present).
         match &self.full_ident_transform {
@@ -1973,9 +1975,7 @@ impl ImplicitDesignPsiDerivative {
         let af = &self.axis_fractions;
         let qv = &self.q_values;
 
-        let raw = self.accumulate_knot_vector(v, |idx| {
-            qv[idx] * af[[idx, axis]]
-        });
+        let raw = self.accumulate_knot_vector(v, |idx| qv[idx] * af[[idx, axis]]);
 
         self.project_and_pad(&raw)
     }
@@ -2072,8 +2072,7 @@ impl ImplicitDesignPsiDerivative {
             let base = i * k;
             for j in 0..k {
                 let s = self.axis_fractions[[base + j, axis]];
-                raw[[i, j]] = 2.0 * self.q_values[base + j] * s
-                    + self.t_values[base + j] * s * s;
+                raw[[i, j]] = 2.0 * self.q_values[base + j] * s + self.t_values[base + j] * s * s;
             }
         }
 
@@ -2115,9 +2114,8 @@ impl ImplicitDesignPsiDerivative {
         assert_eq!(v.len(), self.n);
         let af = &self.axis_fractions;
         let tv = &self.t_values;
-        let raw = self.accumulate_knot_vector(v, |idx| {
-            tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]
-        });
+        let raw =
+            self.accumulate_knot_vector(v, |idx| tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]);
         self.project_and_pad(&raw)
     }
 
@@ -4039,45 +4037,41 @@ fn build_matern_operator_penalty_aniso_derivatives(
     struct PerOperatorInfo {
         s_raw: Array2<f64>,
         c: f64,
-        s_first: Vec<Array2<f64>>,     // per-axis first derivatives (normalized)
-        s_second: Vec<Array2<f64>>,     // per-axis second derivatives (normalized)
-        s_first_raw: Vec<Array2<f64>>,  // per-axis first derivatives (raw, for cross normalization)
+        s_first: Vec<Array2<f64>>, // per-axis first derivatives (normalized)
+        s_second: Vec<Array2<f64>>, // per-axis second derivatives (normalized)
+        s_first_raw: Vec<Array2<f64>>, // per-axis first derivatives (raw, for cross normalization)
     }
 
-    let compute_operator_info =
-        |d_op: &Array2<f64>,
-         d_eta_all: &[Array2<f64>],
-         d_eta2_all: &[Array2<f64>]|
-         -> PerOperatorInfo {
-            // Compute the raw Gram and its norm (same for all axes).
-            let s_raw = symmetrize(&fast_ata(d_op));
-            let fro2: f64 = s_raw.iter().map(|v| v * v).sum();
-            let c = fro2.sqrt();
+    let compute_operator_info = |d_op: &Array2<f64>,
+                                 d_eta_all: &[Array2<f64>],
+                                 d_eta2_all: &[Array2<f64>]|
+     -> PerOperatorInfo {
+        // Compute the raw Gram and its norm (same for all axes).
+        let s_raw = symmetrize(&fast_ata(d_op));
+        let fro2: f64 = s_raw.iter().map(|v| v * v).sum();
+        let c = fro2.sqrt();
 
-            let mut s_first = Vec::with_capacity(dim);
-            let mut s_second = Vec::with_capacity(dim);
-            let mut s_first_raw = Vec::with_capacity(dim);
-            for a in 0..dim {
-                let (_, sa, sa2) = gram_and_psi_derivatives_from_operator(
-                    d_op,
-                    &d_eta_all[a],
-                    &d_eta2_all[a],
-                );
-                let (_, sa_norm, sa2_norm, _) =
-                    normalize_penaltywith_psi_derivatives(&s_raw, &sa, &sa2);
-                s_first_raw.push(sa);
-                s_first.push(sa_norm);
-                s_second.push(sa2_norm);
-            }
+        let mut s_first = Vec::with_capacity(dim);
+        let mut s_second = Vec::with_capacity(dim);
+        let mut s_first_raw = Vec::with_capacity(dim);
+        for a in 0..dim {
+            let (_, sa, sa2) =
+                gram_and_psi_derivatives_from_operator(d_op, &d_eta_all[a], &d_eta2_all[a]);
+            let (_, sa_norm, sa2_norm, _) =
+                normalize_penaltywith_psi_derivatives(&s_raw, &sa, &sa2);
+            s_first_raw.push(sa);
+            s_first.push(sa_norm);
+            s_second.push(sa2_norm);
+        }
 
-            PerOperatorInfo {
-                s_raw,
-                c,
-                s_first,
-                s_second,
-                s_first_raw,
-            }
-        };
+        PerOperatorInfo {
+            s_raw,
+            c,
+            s_first,
+            s_second,
+            s_first_raw,
+        }
+    };
 
     let op0_info = compute_operator_info(&d0, &d0_eta_all, &d0_eta2_all);
     let op1_info = compute_operator_info(&d1, &d1_eta_all, &d1_eta2_all);
@@ -4166,13 +4160,12 @@ fn build_matern_operator_penalty_aniso_derivatives(
     for (ci_idx, &(a, b)) in cross_pairs.iter().enumerate() {
         // For each operator, compute the raw cross Gram derivative and normalize.
         let compute_cross_for_op = |op_info: &PerOperatorInfo,
-                                     d_op: &Array2<f64>,
-                                     d_a: &Array2<f64>,
-                                     d_b: &Array2<f64>,
-                                     d_ab: &Array2<f64>|
+                                    d_op: &Array2<f64>,
+                                    d_a: &Array2<f64>,
+                                    d_b: &Array2<f64>,
+                                    d_ab: &Array2<f64>|
          -> Array2<f64> {
-            let s_ab_raw =
-                gram_cross_psi_derivative_from_operator(d_op, d_a, d_b, d_ab);
+            let s_ab_raw = gram_cross_psi_derivative_from_operator(d_op, d_a, d_b, d_ab);
             normalize_penalty_cross_psi_derivative(
                 &op_info.s_raw,
                 &op_info.s_first_raw[a],
@@ -4292,8 +4285,9 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     }
     let mut d0_raw_eta_cross: Vec<Array2<f64>> =
         (0..num_cross).map(|_| Array2::zeros((p, z_cols))).collect();
-    let mut d1_raw_eta_cross: Vec<Array2<f64>> =
-        (0..num_cross).map(|_| Array2::zeros((p * d, z_cols))).collect();
+    let mut d1_raw_eta_cross: Vec<Array2<f64>> = (0..num_cross)
+        .map(|_| Array2::zeros((p * d, z_cols)))
+        .collect();
     let mut d2_raw_eta_cross: Vec<Array2<f64>> =
         (0..num_cross).map(|_| Array2::zeros((p, z_cols))).collect();
 
@@ -4396,8 +4390,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
                         let d1_eta2_val = if r > 1e-14 {
                             if a == b {
-                                w_b * h_b
-                                    * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
+                                w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
                             } else {
                                 w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
                             }
@@ -4442,8 +4435,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                         //   ∂t_r/∂ψ_a = d2t_dr2·s_a/r,  ∂(s_a/r)/∂ψ_a = s_a/r·(2 - s_a/r²)
                         //   product rule => d2t_dr2·s_a²/r² + dt_dr·s_a/r·(2 - s_a/r²)
                         let r2 = r * r;
-                        let d_dt_sa_r =
-                            d2t_dr2 * s_a2 / r2 + dt_dr * s_a / r * (2.0 - s_a / r2);
+                        let d_dt_sa_r = d2t_dr2 * s_a2 / r2 + dt_dr * s_a / r * (2.0 - s_a / r2);
 
                         // ∂T1/∂ψ_a = d_dt_sa_r · W₂ + dt_sa_r · 4·w_a·s_a
                         let dt1 = d_dt_sa_r * sum_wb_sb + dt_sa_r * 4.0 * w_a * s_a;
@@ -4515,19 +4507,16 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                         //   ∂t_r/∂ψ_b = d2t_dr2·s_b/r,
                         //   ∂(s_a/r)/∂ψ_b = -s_a·s_b/r³
                         //   => d2t_dr2·s_a·s_b/r² - dt_dr·s_a·s_b/r³
-                        let d_dt_sa_r_b =
-                            d2t_dr2 * s_a * s_b / r2 - dt_dr * s_a * s_b / (r2 * r);
+                        let d_dt_sa_r_b = d2t_dr2 * s_a * s_b / r2 - dt_dr * s_a * s_b / (r2 * r);
 
                         // T1: ∂/∂ψ_b[dt_dr·s_a/r · W₂]
-                        let term1 =
-                            d_dt_sa_r_b * sum_wb_sb + dt_sa_r * 4.0 * w_b * s_b;
+                        let term1 = d_dt_sa_r_b * sum_wb_sb + dt_sa_r * 4.0 * w_b * s_b;
 
                         // T2: ∂/∂ψ_b[4·t·w_a·s_a] = 4·(dt_dr·s_b/r)·w_a·s_a
                         let term2 = 4.0 * dt_sb_r * w_a * s_a;
 
                         // T3: ∂/∂ψ_b[t·s_a·W₁] = dt_sb_r·s_a·W₁ + t·s_a·2·w_b
-                        let term3 =
-                            dt_sb_r * s_a * sum_metric_weights + t * s_a * 2.0 * w_b;
+                        let term3 = dt_sb_r * s_a * sum_metric_weights + t * s_a * 2.0 * w_b;
 
                         // T4: ∂/∂ψ_b[2·q·w_a] = 2·t·s_b·w_a
                         let term4 = 2.0 * t * s_b * w_a;
@@ -4553,10 +4542,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     }
 
     let compute_operator_info =
-        |d_op: &Array2<f64>,
-         d_eta: &[Array2<f64>],
-         d_eta2: &[Array2<f64>]|
-         -> PerOperatorInfo {
+        |d_op: &Array2<f64>, d_eta: &[Array2<f64>], d_eta2: &[Array2<f64>]| -> PerOperatorInfo {
             let s_raw = symmetrize(&fast_ata(d_op));
             let fro2: f64 = s_raw.iter().map(|v| v * v).sum();
             let c = fro2.sqrt();
@@ -4565,11 +4551,8 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             let mut s_second = Vec::with_capacity(dim);
             let mut s_first_raw = Vec::with_capacity(dim);
             for a in 0..dim {
-                let (_, sa, sa2) = gram_and_psi_derivatives_from_operator(
-                    d_op,
-                    &d_eta[a],
-                    &d_eta2[a],
-                );
+                let (_, sa, sa2) =
+                    gram_and_psi_derivatives_from_operator(d_op, &d_eta[a], &d_eta2[a]);
                 let (_, sa_norm, sa2_norm, _) =
                     normalize_penaltywith_psi_derivatives(&s_raw, &sa, &sa2);
                 s_first_raw.push(sa);
@@ -4657,13 +4640,12 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     let mut cross_results = Vec::with_capacity(num_cross);
     for (ci_idx, &(a, b)) in cross_pairs.iter().enumerate() {
         let compute_cross_for_op = |op_info: &PerOperatorInfo,
-                                     d_op: &Array2<f64>,
-                                     d_a: &Array2<f64>,
-                                     d_b: &Array2<f64>,
-                                     d_ab: &Array2<f64>|
+                                    d_op: &Array2<f64>,
+                                    d_a: &Array2<f64>,
+                                    d_b: &Array2<f64>,
+                                    d_ab: &Array2<f64>|
          -> Array2<f64> {
-            let s_ab_raw =
-                gram_cross_psi_derivative_from_operator(d_op, d_a, d_b, d_ab);
+            let s_ab_raw = gram_cross_psi_derivative_from_operator(d_op, d_a, d_b, d_ab);
             normalize_penalty_cross_psi_derivative(
                 &op_info.s_raw,
                 &op_info.s_first_raw[a],
@@ -7548,8 +7530,7 @@ fn build_matern_design_psi_aniso_derivatives(
                     for a in 0..dim {
                         center_buf[a] = centers[[j, a]];
                     }
-                    let (r, s_vec) =
-                        aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
                     let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
                     q_row[j] = q;
                     t_row[j] = t;
@@ -7628,8 +7609,7 @@ fn build_matern_design_psi_aniso_derivatives(
                     for a in 0..dim {
                         center_buf[a] = centers[[j, a]];
                     }
-                    let (r, s_vec) =
-                        aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
                     let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
                     t_row[j] = t;
                     // Design matrix ψ-derivatives using UNNORMALIZED s_a = exp(2ψ_a)·h_a²:
@@ -7670,8 +7650,7 @@ fn build_matern_design_psi_aniso_derivatives(
         };
 
         let kernel_first: Vec<_> = kernel_first.into_iter().map(&project).collect();
-        let kernel_second_diag: Vec<_> =
-            kernel_second_diag.into_iter().map(&project).collect();
+        let kernel_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&project).collect();
         let design_cross_t = project(t_raw);
 
         // Pad with intercept column (zero derivative for intercept).
@@ -7689,8 +7668,7 @@ fn build_matern_design_psi_aniso_derivatives(
         };
 
         let design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
-        let design_second_diag: Vec<_> =
-            kernel_second_diag.into_iter().map(&pad).collect();
+        let design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
         let design_cross_t = pad(design_cross_t);
         let s_components_projected: Vec<_> = s_components_raw
             .iter()
@@ -7806,8 +7784,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                     let ci_v: Vec<f64> = (0..dim).map(|ax| centers[[i, ax]]).collect();
                     for j_idx in i..k {
                         let cj_v: Vec<f64> = (0..dim).map(|ax| centers[[j_idx, ax]]).collect();
-                        let (r, s_vec) =
-                            aniso_distance_and_components(&ci_v, &cj_v, eta);
+                        let (r, s_vec) = aniso_distance_and_components(&ci_v, &cj_v, eta);
                         let (_, _, t_val) =
                             matern_aniso_radial_scalars(r, spec.length_scale, spec.nu)?;
                         let val = t_val * s_vec[a] * s_vec[b];
@@ -7925,7 +7902,9 @@ fn build_duchon_design_psi_aniso_derivatives(
     // Determine output dimension to decide dense vs implicit.
     let p_constrained = z_kernel.ncols();
     let p_padded = p_constrained + poly_cols;
-    let p_final = identifiability_transform.map(|zf| zf.ncols()).unwrap_or(p_padded);
+    let p_final = identifiability_transform
+        .map(|zf| zf.ncols())
+        .unwrap_or(p_padded);
 
     let use_implicit = should_use_implicit_operators(n, p_final, dim);
 
@@ -7952,10 +7931,8 @@ fn build_duchon_design_psi_aniso_derivatives(
                     for a in 0..dim {
                         center_buf[a] = centers[[j, a]];
                     }
-                    let (r, s_vec) =
-                        aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                    let jets =
-                        duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
                     q_row[j] = jets.q;
                     t_row[j] = jets.t;
                     for a in 0..dim {
@@ -8042,10 +8019,8 @@ fn build_duchon_design_psi_aniso_derivatives(
                     for a in 0..dim {
                         center_buf[a] = centers[[j, a]];
                     }
-                    let (r, s_vec) =
-                        aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                    let jets =
-                        duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
                     let q = jets.q;
                     let t = jets.t;
                     t_row[j] = t;
@@ -8097,8 +8072,7 @@ fn build_duchon_design_psi_aniso_derivatives(
         };
 
         let mut design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
-        let mut design_second_diag: Vec<_> =
-            kernel_second_diag.into_iter().map(&pad).collect();
+        let mut design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
         let mut design_cross_t = pad(design_cross_t);
         let mut s_components_projected: Vec<_> = s_components_raw
             .iter()
@@ -8107,10 +8081,7 @@ fn build_duchon_design_psi_aniso_derivatives(
 
         // Apply the full identifiability transform (if present).
         if let Some(zf) = identifiability_transform {
-            design_first = design_first
-                .into_iter()
-                .map(|m| fast_ab(&m, zf))
-                .collect();
+            design_first = design_first.into_iter().map(|m| fast_ab(&m, zf)).collect();
             design_second_diag = design_second_diag
                 .into_iter()
                 .map(|m| fast_ab(&m, zf))
@@ -8999,8 +8970,7 @@ fn duchon_phi_rrrrrr_collision(
             duchon_matern_block_triplet(r_p1, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
         let (_, _, d2_p2) =
             duchon_matern_block_triplet(r_p2, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let sixth_fd =
-            (d2_m2 - 4.0 * d2_m1 + 6.0 * d2_0 - 4.0 * d2_p1 + d2_p2) / h.powi(4);
+        let sixth_fd = (d2_m2 - 4.0 * d2_m1 + 6.0 * d2_0 - 4.0 * d2_p1 + d2_p2) / h.powi(4);
         phi_rrrrrr += b_n * sixth_fd;
     }
     phi_rrrrrr
@@ -14737,7 +14707,11 @@ mod tests {
 
         let jets_0 = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
-        assert!(jets_0.t_r.abs() < 1e-12, "expected t_r(0)=0, got {}", jets_0.t_r);
+        assert!(
+            jets_0.t_r.abs() < 1e-12,
+            "expected t_r(0)=0, got {}",
+            jets_0.t_r
+        );
         assert!(
             (jets_0.t_rr - t_rr_collision).abs() < 1e-12,
             "expected exact t_rr(0) collision limit, got {} vs {}",

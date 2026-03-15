@@ -749,11 +749,8 @@ pub fn blockwise_fit_from_parts(
     validate_lambda_pair_consistency(&log_lambdas, &lambdas, "blockwise_fit.lambdas")?;
     ensure_finite_scalar_estimation("blockwise_fit.penalized_objective", penalized_objective)
         .map_err(|e| e.to_string())?;
-    ensure_finite_scalar_estimation(
-        "blockwise_fit.outer_gradient_norm",
-        outer_gradient_norm,
-    )
-    .map_err(|e| e.to_string())?;
+    ensure_finite_scalar_estimation("blockwise_fit.outer_gradient_norm", outer_gradient_norm)
+        .map_err(|e| e.to_string())?;
 
     let n = block_states[0].eta.len();
     let total_p = block_states
@@ -810,9 +807,7 @@ pub fn blockwise_fit_from_parts(
     }
 
     // Build unified blocks from the blockwise states.
-    use crate::solver::estimate::{
-        BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts,
-    };
+    use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let blocks: Vec<FittedBlock> = block_states
         .iter()
         .enumerate()
@@ -4756,8 +4751,8 @@ pub fn fit_custom_family<F: CustomFamily>(
     // selects EFS for penalty-like coordinates — a multiplicative fixed-point
     // that avoids the fragile Hessian path entirely. Wiggle λ coordinates are
     // penalty-like (B-spline difference penalties), so EFS applies directly.
-    let force_efs_for_wiggle = include_exact_newton_logdet_h(family)
-        && family.known_link_wiggle().is_some();
+    let force_efs_for_wiggle =
+        include_exact_newton_logdet_h(family) && family.known_link_wiggle().is_some();
 
     use crate::estimate::EstimationError;
     use crate::solver::strategy::{
@@ -4948,12 +4943,18 @@ pub fn fit_custom_family<F: CustomFamily>(
                 hessian,
             })
         },
-        reset_fn: |outer: &mut CustomOuterState| {
+        reset_fn: Some(|outer: &mut CustomOuterState| {
             outer.warm_cache = None;
             outer.last_eval = None;
             outer.last_error = None;
-        },
-        efs_fn: None::<fn(&mut CustomOuterState, &Array1<f64>) -> Result<crate::solver::strategy::EfsEval, crate::estimate::EstimationError>>,
+        }),
+        efs_fn: None::<
+            fn(
+                &mut CustomOuterState,
+                &Array1<f64>,
+            )
+                -> Result<crate::solver::strategy::EfsEval, crate::estimate::EstimationError>,
+        >,
     };
 
     let outer_result = crate::solver::strategy::run_outer(&mut obj, &outer_config, "custom family");

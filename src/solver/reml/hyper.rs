@@ -1666,46 +1666,39 @@ impl<'a> RemlState<'a> {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-        let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
-        let rho = blocks.rho_owned();
+        let rho = theta.slice(s![..rho_dim]).to_owned();
 
-        // Primary path: route through the unified evaluator with ext_coords.
-        // This produces the joint [ρ, ψ] gradient and Hessian from a single
-        // InnerSolution + reml_laml_evaluate call, eliminating the duplicated
-        // piecewise directional code path.
         if !hyper_dirs.is_empty() {
-            let unified_result = self.evaluate_unified_with_psi_ext(
+            // Unified evaluator path: produces the joint [ρ, ψ] gradient and
+            // Hessian from a single InnerSolution + reml_laml_evaluate call.
+            let result = self.evaluate_unified_with_psi_ext(
                 &rho,
                 super::unified::EvalMode::ValueGradientHessian,
                 hyper_dirs,
+            )?;
+            let cost = result.cost;
+            let grad = result
+                .gradient
+                .unwrap_or_else(|| Array1::zeros(theta.len()));
+            let hess = result
+                .hessian
+                .unwrap_or_else(|| Array2::zeros((theta.len(), theta.len())));
+            log::trace!(
+                "[joint-hyper] unified evaluator: cost={:.6e}, grad_norm={:.4e}, hess_dim={}x{}",
+                cost,
+                grad.iter().map(|g| g * g).sum::<f64>().sqrt(),
+                hess.nrows(),
+                hess.ncols(),
             );
-
-            if let Ok(result) = unified_result {
-                let cost = result.cost;
-                let grad = result.gradient.unwrap_or_else(|| Array1::zeros(theta.len()));
-                let hess = result.hessian.unwrap_or_else(|| {
-                    Array2::zeros((theta.len(), theta.len()))
-                });
-                log::trace!(
-                    "[joint-hyper] unified evaluator: cost={:.6e}, grad_norm={:.4e}, hess_dim={}x{}",
-                    cost,
-                    grad.iter().map(|g| g * g).sum::<f64>().sqrt(),
-                    hess.nrows(),
-                    hess.ncols(),
-                );
-                return Ok((cost, grad, hess));
-            } else {
-                log::trace!(
-                    "[joint-hyper] unified evaluator failed, falling back to piecewise path"
-                );
-            }
+            Ok((cost, grad, hess))
+        } else {
+            // Rho-only path: no directional hyperparameters, use standard
+            // rho-only evaluators directly.
+            let cost = self.compute_cost(&rho)?;
+            let grad = self.compute_gradient(&rho)?;
+            let hess = self.compute_lamlhessian_exact(&rho)?;
+            Ok((cost, grad, hess))
         }
-
-        // Fallback: piecewise directional path (used when ext_coords are empty
-        // or when the unified path fails).
-        let (cost, grad) = self.compute_joint_hypercostgradient(theta, rho_dim, hyper_dirs)?;
-        let hess = self.compute_joint_hyperhessian(theta, rho_dim, hyper_dirs)?;
-        Ok((cost, grad, hess))
     }
 
     /// Build the extended-coordinate objects for τ (directional) hyperparameters
@@ -2252,8 +2245,8 @@ impl<'a> RemlState<'a> {
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
-            return Ok((0..psi_dim).map(|j| {
-                super::unified::HyperCoord {
+            return Ok((0..psi_dim)
+                .map(|j| super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
                     b_mat: Array2::zeros((0, 0)),
@@ -2261,8 +2254,8 @@ impl<'a> RemlState<'a> {
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
-                }
-            }).collect::<Vec<_>>());
+                })
+                .collect::<Vec<_>>());
         }
 
         // Working residual u = w ⊙ (z − η̂).
@@ -2397,23 +2390,22 @@ impl<'a> RemlState<'a> {
             // dominant terms and would require additional storage. For problems large
             // enough to trigger implicit operators, these corrections contribute
             // negligibly to the stochastic trace estimate.
-            let b_operator: Option<Box<dyn super::unified::HyperOperator>> =
-                if use_implicit {
-                    if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
-                        Some(Box::new(super::unified::ImplicitHyperOperator {
-                            implicit_deriv,
-                            axis,
-                            x_dense: x_dense_shared.clone().unwrap(),
-                            w_diag: w_diag_shared.clone().unwrap(),
-                            s_psi: s_tau_j.clone(),
-                            p: p_dim,
-                        }))
-                    } else {
-                        None
-                    }
+            let b_operator: Option<Box<dyn super::unified::HyperOperator>> = if use_implicit {
+                if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
+                    Some(Box::new(super::unified::ImplicitHyperOperator {
+                        implicit_deriv,
+                        axis,
+                        x_dense: x_dense_shared.clone().unwrap(),
+                        w_diag: w_diag_shared.clone().unwrap(),
+                        s_psi: s_tau_j.clone(),
+                        p: p_dim,
+                    }))
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
             // Materialize the dense B_j matrix. When b_operator is active, we use
             // a zero-sized placeholder since the unified evaluator checks
@@ -2429,11 +2421,8 @@ impl<'a> RemlState<'a> {
                     // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
                     let c_x_tau_beta = c_array * &x_tau_beta_j;
                     let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                    b_j += &Self::xt_diag_x_dense_into(
-                        x_dense,
-                        &c_x_tau_beta,
-                        &mut weighted_scratch,
-                    );
+                    b_j +=
+                        &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
                 }
 
                 // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
@@ -3217,8 +3206,7 @@ impl<'a> RemlState<'a> {
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
                 // Fisher weight derivative: ∂W_F/∂θ = ∂(h'²/V)/∂θ
-                let dw_fisher = wi
-                    * (numerator_param * variance - numerator * variance_param)
+                let dw_fisher = wi * (numerator_param * variance - numerator * variance_param)
                     / (variance * variance);
 
                 // Observed correction: W_obs = W_F − (y−μ)·B where
@@ -3229,7 +3217,7 @@ impl<'a> RemlState<'a> {
                 let h2 = jets.jet.d2;
                 let resid = yi - mu;
                 let v_prime = aux.variancemu_scale; // 1 − 2μ
-                let v_dprime = -2.0_f64;            // V''(μ) for binomial
+                let v_dprime = -2.0_f64; // V''(μ) for binomial
 
                 let b_num = h2 * variance - numerator * v_prime;
                 let var_sq = variance * variance;
@@ -3239,11 +3227,10 @@ impl<'a> RemlState<'a> {
                 //   dV/dθ  = V'·dμ/dθ
                 //   dV'/dθ = V''·dμ/dθ
                 //   d(b_num)/dθ = dd2·V + h''·dV − 2·h'·dd1·V' − h'²·dV'
-                let d_var = v_prime * dmu;     // dV/dθ
+                let d_var = v_prime * dmu; // dV/dθ
                 let d_vprime = v_dprime * dmu; // dV'/dθ
-                let db_num = dd2 * variance + h2 * d_var
-                    - 2.0 * d1 * dd1 * v_prime
-                    - numerator * d_vprime;
+                let db_num =
+                    dd2 * variance + h2 * d_var - 2.0 * d1 * dd1 * v_prime - numerator * d_vprime;
                 // Quotient rule: (db_num·V² − b_num·2V·dV) / V⁴
                 //              = (db_num − 2·B·dV) / V²
                 let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
@@ -3268,7 +3255,8 @@ impl<'a> RemlState<'a> {
             // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
             // Uses observed-information weight derivatives (not Fisher) for exact
             // REML/LAML with non-canonical links (SAS, beta-logistic).
-            let b_j = Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+            let b_j =
+                Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
 
             coords.push(super::unified::HyperCoord {
                 a: a_j,
@@ -3384,8 +3372,7 @@ impl<'a> RemlState<'a> {
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
                 // Fisher weight derivative: ∂W_F/∂θ = ∂(h'²/V)/∂θ
-                let dw_fisher = wi
-                    * (numerator_param * variance - numerator * variance_param)
+                let dw_fisher = wi * (numerator_param * variance - numerator * variance_param)
                     / (variance * variance);
 
                 // Observed correction: W_obs = W_F − (y−μ)·B where
@@ -3396,7 +3383,7 @@ impl<'a> RemlState<'a> {
                 let h2 = jet.d2;
                 let resid = yi - mu;
                 let v_prime = aux.variancemu_scale; // 1 − 2μ
-                let v_dprime = -2.0_f64;            // V''(μ) for binomial
+                let v_dprime = -2.0_f64; // V''(μ) for binomial
 
                 let b_num = h2 * variance - numerator * v_prime;
                 let var_sq = variance * variance;
@@ -3406,11 +3393,10 @@ impl<'a> RemlState<'a> {
                 //   dV/dθ  = V'·dμ/dθ
                 //   dV'/dθ = V''·dμ/dθ
                 //   d(b_num)/dθ = dd2·V + h''·dV − 2·h'·dd1·V' − h'²·dV'
-                let d_var = v_prime * dmu;     // dV/dθ
+                let d_var = v_prime * dmu; // dV/dθ
                 let d_vprime = v_dprime * dmu; // dV'/dθ
-                let db_num = dd2 * variance + h2 * d_var
-                    - 2.0 * d1 * dd1 * v_prime
-                    - numerator * d_vprime;
+                let db_num =
+                    dd2 * variance + h2 * d_var - 2.0 * d1 * dd1 * v_prime - numerator * d_vprime;
                 let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
 
                 dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
@@ -3428,7 +3414,8 @@ impl<'a> RemlState<'a> {
             // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
             // Uses observed-information weight derivatives (not Fisher) for exact
             // REML/LAML with non-canonical links (mixture/blended).
-            let b_j = Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+            let b_j =
+                Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
 
             coords.push(super::unified::HyperCoord {
                 a: a_j,

@@ -124,13 +124,20 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         let hessian_source = match forced {
             S::Arc => H::Analytic,
             S::NewtonTrustRegion => {
-                if cap.hessian == Analytic { H::Analytic } else { H::FiniteDifference }
+                if cap.hessian == Analytic {
+                    H::Analytic
+                } else {
+                    H::FiniteDifference
+                }
             }
             S::Bfgs => H::BfgsApprox,
             S::Efs => H::EfsFixedPoint,
             S::CoordinateSearch => H::None,
         };
-        return OuterPlan { solver: forced, hessian_source };
+        return OuterPlan {
+            solver: forced,
+            hessian_source,
+        };
     }
 
     match (cap.gradient, cap.hessian) {
@@ -155,12 +162,10 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // a quantitative check each step via `barrier_curvature_is_significant`
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
-        (_, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => {
-            OuterPlan {
-                solver: S::Efs,
-                hessian_source: H::EfsFixedPoint,
-            }
-        }
+        (_, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
+            solver: S::Efs,
+            hessian_source: H::EfsFixedPoint,
+        },
 
         // With many params, FD Hessian is too expensive; fall back to BFGS.
         (Analytic, Unavailable) => OuterPlan {
@@ -321,12 +326,19 @@ pub trait OuterObjective {
 /// This allows any call site to construct an `OuterObjective` from closures
 /// without needing to define a wrapper struct or modify the state type.
 /// Each call site wraps its existing methods into closures and passes them here.
-pub struct ClosureObjective<S, Fc, Fe, Fr, Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>> {
+pub struct ClosureObjective<
+    S,
+    Fc,
+    Fe,
+    Fr = fn(&mut S),
+    Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+> {
     pub state: S,
     pub cap: OuterCapability,
     pub cost_fn: Fc,
     pub eval_fn: Fe,
-    pub reset_fn: Fr,
+    /// Optional reset closure. When `None`, `reset()` is a no-op.
+    pub reset_fn: Option<Fr>,
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
     pub efs_fn: Option<Fefs>,
@@ -361,7 +373,9 @@ where
     }
 
     fn reset(&mut self) {
-        (self.reset_fn)(&mut self.state);
+        if let Some(f) = self.reset_fn.as_mut() {
+            f(&mut self.state);
+        }
     }
 }
 
@@ -500,9 +514,7 @@ pub fn run_outer(
     for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan(attempt_cap);
         if attempt_idx > 0 {
-            log::info!(
-                "[OUTER] {context}: primary plan failed; falling back to {the_plan}"
-            );
+            log::info!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
         }
         log_plan(context, attempt_cap, &the_plan);
 
@@ -524,9 +536,7 @@ pub fn run_outer(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        EstimationError::RemlOptimizationFailed(format!(
-            "all plan attempts exhausted ({context})"
-        ))
+        EstimationError::RemlOptimizationFailed(format!("all plan attempts exhausted ({context})"))
     }))
 }
 
@@ -676,24 +686,22 @@ fn run_outer_with_plan(
                             ));
                         }
                         let hessian = match hessian_source {
-                            HessianSource::Analytic => {
-                                match eval.hessian {
-                                    HessianResult::Analytic(h) => {
-                                        if h.iter().any(|v| !v.is_finite()) {
-                                            return Err(ObjectiveEvalError::recoverable(
-                                                "analytic Hessian contained non-finite values",
-                                            ));
-                                        }
-                                        Some(h)
+                            HessianSource::Analytic => match eval.hessian {
+                                HessianResult::Analytic(h) => {
+                                    if h.iter().any(|v| !v.is_finite()) {
+                                        return Err(ObjectiveEvalError::recoverable(
+                                            "analytic Hessian contained non-finite values",
+                                        ));
                                     }
-                                    HessianResult::Unavailable => {
-                                        log::debug!(
-                                            "[OUTER] analytic Hessian expected but unavailable; falling back to FD for this step"
-                                        );
-                                        None
-                                    }
+                                    Some(h)
                                 }
-                            }
+                                HessianResult::Unavailable => {
+                                    log::debug!(
+                                        "[OUTER] analytic Hessian expected but unavailable; falling back to FD for this step"
+                                    );
+                                    None
+                                }
+                            },
                             HessianSource::FiniteDifference => None,
                             HessianSource::BfgsApprox
                             | HessianSource::EfsFixedPoint
@@ -867,17 +875,13 @@ fn run_outer_with_plan(
                     let efs_eval = match obj.eval_efs(&rho) {
                         Ok(e) => e,
                         Err(e) => {
-                            log::debug!(
-                                "[OUTER] EFS iteration {iter} failed: {e}; using last rho"
-                            );
+                            log::debug!("[OUTER] EFS iteration {iter} failed: {e}; using last rho");
                             break;
                         }
                     };
 
                     if !efs_eval.cost.is_finite() {
-                        log::debug!(
-                            "[OUTER] EFS iteration {iter}: non-finite cost; stopping"
-                        );
+                        log::debug!("[OUTER] EFS iteration {iter}: non-finite cost; stopping");
                         break;
                     }
                     last_cost = efs_eval.cost;
@@ -886,9 +890,9 @@ fn run_outer_with_plan(
                         if let Some(ref beta) = efs_eval.beta {
                             let ref_diag = 1.0;
                             let threshold = 0.01;
-                            if barrier_cfg.barrier_curvature_is_significant(
-                                beta, ref_diag, threshold,
-                            ) {
+                            if barrier_cfg
+                                .barrier_curvature_is_significant(beta, ref_diag, threshold)
+                            {
                                 log::info!(
                                     "[OUTER] EFS iter {iter}: barrier curvature significant \
                                      (τ/(β-l)² > {threshold} × ref_diag); stopping EFS early"
@@ -939,13 +943,14 @@ fn run_outer_with_plan(
                     )
                 })?;
                 let (lo, hi) = &bounds_template;
-                run_coordinate_search(obj, seed, lo, hi, cs, cap.n_params)
-                    .map(|r| RawOuterCandidate {
+                run_coordinate_search(obj, seed, lo, hi, cs, cap.n_params).map(|r| {
+                    RawOuterCandidate {
                         rho: r.rho,
                         final_value: r.final_value,
                         iterations: r.iterations,
                         converged: true,
-                    })
+                    }
+                })
             }
         };
 
@@ -1001,9 +1006,7 @@ fn run_coordinate_search(
     );
 
     let mut current_theta = seed.clone();
-    let mut current_cost = obj
-        .eval_cost(&current_theta)
-        .unwrap_or(f64::INFINITY);
+    let mut current_cost = obj.eval_cost(&current_theta).unwrap_or(f64::INFINITY);
     let mut total_iters = 0_usize;
 
     for pass in 0..cs.max_coord_iters {
@@ -1035,7 +1038,8 @@ fn run_coordinate_search(
             if left_cost.is_finite() && right_cost.is_finite() {
                 let d_left = left_value - base_value;
                 let d_right = right_value - base_value;
-                if d_left.abs() > 1e-15 && d_right.abs() > 1e-15 && (d_left - d_right).abs() > 1e-15 {
+                if d_left.abs() > 1e-15 && d_right.abs() > 1e-15 && (d_left - d_right).abs() > 1e-15
+                {
                     let a_left = (left_cost - base_cost) / d_left;
                     let a_right = (right_cost - base_cost) / d_right;
                     let curvature = (a_left - a_right) / (d_left - d_right);
@@ -1075,8 +1079,8 @@ fn run_coordinate_search(
                 };
 
             loop {
-                let next_value = (cand_value + direction * cs.log_step)
-                    .clamp(lower[coord], upper[coord]);
+                let next_value =
+                    (cand_value + direction * cs.log_step).clamp(lower[coord], upper[coord]);
                 if (next_value - cand_value).abs() <= 1e-12 {
                     break;
                 }
@@ -1411,9 +1415,9 @@ mod tests {
                     hessian: HessianResult::Unavailable,
                 })
             },
-            reset_fn: |st: &mut i32| {
+            reset_fn: Some(|st: &mut i32| {
                 *st = 42;
-            },
+            }),
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         };
         assert_eq!(obj.capability().n_params, 1);

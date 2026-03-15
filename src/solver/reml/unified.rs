@@ -992,14 +992,12 @@ impl ImplicitHyperOperator {
     /// This method computes q_d = A_d z using the shared x_vec = X z:
     ///   q_d = (∂X/∂ψ_d)^T (W (X z)) + X^T (W ((∂X/∂ψ_d) z)) + S_psi z
     /// which is the standard mul_vec but we can share x_vec across axes.
-    pub fn matvec_with_shared_xz(
-        &self,
-        x_vec: &Array1<f64>,
-        z: &Array1<f64>,
-    ) -> Array1<f64> {
+    pub fn matvec_with_shared_xz(&self, x_vec: &Array1<f64>, z: &Array1<f64>) -> Array1<f64> {
         // Term 1: (∂X/∂ψ_d)^T (W · x_vec)
         let w_x_vec = &*self.w_diag * x_vec;
-        let term1 = self.implicit_deriv.transpose_mul(self.axis, &w_x_vec.view());
+        let term1 = self
+            .implicit_deriv
+            .transpose_mul(self.axis, &w_x_vec.view());
 
         // Term 2: X^T (W · ((∂X/∂ψ_d) · z))
         let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view());
@@ -1473,18 +1471,20 @@ pub fn reml_laml_evaluate(
 
     // When a barrier is active, wrap the inner derivative provider so that
     // dH/dρ and d²H/dρ² include barrier-Hessian correction terms.
-    let barrier_deriv_holder: Option<BarrierDerivativeProvider<'_>> =
-        if let Some(ref barrier_cfg) = solution.barrier_config {
-            match BarrierDerivativeProvider::new(&*solution.deriv_provider, barrier_cfg, &solution.beta) {
-                Ok(bdp) => Some(bdp),
-                Err(e) => {
-                    log::warn!("BarrierDerivativeProvider skipped (infeasible): {e}");
-                    None
-                }
+    let barrier_deriv_holder: Option<BarrierDerivativeProvider<'_>> = if let Some(ref barrier_cfg) =
+        solution.barrier_config
+    {
+        match BarrierDerivativeProvider::new(&*solution.deriv_provider, barrier_cfg, &solution.beta)
+        {
+            Ok(bdp) => Some(bdp),
+            Err(e) => {
+                log::warn!("BarrierDerivativeProvider skipped (infeasible): {e}");
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     let effective_deriv: &dyn HessianDerivativeProvider = match barrier_deriv_holder {
         Some(ref bdp) => bdp,
         None => &*solution.deriv_provider,
@@ -1502,7 +1502,6 @@ pub fn reml_laml_evaluate(
 
     let ext_dim = solution.ext_coords.len();
     let mut grad = Array1::zeros(k + ext_dim);
-
 
     // --- Stochastic trace estimation decision ---
     //
@@ -1570,7 +1569,8 @@ pub fn reml_laml_evaluate(
                         let mut h_i = op.to_dense();
                         if effective_deriv.has_corrections() {
                             let v_i = hop.solve(&coord.g);
-                            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)
+                            {
                                 h_i += &corr;
                             }
                         }
@@ -1591,11 +1591,7 @@ pub fn reml_laml_evaluate(
 
             let estimator = StochasticTraceEstimator::with_defaults();
             let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
-            let raw_traces = estimator.estimate_traces_structural(
-                hop,
-                &dense_refs,
-                &implicit_ops,
-            );
+            let raw_traces = estimator.estimate_traces_structural(hop, &dense_refs, &implicit_ops);
 
             // Re-map traces back to the [rho_0..rho_k, ext_0..ext_N] layout.
             let mut result = Vec::with_capacity(k + ext_dim);
@@ -2014,8 +2010,7 @@ fn compute_outer_hessian(
         a_k_matrices.push(a_k.clone());
 
         let correction = if effective_deriv.has_corrections() {
-            effective_deriv
-                .hessian_derivative_correction(&v_ks[idx])
+            effective_deriv.hessian_derivative_correction(&v_ks[idx])
         } else {
             None
         };
@@ -2045,9 +2040,10 @@ fn compute_outer_hessian(
     // Check if any ext coordinate uses implicit operators and if the problem
     // is large enough to warrant stochastic cross-traces instead of
     // materializing p x p Hessian drift matrices.
-    let any_ext_implicit = solution.ext_coords.iter().any(|c| {
-        c.b_operator.as_ref().map_or(false, |op| op.is_implicit())
-    });
+    let any_ext_implicit = solution
+        .ext_coords
+        .iter()
+        .any(|c| c.b_operator.as_ref().map_or(false, |op| op.is_implicit()));
     let total_p = hop.dim();
     // Stochastic cross-traces are only used when:
     // (1) implicit operators are present
@@ -2145,11 +2141,7 @@ fn compute_outer_hessian(
 
         let estimator = StochasticTraceEstimator::with_defaults();
         let dense_refs: Vec<&Array2<f64>> = dense_mats.iter().collect();
-        let raw_cross = estimator.estimate_second_order_traces(
-            hop,
-            &dense_refs,
-            &impl_ops,
-        );
+        let raw_cross = estimator.estimate_second_order_traces(hop, &dense_refs, &impl_ops);
 
         // Re-map from [dense_0..N, implicit_0..M] to [rho_0..k, ext_0..D].
         let n_dense_total = coord_is_implicit.iter().filter(|&&b| !b).count();
@@ -2482,8 +2474,8 @@ fn compute_outer_hessian(
                     if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = effective_deriv
-                                .fourth_derivative_trace(&ext_v[ii], &ext_v[jj], hop)
+                            if let Some(d_trace) =
+                                effective_deriv.fourth_derivative_trace(&ext_v[ii], &ext_v[jj], hop)
                             {
                                 h2_trace += d_trace;
                             }
@@ -2514,7 +2506,83 @@ fn compute_outer_hessian(
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
-        return Err("Outer Hessian contains non-finite entries".to_string());
+        // ── Conservative fallback: recompute with L_{kl} = 0 ──
+        //
+        // The trace-curvature block (log|H|₊ second derivatives) produced
+        // non-finite values — likely due to active-subspace instability or
+        // near-singular Hessian solves. Fall back to a conservative Hessian
+        // that keeps only the well-conditioned penalty terms:
+        //   Q_{kl}: penalty-envelope quadratic curvature
+        //   P_{kl}: structural penalty logdet curvature
+        //
+        // This is the same information that the former external
+        // `compute_lamlhessian_analytic_fallback` provided, but computed
+        // inline so that callers never see a failure from VGH mode.
+        log::warn!(
+            "Outer Hessian contains non-finite entries; \
+             falling back to conservative penalty-only Hessian (L_{{kl}} = 0)."
+        );
+
+        let mut hess_conservative = Array2::zeros((total, total));
+
+        // ── Q_{kl} (penalty quadratic curvature) ──
+        for kk in 0..k {
+            for ll in kk..k {
+                let q_kl_raw = -a_k_betas[ll].dot(&v_ks[kk])
+                    + if kk == ll { rho_a_vals[kk] } else { 0.0 };
+                let q_kl = if is_profiled {
+                    q_kl_raw / profiled_phi
+                        - 2.0 * rho_a_vals[kk] * rho_a_vals[ll]
+                            / (profiled_nu * profiled_phi * profiled_phi)
+                } else {
+                    q_kl_raw
+                };
+                hess_conservative[[kk, ll]] = q_kl;
+                if kk != ll {
+                    hess_conservative[[ll, kk]] = q_kl;
+                }
+            }
+        }
+
+        // ── P_{kl} (penalty logdet curvature) ──
+        if incl_logdet_s {
+            for kk in 0..k {
+                for ll in kk..k {
+                    let p_kl = -0.5 * det2[[kk, ll]];
+                    hess_conservative[[kk, ll]] += p_kl;
+                    if kk != ll {
+                        hess_conservative[[ll, kk]] += p_kl;
+                    }
+                }
+            }
+        }
+
+        // ── Enforce PD with jitter + symmetry ──
+        let scale = hess_conservative
+            .diag()
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let jitter = 1e-8 * scale;
+        for i in 0..total {
+            hess_conservative[[i, i]] += jitter;
+        }
+        for i in 0..total {
+            for j in 0..i {
+                let avg = 0.5 * (hess_conservative[[i, j]] + hess_conservative[[j, i]]);
+                hess_conservative[[i, j]] = avg;
+                hess_conservative[[j, i]] = avg;
+            }
+        }
+
+        if hess_conservative.iter().any(|v| !v.is_finite()) {
+            return Err(
+                "Conservative fallback Hessian (penalty-only) still contains non-finite entries"
+                    .to_string(),
+            );
+        }
+        return Ok(hess_conservative);
     }
 
     Ok(hess)
@@ -4090,14 +4158,14 @@ impl StochasticTraceEstimator {
             };
 
             // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
-            let implicit_dx_u: Vec<Array1<f64>> = implicit_ops.iter().map(|op| {
-                op.implicit_deriv.forward_mul(op.axis, &u.view())
-            }).collect();
+            let implicit_dx_u: Vec<Array1<f64>> = implicit_ops
+                .iter()
+                .map(|op| op.implicit_deriv.forward_mul(op.axis, &u.view()))
+                .collect();
 
             // Precompute u^T S_psi for each implicit axis (for penalty dot products).
-            let implicit_u_s: Vec<Array1<f64>> = implicit_ops.iter().map(|op| {
-                op.s_psi.t().dot(&u)
-            }).collect();
+            let implicit_u_s: Vec<Array1<f64>> =
+                implicit_ops.iter().map(|op| op.s_psi.t().dot(&u)).collect();
 
             for d in 0..total {
                 for e in d..total {
@@ -4212,7 +4280,6 @@ pub fn stochastic_trace_hinv_product(
 ) -> f64 {
     StochasticTraceEstimator::new(config.clone()).estimate_single_trace(hop, a)
 }
-
 
 // Lightweight xoshiro256ss RNG
 //
@@ -4713,10 +4780,16 @@ mod tests {
         let analytic = op0.trace_logdet_gradient(&dh_dt);
 
         // Finite difference: (logdet(t+h) - logdet(t-h)) / (2h)
-        let h_plus =
-            Array2::from_diag(&array![2.0 + t0 + h_step, 0.01 + 2.0 * (t0 + h_step), 3.0 - (t0 + h_step)]);
-        let h_minus =
-            Array2::from_diag(&array![2.0 + t0 - h_step, 0.01 + 2.0 * (t0 - h_step), 3.0 - (t0 - h_step)]);
+        let h_plus = Array2::from_diag(&array![
+            2.0 + t0 + h_step,
+            0.01 + 2.0 * (t0 + h_step),
+            3.0 - (t0 + h_step)
+        ]);
+        let h_minus = Array2::from_diag(&array![
+            2.0 + t0 - h_step,
+            0.01 + 2.0 * (t0 - h_step),
+            3.0 - (t0 - h_step)
+        ]);
         let op_plus = DenseSpectralOperator::from_symmetric(&h_plus).unwrap();
         let op_minus = DenseSpectralOperator::from_symmetric(&h_minus).unwrap();
         let fd = (op_plus.logdet() - op_minus.logdet()) / (2.0 * h_step);
@@ -4744,11 +4817,7 @@ mod tests {
         let c = psi.cos();
         let s = psi.sin();
         // R rotates in the (0,2) plane so the nullspace direction changes.
-        let r = array![
-            [c, 0.0, -s],
-            [0.0, 1.0, 0.0],
-            [s, 0.0, c],
-        ];
+        let r = array![[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c],];
         let d = Array2::from_diag(&array![s1, s2, 0.0]);
         r.dot(&d).dot(&r.t())
     }
@@ -4778,12 +4847,7 @@ mod tests {
     /// correction, and WITHOUT it, so we can verify the correction is needed.
     ///
     /// Returns (with_correction, without_correction).
-    fn analytic_pseudo_logdet_second(
-        psi: f64,
-        s1: f64,
-        s2: f64,
-        tol: f64,
-    ) -> (f64, f64) {
+    fn analytic_pseudo_logdet_second(psi: f64, s1: f64, s2: f64, tol: f64) -> (f64, f64) {
         let s_mat = rotating_nullspace_penalty(psi, s1, s2);
 
         // Eigendecompose S
@@ -4797,30 +4861,17 @@ mod tests {
         // S(psi) = R D R^T => dS/dpsi = R' D R^T + R D R'^T
         let c = psi.cos();
         let s = psi.sin();
-        let r = array![
-            [c, 0.0, -s],
-            [0.0, 1.0, 0.0],
-            [s, 0.0, c],
-        ];
+        let r = array![[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c],];
         // R' = dR/dpsi
-        let rp = array![
-            [-s, 0.0, -c],
-            [0.0, 0.0, 0.0],
-            [c, 0.0, -s],
-        ];
+        let rp = array![[-s, 0.0, -c], [0.0, 0.0, 0.0], [c, 0.0, -s],];
         let d = Array2::from_diag(&array![s1, s2, 0.0]);
         let s_psi = rp.dot(&d).dot(&r.t()) + r.dot(&d).dot(&rp.t());
 
         // Build S_psi_psi = d^2S/dpsi^2 analytically.
         // R'' = d^2R/dpsi^2
-        let rpp = array![
-            [-c, 0.0, s],
-            [0.0, 0.0, 0.0],
-            [-s, 0.0, -c],
-        ];
-        let s_psi_psi = rpp.dot(&d).dot(&r.t())
-            + 2.0 * &rp.dot(&d).dot(&rp.t())
-            + r.dot(&d).dot(&rpp.t());
+        let rpp = array![[-c, 0.0, s], [0.0, 0.0, 0.0], [-s, 0.0, -c],];
+        let s_psi_psi =
+            rpp.dot(&d).dot(&r.t()) + 2.0 * &rp.dot(&d).dot(&rp.t()) + r.dot(&d).dot(&rpp.t());
 
         // Build S^+ (pseudoinverse): S^+ = V diag(1/sigma_i for pos, 0 for null) V^T
         let mut s_dag = Array2::<f64>::zeros((p, p));
@@ -4948,11 +4999,7 @@ mod tests {
         // d/dt = 3, d^2/dt^2 = 0.
 
         let build_s = |t: f64| -> Array2<f64> {
-            Array2::from_diag(&array![
-                (rho1 + t).exp(),
-                (rho2 + 2.0 * t).exp(),
-                0.0
-            ])
+            Array2::from_diag(&array![(rho1 + t).exp(), (rho2 + 2.0 * t).exp(), 0.0])
         };
 
         let t0 = 0.0_f64;

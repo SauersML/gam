@@ -16,9 +16,10 @@ use gam::basis::{
 use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, UnifiedFitResult, UnifiedFitResultParts,
-    FittedLinkState, ModelSummary, ParametricTermSummary, PredictInput, SmoothTermSummary,
-    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
+    ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
+    UnifiedFitResultParts, compute_continuous_smoothness_order, fit_gam, optimize_external_design,
+    predict_gam,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -4649,10 +4650,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         "eval not available for cost-only survival link optimization".to_string(),
                     ))
                 },
-                reset_fn: |state: &mut ()| {
-                    let _ = state;
-                },
-                efs_fn: None::<fn(&mut (), &Array1<f64>) -> Result<gam::solver::strategy::EfsEval, gam::estimate::EstimationError>>,
+                reset_fn: None::<fn(&mut ())>,
+                efs_fn: None::<
+                    fn(
+                        &mut (),
+                        &Array1<f64>,
+                    )
+                        -> Result<gam::solver::strategy::EfsEval, gam::estimate::EstimationError>,
+                >,
             };
             match gam::solver::strategy::run_outer(&mut obj, &outer_config, name) {
                 Ok(result) => {
@@ -6784,7 +6789,9 @@ fn compute_probit_q0_from_eta(
     Ok(q0)
 }
 
-fn compute_probit_q0_from_fit(fit: &gam::estimate::UnifiedFitResult) -> Result<Array1<f64>, String> {
+fn compute_probit_q0_from_fit(
+    fit: &gam::estimate::UnifiedFitResult,
+) -> Result<Array1<f64>, String> {
     let eta_t = fit
         .block_states
         .first()
@@ -7384,8 +7391,9 @@ fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::Mi
 
 fn saved_sas_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::SasLinkState> {
     match &fit.fitted_link {
-        FittedLinkState::Sas { state, .. }
-        | FittedLinkState::BetaLogistic { state, .. } => Some(state.clone()),
+        FittedLinkState::Sas { state, .. } | FittedLinkState::BetaLogistic { state, .. } => {
+            Some(state.clone())
+        }
         _ => None,
     }
 }
@@ -9489,7 +9497,10 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
     }
 }
 
-fn apply_inverse_link_state_to_fit_result(fit_result: &mut UnifiedFitResult, inverse_link: &InverseLink) {
+fn apply_inverse_link_state_to_fit_result(
+    fit_result: &mut UnifiedFitResult,
+    inverse_link: &InverseLink,
+) {
     let link = match inverse_link {
         InverseLink::Sas(state) => FittedLinkState::Sas {
             state: state.clone(),
@@ -10042,7 +10053,9 @@ fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCov
     }
 }
 
-fn fit_result_from_saved_model_for_prediction(model: &SavedModel) -> Result<UnifiedFitResult, String> {
+fn fit_result_from_saved_model_for_prediction(
+    model: &SavedModel,
+) -> Result<UnifiedFitResult, String> {
     model.fit_result.clone().ok_or_else(|| {
         "model is missing canonical fit_result payload; refit with current CLI".to_string()
     })
@@ -10501,8 +10514,8 @@ mod tests {
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_binomial_linkwiggle, pretty_familyname,
         run_generate_gaussian_location_scale, run_generate_standard_or_flexible,
-        run_predict_binomial_location_scale,
-        saved_probitwiggle_derivative_q0, saved_probitwiggle_design, summarizewiggle_domain,
+        run_predict_binomial_location_scale, saved_probitwiggle_derivative_q0,
+        saved_probitwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };

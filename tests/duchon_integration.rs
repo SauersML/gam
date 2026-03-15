@@ -1,8 +1,8 @@
 use gam::estimate::AdaptiveRegularizationOptions;
 use gam::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions, FittedTermCollectionWithSpec,
-    LikelihoodFamily, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, fit_term_collection,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions,
+    FittedTermCollectionWithSpec, LikelihoodFamily, ShapeConstraint, SmoothBasisSpec,
+    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec, fit_term_collection,
     fit_term_collectionwith_spatial_length_scale_optimization, predict_gam,
 };
 use ndarray::{Array1, Array2};

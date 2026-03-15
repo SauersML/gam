@@ -5644,17 +5644,7 @@ pub fn observed_weight_dispatch(
                 WeightFamily::Poisson => VarianceJet::poisson(mu),
                 WeightFamily::Gamma => VarianceJet::gamma(mu),
             };
-            observed_weight_noncanonical(
-                y,
-                mu,
-                jet.d1,
-                jet.d2,
-                jet.d3,
-                h4,
-                vj,
-                phi,
-                prior_weight,
-            )
+            observed_weight_noncanonical(y, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, prior_weight)
         }
     }
 }
@@ -5694,9 +5684,9 @@ pub fn fisher_weight_dispatch(
             };
             // At y=mu the observed correction vanishes, giving Fisher weights.
             observed_weight_noncanonical(
-                mu,  // y = mu → residual = 0
+                mu, // y = mu → residual = 0
                 mu,
-                1.0,  // placeholder h1 for generic path
+                1.0, // placeholder h1 for generic path
                 0.0,
                 0.0,
                 0.0,
@@ -5797,7 +5787,10 @@ pub fn compute_observed_weights_dispatched(
                 y,
                 jets,
                 h4,
-                |mu| { assert!(mu.is_finite()); var_jet_fn() },
+                |mu| {
+                    assert!(mu.is_finite());
+                    var_jet_fn()
+                },
                 phi,
                 prior_weights,
             )
@@ -6031,18 +6024,19 @@ pub fn calculate_deviance(
             // with convention 0 * ln(0) = 0.
             // This is also a reasonable deviance for Gamma(log) since the IRLS
             // convergence criterion just needs a monotonic objective.
-            let total = ndarray::Zip::from(y)
-                .and(mu)
-                .and(priorweights)
-                .fold(0.0, |acc, &yi, &mui, &wi| {
-                    let mui_c = mui.max(EPS);
-                    let term = if yi > EPS {
-                        yi * (yi / mui_c).ln() - (yi - mui_c)
-                    } else {
-                        mui_c // when y=0, deviance contribution is mu
-                    };
-                    acc + wi * term
-                });
+            let total =
+                ndarray::Zip::from(y)
+                    .and(mu)
+                    .and(priorweights)
+                    .fold(0.0, |acc, &yi, &mui, &wi| {
+                        let mui_c = mui.max(EPS);
+                        let term = if yi > EPS {
+                            yi * (yi / mui_c).ln() - (yi - mui_c)
+                        } else {
+                            mui_c // when y=0, deviance contribution is mu
+                        };
+                        acc + wi * term
+                    });
             2.0 * total
         }
     }

@@ -1,12 +1,11 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec,
-    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
-    BasisPsiSecondDerivativeResult, CenterStrategy, DuchonBasisSpec, MaternBasisSpec,
-    MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
-    ThinPlateBasisSpec, apply_sum_to_zero_constraint, applyweighted_orthogonality_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
-    build_duchon_basis_log_kappa_derivative, build_duchon_basis_log_kappasecond_derivative,
-    build_matern_basis,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
+    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
+    DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo,
+    PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
+    applyweighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
+    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
+    build_duchon_basis_log_kappasecond_derivative, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivative,
     build_matern_basis_log_kappasecond_derivative, build_matern_collocation_operator_matrices,
     build_thin_plate_basis, estimate_penalty_nullity, filter_active_penalty_candidates,
@@ -19,8 +18,8 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
-    EstimationError, ExternalOptimOptions, FitInference, FitOptions, UnifiedFitResult,
-    FittedLinkState, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
+    EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState,
+    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -684,7 +683,10 @@ impl SpatialLogKappaCoords {
 }
 
 /// Get the `aniso_log_scales` from a spatial term, if present.
-pub fn get_spatial_aniso_log_scales(spec: &TermCollectionSpec, term_idx: usize) -> Option<Vec<f64>> {
+pub fn get_spatial_aniso_log_scales(
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> Option<Vec<f64>> {
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
@@ -723,7 +725,9 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
             _ => (None, None),
         };
         let Some(eta) = aniso else { continue };
-        if eta.is_empty() { continue; }
+        if eta.is_empty() {
+            continue;
+        }
         let Some(ls) = length_scale else { continue };
         // psi_bar = -ln(length_scale), kappa_bar = 1/length_scale
         // per-axis: kappa_a = kappa_bar * exp(eta_a), length_a = ls * exp(-eta_a)
@@ -1984,11 +1988,7 @@ pub fn build_smooth_design(
                     rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
                 })?;
                 // Inject input scales into metadata for downstream storage.
-                if let BasisMetadata::ThinPlate {
-                    input_scales,
-                    ..
-                } = &mut result.metadata
-                {
+                if let BasisMetadata::ThinPlate { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
                 result
@@ -2020,11 +2020,7 @@ pub fn build_smooth_design(
                     None
                 };
                 let mut result = build_matern_basis(x.view(), spec)?;
-                if let BasisMetadata::Matern {
-                    input_scales,
-                    ..
-                } = &mut result.metadata
-                {
+                if let BasisMetadata::Matern { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
                 result
@@ -2064,11 +2060,7 @@ pub fn build_smooth_design(
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
                 let mut result = build_duchon_basis(x.view(), &spec_local)?;
-                if let BasisMetadata::Duchon {
-                    input_scales,
-                    ..
-                } = &mut result.metadata
-                {
+                if let BasisMetadata::Duchon { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
                 result
@@ -4657,11 +4649,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 hessian: HessianResult::Analytic(hessian),
             })
         },
-        reset_fn: |st: &mut SpatialAdaptiveOuterState| {
+        reset_fn: Some(|st: &mut SpatialAdaptiveOuterState| {
             st.warm_cache = None;
             st.last_eval = None;
-        },
-        efs_fn: None::<fn(&mut SpatialAdaptiveOuterState, &Array1<f64>) -> Result<crate::solver::strategy::EfsEval, EstimationError>>,
+        }),
+        efs_fn: None::<
+            fn(
+                &mut SpatialAdaptiveOuterState,
+                &Array1<f64>,
+            ) -> Result<crate::solver::strategy::EfsEval, EstimationError>,
+        >,
     };
 
     let outer_result = crate::solver::strategy::run_outer(
@@ -7758,15 +7755,24 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
 
     // Check if this result uses implicit operators (design matrices empty).
     let use_implicit = aniso_result.implicit_operator.is_some();
-    let implicit_op_arc = aniso_result.implicit_operator.as_ref().map(|op| {
-        std::sync::Arc::new(op.clone())
-    });
+    let implicit_op_arc = aniso_result
+        .implicit_operator
+        .as_ref()
+        .map(|op| std::sync::Arc::new(op.clone()));
 
     // Pre-compute cross-derivative design matrices: d2X/(d psi_a d psi_b) = t * s_a * s_b
     // using projected+padded components (element-wise product in design space).
     // Only needed for the dense path.
-    let t_proj = if use_implicit { None } else { Some(&aniso_result.design_cross_t) };
-    let s_proj = if use_implicit { None } else { Some(&aniso_result.s_components_projected) };
+    let t_proj = if use_implicit {
+        None
+    } else {
+        Some(&aniso_result.design_cross_t)
+    };
+    let s_proj = if use_implicit {
+        None
+    } else {
+        Some(&aniso_result.s_components_projected)
+    };
 
     let mut entries = Vec::with_capacity(d);
     for a in 0..d {
@@ -7776,10 +7782,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             // need to materialize the dense (n x p) matrices here.  Store empty
             // placeholders — they are never read when the implicit operator is
             // present (spatial_log_kappa_hyper_dirs_frominfo_list uses from_implicit).
-            (
-                Array2::<f64>::zeros((0, 0)),
-                Array2::<f64>::zeros((0, 0)),
-            )
+            (Array2::<f64>::zeros((0, 0)), Array2::<f64>::zeros((0, 0)))
         } else {
             let x_first = aniso_result.design_first[a].clone();
             let x_second = aniso_result.design_second_diag[a].clone();
@@ -7860,7 +7863,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             s_psi_psi_local,
             s_psi_psi_components_local: s_psi_psi_components,
             aniso_group_id: Some(aniso_group_id),
-            aniso_cross_designs: if cross_designs.is_empty() { None } else { Some(cross_designs) },
+            aniso_cross_designs: if cross_designs.is_empty() {
+                None
+            } else {
+                Some(cross_designs)
+            },
             aniso_cross_penalties: cross_penalties_opt,
             implicit_operator: implicit_op_arc.clone(),
             implicit_axis: a,
@@ -8138,12 +8145,15 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                 info.total_p,
             )
         };
-        hyper_dirs.push(DirectionalHyperParam::new_compact(
-            x_first_hyper,
-            s_components,
-            Some(xsecond),
-            Some(ssecond_components),
-        )?.not_penalty_like());
+        hyper_dirs.push(
+            DirectionalHyperParam::new_compact(
+                x_first_hyper,
+                s_components,
+                Some(xsecond),
+                Some(ssecond_components),
+            )?
+            .not_penalty_like(),
+        );
     }
     Ok(hyper_dirs)
 }
@@ -8514,7 +8524,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 }
             }
         },
-        reset_fn: |ctx: &mut &mut AnisoJointContext<'_>| { assert!(ctx.rho_dim > 0 || ctx.rho_dim == 0); },
+        reset_fn: None::<fn(&mut &mut AnisoJointContext<'_>)>,
         efs_fn: None::<
             fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
@@ -8548,11 +8558,7 @@ fn try_exact_joint_spatial_aniso_optimization(
 /// For each anisotropic group with d > 1 axes, the d ψ values are shifted
 /// so that their mean is zero: ψ_a ← ψ_a − mean(ψ).
 /// This preserves the anisotropy ratios while centering the log-scale coordinates.
-fn enforce_psi_sum_to_zero(
-    theta: &mut Array1<f64>,
-    rho_dim: usize,
-    dims_per_term: &[usize],
-) {
+fn enforce_psi_sum_to_zero(theta: &mut Array1<f64>, rho_dim: usize, dims_per_term: &[usize]) {
     let mut offset = rho_dim;
     for &d in dims_per_term {
         if d > 1 {
@@ -8674,11 +8680,11 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 self.rho_dim,
                 self.dims_per_term.to_vec(),
             );
-            let spec_at_kappa =
-                match log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms) {
-                    Ok(s) => s,
-                    Err(_) => return f64::INFINITY,
-                };
+            let spec_at_kappa = match log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms)
+            {
+                Ok(s) => s,
+                Err(_) => return f64::INFINITY,
+            };
             let rho_vec = theta.slice(s![..self.rho_dim]).mapv(f64::exp);
             match fit_term_collection_forspecwith_heuristic_lambdas(
                 self.data,
@@ -8777,28 +8783,24 @@ fn try_exact_joint_spatial_isotropic_optimization(
             ctx.track_best(theta, cost);
             Ok(cost)
         },
-        eval_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
-            match ctx.eval_full(theta) {
-                Ok((cost, grad, hess)) => {
-                    ctx.track_best(theta, cost);
-                    Ok(OuterEval {
-                        cost,
-                        gradient: grad,
-                        hessian: HessianResult::Analytic(hess),
-                    })
-                }
-                Err(_) => {
-                    Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    })
-                }
+        eval_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| match ctx
+            .eval_full(theta)
+        {
+            Ok((cost, grad, hess)) => {
+                ctx.track_best(theta, cost);
+                Ok(OuterEval {
+                    cost,
+                    gradient: grad,
+                    hessian: HessianResult::Analytic(hess),
+                })
             }
+            Err(_) => Ok(OuterEval {
+                cost: f64::INFINITY,
+                gradient: Array1::zeros(theta.len()),
+                hessian: HessianResult::Unavailable,
+            }),
         },
-        reset_fn: |ctx: &mut &mut IsoJointContext<'_>| {
-            assert!(ctx.rho_dim > 0 || ctx.rho_dim == 0);
-        },
+        reset_fn: None::<fn(&mut &mut IsoJointContext<'_>)>,
         efs_fn: None::<
             fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
@@ -8825,7 +8827,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         }
     }
 }
-
 
 fn optimize_single_block_spatial_length_scale<FitOut, FitFn, ScoreFn>(
     resolvedspec: &TermCollectionSpec,
@@ -8927,7 +8928,8 @@ where
             barrier_config: None,
             force_solver: None,
         },
-        cost_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
+        cost_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>,
+                  theta: &Array1<f64>| {
             eval_single_block_spatial_cost(
                 &mut ctx.hyper,
                 ctx.resolvedspec,
@@ -8937,7 +8939,8 @@ where
                 &ctx.score_fn,
             )
         },
-        eval_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
+        eval_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>,
+                  theta: &Array1<f64>| {
             let cost = eval_single_block_spatial_cost(
                 &mut ctx.hyper,
                 ctx.resolvedspec,
@@ -8952,9 +8955,12 @@ where
                 hessian: HessianResult::Unavailable,
             })
         },
-        reset_fn: |_ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>| {},
+        reset_fn: None::<fn(&mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>)>,
         efs_fn: None::<
-            fn(&mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+            fn(
+                &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>,
+                &Array1<f64>,
+            ) -> Result<EfsEval, EstimationError>,
         >,
     };
 
@@ -8970,16 +8976,14 @@ where
         rho_bound: kappa_options.max_length_scale.ln().abs().max(12.0),
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![
-            OuterCapability {
-                gradient: Derivative::Unavailable,
-                hessian: Derivative::Unavailable,
-                n_params,
-                all_penalty_like: false,
-                barrier_config: None,
-                force_solver: Some(Solver::CoordinateSearch),
-            },
-        ],
+        fallback_sequence: vec![OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params,
+            all_penalty_like: false,
+            barrier_config: None,
+            force_solver: Some(Solver::CoordinateSearch),
+        }],
         coordinate_search: Some(CoordinateSearchConfig {
             log_step: kappa_options.log_step,
             max_coord_iters: kappa_options.max_outer_iter,
@@ -8988,7 +8992,9 @@ where
     };
 
     let result = crate::solver::strategy::run_outer(
-        &mut obj, &outer_config, "single-block spatial length-scale",
+        &mut obj,
+        &outer_config,
+        "single-block spatial length-scale",
     )?;
 
     // Realize the best point from the optimization.
@@ -9111,10 +9117,7 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
             *input_scales = meta_scales.clone();
         }
         if let (
-            SmoothBasisSpec::ThinPlate {
-                input_scales,
-                ..
-            },
+            SmoothBasisSpec::ThinPlate { input_scales, .. },
             BasisMetadata::ThinPlate {
                 input_scales: meta_scales,
                 ..
@@ -9348,9 +9351,12 @@ where
                     hessian: HessianResult::Unavailable,
                 })
             },
-            reset_fn: |_ctx: &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>| {},
+            reset_fn: None::<fn(&mut &mut TBS<'_, FitOut, FitFn, ScoreFn>)>,
             efs_fn: None::<
-                fn(&mut &mut TBS<'_, FitOut, FitFn, ScoreFn>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+                fn(
+                    &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
             >,
         };
 
@@ -9366,16 +9372,14 @@ where
             rho_bound: kappa_options.max_length_scale.ln().abs().max(12.0),
             heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
             initial_rho: Some(theta0.clone()),
-            fallback_sequence: vec![
-                OuterCapability {
-                    gradient: Derivative::Unavailable,
-                    hessian: Derivative::Unavailable,
-                    n_params: total_terms,
-                    all_penalty_like: false,
-                    barrier_config: None,
-                    force_solver: Some(Solver::CoordinateSearch),
-                },
-            ],
+            fallback_sequence: vec![OuterCapability {
+                gradient: Derivative::Unavailable,
+                hessian: Derivative::Unavailable,
+                n_params: total_terms,
+                all_penalty_like: false,
+                barrier_config: None,
+                force_solver: Some(Solver::CoordinateSearch),
+            }],
             coordinate_search: Some(CoordinateSearchConfig {
                 log_step: kappa_options.log_step,
                 max_coord_iters: kappa_options.max_outer_iter,
@@ -9384,13 +9388,17 @@ where
         };
 
         let result = crate::solver::strategy::run_outer(
-            &mut obj, &outer_config, "two-block spatial length-scale",
+            &mut obj,
+            &outer_config,
+            "two-block spatial length-scale",
         )
         .map_err(|e| e.to_string())?;
 
         // Realize the best result from the optimization.
         let data_view = state.data;
-        let realize_bp = |ms: &TermCollectionSpec, ns: &TermCollectionSpec| -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
+        let realize_bp = |ms: &TermCollectionSpec,
+                          ns: &TermCollectionSpec|
+         -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
             let d_mean = build_term_collection_design(data_view, ms)
                 .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
             let d_noise = build_term_collection_design(data_view, ns)
@@ -9591,16 +9599,14 @@ where
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![
-            OuterCapability {
-                gradient: Derivative::Analytic,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                barrier_config: None,
-                force_solver: None,
-            },
-        ],
+        fallback_sequence: vec![OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: theta_dim,
+            all_penalty_like: false,
+            barrier_config: None,
+            force_solver: None,
+        }],
         coordinate_search: None,
     };
 
@@ -9616,7 +9622,9 @@ where
         },
         cost_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
             let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta, rho_dim, all_dims_ref.clone(),
+                theta,
+                rho_dim,
+                all_dims_ref.clone(),
             );
             let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
             let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
@@ -9633,7 +9641,10 @@ where
             };
             match (&mut *exact_fn_cell.borrow_mut())(
                 &theta.slice(s![..rho_dim]).to_owned(),
-                &ms, &ns, &md, &nd,
+                &ms,
+                &ns,
+                &md,
+                &nd,
                 false,
             ) {
                 Ok((c, _, _)) => {
@@ -9645,7 +9656,9 @@ where
         },
         eval_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
             let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta, rho_dim, all_dims_ref.clone(),
+                theta,
+                rho_dim,
+                all_dims_ref.clone(),
             );
             let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
             let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
@@ -9680,7 +9693,10 @@ where
             };
             match (&mut *exact_fn_cell.borrow_mut())(
                 &theta.slice(s![..rho_dim]).to_owned(),
-                &ms, &ns, &md, &nd,
+                &ms,
+                &ns,
+                &md,
+                &nd,
                 true,
             ) {
                 Ok((cost, grad, hess)) => {
@@ -9708,12 +9724,9 @@ where
                 }),
             }
         },
-        reset_fn: |ctx: &mut &mut TwoBlockExactJointState| { let _ = ctx; },
+        reset_fn: None::<fn(&mut &mut TwoBlockExactJointState)>,
         efs_fn: None::<
-            fn(
-                &mut &mut TwoBlockExactJointState,
-                &Array1<f64>,
-            ) -> Result<EfsEval, EstimationError>,
+            fn(&mut &mut TwoBlockExactJointState, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
     };
 
@@ -9721,7 +9734,8 @@ where
         &mut obj,
         &outer_config,
         "two-block exact-joint spatial",
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let mut theta_star = result.rho;
     enforce_psi_sum_to_zero(&mut theta_star, rho_dim, &all_dims);

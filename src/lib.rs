@@ -23,9 +23,9 @@ pub use families::survival;
 pub use families::survival_location_scale;
 
 pub use families::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResultParts,
-    CustomFamily, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
-    blockwise_fit_from_parts, fit_custom_family,
+    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResultParts, CustomFamily, FamilyEvaluation,
+    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, blockwise_fit_from_parts,
+    fit_custom_family,
 };
 pub use families::gamlss::{
     BinomialLocationScaleFamily, BinomialLocationScaleSpec, BinomialLocationScaleTermSpec,
@@ -75,22 +75,21 @@ pub use inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, ModelKind, SchemaColumn,
 };
 pub use solver::estimate::{
-    BlockRole, CoefficientUncertaintyResult, FitArtifacts, FitGeometry, FitOptions,
-    FittedBlock, FittedLinkState, InferenceCovarianceMode, MeanIntervalMethod,
-    PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
-    UnifiedFitResult, UnifiedFitResultParts, coefficient_uncertainty,
-    coefficient_uncertaintywith_mode,
-    fit_gam, optimize_external_design, predict_gam,
-    predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
+    BlockRole, CoefficientUncertaintyResult, FitArtifacts, FitGeometry, FitOptions, FittedBlock,
+    FittedLinkState, InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
+    PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, UnifiedFitResult,
+    UnifiedFitResultParts, coefficient_uncertainty, coefficient_uncertaintywith_mode, fit_gam,
+    optimize_external_design, predict_gam, predict_gam_posterior_mean,
+    predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
     BasisBuildResult, BasisMetadata, BasisWorkspace, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonSplineBasis, MaternBasisSpec, MaternIdentifiability, MaternNu,
     MaternSplineBasis, SpatialIdentifiability, ThinPlateBasisSpec, ThinPlateSplineBasis,
-    build_bspline_basis_1d, build_duchon_basis, build_matern_basis, build_thin_plate_basis, default_num_centers,
+    build_bspline_basis_1d, build_duchon_basis, build_matern_basis, build_thin_plate_basis,
     create_duchon_spline_basis, create_matern_spline_basis, create_thin_plate_spline_basis,
-    create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,
+    create_thin_plate_spline_basis_with_knot_count, default_num_centers, select_thin_plate_knots,
 };
 pub use terms::layout::{
     EngineLayout, EngineLayoutBuilder, EngineTerm, EngineTermKind, EngineTermSpec, PenaltySpec,
@@ -104,9 +103,8 @@ pub use terms::smooth::{
     TwoBlockSpatialLengthScaleOptimizationResult, build_smooth_design,
     build_term_collection_design, fit_term_collection,
     fit_term_collectionwith_matern_kappa_optimization,
-    fit_term_collectionwith_spatial_length_scale_optimization, optimize_two_block_matern_kappa,
+    fit_term_collectionwith_spatial_length_scale_optimization, get_spatial_aniso_log_scales,
+    get_spatial_length_scale, log_spatial_aniso_scales, optimize_two_block_matern_kappa,
     optimize_two_block_spatial_length_scale,
-    get_spatial_aniso_log_scales, get_spatial_length_scale,
-    log_spatial_aniso_scales,
 };
 pub use types::{LikelihoodFamily, LinkFunction};

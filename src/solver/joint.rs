@@ -1566,7 +1566,11 @@ impl<'a> JointRemlState<'a> {
             &self.core.base_rs_list,
         )?;
         let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
-        Ok(crate::solver::strategy::EfsEval { cost, steps, beta: None })
+        Ok(crate::solver::strategy::EfsEval {
+            cost,
+            steps,
+            beta: None,
+        })
     }
 
     fn fixed_subspace_logdet_for_penalty(
@@ -2416,7 +2420,9 @@ impl<'a> JointRemlState<'a> {
         let cached_converged = self.eval.last_converged;
         let rho = self.core.state.rho.clone();
         let knot_range = self.core.state.knot_range.unwrap_or((0.0, 1.0));
-        let knot_vector = self.core.state
+        let knot_vector = self
+            .core
+            .state
             .knot_vector
             .clone()
             .unwrap_or_else(|| Array1::zeros(0));
@@ -2631,12 +2637,12 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             // all through the single reml_laml_evaluate function.
             state.compute_unified_eval(rho)
         },
-        reset_fn: {
+        reset_fn: Some({
             let snap = snapshot;
             move |state: &mut JointRemlState<'_>| {
                 snap.restore(state);
             }
-        },
+        }),
         efs_fn: Some(|state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
             state.compute_efs_eval(rho)
         }),
