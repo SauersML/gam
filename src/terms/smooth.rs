@@ -3140,32 +3140,6 @@ fn with_spatial_identifiability_transform(
     }
 }
 
-pub fn fit_term_collection(
-    data: ArrayView2<'_, f64>,
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    offset: Array1<f64>,
-    spec: &TermCollectionSpec,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-) -> Result<FittedTermCollection, EstimationError> {
-    let out = fit_term_collectionwith_spatial_length_scale_optimization(
-        data,
-        y,
-        weights,
-        offset,
-        spec,
-        family,
-        options,
-        &SpatialLengthScaleOptimizationOptions::default(),
-    )?;
-    Ok(FittedTermCollection {
-        fit: out.fit,
-        design: out.design,
-        adaptive_diagnostics: out.adaptive_diagnostics,
-    })
-}
-
 fn fit_term_collection_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -9120,7 +9094,7 @@ where
     })
 }
 
-pub fn fit_term_collectionwith_spatial_length_scale_optimization(
+pub(crate) fn fit_term_collectionwith_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: Array1<f64>,
     weights: Array1<f64>,
