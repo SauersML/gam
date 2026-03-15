@@ -105,7 +105,7 @@ pub use terms::smooth::{
     build_term_collection_design, fit_term_collection,
     fit_term_collectionwith_matern_kappa_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization, optimize_two_block_matern_kappa,
-    optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_bfgs,
+    optimize_two_block_spatial_length_scale,
     get_spatial_aniso_log_scales, get_spatial_length_scale,
     log_spatial_aniso_scales,
 };

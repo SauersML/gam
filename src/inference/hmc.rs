@@ -338,6 +338,15 @@ struct SharedData {
 /// Uses Arc for shared data to prevent memory explosion when cloned for chains.
 /// Uses faer for numerically stable Cholesky decomposition.
 #[derive(Clone)]
+/// Family mode for NUTS log-likelihood computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NutsFamily {
+    Gaussian,
+    BinomialLogit,
+    PoissonLog,
+    GammaLog,
+}
+
 pub struct NutsPosterior {
     /// Shared read-only data (Arc prevents duplication)
     data: SharedData,
@@ -346,8 +355,8 @@ pub struct NutsPosterior {
     chol: Array2<f64>,
     /// L^T for gradient chain rule: ∇z = L^T @ ∇_β
     chol_t: Array2<f64>,
-    /// Link function type
-    is_logit: bool,
+    /// Family for log-likelihood computation
+    nuts_family: NutsFamily,
 }
 
 impl NutsPosterior {
@@ -379,7 +388,7 @@ impl NutsPosterior {
     /// * `penalty_matrix` - Combined penalty S [dim, dim]
     /// * `mode` - MAP estimate μ [dim]
     /// * `hessian` - Hessian H [dim, dim] (NOT the inverse!)
-    /// * `is_logit` - True for logistic regression, false for Gaussian
+    /// * `nuts_family` - Family for log-likelihood computation
     ///
     /// # Numerical Stability
     /// Accepts the Hessian directly and computes L = (chol(H))^{-T} via
@@ -391,7 +400,7 @@ impl NutsPosterior {
         penalty_matrix: ArrayView2<f64>,
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
-        is_logit: bool,
+        nuts_family: NutsFamily,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let dim = x.ncols();
@@ -438,7 +447,7 @@ impl NutsPosterior {
             data,
             chol,
             chol_t,
-            is_logit,
+            nuts_family,
         })
     }
 
@@ -455,10 +464,11 @@ impl NutsPosterior {
         let eta = self.data.x.dot(&beta);
 
         // === Step 3: Compute log-likelihood and gradient ===
-        let (ll, grad_ll_beta) = if self.is_logit {
-            self.logit_logp_and_grad(&eta)
-        } else {
-            self.gaussian_logp_and_grad(&eta)
+        let (ll, grad_ll_beta) = match self.nuts_family {
+            NutsFamily::BinomialLogit => self.logit_logp_and_grad(&eta),
+            NutsFamily::Gaussian => self.gaussian_logp_and_grad(&eta),
+            NutsFamily::PoissonLog => self.poisson_log_logp_and_grad(&eta),
+            NutsFamily::GammaLog => self.gamma_log_logp_and_grad(&eta),
         };
 
         // === Step 4: Compute penalty and its gradient ===
@@ -523,6 +533,56 @@ impl NutsPosterior {
         // Gradient of log-likelihood: X^T @ (w * (y - η))
         let grad_ll = fast_atv(&self.data.x, &weighted_residual);
 
+        (ll, grad_ll)
+    }
+
+    /// Poisson(log) log-likelihood and gradient.
+    /// log p(y|η) = y*η - exp(η) - log(y!)
+    /// ∂/∂η = y - exp(η) = y - μ
+    fn poisson_log_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+        let n = self.data.n_samples;
+        let mut ll = 0.0;
+        let mut residual = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp();
+            let y_i = self.data.y[i];
+            let w_i = self.data.weights[i];
+            // log p(y|η) = y*η - exp(η)  (dropping constant log(y!))
+            ll += w_i * (y_i * eta_i - mu_i);
+            residual[i] = w_i * (y_i - mu_i);
+        }
+
+        let grad_ll = fast_atv(&self.data.x, &residual);
+        (ll, grad_ll)
+    }
+
+    /// Gamma(log) log-likelihood and gradient.
+    /// Using shape=1 (exponential): log p(y|η) = -η - y*exp(-η)
+    /// ∂/∂η = -1 + y*exp(-η) = (y/μ - 1)
+    /// General Gamma with known shape k: log p(y|η) = -k*η + (k-1)*log(y) - k*y/μ + const
+    /// ∂/∂η = -k + k*y/μ = k*(y/μ - 1)
+    /// For NUTS we use shape=1 since shape is typically estimated separately.
+    fn gamma_log_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+        let n = self.data.n_samples;
+        let mut ll = 0.0;
+        let mut residual = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp();
+            let y_i = self.data.y[i];
+            let w_i = self.data.weights[i];
+            // Gamma deviance contribution: -log(y/μ) + (y-μ)/μ = η - log(y) + y/μ - 1
+            // Negated (since we want log-likelihood): -η + log(y) - y/μ + 1
+            // Drop constants: ll += w * (-η - y/μ)
+            ll += w_i * (-eta_i - y_i / mu_i);
+            // Gradient: d/dη (-η - y*exp(-η)) = -1 + y*exp(-η) = y/μ - 1
+            residual[i] = w_i * (y_i / mu_i - 1.0);
+        }
+
+        let grad_ll = fast_atv(&self.data.x, &residual);
         (ll, grad_ll)
     }
 
@@ -1767,7 +1827,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 /// * `penalty_matrix` - Combined penalty S [dim, dim]
 /// * `mode` - MAP estimate μ [dim]
 /// * `hessian` - Penalized Hessian H [dim, dim] (NOT the inverse!)
-/// * `is_logit` - True for logistic regression, false for Gaussian
+/// * `nuts_family` - Family for log-likelihood computation
 /// * `firth_bias_reduction` - Whether Firth bias reduction was used in training
 /// * `config` - NUTS configuration
 pub(crate) fn run_nuts_sampling(
@@ -1777,11 +1837,11 @@ pub(crate) fn run_nuts_sampling(
     penalty_matrix: ArrayView2<f64>,
     mode: ArrayView1<f64>,
     hessian: ArrayView2<f64>,
-    is_logit: bool,
+    nuts_family: NutsFamily,
     firth_bias_reduction: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    if is_logit && firth_bias_reduction {
+    if nuts_family == NutsFamily::BinomialLogit && firth_bias_reduction {
         return Err(
             "NUTS with Firth bias reduction is disabled: posterior target mismatch. Refit with firth_bias_reduction=false for consistent HMC uncertainty."
                 .to_string(),
@@ -1790,7 +1850,7 @@ pub(crate) fn run_nuts_sampling(
     let dim = mode.len();
 
     // Create posterior target with analytical gradients.
-    let target = NutsPosterior::new(x, y, weights, penalty_matrix, mode, hessian, is_logit)?;
+    let target = NutsPosterior::new(x, y, weights, penalty_matrix, mode, hessian, nuts_family)?;
 
     // Get Cholesky factor for un-whitening samples later
     let chol = target.chol().clone();
@@ -1922,7 +1982,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.penalty_matrix,
             glm.mode,
             glm.hessian,
-            false,
+            NutsFamily::Gaussian,
             glm.firth_bias_reduction,
             config,
         ),
@@ -1946,7 +2006,7 @@ pub fn run_nuts_sampling_flattened_family(
                     glm.penalty_matrix,
                     glm.mode,
                     glm.hessian,
-                    true,
+                    NutsFamily::BinomialLogit,
                     glm.firth_bias_reduction,
                     config,
                 )
@@ -2002,13 +2062,27 @@ pub fn run_nuts_sampling_flattened_family(
             "Survival flattened inputs are only valid for LikelihoodFamily::RoystonParmar"
                 .to_string(),
         ),
-        (LikelihoodFamily::PoissonLog, FamilyNutsInputs::Glm(_)) => Err(
-            "PoissonLog NUTS is not supported; use fit_poisson_log for blockwise Poisson models"
-                .to_string(),
+        (LikelihoodFamily::PoissonLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+            glm.x,
+            glm.y,
+            glm.weights,
+            glm.penalty_matrix,
+            glm.mode,
+            glm.hessian,
+            NutsFamily::PoissonLog,
+            false,
+            config,
         ),
-        (LikelihoodFamily::GammaLog, FamilyNutsInputs::Glm(_)) => Err(
-            "GammaLog NUTS is not supported; use fit_gamma_log for blockwise Gamma models"
-                .to_string(),
+        (LikelihoodFamily::GammaLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+            glm.x,
+            glm.y,
+            glm.weights,
+            glm.penalty_matrix,
+            glm.mode,
+            glm.hessian,
+            NutsFamily::GammaLog,
+            false,
+            config,
         ),
     }
 }

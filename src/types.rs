@@ -13,6 +13,7 @@ pub enum LinkFunction {
     Sas,
     BetaLogistic,
     Identity,
+    Log,
 }
 
 /// Supported inverse-link components for convex blended inverse links.
@@ -119,9 +120,8 @@ impl LikelihoodFamily {
     #[inline]
     pub fn link_function(self) -> LinkFunction {
         match self {
-            Self::GaussianIdentity | Self::RoystonParmar | Self::PoissonLog | Self::GammaLog => {
-                LinkFunction::Identity
-            }
+            Self::GaussianIdentity | Self::RoystonParmar => LinkFunction::Identity,
+            Self::PoissonLog | Self::GammaLog => LinkFunction::Log,
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
             Self::BinomialCLogLog => LinkFunction::CLogLog,
@@ -186,6 +186,8 @@ pub enum GlmLikelihoodFamily {
     BinomialSas,
     BinomialBetaLogistic,
     BinomialMixture,
+    PoissonLog,
+    GammaLog,
 }
 
 impl GlmLikelihoodFamily {
@@ -207,12 +209,8 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::BinomialSas => Ok(Self::BinomialSas),
             LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
             LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
-            LikelihoodFamily::PoissonLog => {
-                Err("PoissonLog uses blockwise custom family fitting and is not a GLM likelihood")
-            }
-            LikelihoodFamily::GammaLog => {
-                Err("GammaLog uses blockwise custom family fitting and is not a GLM likelihood")
-            }
+            LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
+            LikelihoodFamily::GammaLog => Ok(Self::GammaLog),
             LikelihoodFamily::RoystonParmar => {
                 Err("RoystonParmar is survival-specific and not a GLM likelihood")
             }
@@ -230,6 +228,8 @@ impl From<GlmLikelihoodFamily> for LikelihoodFamily {
             GlmLikelihoodFamily::BinomialSas => Self::BinomialSas,
             GlmLikelihoodFamily::BinomialBetaLogistic => Self::BinomialBetaLogistic,
             GlmLikelihoodFamily::BinomialMixture => Self::BinomialMixture,
+            GlmLikelihoodFamily::PoissonLog => Self::PoissonLog,
+            GlmLikelihoodFamily::GammaLog => Self::GammaLog,
         }
     }
 }

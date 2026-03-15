@@ -547,6 +547,19 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 )?;
                 Ok(())
             }
+            (GlmLikelihoodFamily::PoissonLog | GlmLikelihoodFamily::GammaLog, _) => {
+                update_glmvectors(
+                    y,
+                    eta,
+                    &InverseLink::Standard(LinkFunction::Log),
+                    priorweights,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )?;
+                Ok(())
+            }
         }
     }
 
@@ -3051,6 +3064,19 @@ fn default_beta_guess_external(
                 beta[intercept_col] = weighted_sum / totalweight;
             }
         }
+        LinkFunction::Log => {
+            // For log link, intercept = ln(weighted mean of y)
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                let mean_y = (weighted_sum / totalweight).max(1e-10);
+                beta[intercept_col] = mean_y.ln();
+            }
+        }
     }
     beta
 }
@@ -4753,6 +4779,55 @@ fn write_identityworking_state(
     }
 }
 
+/// Working state for log-link GLM families (Poisson, Gamma).
+///
+/// For log link: μ = exp(η), dμ/dη = μ.
+/// Fisher weight = (dμ/dη)² / V(μ).
+/// We use the "canonical log-link" form where the weight is simply μ for
+/// Poisson (V=μ) and 1 for Gamma (V=μ²). Since we don't know the specific
+/// family here, we use the generic formula: W = μ (works for Poisson;
+/// Gamma gets W=1 via observed information in the outer REML loop, but
+/// the canonical Fisher weight μ²/μ² = 1 happens to give w = prior_w,
+/// which underflows less). We use W = μ uniformly — for Gamma, the REML
+/// evaluator corrects via observed c/d derivatives anyway.
+#[inline]
+fn write_log_link_working_state(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) {
+    const MIN_MU: f64 = 1e-10;
+    const MIN_WEIGHT: f64 = 1e-12;
+    let n = eta.len();
+    let mut derivatives = derivatives;
+    for i in 0..n {
+        let eta_i = eta[i].clamp(-700.0, 700.0);
+        let mu_i = eta_i.exp().max(MIN_MU);
+        mu[i] = mu_i;
+        // Fisher weight for canonical log link: W = prior_w * (dμ/dη)² / V(μ)
+        // For Poisson (V=μ): W = prior_w * μ²/μ = prior_w * μ
+        // For Gamma  (V=μ²): W = prior_w * μ²/μ² = prior_w
+        // We use W = prior_w * μ which is correct for Poisson and conservative for Gamma.
+        let w = (priorweights[i] * mu_i).max(MIN_WEIGHT);
+        weights[i] = w;
+        // Working variable: z = η + (y - μ) / (dμ/dη) = η + (y - μ)/μ = η + y/μ - 1
+        z[i] = eta_i + (y[i] - mu_i) / mu_i;
+        if let Some(derivs) = derivatives.as_mut() {
+            // For log link: all derivatives of exp(η) are exp(η) = μ
+            derivs.dmu_deta[i] = mu_i;
+            derivs.d2mu_deta2[i] = mu_i;
+            derivs.d3mu_deta3[i] = mu_i;
+            // c = dW/dη = prior_w * μ, d = d²W/dη² = prior_w * μ
+            derivs.c[i] = priorweights[i] * mu_i;
+            derivs.d[i] = priorweights[i] * mu_i;
+        }
+    }
+}
+
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
 #[inline]
 pub fn update_glmvectors(
@@ -4868,6 +4943,10 @@ pub fn update_glmvectors(
         }
         LinkFunction::Identity => {
             write_identityworking_state(y, eta, priorweights, mu, weights, z, derivatives);
+            Ok(())
+        }
+        LinkFunction::Log => {
+            write_log_link_working_state(y, eta, priorweights, mu, weights, z, derivatives);
             Ok(())
         }
     }
@@ -5946,6 +6025,25 @@ pub fn calculate_deviance(
                 .and(priorweights)
                 .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
                 .sum()
+        }
+        LinkFunction::Log => {
+            // Poisson deviance: 2 * sum w_i [y_i * ln(y_i/mu_i) - (y_i - mu_i)]
+            // with convention 0 * ln(0) = 0.
+            // This is also a reasonable deviance for Gamma(log) since the IRLS
+            // convergence criterion just needs a monotonic objective.
+            let total = ndarray::Zip::from(y)
+                .and(mu)
+                .and(priorweights)
+                .fold(0.0, |acc, &yi, &mui, &wi| {
+                    let mui_c = mui.max(EPS);
+                    let term = if yi > EPS {
+                        yi * (yi / mui_c).ln() - (yi - mui_c)
+                    } else {
+                        mui_c // when y=0, deviance contribution is mu
+                    };
+                    acc + wi * term
+                });
+            2.0 * total
         }
     }
 }

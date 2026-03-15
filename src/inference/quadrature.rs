@@ -2196,14 +2196,30 @@ pub fn integrated_family_moments_jetwith_state(
         LikelihoodFamily::BinomialMixture => Err(EstimationError::InvalidInput(
             "Integrated moments dispatcher does not support binomial mixture links yet".to_string(),
         )),
-        LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-            "Integrated moments dispatcher does not support PoissonLog; use fit_poisson_log outputs directly"
-                .to_string(),
-        )),
-        LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-            "Integrated moments dispatcher does not support GammaLog; use fit_gamma_log outputs directly"
-                .to_string(),
-        )),
+        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            // Log-normal MGF: E[exp(η)] = exp(e + s²/2)
+            // d/de = exp(e + s²/2)   (same as the mean)
+            // d²/de² = exp(e + s²/2)
+            // d³/de³ = exp(e + s²/2)
+            let s2 = se * se;
+            let mean = (e + 0.5 * s2).exp();
+            // Variance of the response depends on family:
+            //   Poisson: Var = mean (since Var[Y|mu] = mu)
+            //   Gamma:   Var = mean² / shape, but shape not available here;
+            //            use mean² as proxy (shape=1).
+            let variance = match family {
+                LikelihoodFamily::PoissonLog => mean,
+                _ => mean * mean,
+            };
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance,
+                d1: mean,
+                d2: mean,
+                d3: mean,
+                mode: IntegratedExpectationMode::ExactClosedForm,
+            })
+        }
     }
 }
 

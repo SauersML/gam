@@ -1238,12 +1238,8 @@ fn resolve_external_family(
             Ok((LinkFunction::BetaLogistic, false))
         }
         crate::types::LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
-        crate::types::LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-            "optimize_external_design does not support PoissonLog; use fit_poisson_log".to_string(),
-        )),
-        crate::types::LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-            "optimize_external_design does not support GammaLog; use fit_gamma_log".to_string(),
-        )),
+        crate::types::LikelihoodFamily::PoissonLog => Ok((LinkFunction::Log, false)),
+        crate::types::LikelihoodFamily::GammaLog => Ok((LinkFunction::Log, false)),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -1588,6 +1584,7 @@ where
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
+                force_solver: None,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
@@ -1695,6 +1692,7 @@ where
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
+                force_solver: None,
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let rho = theta.slice(s![..k]).to_owned();
@@ -3472,12 +3470,10 @@ impl UnifiedFitResult {
                     "BinomialMixture requires fitted mixture link parameters".to_string(),
                 )),
             },
-            crate::types::LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-                "fitted_link_state is not defined for PoissonLog".to_string(),
-            )),
-            crate::types::LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-                "fitted_link_state is not defined for GammaLog".to_string(),
-            )),
+            crate::types::LikelihoodFamily::PoissonLog
+            | crate::types::LikelihoodFamily::GammaLog => {
+                Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))
+            }
             crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "fitted_link_state is not defined for RoystonParmar".to_string(),
             )),

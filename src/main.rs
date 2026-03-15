@@ -378,6 +378,8 @@ enum FamilyArg {
     BinomialLogit,
     BinomialProbit,
     BinomialCloglog,
+    PoissonLog,
+    GammaLog,
     RoystonParmar,
 }
 
@@ -4632,6 +4634,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     n_params: dim,
                     all_penalty_like: false,
                     barrier_config: None,
+                    force_solver: None,
                 },
                 cost_fn: |state: &mut (), rho: &Array1<f64>| {
                     let _ = state;
@@ -9043,6 +9046,8 @@ fn resolve_family(
         FamilyArg::BinomialLogit => LikelihoodFamily::BinomialLogit,
         FamilyArg::BinomialProbit => LikelihoodFamily::BinomialProbit,
         FamilyArg::BinomialCloglog => LikelihoodFamily::BinomialCLogLog,
+        FamilyArg::PoissonLog => LikelihoodFamily::PoissonLog,
+        FamilyArg::GammaLog => LikelihoodFamily::GammaLog,
         FamilyArg::RoystonParmar => LikelihoodFamily::RoystonParmar,
         FamilyArg::Auto => {
             if is_binary_response(y) {
@@ -9061,6 +9066,8 @@ fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
         FamilyArg::BinomialLogit => Some(LikelihoodFamily::BinomialLogit),
         FamilyArg::BinomialProbit => Some(LikelihoodFamily::BinomialProbit),
         FamilyArg::BinomialCloglog => Some(LikelihoodFamily::BinomialCLogLog),
+        FamilyArg::PoissonLog => Some(LikelihoodFamily::PoissonLog),
+        FamilyArg::GammaLog => Some(LikelihoodFamily::GammaLog),
         FamilyArg::RoystonParmar => Some(LikelihoodFamily::RoystonParmar),
     }
 }

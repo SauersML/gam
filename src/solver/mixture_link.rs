@@ -600,6 +600,15 @@ impl InverseLinkKernel for LinkFunction {
                 d2: 0.0,
                 d3: 0.0,
             }),
+            LinkFunction::Log => {
+                let e = eta.clamp(-700.0, 700.0).exp();
+                Ok(InverseLinkJet {
+                    mu: e,
+                    d1: e,
+                    d2: e,
+                    d3: e,
+                })
+            }
             LinkFunction::Sas => Err(EstimationError::InvalidInput(
                 "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
             )),
@@ -716,6 +725,10 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     // because the mixture weights `pi_j` are constant with respect to `eta`.
     match link {
         InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
+        InverseLink::Standard(LinkFunction::Log) => {
+            // For log link: g⁻¹(η) = exp(η), all derivatives = exp(η).
+            Ok(eta.clamp(-700.0, 700.0).exp())
+        }
         InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdfthird_derivative(eta)),
         InverseLink::Standard(LinkFunction::Logit) => Ok(
             component_inverse_link_pdfthird_derivative(LinkComponent::Logit, eta),
@@ -838,14 +851,9 @@ pub fn inverse_link_jet_for_family(
                 sas_link_state,
             )
         }
-        LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-            "PoissonLog inverse-link jet is not defined in mixture-link dispatcher; use fit_poisson_log outputs directly"
-                .to_string(),
-        )),
-        LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-            "GammaLog inverse-link jet is not defined in mixture-link dispatcher; use fit_gamma_log outputs directly"
-                .to_string(),
-        )),
+        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            inverse_link_jet_for_link_function(LinkFunction::Log, eta, mixture_link_state, sas_link_state)
+        }
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "RoystonParmar inverse-link jet is not defined in mixture-link dispatcher".to_string(),
         )),
