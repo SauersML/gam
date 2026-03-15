@@ -80,10 +80,9 @@ pub use solver::estimate::{
 };
 pub use solver::workflow::{
     BinomialLocationScaleWorkflowRequest, FitModelRequest, FitModelResult,
-    FlexibleLinkWorkflowRequest, FlexibleLinkWorkflowResult, GaussianLocationScaleWorkflowRequest,
-    LinkWiggleWorkflowConfig, StandardBinomialWiggleWorkflowConfig, StandardFitWorkflowRequest,
-    StandardFitWorkflowResult, SurvivalLocationScaleWorkflowRequest,
-    SurvivalLocationScaleWorkflowResult, fit_model,
+    GaussianLocationScaleWorkflowRequest, LinkWiggleWorkflowConfig,
+    StandardBinomialWiggleWorkflowConfig, StandardFitWorkflowRequest, StandardFitWorkflowResult,
+    SurvivalLocationScaleWorkflowRequest, SurvivalLocationScaleWorkflowResult, fit_model,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,

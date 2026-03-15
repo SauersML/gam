@@ -478,10 +478,20 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Returns the eta-derivative carriers for the exact Hessian surface that
-    /// PIRLS accepted at the mode. For canonical links these coincide with the
-    /// Fisher arrays; for non-canonical links they carry the clamped observed-
-    /// information curvature used on the PIRLS left-hand side.
+    /// Returns the eta-derivative carriers (c = dW/deta, d = d^2W/deta^2) for
+    /// the exact Hessian surface that PIRLS accepted at the mode.
+    ///
+    /// For canonical links these coincide with the Fisher arrays; for
+    /// non-canonical links they carry the clamped **observed-information**
+    /// curvature used on the PIRLS left-hand side, including the residual-
+    /// dependent corrections:
+    ///   c_obs = c_Fisher + h'*B - (y-mu)*B_eta
+    ///   d_obs = d_Fisher + h''*B + 2*h'*B_eta - (y-mu)*B_etaeta
+    ///
+    /// These flow into the outer REML gradient's C[v] correction term and
+    /// the outer Hessian's Q[v_k, v_l] correction term. Using the observed
+    /// versions is required for the exact Laplace approximation; Fisher
+    /// versions would yield a PQL-type surrogate. See response.md Section 3.
     fn hessian_cd_arrays(
         &self,
         pirls_result: &PirlsResult,
@@ -574,10 +584,17 @@ impl<'a> RemlState<'a> {
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
     /// PIRLS folds any stabilization ridge directly into the penalized objective:
-    ///   l_p(β; ρ) = l(β) - 0.5 * βᵀ (S_λ + ridge I) β.
+    ///   l_p(beta; rho) = l(beta) - 0.5 * beta^T (S_lambda + ridge I) beta.
     /// Therefore the curvature used in LAML is
-    ///   H_eff = X'W_HX + S_λ + ridge I,
+    ///   H_eff = X' W_H X + S_lambda + ridge I,
     /// and adding another ridge here places the Laplace expansion on a different surface.
+    ///
+    /// IMPORTANT: W_H here is the **observed-information** weight for non-canonical
+    /// links (or Fisher weight for canonical links, where the two coincide). The
+    /// `stabilizedhessian_transformed` from PIRLS was assembled with the Hessian-side
+    /// weights (`lasthessian_weights`), which are observed when PIRLS accepted that
+    /// curvature. This ensures log|H_eff| in the outer REML uses the correct Laplace
+    /// Hessian. See response.md Section 3 for the mathematical justification.
     ///
     pub(super) fn effectivehessian(
         &self,

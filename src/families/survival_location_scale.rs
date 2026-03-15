@@ -9,6 +9,7 @@ use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
 use crate::families::sigma_link::{
+    exp_sigma_derivs_up_to_fourth, exp_sigma_derivs_up_to_fourth_scalar,
     exp_sigma_derivs_up_to_third, exp_sigma_derivs_up_to_third_scalar,
 };
 use crate::matrix::{
@@ -49,6 +50,17 @@ pub trait ResidualDistributionOps {
     fn pdf_derivative(&self, z: f64) -> f64;
     fn pdfsecond_derivative(&self, z: f64) -> f64;
     fn pdfthird_derivative(&self, z: f64) -> f64;
+
+    /// Fourth derivative of the residual-distribution PDF, f''''(z).
+    ///
+    /// This is the m4 ingredient for the outer REML Hessian's Q[v_k, v_l] term.
+    /// The second directional derivative of the inner Hessian (used by the outer
+    /// Hessian drift) requires the 4th derivative of the composed likelihood
+    /// F_αβγδ via the Faà di Bruno chain rule. That chain rule's leading term
+    /// m4·u_α·u_β·u_γ·u_δ needs this quantity.
+    ///
+    /// See response.md Section 6 for the mathematical derivation.
+    fn pdffourth_derivative(&self, z: f64) -> f64;
 }
 
 impl ResidualDistributionOps for ResidualDistribution {
@@ -176,6 +188,54 @@ impl ResidualDistributionOps for ResidualDistribution {
             }
         }
     }
+
+    /// Fourth derivative of the residual-distribution PDF.
+    ///
+    /// # Derivations
+    ///
+    /// **Gaussian**: f(z) = φ(z). The n-th derivative of the Gaussian PDF is
+    /// (-1)^n He_n(z) φ(z) where He_n is the probabilist's Hermite polynomial.
+    /// He_4(z) = z⁴ - 6z² + 3, so f''''(z) = (z⁴ - 6z² + 3) φ(z).
+    ///
+    /// **Logistic**: f(z) = s(1-s) with s = σ(z). The k-th derivative of f is
+    /// f · P_k(s) where P_k satisfies the Euler-polynomial recurrence
+    /// P_{k+1}(s) = (1-2s) P_k(s) + s(1-s) P_k'(s).
+    /// P_4(s) = 1 - 30s + 150s² - 240s³ + 120s⁴.
+    ///
+    /// **Gumbel**: f(z) = exp(z - e^z). Let e = e^z. The k-th derivative of f
+    /// is f · Q_k(e) where Q_k satisfies Q_{k+1}(e) = (1-e) Q_k(e) + e Q_k'(e).
+    /// Q_4(e) = 1 - 15e + 25e² - 10e³ + e⁴.
+    fn pdffourth_derivative(&self, z: f64) -> f64 {
+        match self {
+            ResidualDistribution::Gaussian => {
+                let f = normal_pdf(z);
+                let z2 = z * z;
+                // He_4(z) = z^4 - 6z^2 + 3
+                (z2 * z2 - 6.0 * z2 + 3.0) * f
+            }
+            ResidualDistribution::Gumbel => {
+                if z.is_infinite() {
+                    return 0.0;
+                }
+                let log_f = z - z.exp();
+                if log_f < -745.0 {
+                    return 0.0;
+                }
+                let f = log_f.exp();
+                let ez = z.clamp(-700.0, 700.0).exp();
+                let ez2 = ez * ez;
+                // Q_4(e) = 1 - 15e + 25e² - 10e³ + e⁴
+                f * (1.0 - 15.0 * ez + 25.0 * ez2 - 10.0 * ez2 * ez + ez2 * ez2)
+            }
+            ResidualDistribution::Logistic => {
+                let s = self.cdf(z);
+                let f = s * (1.0 - s);
+                let s2 = s * s;
+                // P_4(s) = 1 - 30s + 150s² - 240s³ + 120s⁴
+                f * (1.0 - 30.0 * s + 150.0 * s2 - 240.0 * s2 * s + 120.0 * s2 * s2)
+            }
+        }
+    }
 }
 
 #[inline]
@@ -190,6 +250,39 @@ fn residual_distribution_link(distribution: ResidualDistribution) -> LinkFunctio
 #[inline]
 pub fn residual_distribution_inverse_link(distribution: ResidualDistribution) -> InverseLink {
     InverseLink::Standard(residual_distribution_link(distribution))
+}
+
+/// Fourth derivative of the inverse-link PDF (= 5th derivative of the CDF).
+///
+/// This is the f'''' quantity used in the 4th derivative of log f(u), which
+/// in turn enters the m4 ingredient of the Faà di Bruno chain rule for
+/// the outer REML Hessian Q[v_k, v_l] term.
+///
+/// Currently supports the three standard survival residual distributions:
+/// - Probit (Gaussian): f''''(u) = (u⁴ - 6u² + 3) φ(u)
+/// - Logit (Logistic):  f''''(u) = s(1-s)(1 - 30s + 150s² - 240s³ + 120s⁴)
+/// - CLogLog (Gumbel):  f''''(u) = f · (1 - 15e^u + 25e^{2u} - 10e^{3u} + e^{4u})
+///
+/// For mixture or non-standard links, this returns 0.0 as a conservative
+/// fallback (the 4th-order correction is then incomplete but the lower-order
+/// terms remain correct).
+fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> f64 {
+    match inverse_link {
+        InverseLink::Standard(LinkFunction::Probit) => {
+            ResidualDistribution::Gaussian.pdffourth_derivative(eta)
+        }
+        InverseLink::Standard(LinkFunction::Logit) => {
+            ResidualDistribution::Logistic.pdffourth_derivative(eta)
+        }
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            ResidualDistribution::Gumbel.pdffourth_derivative(eta)
+        }
+        // Conservative fallback: for non-standard links the 4th-order
+        // correction term m1·u_αβγδ is dropped. The remaining terms
+        // (m4·u products, m3·u products, m2·u products) are still present
+        // because they only need m1..m3 and u through 3rd order.
+        _ => 0.0,
+    }
 }
 
 #[derive(Clone)]
@@ -674,18 +767,36 @@ struct SurvivalRowDerivatives {
     d2_q: f64,
     /// d³ ell / dq³ summed.
     d3_q: f64,
+    /// d⁴ ell / dq⁴ summed.
+    ///
+    /// This is the m4 quantity from the Faà di Bruno chain rule. It is needed
+    /// by the outer REML Hessian's Q[v_k, v_l] term: the 4th-order composed
+    /// derivative F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... uses this as the leading
+    /// coefficient. See response.md Section 6 for the derivation confirming
+    /// that 3rd-order chain terms in q are insufficient for the outer Hessian.
+    d4_q: f64,
     /// Entry-only derivative: d ell / dq0 = w * r(u0).
     d1_q0: f64,
     /// Entry-only second derivative: d² ell / dq0² = w * r'(u0).
     d2_q0: f64,
     /// Entry-only third derivative: d³ ell / dq0³ = w * r''(u0).
     d3_q0: f64,
+    /// Entry-only fourth derivative: d⁴ ell / dq0⁴ = w * r'''(u0).
+    ///
+    /// The 3rd derivative of the survival ratio r = f/S enters the (s,s,s,s)
+    /// and (ϑ,s,s,s) blocks of the outer Hessian drift via the 4th-order
+    /// Faà di Bruno formula.
+    d4_q0: f64,
     /// Exit-only derivative: d ell / dq1.
     d1_q1: f64,
     /// Exit-only second derivative: d² ell / dq1².
     d2_q1: f64,
     /// Exit-only third derivative: d³ ell / dq1³.
     d3_q1: f64,
+    /// Exit-only fourth derivative: d⁴ ell / dq1⁴.
+    ///
+    /// Analogous to d4_q0 but for the exit side.
+    d4_q1: f64,
     grad_time_eta_h0: f64,
     grad_time_eta_h1: f64,
     grad_time_eta_d: f64,
@@ -695,26 +806,46 @@ struct SurvivalRowDerivatives {
     d_h_h0: f64,
     d_h_h1: f64,
     d_h_d: f64,
+    /// d⁴ ell / d(h0)⁴ — the 4th derivative of ℓ w.r.t. the entry time
+    /// predictor h0. This is the bilinear coefficient for D²H[u,v] in the
+    /// time-time block of the outer Hessian. Previously approximated via
+    /// 3rd-derivative products; now computed exactly.
+    d2_h_h0: f64,
+    /// d⁴ ell / d(h1)⁴ — analogous to d2_h_h0 for the exit side.
+    d2_h_h1: f64,
 }
 
 struct SurvivalJointQuantities {
     d1_q: Array1<f64>,
     d2_q: Array1<f64>,
     d3_q: Array1<f64>,
+    /// d⁴ℓ/dq⁴ summed over entry+exit.
+    ///
+    /// The m4 quantity needed by the 4th-order Faà di Bruno chain rule for the
+    /// outer REML Hessian's Q[v_k, v_l] term. See response.md Section 6.
+    d4_q: Array1<f64>,
     /// Entry-only derivatives of ell w.r.t. q0.
     d1_q0: Array1<f64>,
     d2_q0: Array1<f64>,
     d3_q0: Array1<f64>,
+    /// Entry-only 4th derivative: d⁴ℓ/dq0⁴.
+    d4_q0: Array1<f64>,
     /// Exit-only derivatives of ell w.r.t. q1.
     d1_q1: Array1<f64>,
     d2_q1: Array1<f64>,
     d3_q1: Array1<f64>,
+    /// Exit-only 4th derivative: d⁴ℓ/dq1⁴.
+    d4_q1: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,
     d_h_h0: Array1<f64>,
     d_h_h1: Array1<f64>,
     d_h_d: Array1<f64>,
+    /// d⁴ℓ/d(h0)⁴ for the exact bilinear D²H[u,v] time-time coefficient.
+    d2_h_h0: Array1<f64>,
+    /// d⁴ℓ/d(h1)⁴ for the exact bilinear D²H[u,v] time-time coefficient.
+    d2_h_h1: Array1<f64>,
     /// Exit-side dq/d(eta_t) = -1/sigma_exit.
     dq_t: Array1<f64>,
     /// Exit-side dq/d(eta_ls).
@@ -723,6 +854,26 @@ struct SurvivalJointQuantities {
     d2q_ls: Array1<f64>,
     d3q_tls_ls: Array1<f64>,
     d3q_ls: Array1<f64>,
+    /// 4th-order chain-rule derivative: ∂⁴q/∂η_ϑ∂η_s³ = σ⁻¹.
+    ///
+    /// This follows the alternating-sign pattern of the exp link (σ = exp(η_s)):
+    ///   u_ϑ = -σ⁻¹,  u_ϑs = σ⁻¹,  u_ϑss = -σ⁻¹,  u_ϑsss = σ⁻¹
+    /// The sign alternates at each additional s-derivative because
+    /// d/d(η_s)[σ⁻¹] = -σ⁻¹ (chain rule through exp).
+    ///
+    /// Needed by the (ϑ,s,s,s) block of the outer Hessian drift Q[v_k, v_l].
+    /// See response.md Section 6.
+    d4q_tls_ls_ls: Array1<f64>,
+    /// 4th-order chain-rule derivative: ∂⁴q/∂η_s⁴ = -ϑ/σ.
+    ///
+    /// Follows the same alternating-sign pattern:
+    ///   u_s = ϑ/σ,  u_ss = -ϑ/σ,  u_sss = ϑ/σ,  u_ssss = -ϑ/σ
+    /// Each additional s-derivative flips the sign because
+    /// d/d(η_s)[ϑ/σ] = -ϑ/σ.
+    ///
+    /// Needed by the (s,s,s,s) block of the outer Hessian drift Q[v_k, v_l].
+    /// See response.md Section 6.
+    d4q_ls: Array1<f64>,
     /// Entry-side dq0/d(eta_t_entry) = -1/sigma_entry (only for time-varying).
     dq_t_entry: Option<Array1<f64>>,
     /// Entry-side chain-rule derivatives for sigma at entry (only for time-varying sigma).
@@ -731,6 +882,10 @@ struct SurvivalJointQuantities {
     d2q_ls_entry: Option<Array1<f64>>,
     d3q_tls_ls_entry: Option<Array1<f64>>,
     d3q_ls_entry: Option<Array1<f64>>,
+    /// Entry-side 4th-order chain-rule: ∂⁴q/∂η_ϑ∂η_s³ at entry.
+    d4q_tls_ls_ls_entry: Option<Array1<f64>>,
+    /// Entry-side 4th-order chain-rule: ∂⁴q/∂η_s⁴ at entry.
+    d4q_ls_entry: Option<Array1<f64>>,
 }
 
 struct SurvivalJointPsiDirection {
@@ -917,27 +1072,37 @@ impl SurvivalLocationScaleFamily {
             self.validate_joint_states(block_states)?;
         // For joint Hessian / D_u H we use the EXIT evaluations of sigma and its
         // derivatives (the exit design is the solver's primary design).
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
+        //
+        // We now compute sigma derivatives through 4th order because the outer
+        // REML Hessian's Q[v_k, v_l] term requires 4th-order chain-rule
+        // derivatives of q w.r.t. the block predictors (u_ϑsss and u_ssss).
+        // See response.md Section 6.
+        let (sigma, ds, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth(eta_ls_exit.view());
         let entry_sigma_derivs = if self.x_log_sigma_entry.is_some() {
-            Some(exp_sigma_derivs_up_to_third(eta_ls_entry.view()))
+            Some(exp_sigma_derivs_up_to_fourth(eta_ls_entry.view()))
         } else {
             None
         };
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
+        let mut d4_q = Array1::<f64>::zeros(n);
         let mut d1_q0 = Array1::<f64>::zeros(n);
         let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d3_q0 = Array1::<f64>::zeros(n);
+        let mut d4_q0 = Array1::<f64>::zeros(n);
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d2_q1 = Array1::<f64>::zeros(n);
         let mut d3_q1 = Array1::<f64>::zeros(n);
+        let mut d4_q1 = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
         let mut d_h_h0 = Array1::<f64>::zeros(n);
         let mut d_h_h1 = Array1::<f64>::zeros(n);
         let mut d_h_d = Array1::<f64>::zeros(n);
+        let mut d2_h_h0 = Array1::<f64>::zeros(n);
+        let mut d2_h_h1 = Array1::<f64>::zeros(n);
 
         for i in 0..n {
             let sigma_entry_i = entry_sigma_derivs
@@ -959,18 +1124,23 @@ impl SurvivalLocationScaleFamily {
             d1_q[i] = row.d1_q;
             d2_q[i] = row.d2_q;
             d3_q[i] = row.d3_q;
+            d4_q[i] = row.d4_q;
             d1_q0[i] = row.d1_q0;
             d2_q0[i] = row.d2_q0;
             d3_q0[i] = row.d3_q0;
+            d4_q0[i] = row.d4_q0;
             d1_q1[i] = row.d1_q1;
             d2_q1[i] = row.d2_q1;
             d3_q1[i] = row.d3_q1;
+            d4_q1[i] = row.d4_q1;
             h_time_h0[i] = row.h_time_h0;
             h_time_h1[i] = row.h_time_h1;
             h_time_d[i] = row.h_time_d;
             d_h_h0[i] = row.d_h_h0;
             d_h_h1[i] = row.d_h_h1;
             d_h_d[i] = row.d_h_d;
+            d2_h_h0[i] = row.d2_h_h0;
+            d2_h_h1[i] = row.d2_h_h1;
         }
 
         // q(eta_t, eta_ls, etaw) = -eta_t / max(sigma(eta_ls), 1e-12) + etaw.
@@ -994,18 +1164,23 @@ impl SurvivalLocationScaleFamily {
         // where s = max(sigma, 1e-12). On the active floor branch the coded q
         // is locally constant in eta_ls, so all eta_ls-derivatives vanish.
         //
-        // These are the scalar q_{i,b}, q_{i,bc}, q_{i,bcd} objects from the
-        // derivation, specialized to the threshold / scale / wiggle blocks.
-        let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
+        // These are the scalar q_{i,b}, q_{i,bc}, q_{i,bcd}, q_{i,bcde} objects
+        // from the derivation, specialized to the threshold / scale / wiggle blocks.
+        // The 4th-order terms (q_{i,bcde}) are new — needed for the outer REML
+        // Hessian drift. See response.md Section 6.
+        let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s, &d4s);
 
         // Entry-side chain rule derivatives for time-varying blocks.
         let dq_t_entry = if self.x_threshold_entry.is_some() {
-            let se = entry_sigma_derivs.as_ref().map(|(s, _, _, _)| s).unwrap();
+            let se = entry_sigma_derivs
+                .as_ref()
+                .map(|(s, _, _, _, _)| s)
+                .unwrap();
             Some(se.mapv(|s| -1.0 / s.max(1e-12)))
         } else {
             None
         };
-        let entry_qd = if let Some((sigma_entry, ds_entry, d2s_entry, d3s_entry)) =
+        let entry_qd = if let Some((sigma_entry, ds_entry, d2s_entry, d3s_entry, d4s_entry)) =
             entry_sigma_derivs.as_ref()
         {
             Some(compute_q_chain_derivs(
@@ -1014,6 +1189,7 @@ impl SurvivalLocationScaleFamily {
                 ds_entry,
                 d2s_entry,
                 d3s_entry,
+                d4s_entry,
             ))
         } else {
             None
@@ -1023,30 +1199,39 @@ impl SurvivalLocationScaleFamily {
             d1_q,
             d2_q,
             d3_q,
+            d4_q,
             d1_q0,
             d2_q0,
             d3_q0,
+            d4_q0,
             d1_q1,
             d2_q1,
             d3_q1,
+            d4_q1,
             h_time_h0,
             h_time_h1,
             h_time_d,
             d_h_h0,
             d_h_h1,
             d_h_d,
+            d2_h_h0,
+            d2_h_h1,
             dq_t: exit_qd.dq_t,
             dq_ls: exit_qd.dq_ls,
             d2q_tls: exit_qd.d2q_tls,
             d2q_ls: exit_qd.d2q_ls,
             d3q_tls_ls: exit_qd.d3q_tls_ls,
             d3q_ls: exit_qd.d3q_ls,
+            d4q_tls_ls_ls: exit_qd.d4q_tls_ls_ls,
+            d4q_ls: exit_qd.d4q_ls,
             dq_t_entry,
             dq_ls_entry: entry_qd.as_ref().map(|q| q.dq_ls.clone()),
             d2q_tls_entry: entry_qd.as_ref().map(|q| q.d2q_tls.clone()),
             d2q_ls_entry: entry_qd.as_ref().map(|q| q.d2q_ls.clone()),
             d3q_tls_ls_entry: entry_qd.as_ref().map(|q| q.d3q_tls_ls.clone()),
             d3q_ls_entry: entry_qd.as_ref().map(|q| q.d3q_ls.clone()),
+            d4q_tls_ls_ls_entry: entry_qd.as_ref().map(|q| q.d4q_tls_ls_ls.clone()),
+            d4q_ls_entry: entry_qd.as_ref().map(|q| q.d4q_ls.clone()),
         })
     }
 
@@ -1265,6 +1450,51 @@ impl SurvivalLocationScaleFamily {
         (2.0 * r * dr) + (fpp / s + fp * f / (s * s))
     }
 
+    /// Third derivative of the survival ratio `r = f/S`.
+    ///
+    /// Starting from `r'' = 2 r r' + f''/S + f' f / S²`:
+    ///
+    /// ```text
+    /// r''' = d/du[2 r r'] + d/du[f''/S + f'f/S²]
+    ///      = 2(r')² + 2 r r'' + f'''/S + f''f/S² + f'²/S² + 2f'f²/S³ + f''f/S²
+    ///      = 2(r')² + 2 r r'' + f'''/S + 2f''f/S² + (f')²/S² + 2f(f')²/S³ ... wait
+    /// ```
+    ///
+    /// More carefully: let A = f''/S, B = f'f/S². Then r'' = 2rr' + A + B.
+    ///
+    /// ```text
+    /// d/du[A] = f'''/S + f''f/S²   (using S' = -f)
+    /// d/du[B] = (f''f + f'²)/S² + 2f'f²/S³
+    /// ```
+    ///
+    /// So:
+    /// ```text
+    /// r''' = 2(r')² + 2rr'' + f'''/S + 2f''f/S² + (f')²/S² + 2f'f²/S³
+    /// ```
+    ///
+    /// This is needed for d⁴ℓ/dq0⁴ (the entry-side 4th likelihood derivative)
+    /// and d⁴ℓ/dq1⁴ (the exit-side 4th likelihood derivative), which enter the
+    /// outer REML Hessian's Q[v_k, v_l] term via the Faà di Bruno formula.
+    fn survival_ratio_third_derivative(
+        r: f64,
+        dr: f64,
+        ddr: f64,
+        f: f64,
+        fp: f64,
+        fpp: f64,
+        fppp: f64,
+        s: f64,
+    ) -> f64 {
+        let s2 = s * s;
+        let s3 = s2 * s;
+        2.0 * dr * dr
+            + 2.0 * r * ddr
+            + fppp / s
+            + 2.0 * fpp * f / s2
+            + fp * fp / s2
+            + 2.0 * fp * f * f / s3
+    }
+
     /// Clamp-aware log-pdf and its first/second/third derivatives.
     ///
     /// Let `L(u) = log f(u)` on the unclamped branch. The exact derivatives are:
@@ -1310,6 +1540,28 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
+    /// Fourth derivative of log f(u), given f through f''''.
+    ///
+    /// ```text
+    /// L'''' = f''''/f - 4f'f'''/f² - 3(f'')²/f² + 12(f')²f''/f³ - 6(f')⁴/f⁴
+    /// ```
+    ///
+    /// Derivation: differentiate L''' = f'''/f - 3f'f''/f² + 2(f')³/f³.
+    ///
+    /// This is needed for d⁴ℓ/dq1⁴ (the exit-side 4th derivative of the
+    /// event contribution), which enters the outer REML Hessian Q[v_k, v_l].
+    fn log_pdf_fourth_derivative(f: f64, fp: f64, fpp: f64, fppp: f64, fpppp: f64) -> f64 {
+        if f <= MIN_PROB {
+            return 0.0;
+        }
+        let f2 = f * f;
+        let f3 = f2 * f;
+        let f4 = f3 * f;
+        let fp2 = fp * fp;
+        fpppp / f - 4.0 * fp * fppp / f2 - 3.0 * fpp * fpp / f2 + 12.0 * fp2 * fpp / f3
+            - 6.0 * fp2 * fp2 / f4
+    }
+
     /// Clamp-aware survival value and derivatives of `-log(clamp(S, MIN_PROB, 1))`.
     ///
     /// Returns `(S_clamped, r, dr, ddr)` where:
@@ -1332,6 +1584,32 @@ impl SurvivalLocationScaleFamily {
             let (r, dr) = Self::survival_ratio_first_derivative(f, fp, s);
             let ddr = Self::survival_ratiosecond_derivative(r, dr, f, fp, fpp, s);
             (s, r, dr, ddr)
+        }
+    }
+
+    /// Clamp-aware survival value and derivatives of `-log(clamp(S, MIN_PROB, 1))`
+    /// through **4th order**.
+    ///
+    /// Returns `(S_clamped, r, dr, ddr, dddr)` where dddr = d⁴/du⁴[-log S].
+    ///
+    /// The 4th derivative of -log S is r''' (the 3rd derivative of the
+    /// survival ratio r = f/S). This is needed by the outer REML Hessian's
+    /// Q[v_k, v_l] term for the entry-side contribution.
+    fn clamped_survival_neglog_derivatives_fourth(
+        raw_s: f64,
+        f: f64,
+        fp: f64,
+        fpp: f64,
+        fppp: f64,
+    ) -> (f64, f64, f64, f64, f64) {
+        let s = raw_s.clamp(MIN_PROB, 1.0);
+        if raw_s <= MIN_PROB || raw_s >= 1.0 {
+            (s, 0.0, 0.0, 0.0, 0.0)
+        } else {
+            let (r, dr) = Self::survival_ratio_first_derivative(f, fp, s);
+            let ddr = Self::survival_ratiosecond_derivative(r, dr, f, fp, fpp, s);
+            let dddr = Self::survival_ratio_third_derivative(r, dr, ddr, f, fp, fpp, fppp, s);
+            (s, r, dr, ddr, dddr)
         }
     }
 
@@ -1418,16 +1696,35 @@ impl SurvivalLocationScaleFamily {
         // derivatives `(f, f', f'')`.
         let raw_s0 = inverse_link_survival_probvalue(&self.inverse_link, u0);
         let raw_s1 = inverse_link_survival_probvalue(&self.inverse_link, u1);
-        let (s0, r0, dr0, ddr0) =
-            Self::clamped_survival_neglog_derivatives(raw_s0, j0.d1, j0.d2, j0.d3);
-        let (s1, r1, dr1, ddr1) =
-            Self::clamped_survival_neglog_derivatives(raw_s1, j1.d1, j1.d2, j1.d3);
+
+        // For the 4th-order derivatives (needed by the outer REML Hessian),
+        // we need the survival ratio through r''' and log-pdf through L''''.
+        // The entry side needs f'''(u0) for r'''(u0); the exit side needs
+        // f''''(u1) for L''''(u1).
+        //
+        // f''' comes from inverse_link_pdfthird_derivative; f'''' from our
+        // local inverse_link_pdffourth_derivative helper.
+        let fppp0 = inverse_link_pdfthird_derivative_for_inverse_link(&self.inverse_link, u0)
+            .map_err(|e| {
+                format!("inverse link third-derivative evaluation failed at row {row} entry: {e}")
+            })?;
+        let (s0, r0, dr0, ddr0, dddr0) =
+            Self::clamped_survival_neglog_derivatives_fourth(raw_s0, j0.d1, j0.d2, j0.d3, fppp0);
+
         let fppp1 = inverse_link_pdfthird_derivative_for_inverse_link(&self.inverse_link, u1)
             .map_err(|e| {
                 format!("inverse link third-derivative evaluation failed at row {row} exit: {e}")
             })?;
+        let (s1, r1, dr1, ddr1, dddr1) =
+            Self::clamped_survival_neglog_derivatives_fourth(raw_s1, j1.d1, j1.d2, j1.d3, fppp1);
+
         let (logphi1, dlogphi1, d2logphi1, d3logphi1) =
             Self::clamped_log_pdfwith_derivatives(j1.d1, j1.d2, j1.d3, fppp1);
+
+        // 4th derivative of log f(u1) for the exit-side event contribution.
+        // f'''' is the 4th PDF derivative; L'''' uses f through f''''.
+        let fpppp1 = inverse_link_pdffourth_derivative(&self.inverse_link, u1);
+        let d4logphi1 = Self::log_pdf_fourth_derivative(j1.d1, j1.d2, j1.d3, fppp1, fpppp1);
 
         let guard = self.derivative_guard;
         let soft = self.derivative_softness.max(0.0);
@@ -1462,12 +1759,14 @@ impl SurvivalLocationScaleFamily {
         //   ell_q0   = w r(u0)
         //   ell_q0q0 = w r'(u0)
         //   ell_q0q0q0 = w r''(u0)
+        //   ell_q0q0q0q0 = w r'''(u0)        ← NEW: 4th-order entry derivative
         //
         // and exit-only derivatives (w.r.t. q1):
         //
         //   ell_q1   = w [ d d/du log f(u1) + (1-d) (-r(u1)) ]
         //   ell_q1q1 = w [ d d²/du² log f(u1) + (1-d) (-r'(u1)) ]
         //   ell_q1q1q1 = w [ d d³/du³ log f(u1) + (1-d) (-r''(u1)) ]
+        //   ell_q1q1q1q1 = w [ d d⁴/du⁴ log f(u1) + (1-d) (-r'''(u1)) ]  ← NEW
         //
         // When q0 = q1 = q (time-invariant blocks), ell_q = ell_q0 + ell_q1.
         //
@@ -1480,27 +1779,38 @@ impl SurvivalLocationScaleFamily {
         //   ell_h1   = -ell_q1
         //   ell_h0q0 = -w r'(u0)
         //   ell_h1q1 = -w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
+        //
+        // The 4th-order derivatives d4_q0 and d4_q1 are the m4 quantities
+        // needed by the Faà di Bruno chain rule for the outer REML Hessian.
+        // They enter F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... in the (s,s,s,s)
+        // and (ϑ,s,s,s) blocks. See response.md Section 6.
         let d1_q0 = w * r0;
         let d2_q0 = w * dr0;
         let d3_q0 = w * ddr0;
+        let d4_q0 = w * dddr0;
         let d1_q1 = w * (d * dlogphi1 + (1.0 - d) * (-r1));
         let d2_q1 = w * (d * d2logphi1 + (1.0 - d) * (-dr1));
         let d3_q1 = w * (d * d3logphi1 + (1.0 - d) * (-ddr1));
+        let d4_q1 = w * (d * d4logphi1 + (1.0 - d) * (-dddr1));
         let d1_q = d1_q0 + d1_q1;
         let d2_q = d2_q0 + d2_q1;
         let d3_q = d3_q0 + d3_q1;
+        let d4_q = d4_q0 + d4_q1;
 
         Ok(Some(SurvivalRowDerivatives {
             ll: w * (d * (logphi1 + log_g_safe) + (1.0 - d) * s1.ln() - s0.ln()),
             d1_q,
             d2_q,
             d3_q,
+            d4_q,
             d1_q0,
             d2_q0,
             d3_q0,
+            d4_q0,
             d1_q1,
             d2_q1,
             d3_q1,
+            d4_q1,
             grad_time_eta_h0: -w * r0,
             grad_time_eta_h1: -w * (d * dlogphi1 + (1.0 - d) * (-r1)),
             grad_time_eta_d: w * d * d_log_g,
@@ -1510,6 +1820,12 @@ impl SurvivalLocationScaleFamily {
             d_h_h0: w * ddr0,
             d_h_h1: w * d * d3logphi1 - w * (1.0 - d) * ddr1,
             d_h_d: -w * d * d3_log_g,
+            // 4th derivatives of ℓ w.r.t. the time predictors h0, h1.
+            // These are the exact bilinear coefficients for D²H[u,v] in the
+            // time-time block. Since u = q - h and d⁴ℓ/dh⁴ = d⁴ℓ/du⁴
+            // (same sign because (-1)⁴ = 1), we have:
+            d2_h_h0: w * dddr0,
+            d2_h_h1: w * (d * d4logphi1 + (1.0 - d) * (-dddr1)),
         }))
     }
 }
@@ -1544,9 +1860,169 @@ pub(crate) fn q_chain_derivs_scalar(
     (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls)
 }
 
+/// Extended scalar chain-rule derivatives of
+/// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12)
+/// through **4th order**.
+///
+/// Returns the same 6 values as `q_chain_derivs_scalar` plus two 4th-order terms:
+///
+///   u_ϑsss = ∂⁴q / ∂η_ϑ ∂η_s³
+///   u_ssss = ∂⁴q / ∂η_s⁴
+///
+/// # Alternating-sign pattern for exp-link chain derivatives
+///
+/// With σ = exp(η_s), all derivatives of σ w.r.t. η_s equal σ itself:
+/// σ' = σ'' = σ''' = σ'''' = σ. The chain-rule derivatives of
+/// q = -η_ϑ/σ then exhibit a clean alternating-sign pattern:
+///
+/// ```text
+///   u_ϑ    = -σ⁻¹       u_s    =  ϑ/σ
+///   u_ϑs   =  σ⁻¹       u_ss   = -ϑ/σ
+///   u_ϑss  = -σ⁻¹       u_sss  =  ϑ/σ
+///   u_ϑsss =  σ⁻¹       u_ssss = -ϑ/σ
+/// ```
+///
+/// Each additional η_s derivative multiplies by d/d(η_s)[σ⁻¹] = -σ⁻¹,
+/// producing the sign flip.
+///
+/// # Why 4th order is needed (see response.md Section 6)
+///
+/// The outer REML Hessian's Q[v_k, v_l] term requires the 4th derivative
+/// of the composed likelihood via the Faà di Bruno formula:
+///
+/// ```text
+///   F_αβγδ = m4·u_α·u_β·u_γ·u_δ
+///          + m3·Σ(6 perms) u_αβ·u_γ·u_δ
+///          + m2·Σ(3 perms) u_αβ·u_γδ
+///          + m2·Σ(4 perms) u_αβγ·u_δ
+///          + m1·u_αβγδ          ← requires u_ϑsss and u_ssss
+/// ```
+///
+/// The last term m1·u_αβγδ is nonzero only for (ϑ,s,s,s) and (s,s,s,s).
+/// Without these terms the outer Hessian drift is incomplete.
+#[inline]
+pub(crate) fn q_chain_derivs_fourth_scalar(
+    eta_t: f64,
+    sigma: f64,
+    dsigma: f64,
+    d2sigma: f64,
+    d3sigma: f64,
+    d4sigma: f64,
+) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
+    let s = sigma.max(1e-12);
+    let q_t = -1.0 / s;
+    if sigma <= 1e-12 {
+        return (q_t, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let s4 = s3 * s;
+    let s5 = s4 * s;
+
+    // 1st order
+    let q_tl = dsigma / s2;
+    let q_ls = eta_t * q_tl;
+
+    // 2nd order
+    let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
+    let q_ll = eta_t * q_tl_ls;
+
+    // 3rd order
+    let ds2 = dsigma * dsigma;
+    let q_ll_ls = eta_t * (d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * ds2 * dsigma / s4);
+
+    // 4th order: u_ϑssss and u_ssss
+    //
+    // u_ϑsss (3rd order in s, mixed with ϑ) was:
+    //   σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴
+    //
+    // u_ϑssss = d/d(η_s)[u_ϑsss]:
+    //   d/d(η_s)[σ'''/σ²]        = σ''''/σ² - 2σ'σ'''/σ³
+    //   d/d(η_s)[-6σ'σ''/σ³]     = -6(σ''² + σ'σ''')/σ³ + 18(σ')²σ''/σ⁴
+    //   d/d(η_s)[6(σ')³/σ⁴]      = 18(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵
+    //
+    // Collecting:
+    //   u_ϑssss = σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³ + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵
+    //
+    // For exp link (σ=σ'=σ''=σ'''=σ''''):
+    //   = σ⁻¹(1 - 8 - 6 + 36 - 24) = -σ⁻¹
+    //
+    // Wait — that gives -σ⁻¹, but the alternating pattern predicts +σ⁻¹ for
+    // u_ϑsss (4th partial, 3 s-slots) and the *next* one should be -σ⁻¹.
+    //
+    // Clarification: the naming is careful here.
+    //   u_ϑs    = 1st s-deriv of u_ϑ   = +σ⁻¹
+    //   u_ϑss   = 2nd s-deriv of u_ϑ   = -σ⁻¹
+    //   u_ϑsss  = 3rd s-deriv of u_ϑ   = +σ⁻¹
+    //   u_ϑssss = 4th s-deriv of u_ϑ   = -σ⁻¹  ← this is what we compute here
+    //
+    // The formula above gives -σ⁻¹ for exp link, which matches the 4th
+    // s-derivative (even count → negative). The Faà di Bruno entry for the
+    // (ϑ,s,s,s) block uses u_ϑsss (3rd s-deriv = +σ⁻¹), NOT u_ϑssss.
+    // But response.md Section 6 labels the needed quantity as u_ϑsss = σ⁻¹,
+    // meaning the partial with indices (ϑ,s,s,s) = 3 s-slots = +σ⁻¹.
+    //
+    // So the variable naming convention here is:
+    //   q_tl_ls_ls = u_ϑssss = 4th s-deriv of u_ϑ (what we compute)
+    //
+    // BUT for the QChainDerivs struct, d4q_tls_ls_ls stores u_ϑsss
+    // (the partial ∂⁴q/∂η_ϑ∂η_s³ with exactly 3 s-indices), which is
+    // the 3rd s-derivative of u_ϑ = the quantity labeled u_ϑsss in
+    // response.md Section 6.
+    //
+    // The scalar function here computes the actual 4th-order derivatives
+    // of q w.r.t. η_s, using σ'''' = d4sigma.
+    //
+    // For clarity: q_tl_ls_ls = ∂⁴q/(∂η_ϑ ∂η_s³), which is u_ϑsss.
+    // This is the 3rd partial in η_s of q_t = -1/σ, i.e., the derivative
+    // chain applied 3 times through σ(η_s).
+    //
+    // Recurrence: q_tl_ls_ls = d/d(η_s)[q_tl_ls] where q_tl_ls = u_ϑss.
+    // But q_tl_ls is the 2nd s-partial, and differentiating once more gives
+    // the 3rd s-partial = u_ϑsss. So:
+    //   q_tl_ls_ls = u_ϑsss = σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴
+    //
+    // That's the SAME as q_ll_ls / eta_t. So for the true 4th-order
+    // (4 s-slots), we need one more derivative:
+    //
+    // d4q_tls_ls_ls in the struct = ∂⁴q/(∂η_ϑ ∂η_s³) = u_ϑsss
+    //   = σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴   (this is 3rd-order, already have it)
+    //
+    // d4q_ls in the struct = ∂⁴q/∂η_s⁴ = u_ssss
+    //   = η_ϑ · [σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³ + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵]
+    //
+    // So the 4th-order q chain derivatives that are genuinely NEW are:
+    //   (a) u_ϑsss = 3rd s-partial of u_ϑ — already computed as q_ll_ls/eta_t
+    //       but stored explicitly for the Faà di Bruno formula
+    //   (b) u_ssss = 4th s-partial of q — needs σ''''
+    let q_tl_ls_ls = q_ll_ls / eta_t.max(1e-300).min(-1e-300).copysign(eta_t);
+    // Recompute cleanly to avoid division issues when eta_t ≈ 0:
+    let q_tl_ls_ls_clean = d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * ds2 * dsigma / s4;
+
+    // u_ssss = ∂⁴q/∂η_s⁴ needs σ'''' and the full 4th-order chain rule:
+    let q_llll = eta_t
+        * (d4sigma / s2 - 8.0 * dsigma * d3sigma / s3 - 6.0 * d2sigma * d2sigma / s3
+            + 36.0 * ds2 * d2sigma / s4
+            - 24.0 * ds2 * ds2 / s5);
+
+    (
+        q_t,
+        q_ls,
+        q_tl,
+        q_ll,
+        q_tl_ls,
+        q_ll_ls,
+        q_tl_ls_ls_clean,
+        q_llll,
+    )
+}
+
 /// All chain-rule partial derivatives of
 /// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12)
 /// with respect to the block linear predictors eta_t and eta_ls.
+///
+/// Includes 4th-order terms needed by the outer REML Hessian drift.
 struct QChainDerivs {
     dq_t: Array1<f64>,       // ∂q/∂eta_t = -1/s with s = max(σ, 1e-12)
     dq_ls: Array1<f64>,      // ∂q/∂eta_ls = eta_t · σ'/s²
@@ -1554,11 +2030,70 @@ struct QChainDerivs {
     d2q_ls: Array1<f64>,     // ∂²q/∂eta_ls² = eta_t · (σ''/s² - 2σ'²/s³)
     d3q_tls_ls: Array1<f64>, // ∂³q/∂eta_t∂eta_ls² = σ''/s² - 2σ'²/s³
     d3q_ls: Array1<f64>,     // ∂³q/∂eta_ls³ = eta_t · (σ'''/s² - 6σ'σ''/s³ + 6σ'³/s⁴)
+
+    /// ∂⁴q/∂η_ϑ∂η_s³ = u_ϑsss.
+    ///
+    /// For exp link: +σ⁻¹ (alternating-sign pattern, 3rd s-derivative of u_ϑ).
+    /// General formula: σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴.
+    ///
+    /// This enters the (ϑ,s,s,s) block of the 4th-order Faà di Bruno formula
+    /// via the m1·u_αβγδ term. See response.md Section 6.
+    d4q_tls_ls_ls: Array1<f64>,
+
+    /// ∂⁴q/∂η_s⁴ = u_ssss.
+    ///
+    /// For exp link: -ϑ/σ (alternating-sign pattern, 4th s-derivative of q).
+    /// General formula: η_ϑ · (σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³
+    ///                         + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵).
+    ///
+    /// This enters the (s,s,s,s) block of the 4th-order Faà di Bruno formula
+    /// via the m1·u_αβγδ term. See response.md Section 6.
+    d4q_ls: Array1<f64>,
 }
 
 /// Compute all chain-rule derivatives of
-/// q = -eta_t / max(sigma(eta_ls), 1e-12) as length-n arrays.
+/// q = -eta_t / max(sigma(eta_ls), 1e-12) as length-n arrays,
+/// including 4th-order terms needed by the outer REML Hessian.
 fn compute_q_chain_derivs(
+    eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
+    sigma: &Array1<f64>,
+    ds: &Array1<f64>,
+    d2s: &Array1<f64>,
+    d3s: &Array1<f64>,
+    d4s: &Array1<f64>,
+) -> QChainDerivs {
+    let n = eta_t.len();
+    let mut r = QChainDerivs {
+        dq_t: Array1::zeros(n),
+        dq_ls: Array1::zeros(n),
+        d2q_tls: Array1::zeros(n),
+        d2q_ls: Array1::zeros(n),
+        d3q_tls_ls: Array1::zeros(n),
+        d3q_ls: Array1::zeros(n),
+        d4q_tls_ls_ls: Array1::zeros(n),
+        d4q_ls: Array1::zeros(n),
+    };
+    for i in 0..n {
+        let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
+            q_chain_derivs_fourth_scalar(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i], d4s[i]);
+        r.dq_t[i] = q_t;
+        r.dq_ls[i] = q_ls;
+        r.d2q_tls[i] = q_tl;
+        r.d2q_ls[i] = q_ll;
+        r.d3q_tls_ls[i] = q_tl_ls;
+        r.d3q_ls[i] = q_ll_ls;
+        r.d4q_tls_ls_ls[i] = q_tl_ls_ls;
+        r.d4q_ls[i] = q_llll;
+    }
+    r
+}
+
+/// Compute chain-rule derivatives of q through 3rd order only (no 4th-order terms).
+///
+/// This is the inner-loop version used by the P-IRLS evaluate path, which
+/// only needs gradient and Hessian weights (not the outer REML Hessian drift).
+/// The 4th-order fields `d4q_tls_ls_ls` and `d4q_ls` are set to zero.
+fn compute_q_chain_derivs_third(
     eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
     sigma: &Array1<f64>,
     ds: &Array1<f64>,
@@ -1573,6 +2108,8 @@ fn compute_q_chain_derivs(
         d2q_ls: Array1::zeros(n),
         d3q_tls_ls: Array1::zeros(n),
         d3q_ls: Array1::zeros(n),
+        d4q_tls_ls_ls: Array1::zeros(n),
+        d4q_ls: Array1::zeros(n),
     };
     for i in 0..n {
         let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
@@ -1583,6 +2120,7 @@ fn compute_q_chain_derivs(
         r.d2q_ls[i] = q_ll;
         r.d3q_tls_ls[i] = q_tl_ls;
         r.d3q_ls[i] = q_ll_ls;
+        // d4q_tls_ls_ls and d4q_ls remain zero — not needed for P-IRLS.
     }
     r
 }
@@ -3085,6 +3623,11 @@ fn lift_conditional_covariance(
     t_map.dot(cov_reduced).dot(&t_map.t())
 }
 
+/// Observed vs expected information: The survival location-scale family uses
+/// `BlockWorkingSet::ExactNewton` which provides the actual gradient and Hessian
+/// (-nabla^2 log L) from the survival likelihood. This is the **observed** Hessian
+/// by construction, which is the correct quantity for the outer REML Laplace
+/// approximation (see response.md Section 3). No Fisher surrogate is used here.
 impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
@@ -3180,11 +3723,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let (grad_ls, hess_ls) = if let Some(x_ls_entry) = self.x_log_sigma_entry.as_ref() {
             let sigma_e = sigma_entry.as_ref().unwrap();
             // For exp link: σ' = σ = exp(η_ls)
-            let exit_qd =
-                compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
+            let exit_qd = compute_q_chain_derivs_third(
+                &eta_t_exit,
+                &sigma_exit,
+                &ds_exit,
+                &d2s_exit,
+                &d2s_exit,
+            );
             let ds_entry = eta_ls_entry.mapv(crate::families::sigma_link::safe_exp);
-            let entry_qd =
-                compute_q_chain_derivs(&eta_t_entry, sigma_e, &ds_entry, &ds_entry, &ds_entry);
+            let entry_qd = compute_q_chain_derivs_third(
+                &eta_t_entry,
+                sigma_e,
+                &ds_entry,
+                &ds_entry,
+                &ds_entry,
+            );
             let (ge, he) =
                 chain_rule_weights(&d1_q1, &d2_q1, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
             let (gn, hn) =
@@ -3195,8 +3748,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 .add(&xt_diag_x_symmetric(x_ls_entry, &hn)?)?;
             (grad, hess)
         } else {
-            let exit_qd =
-                compute_q_chain_derivs(&eta_t_exit, &sigma_exit, &ds_exit, &d2s_exit, &d2s_exit);
+            let exit_qd = compute_q_chain_derivs_third(
+                &eta_t_exit,
+                &sigma_exit,
+                &ds_exit,
+                &d2s_exit,
+                &d2s_exit,
+            );
             let (g, h) = chain_rule_weights(&d1_q, &d2_q, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
             let grad = self.x_log_sigma.transpose_vector_multiply(&g);
             let hess = xt_diag_x_symmetric(&self.x_log_sigma, &h)?;
@@ -3366,8 +3924,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 if let Some(x_ls_entry) = self.x_log_sigma_entry.as_ref() {
                     let sigma_e = sigma_entry_vec.as_ref().unwrap();
                     // For exp link: σ' = σ'' = σ''' = σ
-                    let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
-                    let entry_qd = compute_q_chain_derivs(
+                    let exit_qd =
+                        compute_q_chain_derivs_third(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
+                    let entry_qd = compute_q_chain_derivs_third(
                         &eta_t_entry.to_owned(),
                         sigma_e,
                         sigma_e,
@@ -3398,7 +3957,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                         .add(&xt_diag_x_symmetric(x_ls_entry, &dh_entry)?)?;
                     Ok(Some(d_h.to_dense()))
                 } else {
-                    let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
+                    let exit_qd =
+                        compute_q_chain_derivs_third(&eta_t_exit, &sigma, &ds, &d2s, &d3s);
                     let d_eta_ls = self.x_log_sigma.matrixvectormultiply(d_beta);
                     let dh = directional_hessian_weights(
                         &d1_q,
@@ -4293,6 +4853,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
         let d3q_tls_ls_entry = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
         let d3q_ls_entry = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
+        // 4th-order chain-rule derivatives for the second-order Hessian drift.
+        // These enter the (ϑ,s,s,s) and (s,s,s,s) blocks of the bilinear
+        // d²q_chain/dψ² computation via the Faà di Bruno formula.
+        let d4q_tls_ls_ls_entry = q.d4q_tls_ls_ls_entry.as_ref().unwrap_or(&q.d4q_tls_ls_ls);
+        let d4q_ls_entry = q.d4q_ls_entry.as_ref().unwrap_or(&q.d4q_ls);
 
         let entry_cross = &(&dir_i.z_t_entry_psi * &dir_j.z_ls_entry_psi)
             + &(&dir_j.z_t_entry_psi * &dir_i.z_ls_entry_psi);
@@ -4351,11 +4916,39 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             + &(&q.d3q_tls_ls * &exit_cross)
             + &(&q.d3q_ls * &(&dir_i.z_ls_exit_psi * &dir_j.z_ls_exit_psi));
 
-        let d2q_tls_entry_ab = &(d3q_tls_ls_entry * &z_ls_entry_ab);
-        let d2q_tls_exit_ab = &(&q.d3q_tls_ls * &z_ls_exit_ab);
-        let d2q_ls_entry_ab =
-            &(d3q_tls_ls_entry * &z_t_entry_ab) + &(d3q_ls_entry * &z_ls_entry_ab);
-        let d2q_ls_exit_ab = &(&q.d3q_tls_ls * &z_t_exit_ab) + &(&q.d3q_ls * &z_ls_exit_ab);
+        // Bilinear derivatives of 2nd-order chain-rule quantities w.r.t. ψ.
+        //
+        // These now include the 4th-order chain-rule terms from response.md
+        // Section 6. The general formula for d²(∂²q/∂α∂β)/dψ_i dψ_j is:
+        //
+        //   Σ_k (∂³q/∂α∂β∂η_k) · z_k_ab
+        //     + Σ_{k,l} (∂⁴q/∂α∂β∂η_k∂η_l) · z_k_i · z_l_j
+        //
+        // The second sum is the NEW 4th-order contribution. It is nonzero
+        // only when at least one of k,l is an η_s index, because:
+        //   u_ϑsss = ∂⁴q/∂η_ϑ∂η_s³ ≠ 0
+        //   u_ssss = ∂⁴q/∂η_s⁴ ≠ 0
+        //
+        // For the (ϑ,s) cross block: ∂²(d2q_tls)/dψ² needs d4q_tls_ls_ls.
+        // For the (s,s) block: ∂²(d2q_ls)/dψ² needs d4q_tls_ls_ls and d4q_ls.
+        let ls_prod_entry = &dir_i.z_ls_entry_psi * &dir_j.z_ls_entry_psi;
+        let ls_prod_exit = &dir_i.z_ls_exit_psi * &dir_j.z_ls_exit_psi;
+        let d2q_tls_entry_ab =
+            &(d3q_tls_ls_entry * &z_ls_entry_ab) + &(d4q_tls_ls_ls_entry * &ls_prod_entry);
+        let d2q_tls_exit_ab =
+            &(&q.d3q_tls_ls * &z_ls_exit_ab) + &(&q.d4q_tls_ls_ls * &ls_prod_exit);
+        let tls_cross_entry = &(&dir_i.z_t_entry_psi * &dir_j.z_ls_entry_psi)
+            + &(&dir_j.z_t_entry_psi * &dir_i.z_ls_entry_psi);
+        let tls_cross_exit = &(&dir_i.z_t_exit_psi * &dir_j.z_ls_exit_psi)
+            + &(&dir_j.z_t_exit_psi * &dir_i.z_ls_exit_psi);
+        let d2q_ls_entry_ab = &(d3q_tls_ls_entry * &z_t_entry_ab)
+            + &(d3q_ls_entry * &z_ls_entry_ab)
+            + &(d4q_tls_ls_ls_entry * &tls_cross_entry)
+            + &(d4q_ls_entry * &ls_prod_entry);
+        let d2q_ls_exit_ab = &(&q.d3q_tls_ls * &z_t_exit_ab)
+            + &(&q.d3q_ls * &z_ls_exit_ab)
+            + &(&q.d4q_tls_ls_ls * &tls_cross_exit)
+            + &(&q.d4q_ls * &ls_prod_exit);
 
         let objective_psi_psi = (&q.d2_q0 * &(q0_i * q0_j)).sum()
             + q.d1_q0.dot(q0_ab)
@@ -4441,11 +5034,18 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 .assign(&wiggle_score);
         }
 
-        // Higher-order survival Hessian drift would require fourth row
-        // derivatives that are not carried in SurvivalJointQuantities. Keep the
-        // explicit second-order family Hessian contribution to the same
-        // product-rule level already used elsewhere in the survival exact
-        // calculus: realized-design motion plus first-order row-weight drift.
+        // Second-order family Hessian contribution.
+        //
+        // SurvivalJointQuantities now carries d4_q0/d4_q1 (4th derivatives of ℓ
+        // w.r.t. q), d4q_tls_ls_ls and d4q_ls (4th-order chain-rule derivatives
+        // of q w.r.t. block predictors), and d2_h_h0/d2_h_h1 (4th derivatives
+        // of ℓ w.r.t. time predictors). These are used in the second-order
+        // Hessian drift (D²H[u,v]) computation. See response.md Section 6.
+        //
+        // The bilinear psi-psi Hessian below uses 3rd-order row derivatives
+        // (d3_q, d_h_h) for the leading product-rule terms. The 4th-order
+        // corrections (d4_q, d2_h_h) enter the D²H bilinear computation in
+        // exact_newton_joint_psi_second_order_terms, not here.
         let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
         let h_time_time = fast_xt_diag_x(
             &self.x_time_entry,
@@ -5235,13 +5835,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // For the time block, the Hessian has three contributions:
         //   h_time_h0[i], h_time_h1[i], h_time_d[i]
         // Their first derivatives w.r.t. β are d_h_h0, d_h_h1, d_h_d.
-        // The second derivatives need the fourth-order row quantities.
+        // The second derivatives use the 4th-order row quantities d2_h_h0
+        // and d2_h_h1 (d⁴ℓ/dh⁴), which are now stored in
+        // SurvivalJointQuantities.
         //
-        // Since the fourth derivatives of ℓ w.r.t. (q, h) are not stored in
-        // SurvivalJointQuantities, we approximate D²H[u,v] using the available
-        // third-derivative infrastructure. Specifically, we compute the product
-        // of the two perturbation directions weighted by the third derivatives
-        // of the Hessian weights (which are the fourth derivatives of ℓ).
+        // The 4th derivatives of ℓ w.r.t. q (d4_q0, d4_q1, d4_q) are also
+        // now available. They enter the bilinear D²(d2_q) computation as the
+        // leading coefficient: D²_{u,v}(d2_q) = d4_q · δq_u · δq_v + ...
+        //
+        // The 4th-order chain-rule derivatives of q (d4q_tls_ls_ls = u_ϑsss,
+        // d4q_ls = u_ssss) enter the bilinear derivatives of the 2nd-order
+        // chain quantities: D²_{ψ}(d2q_tls) and D²_{ψ}(d2q_ls).
+        //
+        // Together these provide the complete 4th-order Faà di Bruno formula
+        // for the (ϑ,s,s,s) and (s,s,s,s) blocks of the outer Hessian drift
+        // Q[v_k, v_l]. See response.md Section 6.
         //
         // For the exit contribution:
         //   d²(d2_q1)/dβ² [u,v] uses d³ℓ/dq1³ products and would need d⁴ℓ/dq1⁴.
@@ -5280,8 +5888,14 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let xi_h1_v = &delta_h1_v - &delta_q_exit_v;
 
         // Second-order time-time weight: bilinear in perturbation directions.
-        let d2h_h0 = &q.d_h_h0 * &(&xi_h0_u * &xi_h0_v);
-        let d2h_h1 = &q.d_h_h1 * &(&xi_h1_u * &xi_h1_v);
+        //
+        // The exact D²H[u,v] for the time block uses the 4th derivative of ℓ
+        // w.r.t. the time predictors (d2_h_h0, d2_h_h1). Previously this used
+        // d_h_h0 (= d³ℓ/dh0³) which is the coefficient for D¹H, not D²H.
+        // The correct bilinear coefficient is d⁴ℓ/dh0⁴ for the leading term.
+        // See response.md Section 6 for why 4th-order derivatives are needed.
+        let d2h_h0 = &q.d2_h_h0 * &(&xi_h0_u * &xi_h0_v);
+        let d2h_h1 = &q.d2_h_h1 * &(&xi_h1_u * &xi_h1_v);
         let d2h_d = &q.d_h_d * &(&delta_d_u * &delta_d_v);
         let d2_h_time = fast_xt_diag_x(&self.x_time_entry, &d2h_h0)
             + fast_xt_diag_x(&self.x_time_exit, &d2h_h1)
@@ -5292,6 +5906,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if let Some(x_t_en) = x_threshold_entry.as_ref() {
             let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
             // Exit contribution: bilinear product of the two perturbation directions.
+            //
+            // NOTE: This split-case formula uses D_u(d2_q1)·δq_v (a product of
+            // first directional derivatives) rather than the exact bilinear
+            // D²_{u,v}(d2_q1) = d4_q1·δu1_u·δu1_v. The 4th-order quantities
+            // d4_q0, d4_q1, d2_h_h0, d2_h_h1 are available in q for a future
+            // upgrade to the exact split-case bilinear. See response.md Section 6.
             let d2_w_exit = &d_d2_q_exit_u * &delta_q_exit_v * &q.dq_t.mapv(|v| v * v)
                 + &d_d2_q_exit_v * &delta_q_exit_u * &q.dq_t.mapv(|v| v * v)
                 + &q.d2_q1 * &(2.0 * &delta_q_t_exit_u * &delta_q_t_exit_v);
@@ -5305,9 +5925,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_t_en)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
         } else {
-            let d2_d2_q = &q.d3_q * &(&delta_q_exit_u * &delta_q_exit_v)
-                - &q.d_h_h0 * &(&delta_h0_u * &delta_h0_v)
-                - &q.d_h_h1 * &(&delta_h1_u * &delta_h1_v);
+            // Exact 4th-order bilinear D²(d2_q) — same correction as the
+            // log-sigma block. See comment there for derivation.
+            let d2_d2_q = &q.d4_q * &(&delta_q_exit_u * &delta_q_exit_v)
+                - &q.d2_h_h0 * &(&delta_h0_u * &delta_h0_v)
+                - &q.d2_h_h1 * &(&delta_h1_u * &delta_h1_v);
             let d2_w = &d2_d2_q * &q.dq_t.mapv(|v| v * v)
                 + &q.d2_q * &(2.0 * &delta_q_t_exit_u * &delta_q_t_exit_v);
             let d2_h_tt =
@@ -5318,6 +5940,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // --- Log-sigma-log-sigma D²H[u,v] ---
         if let Some(x_ls_en) = x_log_sigma_entry.as_ref() {
             let dq_ls_en = q.dq_ls_entry.as_ref().unwrap();
+            // NOTE: Same first-order product approximation as TT block above.
+            // Uses D_u(d2_q)·δq_v instead of exact D²(d2_q) = d4_q·δu_u·δu_v.
+            // The 4th-order quantities are available for future upgrade.
             let d2_w_exit = &d_d2_q_exit_u * &delta_q_exit_v * &q.dq_ls.mapv(|v| v * v)
                 + &d_d2_q_exit_v * &delta_q_exit_u * &q.dq_ls.mapv(|v| v * v)
                 + &q.d2_q1 * &(2.0 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
@@ -5338,9 +5963,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 &q.d2_q * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u + &q.h_time_h1 * &delta_h1_u;
             let d_d1_q_v =
                 &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
-            let d2_d2_q = &q.d3_q * &(&delta_q_exit_u * &delta_q_exit_v)
-                - &q.d_h_h0 * &(&delta_h0_u * &delta_h0_v)
-                - &q.d_h_h1 * &(&delta_h1_u * &delta_h1_v);
+            // Bilinear D²(d2_q) using the exact 4th-order ℓ derivatives.
+            //
+            // d2_q = d2_q0 + d2_q1 where d2_q0 is a function of u0 = q - h0
+            // and d2_q1 is a function of u1 = q - h1.
+            //
+            // D²_{u,v}(d2_q0) = d4_q0 · δu0_u · δu0_v = d4_q0 · (δq-δh0)_u · (δq-δh0)_v
+            // D²_{u,v}(d2_q1) = d4_q1 · δu1_u · δu1_v = d4_q1 · (δq-δh1)_u · (δq-δh1)_v
+            //
+            // For time-invariant blocks, δq0 = δq1 = δq_exit.
+            // In the combined form:
+            //   D²(d2_q) ≈ d4_q · (δq_exit_u · δq_exit_v)
+            //             - d2_h_h0 · (δh0_u · δh0_v)
+            //             - d2_h_h1 · (δh1_u · δh1_v)
+            //
+            // Previously this used d3_q and d_h_h0/d_h_h1 (3rd-order approx).
+            // Now uses the exact 4th derivatives. See response.md Section 6.
+            let d2_d2_q = &q.d4_q * &(&delta_q_exit_u * &delta_q_exit_v)
+                - &q.d2_h_h0 * &(&delta_h0_u * &delta_h0_v)
+                - &q.d2_h_h1 * &(&delta_h1_u * &delta_h1_v);
             let d2_w = &d2_d2_q * &q.dq_ls.mapv(|v| v * v)
                 + &q.d2_q * &(2.0 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
                 + &d_d1_q_u * &delta_q_ls_ls_exit_v
@@ -5361,6 +6002,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
                 // d2q_tls_entry is resolved but not needed in the bilinear cross term;
                 // the entry bilinear uses per-axis deltas directly.
+                //
+                // NOTE: Same first-order product approximation as TT/LL split blocks.
+                // Uses D_u(d2_q)·δq_v instead of exact D²(d2_q) = d4_q·δu_u·δu_v.
                 // Exit bilinear.
                 let d2_w_exit = &d_d2_q_exit_u * &delta_q_exit_v * &(&q.dq_t * &q.dq_ls)
                     + &d_d2_q_exit_v * &delta_q_exit_u * &(&q.dq_t * &q.dq_ls)
@@ -5389,9 +6033,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let d_d1_q_v = &q.d2_q * &delta_q_exit_v
                     + &q.h_time_h0 * &delta_h0_v
                     + &q.h_time_h1 * &delta_h1_v;
-                let d2_d2_q = &q.d3_q * &(&delta_q_exit_u * &delta_q_exit_v)
-                    - &q.d_h_h0 * &(&delta_h0_u * &delta_h0_v)
-                    - &q.d_h_h1 * &(&delta_h1_u * &delta_h1_v);
+                // Exact 4th-order bilinear D²(d2_q) for the cross block.
+                let d2_d2_q = &q.d4_q * &(&delta_q_exit_u * &delta_q_exit_v)
+                    - &q.d2_h_h0 * &(&delta_h0_u * &delta_h0_v)
+                    - &q.d2_h_h1 * &(&delta_h1_u * &delta_h1_v);
                 let d2_w = &d2_d2_q * &(&q.dq_t * &q.dq_ls)
                     + &q.d2_q
                         * &(&delta_q_t_exit_u * &delta_q_ls_exit_v

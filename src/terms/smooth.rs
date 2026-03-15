@@ -7510,11 +7510,12 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         }
         _ => return Ok(None),
     };
-    // Get number of axes from either the dense design_first or the implicit operator.
-    let d = if !aniso_result.design_first.is_empty() {
-        aniso_result.design_first.len()
-    } else if let Some(ref op) = aniso_result.implicit_operator {
+    // Get number of axes from the shared operator when available; otherwise
+    // fall back to the dense design list.
+    let d = if let Some(ref op) = aniso_result.implicit_operator {
         op.n_axes()
+    } else if !aniso_result.design_first.is_empty() {
+        aniso_result.design_first.len()
     } else {
         0
     };
@@ -7531,30 +7532,18 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     let num_penalties = aniso_result.penalties_first[0].len();
     let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
 
-    // Check if this result uses implicit operators (design matrices empty).
-    let use_implicit = aniso_result.implicit_operator.is_some();
+    // Dense first/diagonal-second matrices may be present even when the shared
+    // operator is available. The operator remains the canonical source for
+    // exact cross-axis second derivatives.
+    let use_implicit_design = aniso_result.design_first.is_empty();
     let implicit_op_arc = aniso_result
         .implicit_operator
         .as_ref()
         .map(|op| std::sync::Arc::new(op.clone()));
 
-    // Pre-compute cross-derivative design matrices: d2X/(d psi_a d psi_b) = t * s_a * s_b
-    // using projected+padded components (element-wise product in design space).
-    // Only needed for the dense path.
-    let t_proj = if use_implicit {
-        None
-    } else {
-        Some(&aniso_result.design_cross_t)
-    };
-    let s_proj = if use_implicit {
-        None
-    } else {
-        Some(&aniso_result.s_components_projected)
-    };
-
     let mut entries = Vec::with_capacity(d);
     for a in 0..d {
-        let (x_psi_local, x_psi_psi_local) = if use_implicit {
+        let (x_psi_local, x_psi_psi_local) = if use_implicit_design {
             // Implicit path: design-derivative matvecs will be dispatched through
             // the ImplicitDerivativeOp inside HyperDesignDerivative, so we do NOT
             // need to materialize the dense (n x p) matrices here.  Store empty
@@ -7581,13 +7570,9 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         // Build cross-design entries for other axes b != a in this group.
         // These will be indexed by (b, cross_matrix) where b is the axis
         // offset within the d-entry block.
-        // For the implicit path, cross designs are computed on the fly, so we
-        // skip pre-materialization.
-        let cross_designs = if use_implicit {
-            // Implicit path: cross-design matvecs will be dispatched through
-            // ImplicitDerivativeOp with SecondCross level, so we store empty
-            // placeholder matrices here. The axis indices are preserved so
-            // spatial_log_kappa_hyper_dirs_frominfo_list can route them.
+        // Cross-axis second derivatives are sourced from the shared operator,
+        // so we only need placeholder entries to preserve the axis layout.
+        let cross_designs = if implicit_op_arc.is_some() {
             let mut cd = Vec::with_capacity(d - 1);
             for b in 0..d {
                 if b == a {
@@ -7597,18 +7582,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             }
             cd
         } else {
-            let t_proj_ref = t_proj.unwrap();
-            let s_proj_ref = s_proj.unwrap();
-            let mut cd = Vec::with_capacity(d - 1);
-            for b in 0..d {
-                if b == a {
-                    continue;
-                }
-                // d2X/(d psi_a d psi_b) = t * s_a * s_b (element-wise in projected space)
-                let cross = t_proj_ref * &s_proj_ref[a] * &s_proj_ref[b];
-                cd.push((b, cross));
-            }
-            cd
+            Vec::new()
         };
         // Build cross-penalty entries for this axis a.
         // For each pair (a, b) with a < b in penalties_cross_pairs, store it

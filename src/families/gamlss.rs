@@ -2780,13 +2780,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
         });
     }
 
-    if !matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-        return Err(
-            "fit_binomial_mean_wiggle_terms_auto_from_pilot requires the standard probit link when spatial length-scale hyperparameters are active"
-                .to_string(),
-        );
-    }
-
     let dims_per_term = single_block_spatial_dims_per_term(pilot_spec, &spatial_terms);
     let log_kappa0 =
         SpatialLogKappaCoords::from_length_scales_aniso(pilot_spec, &spatial_terms, kappa_options);
@@ -2834,7 +2827,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             Array1<f64>,
             f64,
             Array1<f64>,
-            Array2<f64>,
+            Option<Array2<f64>>,
             crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
@@ -2908,9 +2901,12 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             warm_cache: None,
             last_eval: None,
         },
+        // Exact first-order [rho, psi] calculus is available for all inverse
+        // links via the shared jet formulas. Exact outer Hessians additionally
+        // need family-provided second-order psi terms; keep those opt-in.
         cap: OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
             n_params: theta_dim,
             all_penalty_like: false,
             barrier_config: None,
@@ -2936,22 +2932,19 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
                 return Ok(OuterEval {
                     cost: *cached_cost,
                     gradient: cached_grad.clone(),
-                    hessian: HessianResult::Analytic(cached_hess.clone()),
+                    hessian: cached_hess
+                        .clone()
+                        .map(HessianResult::Analytic)
+                        .unwrap_or(HessianResult::Unavailable),
                 });
             }
-            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), true)
+            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
                 .map_err(EstimationError::InvalidInput)?;
-            let hessian = eval.outer_hessian.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "binomial mean wiggle exact outer evaluation did not return a Hessian"
-                        .to_string(),
-                )
-            })?;
             state.last_eval = Some((
                 theta.clone(),
                 eval.objective,
                 eval.gradient.clone(),
-                hessian.clone(),
+                None,
                 eval.warm_start.clone(),
             ));
             state.warm_cache = Some(eval.warm_start);
@@ -2966,7 +2959,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
                     .as_ref()
                     .map(|x| x.2.clone())
                     .unwrap_or_else(|| Array1::zeros(theta.len())),
-                hessian: HessianResult::Analytic(hessian),
+                hessian: HessianResult::Unavailable,
             })
         },
         reset_fn: None::<fn(&mut MeanWiggleOuterState)>,
@@ -3177,6 +3170,295 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
         * (amumumu * phi.powi(4) - 6.0 * q * amumu * phi.powi(3)
             + (7.0 * q * q - 4.0) * amu * phi * phi
             - (q * q * q - 3.0 * q) * a * phi)
+}
+
+// ---------------------------------------------------------------------------
+// Logit closed-form m1–m4
+// ---------------------------------------------------------------------------
+//
+// For the logit (sigmoid) inverse link, F(q) = -w[y log G(q) + (1-y) log(1-G(q))]
+// where G(q) = 1/(1 + e^{-q}) is the standard logistic CDF.
+//
+// Because logit is the canonical link for Bernoulli, the derivatives of F
+// collapse to especially simple closed forms in terms of p = G(q) and
+// s = p(1-p) = Var(Bernoulli(p)):
+//
+//   m1 = w(p - y)
+//   m2 = ws                           (always non-negative)
+//   m3 = ws(1 - 2p) = -ws tanh(q/2)
+//   m4 = ws(1 - 6s) = ws(1 - 6p + 6p^2)
+//
+// Derivation: since log G(q) = -log(1 + e^{-q}) and log(1 - G(q)) = -log(1 + e^q),
+// F(q) = w[-y log G + (1-y)(-log(1-G))]
+//       = w[y log(1+e^{-q}) + (1-y) log(1+e^q)]
+//       = w[(1-y)q + log(1+e^{-q})]     (the standard softplus form).
+//
+// Differentiating: F' = w(G(q) - y) = w(p - y), which is m1.
+// F'' = wG'(q) = wp(1-p) = ws, which is m2.
+// F''' = w[p(1-p)(1-2p)] = ws(1-2p), which is m3.
+// F'''' = w[s(1-6s)], which is m4. The identity 1-6s = 1-6p+6p^2 follows directly.
+//
+// Numerical stability (see response.md Section 1a):
+// - p is computed with a branched expit to avoid overflow:
+//     p = (1+e^{-q})^{-1} for q >= 0,  p = e^q/(1+e^q) for q < 0.
+// - s = p(1-p). For extreme tails, s = t/(1+t)^2 with t = e^{-|q|}, which
+//   decays as O(e^{-|q|}). Once |q| > ~36, e^{-|q|} < machine epsilon and
+//   all derivatives are genuinely below precision, so saturation to 0 is safe.
+// - The identity 1-2p = -tanh(q/2) provides a stable alternative for m3.
+//
+// Reference: response.md Section 1a.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn binomial_neglog_q_derivatives_logit_closed_form(y: f64, weight: f64, q: f64) -> (f64, f64, f64) {
+    // Returns (m1, m2, m3) for F(q) = -w[y log G(q) + (1-y) log(1-G(q))]
+    // with G = logistic CDF.
+    if weight == 0.0 || !q.is_finite() {
+        return (0.0, 0.0, 0.0);
+    }
+    // Branched expit for numerical stability:
+    //   q >= 0: p = 1/(1+e^{-q}), avoids overflow in e^q
+    //   q < 0:  p = e^q/(1+e^q),  avoids overflow in e^{-q}
+    let p = if q >= 0.0 {
+        1.0 / (1.0 + (-q).exp())
+    } else {
+        let eq = q.exp();
+        eq / (1.0 + eq)
+    };
+    let s = p * (1.0 - p);
+    // For extreme |q|, s underflows gracefully to 0, which is correct.
+
+    let m1 = weight * (p - y);
+    let m2 = weight * s;
+    // m3 = ws(1 - 2p). Using the identity 1-2p = -tanh(q/2) for stability:
+    let m3 = weight * s * (1.0 - 2.0 * p);
+    (m1, m2, m3)
+}
+
+#[inline]
+fn binomial_neglog_q_fourth_derivative_logit_closed_form(y: f64, weight: f64, q: f64) -> f64 {
+    // Returns m4 = d^4F/dq^4 for logit link.
+    // m4 = ws(1 - 6s) = ws(1 - 6p(1-p)).
+    //
+    // Note: m4 does not depend on y at all (same as m2), because all
+    // even-order derivatives of the canonical Bernoulli NLL are functions
+    // of p alone. The y-dependence cancels out in the chain rule because
+    // the logit is the canonical link.
+    let _ = y; // m4 is independent of y for canonical logit
+    if weight == 0.0 || !q.is_finite() {
+        return 0.0;
+    }
+    let p = if q >= 0.0 {
+        1.0 / (1.0 + (-q).exp())
+    } else {
+        let eq = q.exp();
+        eq / (1.0 + eq)
+    };
+    let s = p * (1.0 - p);
+    weight * s * (1.0 - 6.0 * s)
+}
+
+// ---------------------------------------------------------------------------
+// CLogLog / Gumbel closed-form m1–m4
+// ---------------------------------------------------------------------------
+//
+// For the complementary log-log link, G(q) = 1 - exp(-exp(q)), so
+// F(q) = -w[y log G(q) + (1-y) log(1-G(q))].
+//
+// Define:
+//   z = e^q            (the "inner exponential")
+//   r = e^{-z}         (survival probability 1 - G(q))
+//   p = 1 - r = G(q) = -expm1(-z)
+//   h = z / expm1(z) = z*r / p
+//
+// The ratio h is the key stable building block. It arises because the
+// y=1 branch of the loss is F_{y=1} = -w log(1 - e^{-z}), and differentiating
+// log(-expm1(-z)) w.r.t. q produces factors of z*e^{-z}/(1 - e^{-z}) = z*r/p = h.
+// The function h = z/(e^z - 1) is smooth on all of R, with h -> 1 as z -> 0
+// (removable singularity), and h -> z*e^{-z} -> 0 as z -> +inf.
+//
+// For y=0, the loss is simply F_{y=0} = w*e^q = w*z, so all derivatives are w*z.
+//
+// For y=1, the derivatives in the "h-form" (from response.md Section 1b) are:
+//   F'_{y=1}    = -wh
+//   F''_{y=1}   = wh(h + z - 1)
+//   F'''_{y=1}  = -wh(2h^2 + 3(z-1)h + z^2 - 3z + 1)
+//   F''''_{y=1} = wh(6h^3 + 12(z-1)h^2 + (7z^2 - 18z + 7)h + z^3 - 6z^2 + 7z - 1)
+//
+// For general y in [0,1], combining linearly:
+//   m1 = w[(1-y)z - yh]
+//   m2 = w[(1-y)z + yh(h + z - 1)]
+//   m3 = w[(1-y)z - yh(2h^2 + 3(z-1)h + z^2 - 3z + 1)]
+//   m4 = w[(1-y)z + yh(6h^3 + 12(z-1)h^2 + (7z^2 - 18z + 7)h + z^3 - 6z^2 + 7z - 1)]
+//
+// Numerical stability (see response.md Section 1b):
+//
+// Left tail (q << 0, z small):
+//   p = -expm1(-z) avoids cancellation in 1 - e^{-z} when z is tiny.
+//   h = z/expm1(z) is computed directly via expm1; no separate Taylor branch
+//   is strictly necessary because expm1 is accurate for small arguments.
+//   As z -> 0, h -> 1 - z/2 + z^2/12 - z^4/720 + O(z^6).
+//
+// Right tail (q >> 0, z > 36.7):
+//   r = e^{-z} underflows to 0, so p rounds to 1. In this regime,
+//   h = z*r/(1-r) ≈ z*r, which gracefully underflows to 0.
+//   For y=1, all four derivatives -> 0. For y=0, they equal w*z.
+//   The overflow boundary for e^z is z ≈ 709, i.e. q ≈ 6.56. Beyond that,
+//   we must not compute e^z directly; instead h = z*r/p with r = e^{-z}.
+//
+// Reference: response.md Section 1b.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn cloglog_stable_h(z: f64) -> f64 {
+    // Compute h = z / expm1(z) = z / (e^z - 1) = z * e^{-z} / (1 - e^{-z}).
+    //
+    // This is the fundamental stable building block for cloglog derivatives.
+    // It has a removable singularity at z=0 where h -> 1.
+    //
+    // For large z (z > 36.7), expm1(z) overflows to infinity, but z*e^{-z}
+    // is tiny and the derivatives are negligible. We use the identity
+    // h = z * r / p where r = e^{-z} and p = -expm1(-z) for all z, which
+    // is stable across the full range because:
+    //   - For z near 0: expm1(z) is accurate, so z/expm1(z) is fine.
+    //   - For large z: r = e^{-z} -> 0, making h -> 0 as well.
+    if z.abs() < 1e-12 {
+        // Taylor: h = 1 - z/2 + z^2/12 - z^4/720 + ...
+        return 1.0 - z * 0.5 + z * z / 12.0;
+    }
+    let expm1_z = z.exp_m1();
+    if expm1_z.is_infinite() {
+        // z is very large (> ~709), e^z overflows. h = z*e^{-z}/(1 - e^{-z}).
+        // Since z > 709, e^{-z} is essentially 0, so h ≈ 0.
+        let r = (-z).exp();
+        if r == 0.0 {
+            return 0.0;
+        }
+        return z * r / (1.0 - r);
+    }
+    z / expm1_z
+}
+
+#[inline]
+fn binomial_neglog_q_derivatives_cloglog_closed_form(
+    y: f64,
+    weight: f64,
+    q: f64,
+) -> (f64, f64, f64) {
+    // Returns (m1, m2, m3) for F(q) = -w[y log G(q) + (1-y) log(1-G(q))]
+    // with G = cloglog CDF: G(q) = 1 - exp(-exp(q)).
+    if weight == 0.0 || !q.is_finite() {
+        return (0.0, 0.0, 0.0);
+    }
+    let z = q.exp(); // z = e^q; may be large but that's handled below
+    let h = cloglog_stable_h(z);
+
+    // y=0 branch: all derivatives equal w*z (since F_{y=0} = w*e^q).
+    // y=1 branch: uses the h-polynomial forms.
+    // General y: linear combination.
+    let y0_term = (1.0 - y) * z; // common y=0 contribution to each derivative
+
+    let m1 = weight * (y0_term - y * h);
+    let m2 = weight * (y0_term + y * h * (h + z - 1.0));
+    let m3 =
+        weight * (y0_term - y * h * (2.0 * h * h + 3.0 * (z - 1.0) * h + z * z - 3.0 * z + 1.0));
+    (m1, m2, m3)
+}
+
+#[inline]
+fn binomial_neglog_q_fourth_derivative_cloglog_closed_form(y: f64, weight: f64, q: f64) -> f64 {
+    // Returns m4 = d^4F/dq^4 for cloglog link.
+    // m4 = w[(1-y)z + yh(6h^3 + 12(z-1)h^2 + (7z^2-18z+7)h + z^3-6z^2+7z-1)]
+    if weight == 0.0 || !q.is_finite() {
+        return 0.0;
+    }
+    let z = q.exp();
+    let h = cloglog_stable_h(z);
+    let y0_term = (1.0 - y) * z;
+    let h2 = h * h;
+    let h3 = h2 * h;
+    let z2 = z * z;
+    let z3 = z2 * z;
+    let y1_poly = 6.0 * h3 + 12.0 * (z - 1.0) * h2 + (7.0 * z2 - 18.0 * z + 7.0) * h + z3
+        - 6.0 * z2
+        + 7.0 * z
+        - 1.0;
+    weight * (y0_term + y * h * y1_poly)
+}
+
+// ---------------------------------------------------------------------------
+// Unified dispatch: choose closed-form or jet fallback for binomial m1–m4
+// ---------------------------------------------------------------------------
+//
+// For Probit, Logit, and CLogLog links, we have closed-form expressions for
+// m1–m4 that are both faster and more numerically stable than the generic
+// jet-based chain rule. For exotic links (SAS, BetaLogistic, blended, mixture),
+// we fall back to the jet-based computation.
+//
+// The dispatch is based on the InverseLink variant. The closed-form functions
+// take different arguments:
+//   - Probit: needs (y, w, q, mu) because it uses mu = Phi(q) and phi(q)
+//   - Logit/CLogLog: need only (y, w, q) since p is computed internally
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn binomial_neglog_q_derivatives_closed_form_dispatch(
+    y: f64,
+    weight: f64,
+    q: f64,
+    mu: f64,
+    link_kind: &InverseLink,
+) -> (f64, f64, f64) {
+    match link_kind {
+        InverseLink::Standard(LinkFunction::Probit) => {
+            binomial_neglog_q_derivatives_probit_closed_form(y, weight, q, mu)
+        }
+        InverseLink::Standard(LinkFunction::Logit) => {
+            binomial_neglog_q_derivatives_logit_closed_form(y, weight, q)
+        }
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            binomial_neglog_q_derivatives_cloglog_closed_form(y, weight, q)
+        }
+        _ => {
+            // Should not be called for unsupported links; caller should use jet path.
+            // This is a safety fallback.
+            (0.0, 0.0, 0.0)
+        }
+    }
+}
+
+#[inline]
+fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
+    y: f64,
+    weight: f64,
+    q: f64,
+    mu: f64,
+    link_kind: &InverseLink,
+) -> f64 {
+    match link_kind {
+        InverseLink::Standard(LinkFunction::Probit) => {
+            binomial_neglog_q_fourth_derivative_probit_closed_form(y, weight, q, mu)
+        }
+        InverseLink::Standard(LinkFunction::Logit) => {
+            binomial_neglog_q_fourth_derivative_logit_closed_form(y, weight, q)
+        }
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, weight, q)
+        }
+        _ => 0.0,
+    }
+}
+
+/// Returns true if the given link supports closed-form m1–m4 derivatives for
+/// the binomial location-scale family, enabling the exact joint Newton path.
+#[inline]
+fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
+    matches!(
+        link_kind,
+        InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+    )
 }
 
 fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -3711,6 +3993,16 @@ fn binomial_location_scale_working_sets(
         ));
     }
 
+    // Diagonal IRLS fallback path (used when ExactNewton geometry is unavailable).
+    //
+    // NOTE on observed vs expected information (see response.md Section 3):
+    // These weights are Fisher-style: w = pw * (dmu/deta)^2 / V(mu). For the inner
+    // IRLS solver this is fine (Fisher scoring finds the same mode). For the outer
+    // REML, the ExactNewton path (above) is preferred because it provides the
+    // actual observed Hessian. When only Diagonal weights are available, the outer
+    // REML uses these Fisher weights in H = X'WX + S, which is a PQL-type
+    // approximation for non-canonical links. This is acceptable when the
+    // ExactNewton path handles the joint Hessian for the outer objective.
     let mut z_t = Array1::<f64>::zeros(n);
     let mut w_t = Array1::<f64>::zeros(n);
     let mut z_ls = Array1::<f64>::zeros(n);
@@ -5050,6 +5342,17 @@ impl CustomFamily for GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
+        // Diagonal IRLS weights for the inner solver.
+        //
+        // For the location block (identity link): wmu = pw / sigma^2. Since the
+        // location link is identity, observed = Fisher --- no correction needed.
+        //
+        // For the log-sigma block (log link): w_ls = 2 * pw * (dsigma/deta)^2 / sigma^2.
+        // This is the Fisher weight. For the outer REML, the joint
+        // `exact_newton_joint_hessian` provides the full observed Hessian directly,
+        // so these Diagonal weights are only used for the inner IRLS iteration
+        // (where Fisher scoring is fine). See response.md Section 3.
+        //
         // SAFETY: every element is written before being read in the loop below.
         let mut zmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
         let mut wmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
@@ -7176,9 +7479,59 @@ pub struct BinomialMeanWiggleFamily {
     pub wiggle_degree: usize,
 }
 
+struct BinomialMeanWiggleGeometry {
+    basis: Array2<f64>,
+    basis_d1: Array2<f64>,
+    basis_d2: Array2<f64>,
+    dq_dq0: Array1<f64>,
+    d2q_dq02: Array1<f64>,
+    d3q_dq03: Array1<f64>,
+}
+
+struct BinomialMeanWiggleJointPsiDirection {
+    local_idx: usize,
+    x_eta_psi: Array2<f64>,
+    z_eta_psi: Array1<f64>,
+}
+
+fn binomial_pack_mean_wiggle_joint_score(
+    score_eta: &Array1<f64>,
+    score_w: &Array1<f64>,
+) -> Array1<f64> {
+    let p_eta = score_eta.len();
+    let pw = score_w.len();
+    let mut out = Array1::<f64>::zeros(p_eta + pw);
+    out.slice_mut(s![0..p_eta]).assign(score_eta);
+    out.slice_mut(s![p_eta..p_eta + pw]).assign(score_w);
+    out
+}
+
+fn binomial_pack_mean_wiggle_joint_symmetrichessian(
+    h_eta_eta: &Array2<f64>,
+    h_eta_w: &Array2<f64>,
+    h_ww: &Array2<f64>,
+) -> Array2<f64> {
+    let p_eta = h_eta_eta.nrows();
+    let pw = h_ww.nrows();
+    let total = p_eta + pw;
+    let mut out = Array2::<f64>::zeros((total, total));
+    out.slice_mut(s![0..p_eta, 0..p_eta]).assign(h_eta_eta);
+    out.slice_mut(s![0..p_eta, p_eta..total]).assign(h_eta_w);
+    out.slice_mut(s![p_eta..total, p_eta..total]).assign(h_ww);
+    mirror_upper_to_lower(&mut out);
+    out
+}
+
 impl BinomialMeanWiggleFamily {
     pub const BLOCK_ETA: usize = 0;
     pub const BLOCK_WIGGLE: usize = 1;
+
+    fn wiggle_constraint_transform(&self) -> Result<Array2<f64>, String> {
+        let (z, _) =
+            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
+                .map_err(|e| e.to_string())?;
+        Ok(z)
+    }
 
     fn wiggle_basiswith_options(
         &self,
@@ -7193,9 +7546,7 @@ impl BinomialMeanWiggleFamily {
         )
         .map_err(|e| e.to_string())?;
         let full = (*basis).clone();
-        let (z, _) =
-            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
-                .map_err(|e| e.to_string())?;
+        let z = self.wiggle_constraint_transform()?;
         if full.ncols() != z.nrows() {
             return Err(format!(
                 "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
@@ -7224,6 +7575,180 @@ impl BinomialMeanWiggleFamily {
             ));
         }
         Ok(d_constrained.dot(&betawiggle) + 1.0)
+    }
+
+    fn wiggle_d2q_dq02(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        betawiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
+        if d2.ncols() != betawiggle.len() {
+            return Err(format!(
+                "wiggle second-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                d2.ncols(),
+                betawiggle.len()
+            ));
+        }
+        Ok(d2.dot(&betawiggle))
+    }
+
+    fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        if self.wiggle_degree < 3 {
+            let z = self.wiggle_constraint_transform()?;
+            return Ok(Array2::zeros((q0.len(), z.ncols())));
+        }
+        let z = self.wiggle_constraint_transform()?;
+        let num_basis = self
+            .wiggle_knots
+            .len()
+            .checked_sub(self.wiggle_degree + 1)
+            .ok_or_else(|| "wiggle knot vector too short for third derivative".to_string())?;
+        if z.nrows() != num_basis {
+            return Err(format!(
+                "wiggle third-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
+                num_basis,
+                z.nrows()
+            ));
+        }
+        let mut raw = vec![0.0; num_basis];
+        let mut out = Array2::<f64>::zeros((q0.len(), z.ncols()));
+        for (i, &q0_i) in q0.iter().enumerate() {
+            evaluate_bsplinethird_derivative_scalar(
+                q0_i,
+                self.wiggle_knots.view(),
+                self.wiggle_degree,
+                &mut raw,
+            )
+            .map_err(|e| format!("failed to evaluate wiggle third derivative basis: {e}"))?;
+            for constrained_j in 0..z.ncols() {
+                let mut basis_j = 0.0;
+                for raw_k in 0..num_basis {
+                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
+                }
+                out[[i, constrained_j]] = basis_j;
+            }
+        }
+        Ok(out)
+    }
+
+    fn wiggle_d3q_dq03(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        betawiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d3 = self.wiggle_d3basis_constrained(q0)?;
+        if d3.ncols() != betawiggle.len() {
+            return Err(format!(
+                "wiggle third-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                d3.ncols(),
+                betawiggle.len()
+            ));
+        }
+        Ok(d3.dot(&betawiggle))
+    }
+
+    fn wiggle_geometry(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        betawiggle: ArrayView1<'_, f64>,
+    ) -> Result<BinomialMeanWiggleGeometry, String> {
+        let basis = self.wiggle_design(q0)?;
+        let basis_d1 = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
+        let basis_d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
+        let dq_dq0 = self.wiggle_dq_dq0(q0, betawiggle)?;
+        let d2q_dq02 = self.wiggle_d2q_dq02(q0, betawiggle)?;
+        let d3q_dq03 = self.wiggle_d3q_dq03(q0, betawiggle)?;
+        Ok(BinomialMeanWiggleGeometry {
+            basis,
+            basis_d1,
+            basis_d2,
+            dq_dq0,
+            d2q_dq02,
+            d3q_dq03,
+        })
+    }
+
+    fn neglog_q_derivatives(&self, y: f64, weight: f64, q: f64) -> Result<(f64, f64, f64), String> {
+        let mut jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+            .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+        let (mu_clamped, clamp_active) = clamped_binomial_probability(jet.mu);
+        jet.mu = mu_clamped;
+        if clamp_active {
+            jet.d1 = 0.0;
+            jet.d2 = 0.0;
+            jet.d3 = 0.0;
+        }
+        Ok(if binomial_link_has_closed_form(&self.link_kind) {
+            binomial_neglog_q_derivatives_closed_form_dispatch(
+                y,
+                weight,
+                q,
+                jet.mu,
+                &self.link_kind,
+            )
+        } else {
+            binomial_neglog_q_derivatives_from_jet(y, weight, jet.mu, jet.d1, jet.d2, jet.d3)
+        })
+    }
+
+    fn dense_eta_design_fromspecs<'a>(
+        &self,
+        specs: &'a [ParameterBlockSpec],
+    ) -> Result<Cow<'a, Array2<f64>>, String> {
+        if specs.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 specs, got {}",
+                specs.len()
+            ));
+        }
+        Ok(match specs[Self::BLOCK_ETA].design.as_dense_ref() {
+            Some(d) => Cow::Borrowed(d),
+            None => Cow::Owned(specs[Self::BLOCK_ETA].design.to_dense()),
+        })
+    }
+
+    fn exact_newton_joint_psi_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_eta: &Array2<f64>,
+    ) -> Result<Option<BinomialMeanWiggleJointPsiDirection>, String> {
+        if block_states.len() != 2 || derivative_blocks.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint psi direction expects 2 blocks and 2 derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let n = self.y.len();
+        let p_eta = x_eta.ncols();
+        let beta_eta = &block_states[Self::BLOCK_ETA].beta;
+        let mut global = 0usize;
+        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+            for (local_idx, deriv) in block_derivs.iter().enumerate() {
+                if global == psi_index {
+                    if block_idx != Self::BLOCK_ETA {
+                        return Ok(None);
+                    }
+                    let x_eta_psi = resolve_custom_family_x_psi(
+                        deriv,
+                        n,
+                        p_eta,
+                        "BinomialMeanWiggleFamily eta",
+                    )?;
+                    let z_eta_psi = x_eta_psi.dot(beta_eta);
+                    return Ok(Some(BinomialMeanWiggleJointPsiDirection {
+                        local_idx,
+                        x_eta_psi,
+                        z_eta_psi,
+                    }));
+                }
+                global += 1;
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -7337,6 +7862,233 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 
     fn block_geometry_is_dynamic(&self) -> bool {
         true
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let x_eta = self.dense_eta_design_fromspecs(specs)?;
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta.ncols();
+        let pw = geom.basis.ncols();
+        let mut coeff_eta = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_ww = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, _) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            coeff_eta[row] = hessian_coeff_fromobjective_q_terms(m1, m2, a, a, b);
+            coeff_etaw_b[row] = m2 * a;
+            coeff_etaw_d1[row] = m1;
+            coeff_ww[row] = m2;
+        }
+        let h_eta_eta = xt_diag_x_dense(&x_eta, &coeff_eta)?;
+        let h_eta_w = xt_diag_y_dense(&x_eta, &coeff_etaw_b, &geom.basis)?
+            + &xt_diag_y_dense(&x_eta, &coeff_etaw_d1, &geom.basis_d1)?;
+        let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww)?;
+        debug_assert_eq!(h_eta_eta.nrows(), p_eta);
+        debug_assert_eq!(h_ww.nrows(), pw);
+        Ok(Some(binomial_pack_mean_wiggle_joint_symmetrichessian(
+            &h_eta_eta, &h_eta_w, &h_ww,
+        )))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let x_eta = self.dense_eta_design_fromspecs(specs)?;
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta.ncols();
+        let pw = geom.basis.ncols();
+        if d_beta_flat.len() != p_eta + pw {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                p_eta + pw
+            ));
+        }
+        let u_eta = d_beta_flat.slice(s![0..p_eta]).to_owned();
+        let uw = d_beta_flat.slice(s![p_eta..p_eta + pw]).to_owned();
+        let xi = x_eta.dot(&u_eta);
+        let phi = geom.basis.dot(&uw);
+        let basis1_u = geom.basis_d1.dot(&uw);
+        let basis2_u = geom.basis_d2.dot(&uw);
+
+        let mut coeff_eta = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d2 = Array1::<f64>::zeros(n);
+        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_db = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            let c = geom.d3q_dq03[row];
+            let q_u = a * xi[row] + phi[row];
+            let a_u = b * xi[row] + basis1_u[row];
+            let b_u = c * xi[row] + basis2_u[row];
+            coeff_eta[row] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, q_u, a, a, b, a_u, a_u, b_u,
+            );
+            coeff_etaw_b[row] = m3 * q_u * a + m2 * a_u;
+            coeff_etaw_d1[row] = m2 * (a * xi[row] + q_u);
+            coeff_etaw_d2[row] = m1 * xi[row];
+            coeff_ww_bb[row] = m3 * q_u;
+            coeff_ww_db[row] = m2 * xi[row];
+        }
+
+        let d_h_eta_eta = xt_diag_x_dense(&x_eta, &coeff_eta)?;
+        let d_h_eta_w = xt_diag_y_dense(&x_eta, &coeff_etaw_b, &geom.basis)?
+            + &xt_diag_y_dense(&x_eta, &coeff_etaw_d1, &geom.basis_d1)?
+            + &xt_diag_y_dense(&x_eta, &coeff_etaw_d2, &geom.basis_d2)?;
+        let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
+        let d_h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+        Ok(Some(binomial_pack_mean_wiggle_joint_symmetrichessian(
+            &d_h_eta_eta,
+            &d_h_eta_w,
+            &d_h_ww,
+        )))
+    }
+
+    fn exact_newton_joint_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        if block_states.len() != 2 || derivative_blocks.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint psi terms expect 2 blocks and 2 derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let x_eta = self.dense_eta_design_fromspecs(specs)?;
+        let Some(dir_a) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            &x_eta,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta.ncols();
+        let pw = geom.basis.ncols();
+
+        let mut objective_psi = 0.0;
+        let mut score_eta_xa = Array1::<f64>::zeros(n);
+        let mut score_eta_x = Array1::<f64>::zeros(n);
+        let mut score_w_b = Array1::<f64>::zeros(n);
+        let mut score_w_d1 = Array1::<f64>::zeros(n);
+
+        let mut coeff_eta_eta_xx = Array1::<f64>::zeros(n);
+        let mut coeff_eta_eta_xa_x = Array1::<f64>::zeros(n);
+        let mut coeff_eta_w_xa_b = Array1::<f64>::zeros(n);
+        let mut coeff_eta_w_x_b = Array1::<f64>::zeros(n);
+        let mut coeff_eta_w_x_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_eta_w_xa_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_eta_w_x_d2 = Array1::<f64>::zeros(n);
+        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_db = Array1::<f64>::zeros(n);
+
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let z_a = dir_a.z_eta_psi[row];
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            let c = geom.d3q_dq03[row];
+            let q_a = a * z_a;
+
+            objective_psi += m1 * q_a;
+
+            score_eta_xa[row] = m1 * a;
+            score_eta_x[row] = m2 * q_a * a + m1 * b * z_a;
+            score_w_b[row] = m2 * q_a;
+            score_w_d1[row] = m1 * z_a;
+
+            coeff_eta_eta_xx[row] =
+                m3 * q_a * a * a + m2 * (2.0 * a * b * z_a + q_a * b) + m1 * c * z_a;
+            coeff_eta_eta_xa_x[row] = m2 * a * a + m1 * b;
+            coeff_eta_w_xa_b[row] = m2 * a;
+            coeff_eta_w_x_b[row] = m3 * q_a * a + m2 * b * z_a;
+            coeff_eta_w_x_d1[row] = m2 * (a * z_a + q_a);
+            coeff_eta_w_xa_d1[row] = m1;
+            coeff_eta_w_x_d2[row] = m1 * z_a;
+            coeff_ww_bb[row] = m3 * q_a;
+            coeff_ww_db[row] = m2 * z_a;
+        }
+
+        let score_psi = binomial_pack_mean_wiggle_joint_score(
+            &(dir_a.x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
+            &(geom.basis.t().dot(&score_w_b) + geom.basis_d1.t().dot(&score_w_d1)),
+        );
+
+        let a_eta_eta = xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_eta_xa_x, &x_eta)?;
+        let h_eta_eta = &a_eta_eta + &a_eta_eta.t() + &xt_diag_x_dense(&x_eta, &coeff_eta_eta_xx)?;
+        let h_eta_w = xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_w_xa_b, &geom.basis)?
+            + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_b, &geom.basis)?
+            + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d1, &geom.basis_d1)?
+            + &xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_w_xa_d1, &geom.basis_d1)?
+            + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d2, &geom.basis_d2)?;
+        let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
+        let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+
+        debug_assert_eq!(score_psi.len(), p_eta + pw);
+        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi: binomial_pack_mean_wiggle_joint_symmetrichessian(
+                &h_eta_eta, &h_eta_w, &h_ww,
+            ),
+        }))
     }
 }
 
@@ -7768,7 +8520,10 @@ impl BinomialLocationScaleFamily {
     }
 
     fn exact_joint_supported(&self) -> bool {
-        matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit))
+        // Closed-form m1–m4 are available for Probit, Logit, and CLogLog links,
+        // enabling the exact joint Newton path for all three. Exotic links
+        // (SAS, BetaLogistic, blended, mixture) still require the jet fallback.
+        binomial_link_has_closed_form(&self.link_kind)
             && self.threshold_design.is_some()
             && self.log_sigma_design.is_some()
     }
@@ -7831,7 +8586,7 @@ impl BinomialLocationScaleFamily {
         // curvature, forcing the code back onto a blockwise surrogate just
         // because the family did not cache duplicate dense designs would be
         // mathematically wrong.
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         if self.threshold_design.is_some() && self.log_sigma_design.is_some() {
@@ -8043,11 +8798,12 @@ impl BinomialLocationScaleFamily {
         for i in 0..n {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
-            let (m1, m2, _) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (m1, m2, _) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q,
                 core.mu[i],
+                &self.link_kind,
             );
             coeff_tt[i] = m2 * r * r;
             coeff_tl[i] = r * (m1 + q * m2);
@@ -8159,11 +8915,12 @@ impl BinomialLocationScaleFamily {
         for i in 0..n {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q,
                 core.mu[i],
+                &self.link_kind,
             );
             let a = d_eta_t[i];
             let b = d_eta_ls[i];
@@ -8287,17 +9044,19 @@ impl BinomialLocationScaleFamily {
         for i in 0..n {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q,
                 core.mu[i],
+                &self.link_kind,
             );
-            let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+            let m4 = binomial_neglog_q_fourth_derivative_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q,
                 core.mu[i],
+                &self.link_kind,
             );
             let a = d_eta_t_u[i];
             let b = d_eta_ls_u[i];
@@ -8453,7 +9212,7 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         if block_states.len() != 2 {
@@ -8613,11 +9372,12 @@ impl BinomialLocationScaleFamily {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
             let q_psi = -r * z_t[i] - q * z_ls[i];
-            let (a, b, c) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (a, b, c) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q,
                 core.mu[i],
+                &self.link_kind,
             );
             r_t[i] = -a * r;
             r_ls[i] = -a * q;
@@ -8676,7 +9436,7 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         let Some(dir_i) = self.exact_newton_joint_psi_direction(
@@ -8865,17 +9625,19 @@ impl BinomialLocationScaleFamily {
                 + r * (dir_i.z_t_psi[row] * dir_j.z_ls_psi[row]
                     + dir_j.z_t_psi[row] * dir_i.z_ls_psi[row])
                 + q * (dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row] - z_ls_ab[row]);
-            let (a, b, c) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (a, b, c) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
-            let d = binomial_neglog_q_fourth_derivative_probit_closed_form(
+            let d = binomial_neglog_q_fourth_derivative_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
             let u = a + q * b;
             let u_i = (2.0 * b + q * c) * q_i;
@@ -9087,17 +9849,19 @@ impl BinomialLocationScaleFamily {
             let du = -r * xi_t[row] - q * xi_ls[row];
             let q_a = -r * dir_a.z_t_psi[row] - q * dir_a.z_ls_psi[row];
             let q_au = r * dir_a.z_t_psi[row] * xi_ls[row] - du * dir_a.z_ls_psi[row];
-            let (a, b, c) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (a, b, c) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
-            let d = binomial_neglog_q_fourth_derivative_probit_closed_form(
+            let d = binomial_neglog_q_fourth_derivative_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
             let u = a + q * b;
             h_tt_u[row] = r * r * (c * du - 2.0 * b * xi_ls[row]);
@@ -9262,7 +10026,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
-        matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit))
+        binomial_link_has_closed_form(&self.link_kind)
     }
 
     fn diagonalworking_weights_directional_derivative(
@@ -9647,7 +10411,10 @@ impl BinomialLocationScaleWiggleFamily {
     }
 
     fn exact_joint_supported(&self) -> bool {
-        matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit))
+        // Closed-form m1–m4 are available for Probit, Logit, and CLogLog links,
+        // enabling the exact joint Newton path for all three. Exotic links
+        // (SAS, BetaLogistic, blended, mixture) still require the jet fallback.
+        binomial_link_has_closed_form(&self.link_kind)
             && self.threshold_design.is_some()
             && self.log_sigma_design.is_some()
     }
@@ -10086,7 +10853,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         let Some(dir_a) = self.exact_newton_joint_psi_direction(
@@ -10216,11 +10983,12 @@ impl BinomialLocationScaleWiggleFamily {
             let q_tw_a = ddrow.to_owned() * (q0_a * q0_geom.q_t) + &(drow.to_owned() * q0_t_a);
             let q_lw_a = ddrow.to_owned() * (q0_a * q0_geom.q_ls) + &(drow.to_owned() * q0_ls_a);
 
-            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
 
             objective_psi += loss_1 * m[row] * q0_a;
@@ -10382,7 +11150,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         if block_states.len() != 3 || derivative_blocks.len() != 3 {
@@ -10649,17 +11417,19 @@ impl BinomialLocationScaleWiggleFamily {
                 + &(&(&ddrow * q0_a) * q0_ls_b)
                 + &(&drow * q0_ls_ab);
 
-            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
-            let loss_4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+            let loss_4 = binomial_neglog_q_fourth_derivative_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
             objective_psi_psi += loss_2 * q_a * q_b + loss_1 * q_ab;
 
@@ -11124,7 +11894,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         let Some(dir_a) = self.exact_newton_joint_psi_direction(
@@ -11206,17 +11976,19 @@ impl BinomialLocationScaleWiggleFamily {
         let mut out = Array2::<f64>::zeros((total, total));
         for row in 0..n {
             let q = core.q0[row] + etaw[row];
-            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
-            let loss_4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+            let loss_4 = binomial_neglog_q_fourth_derivative_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
                 q,
                 core.mu[row],
+                &self.link_kind,
             );
             let q0 = nonwiggle_q_derivs(eta_t[row], sigma[row], ds[row], d2s[row], d3s[row]);
             let s_safe = sigma[row].max(1e-12);
@@ -11971,24 +12743,24 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let mut coeffww = Array1::<f64>::zeros(n);
         for i in 0..n {
             let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, _) =
-                if matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-                    binomial_neglog_q_derivatives_probit_closed_form(
-                        self.y[i],
-                        self.weights[i],
-                        q_i,
-                        core0.mu[i],
-                    )
-                } else {
-                    binomial_neglog_q_derivatives_from_jet(
-                        self.y[i],
-                        self.weights[i],
-                        core0.mu[i],
-                        core0.dmu_dq[i],
-                        core0.d2mu_dq2[i],
-                        core0.d3mu_dq3[i],
-                    )
-                };
+            let (m1, m2, _) = if binomial_link_has_closed_form(&self.link_kind) {
+                binomial_neglog_q_derivatives_closed_form_dispatch(
+                    self.y[i],
+                    self.weights[i],
+                    q_i,
+                    core0.mu[i],
+                    &self.link_kind,
+                )
+            } else {
+                binomial_neglog_q_derivatives_from_jet(
+                    self.y[i],
+                    self.weights[i],
+                    core0.mu[i],
+                    core0.dmu_dq[i],
+                    core0.d2mu_dq2[i],
+                    core0.d3mu_dq3[i],
+                )
+            };
             let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
 
             let q_t = m[i] * q0.q_t;
@@ -12146,24 +12918,24 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let mut coeffww_db = Array1::<f64>::zeros(n);
         for i in 0..n {
             let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) =
-                if matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-                    binomial_neglog_q_derivatives_probit_closed_form(
-                        self.y[i],
-                        self.weights[i],
-                        q_i,
-                        core0.mu[i],
-                    )
-                } else {
-                    binomial_neglog_q_derivatives_from_jet(
-                        self.y[i],
-                        self.weights[i],
-                        core0.mu[i],
-                        core0.dmu_dq[i],
-                        core0.d2mu_dq2[i],
-                        core0.d3mu_dq3[i],
-                    )
-                };
+            let (m1, m2, m3) = if binomial_link_has_closed_form(&self.link_kind) {
+                binomial_neglog_q_derivatives_closed_form_dispatch(
+                    self.y[i],
+                    self.weights[i],
+                    q_i,
+                    core0.mu[i],
+                    &self.link_kind,
+                )
+            } else {
+                binomial_neglog_q_derivatives_from_jet(
+                    self.y[i],
+                    self.weights[i],
+                    core0.mu[i],
+                    core0.dmu_dq[i],
+                    core0.d2mu_dq2[i],
+                    core0.d3mu_dq3[i],
+                )
+            };
             let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
             let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
 
@@ -12265,7 +13037,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
         if block_states.len() != 3 {
@@ -12337,17 +13109,19 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         for i in 0..n {
             // Per-row scalar objective derivatives for F_i(q).
             let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q_i,
                 core0.mu[i],
+                &self.link_kind,
             );
-            let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+            let m4 = binomial_neglog_q_fourth_derivative_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
                 q_i,
                 core0.mu[i],
+                &self.link_kind,
             );
 
             // Non-wiggle q0(eta_t, eta_ls) derivatives and sigma-ratio helpers.
