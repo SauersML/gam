@@ -35,8 +35,7 @@ use gam::gamlss::{
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
-    FamilyNutsInputs, GlmFlatInputs, JointSplineArtifacts, NutsConfig, run_joint_nuts_sampling,
-    run_nuts_sampling_flattened_family,
+    FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family,
 };
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
@@ -46,7 +45,6 @@ use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
     ModelKind, PredictModelClass,
 };
-use gam::joint::{JointModelResult, predict_joint};
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
@@ -1500,20 +1498,18 @@ fn run_fitwith_predict_noise(
 /// - **BinomialLocationScale** with link wiggles: the wiggle-augmented q0
 ///   prediction path (probit-wiggle, joint conditional integration) is not
 ///   captured by `BinomialLocationScalePredictor`.
-/// - **Standard** with link wiggles or joint flexible link: the `StandardPredictor`
-///   does not handle these augmented prediction paths.
+/// - **Standard** with link wiggles: the `StandardPredictor` does not handle
+///   these augmented prediction paths.
 fn needs_special_predict_handling(model: &SavedModel) -> bool {
     match model.predict_model_class() {
         // Survival always needs specialised handling (time basis, entry/exit).
         PredictModelClass::Survival => true,
         // Binomial location-scale with link wiggles needs the hand-rolled path.
         PredictModelClass::BinomialLocationScale => model.betawiggle.is_some(),
-        // Standard models with wiggle or joint link need their special paths.
+        // Standard models with link wiggles need their special paths.
         PredictModelClass::Standard => {
             let family = model.likelihood();
-            let has_wiggle = model.betawiggle.is_some() && is_binomial_family(family);
-            let has_joint = model.joint_beta_link.is_some();
-            has_wiggle || has_joint
+            model.betawiggle.is_some() && is_binomial_family(family)
         }
         PredictModelClass::GaussianLocationScale => model.betawiggle.is_some(),
     }
@@ -2682,15 +2678,13 @@ fn run_predict_gaussian_location_scale(
     Ok(())
 }
 
-/// Special-case standard / flexible-link prediction.
+/// Special-case standard prediction.
 ///
-/// This handles two cases that cannot go through `PredictableModel`:
+/// This handles the standard case that cannot go through `PredictableModel`:
 /// - **Link wiggles**: standard binomial models with `betawiggle` use a
 ///   hand-rolled path through `predict_standard_binomial_linkwiggle`.
-/// - **Joint flexible link**: models with `joint_beta_link` go through the
-///   `predict_joint` engine with its own SE propagation.
 ///
-/// For plain standard models (no wiggle, no joint), the unified path in
+/// For plain standard models (no wiggle), the unified path in
 /// `run_predict` handles prediction via `StandardPredictor`.
 fn run_predict_standard_or_flexible(
     progress: &mut gam::visualizer::VisualizerSession,
@@ -2760,105 +2754,7 @@ fn run_predict_standard_or_flexible(
         );
         return Ok(());
     }
-    if let Some(joint) = load_joint_result(model, family)? {
-        let beta_base = fit_saved.beta.clone();
-        if beta_base.len() != design.design.ncols() {
-            return Err(format!(
-                "joint model/design mismatch: beta has {} coefficients but design has {} columns",
-                beta_base.len(),
-                design.design.ncols()
-            ));
-        }
-        let eta_base = design.design.dot(&beta_base);
-        let nonlinear = !matches!(family, LikelihoodFamily::GaussianIdentity);
-        let mut se_base = None;
-        if (nonlinear && args.mode == PredictModeArg::PosteriorMean) || args.uncertainty {
-            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-            if cov_mat.nrows() != beta_base.len() || cov_mat.ncols() != beta_base.len() {
-                return Err(format!(
-                    "covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov_mat.nrows(),
-                    cov_mat.ncols(),
-                    beta_base.len(),
-                    beta_base.len()
-                ));
-            }
-            se_base = Some(linear_predictor_se(design.design.view(), &cov_mat));
-        }
-
-        let pred = if args.mode == PredictModeArg::PosteriorMean {
-            predict_joint(&joint, &eta_base, se_base.as_ref())
-        } else {
-            predict_joint(&joint, &eta_base, None)
-        }
-        .map_err(|e| format!("joint prediction failed: {e}"))?;
-        let mut mean_lo = None;
-        let mut mean_hi = None;
-        if args.uncertainty {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
-            let eff = pred
-                .effective_se
-                .as_ref()
-                .ok_or_else(|| "internal error: joint effective_se missing".to_string())?;
-            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            if nonlinear {
-                let response_sd = response_sd_from_eta_for_family(
-                    family,
-                    pred.eta.view(),
-                    eff.view(),
-                    saved_mixture,
-                    saved_sas,
-                    saved_mixture_param_cov,
-                    saved_sas_param_cov,
-                )?;
-                let (lo, hi) = response_interval_from_mean_sd(
-                    pred.probabilities.view(),
-                    response_sd.view(),
-                    z,
-                    1e-10,
-                    1.0 - 1e-10,
-                );
-                mean_lo = Some(lo);
-                mean_hi = Some(hi);
-            } else {
-                let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
-                let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
-                mean_lo = Some(
-                    try_inverse_link_array(family, eta_lower.view(), saved_link_kind)
-                        .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
-                );
-                mean_hi = Some(
-                    try_inverse_link_array(family, eta_upper.view(), saved_link_kind)
-                        .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
-                );
-            }
-        }
-        progress.advance_workflow(4);
-        progress.set_stage("predict", "writing joint predictions");
-        let out_se = if args.uncertainty {
-            pred.effective_se.as_ref().map(|a| a.view())
-        } else {
-            None
-        };
-        write_prediction_csv(
-            &args.out,
-            pred.eta.view(),
-            pred.probabilities.view(),
-            out_se,
-            mean_lo.as_ref().map(|a| a.view()),
-            mean_hi.as_ref().map(|a| a.view()),
-        )?;
-        println!(
-            "wrote predictions: {} (rows={})",
-            args.out.display(),
-            pred.probabilities.len()
-        );
-        return Ok(());
-    }
-
-    // Standard (no-wiggle, no-joint) path: delegate to PredictableModel trait.
+    // Standard (no-wiggle) path: delegate to PredictableModel trait.
     let predictor = model
         .predictor()
         .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
@@ -5241,12 +5137,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         .as_ref()
         .map(|fr| fr.beta.len())
         .unwrap_or(0);
-    let n_link_params = model
-        .joint_beta_link
-        .as_ref()
-        .map(|bl| bl.len())
-        .unwrap_or(0);
-    let adaptive = NutsConfig::for_dimension(n_base_params + n_link_params);
+    let adaptive = NutsConfig::for_dimension(n_base_params);
     let cfg = NutsConfig {
         n_samples: args.samples.unwrap_or(adaptive.n_samples),
         nwarmup: args.warmup.unwrap_or(adaptive.nwarmup),
@@ -5294,22 +5185,8 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     progress.advance_workflow(4);
     progress.set_stage("sample", "writing posterior draws");
 
-    // Determine how many columns are base coefficients vs link-wiggle
-    // coefficients.  When joint sampling was used the sample matrix has
-    // p_base + p_link columns; otherwise all columns are base coefficients.
     let n_coeffs = nuts.samples.ncols();
-    let p_base = model
-        .fit_result
-        .as_ref()
-        .map(|fr| fr.beta.len())
-        .unwrap_or(n_coeffs);
-    let coeff_name = |j: usize| -> String {
-        if j < p_base {
-            format!("beta_{j}")
-        } else {
-            format!("theta_{}", j - p_base)
-        }
-    };
+    let coeff_name = |j: usize| -> String { format!("beta_{j}") };
 
     // Write raw posterior samples CSV with appropriate column headers.
     {
@@ -5717,91 +5594,6 @@ fn run_sample_standard(
     progress.advance_workflow(3);
     let penalty = weighted_penalty_matrix(&design.penalties, fit.lambdas.view())?;
 
-    // Check if the model has a learned joint link wiggle; if so, attempt
-    // joint (beta, theta) sampling via run_joint_nuts_sampling.
-    if let Some(joint) = load_joint_result(model, family)? {
-        let base_link = joint.link;
-        let is_logit = match base_link {
-            LinkFunction::Logit => true,
-            LinkFunction::Identity => false,
-            other => {
-                eprintln!(
-                    "warning: joint NUTS sampling only supports logit and identity base links; \
-                     model uses {:?} -- falling back to base-only sampling with link wiggle fixed at MAP",
-                    other
-                );
-                // Fall back to base-only sampling.
-                return run_nuts_sampling_flattened_family(
-                    family,
-                    FamilyNutsInputs::Glm(GlmFlatInputs {
-                        x: design.design.view(),
-                        y: y.view(),
-                        weights: weights.view(),
-                        penalty_matrix: penalty.view(),
-                        mode: fit.beta.view(),
-                        hessian: fit
-                            .penalized_hessian()
-                            .ok_or_else(|| {
-                                "fit result is missing inference Hessian; refit with inference enabled"
-                                    .to_string()
-                            })?
-                            .view(),
-                        firth_bias_reduction: false,
-                    }),
-                    cfg,
-                )
-                .map_err(|e| format!("NUTS sampling failed: {e}"));
-            }
-        };
-
-        let scale = fit.standard_deviation;
-        let spline = JointSplineArtifacts {
-            knot_range: joint.knot_range,
-            knot_vector: joint.knot_vector.clone(),
-            link_transform: joint.link_transform.clone(),
-            degree: joint.degree,
-        };
-        let penalty_link = joint.s_link_constrained.clone();
-        let mode_theta = joint.beta_link.clone();
-
-        // Build the joint penalized Hessian by augmenting the base Hessian
-        // with the link penalty block.
-        let base_hessian = fit.penalized_hessian().ok_or_else(|| {
-            "fit result is missing inference Hessian; refit with inference enabled".to_string()
-        })?;
-        let p_base = base_hessian.nrows();
-        let p_link = penalty_link.nrows();
-        let dim = p_base + p_link;
-        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
-        joint_hessian
-            .slice_mut(ndarray::s![..p_base, ..p_base])
-            .assign(base_hessian);
-        joint_hessian
-            .slice_mut(ndarray::s![p_base.., p_base..])
-            .assign(&penalty_link);
-
-        eprintln!(
-            "info: using joint (beta, theta) NUTS sampling with {} base + {} link-wiggle parameters",
-            p_base, p_link
-        );
-
-        return run_joint_nuts_sampling(
-            design.design.view(),
-            y.view(),
-            weights.view(),
-            penalty.view(),
-            penalty_link.view(),
-            fit.beta.view(),
-            mode_theta.view(),
-            joint_hessian.view(),
-            spline,
-            cfg,
-            is_logit,
-            scale,
-        )
-        .map_err(|e| format!("joint NUTS sampling failed: {e}"));
-    }
-
     run_nuts_sampling_flattened_family(
         family,
         FamilyNutsInputs::Glm(GlmFlatInputs {
@@ -5851,8 +5643,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("generate", "building predictive state");
     // Unified path: delegate to PredictableModel for models that don't need
-    // special handling (link wiggles, joint flexible link).  Fall back to the
-    // legacy per-class helpers for those special cases.
+    // special handling (link wiggles). Fall back to the legacy per-class
+    // helpers for those special cases.
     let spec = if needs_special_predict_handling(&model) {
         match model.predict_model_class() {
             PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
@@ -6177,54 +5969,30 @@ fn run_generate_standard_or_flexible(
             noise: gam::generative::NoiseModel::Bernoulli,
         });
     }
-    if let Some(joint) = load_joint_result(model, family)? {
-        if !is_binomial_family(family) {
-            return Err(
-                "generate for flexible-link models currently supports binomial families only"
-                    .to_string(),
-            );
-        }
-        let beta_base = fit_saved.beta.clone();
-        if beta_base.len() != design.design.ncols() {
-            return Err(format!(
-                "joint model/design mismatch: beta has {} coefficients but design has {} columns",
-                beta_base.len(),
-                design.design.ncols()
-            ));
-        }
-        let eta_base = design.design.dot(&beta_base);
-        let pred = predict_joint(&joint, &eta_base, None)
-            .map_err(|e| format!("joint prediction failed: {e}"))?;
-        Ok(gam::generative::GenerativeSpec {
-            mean: pred.probabilities,
-            noise: gam::generative::NoiseModel::Bernoulli,
-        })
-    } else {
-        // Standard (no-wiggle, no-joint) path: delegate to PredictableModel.
-        let predictor = model
-            .predictor()
-            .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
-        let beta = fit_saved.beta.clone();
-        if beta.len() != design.design.ncols() {
-            return Err(format!(
-                "model/design mismatch: model beta has {} coefficients but design has {} columns",
-                beta.len(),
-                design.design.ncols()
-            ));
-        }
-        let offset = Array1::zeros(design.design.nrows());
-        let pred_input = PredictInput {
-            design: DesignMatrix::Dense(design.design.clone()),
-            offset,
-            design_noise: None,
-            offset_noise: None,
-        };
-        let pred = predictor
-            .predict_response(&pred_input)
-            .map_err(|e| format!("predict_response failed: {e}"))?;
-        generativespec_from_predict(pred, family, Some(fit_saved.standard_deviation))
-            .map_err(|e| format!("failed to build generative spec: {e}"))
+    // Standard (no-wiggle) path: delegate to PredictableModel.
+    let predictor = model
+        .predictor()
+        .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
+    let beta = fit_saved.beta.clone();
+    if beta.len() != design.design.ncols() {
+        return Err(format!(
+            "model/design mismatch: model beta has {} coefficients but design has {} columns",
+            beta.len(),
+            design.design.ncols()
+        ));
     }
+    let offset = Array1::zeros(design.design.nrows());
+    let pred_input = PredictInput {
+        design: DesignMatrix::Dense(design.design.clone()),
+        offset,
+        design_noise: None,
+        offset_noise: None,
+    };
+    let pred = predictor
+        .predict_response(&pred_input)
+        .map_err(|e| format!("predict_response failed: {e}"))?;
+    generativespec_from_predict(pred, family, Some(fit_saved.standard_deviation))
+        .map_err(|e| format!("failed to build generative spec: {e}"))
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
@@ -7267,23 +7035,6 @@ impl SavedFitSummary {
         self.reml_score += n * log_scale;
         self.max_abs_eta *= response_scale;
         self.validated()
-    }
-
-    fn from_joint_result(joint: &JointModelResult) -> Result<Self, String> {
-        Self {
-            iterations: joint.backfit_iterations,
-            finalgrad_norm: joint.outer_gradient_norm,
-            pirls_status: if joint.converged {
-                gam::pirls::PirlsStatus::Converged
-            } else {
-                gam::pirls::PirlsStatus::StalledAtValidMinimum
-            },
-            deviance: joint.deviance,
-            stable_penalty_term: 0.0,
-            max_abs_eta: 0.0,
-            reml_score: joint.deviance,
-        }
-        .validated()
     }
 
     fn from_survival_location_scale_fit(
@@ -9438,63 +9189,6 @@ fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
 
-fn load_joint_result(
-    model: &SavedModel,
-    family: LikelihoodFamily,
-) -> Result<Option<JointModelResult>, String> {
-    let Some(beta_linkvec) = &model.joint_beta_link else {
-        return Ok(None);
-    };
-    let (knot_min, knot_max) = model
-        .joint_knot_range
-        .ok_or_else(|| "saved joint model is missing knot range".to_string())?;
-    let knotvec = model
-        .joint_knot_vector
-        .as_ref()
-        .ok_or_else(|| "saved joint model is missing knot vector".to_string())?;
-    let link_transform_nested = model
-        .joint_link_transform
-        .as_ref()
-        .ok_or_else(|| "saved joint model is missing link transform".to_string())?;
-
-    let link = parse_link_choice(model.link.as_deref(), false)?
-        .map(|c| c.link)
-        .unwrap_or_else(|| family_to_link(family));
-    let link_transform = nestedvec_to_array2(link_transform_nested)?;
-    let beta_link = Array1::from_vec(beta_linkvec.clone());
-    if link_transform.ncols() != beta_link.len() {
-        return Err(format!(
-            "saved joint model link transform mismatch: {} columns vs {} beta_link coefficients",
-            link_transform.ncols(),
-            beta_link.len()
-        ));
-    }
-    let p_link = beta_link.len();
-    let mut s_link = Array2::<f64>::zeros((p_link, p_link));
-    for i in 0..p_link {
-        s_link[[i, i]] = 1.0;
-    }
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    Ok(Some(JointModelResult {
-        beta_base: fit_saved.beta.clone(),
-        beta_link,
-        lambdas: fit_saved.lambdas.to_vec(),
-        deviance: 0.0,
-        edf: 0.0,
-        backfit_iterations: 0,
-        converged: true,
-        outer_gradient_norm: fit_saved.outer_gradient_norm,
-        knot_range: (knot_min, knot_max),
-        knot_vector: Array1::from_vec(knotvec.clone()),
-        link_transform,
-        degree: model.joint_degree.unwrap_or(3),
-        link,
-        s_link_constrained: s_link,
-        ridge_used: model.jointridge_used.unwrap_or(0.0),
-        beta_base_covariance: None,
-    }))
-}
-
 fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
     if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
         return None;
@@ -10608,12 +10302,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: Some(response_scale),
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
@@ -10690,12 +10378,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: wiggle_knots,
             probitwiggle_degree: wiggle_degree,
             betawiggle,
@@ -10775,12 +10457,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: Some(wiggle_knots),
             probitwiggle_degree: Some(wiggle_degree),
             betawiggle: Some(betawiggle),
@@ -12013,12 +11689,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
@@ -12089,12 +11759,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
@@ -12199,12 +11863,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
@@ -13485,12 +13143,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: Some(knots),
             probitwiggle_degree: Some(3),
             betawiggle: Some(betawiggle.clone()),
@@ -13686,12 +13338,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
@@ -13757,12 +13403,6 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
             probitwiggle_degree: Some(2),
             betawiggle: None,

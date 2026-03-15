@@ -3145,10 +3145,7 @@ pub fn compute_hybrid_efs_update(
     }
 
     // Collect the ψ-block gradient for the caller (for backtracking).
-    let psi_gradient: Vec<f64> = psi_global_indices
-        .iter()
-        .map(|&gi| gradient[gi])
-        .collect();
+    let psi_gradient: Vec<f64> = psi_global_indices.iter().map(|&gi| gradient[gi]).collect();
 
     // ── ψ coordinates: preconditioned gradient step ──
     //
@@ -3296,9 +3293,7 @@ fn pseudoinverse_times_vec(
 ///
 /// This is a self-contained implementation to avoid external dependencies.
 /// For larger matrices, use faer's `SelfAdjointEigendecomposition`.
-fn symmetric_eigen(
-    a: &ndarray::Array2<f64>,
-) -> (Vec<f64>, ndarray::Array2<f64>) {
+fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>) {
     let n = a.nrows();
     assert_eq!(n, a.ncols(), "symmetric_eigen requires square matrix");
 
@@ -4221,8 +4216,7 @@ pub fn compute_block_penalty_logdet_derivs(
         };
 
         // Smooth pseudo-logdet: L_δ(S_b) = log det(S_b + δI) − m₀ log δ.
-        let block_logdet =
-            smooth_pseudo_logdet(eigs.as_slice().unwrap(), block_nullity, delta);
+        let block_logdet = smooth_pseudo_logdet(eigs.as_slice().unwrap(), block_nullity, delta);
         log_det_total += block_logdet;
 
         // (S + δI)⁻¹ for trace derivatives: full-rank inverse (no eigenspace
@@ -5776,10 +5770,7 @@ mod tests {
         let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let result = pseudoinverse_times_vec(&eye, &v, 1e-8);
         for i in 0..3 {
-            assert!(
-                (result[i] - v[i]).abs() < 1e-12,
-                "G=I: G⁺v should equal v"
-            );
+            assert!((result[i] - v[i]).abs() < 1e-12, "G=I: G⁺v should equal v");
         }
     }
 

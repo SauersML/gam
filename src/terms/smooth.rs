@@ -8356,7 +8356,12 @@ fn try_exact_joint_spatial_aniso_optimization(
             smooth_term_penalty_index(resolvedspec, baseline_design, term_idx).unwrap_or(0)
         })
         .collect();
-    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, dims_per_term, Some(&rho_kappa_indices));
+    enforce_psi_sum_to_zero(
+        &mut theta_star,
+        rho_dim,
+        dims_per_term,
+        Some(&rho_kappa_indices),
+    );
     Ok(theta_star)
 }
 
@@ -8547,8 +8552,7 @@ pub(crate) fn project_psi_hessian(
             grand_mean /= df * df;
             for a in 0..d {
                 for b in 0..d {
-                    hessian[[offset + a, offset + b]] +=
-                        -row_means[a] - col_means[b] + grand_mean;
+                    hessian[[offset + a, offset + b]] += -row_means[a] - col_means[b] + grand_mean;
                 }
             }
 
@@ -9418,9 +9422,7 @@ where
         .sum();
     let mean_rho_indices: Vec<usize> = mean_terms
         .iter()
-        .map(|&ti| {
-            smooth_term_penalty_index(&best_meanspec, &bootmean_design, ti).unwrap_or(0)
-        })
+        .map(|&ti| smooth_term_penalty_index(&best_meanspec, &bootmean_design, ti).unwrap_or(0))
         .collect();
     let noise_rho_indices: Vec<usize> = noise_terms
         .iter()
@@ -9435,7 +9437,12 @@ where
         .chain(noise_rho_indices.iter())
         .copied()
         .collect();
-    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, &all_dims, Some(&combined_rho_indices));
+    enforce_psi_sum_to_zero(
+        &mut theta_star,
+        rho_dim,
+        &all_dims,
+        Some(&combined_rho_indices),
+    );
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, all_dims);
     let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());

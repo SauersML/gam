@@ -68,18 +68,6 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
     #[serde(default)]
-    pub joint_beta_link: Option<Vec<f64>>,
-    #[serde(default)]
-    pub joint_knot_range: Option<(f64, f64)>,
-    #[serde(default)]
-    pub joint_knot_vector: Option<Vec<f64>>,
-    #[serde(default)]
-    pub joint_link_transform: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    pub joint_degree: Option<usize>,
-    #[serde(default)]
-    pub jointridge_used: Option<f64>,
-    #[serde(default)]
     pub probitwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
     pub probitwiggle_degree: Option<usize>,
@@ -180,12 +168,6 @@ impl FittedModelPayload {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            jointridge_used: None,
             probitwiggle_knots: None,
             probitwiggle_degree: None,
             betawiggle: None,
@@ -240,7 +222,6 @@ pub enum ModelKind {
     Standard,
     LocationScale,
     Survival,
-    FlexibleLink,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -266,10 +247,6 @@ pub enum FittedFamily {
         #[serde(default)]
         survival_distribution: Option<String>,
     },
-    FlexibleLink {
-        likelihood: LikelihoodFamily,
-        link: LinkFunction,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,8 +263,7 @@ impl FittedFamily {
         match self {
             Self::Standard { likelihood, .. }
             | Self::LocationScale { likelihood, .. }
-            | Self::Survival { likelihood, .. }
-            | Self::FlexibleLink { likelihood, .. } => *likelihood,
+            | Self::Survival { likelihood, .. } => *likelihood,
         }
     }
 }
@@ -518,9 +494,6 @@ impl FittedModel {
             FittedFamily::LocationScale { base_link, .. } => Ok(base_link.clone().or(stateful)),
             FittedFamily::Standard { link, .. } => {
                 Ok(stateful.or_else(|| link.map(InverseLink::Standard)))
-            }
-            FittedFamily::FlexibleLink { link, .. } => {
-                Ok(stateful.or(Some(InverseLink::Standard(*link))))
             }
             FittedFamily::Survival { .. } => Ok(None),
         }
@@ -759,16 +732,10 @@ impl FittedModel {
                 self.survival_time_smooth_lambda,
             ),
             ("survivalridge_lambda", self.survivalridge_lambda),
-            ("jointridge_used", self.jointridge_used),
         ] {
             if let Some(v) = opt {
                 ensure_finite_scalar(name, v)?;
             }
-        }
-
-        if let Some((a, b)) = self.joint_knot_range {
-            ensure_finite_scalar("joint_knot_range.0", a)?;
-            ensure_finite_scalar("joint_knot_range.1", b)?;
         }
 
         if let Some(v) = self.beta_noise.as_ref() {
@@ -785,12 +752,6 @@ impl FittedModel {
         }
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v)?;
-        }
-        if let Some(v) = self.joint_beta_link.as_ref() {
-            validate_all_finite("joint_beta_link", v.iter().copied())?;
-        }
-        if let Some(v) = self.joint_knot_vector.as_ref() {
-            validate_all_finite("joint_knot_vector", v.iter().copied())?;
         }
         if let Some(v) = self.betawiggle.as_ref() {
             validate_all_finite("betawiggle", v.iter().copied())?;

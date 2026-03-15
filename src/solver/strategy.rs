@@ -642,10 +642,8 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             let mut combined_step = Array1::from_vec(eval.steps);
 
             // Save the original ψ step magnitudes for halving.
-            let original_psi_steps: Vec<f64> = psi_indices
-                .iter()
-                .map(|&i| combined_step[i])
-                .collect();
+            let original_psi_steps: Vec<f64> =
+                psi_indices.iter().map(|&i| combined_step[i]).collect();
 
             let mut accepted = false;
             for bt in 0..MAX_PSI_BACKTRACK {

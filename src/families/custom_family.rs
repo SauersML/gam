@@ -3037,10 +3037,8 @@ fn unified_joint_cost_gradient(
         specs.iter().map(|s| s.penalties.as_slice()).collect();
     // Per-block nullities: use zero nullity for each penalty when structural
     // nullity info is not available from the block specs.
-    let per_block_nullity_vecs: Vec<Vec<usize>> = specs
-        .iter()
-        .map(|s| vec![0; s.penalties.len()])
-        .collect();
+    let per_block_nullity_vecs: Vec<Vec<usize>> =
+        specs.iter().map(|s| vec![0; s.penalties.len()]).collect();
     let per_block_nullity_refs: Vec<&[usize]> = per_block_nullity_vecs
         .iter()
         .map(|v| v.as_slice())
