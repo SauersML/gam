@@ -3272,6 +3272,47 @@ impl UnifiedFitResult {
             }
             flat
         };
+        let p = beta.len();
+        if let Some(cov) = covariance_conditional.as_ref() {
+            if cov.nrows() != p || cov.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov.nrows(),
+                    cov.ncols(),
+                    p,
+                    p
+                )));
+            }
+        }
+        if let Some(cov) = covariance_corrected.as_ref() {
+            if cov.nrows() != p || cov.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov.nrows(),
+                    cov.ncols(),
+                    p,
+                    p
+                )));
+            }
+        }
+        if let Some(inf) = inference.as_ref() {
+            if inf.penalized_hessian.nrows() != p || inf.penalized_hessian.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    inf.penalized_hessian.nrows(),
+                    inf.penalized_hessian.ncols(),
+                    p,
+                    p
+                )));
+            }
+        }
+        if !block_states.is_empty() && block_states.len() != blocks.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "UnifiedFitResult block state count mismatch: blocks={}, block_states={}",
+                blocks.len(),
+                block_states.len()
+            )));
+        }
 
         Ok(Self {
             blocks,
