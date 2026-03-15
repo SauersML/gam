@@ -176,35 +176,36 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// False for Gaussian, true for GLMs and coupled families.
     fn has_corrections(&self) -> bool;
 
-    /// Adjoint trick for scalar GLMs: precompute z_c = H⁻¹ Xᵀ (c ⊙ h) where
-    /// h = diag(X H⁻¹ Xᵀ) is the hat matrix diagonal (leverages).
+    /// Raw ingredients for the adjoint trace optimization.
     ///
-    /// When available, the trace `tr(H⁻¹ C[u])` for `C[u] = Xᵀ diag(c ⊙ Xu) X`
-    /// simplifies to `u^T z_c`, replacing an O(p²) solve with an O(p) dot product.
+    /// When available, the evaluator can use these to compute
+    /// tr(H⁻¹ C[u]) = uᵀ z_c  (O(p) dot product instead of O(p²) solve)
+    /// and fourth-derivative traces directly, without the trait having to
+    /// implement the optimization algorithm.
     ///
-    /// Returns `None` for providers that don't support this optimization
-    /// (Gaussian, multi-predictor, coupled families).
-    fn adjoint_trace_vector(&self, hop: &dyn HessianOperator) -> Option<Array1<f64>> {
-        let _ = hop;
+    /// Returns `None` for Gaussian (no corrections), multi-predictor,
+    /// and coupled families where the optimization doesn't apply.
+    fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
         None
     }
+}
 
-    /// Compute the trace contribution from fourth-derivative (d/Q) terms only:
-    ///   tr(H⁻¹ Xᵀ diag(d ⊙ (Xvₖ) ⊙ (Xvₗ)) X)
-    ///
-    /// This is the portion of `hessian_second_derivative_correction` that does NOT
-    /// depend on u_kl. Used alongside `adjoint_trace_vector` to avoid the u_kl solve.
-    ///
-    /// Returns `None` if there are no fourth-derivative (d) terms.
-    fn fourth_derivative_trace(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        hop: &dyn HessianOperator,
-    ) -> Option<f64> {
-        let _ = (v_k, v_l, hop);
-        None
-    }
+/// Raw ingredients for the adjoint trace optimization in scalar GLMs.
+///
+/// For single-predictor GLMs, the third-derivative correction is
+///   C[u] = Xᵀ diag(c ⊙ Xu) X
+/// and the fourth-derivative correction is
+///   Q[vₖ, vₗ] = Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X
+///
+/// The evaluator uses these arrays to implement the adjoint trace trick
+/// and compute fourth-derivative traces without materializing p×p matrices.
+pub struct ScalarGlmIngredients<'a> {
+    /// c = dW/dη, the third-derivative weight array.
+    pub c_array: &'a Array1<f64>,
+    /// d = d²W/dη², the fourth-derivative weight array (`None` if zero).
+    pub d_array: Option<&'a Array1<f64>>,
+    /// Design matrix X in the transformed basis.
+    pub x: &'a DesignMatrix,
 }
 
 /// Null implementation for Gaussian families (c=d=0).
@@ -356,83 +357,12 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         true
     }
 
-    fn adjoint_trace_vector(&self, hop: &dyn HessianOperator) -> Option<Array1<f64>> {
-        use ndarray::Zip;
-        let x = self.x_transformed.to_dense_arc();
-        let x_ref = x.as_ref();
-        let n = x_ref.nrows();
-        let p = x_ref.ncols();
-
-        // Z = H⁻¹ Xᵀ  (p × n)
-        let x_t = x_ref.t().to_owned();
-        let z = hop.solve_multi(&x_t);
-
-        // Hat diagonal: h_i = Σ_j X_{i,j} * Z_{j,i}
-        let mut h_diag = Array1::zeros(n);
-        for i in 0..n {
-            let mut hi = 0.0;
-            for j in 0..p {
-                hi += x_ref[[i, j]] * z[[j, i]];
-            }
-            h_diag[i] = hi;
-        }
-
-        // t = c ⊙ h
-        let mut t = h_diag;
-        Zip::from(&mut t)
-            .and(&self.c_array)
-            .for_each(|t_i, &c_i| *t_i *= c_i);
-
-        // z_c = H⁻¹ Xᵀ t
-        let x_t_t = x_ref.t().dot(&t);
-        let z_c = hop.solve(&x_t_t);
-        Some(z_c)
-    }
-
-    fn fourth_derivative_trace(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        hop: &dyn HessianOperator,
-    ) -> Option<f64> {
-        use ndarray::Zip;
-        let d_array = self.d_array.as_ref()?;
-        let x = self.x_transformed.to_dense_arc();
-        let x_ref = x.as_ref();
-        let n = x_ref.nrows();
-        let p = x_ref.ncols();
-
-        let x_vk = x_ref.dot(v_k);
-        let x_vl = x_ref.dot(v_l);
-
-        // weights = d ⊙ (X vₖ) ⊙ (X vₗ)
-        let mut weights = Array1::zeros(n);
-        Zip::from(&mut weights)
-            .and(d_array)
-            .and(&x_vk)
-            .and(&x_vl)
-            .for_each(|w, &d, &xvk, &xvl| *w = d * xvk * xvl);
-
-        // Q = Xᵀ diag(weights) X
-        let mut q_mat = Array2::zeros((p, p));
-        for i in 0..n {
-            let wi = weights[i];
-            if wi.abs() > 0.0 {
-                let xi = x_ref.row(i);
-                for a in 0..p {
-                    let wa = wi * xi[a];
-                    for b in a..p {
-                        let val = wa * xi[b];
-                        q_mat[[a, b]] += val;
-                        if a != b {
-                            q_mat[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(hop.trace_logdet_gradient(&q_mat))
+    fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
+        Some(ScalarGlmIngredients {
+            c_array: &self.c_array,
+            d_array: self.d_array.as_ref(),
+            x: &self.x_transformed,
+        })
     }
 }
 
@@ -505,6 +435,12 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
 
     fn has_corrections(&self) -> bool {
         true
+    }
+
+    fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
+        // Firth correction doesn't affect the adjoint trick — it uses the
+        // same c/d/X from the base GLM.
+        self.base.scalar_glm_ingredients()
     }
 }
 
@@ -721,6 +657,10 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 
     fn has_corrections(&self) -> bool {
         true
+    }
+
+    fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
+        self.inner.scalar_glm_ingredients()
     }
 }
 
@@ -1097,23 +1037,11 @@ pub struct InnerSolution<'dp> {
     /// Firth/Jeffreys prior log-determinant contribution.
     pub firth_logdet: f64,
 
-    /// Gradient of the Firth contribution with respect to ρ.
-    pub firth_gradient: Option<Array1<f64>>,
-
-    /// Hessian of the Firth contribution with respect to ρ (q × q matrix).
-    ///
-    /// This is the second derivative ∂²Φ/∂ρₖ∂ρₗ of the Firth penalty
-    /// Φ = ½ log|I(β̂)|₊, computed via:
-    ///
-    /// ```text
-    /// J_{kl} = ½ [tr(I⁻¹ Ï_{kl}) − tr(I⁻¹ İ_l I⁻¹ İ_k)]
-    /// ```
-    ///
-    /// This parallels the LAML Hessian structure exactly — the same
-    /// trace-of-product and trace-of-second-derivative pattern — but uses
-    /// Fisher information I in place of penalized Hessian H, and
-    /// D(H_φ) / D²(H_φ) in place of observed-weight corrections.
-    pub firth_hessian: Option<Array2<f64>>,
+    /// Optional Firth dense operator for computing Firth gradient and Hessian
+    /// contributions internally. When present, `reml_laml_evaluate` and
+    /// `compute_outer_hessian` compute the Firth gradient ∂Φ/∂ρ and Hessian
+    /// ∂²Φ/∂ρ² inline, eliminating the need for callers to pre-compute them.
+    pub firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
 
     // === Model dimensions ===
     /// Number of observations.
@@ -1166,8 +1094,7 @@ pub struct InnerSolutionBuilder<'dp> {
     tk_correction: f64,
     tk_gradient: Option<Array1<f64>>,
     firth_logdet: f64,
-    firth_gradient: Option<Array1<f64>>,
-    firth_hessian: Option<Array2<f64>>,
+    firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
     nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     ext_coords: Vec<HyperCoord>,
@@ -1202,8 +1129,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_correction: 0.0,
             tk_gradient: None,
             firth_logdet: 0.0,
-            firth_gradient: None,
-            firth_hessian: None,
+            firth_op: None,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -1224,14 +1150,9 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    pub fn firth(mut self, logdet: f64, gradient: Option<Array1<f64>>) -> Self {
+    pub fn firth(mut self, logdet: f64, op: Option<std::sync::Arc<super::FirthDenseOperator>>) -> Self {
         self.firth_logdet = logdet;
-        self.firth_gradient = gradient;
-        self
-    }
-
-    pub fn firth_hessian(mut self, hessian: Option<Array2<f64>>) -> Self {
-        self.firth_hessian = hessian;
+        self.firth_op = op;
         self
     }
 
@@ -1295,8 +1216,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_correction: self.tk_correction,
             tk_gradient: self.tk_gradient,
             firth_logdet: self.firth_logdet,
-            firth_gradient: self.firth_gradient,
-            firth_hessian: self.firth_hessian,
+            firth_op: self.firth_op,
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,
@@ -1772,10 +1692,23 @@ pub fn reml_laml_evaluate(
             sl += tk_grad;
         }
     }
-    if let Some(firth_grad) = &solution.firth_gradient {
-        {
-            let mut sl = grad.slice_mut(ndarray::s![..k]);
-            sl += firth_grad;
+
+    // Firth gradient: ∂Φ/∂ρ_k = −0.5 tr(H⁻¹ D(H_φ)[B_k])
+    //
+    // Computed internally from the FirthDenseOperator when present. The mode
+    // response v_k = H⁻¹(A_k β̂) is re-derived here (cheap relative to the
+    // trace computation) to avoid storing intermediate vectors.
+    if let Some(ref firth_op) = solution.firth_op {
+        for idx in 0..k {
+            let r_k = &solution.penalty_roots[idx];
+            let r_beta = r_k.dot(&solution.beta);
+            let s_k_beta = r_k.t().dot(&r_beta);
+            let a_k_beta = &s_k_beta * lambdas[idx];
+            let v_k = hop.solve(&a_k_beta);
+            let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_k).mapv(|v| -v);
+            let dir_k = firth_op.direction_from_deta(deta_k);
+            let dhphi_k = firth_op.hphi_direction(&dir_k);
+            grad[idx] += -0.5 * hop.trace_hinv_product(&dhphi_k);
         }
     }
 
@@ -1794,11 +1727,6 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let mut h = compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv)?;
-        // Add Firth Hessian (second derivatives of the Firth penalty on ρ, ρ-only).
-        if let Some(ref fh) = solution.firth_hessian {
-            let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
-            sl += fh;
-        }
         // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
         if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
             let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
@@ -1935,6 +1863,92 @@ pub fn compute_firth_hessian_contribution(
     firth_hess
 }
 
+/// Precompute the adjoint trace vector z_c = H⁻¹ Xᵀ (c ⊙ h) from raw GLM ingredients.
+///
+/// When available, tr(H⁻¹ C[u]) for C[u] = Xᵀ diag(c ⊙ Xu) X simplifies to uᵀ z_c,
+/// replacing an O(p²) solve with an O(p) dot product.
+fn compute_adjoint_z_c(
+    ing: &ScalarGlmIngredients<'_>,
+    hop: &dyn HessianOperator,
+) -> Array1<f64> {
+    let x = ing.x.to_dense_arc();
+    let x_ref = x.as_ref();
+    let n = x_ref.nrows();
+    let p = x_ref.ncols();
+
+    // Z = H⁻¹ Xᵀ  (p × n)
+    let x_t = x_ref.t().to_owned();
+    let z = hop.solve_multi(&x_t);
+
+    // Hat diagonal: h_i = Σ_j X_{i,j} * Z_{j,i}
+    let mut h_diag = Array1::zeros(n);
+    for i in 0..n {
+        let mut hi = 0.0;
+        for j in 0..p {
+            hi += x_ref[[i, j]] * z[[j, i]];
+        }
+        h_diag[i] = hi;
+    }
+
+    // t = c ⊙ h
+    let mut t = h_diag;
+    Zip::from(&mut t)
+        .and(ing.c_array)
+        .for_each(|t_i, &c_i| *t_i *= c_i);
+
+    // z_c = H⁻¹ Xᵀ t
+    let x_t_t = x_ref.t().dot(&t);
+    hop.solve(&x_t_t)
+}
+
+/// Compute the fourth-derivative trace: tr(H⁻¹ Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
+///
+/// Returns `None` if there are no fourth-derivative (d) terms.
+fn compute_fourth_derivative_trace(
+    ing: &ScalarGlmIngredients<'_>,
+    v_k: &Array1<f64>,
+    v_l: &Array1<f64>,
+    hop: &dyn HessianOperator,
+) -> Option<f64> {
+    let d_array = ing.d_array?;
+    let x = ing.x.to_dense_arc();
+    let x_ref = x.as_ref();
+    let n = x_ref.nrows();
+    let p = x_ref.ncols();
+
+    let x_vk = x_ref.dot(v_k);
+    let x_vl = x_ref.dot(v_l);
+
+    // weights = d ⊙ (X vₖ) ⊙ (X vₗ)
+    let mut weights = Array1::zeros(n);
+    Zip::from(&mut weights)
+        .and(d_array)
+        .and(&x_vk)
+        .and(&x_vl)
+        .for_each(|w, &d, &xvk, &xvl| *w = d * xvk * xvl);
+
+    // Q = Xᵀ diag(weights) X
+    let mut q_mat = Array2::zeros((p, p));
+    for i in 0..n {
+        let wi = weights[i];
+        if wi.abs() > 0.0 {
+            let xi = x_ref.row(i);
+            for a in 0..p {
+                let wa = wi * xi[a];
+                for b in a..p {
+                    let val = wa * xi[b];
+                    q_mat[[a, b]] += val;
+                    if a != b {
+                        q_mat[[b, a]] += val;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(hop.trace_logdet_gradient(&q_mat))
+}
+
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
 /// Uses the precomputed HessianOperator for all linear algebra.
@@ -2029,8 +2043,11 @@ fn compute_outer_hessian(
     // This replaces O(k²) linear solves for u_kl = H⁻¹ rhs with O(k²) dot
     // products, at the cost of ONE precomputed solve for z_c (plus computing
     // the hat diagonal). The net saving is large when k >> 1.
-    let adjoint_z_c = if effective_deriv.has_corrections() && incl_logdet_h {
-        effective_deriv.adjoint_trace_vector(hop)
+    let glm_ingredients = effective_deriv.scalar_glm_ingredients();
+    let adjoint_z_c = if incl_logdet_h {
+        glm_ingredients
+            .as_ref()
+            .map(|ing| compute_adjoint_z_c(ing, hop))
     } else {
         None
     };
@@ -2225,8 +2242,9 @@ fn compute_outer_hessian(
                     if let Some(ref z_c) = adjoint_z_c {
                         // Adjoint shortcut: tr(H⁻¹ C[u_kk]) = rhs · z_c
                         let c_trace = rhs.dot(z_c);
-                        let d_trace = effective_deriv
-                            .fourth_derivative_trace(&v_ks[kk], &v_ks[kk], hop)
+                        let d_trace = glm_ingredients
+                            .as_ref()
+                            .and_then(|ing| compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[kk], hop))
                             .unwrap_or(0.0);
                         base + c_trace + d_trace
                     } else {
@@ -2250,8 +2268,9 @@ fn compute_outer_hessian(
 
                     if let Some(ref z_c) = adjoint_z_c {
                         let c_trace = rhs.dot(z_c);
-                        let d_trace = effective_deriv
-                            .fourth_derivative_trace(&v_ks[kk], &v_ks[ll], hop)
+                        let d_trace = glm_ingredients
+                            .as_ref()
+                            .and_then(|ing| compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[ll], hop))
                             .unwrap_or(0.0);
                         c_trace + d_trace
                     } else {
@@ -2363,11 +2382,15 @@ fn compute_outer_hessian(
                     if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = effective_deriv.fourth_derivative_trace(
-                                &v_ks[rho_idx],
-                                &ext_v[ext_idx],
-                                hop,
-                            ) {
+                            if let Some(d_trace) = glm_ingredients
+                                .as_ref()
+                                .and_then(|ing| compute_fourth_derivative_trace(
+                                    ing,
+                                    &v_ks[rho_idx],
+                                    &ext_v[ext_idx],
+                                    hop,
+                                ))
+                            {
                                 h2_trace += d_trace;
                             }
                         } else {
@@ -2474,8 +2497,11 @@ fn compute_outer_hessian(
                     if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) =
-                                effective_deriv.fourth_derivative_trace(&ext_v[ii], &ext_v[jj], hop)
+                            if let Some(d_trace) = glm_ingredients
+                                .as_ref()
+                                .and_then(|ing| compute_fourth_derivative_trace(
+                                    ing, &ext_v[ii], &ext_v[jj], hop,
+                                ))
                             {
                                 h2_trace += d_trace;
                             }
@@ -2503,6 +2529,25 @@ fn compute_outer_hessian(
                 }
             }
         }
+    }
+
+    // ── Firth Hessian contribution (computed internally from firth_op) ──
+    //
+    // ∂²Φ/∂ρₖ∂ρₗ is computed using the precomputed v_ks, h_k_matrices,
+    // a_k_betas, and a_k_matrices that are already available. This replaces
+    // the formerly caller-injected Firth Hessian.
+    if let Some(ref firth_op) = solution.firth_op {
+        let fh = compute_firth_hessian_contribution(
+            firth_op,
+            hop,
+            &solution.beta,
+            &v_ks,
+            &a_k_matrices, // h_k_matrices ≈ a_k_matrices (first-order approximation)
+            &a_k_betas,
+            &a_k_matrices,
+        );
+        let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
+        sl += &fh;
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
@@ -4473,8 +4518,7 @@ mod tests {
             tk_correction: 0.0,
             tk_gradient: None,
             firth_logdet: 0.0,
-            firth_gradient: None,
-            firth_hessian: None,
+            firth_op: None,
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -4602,8 +4646,7 @@ mod tests {
             tk_correction: 0.0,
             tk_gradient: None,
             firth_logdet: 0.0,
-            firth_gradient: None,
-            firth_hessian: None,
+            firth_op: None,
             n_observations: n,
             nullspace_dim: (p - penalty_rank) as f64,
             dispersion: DispersionHandling::ProfiledGaussian,

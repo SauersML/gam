@@ -23,7 +23,8 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
+use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
+use crate::solver::reml::unified::compute_block_penalty_logdet_derivs;
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -464,12 +465,7 @@ impl NutsPosterior {
         let eta = self.data.x.dot(&beta);
 
         // === Step 3: Compute log-likelihood and gradient ===
-        let (ll, grad_ll_beta) = match self.nuts_family {
-            NutsFamily::BinomialLogit => self.logit_logp_and_grad(&eta),
-            NutsFamily::Gaussian => self.gaussian_logp_and_grad(&eta),
-            NutsFamily::PoissonLog => self.poisson_log_logp_and_grad(&eta),
-            NutsFamily::GammaLog => self.gamma_log_logp_and_grad(&eta),
-        };
+        let (ll, grad_ll_beta) = self.family_logp_and_grad(&eta);
 
         // === Step 4: Compute penalty and its gradient ===
         // penalty = 0.5 * β^T @ S @ β
@@ -492,98 +488,9 @@ impl NutsPosterior {
         (logp, gradz)
     }
 
-    /// Logistic regression log-likelihood and gradient.
-    fn logit_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let n = self.data.n_samples;
-        let mut ll = 0.0;
-        let mut residual = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let eta_i = eta[i];
-            let y_i = self.data.y[i];
-            let w_i = self.data.weights[i];
-            // Use stable Bernoulli-logit log-likelihood directly:
-            //   log p(y|eta) = y*eta - log(1 + exp(eta))
-            // This keeps the target smooth and consistent with its gradient.
-            ll += w_i * (y_i * eta_i - Self::log1pexp(eta_i));
-
-            let mu = Self::sigmoid_stable(eta_i);
-            residual[i] = w_i * (y_i - mu);
-        }
-
-        // Gradient of log-likelihood: X^T @ (w * (y - μ))
-        let grad_ll = fast_atv(&self.data.x, &residual);
-
-        (ll, grad_ll)
-    }
-
-    /// Gaussian log-likelihood and gradient.
-    fn gaussian_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let n = self.data.n_samples;
-        let mut ll = 0.0;
-        let mut weighted_residual = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let residual = self.data.y[i] - eta[i];
-            let w_i = self.data.weights[i];
-            ll -= 0.5 * w_i * residual * residual;
-            weighted_residual[i] = w_i * residual;
-        }
-
-        // Gradient of log-likelihood: X^T @ (w * (y - η))
-        let grad_ll = fast_atv(&self.data.x, &weighted_residual);
-
-        (ll, grad_ll)
-    }
-
-    /// Poisson(log) log-likelihood and gradient.
-    /// log p(y|η) = y*η - exp(η) - log(y!)
-    /// ∂/∂η = y - exp(η) = y - μ
-    fn poisson_log_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let n = self.data.n_samples;
-        let mut ll = 0.0;
-        let mut residual = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
-            let mu_i = eta_i.exp();
-            let y_i = self.data.y[i];
-            let w_i = self.data.weights[i];
-            // log p(y|η) = y*η - exp(η)  (dropping constant log(y!))
-            ll += w_i * (y_i * eta_i - mu_i);
-            residual[i] = w_i * (y_i - mu_i);
-        }
-
-        let grad_ll = fast_atv(&self.data.x, &residual);
-        (ll, grad_ll)
-    }
-
-    /// Gamma(log) log-likelihood and gradient.
-    /// Using shape=1 (exponential): log p(y|η) = -η - y*exp(-η)
-    /// ∂/∂η = -1 + y*exp(-η) = (y/μ - 1)
-    /// General Gamma with known shape k: log p(y|η) = -k*η + (k-1)*log(y) - k*y/μ + const
-    /// ∂/∂η = -k + k*y/μ = k*(y/μ - 1)
-    /// For NUTS we use shape=1 since shape is typically estimated separately.
-    fn gamma_log_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let n = self.data.n_samples;
-        let mut ll = 0.0;
-        let mut residual = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
-            let mu_i = eta_i.exp();
-            let y_i = self.data.y[i];
-            let w_i = self.data.weights[i];
-            // Gamma deviance contribution: -log(y/μ) + (y-μ)/μ = η - log(y) + y/μ - 1
-            // Negated (since we want log-likelihood): -η + log(y) - y/μ + 1
-            // Drop constants: ll += w * (-η - y/μ)
-            ll += w_i * (-eta_i - y_i / mu_i);
-            // Gradient: d/dη (-η - y*exp(-η)) = -1 + y*exp(-η) = y/μ - 1
-            residual[i] = w_i * (y_i / mu_i - 1.0);
-        }
-
-        let grad_ll = fast_atv(&self.data.x, &residual);
-        (ll, grad_ll)
+    /// Dispatch log-likelihood and β-gradient computation to the appropriate family.
+    fn family_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+        nuts_family_logp_and_grad(self.nuts_family, &self.data, eta)
     }
 
     /// Get the Cholesky factor L for un-whitening samples
@@ -600,6 +507,110 @@ impl NutsPosterior {
     pub fn dim(&self) -> usize {
         self.data.dim
     }
+}
+
+// ============================================================================
+// Shared family log-likelihood helpers
+// ============================================================================
+//
+// Freestanding functions for computing ℓ(y|β) and ∇_β ℓ for each supported
+// family. Used by both `NutsPosterior` (fixed-ρ β-only sampling) and
+// `JointBetaRhoPosterior` (joint β+ρ sampling).
+
+/// Dispatch log-likelihood and ∇_β computation to the appropriate family.
+fn nuts_family_logp_and_grad(
+    family: NutsFamily,
+    data: &SharedData,
+    eta: &Array1<f64>,
+) -> (f64, Array1<f64>) {
+    match family {
+        NutsFamily::BinomialLogit => logit_logp_and_grad(data, eta),
+        NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
+        NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
+        NutsFamily::GammaLog => gamma_log_logp_and_grad(data, eta),
+    }
+}
+
+/// Logistic regression log-likelihood and gradient.
+///
+/// log p(y|η) = y·η − log(1 + exp(η)), gradient = X'(w ⊙ (y − μ))
+fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut residual = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let eta_i = eta[i];
+        let y_i = data.y[i];
+        let w_i = data.weights[i];
+        ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
+        let mu = NutsPosterior::sigmoid_stable(eta_i);
+        residual[i] = w_i * (y_i - mu);
+    }
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
+}
+
+/// Gaussian log-likelihood and gradient.
+///
+/// log p(y|η) = −½ w·(y − η)², gradient = X'(w ⊙ (y − η))
+fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut weighted_residual = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let residual = data.y[i] - eta[i];
+        let w_i = data.weights[i];
+        ll -= 0.5 * w_i * residual * residual;
+        weighted_residual[i] = w_i * residual;
+    }
+
+    let grad_ll = fast_atv(&data.x, &weighted_residual);
+    (ll, grad_ll)
+}
+
+/// Poisson(log) log-likelihood and gradient.
+///
+/// log p(y|η) = y·η − exp(η), gradient = X'(w ⊙ (y − μ))
+fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut residual = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let eta_i = eta[i].clamp(-700.0, 700.0);
+        let mu_i = eta_i.exp();
+        let y_i = data.y[i];
+        let w_i = data.weights[i];
+        ll += w_i * (y_i * eta_i - mu_i);
+        residual[i] = w_i * (y_i - mu_i);
+    }
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
+}
+
+/// Gamma(log) log-likelihood and gradient (shape=1).
+///
+/// log p(y|η) = −η − y·exp(−η), gradient = X'(w ⊙ (y/μ − 1))
+fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut residual = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let eta_i = eta[i].clamp(-700.0, 700.0);
+        let mu_i = eta_i.exp();
+        let y_i = data.y[i];
+        let w_i = data.weights[i];
+        ll += w_i * (-eta_i - y_i / mu_i);
+        residual[i] = w_i * (y_i / mu_i - 1.0);
+    }
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
 }
 
 #[cfg(test)]
@@ -2166,14 +2177,16 @@ struct JointBetaRhoPosterior {
     chol: Array2<f64>,
     /// L' for chain rule
     chol_t: Array2<f64>,
-    /// Logit or Gaussian
-    is_logit: bool,
+    /// Family for log-likelihood computation
+    nuts_family: NutsFamily,
     /// Dimension of β
     n_beta: usize,
     /// Dimension of ρ
     n_rho: usize,
     /// Penalty root matrices R_k where S_k = R_k' R_k (in transformed basis)
     penalty_roots: Vec<Array2<f64>>,
+    /// Precomputed penalty matrices S_k = R_k' R_k (avoids recomputation each gradient eval)
+    penalty_matrices: Vec<Array2<f64>>,
     /// Prior std dev on ρ (weakly informative Gaussian)
     rho_prior_sd: f64,
     /// LAML-converged ρ (used as centering for ρ prior)
@@ -2189,7 +2202,7 @@ impl JointBetaRhoPosterior {
         hessian: ArrayView2<f64>,
         penalty_roots: Vec<Array2<f64>>,
         rho_mode: ArrayView1<f64>,
-        is_logit: bool,
+        nuts_family: NutsFamily,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let n_beta = x.ncols();
@@ -2212,12 +2225,17 @@ impl JointBetaRhoPosterior {
         let chol = solve_upper_triangular_transpose(&l_h, n_beta);
         let chol_t = chol.t().to_owned();
 
+        // Precompute S_k = R_k' R_k once; reused in every gradient evaluation.
+        let penalty_matrices: Vec<Array2<f64>> = penalty_roots
+            .iter()
+            .map(|r_k| r_k.t().dot(r_k))
+            .collect();
+
         // Build combined penalty at the LAML mode (for SharedData)
         let lambdas_mode: Array1<f64> = rho_mode.mapv(f64::exp);
         let mut s_combined = Array2::<f64>::zeros((n_beta, n_beta));
-        for (k, r_k) in penalty_roots.iter().enumerate() {
-            let s_k = r_k.t().dot(r_k);
-            s_combined.scaled_add(lambdas_mode[k], &s_k);
+        for (k, s_k) in penalty_matrices.iter().enumerate() {
+            s_combined.scaled_add(lambdas_mode[k], s_k);
         }
 
         let data = SharedData {
@@ -2239,16 +2257,24 @@ impl JointBetaRhoPosterior {
             data,
             chol,
             chol_t,
-            is_logit,
+            nuts_family,
             n_beta,
             n_rho,
             penalty_roots,
+            penalty_matrices,
             rho_prior_sd,
             rho_mode: rho_mode.to_owned(),
         })
     }
 
     /// Compute the joint log-posterior and gradient.
+    ///
+    /// The joint log-posterior is:
+    ///   log p(β, ρ | y) = ℓ(y|β) − ½β'S(ρ)β + ½ log|S(ρ)|₊ + log p(ρ) + const
+    ///
+    /// This is NOT the REML/LAML objective (which integrates out β). Here β is
+    /// an explicit parameter being sampled, evaluated at arbitrary values — not
+    /// just at the mode β̂(ρ).
     ///
     /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho)]
     fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>) {
@@ -2267,36 +2293,12 @@ impl JointBetaRhoPosterior {
         let eta = self.data.x.dot(&beta);
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
-        let (ll, grad_ll_beta) = if self.is_logit {
-            let n = self.data.n_samples;
-            let mut ll = 0.0;
-            let mut residual = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let eta_i = eta[i];
-                let y_i = self.data.y[i];
-                let w_i = self.data.weights[i];
-                ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
-                let mu = NutsPosterior::sigmoid_stable(eta_i);
-                residual[i] = w_i * (y_i - mu);
-            }
-            let grad_ll = fast_atv(&self.data.x, &residual);
-            (ll, grad_ll)
-        } else {
-            let n = self.data.n_samples;
-            let mut ll = 0.0;
-            let mut weighted_residual = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let residual = self.data.y[i] - eta[i];
-                let w_i = self.data.weights[i];
-                ll -= 0.5 * w_i * residual * residual;
-                weighted_residual[i] = w_i * residual;
-            }
-            let grad_ll = fast_atv(&self.data.x, &weighted_residual);
-            (ll, grad_ll)
-        };
+        // Delegates to shared family helpers (same code as NutsPosterior).
+        let (ll, grad_ll_beta) = nuts_family_logp_and_grad(self.nuts_family, &self.data, &eta);
 
         // ---- Penalty: -0.5 β'S(ρ)β ----
-        // S(ρ) = Σ_k λ_k S_k = Σ_k λ_k R_k'R_k
+        // S(ρ) = Σ_k λ_k S_k where S_k = R_k'R_k (precomputed in penalty_matrices).
+        // Uses penalty_roots for the efficient ||R_k β||² form.
         let mut penalty_val = 0.0;
         let mut s_beta = Array1::<f64>::zeros(n_beta);
         let mut grad_rho = Array1::<f64>::zeros(n_rho);
@@ -2310,51 +2312,30 @@ impl JointBetaRhoPosterior {
             let s_k_beta = r_k.t().dot(&r_beta);
             s_beta.scaled_add(lambdas[k], &s_k_beta);
 
-            // ρ_k gradient from penalty: -0.5 λ_k β'S_k β
+            // ρ_k gradient from penalty: ∂/∂ρ_k [-0.5 λ_k β'S_k β] = -0.5 λ_k β'S_k β
+            // (since ∂λ_k/∂ρ_k = λ_k for ρ = log λ)
             grad_rho[k] = -0.5 * lambdas[k] * quad_k;
         }
 
-        // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|_+ ----
-        // Compute via eigendecomposition of S(ρ).
-        let mut s_rho = Array2::<f64>::zeros((n_beta, n_beta));
-        for (k, r_k) in self.penalty_roots.iter().enumerate() {
-            let s_k = r_k.t().dot(r_k);
-            s_rho.scaled_add(lambdas[k], &s_k);
-        }
-        let (log_det_s, s_inv_opt) = {
-            match s_rho.eigh(Side::Lower) {
-                Ok((evals, evecs)) => {
-                    let floor = 1e-10;
-                    let lds: f64 = evals.iter().filter(|&&v| v > floor).map(|&v| v.ln()).sum();
-                    // S_+⁻¹ for gradient: only invert on kept subspace
-                    let mut s_inv = Array2::<f64>::zeros((n_beta, n_beta));
-                    for i in 0..evals.len() {
-                        if evals[i] > floor {
-                            let u = evecs.column(i);
-                            // s_inv += (1/evals[i]) * u u'
-                            for a in 0..n_beta {
-                                for b in 0..n_beta {
-                                    s_inv[[a, b]] += u[a] * u[b] / evals[i];
-                                }
-                            }
-                        }
-                    }
-                    (lds, Some(s_inv))
-                }
-                Err(_) => (0.0, None),
-            }
+        // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|₊ and ρ-derivatives ----
+        // Delegates to the shared utility from the unified REML module, which
+        // uses eigendecomposition with adaptive tolerance and computes both
+        // log|S|₊ and ∂/∂ρ_k log|S|₊ = tr(S₊⁻¹ A_k) from the same decomposition.
+        //
+        // All penalty matrices live in a single block (no multi-block structure).
+        let penalty_logdet = compute_block_penalty_logdet_derivs(
+            &[rho.clone()],
+            &[self.penalty_matrices.as_slice()],
+            0.0,
+        );
+        let (log_det_s, logdet_grad) = match penalty_logdet {
+            Ok(pld) => (pld.value, pld.first),
+            Err(_) => (0.0, Array1::zeros(n_rho)),
         };
 
-        // ρ_k gradient from log|S|_+: +0.5 tr(S_+⁻¹ A_k)
-        // where A_k = λ_k S_k.
-        if let Some(ref s_inv) = s_inv_opt {
-            for (k, r_k) in self.penalty_roots.iter().enumerate() {
-                // tr(S_+⁻¹ λ_k S_k) = λ_k tr(S_+⁻¹ R_k'R_k) = λ_k ||R_k S_inv_half||²
-                // But we just compute tr(S_inv @ A_k) directly.
-                let s_k = r_k.t().dot(r_k);
-                let tr_val: f64 = s_inv.iter().zip(s_k.iter()).map(|(&si, &sk)| si * sk).sum();
-                grad_rho[k] += 0.5 * lambdas[k] * tr_val;
-            }
+        // Add logdet ρ-gradient: +0.5 ∂/∂ρ_k log|S|₊
+        for k in 0..n_rho {
+            grad_rho[k] += 0.5 * logdet_grad[k];
         }
 
         // ---- Prior on ρ: N(rho_mode, σ²I) ----
@@ -2401,7 +2382,7 @@ pub struct JointBetaRhoInputs<'a> {
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<Array2<f64>>,
     pub rho_mode: ArrayView1<'a, f64>,
-    pub is_logit: bool,
+    pub nuts_family: NutsFamily,
     /// Max posterior skewness that triggered this sampling
     pub trigger_skewness: f64,
 }
@@ -2435,7 +2416,7 @@ pub fn run_joint_beta_rho_sampling(
         inputs.hessian,
         inputs.penalty_roots.clone(),
         inputs.rho_mode,
-        inputs.is_logit,
+        inputs.nuts_family,
     )?;
 
     let chol = target.chol.clone();
