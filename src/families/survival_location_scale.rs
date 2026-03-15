@@ -281,10 +281,10 @@ pub struct SurvivalLocationScaleFitResultParts {
     pub lambdas_log_sigma: Array1<f64>,
     pub lambdas_linkwiggle: Option<Array1<f64>>,
     pub log_likelihood: f64,
-    pub penalizedobjective: f64,
-    pub iterations: usize,
-    pub finalgrad_norm: f64,
-    pub converged: bool,
+    pub penalized_objective: f64,
+    pub outer_iterations: usize,
+    pub outer_gradient_norm: f64,
+    pub outer_converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
     pub geometry: Option<FitGeometry>,
 }
@@ -304,10 +304,10 @@ pub fn survival_fit_from_parts(
         lambdas_log_sigma,
         lambdas_linkwiggle,
         log_likelihood,
-        penalizedobjective,
-        iterations,
-        finalgrad_norm,
-        converged,
+        penalized_objective,
+        outer_iterations,
+        outer_gradient_norm,
+        outer_converged,
         covariance_conditional,
         geometry,
     } = parts;
@@ -356,9 +356,9 @@ pub fn survival_fit_from_parts(
     }
     ensure_finite_scalar_estimation("survival_fit.log_likelihood", log_likelihood)
         .map_err(|e| e.to_string())?;
-    ensure_finite_scalar_estimation("survival_fit.penalizedobjective", penalizedobjective)
+    ensure_finite_scalar_estimation("survival_fit.penalized_objective", penalized_objective)
         .map_err(|e| e.to_string())?;
-    ensure_finite_scalar_estimation("survival_fit.finalgrad_norm", finalgrad_norm)
+    ensure_finite_scalar_estimation("survival_fit.outer_gradient_norm", outer_gradient_norm)
         .map_err(|e| e.to_string())?;
 
     let total_p = beta_time.len()
@@ -397,7 +397,7 @@ pub fn survival_fit_from_parts(
 
     // Build blocks for the unified representation.
     use crate::solver::estimate::{
-        BlockRole, FittedBlock, FittedLinkParameters, UnifiedFitResultParts,
+        BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts,
     };
     let mut blocks = vec![
         FittedBlock {
@@ -446,17 +446,17 @@ pub fn survival_fit_from_parts(
         log_lambdas,
         lambdas: Array1::from_vec(all_lambdas),
         log_likelihood,
-        reml_score: penalizedobjective,
-        stable_penalty_term: 2.0 * penalizedobjective - deviance,
-        penalized_objective: penalizedobjective,
-        outer_iterations: iterations,
-        outer_converged: converged,
-        outer_gradient_norm: finalgrad_norm,
+        reml_score: penalized_objective,
+        stable_penalty_term: 2.0 * penalized_objective - deviance,
+        penalized_objective,
+        outer_iterations,
+        outer_converged,
+        outer_gradient_norm,
         standard_deviation: 1.0,
         covariance_conditional,
         covariance_corrected: None,
         inference: None,
-        fitted_link: FittedLinkParameters::Standard,
+        fitted_link: FittedLinkState::Standard(None),
         geometry,
         block_states: Vec::new(),
         pirls_status: crate::pirls::PirlsStatus::Converged,
@@ -2002,11 +2002,15 @@ fn prediction_linear_predictors(
 ) -> Result<PredictionLinearPredictors, String> {
     validate_predict_inverse_link(&input.inverse_link)?;
     let n = input.x_time_exit.nrows();
-    if input.x_time_exit.ncols() != fit.beta_time.len() {
+    let beta_time = fit.beta_time();
+    let beta_threshold = fit.beta_threshold();
+    let beta_log_sigma = fit.beta_log_sigma();
+    let beta_link_wiggle = fit.beta_link_wiggle();
+    if input.x_time_exit.ncols() != beta_time.len() {
         return Err(format!(
             "predict_survival_location_scale: time design/beta mismatch: {} vs {}",
             input.x_time_exit.ncols(),
-            fit.beta_time.len()
+            beta_time.len()
         ));
     }
     if input.eta_time_offset_exit.len() != n
@@ -2017,7 +2021,7 @@ fn prediction_linear_predictors(
     {
         return Err("predict_survival_location_scale: row mismatch across inputs".to_string());
     }
-    if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &fit.beta_link_wiggle) {
+    if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &beta_link_wiggle) {
         if xw.nrows() != n {
             return Err(format!(
                 "predict_survival_location_scale: link-wiggle row mismatch: got {}, expected {n}",
@@ -2031,19 +2035,19 @@ fn prediction_linear_predictors(
                 betaw.len()
             ));
         }
-    } else if input.x_link_wiggle.is_some() || fit.beta_link_wiggle.is_some() {
+    } else if input.x_link_wiggle.is_some() || beta_link_wiggle.is_some() {
         return Err(
             "predict_survival_location_scale: link-wiggle metadata is partial; both design and beta must be provided"
                 .to_string(),
         );
     }
     Ok(PredictionLinearPredictors {
-        h: input.x_time_exit.dot(&fit.beta_time) + &input.eta_time_offset_exit,
-        eta_t: input.x_threshold.matrixvectormultiply(&fit.beta_threshold)
+        h: input.x_time_exit.dot(&beta_time) + &input.eta_time_offset_exit,
+        eta_t: input.x_threshold.matrixvectormultiply(&beta_threshold)
             + &input.eta_threshold_offset,
-        eta_ls: input.x_log_sigma.matrixvectormultiply(&fit.beta_log_sigma)
+        eta_ls: input.x_log_sigma.matrixvectormultiply(&beta_log_sigma)
             + &input.eta_log_sigma_offset,
-        etaw: if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &fit.beta_link_wiggle) {
+        etaw: if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &beta_link_wiggle) {
             Some(xw.matrixvectormultiply(betaw))
         } else {
             None
@@ -3929,10 +3933,10 @@ pub fn fit_survival_location_scale(
         lambdas_log_sigma,
         lambdas_linkwiggle,
         log_likelihood: fit.log_likelihood,
-        penalizedobjective: fit.penalizedobjective,
-        iterations: fit.inner_cycles,
-        finalgrad_norm: fit.outer_final_gradient_norm,
-        converged: fit.converged,
+        penalized_objective: fit.penalized_objective,
+        outer_iterations: fit.inner_cycles,
+        outer_gradient_norm: fit.outer_gradient_norm,
+        outer_converged: fit.outer_converged,
         covariance_conditional,
         geometry: fit.geometry.clone(),
     })
@@ -4013,10 +4017,10 @@ pub fn predict_survival_location_scale_posterior_mean(
     let pred = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
     let predictors = prediction_linear_predictors(input, fit)?;
-    let p_time = fit.beta_time.len();
-    let p_t = fit.beta_threshold.len();
-    let p_ls = fit.beta_log_sigma.len();
-    let pw = fit.beta_link_wiggle.as_ref().map_or(0, |b| b.len());
+    let p_time = fit.beta_time().len();
+    let p_t = fit.beta_threshold().len();
+    let p_ls = fit.beta_log_sigma().len();
+    let pw = fit.beta_link_wiggle().map_or(0, |b| b.len());
     let p_total = p_time + p_t + p_ls + pw;
     if covariance.nrows() != p_total || covariance.ncols() != p_total {
         return Err(format!(
@@ -4299,10 +4303,11 @@ pub fn predict_survival_location_scalewith_uncertainty(
 ) -> Result<SurvivalLocationScalePredictUncertaintyResult, String> {
     let base = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
-    let p_time = fit.beta_time.len();
-    let p_t = fit.beta_threshold.len();
-    let p_ls = fit.beta_log_sigma.len();
-    let pw = fit.beta_link_wiggle.as_ref().map_or(0, |b| b.len());
+    let p_time = fit.beta_time().len();
+    let p_t = fit.beta_threshold().len();
+    let p_ls = fit.beta_log_sigma().len();
+    let beta_link_wiggle = fit.beta_link_wiggle();
+    let pw = beta_link_wiggle.as_ref().map_or(0, |b| b.len());
     let p_total = p_time + p_t + p_ls + pw;
     if covariance.nrows() != p_total || covariance.ncols() != p_total {
         return Err(format!(
@@ -4313,7 +4318,7 @@ pub fn predict_survival_location_scalewith_uncertainty(
             p_total
         ));
     }
-    if pw > 0 && (fit.beta_link_wiggle.is_none() || input.x_link_wiggle.is_none()) {
+    if pw > 0 && (beta_link_wiggle.is_none() || input.x_link_wiggle.is_none()) {
         return Err(
             "predict_survival_location_scalewith_uncertainty: wiggle covariance provided but wiggle design/beta is partial"
                 .to_string(),
@@ -4517,10 +4522,10 @@ mod tests {
             lambdas_log_sigma: Array1::zeros(0),
             lambdas_linkwiggle,
             log_likelihood: 0.0,
-            penalizedobjective: 0.0,
-            iterations: 0,
-            finalgrad_norm: 0.0,
-            converged: true,
+            penalized_objective: 0.0,
+            outer_iterations: 0,
+            outer_gradient_norm: 0.0,
+            outer_converged: true,
             covariance_conditional: None,
             geometry: None,
         })
@@ -5900,10 +5905,10 @@ mod tests {
         };
         let pred = predict_survival_location_scale(&input, &fit).expect("predict");
 
-        let eta_t = array![1.0, -0.2].dot(&fit.beta_threshold) + input.eta_threshold_offset[0];
-        let eta_ls = array![1.0, 0.3].dot(&fit.beta_log_sigma) + input.eta_log_sigma_offset[0];
+        let eta_t = array![1.0, -0.2].dot(&fit.beta_threshold()) + input.eta_threshold_offset[0];
+        let eta_ls = array![1.0, 0.3].dot(&fit.beta_log_sigma()) + input.eta_log_sigma_offset[0];
         let sigma = exp_sigma_derivs_up_to_third_scalar(eta_ls).0;
-        let h = array![1.0, 0.5].dot(&fit.beta_time) + input.eta_time_offset_exit[0];
+        let h = array![1.0, 0.5].dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
         let expected_eta = -h - eta_t / sigma.max(1e-12);
         let expected_survival =
             inverse_link_survival_prob_checked(&input.inverse_link, expected_eta)

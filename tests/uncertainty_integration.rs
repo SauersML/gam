@@ -1,4 +1,4 @@
-use gam::estimate::FittedLinkParameters;
+use gam::estimate::FittedLinkState;
 use gam::mixture_link::state_fromspec;
 use gam::probability::try_inverse_link_array;
 use gam::types::LinkComponent;
@@ -350,7 +350,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         initial_rho: Array1::from_vec(vec![0.4, -0.2]),
     })
     .expect("valid synthetic mixture state");
-    fit.fitted_link_parameters = FittedLinkParameters::Mixture {
+    fit.fitted_link = FittedLinkState::Mixture {
         state,
         covariance: None,
     };

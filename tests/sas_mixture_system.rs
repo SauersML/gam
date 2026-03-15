@@ -1,4 +1,4 @@
-use gam::estimate::FittedLinkParameters;
+use gam::estimate::FittedLinkState;
 use gam::estimate::{
     ExternalOptimOptions, FitOptions, evaluate_external_thetacostgradient, fit_gam,
     fit_gamwith_heuristic_lambdas,
@@ -98,8 +98,8 @@ fn sas_fit_recovery_and_calibration_system() {
     )
     .expect("SAS fit");
 
-    let (eps_hat, delta_hat) = match &fit.fitted_link_parameters {
-        FittedLinkParameters::Sas { state, .. } => (state.epsilon, state.delta),
+    let (eps_hat, delta_hat) = match &fit.fitted_link {
+        FittedLinkState::Sas { state, .. } => (state.epsilon, state.delta),
         other => panic!("expected SAS fitted state, got {other:?}"),
     };
     assert!(
@@ -168,8 +168,8 @@ fn mixture_recovery_and_prediction_alignment_system() {
     )
     .expect("mixture fit");
 
-    let pi_hat = match &fit.fitted_link_parameters {
-        FittedLinkParameters::Mixture { state, .. } => state.pi.clone(),
+    let pi_hat = match &fit.fitted_link {
+        FittedLinkState::Mixture { state, .. } => state.pi.clone(),
         other => panic!("expected Mixture fitted state, got {other:?}"),
     };
     let simplex_sum = pi_hat.sum();
@@ -449,8 +449,8 @@ fn outer_profileobjective_stationary_near_fitted_sas_and_mixture_params() {
         &opts_sas,
     )
     .expect("sas fit");
-    let (eps_hat, ld_hat) = match &fit_sas.fitted_link_parameters {
-        FittedLinkParameters::Sas { state, .. } => (state.epsilon, state.log_delta),
+    let (eps_hat, ld_hat) = match &fit_sas.fitted_link {
+        FittedLinkState::Sas { state, .. } => (state.epsilon, state.log_delta),
         other => panic!("expected SAS fitted state, got {other:?}"),
     };
     let eps_bound = 8.0_f64;
@@ -568,8 +568,8 @@ fn outer_profileobjective_stationary_near_fitted_sas_and_mixture_params() {
         &opts_mix,
     )
     .expect("mix fit");
-    let rho_hat = match &fit_mix.fitted_link_parameters {
-        FittedLinkParameters::Mixture { state, .. } => state.rho.clone(),
+    let rho_hat = match &fit_mix.fitted_link {
+        FittedLinkState::Mixture { state, .. } => state.rho.clone(),
         other => panic!("expected Mixture fitted state, got {other:?}"),
     };
     let h_rho = 3e-2;

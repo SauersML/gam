@@ -527,6 +527,49 @@ pub struct BarrierConfig {
 }
 
 impl BarrierConfig {
+    /// Construct a `BarrierConfig` from linear inequality constraints `A β ≥ b`
+    /// by extracting rows that represent simple coordinate bounds (β_j ≥ b_i).
+    ///
+    /// A row is a simple bound iff it has exactly one nonzero entry equal to 1.0.
+    /// Returns `None` if the constraints are `None` or no simple-bound rows are found.
+    pub fn from_constraints(
+        constraints: Option<&crate::pirls::LinearInequalityConstraints>,
+    ) -> Option<Self> {
+        let constraints = constraints?;
+        let mut indices = Vec::new();
+        let mut lower_bounds = Vec::new();
+        for i in 0..constraints.a.nrows() {
+            let row = constraints.a.row(i);
+            let mut single_col = None;
+            let mut is_simple = true;
+            for (j, &val) in row.iter().enumerate() {
+                if val.abs() < 1e-14 {
+                    continue;
+                }
+                if (val - 1.0).abs() < 1e-14 && single_col.is_none() {
+                    single_col = Some(j);
+                } else {
+                    is_simple = false;
+                    break;
+                }
+            }
+            if is_simple {
+                if let Some(col) = single_col {
+                    indices.push(col);
+                    lower_bounds.push(constraints.b[i]);
+                }
+            }
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        Some(BarrierConfig {
+            tau: 1e-6,
+            constrained_indices: indices,
+            lower_bounds,
+        })
+    }
+
     /// Compute slack values Δ_j = β_j − b_j. Returns `None` if infeasible.
     pub fn slacks(&self, beta: &Array1<f64>) -> Option<Vec<f64>> {
         let mut slacks = Vec::with_capacity(self.constrained_indices.len());

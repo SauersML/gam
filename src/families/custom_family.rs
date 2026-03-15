@@ -679,11 +679,11 @@ pub struct BlockwiseFitResultParts {
     pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
     pub covariance_conditional: Option<Array2<f64>>,
-    pub penalizedobjective: f64,
+    pub penalized_objective: f64,
     pub outer_iterations: usize,
-    pub outer_final_gradient_norm: f64,
+    pub outer_gradient_norm: f64,
     pub inner_cycles: usize,
-    pub converged: bool,
+    pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,
 }
 
@@ -733,11 +733,11 @@ pub fn blockwise_fit_from_parts(
         log_lambdas,
         lambdas,
         covariance_conditional,
-        penalizedobjective,
+        penalized_objective,
         outer_iterations,
-        outer_final_gradient_norm,
+        outer_gradient_norm,
         inner_cycles,
-        converged,
+        outer_converged,
         geometry,
     } = parts;
 
@@ -751,11 +751,11 @@ pub fn blockwise_fit_from_parts(
     validate_all_finite_estimation("blockwise_fit.lambdas", lambdas.iter().copied())
         .map_err(|e| e.to_string())?;
     validate_lambda_pair_consistency(&log_lambdas, &lambdas, "blockwise_fit.lambdas")?;
-    ensure_finite_scalar_estimation("blockwise_fit.penalizedobjective", penalizedobjective)
+    ensure_finite_scalar_estimation("blockwise_fit.penalized_objective", penalized_objective)
         .map_err(|e| e.to_string())?;
     ensure_finite_scalar_estimation(
-        "blockwise_fit.outer_final_gradient_norm",
-        outer_final_gradient_norm,
+        "blockwise_fit.outer_gradient_norm",
+        outer_gradient_norm,
     )
     .map_err(|e| e.to_string())?;
 
@@ -815,7 +815,7 @@ pub fn blockwise_fit_from_parts(
 
     // Build unified blocks from the blockwise states.
     use crate::solver::estimate::{
-        BlockRole, FittedBlock, FittedLinkParameters, UnifiedFitResultParts,
+        BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts,
     };
     let blocks: Vec<FittedBlock> = block_states
         .iter()
@@ -843,17 +843,17 @@ pub fn blockwise_fit_from_parts(
         log_lambdas: log_lambdas.clone(),
         lambdas: lambdas.clone(),
         log_likelihood,
-        reml_score: penalizedobjective,
-        stable_penalty_term: 2.0 * penalizedobjective - deviance,
-        penalized_objective: penalizedobjective,
+        reml_score: penalized_objective,
+        stable_penalty_term: 2.0 * penalized_objective - deviance,
+        penalized_objective,
         outer_iterations,
-        outer_converged: converged,
-        outer_gradient_norm: outer_final_gradient_norm,
+        outer_converged,
+        outer_gradient_norm,
         standard_deviation: 1.0,
         covariance_conditional,
         covariance_corrected: None,
         inference: None,
-        fitted_link: FittedLinkParameters::Standard,
+        fitted_link: FittedLinkState::Standard(None),
         geometry,
         block_states,
         pirls_status: crate::pirls::PirlsStatus::Converged,
@@ -4739,15 +4739,15 @@ pub fn fit_custom_family<F: CustomFamily>(
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
             covariance_conditional,
-            penalizedobjective: finite_penalizedobjective(
+            penalized_objective: finite_penalizedobjective(
                 inner.log_likelihood,
                 inner.penalty_value,
                 reml_term,
             ),
             outer_iterations: 0,
-            outer_final_gradient_norm: 0.0,
+            outer_gradient_norm: 0.0,
             inner_cycles: inner.cycles,
-            converged: inner.converged,
+            outer_converged: inner.converged,
             geometry,
         })
         .map_err(CustomFamilyError::Optimization);
@@ -4827,7 +4827,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             all_penalty_like: force_efs_for_wiggle,
             // Custom families enforce constraints via active-set QP in the inner
             // loop, not via log-barrier in the outer evaluator.
-            barrier_active: false,
+            barrier_config: None,
         },
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = if has_exact_hess {
@@ -5009,15 +5009,15 @@ pub fn fit_custom_family<F: CustomFamily>(
                         log_lambdas: rho0.clone(),
                         lambdas: rho0.mapv(f64::exp),
                         covariance_conditional,
-                        penalizedobjective: finite_penalizedobjective(
+                        penalized_objective: finite_penalizedobjective(
                             inner.log_likelihood,
                             inner.penalty_value,
                             reml_term,
                         ),
                         outer_iterations: 0,
-                        outer_final_gradient_norm: 0.0,
+                        outer_gradient_norm: 0.0,
                         inner_cycles: inner.cycles,
-                        converged: inner.converged,
+                        outer_converged: inner.converged,
                         geometry,
                     })
                     .map_err(CustomFamilyError::Optimization);
@@ -5058,7 +5058,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         log_lambdas: rho_star.clone(),
         lambdas: rho_star.mapv(f64::exp),
         covariance_conditional,
-        penalizedobjective: finite_penalizedobjective(
+        penalized_objective: finite_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
             if include_exact_newton_logdet_h(family) {
@@ -5072,13 +5072,13 @@ pub fn fit_custom_family<F: CustomFamily>(
             },
         ),
         outer_iterations: outer_iters,
-        outer_final_gradient_norm: if outer_grad_norm.is_finite() {
+        outer_gradient_norm: if outer_grad_norm.is_finite() {
             outer_grad_norm
         } else {
             0.0
         },
         inner_cycles: inner.cycles,
-        converged: inner.converged,
+        outer_converged: inner.converged,
         geometry,
     })
     .map_err(CustomFamilyError::Optimization)
@@ -5604,9 +5604,9 @@ mod tests {
         let beta = result.block_states[0].beta[0];
         let expected_penalty = 0.5 * ridge * beta * beta;
         assert!(
-            (result.penalizedobjective - expected_penalty).abs() < 1e-12,
+            (result.penalized_objective - expected_penalty).abs() < 1e-12,
             "penalized objective should equal ridge quadratic term when ll=0 and S=0; got {}, expected {}",
-            result.penalizedobjective,
+            result.penalized_objective,
             expected_penalty
         );
     }
@@ -5819,9 +5819,9 @@ mod tests {
         .expect("pseudo-laplace exact-newton fit");
         let expected = 0.5 * 2.0_f64.ln();
         assert!(
-            (fit.penalizedobjective - expected).abs() < 1e-8,
+            (fit.penalized_objective - expected).abs() < 1e-8,
             "pseudo-Laplace objective mismatch: got {}, expected {}",
-            fit.penalizedobjective,
+            fit.penalized_objective,
             expected
         );
     }
@@ -5963,9 +5963,9 @@ mod tests {
         )
         .expect("nearly symmetric pseudo-laplace Hessian should be accepted after symmetrization");
         assert!(
-            fit.penalizedobjective.is_finite(),
+            fit.penalized_objective.is_finite(),
             "expected finite pseudo-laplace objective, got {}",
-            fit.penalizedobjective
+            fit.penalized_objective
         );
     }
 

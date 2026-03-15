@@ -1,5 +1,5 @@
 use gam::estimate::{
-    BlockRole, FitArtifacts, FitResult, FittedBlock, FittedLinkParameters, UnifiedFitResultParts,
+    BlockRole, FitArtifacts, FitResult, FittedBlock, FittedLinkState, UnifiedFitResultParts,
 };
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::pirls::PirlsStatus;
@@ -7,7 +7,7 @@ use gam::types::{LikelihoodFamily, LinkFunction, SasLinkState};
 use ndarray::{Array1, Array2};
 use tempfile::tempdir;
 
-fn minimal_fit_result(fitted_link_parameters: FittedLinkParameters) -> FitResult {
+fn minimal_fit_result(fitted_link_parameters: FittedLinkState) -> FitResult {
     FitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: Array1::from_vec(vec![0.0]),
@@ -62,7 +62,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         },
         "binomial-sas".to_string(),
     );
-    payload.fit_result = Some(minimal_fit_result(FittedLinkParameters::Sas {
+    payload.fit_result = Some(minimal_fit_result(FittedLinkState::Sas {
         state: sas_state,
         covariance: Some(covariance.clone()),
     }));

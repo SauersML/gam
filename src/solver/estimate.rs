@@ -1197,7 +1197,7 @@ pub struct ExternalOptimResult {
     pub artifacts: FitArtifacts,
     pub inference: Option<FitInference>,
     pub reml_score: f64,
-    pub fitted_link_parameters: FittedLinkParameters,
+    pub fitted_link_parameters: FittedLinkState,
 }
 
 #[derive(Clone)]
@@ -1585,7 +1585,9 @@ where
                 hessian: Derivative::Analytic,
                 n_params: k,
                 all_penalty_like: true,
-                barrier_active: fit_linear_constraints.is_some(),
+                barrier_config: self::reml::unified::BarrierConfig::from_constraints(
+                    fit_linear_constraints.as_ref(),
+                ),
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
@@ -1690,7 +1692,9 @@ where
                 n_params: theta_dim,
                 // Mixture/SAS coords are design-moving (not penalty-like).
                 all_penalty_like: false,
-                barrier_active: fit_linear_constraints.is_some(),
+                barrier_config: self::reml::unified::BarrierConfig::from_constraints(
+                    fit_linear_constraints.as_ref(),
+                ),
             },
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let rho = theta.slice(s![..k]).to_owned();
@@ -2478,26 +2482,26 @@ where
         inference,
         reml_score: outer_result.final_value,
         fitted_link_parameters: if let Some(state) = final_mixture_state {
-            FittedLinkParameters::Mixture {
+            FittedLinkState::Mixture {
                 state,
                 covariance: final_mixture_param_covariance,
             }
         } else if let Some(state) = final_sas_state {
             match opts.family {
-                crate::types::LikelihoodFamily::BinomialSas => FittedLinkParameters::Sas {
+                crate::types::LikelihoodFamily::BinomialSas => FittedLinkState::Sas {
                     state,
                     covariance: final_sas_param_covariance,
                 },
                 crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                    FittedLinkParameters::BetaLogistic {
+                    FittedLinkState::BetaLogistic {
                         state,
                         covariance: final_sas_param_covariance,
                     }
                 }
-                _ => FittedLinkParameters::Standard,
+                _ => FittedLinkState::Standard(None),
             }
         } else {
-            FittedLinkParameters::Standard
+            FittedLinkState::Standard(None)
         },
     };
     Ok(conditioning.backtransform_external_result(result))
@@ -2808,8 +2812,8 @@ pub type FitResult = UnifiedFitResult;
 pub type FitResultParts = UnifiedFitResultParts;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum FittedLinkParameters {
-    Standard,
+pub enum FittedLinkState {
+    Standard(Option<LinkFunction>),
     Sas {
         state: SasLinkState,
         covariance: Option<Array2<f64>>,
@@ -2824,29 +2828,15 @@ pub enum FittedLinkParameters {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum FittedLinkState {
-    Standard(LinkFunction),
-    Sas {
-        state: SasLinkState,
-        covariance: Option<Array2<f64>>,
-    },
-    BetaLogistic {
-        state: SasLinkState,
-        covariance: Option<Array2<f64>>,
-    },
-    Mixture {
-        state: MixtureLinkState,
-        covariance: Option<Array2<f64>>,
-    },
-}
+/// Backward-compatible alias.
+pub type FittedLinkParameters = FittedLinkState;
 
 fn validate_fitted_link_parameters_estimation(
-    fitted_link: &FittedLinkParameters,
+    fitted_link: &FittedLinkState,
 ) -> Result<(), EstimationError> {
     match fitted_link {
-        FittedLinkParameters::Standard => Ok(()),
-        FittedLinkParameters::Mixture { state, covariance } => {
+        FittedLinkState::Standard(_) => Ok(()),
+        FittedLinkState::Mixture { state, covariance } => {
             validate_all_finite_estimation(
                 "fit_result.mixture_link_rho",
                 state.rho.iter().copied(),
@@ -2863,8 +2853,8 @@ fn validate_fitted_link_parameters_estimation(
             }
             Ok(())
         }
-        FittedLinkParameters::Sas { state, covariance }
-        | FittedLinkParameters::BetaLogistic { state, covariance } => {
+        FittedLinkState::Sas { state, covariance }
+        | FittedLinkState::BetaLogistic { state, covariance } => {
             ensure_finite_scalar_estimation("fit_result.sas_epsilon", state.epsilon)?;
             ensure_finite_scalar_estimation("fit_result.sas_log_delta", state.log_delta)?;
             ensure_finite_scalar_estimation("fit_result.sas_delta", state.delta)?;
@@ -2942,7 +2932,7 @@ pub struct UnifiedFitResultParts {
     pub covariance_conditional: Option<Array2<f64>>,
     pub covariance_corrected: Option<Array2<f64>>,
     pub inference: Option<FitInference>,
-    pub fitted_link: FittedLinkParameters,
+    pub fitted_link: FittedLinkState,
     pub geometry: Option<FitGeometry>,
     pub block_states: Vec<crate::families::custom_family::ParameterBlockState>,
     // Backward-compatible fields (all have sensible defaults).
@@ -3003,24 +2993,16 @@ pub struct UnifiedFitResult {
     /// Inference quantities from the inner solver (EDF, Hessian, etc.).
     pub inference: Option<FitInference>,
     /// Fitted link parameters (SAS, BetaLogistic, Mixture).
-    pub fitted_link: FittedLinkParameters,
+    pub fitted_link: FittedLinkState,
     /// Working-set geometry at convergence (for ALO diagnostics).
     #[serde(skip)]
     pub geometry: Option<FitGeometry>,
     /// Internal block states from custom-family paths.
     #[serde(skip)]
     pub block_states: Vec<crate::families::custom_family::ParameterBlockState>,
-
-    // ── backward-compatible aliases (old FitResult fields) ────────────────
     /// Joint coefficient vector (first block for standard GAMs, concatenated for multi-block).
     #[serde(default)]
     pub beta: Array1<f64>,
-    /// Alias for `outer_iterations` (old FitResult name).
-    #[serde(default)]
-    pub iterations: usize,
-    /// Alias for `outer_gradient_norm` (old FitResult name).
-    #[serde(default)]
-    pub finalgrad_norm: f64,
     /// Inner solver convergence status.
     #[serde(default = "default_pirls_status")]
     pub pirls_status: crate::pirls::PirlsStatus,
@@ -3033,58 +3015,18 @@ pub struct UnifiedFitResult {
     /// Solver artifacts (e.g. cached PIRLS result for ALO).
     #[serde(skip)]
     pub artifacts: FitArtifacts,
-    /// Alias for `fitted_link` (old FitResult name).
-    #[serde(default)]
-    pub fitted_link_parameters: FittedLinkParameters,
-
-    // ── backward-compatible aliases (old BlockwiseFitResult fields) ───────
-    /// Alias for `outer_converged` (old BlockwiseFitResult name).
-    #[serde(default)]
-    pub converged: bool,
-    /// Alias for `penalized_objective` (old BlockwiseFitResult name).
-    #[serde(default)]
-    pub penalizedobjective: f64,
-    /// Alias for `outer_gradient_norm` (old BlockwiseFitResult name).
-    #[serde(default)]
-    pub outer_final_gradient_norm: f64,
     /// Inner cycle count (blockwise path).
     #[serde(default)]
     pub inner_cycles: usize,
-
-    // ── backward-compatible survival fields ───────────────────────────────
-    /// Time/baseline-hazard coefficients (survival location-scale).
-    #[serde(default)]
-    pub beta_time: Array1<f64>,
-    /// Threshold coefficients (survival location-scale).
-    #[serde(default)]
-    pub beta_threshold: Array1<f64>,
-    /// Log-sigma coefficients (survival location-scale).
-    #[serde(default)]
-    pub beta_log_sigma: Array1<f64>,
-    /// Link-wiggle coefficients (survival location-scale, optional).
-    #[serde(default)]
-    pub beta_link_wiggle: Option<Array1<f64>>,
-    /// Smoothing parameters for time block.
-    #[serde(default)]
-    pub lambdas_time: Array1<f64>,
-    /// Smoothing parameters for threshold block.
-    #[serde(default)]
-    pub lambdas_threshold: Array1<f64>,
-    /// Smoothing parameters for log-sigma block.
-    #[serde(default)]
-    pub lambdas_log_sigma: Array1<f64>,
-    /// Smoothing parameters for link-wiggle block.
-    #[serde(default)]
-    pub lambdas_linkwiggle: Option<Array1<f64>>,
 }
 
 fn default_pirls_status() -> crate::pirls::PirlsStatus {
     crate::pirls::PirlsStatus::Converged
 }
 
-impl Default for FittedLinkParameters {
+impl Default for FittedLinkState {
     fn default() -> Self {
-        FittedLinkParameters::Standard
+        FittedLinkState::Standard(None)
     }
 }
 
@@ -3283,48 +3225,7 @@ impl UnifiedFitResult {
             flat
         };
 
-        // Extract survival-specific block data for backward compatibility.
-        let beta_time = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::Time)
-            .map(|b| b.beta.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let beta_threshold = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::Threshold)
-            .map(|b| b.beta.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let beta_log_sigma_val = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::Scale)
-            .map(|b| b.beta.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let beta_link_wiggle = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::LinkWiggle)
-            .map(|b| b.beta.clone());
-        let lambdas_time = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::Time)
-            .map(|b| b.lambdas.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let lambdas_threshold = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::Threshold)
-            .map(|b| b.lambdas.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let lambdas_log_sigma_val = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::Scale)
-            .map(|b| b.lambdas.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let lambdas_linkwiggle = blocks
-            .iter()
-            .find(|b| b.role == BlockRole::LinkWiggle)
-            .map(|b| b.lambdas.clone());
-
         Ok(Self {
-            // canonical
             blocks,
             log_lambdas,
             lambdas,
@@ -3340,31 +3241,15 @@ impl UnifiedFitResult {
             covariance_conditional,
             covariance_corrected,
             inference,
-            fitted_link_parameters: fitted_link.clone(),
             fitted_link,
             geometry,
             block_states,
-            // backward-compat aliases
             beta,
-            iterations: outer_iterations,
-            finalgrad_norm: outer_gradient_norm,
             pirls_status,
             max_abs_eta,
             constraint_kkt,
             artifacts,
-            converged: outer_converged,
-            penalizedobjective: penalized_objective,
-            outer_final_gradient_norm: outer_gradient_norm,
             inner_cycles,
-            // survival fields
-            beta_time,
-            beta_threshold,
-            beta_log_sigma: beta_log_sigma_val,
-            beta_link_wiggle,
-            lambdas_time,
-            lambdas_threshold,
-            lambdas_log_sigma: lambdas_log_sigma_val,
-            lambdas_linkwiggle,
         })
     }
 
@@ -3467,6 +3352,60 @@ impl UnifiedFitResult {
         self.beta.clone()
     }
 
+    /// Time/baseline-hazard coefficients (survival location-scale).
+    pub fn beta_time(&self) -> Array1<f64> {
+        self.block_by_role(BlockRole::Time)
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0))
+    }
+
+    /// Threshold coefficients (survival location-scale).
+    pub fn beta_threshold(&self) -> Array1<f64> {
+        self.block_by_role(BlockRole::Threshold)
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0))
+    }
+
+    /// Log-sigma coefficients (survival location-scale).
+    pub fn beta_log_sigma(&self) -> Array1<f64> {
+        self.block_by_role(BlockRole::Scale)
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0))
+    }
+
+    /// Link-wiggle coefficients (survival location-scale, optional).
+    pub fn beta_link_wiggle(&self) -> Option<Array1<f64>> {
+        self.block_by_role(BlockRole::LinkWiggle)
+            .map(|b| b.beta.clone())
+    }
+
+    /// Smoothing parameters for time block.
+    pub fn lambdas_time(&self) -> Array1<f64> {
+        self.block_by_role(BlockRole::Time)
+            .map(|b| b.lambdas.clone())
+            .unwrap_or_else(|| Array1::zeros(0))
+    }
+
+    /// Smoothing parameters for threshold block.
+    pub fn lambdas_threshold(&self) -> Array1<f64> {
+        self.block_by_role(BlockRole::Threshold)
+            .map(|b| b.lambdas.clone())
+            .unwrap_or_else(|| Array1::zeros(0))
+    }
+
+    /// Smoothing parameters for log-sigma block.
+    pub fn lambdas_log_sigma(&self) -> Array1<f64> {
+        self.block_by_role(BlockRole::Scale)
+            .map(|b| b.lambdas.clone())
+            .unwrap_or_else(|| Array1::zeros(0))
+    }
+
+    /// Smoothing parameters for link-wiggle block.
+    pub fn lambdas_linkwiggle(&self) -> Option<Array1<f64>> {
+        self.block_by_role(BlockRole::LinkWiggle)
+            .map(|b| b.lambdas.clone())
+    }
+
     /// Number of coefficient blocks.
     pub fn n_blocks(&self) -> usize {
         self.blocks.len()
@@ -3478,25 +3417,30 @@ impl UnifiedFitResult {
     }
 
     /// Resolve the fitted link state for a given family.
+    ///
+    /// For standard (non-adaptive) link families, this enriches the stored
+    /// `FittedLinkState::Standard` with the concrete `LinkFunction` derived
+    /// from the family.  For adaptive links (SAS, BetaLogistic, Mixture) it
+    /// validates that the stored state matches the family and clones it out.
     pub fn fitted_link_state(
         &self,
         family: crate::types::LikelihoodFamily,
     ) -> Result<FittedLinkState, EstimationError> {
         match family {
             crate::types::LikelihoodFamily::GaussianIdentity => {
-                Ok(FittedLinkState::Standard(LinkFunction::Identity))
+                Ok(FittedLinkState::Standard(Some(LinkFunction::Identity)))
             }
             crate::types::LikelihoodFamily::BinomialLogit => {
-                Ok(FittedLinkState::Standard(LinkFunction::Logit))
+                Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
             }
             crate::types::LikelihoodFamily::BinomialProbit => {
-                Ok(FittedLinkState::Standard(LinkFunction::Probit))
+                Ok(FittedLinkState::Standard(Some(LinkFunction::Probit)))
             }
             crate::types::LikelihoodFamily::BinomialCLogLog => {
-                Ok(FittedLinkState::Standard(LinkFunction::CLogLog))
+                Ok(FittedLinkState::Standard(Some(LinkFunction::CLogLog)))
             }
             crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link {
-                FittedLinkParameters::Sas { state, covariance } => Ok(FittedLinkState::Sas {
+                FittedLinkState::Sas { state, covariance } => Ok(FittedLinkState::Sas {
                     state: state.clone(),
                     covariance: covariance.clone(),
                 }),
@@ -3505,7 +3449,7 @@ impl UnifiedFitResult {
                 )),
             },
             crate::types::LikelihoodFamily::BinomialBetaLogistic => match &self.fitted_link {
-                FittedLinkParameters::BetaLogistic { state, covariance } => {
+                FittedLinkState::BetaLogistic { state, covariance } => {
                     Ok(FittedLinkState::BetaLogistic {
                         state: state.clone(),
                         covariance: covariance.clone(),
@@ -3517,7 +3461,7 @@ impl UnifiedFitResult {
                 )),
             },
             crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link {
-                FittedLinkParameters::Mixture { state, covariance } => {
+                FittedLinkState::Mixture { state, covariance } => {
                     Ok(FittedLinkState::Mixture {
                         state: state.clone(),
                         covariance: covariance.clone(),

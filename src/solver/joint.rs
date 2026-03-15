@@ -1566,7 +1566,7 @@ impl<'a> JointRemlState<'a> {
             &self.core.base_rs_list,
         )?;
         let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
-        Ok(crate::solver::strategy::EfsEval { cost, steps })
+        Ok(crate::solver::strategy::EfsEval { cost, steps, beta: None })
     }
 
     fn fixed_subspace_logdet_for_penalty(
@@ -2622,7 +2622,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             // Joint models have both rho (penalty) and potentially psi (design-moving)
             // coordinates. Conservatively false.
             all_penalty_like: false,
-            barrier_active: false,
+            barrier_config: None,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {
