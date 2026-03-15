@@ -1998,54 +1998,48 @@ fn run_predict_survival(
         .map_err(|e| format!("invalid survival location-scale fit stub: {e}"))?;
         let pred = predict_survival_location_scale(&pred_input, &fit_stub)
             .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
-        let (mean, eta_se_default) = if args.mode == PredictModeArg::PosteriorMean {
-            if beta_link_wiggle.is_some() {
-                (pred.survival_prob.clone(), None)
-            } else {
-                let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-                let out =
-                    gam::survival_location_scale::predict_survival_location_scalewith_uncertainty(
-                        &pred_input,
-                        &fit_stub,
-                        &cov_mat,
-                        true,
-                        false,
-                    )
-                    .map_err(|e| {
-                        format!("survival location-scale posterior-mean predict failed: {e}")
-                    })?;
-                (out.survival_prob, Some(out.eta_standard_error))
-            }
+        let posterior_or_uncertainty = if args.mode == PredictModeArg::PosteriorMean
+            || args.uncertainty
+        {
+            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
+            Some(
+                gam::survival_location_scale::predict_survival_location_scalewith_uncertainty(
+                    &pred_input,
+                    &fit_stub,
+                    &cov_mat,
+                    args.mode == PredictModeArg::PosteriorMean,
+                    args.uncertainty,
+                )
+                .map_err(|e| format!("survival location-scale uncertainty predict failed: {e}"))?,
+            )
         } else {
-            (pred.survival_prob.clone(), None)
+            None
         };
+        let mean = posterior_or_uncertainty
+            .as_ref()
+            .map(|out| out.survival_prob.clone())
+            .unwrap_or_else(|| pred.survival_prob.clone());
+        let eta_out = posterior_or_uncertainty
+            .as_ref()
+            .map(|out| out.eta.clone())
+            .unwrap_or_else(|| pred.eta.clone());
+        let eta_se_default = posterior_or_uncertainty
+            .as_ref()
+            .map(|out| out.eta_standard_error.clone());
         if args.uncertainty {
             if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
                 return Err(format!("--level must be in (0,1), got {}", args.level));
             }
-            let (eta_se, response_sd) = if beta_link_wiggle.is_some() {
-                (Array1::zeros(n), Array1::zeros(n))
-            } else {
-                let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-                let out =
-                    gam::survival_location_scale::predict_survival_location_scalewith_uncertainty(
-                        &pred_input,
-                        &fit_stub,
-                        &cov_mat,
-                        args.mode == PredictModeArg::PosteriorMean,
-                        true,
-                    )
-                    .map_err(|e| {
-                        format!("survival location-scale uncertainty predict failed: {e}")
-                    })?;
-                let se = eta_se_default
-                    .clone()
-                    .unwrap_or(out.eta_standard_error.clone());
-                let rsd = out
-                    .response_standard_error
-                    .unwrap_or_else(|| Array1::zeros(n));
-                (se, rsd)
-            };
+            let out = posterior_or_uncertainty.as_ref().ok_or_else(|| {
+                "internal error: survival location-scale uncertainty output missing".to_string()
+            })?;
+            let eta_se = eta_se_default
+                .clone()
+                .unwrap_or_else(|| out.eta_standard_error.clone());
+            let response_sd = out
+                .response_standard_error
+                .clone()
+                .unwrap_or_else(|| Array1::zeros(n));
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             let (mean_lo, mean_hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
@@ -2053,7 +2047,7 @@ fn run_predict_survival(
             progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
-                pred.eta.view(),
+                eta_out.view(),
                 mean.view(),
                 Some(eta_se.view()),
                 Some(mean_lo.view()),
@@ -2064,7 +2058,7 @@ fn run_predict_survival(
             progress.set_stage("predict", "writing survival predictions");
             write_survival_prediction_csv(
                 &args.out,
-                pred.eta.view(),
+                eta_out.view(),
                 mean.view(),
                 None,
                 None,
@@ -2310,9 +2304,7 @@ fn run_predict_binomial_location_scale(
     } else {
         None
     };
-    let use_probit_integrated =
-        matches!(saved_loc_link, InverseLink::Standard(LinkFunction::Probit));
-    let mean = if args.mode == PredictModeArg::PosteriorMean && use_probit_integrated {
+    let mean = if args.mode == PredictModeArg::PosteriorMean {
         if pw == 0 {
             let cov_mat = covariance_from_model(model, args.covariance_mode)?;
             let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
@@ -2324,20 +2316,29 @@ fn run_predict_binomial_location_scale(
             let xd_l_covll = design_noise.design.dot(&cov_ll);
             let xd_t_covtl = design_t.design.dot(&cov_tl);
             let quadctx = gam::quadrature::QuadratureContext::new();
-            Array1::from_iter((0..eta.len()).map(|i| {
-                let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                let var_ls = design_noise.design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
-                let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
-                gam::quadrature::normal_expectation_2d_adaptive(
-                    &quadctx,
-                    [eta_t[i], eta_noise[i]],
-                    [[var_t, cov_tls], [cov_tls, var_ls]],
-                    |t, ls| {
-                        let sigma = ls.exp();
-                        normal_cdf(-t / sigma.max(1e-12))
-                    },
-                )
-            }))
+            Array1::from_vec(
+                (0..eta.len())
+                    .map(|i| {
+                        let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
+                        let var_ls = design_noise.design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
+                        let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
+                        gam::quadrature::normal_expectation_2d_adaptive_result(
+                            &quadctx,
+                            [eta_t[i], eta_noise[i]],
+                            [[var_t, cov_tls], [cov_tls, var_ls]],
+                            |t, ls| {
+                                let sigma = ls.exp().max(1e-12);
+                                integrated_inverse_link_mean_scalar(
+                                    &quadctx,
+                                    saved_loc_link,
+                                    -t / sigma,
+                                    0.0,
+                                )
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         } else {
             let cov_mat = covariance_from_model(model, args.covariance_mode)?;
             let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
@@ -2425,8 +2426,12 @@ fn run_predict_binomial_location_scale(
                                 varw += xr * covw_cond[[r, c]] * xw[c];
                             }
                         }
-                        let denom = (1.0 + varw.max(0.0)).sqrt().max(1e-12);
-                        Ok(normal_cdf(meanw / denom))
+                        integrated_inverse_link_mean_scalar(
+                            &quadctx,
+                            saved_loc_link,
+                            meanw,
+                            varw.max(0.0).sqrt(),
+                        )
                     },
                 )?;
             }
@@ -6923,6 +6928,33 @@ fn inverse_link_mean_scalar(saved_link_kind: &InverseLink, eta: f64) -> Result<f
     inverse_link_jet_for_inverse_link(saved_link_kind, eta)
         .map(|jet| jet.mu)
         .map_err(|e| format!("inverse-link evaluation failed: {e}"))
+}
+
+fn integrated_inverse_link_mean_scalar(
+    quadctx: &gam::quadrature::QuadratureContext,
+    saved_link_kind: &InverseLink,
+    eta: f64,
+    eta_sd: f64,
+) -> Result<f64, String> {
+    let eta_sd = eta_sd.max(0.0);
+    if !eta.is_finite() || !eta_sd.is_finite() {
+        return Err(format!(
+            "integrated inverse-link evaluation requires finite eta/eta_sd, got eta={eta}, eta_sd={eta_sd}"
+        ));
+    }
+    if eta_sd <= 1e-12 {
+        return inverse_link_mean_scalar(saved_link_kind, eta);
+    }
+    gam::quadrature::integrated_inverse_link_jetwith_state(
+        quadctx,
+        saved_link_kind.link_function(),
+        eta,
+        eta_sd,
+        saved_link_kind.mixture_state(),
+        saved_link_kind.sas_state(),
+    )
+    .map(|jet| jet.mean.clamp(0.0, 1.0))
+    .map_err(|e| format!("integrated inverse-link evaluation failed: {e}"))
 }
 
 fn predict_standard_binomial_linkwiggle(

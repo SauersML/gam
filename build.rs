@@ -1579,6 +1579,15 @@ fn main() {
     emit_stage_detail(&ignored_report);
     allviolations.extend(ignored_testviolations);
 
+    update_stage("scan newly-added #[cfg(test)] production gates");
+    let cfg_test_evasionviolations = scan_for_cfg_test_evasion();
+    let cfg_test_evasion_report = format!(
+        "cfg(test) evasion scan identified {} violation groups",
+        cfg_test_evasionviolations.len()
+    );
+    emit_stage_detail(&cfg_test_evasion_report);
+    allviolations.extend(cfg_test_evasionviolations);
+
     // Scan build scripts for forbidden drop(...) usage
     update_stage("scan build script drop usage");
     let drop_usageviolations = scan_for_drop_in_build_scripts();
@@ -3615,6 +3624,14 @@ struct UnsignedSymbolHints {
     method_names: HashSet<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AddedCfgTestSite {
+    file: String,
+    line: usize,
+    item_preview: String,
+    source_label: &'static str,
+}
+
 fn scan_for_inert_touch_calls() -> Vec<String> {
     let mut allviolations = Vec::new();
 
@@ -3678,6 +3695,213 @@ fn scan_for_inert_touch_calls() -> Vec<String> {
     }
 
     allviolations
+}
+
+fn scan_for_cfg_test_evasion() -> Vec<String> {
+    let mut allviolations = Vec::new();
+    let mut sites: HashSet<AddedCfgTestSite> = HashSet::new();
+
+    for site in
+        collect_added_cfg_test_sites(&["diff", "--name-only", "HEAD"], &["HEAD"], "working tree")
+    {
+        sites.insert(site);
+    }
+    for site in collect_added_cfg_test_sites(
+        &["diff", "--name-only", "@{upstream}..HEAD"],
+        &["@{upstream}..HEAD"],
+        "unpushed commit",
+    ) {
+        sites.insert(site);
+    }
+
+    if sites.is_empty() {
+        return allviolations;
+    }
+
+    let mut grouped: HashMap<String, Vec<AddedCfgTestSite>> = HashMap::new();
+    for site in sites {
+        grouped.entry(site.file.clone()).or_default().push(site);
+    }
+
+    for (file, mut file_sites) in grouped {
+        file_sites.sort_by_key(|site| site.line);
+        let path = Path::new(&file);
+        let violations = file_sites
+            .into_iter()
+            .map(|site| {
+                format!(
+                    "{}:{} -> newly-added #[cfg(test)] gates `{}`",
+                    site.line, site.source_label, site.item_preview
+                )
+            })
+            .collect::<Vec<_>>();
+        allviolations.push(format_grouped_scan_error(
+            "newly-added #[cfg(test)] production gates",
+            path,
+            &violations,
+            "Do not mark production imports, fields, constants, constructors, or helper methods as #[cfg(test)] to suppress dead_code in normal builds. Either wire the code into production, delete it, or keep the test-only logic inside a real #[cfg(test)] test module.",
+        ));
+    }
+
+    allviolations
+}
+
+fn collect_added_cfg_test_sites(
+    changed_files_args: &[&str],
+    patch_spec: &[&str],
+    source_label: &'static str,
+) -> Vec<AddedCfgTestSite> {
+    let changed_files = git_changed_files_set(changed_files_args);
+    let mut sites = Vec::new();
+
+    for file in changed_files {
+        if !file.starts_with("src/") || !file.ends_with(".rs") {
+            continue;
+        }
+
+        let mut args = vec!["diff", "--unified=3"];
+        args.extend_from_slice(patch_spec);
+        args.push("--");
+        args.push(file.as_str());
+
+        let output = match std::process::Command::new("git").args(&args).output() {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        let patch = String::from_utf8_lossy(&output.stdout);
+        sites.extend(parse_added_cfg_test_sites(&file, &patch, source_label));
+    }
+
+    sites
+}
+
+fn git_changed_files_set(args: &[&str]) -> HashSet<String> {
+    std::process::Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_added_cfg_test_sites(
+    file: &str,
+    patch: &str,
+    source_label: &'static str,
+) -> Vec<AddedCfgTestSite> {
+    let mut sites = Vec::new();
+    let lines: Vec<&str> = patch.lines().collect();
+    let mut new_line_num = 0usize;
+    let mut in_hunk = false;
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        if let Some(start) = parse_unified_hunk_new_start(line) {
+            new_line_num = start;
+            in_hunk = true;
+            idx += 1;
+            continue;
+        }
+
+        if !in_hunk {
+            idx += 1;
+            continue;
+        }
+
+        if let Some(content) = line.strip_prefix('+') {
+            let trimmed = content.trim();
+            if is_cfg_test_attr_line(trimmed) {
+                let preview = find_cfg_test_target_preview(&lines, idx + 1);
+                if let Some(item_preview) = preview {
+                    if !is_allowed_cfg_test_target_line(&item_preview) {
+                        sites.push(AddedCfgTestSite {
+                            file: file.to_string(),
+                            line: new_line_num,
+                            item_preview,
+                            source_label,
+                        });
+                    }
+                }
+            }
+            new_line_num += 1;
+            idx += 1;
+            continue;
+        }
+
+        if line.starts_with(' ') {
+            new_line_num += 1;
+            idx += 1;
+            continue;
+        }
+
+        if line.starts_with('-') || line.starts_with('\\') {
+            idx += 1;
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    sites
+}
+
+fn parse_unified_hunk_new_start(line: &str) -> Option<usize> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+    let plus_idx = line.find('+')?;
+    let rest = &line[plus_idx + 1..];
+    let end_idx = rest
+        .find(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    rest[..end_idx].parse::<usize>().ok()
+}
+
+fn is_cfg_test_attr_line(line: &str) -> bool {
+    normalize_no_whitespace(line) == "#[cfg(test)]"
+}
+
+fn find_cfg_test_target_preview(lines: &[&str], mut idx: usize) -> Option<String> {
+    while idx < lines.len() {
+        let line = lines[idx];
+        if line.starts_with("@@") || line.starts_with("diff --git") {
+            return None;
+        }
+        let Some(content) = line.strip_prefix('+').or_else(|| line.strip_prefix(' ')) else {
+            idx += 1;
+            continue;
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() || trimmed.starts_with("#[") {
+            idx += 1;
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn is_allowed_cfg_test_target_line(line: &str) -> bool {
+    let normalized = collapse_whitespace(line);
+    if normalized.starts_with("mod ") {
+        return normalized.contains("test");
+    }
+    if normalized.starts_with("pub mod ") || normalized.starts_with("pub(crate) mod ") {
+        return normalized.contains("test");
+    }
+    false
 }
 
 fn scan_for_suspicious_macro_wrappers() -> Vec<String> {

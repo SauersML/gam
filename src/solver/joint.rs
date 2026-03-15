@@ -35,7 +35,7 @@ use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::solver::strategy::{
     ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
 };
-use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction};
+use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction, SasLinkState};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
@@ -55,15 +55,19 @@ const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 // FD audit constants removed — gradient now computed through unified evaluator.
 
 #[inline]
-fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<GlmLikelihoodFamily> {
+fn integrated_binomial_family_from_link(
+    link: LinkFunction,
+    has_sas_state: bool,
+) -> Option<GlmLikelihoodFamily> {
     match link {
         LinkFunction::Logit => Some(GlmLikelihoodFamily::BinomialLogit),
         LinkFunction::Probit => Some(GlmLikelihoodFamily::BinomialProbit),
         LinkFunction::CLogLog => Some(GlmLikelihoodFamily::BinomialCLogLog),
         LinkFunction::Log => None,
-        // Joint model currently carries only state-less LinkFunction.
-        // SAS requires explicit (epsilon, log_delta) state for mathematically
-        // correct integrated moments, so do not dispatch state-less SAS here.
+        LinkFunction::Sas if has_sas_state => Some(GlmLikelihoodFamily::BinomialSas),
+        LinkFunction::BetaLogistic if has_sas_state => {
+            Some(GlmLikelihoodFamily::BinomialBetaLogistic)
+        }
         LinkFunction::Sas | LinkFunction::BetaLogistic => None,
         LinkFunction::Identity => None,
     }
@@ -252,6 +256,8 @@ pub struct JointModelState<'a> {
     ridge_base_used: f64,
     /// Ridge stabilization used for the link block solve.
     ridge_link_used: f64,
+    /// Fitted SAS/BetaLogistic link state for integrated PIRLS.
+    sas_link_state: Option<SasLinkState>,
 }
 
 struct JointFirthAdjustment {
@@ -391,6 +397,7 @@ impl<'a> JointModelState<'a> {
             ridge_used: 0.0,
             ridge_base_used: 0.0,
             ridge_link_used: 0.0,
+            sas_link_state: None,
         }
     }
 
@@ -398,6 +405,12 @@ impl<'a> JointModelState<'a> {
     /// When set, the joint model uses uncertainty-aware IRLS updates.
     pub fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
         self.covariate_se = Some(se);
+        self
+    }
+
+    /// Set fitted SAS/BetaLogistic link state for integrated PIRLS.
+    pub fn with_sas_link_state(mut self, state: SasLinkState) -> Self {
+        self.sas_link_state = Some(state);
         self
     }
 
@@ -711,7 +724,7 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
         if let Some(se) = &self.covariate_se {
-            if let Some(family) = integrated_binomial_family_from_link(self.link) {
+            if let Some(family) = integrated_binomial_family_from_link(self.link, self.sas_link_state.is_some()) {
                 if let Err(e) = crate::pirls::update_glmvectors_integrated_by_family(
                     &self.quadctx,
                     self.y,
@@ -724,7 +737,7 @@ impl<'a> JointModelState<'a> {
                     &mut z_glm,
                     None,
                     None,
-                    None,
+                    self.sas_link_state.as_ref(),
                 ) {
                     log::warn!(
                         "joint integrated working-vector update failed (falling back to non-integrated): {}",
@@ -1092,14 +1105,20 @@ impl<'a> JointModelState<'a> {
         let mut z_updated = Array1::<f64>::zeros(n);
 
         if let Some(se) = &self.covariate_se {
+            let inverse_link = match (self.link, &self.sas_link_state) {
+                (LinkFunction::Sas, Some(state)) => InverseLink::Sas(*state),
+                (LinkFunction::BetaLogistic, Some(state)) => InverseLink::BetaLogistic(*state),
+                _ => InverseLink::Standard(self.link),
+            };
             match self.link {
-                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog
+                | LinkFunction::Sas | LinkFunction::BetaLogistic => {
                     if let Err(e) = crate::pirls::update_glmvectors_integrated_for_link(
                         &self.quadctx,
                         self.y,
                         eta,
                         se.view(),
-                        &InverseLink::Standard(self.link),
+                        &inverse_link,
                         self.weights,
                         &mut mu_updated,
                         &mut weights_updated,
@@ -1114,7 +1133,7 @@ impl<'a> JointModelState<'a> {
                         if let Err(e2) = crate::pirls::update_glmvectors(
                             self.y,
                             eta,
-                            &InverseLink::Standard(self.link),
+                            &inverse_link,
                             self.weights,
                             &mut mu_updated,
                             &mut weights_updated,
@@ -1129,7 +1148,7 @@ impl<'a> JointModelState<'a> {
                     if let Err(e) = crate::pirls::update_glmvectors(
                         self.y,
                         eta,
-                        &InverseLink::Standard(self.link),
+                        &inverse_link,
                         self.weights,
                         &mut mu_updated,
                         &mut weights_updated,

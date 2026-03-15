@@ -1529,6 +1529,7 @@ impl<'a> RemlState<'a> {
                 logdet_h: sparse_system.logdet_h,
                 logdet_s_pos,
                 det1_values: Arc::new(det1_values),
+                #[cfg(test)]
                 traceworkspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
             })),
             firth_dense_operator: None,

@@ -84,6 +84,205 @@ fn linear_predictorvariance(
     })
 }
 
+fn design_times_dense(
+    design: &DesignMatrix,
+    rhs: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    if design.ncols() != rhs.nrows() {
+        return Err(EstimationError::InvalidInput(format!(
+            "design_times_dense shape mismatch: design is {}x{}, rhs is {}x{}",
+            design.nrows(),
+            design.ncols(),
+            rhs.nrows(),
+            rhs.ncols()
+        )));
+    }
+    match design {
+        DesignMatrix::Dense(x) => Ok(x.dot(rhs)),
+        DesignMatrix::Sparse(_) => {
+            let n = design.nrows();
+            let q = rhs.ncols();
+            let mut out = Array2::<f64>::zeros((n, q));
+            for j in 0..q {
+                let col = rhs.column(j).to_owned();
+                out.column_mut(j).assign(&design.matrixvectormultiply(&col));
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn rowwise_dot_designwith_dense(
+    design: &DesignMatrix,
+    rowvalues: &Array2<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    if design.nrows() != rowvalues.nrows() || design.ncols() != rowvalues.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rowwise_dot_designwith_dense shape mismatch: design is {}x{}, rowvalues is {}x{}",
+            design.nrows(),
+            design.ncols(),
+            rowvalues.nrows(),
+            rowvalues.ncols()
+        )));
+    }
+    match design {
+        DesignMatrix::Dense(x) => Ok(Array1::from_iter(
+            (0..x.nrows()).map(|i| x.row(i).dot(&rowvalues.row(i))),
+        )),
+        DesignMatrix::Sparse(xs) => {
+            let csr = xs.to_csr_arc().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "rowwise_dot_designwith_dense: failed to obtain CSR view".to_string(),
+                )
+            })?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+            let mut out = Array1::<f64>::zeros(xs.nrows());
+            for i in 0..xs.nrows() {
+                let start = row_ptr[i];
+                let end = row_ptr[i + 1];
+                let mut acc = 0.0_f64;
+                for ptr in start..end {
+                    let j = col_idx[ptr];
+                    acc += vals[ptr] * rowvalues[[i, j]];
+                }
+                out[i] = acc;
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn rowwise_cross_quadratic_design(
+    left: &DesignMatrix,
+    middle: &Array2<f64>,
+    right: &DesignMatrix,
+) -> Result<Array1<f64>, EstimationError> {
+    let left_middle = design_times_dense(left, middle)?;
+    rowwise_dot_designwith_dense(right, &left_middle)
+}
+
+const POSTERIOR_MEAN_VARIANCE_TOL: f64 = 1e-10;
+const POSTERIOR_MEAN_CROSS_TOL: f64 = 1e-10;
+
+fn posterior_mean_covariance_or_warn<'a>(
+    fit: &'a UnifiedFitResult,
+    fallback: Option<&'a Array2<f64>>,
+    expected_dim: usize,
+    label: &str,
+) -> Option<&'a Array2<f64>> {
+    for (source, covariance) in [
+        ("fit result", fit.beta_covariance()),
+        ("predictor state", fallback),
+    ] {
+        let Some(covariance) = covariance else {
+            continue;
+        };
+        if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
+            return Some(covariance);
+        }
+        log::warn!(
+            "{label}: ignoring {source} covariance with shape {}x{}; expected {}x{}",
+            covariance.nrows(),
+            covariance.ncols(),
+            expected_dim,
+            expected_dim
+        );
+    }
+    log::warn!("{label}: covariance unavailable; falling back to plug-in point prediction");
+    None
+}
+
+fn project_two_block_linear_predictor_covariance(
+    design_first: &DesignMatrix,
+    design_second: &DesignMatrix,
+    covariance: &Array2<f64>,
+    p_first: usize,
+    p_second: usize,
+    label: &str,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+    let p_total = p_first + p_second;
+    if covariance.nrows() != p_total || covariance.ncols() != p_total {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} covariance dimension mismatch: expected {}x{}, got {}x{}",
+            p_total,
+            p_total,
+            covariance.nrows(),
+            covariance.ncols()
+        )));
+    }
+    if design_first.ncols() != p_first || design_second.ncols() != p_second {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} design dimension mismatch: threshold/location design has {} columns (expected {}), scale design has {} columns (expected {})",
+            design_first.ncols(),
+            p_first,
+            design_second.ncols(),
+            p_second
+        )));
+    }
+
+    let cov_ff = covariance
+        .slice(ndarray::s![0..p_first, 0..p_first])
+        .to_owned();
+    let cov_ss = covariance
+        .slice(ndarray::s![p_first..p_total, p_first..p_total])
+        .to_owned();
+    let cov_fs = covariance
+        .slice(ndarray::s![0..p_first, p_first..p_total])
+        .to_owned();
+    let var_first = design_first.quadratic_form_diag(&cov_ff).map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "{label} failed to compute first-block predictor variance: {e}"
+        ))
+    })?;
+    let var_second = design_second.quadratic_form_diag(&cov_ss).map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "{label} failed to compute second-block predictor variance: {e}"
+        ))
+    })?;
+    let cov_cross = rowwise_cross_quadratic_design(design_first, &cov_fs, design_second)?;
+    Ok((var_first, var_second, cov_cross))
+}
+
+fn projected_bivariate_posterior_mean_result<F>(
+    quadctx: &crate::quadrature::QuadratureContext,
+    mu: [f64; 2],
+    cov: [[f64; 2]; 2],
+    integrand: F,
+) -> Result<f64, EstimationError>
+where
+    F: Fn(f64, f64) -> Result<f64, EstimationError>,
+{
+    let var0 = cov[0][0].max(0.0);
+    let var1 = cov[1][1].max(0.0);
+    let cov01 = cov[0][1];
+
+    if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && var1 <= POSTERIOR_MEAN_VARIANCE_TOL {
+        return integrand(mu[0], mu[1]);
+    }
+    if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
+        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, EstimationError>(
+            quadctx,
+            [mu[1]],
+            [[var1]],
+            21,
+            |x| integrand(mu[0], x[0]),
+        );
+    }
+    if var1 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
+        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, EstimationError>(
+            quadctx,
+            [mu[0]],
+            [[var0]],
+            21,
+            |x| integrand(x[0], mu[1]),
+        );
+    }
+    crate::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
+}
+
 pub struct PredictResult {
     pub eta: Array1<f64>,
     pub mean: Array1<f64>,
@@ -624,53 +823,109 @@ impl PredictableModel for BinomialLocationScalePredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        // Full posterior mean with 2D quadrature over (eta_t, eta_s) uncertainty
-        // is too complex to extract here. Return point prediction.
-        let _ = fit;
+        // Validation target for this projected 2D GHQ path:
+        // compare against 100K Monte Carlo draws under strong threshold/scale
+        // posterior correlation and require agreement within ~0.01; as
+        // covariance -> 0, the integrated mean must converge to the plug-in
+        // point prediction row-wise.
         let (q0, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
-        let prob = self.apply_link(&q0)?;
-        let eta_se = if let Some(ref cov) = self.covariance {
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Binomial location-scale posterior mean requires noise design matrix".to_string(),
+            )
+        })?;
+        let offset_noise = input
+            .offset_noise
+            .as_ref()
+            .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
+        let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
+        let point_prob = self.apply_link(&q0)?;
+        let p_t = self.beta_threshold.len();
+        let p_s = self.beta_noise.len();
+        let p_total = p_t + p_s;
+        let covariance = posterior_mean_covariance_or_warn(
+            fit,
+            self.covariance.as_ref(),
+            p_total,
+            "binomial location-scale posterior mean",
+        );
+
+        let eta_se = if let Some(cov) = covariance {
             let n = eta_t.len();
-            let p_t = self.beta_threshold.len();
-            let p_s = self.beta_noise.len();
-            let p_total = p_t + p_s;
-            if cov.nrows() == p_total && cov.ncols() == p_total {
-                let design_noise = input.design_noise.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "Binomial location-scale posterior mean requires noise design matrix"
-                            .to_string(),
-                    )
-                })?;
-                let mut se = Array1::zeros(n);
-                for i in 0..n {
-                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                        &self.inverse_link,
-                        q0[i],
-                    )?;
-                    let dphi = jet.d1;
-                    let dprob_deta_t = dphi * (-1.0 / sigma[i]);
-                    let dprob_deta_s = dphi * (eta_t[i] / sigma[i]);
-                    let mut grad = Vec::with_capacity(p_total);
-                    for j in 0..p_t {
-                        grad.push(dprob_deta_t * input.design.get(i, j));
-                    }
-                    for j in 0..p_s {
-                        grad.push(dprob_deta_s * design_noise.get(i, j));
-                    }
-                    let var = quadratic_form(cov, &grad)?;
-                    se[i] = var.sqrt();
+            let mut se = Array1::zeros(n);
+            for i in 0..n {
+                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                    &self.inverse_link,
+                    q0[i],
+                )?;
+                let dphi = jet.d1;
+                let dprob_deta_t = dphi * (-1.0 / sigma[i]);
+                let dprob_deta_s = dphi * (eta_t[i] / sigma[i]);
+                let mut grad = Vec::with_capacity(p_total);
+                for j in 0..p_t {
+                    grad.push(dprob_deta_t * input.design.get(i, j));
                 }
-                se
-            } else {
-                Array1::zeros(n)
+                for j in 0..p_s {
+                    grad.push(dprob_deta_s * design_noise.get(i, j));
+                }
+                let var = quadratic_form(cov, &grad)?;
+                se[i] = var.sqrt();
             }
+            se
         } else {
             Array1::zeros(eta_t.len())
+        };
+
+        let mean = if let Some(covariance) = covariance {
+            match project_two_block_linear_predictor_covariance(
+                &input.design,
+                design_noise,
+                covariance,
+                p_t,
+                p_s,
+                "binomial location-scale posterior mean",
+            ) {
+                Ok((var_t, var_s, cov_ts)) => {
+                    let quadctx = crate::quadrature::QuadratureContext::new();
+                    Array1::from_vec(
+                        (0..eta_t.len())
+                            .map(|i| {
+                                projected_bivariate_posterior_mean_result(
+                                    &quadctx,
+                                    [eta_t[i], eta_s[i]],
+                                    [
+                                        [var_t[i].max(0.0), cov_ts[i]],
+                                        [cov_ts[i], var_s[i].max(0.0)],
+                                    ],
+                                    |eta_threshold, eta_log_sigma| {
+                                        let sigma =
+                                            eta_log_sigma.clamp(-500.0, 500.0).exp().max(1e-12);
+                                        let q0 = -eta_threshold / sigma;
+                                        let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                                            &self.inverse_link,
+                                            q0,
+                                        )?;
+                                        Ok(jet.mu.clamp(0.0, 1.0))
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                }
+                Err(err) => {
+                    log::warn!(
+                        "binomial location-scale posterior mean: failed to project covariance into (eta_threshold, eta_log_sigma): {err}; falling back to plug-in point prediction"
+                    );
+                    point_prob.clone()
+                }
+            }
+        } else {
+            point_prob.clone()
         };
         Ok(PredictPosteriorMeanResult {
             eta: eta_t,
             eta_standard_error: eta_se,
-            mean: prob,
+            mean,
         })
     }
 
@@ -901,23 +1156,93 @@ impl PredictableModel for SurvivalPredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        // Exact posterior mean integration not yet implemented for survival.
-        // Return point prediction as approximation.
-        let _ = fit;
-        let result = self.predict_response(input)?;
-        let eta_se = if let Some(ref cov) = self.covariance {
+        // Validation target for this survival posterior-mean path:
+        // compare against 50K Monte Carlo draws from N(beta_hat, V) for a
+        // simple Weibull-style location-scale survival fit and require
+        // agreement within ~0.005; as covariance -> 0, the integrated mean
+        // must collapse to the point prediction.
+        let eta_threshold = input.design.dot(&self.beta_threshold) + &input.offset;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival posterior mean requires noise (log-sigma) design matrix".to_string(),
+            )
+        })?;
+        let offset_noise = input.offset_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Survival posterior mean requires noise (log-sigma) offset".to_string(),
+            )
+        })?;
+        let eta_log_sigma = design_noise.dot(&self.beta_log_sigma) + offset_noise;
+        let point_mean = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+        let p_t = self.beta_threshold.len();
+        let p_s = self.beta_log_sigma.len();
+        let p_total = p_t + p_s;
+        let covariance = posterior_mean_covariance_or_warn(
+            fit,
+            self.covariance.as_ref(),
+            p_total,
+            "survival posterior mean",
+        );
+
+        let eta_se = if let Some(cov) = covariance {
             let p_t = self.beta_threshold.len();
             eta_standard_errors_from_design(
                 &input.design,
                 &cov.slice(ndarray::s![..p_t, ..p_t]).to_owned(),
             )?
         } else {
-            Array1::zeros(result.eta.len())
+            Array1::zeros(eta_threshold.len())
+        };
+
+        let mean = if let Some(covariance) = covariance {
+            match project_two_block_linear_predictor_covariance(
+                &input.design,
+                design_noise,
+                covariance,
+                p_t,
+                p_s,
+                "survival posterior mean",
+            ) {
+                Ok((var_t, var_s, cov_ts)) => {
+                    let quadctx = crate::quadrature::QuadratureContext::new();
+                    Array1::from_vec(
+                        (0..eta_threshold.len())
+                            .map(|i| {
+                                projected_bivariate_posterior_mean_result(
+                                    &quadctx,
+                                    [eta_threshold[i], eta_log_sigma[i]],
+                                    [
+                                        [var_t[i].max(0.0), cov_ts[i]],
+                                        [cov_ts[i], var_s[i].max(0.0)],
+                                    ],
+                                    |threshold, log_sigma| {
+                                        let sigma = log_sigma.clamp(-500.0, 500.0).exp().max(1e-12);
+                                        let survival_eta = threshold / sigma;
+                                        let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                                            &self.inverse_link,
+                                            survival_eta,
+                                        )?;
+                                        Ok(jet.mu.clamp(0.0, 1.0))
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                }
+                Err(err) => {
+                    log::warn!(
+                        "survival posterior mean: failed to project covariance into (eta_threshold, eta_log_sigma): {err}; falling back to plug-in point prediction"
+                    );
+                    point_mean.clone()
+                }
+            }
+        } else {
+            point_mean.clone()
         };
         Ok(PredictPosteriorMeanResult {
-            eta: result.eta,
+            eta: eta_threshold,
             eta_standard_error: eta_se,
-            mean: result.mean,
+            mean,
         })
     }
 

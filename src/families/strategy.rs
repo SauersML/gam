@@ -172,9 +172,15 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                             .to_string(),
                     )
                 })?;
-                Ok(normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
-                    mixture_inverse_link_jet(state, x).mu
-                }))
+                integrated_family_moments_jetwith_state(
+                    quadctx,
+                    LikelihoodFamily::BinomialMixture,
+                    eta,
+                    se_eta,
+                    Some(state),
+                    None,
+                )
+                .map(|v| v.mean)
             }
             LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
@@ -246,9 +252,18 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                             .to_string(),
                     )
                 })?;
-                let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
+                let m1 = integrated_family_moments_jetwith_state(
+                    quadctx,
+                    LikelihoodFamily::BinomialMixture,
+                    eta,
+                    se_eta,
+                    Some(state),
+                    None,
+                )?
+                .mean;
+                let m2 = normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
                     let p = mixture_inverse_link_jet(state, x).mu;
-                    (p, p * p)
+                    p * p
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }

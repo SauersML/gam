@@ -339,7 +339,7 @@ struct SharedData {
 /// Uses faer for numerically stable Cholesky decomposition.
 /// Family mode for NUTS log-likelihood computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NutsFamily {
+pub enum NutsFamily {
     Gaussian,
     BinomialLogit,
     BinomialProbit,
