@@ -52,6 +52,23 @@ pub struct BlockGeometryDirectionalDerivative {
 }
 
 /// Working quantities supplied by a custom family for one block.
+///
+/// # Observed vs expected information (see response.md Section 3)
+///
+/// For the outer REML/LAML criterion, the Hessian used in log|H| and trace terms
+/// must be the **observed** (actual) Hessian at the mode, not the expected Fisher.
+///
+/// - `ExactNewton`: provides -nabla^2 log L directly, which is the observed Hessian
+///   by construction. This is always correct.
+///
+/// - `Diagonal`: provides IRLS working weights W such that the per-block Hessian
+///   is X'WX. For canonical links (logit-Binomial, log-Poisson), W_obs = W_Fisher.
+///   For non-canonical links, W should ideally be the observed weight
+///   W_obs = W_Fisher - (y-mu)*B to ensure the outer REML uses the exact Laplace
+///   Hessian. Currently, GAMLSS families using Diagonal blocks with non-canonical
+///   links may provide Fisher weights; this is acceptable when the link is close to
+///   canonical (small residual correction) but introduces a PQL-type approximation
+///   for strongly non-canonical links.
 #[derive(Clone)]
 pub enum BlockWorkingSet {
     /// Standard IRLS/GLM-style diagonal working set for eta-space updates.
@@ -59,12 +76,21 @@ pub enum BlockWorkingSet {
         /// IRLS pseudo-response for this block's linear predictor.
         working_response: Array1<f64>,
         /// IRLS working weights for this block (non-negative, length n).
+        ///
+        /// For the inner solver, Fisher or observed weights both find the same mode.
+        /// For the outer REML/LAML log|H| term, observed weights are the correct
+        /// Laplace choice (see response.md Section 3). Canonical-link families need
+        /// no correction since observed = Fisher.
         working_weights: Array1<f64>,
     },
     /// Exact Newton block update in coefficient space.
     ///
-    /// `gradient` is ∇ log L wrt block coefficients.
-    /// `hessian` is -∇² log L wrt block coefficients (positive semidefinite near optimum).
+    /// `gradient` is nabla log L wrt block coefficients.
+    /// `hessian` is -nabla^2 log L wrt block coefficients (positive semidefinite near optimum).
+    ///
+    /// This is the observed Hessian by construction (actual second derivative of the
+    /// log-likelihood), which is the correct quantity for the outer REML Laplace
+    /// approximation.
     ExactNewton {
         gradient: Array1<f64>,
         hessian: SymmetricMatrix,
@@ -259,7 +285,18 @@ pub trait CustomFamily {
 
     /// Optional exact joint coefficient-space Hessian across all blocks.
     ///
-    /// Returns the unpenalized matrix `H = -∇² log L` in the flattened block order.
+    /// Returns the unpenalized matrix `H_L = -nabla^2 log L` in the flattened block order.
+    ///
+    /// This is the **observed** (actual) Hessian of the log-likelihood at the mode,
+    /// NOT the expected Fisher information. The outer REML/LAML evaluator requires
+    /// the observed Hessian for the exact Laplace approximation (see response.md
+    /// Section 3). Since this method returns the actual second derivative of log L,
+    /// it is correct by construction.
+    ///
+    /// For families using `BlockWorkingSet::Diagonal` (IRLS-style updates), the
+    /// per-block Hessian is X'WX where W is the working weight. For canonical links
+    /// W_obs = W_Fisher, but for non-canonical links the working weight should include
+    /// the observed-information correction W_obs = W_Fisher - (y-mu)*B.
     fn exact_newton_joint_hessian(
         &self,
         _: &[ParameterBlockState],

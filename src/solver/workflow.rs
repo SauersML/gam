@@ -13,18 +13,16 @@ use crate::families::survival_location_scale::{
     LinkWiggleBlockInput, SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
     fit_survival_location_scale_terms,
 };
-use crate::joint::{JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design,
-    fit_term_collectionwith_spatial_length_scale_optimization,
+    TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::solver::strategy::{
     ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval,
 };
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
-use ndarray::{Array1, ArrayView1, ArrayView2};
+use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkSpec, SasLinkSpec};
+use ndarray::{Array1, ArrayView2};
 
 #[derive(Clone, Debug)]
 pub struct LinkWiggleWorkflowConfig {
@@ -53,17 +51,6 @@ pub struct StandardFitWorkflowRequest<'a> {
     pub wiggle_options: Option<BlockwiseFitOptions>,
 }
 
-pub struct FlexibleLinkWorkflowRequest<'a> {
-    pub y: ArrayView1<'a, f64>,
-    pub weights: ArrayView1<'a, f64>,
-    pub data: ArrayView2<'a, f64>,
-    pub spec: TermCollectionSpec,
-    pub link: LinkFunction,
-    pub geometry: JointLinkGeometry,
-    pub config: JointModelConfig,
-    pub include_base_covariance: bool,
-}
-
 pub struct GaussianLocationScaleWorkflowRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: GaussianLocationScaleTermSpec,
@@ -90,7 +77,6 @@ pub struct SurvivalLocationScaleWorkflowRequest<'a> {
 
 pub enum FitModelRequest<'a> {
     Standard(StandardFitWorkflowRequest<'a>),
-    FlexibleLink(FlexibleLinkWorkflowRequest<'a>),
     GaussianLocationScale(GaussianLocationScaleWorkflowRequest<'a>),
     BinomialLocationScale(BinomialLocationScaleWorkflowRequest<'a>),
     SurvivalLocationScale(SurvivalLocationScaleWorkflowRequest<'a>),
@@ -107,12 +93,6 @@ pub struct StandardFitWorkflowResult {
     pub betawiggle: Option<Vec<f64>>,
 }
 
-pub struct FlexibleLinkWorkflowResult {
-    pub fit: JointModelResult,
-    pub design: TermCollectionDesign,
-    pub spec: TermCollectionSpec,
-}
-
 pub struct SurvivalLocationScaleWorkflowResult {
     pub fit: SurvivalLocationScaleTermFitResult,
     pub inverse_link: InverseLink,
@@ -122,7 +102,6 @@ pub struct SurvivalLocationScaleWorkflowResult {
 
 pub enum FitModelResult {
     Standard(StandardFitWorkflowResult),
-    FlexibleLink(FlexibleLinkWorkflowResult),
     GaussianLocationScale(GaussianLocationScaleWorkflowResult),
     BinomialLocationScale(BinomialLocationScaleWorkflowResult),
     SurvivalLocationScale(SurvivalLocationScaleWorkflowResult),
@@ -232,29 +211,6 @@ fn fit_standard_model(
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
         betawiggle: Some(betawiggle),
-    })
-}
-
-fn fit_flexible_link_model(
-    request: FlexibleLinkWorkflowRequest<'_>,
-) -> Result<FlexibleLinkWorkflowResult, String> {
-    let design =
-        build_term_collection_design(request.data, &request.spec).map_err(|e| e.to_string())?;
-    let fit = fit_joint_model_engine(
-        request.y,
-        request.weights,
-        design.design.view(),
-        design.penalties.clone(),
-        request.link,
-        request.geometry,
-        request.config,
-        request.include_base_covariance,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(FlexibleLinkWorkflowResult {
-        fit,
-        design,
-        spec: request.spec,
     })
 }
 
@@ -629,9 +585,6 @@ pub fn fit_model(request: FitModelRequest<'_>) -> Result<FitModelResult, String>
     match request {
         FitModelRequest::Standard(request) => {
             fit_standard_model(request).map(FitModelResult::Standard)
-        }
-        FitModelRequest::FlexibleLink(request) => {
-            fit_flexible_link_model(request).map(FitModelResult::FlexibleLink)
         }
         FitModelRequest::GaussianLocationScale(request) => {
             fit_gaussian_location_scale_model(request).map(FitModelResult::GaussianLocationScale)

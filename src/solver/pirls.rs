@@ -615,9 +615,26 @@ impl FirthDiagnostics {
     }
 }
 
+/// Which curvature surface is used for the Hessian-side weights in PIRLS.
+///
+/// The **inner** P-IRLS solver can use either Fisher or observed curvature ---
+/// both find the same mode (any convergent algorithm works).
+///
+/// The **outer** REML/LAML criterion MUST use the observed Hessian for the
+/// exact Laplace approximation. For canonical links (logit-Binomial, log-Poisson),
+/// observed = Fisher so both are correct. For non-canonical links (probit, cloglog,
+/// SAS, mixture, flexible), the observed weight includes a residual-dependent
+/// correction W_obs = W_Fisher - (y-mu)*B, and using Fisher weights would yield
+/// a PQL-type surrogate instead of the true Laplace criterion.
+///
+/// See response.md Section 3 for the mathematical justification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HessianCurvatureKind {
+    /// Expected (Fisher) information: W_Fisher = h'^2 / (phi * V(mu)).
+    /// Used as the inner iteration matrix when observed curvature fails (non-SPD).
     Fisher,
+    /// Observed information: W_obs = W_Fisher - (y - mu) * B.
+    /// Required for the outer REML log|H| and trace terms (exact Laplace).
     Observed,
 }
 
@@ -1146,6 +1163,13 @@ impl<'a> GamWorkingModel<'a> {
         self
     }
 
+    /// Convert the working model into its final state for outer REML consumption.
+    ///
+    /// The `finalweights` field is set to `lasthessian_weights`, which are the
+    /// **observed-information** weights (for non-canonical links) or Fisher weights
+    /// (for canonical links where observed = Fisher). These flow into the outer
+    /// REML H = X'W_obs X + S, ensuring log|H| uses the correct Laplace curvature.
+    /// See response.md Section 3 for the mathematical justification.
     fn into_final_state(self) -> GamModelFinalState {
         let GamWorkingModel {
             x_original,
@@ -1303,6 +1327,23 @@ impl<'a> GamWorkingModel<'a> {
         supports_observed_hessian_curvature_for_inverse_link(&self.link_kind)
     }
 
+    /// Compute the Hessian-side weight arrays (w, c, d) for the requested curvature kind.
+    ///
+    /// When `requested == Observed` and the link supports it, returns the
+    /// **observed-information** weights including the residual-dependent correction:
+    ///   W_obs = W_Fisher - (y - mu) * B,  B = (h'' V - h'^2 V') / (phi V^2)
+    ///   c_obs = c_Fisher + h'*B - (y-mu)*B_eta
+    ///   d_obs = d_Fisher + h''*B + 2*h'*B_eta - (y-mu)*B_etaeta
+    ///
+    /// For canonical links (logit-Binomial, log-Poisson), B = 0 so observed = Fisher.
+    ///
+    /// These arrays serve dual purpose:
+    /// 1. **Inner iteration**: They define the Newton system H*delta = -g.
+    ///    Fisher scoring (using W_Fisher) is also valid here since any convergent
+    ///    algorithm finds the same mode.
+    /// 2. **Outer REML**: They define the Laplace Hessian H_obs = X'W_obs X + S.
+    ///    The outer log|H| and trace terms MUST use observed information for the
+    ///    exact Laplace approximation. See response.md Section 3.
     fn hessian_curvature_arrays(
         &self,
         requested: HessianCurvatureKind,
@@ -3309,6 +3350,23 @@ where
     let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
     let lambda_factor = 10.0;
 
+    // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
+    //
+    // The mixed strategy is used here:
+    // - The inner PIRLS iteration uses observed-information curvature when
+    //   available (preferred_curvature = Observed for non-canonical links).
+    //   This gives faster convergence than Fisher scoring for non-canonical
+    //   links, but either choice finds the same mode.
+    // - Fisher scoring internally is FINE --- any convergent algorithm works.
+    //   If observed curvature fails (non-SPD), we fall back to Fisher scoring.
+    // - The CRITICAL requirement is that the **output** Hessian (which flows
+    //   into the outer REML log|H| and trace terms) uses observed information.
+    //   This is ensured by `into_final_state()` which stores the
+    //   `lasthessian_weights` (observed when available) as `finalweights`.
+    //
+    // The Laplace approximation int exp(-F(beta)) dbeta uses the actual
+    // Hessian nabla^2 F at the actual mode. Replacing with expected Fisher
+    // changes the approximation itself --- it becomes a PQL-type surrogate.
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
         let preferred_curvature =
@@ -5569,6 +5627,23 @@ fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
         .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
 }
 
+/// Compute vectorised observed-information curvature arrays (w_obs, c_obs, d_obs)
+/// for the Hessian surface at the mode.
+///
+/// This function is the primary entry point for obtaining the observed weights
+/// that flow into the outer REML/LAML Hessian H_obs = X' W_obs X + S. The
+/// observed corrections include residual-dependent terms that vanish for
+/// canonical links but are nonzero for probit, cloglog, SAS, mixture, and
+/// flexible links.
+///
+/// The output arrays are:
+/// - `hessian_weights`: W_obs per observation (floored to maintain SPD).
+/// - `hessian_c`: c_obs = dW_obs/deta per observation (for outer gradient C[v]).
+/// - `hessian_d`: d_obs = d^2W_obs/deta^2 per observation (for outer Hessian Q[v_k,v_l]).
+///
+/// See `observed_weight_noncanonical` for the per-observation formulas and
+/// response.md Section 3 for the mathematical justification of why observed
+/// (not Fisher) information is required.
 fn compute_observed_hessian_curvature_arrays(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
@@ -5623,20 +5698,40 @@ fn compute_observed_hessian_curvature_arrays(
 }
 
 /// Per-observation observed-information weights and their first two
-/// η-derivatives for a general exponential-dispersion family with a
+/// eta-derivatives for a general exponential-dispersion family with a
 /// noncanonical link.
 ///
+/// The observed weight differs from the Fisher (expected) weight by a
+/// residual-dependent correction (see response.md Section 3):
+///
+///   W_obs = W_Fisher - (y - mu) * B
+///   B = (h'' V - h'^2 V') / (phi V^2)
+///
+///   c_obs = c_Fisher + h' * B - (y - mu) * B_eta
+///   d_obs = d_Fisher + h'' * B + 2*h' * B_eta - (y - mu) * B_etaeta
+///
+/// For canonical links (logit-Binomial, log-Poisson, log-Gamma), B = 0
+/// so observed = Fisher and no correction is needed.
+///
+/// These observed quantities are required for:
+/// 1. The outer REML/LAML Hessian H_obs = X' W_obs X + S (log|H| term).
+/// 2. The outer gradient's C[v] correction (uses c_obs).
+/// 3. The outer Hessian's Q[v_k, v_l] correction (uses d_obs).
+///
+/// Using Fisher weights in the outer REML would yield a PQL-type surrogate
+/// rather than the exact Laplace approximation.
+///
 /// # Arguments
-/// * `y`   – response value
-/// * `mu`  – fitted mean h(η)
-/// * `h1`…`h4` – inverse-link derivatives h'(η) … h''''(η)
-/// * `vj`  – variance-function jet (V, V', V'', V''') evaluated at μ
-/// * `phi` – dispersion parameter (1.0 for Bernoulli/Poisson)
-/// * `pw`  – prior weight for this observation
+/// * `y`   -- response value
+/// * `mu`  -- fitted mean h(eta)
+/// * `h1`...`h4` -- inverse-link derivatives h'(eta) ... h''''(eta)
+/// * `vj`  -- variance-function jet (V, V', V'', V''') evaluated at mu
+/// * `phi` -- dispersion parameter (1.0 for Bernoulli/Poisson)
+/// * `pw`  -- prior weight for this observation
 ///
 /// # Returns
-/// `(w_obs, c_obs, d_obs)` – the observed weight and its first two
-/// η-derivatives, all pre-multiplied by `pw`.
+/// `(w_obs, c_obs, d_obs)` -- the observed weight and its first two
+/// eta-derivatives, all pre-multiplied by `pw`.
 #[inline]
 pub fn observed_weight_noncanonical(
     y: f64,

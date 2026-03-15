@@ -1012,6 +1012,12 @@ pub struct InnerSolution<'dp> {
     // === The factorization (single source of truth for all linear algebra) ===
     /// The Hessian operator providing logdet, trace, and solve.
     /// Both cost and gradient use this same object.
+    ///
+    /// IMPORTANT: This MUST encode the **observed** Hessian H_obs = X'W_obs X + S
+    /// at the converged mode, where W_obs includes the residual-dependent correction
+    /// for non-canonical links. Using expected Fisher H_Fisher = X'W_Fisher X + S
+    /// would make this a PQL surrogate rather than the exact Laplace approximation.
+    /// See response.md Section 3 for the mathematical justification.
     pub hessian_op: Box<dyn HessianOperator>,
 
     // === Coefficients and penalty structure ===
@@ -1027,6 +1033,14 @@ pub struct InnerSolution<'dp> {
 
     // === Family-specific derivative info ===
     /// Provider of third-derivative corrections for non-Gaussian families.
+    ///
+    /// The c and d arrays (dW/deta, d^2W/deta^2) carried by this provider MUST
+    /// be the **observed** derivatives, not the Fisher derivatives. For non-canonical
+    /// links the observed c/d include residual-dependent corrections:
+    ///   c_obs = c_Fisher + h'*B - (y-mu)*B_eta
+    ///   d_obs = d_Fisher + h''*B + 2*h'*B_eta - (y-mu)*B_etaeta
+    /// These corrections matter for the outer gradient (C[v] correction) and
+    /// outer Hessian (Q[v_k, v_l] correction). See response.md Section 3.
     pub deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
 
     // === Corrections ===
@@ -1304,11 +1318,42 @@ const DENOM_RIDGE: f64 = 1e-8;
 /// penalty derivatives, and the same coefficients. Drift between cost and
 /// gradient is structurally impossible because there is no second function.
 ///
+/// # Observed information requirement (see response.md Section 3)
+///
+/// The Laplace approximation to the marginal likelihood integral
+///   int exp(-F(beta)) dbeta  ~  exp(-F(beta_hat)) * (2pi)^{p/2} / sqrt(|H_obs|)
+/// requires H_obs = nabla^2 F(beta_hat), the **observed** (actual) Hessian at
+/// the mode --- NOT the expected Fisher information. Replacing H_obs with
+/// E[H] changes the quadratic approximation itself, yielding a PQL-type
+/// surrogate rather than the true Laplace/LAML criterion.
+///
+/// For this evaluator, the `solution.hessian_op` MUST encode log|H_obs| and
+/// provide traces tr(H_obs^{-1} A_k) using the observed Hessian. Callers
+/// (runtime.rs, joint.rs) are responsible for constructing H from the
+/// observed-information weights W_obs = W_Fisher - (y-mu)*B at the mode.
+///
+/// The **mixed strategy** is valid and deliberately used here:
+/// - The inner P-IRLS solver may use Fisher scoring (expected information)
+///   as its iteration matrix --- any convergent algorithm finds the same mode.
+/// - The outer REML criterion uses the observed Hessian at that mode.
+/// This is correct because the inner algorithm is just a solver; only the
+/// outer log|H| and trace terms define the Laplace approximation.
+///
+/// For canonical links (logit-Binomial, log-Poisson, log-Gamma), observed
+/// equals expected, so no correction is needed. For non-canonical links
+/// (probit, cloglog, SAS, mixture/flexible), the observed weight includes a
+/// residual-dependent correction:
+///   W_obs = W_Fisher - (y - mu) * B,
+///   B = (h'' V - h'^2 V') / (phi V^2)
+/// and the c/d arrays (dW/deta, d^2W/deta^2) similarly include observed
+/// corrections. These are computed by `compute_observed_hessian_curvature_arrays`
+/// in pirls.rs and flow through `PirlsResult` into the `InnerSolution`.
+///
 /// # Arguments
-/// - `solution`: The converged inner state (β̂, H, penalties, corrections).
-/// - `rho`: Log smoothing parameters (ρₖ = log λₖ).
+/// - `solution`: The converged inner state (beta_hat, H_obs, penalties, corrections).
+/// - `rho`: Log smoothing parameters (rho_k = log lambda_k).
 /// - `mode`: What to compute (value only, value+gradient, or all three).
-/// - `prior_cost_gradient`: Optional soft prior on ρ (value, gradient, optional Hessian).
+/// - `prior_cost_gradient`: Optional soft prior on rho (value, gradient, optional Hessian).
 pub fn reml_laml_evaluate(
     solution: &InnerSolution<'_>,
     rho: &[f64],

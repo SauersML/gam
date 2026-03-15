@@ -46,7 +46,7 @@ use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
     ModelKind, PredictModelClass,
 };
-use gam::joint::{JointLinkGeometry, JointModelConfig, JointModelResult, predict_joint};
+use gam::joint::{JointModelResult, predict_joint};
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
@@ -71,7 +71,7 @@ use gam::types::{
 };
 use gam::workflow::{
     BinomialLocationScaleWorkflowRequest, FitModelRequest, FitModelResult,
-    FlexibleLinkWorkflowRequest, GaussianLocationScaleWorkflowRequest, LinkWiggleWorkflowConfig,
+    GaussianLocationScaleWorkflowRequest, LinkWiggleWorkflowConfig,
     StandardBinomialWiggleWorkflowConfig, StandardFitWorkflowRequest,
     SurvivalLocationScaleWorkflowRequest, fit_model,
 };
@@ -856,12 +856,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if args.scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
-    let has_spatial_length_scale_terms = (0..spec.smooth_terms.len())
-        .any(|term_idx| gam::smooth::get_spatial_length_scale(&spec, term_idx).is_some());
     let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
-        matches!(choice.mode, LinkMode::Flexible)
-            && choice.mixture_components.is_none()
-            && (!has_spatial_length_scale_terms || choice.link == LinkFunction::Probit)
+        matches!(choice.mode, LinkMode::Flexible) && choice.mixture_components.is_none()
     });
     progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("dataset parsed and terms resolved");
@@ -906,94 +902,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 return Err(
                     "flexible(...) links currently require a binomial family/link".to_string(),
                 );
-            }
-            if !route_flexible_through_standard {
-                let config = JointModelConfig {
-                    firth_bias_reduction: args.firth,
-                    ..JointModelConfig::default()
-                };
-                let geometry = JointLinkGeometry {
-                    n_link_knots: config.n_link_knots,
-                    degree: 3,
-                };
-                progress.teardown();
-                let joint =
-                    match fit_model(FitModelRequest::FlexibleLink(FlexibleLinkWorkflowRequest {
-                        y: y.view(),
-                        weights: weights.view(),
-                        data: ds.values.view(),
-                        spec: spec.clone(),
-                        link: choice.link,
-                        geometry,
-                        config,
-                        include_base_covariance: args.out.is_some(),
-                    })) {
-                        Ok(FitModelResult::FlexibleLink(result)) => result,
-                        Ok(_) => {
-                            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                            return Err(
-                                "internal flexible-link workflow returned the wrong result variant"
-                                    .to_string(),
-                            );
-                        }
-                        Err(e) => {
-                            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                            return Err(format!("flexible-link fit failed: {e}"));
-                        }
-                    };
-                let initial_frozenspec = freeze_term_collectionspec(&joint.spec, &joint.design)?;
-                let joint = joint.fit;
-
-                println!(
-                    "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
-                    family_to_string(family),
-                    linkname(choice.link),
-                    joint.converged,
-                    joint.backfit_iterations,
-                    joint.edf
-                );
-                println!(
-                    "flexible-link geometry | knots={} | degree={} | ridge={:.3e}",
-                    joint.knot_vector.len(),
-                    joint.degree,
-                    joint.ridge_used
-                );
-
-                if let Some(out) = args.out {
-                    let fit_result = core_saved_fit_result(
-                        joint.beta_base.clone(),
-                        Array1::from_vec(joint.lambdas.clone()),
-                        1.0,
-                        joint.beta_base_covariance.clone(),
-                        None,
-                        SavedFitSummary::from_joint_result(&joint)?,
-                    );
-                    let mut payload = FittedModelPayload::new(
-                        MODEL_VERSION,
-                        formula_text,
-                        ModelKind::FlexibleLink,
-                        FittedFamily::FlexibleLink {
-                            likelihood: family,
-                            link: choice.link,
-                        },
-                        family_to_string(family).to_string(),
-                    );
-                    payload.unified = Some(fit_result.clone());
-                    payload.fit_result = Some(fit_result);
-                    payload.data_schema = Some(ds.schema.clone());
-                    payload.link = Some(link_choice_to_string(choice));
-                    payload.joint_beta_link = Some(joint.beta_link.to_vec());
-                    payload.joint_knot_range = Some(joint.knot_range);
-                    payload.joint_knot_vector = Some(joint.knot_vector.to_vec());
-                    payload.joint_link_transform = Some(array2_to_nestedvec(&joint.link_transform));
-                    payload.joint_degree = Some(joint.degree);
-                    payload.jointridge_used = Some(joint.ridge_used);
-                    payload.training_headers = Some(ds.headers.clone());
-                    payload.resolved_termspec = Some(initial_frozenspec.clone());
-                    write_payload_json(&out, payload)?;
-                }
-                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
-                return Ok(());
             }
         }
     }

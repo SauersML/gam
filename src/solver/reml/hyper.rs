@@ -1822,6 +1822,9 @@ impl<'a> RemlState<'a> {
                 //              = (db_num − 2·B·dV) / V²
                 let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
 
+                // OBSERVED weight derivative for the outer REML (see response.md Section 3):
+                //   dW_obs/dtheta = dW_Fisher/dtheta + (dmu/dtheta)*B - (y-mu)*dB/dtheta
+                // This is the exact Laplace derivative, not the PQL surrogate.
                 dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
             }
         }
@@ -1986,6 +1989,9 @@ impl<'a> RemlState<'a> {
                     dd2 * variance + h2 * d_var - 2.0 * d1 * dd1 * v_prime - numerator * d_vprime;
                 let db_val = (db_num - 2.0 * b_val * d_var * variance) / var_sq;
 
+                // OBSERVED weight derivative for the outer REML (see response.md Section 3):
+                //   dW_obs/dtheta = dW_Fisher/dtheta + (dmu/dtheta)*B - (y-mu)*dB/dtheta
+                // This is the exact Laplace derivative, not the PQL surrogate.
                 dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
             }
         }

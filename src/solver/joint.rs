@@ -1918,10 +1918,33 @@ impl<'a> JointRemlState<'a> {
         let bwiggle = state.build_link_basis_from_state(&u);
         let eta = state.compute_eta_full(&u, &bwiggle);
 
-        // Compute mu/weights at convergence (same as compute_laml_at_convergence).
+        // ═══════════════════════════════════════════════════════════════════
+        //  Compute mu and IRLS weights at convergence.
+        //
+        //  OBSERVED vs EXPECTED INFORMATION (see response.md Section 3):
+        //  The outer REML/LAML criterion requires the **observed** Hessian
+        //  H_obs = J' W_obs J + S_lambda at the mode for the exact Laplace
+        //  approximation. For canonical links (logit-Binomial, log-Poisson),
+        //  W_obs = W_Fisher so no correction is needed. For non-canonical
+        //  links (probit, cloglog), the observed weight includes a
+        //  residual-dependent correction:
+        //    W_obs = W_Fisher - (y - mu) * B,
+        //    B = (h'' V - h'^2 V') / (phi V^2)
+        //
+        //  We compute Fisher weights first (used for the score-side RHS and
+        //  as a starting point), then apply the observed correction for
+        //  non-canonical links before assembling the outer Hessian H.
+        //
+        //  Note: For the joint model with link wiggles, the Jacobian J
+        //  depends on beta, so H = J'WJ is already a Gauss-Newton (GN)
+        //  approximation that drops the d^2J/dbeta^2 terms. Using W_obs
+        //  instead of W_Fisher in this GN form gives the closest feasible
+        //  approximation to the true observed Hessian. The LinkWiggleDerivProvider
+        //  handles the first-order Jacobian sensitivity (dJ/dbeta) terms.
+        // ═══════════════════════════════════════════════════════════════════
         let mut mu = Array1::<f64>::zeros(n);
-        let mut weights = Array1::<f64>::zeros(n);
-        // Integrated GHQ derivatives: d1 = dE[h(η+ε)]/dη, d2 = d²E[h(η+ε)]/dη².
+        let mut fisher_weights = Array1::<f64>::zeros(n);
+        // Integrated GHQ derivatives: d1 = dE[h(eta+epsilon)]/deta, d2 = d^2E[h(eta+epsilon)]/deta^2.
         // Stored per observation for use in w_prime when covariate_se is active.
         let mut integrated_d1 = Array1::<f64>::zeros(n);
         let mut integrated_d2 = Array1::<f64>::zeros(n);
@@ -1931,7 +1954,7 @@ impl<'a> JointRemlState<'a> {
             LinkFunction::Identity => {
                 for i in 0..n {
                     mu[i] = eta[i];
-                    weights[i] = state.weights[i];
+                    fisher_weights[i] = state.weights[i];
                 }
             }
             _ => {
@@ -1955,7 +1978,7 @@ impl<'a> JointRemlState<'a> {
                     let dmu = moments.d1.abs().max(MIN_DMU);
                     mu[i] = moments.mean;
                     let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
+                    fisher_weights[i] = state.weights[i] * w;
                     integrated_d1[i] = moments.d1;
                     integrated_d2[i] = if moments.d2.is_finite() {
                         moments.d2
@@ -1965,9 +1988,89 @@ impl<'a> JointRemlState<'a> {
                 }
             }
         }
+
+        // Apply observed-information correction for non-canonical links.
+        // For canonical links (logit, log, identity), observed = Fisher so
+        // `weights` = `fisher_weights` unchanged. For non-canonical links
+        // (probit, cloglog), the observed weight is:
+        //   W_obs_i = W_Fisher_i - (y_i - mu_i) * B_i
+        //   B_i = (h''(eta_i) V(mu_i) - h'(eta_i)^2 V'(mu_i)) / (phi V(mu_i)^2)
+        //
+        // This is the exact Laplace requirement: the outer log|H| and traces
+        // must use the observed Hessian at the mode, not the expected Fisher.
+        // Fisher scoring in the inner solver is fine (any convergent algorithm
+        // finds the same mode), but the outer criterion is the Laplace
+        // approximation itself. See response.md Section 3.
+        let is_canonical = matches!(
+            state.link,
+            LinkFunction::Identity | LinkFunction::Logit | LinkFunction::Log
+        );
+        let weights = if !is_canonical && !is_gaussian {
+            use crate::pirls::observed_weight_noncanonical;
+            let mut obs_weights = fisher_weights.clone();
+            for i in 0..n {
+                let eta_i = eta[i];
+                let mu_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                // Compute inverse-link derivatives h', h'', h''', h'''' at eta_i.
+                let (h1, h2, h3, h4) = match state.link {
+                    LinkFunction::Probit => {
+                        // h(eta) = Phi(eta), h'(eta) = phi(eta)
+                        let phi_val =
+                            (-0.5 * eta_i * eta_i).exp() / (2.0 * std::f64::consts::PI).sqrt();
+                        let h1 = phi_val;
+                        let h2 = -eta_i * phi_val;
+                        let h3 = (eta_i * eta_i - 1.0) * phi_val;
+                        let h4 = -(eta_i * eta_i * eta_i - 3.0 * eta_i) * phi_val;
+                        (h1, h2, h3, h4)
+                    }
+                    LinkFunction::CLogLog => {
+                        // h(eta) = 1 - exp(-exp(eta))
+                        let exp_eta = eta_i.exp();
+                        let exp_neg_exp = (-exp_eta).exp();
+                        let h1 = exp_eta * exp_neg_exp;
+                        let h2 = h1 * (1.0 - exp_eta);
+                        let h3 = h1 * (1.0 - 3.0 * exp_eta + exp_eta * exp_eta);
+                        let h4 = h1
+                            * (1.0 - 7.0 * exp_eta + 6.0 * exp_eta * exp_eta
+                                - exp_eta * exp_eta * exp_eta);
+                        (h1, h2, h3, h4)
+                    }
+                    _ => {
+                        // For other non-canonical links (SAS, BetaLogistic),
+                        // use Fisher as fallback. These links are rejected at
+                        // the entry point (line 2567), so this is unreachable
+                        // in practice.
+                        obs_weights[i] = fisher_weights[i];
+                        continue;
+                    }
+                };
+                // Variance function for Binomial: V(mu) = mu(1-mu), V'(mu) = 1-2mu.
+                let vj = crate::pirls::VarianceJet::binomial_n(mu_i);
+                let phi = 1.0; // Binomial dispersion = 1.
+                let (w_obs_i, _, _) = observed_weight_noncanonical(
+                    state.y[i],
+                    mu_i,
+                    h1,
+                    h2,
+                    h3,
+                    h4,
+                    vj,
+                    phi,
+                    state.weights[i],
+                );
+                // Floor observed weight to maintain positive definiteness.
+                let floor = (fisher_weights[i].abs() * 0.1).max(1e-12);
+                obs_weights[i] = w_obs_i.max(floor);
+            }
+            obs_weights
+        } else {
+            fisher_weights.clone()
+        };
+
         let deviance = state.compute_deviance(&mu);
 
-        // Build joint Hessian H = J'WJ + S_λ.
+        // Build joint Hessian H = J' W_obs J + S_lambda.
+        // W_obs is the observed-information weight (or Fisher for canonical links).
         let p_base = state.x_base.ncols();
         let p_link = bwiggle.ncols();
         let coef_layout = JointCoefLayout::new(p_base, p_link);
@@ -2204,19 +2307,28 @@ impl<'a> JointRemlState<'a> {
 
         let deriv_provider: Box<dyn crate::estimate::reml::unified::HessianDerivativeProvider> =
             if p_link > 0 {
-                // w_prime = dW/dη for each observation.
+                // w_prime = dW/deta (c array) and w_double_prime = d^2W/deta^2 (d array).
+                //
+                // OBSERVED vs EXPECTED (see response.md Section 3):
+                // These are the eta-derivatives of the Hessian-side weight W used
+                // in H = J'WJ + S. For the exact Laplace approximation, they must
+                // be the **observed** derivatives (c_obs, d_obs), not the Fisher
+                // derivatives. For canonical links (logit), observed = Fisher.
+                // For non-canonical links (probit, cloglog), the observed c/d
+                // include residual-dependent corrections via B and its derivatives.
                 //
                 // For integrated logit (covariate_se active), the IRLS weight is
-                //   W = obsw · d1² / var,  var = μ(1−μ), d1 = dE[sigmoid(η+ε)]/dη.
-                // Its η-derivative uses GHQ derivatives d1, d2:
-                //   dW/dη = obsw · [2·d1·d2/var − d1²·var'/(var²)]
-                // where var' = d1·(1−2μ).
+                //   W = obsw * d1^2 / var,  var = mu(1-mu), d1 = dE[sigmoid(eta+epsilon)]/deta.
+                // Its eta-derivative uses GHQ derivatives d1, d2:
+                //   dW/deta = obsw * [2*d1*d2/var - d1^2*var'/(var^2)]
+                // where var' = d1*(1-2mu).
                 //
-                // For standard logit (no integration): d1 = μ(1−μ), d2 = d1·(1−2μ),
-                // and the formula reduces to obsw · μ(1−μ)(1−2μ).
+                // For standard logit (no integration): d1 = mu(1-mu), d2 = d1*(1-2mu),
+                // and the formula reduces to obsw * mu(1-mu)*(1-2mu).
                 let mut w_prime = Array1::<f64>::zeros(n);
                 let mut w_double_prime = Array1::<f64>::zeros(n);
                 if matches!(state.link, LinkFunction::Logit) {
+                    // Canonical link: observed = Fisher. No residual correction needed.
                     let use_integrated = state.covariate_se.is_some();
                     for i in 0..n {
                         let p_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
@@ -2240,6 +2352,57 @@ impl<'a> JointRemlState<'a> {
                         if !w_double_prime[i].is_finite() {
                             w_double_prime[i] = 0.0;
                         }
+                    }
+                } else if !is_canonical && !is_gaussian {
+                    // Non-canonical link (probit, cloglog): use observed c/d arrays.
+                    // The observed c_obs and d_obs include residual-dependent
+                    // corrections that are required for the exact Laplace outer
+                    // gradient and Hessian. See response.md Section 3.
+                    for i in 0..n {
+                        let eta_i = eta[i];
+                        let mu_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                        let (h1, h2, h3, h4) = match state.link {
+                            LinkFunction::Probit => {
+                                let phi_val = (-0.5 * eta_i * eta_i).exp()
+                                    / (2.0 * std::f64::consts::PI).sqrt();
+                                (
+                                    phi_val,
+                                    -eta_i * phi_val,
+                                    (eta_i * eta_i - 1.0) * phi_val,
+                                    -(eta_i * eta_i * eta_i - 3.0 * eta_i) * phi_val,
+                                )
+                            }
+                            LinkFunction::CLogLog => {
+                                let exp_eta = eta_i.exp();
+                                let exp_neg_exp = (-exp_eta).exp();
+                                let h1 = exp_eta * exp_neg_exp;
+                                let h2 = h1 * (1.0 - exp_eta);
+                                let h3 = h1 * (1.0 - 3.0 * exp_eta + exp_eta * exp_eta);
+                                let h4 = h1
+                                    * (1.0 - 7.0 * exp_eta + 6.0 * exp_eta * exp_eta
+                                        - exp_eta * exp_eta * exp_eta);
+                                (h1, h2, h3, h4)
+                            }
+                            _ => {
+                                // SAS/BetaLogistic rejected at entry; skip.
+                                continue;
+                            }
+                        };
+                        let vj = crate::pirls::VarianceJet::binomial_n(mu_i);
+                        let phi = 1.0;
+                        let (_, c_obs, d_obs) = crate::pirls::observed_weight_noncanonical(
+                            state.y[i],
+                            mu_i,
+                            h1,
+                            h2,
+                            h3,
+                            h4,
+                            vj,
+                            phi,
+                            state.weights[i],
+                        );
+                        w_prime[i] = if c_obs.is_finite() { c_obs } else { 0.0 };
+                        w_double_prime[i] = if d_obs.is_finite() { d_obs } else { 0.0 };
                     }
                 }
 

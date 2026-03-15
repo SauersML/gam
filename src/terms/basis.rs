@@ -1664,16 +1664,6 @@ pub struct AnisoBasisPsiDerivatives {
     pub design_first: Vec<Array2<f64>>,
     /// d matrices, each (n x p_smooth): d2X/d psi_a^2 (diagonal second derivatives).
     pub design_second_diag: Vec<Array2<f64>>,
-    /// Per data-point (i,j) R-operator scalar t(r_ij) for cross-term assembly.
-    /// Shape (n x p_smooth) after identifiability transform.
-    pub design_cross_t: Array2<f64>,
-    /// Per data-point (i,j) per-axis component s_a(i,j) = exp(2 eta_a) * h_a^2.
-    /// Vec of d arrays, each (n x k_raw) -- needed for cross-term assembly:
-    ///   d2 X[i,j]/(d psi_a d psi_b) = t[i,j] * s_a[i,j] * s_b[i,j]  (a != b).
-    pub s_components_raw: Vec<Array2<f64>>,
-    /// Projected+padded s_a components, same shape as design_first entries.
-    /// Used for cross-derivative assembly in smooth.rs.
-    pub s_components_projected: Vec<Array2<f64>>,
     /// d x num_penalties: dS_m/d psi_a for each axis a and penalty m.
     pub penalties_first: Vec<Vec<Array2<f64>>>,
     /// d x num_penalties: d2S_m/d psi_a^2 for each axis a and penalty m.
@@ -1686,10 +1676,11 @@ pub struct AnisoBasisPsiDerivatives {
     /// The (a, b) axis pairs corresponding to each entry in penalties_cross.
     /// Only the upper triangle (a < b) is stored.
     pub penalties_cross_pairs: Vec<(usize, usize)>,
-    /// Optional implicit operator for memory-efficient matrix-vector products.
-    /// When present, the `design_first` / `design_second_diag` / `design_cross_t`
-    /// fields may be empty (zero-sized) and all design-derivative matvecs should
-    /// go through this operator instead.
+    /// Shared operator-backed representation of the anisotropic kernel-side
+    /// design derivatives. When `design_first` / `design_second_diag` are empty,
+    /// callers must use this operator directly; when they are present, this
+    /// operator still provides exact cross-axis second derivatives without
+    /// duplicating separate `t` / `s_a` storage layouts.
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
@@ -1728,7 +1719,7 @@ pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
 ///
 /// - `q_values[i*n_knots + j]` = φ'(r_{ij}) / r_{ij}  (R-operator first scalar)
 /// - `t_values[i*n_knots + j]` = (φ''(r_{ij}) - q_{ij}) / r_{ij}²  (R-operator second scalar)
-/// - `axis_fractions[i*n_knots + j, d]` = exp(2η_d) · (x_{id} - c_{jd})² / r_{ij}²
+/// - `axis_components[i*n_knots + j, d]` = exp(2η_d) · (x_{id} - c_{jd})²
 ///
 /// Memory: O(n · k · (D + 2)) instead of O(n · p · D), where k = n_knots.
 ///
@@ -1738,10 +1729,10 @@ pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
 ///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b)
 #[derive(Debug, Clone)]
 pub struct ImplicitDesignPsiDerivative {
-    /// Per (data, knot) pair axis-fraction components.
+    /// Per (data, knot) pair axis components.
     /// Shape: (n * n_knots, D) stored in row-major order.
-    /// `axis_fractions[[i * n_knots + j, d]]` = s_{d,i,j} = exp(2η_d) · h_{d,ij}².
-    axis_fractions: Array2<f64>,
+    /// `axis_components[[i * n_knots + j, d]]` = s_{d,i,j} = exp(2η_d) · h_{d,ij}².
+    axis_components: Array2<f64>,
 
     /// Per (data, knot) pair R-operator first scalar.
     /// Shape: (n * n_knots,).
@@ -1793,14 +1784,14 @@ impl ImplicitDesignPsiDerivative {
     /// # Arguments
     /// - `q_values`: (n * n_knots,) — φ'(r)/r for each (data, knot) pair.
     /// - `t_values`: (n * n_knots,) — (φ''(r) - q) / r² for each pair.
-    /// - `axis_fractions`: (n * n_knots, D) — s_{d,ij} = exp(2η_d) · h_d² for each pair/axis.
+    /// - `axis_components`: (n * n_knots, D) — s_{d,ij} = exp(2η_d) · h_d² for each pair/axis.
     /// - `ident_transform`: optional (n_knots × p_constrained) constraint projection.
     /// - `full_ident_transform`: optional further projection after padding.
     /// - `n`, `n_knots`, `n_poly`, `n_axes`: dimensions.
     pub fn new(
         q_values: Array1<f64>,
         t_values: Array1<f64>,
-        axis_fractions: Array2<f64>,
+        axis_components: Array2<f64>,
         ident_transform: Option<Array2<f64>>,
         full_ident_transform: Option<Array2<f64>>,
         n: usize,
@@ -1810,10 +1801,10 @@ impl ImplicitDesignPsiDerivative {
     ) -> Self {
         assert_eq!(q_values.len(), n * n_knots);
         assert_eq!(t_values.len(), n * n_knots);
-        assert_eq!(axis_fractions.nrows(), n * n_knots);
-        assert_eq!(axis_fractions.ncols(), n_axes);
+        assert_eq!(axis_components.nrows(), n * n_knots);
+        assert_eq!(axis_components.ncols(), n_axes);
         Self {
-            axis_fractions,
+            axis_components,
             q_values,
             t_values,
             ident_transform,
@@ -1974,7 +1965,7 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis < self.n_axes);
         assert_eq!(v.len(), self.n);
 
-        let af = &self.axis_fractions;
+        let af = &self.axis_components;
         let qv = &self.q_values;
 
         let raw = self.accumulate_knot_vector(v, |idx| qv[idx] * af[[idx, axis]]);
@@ -1996,7 +1987,7 @@ impl ImplicitDesignPsiDerivative {
         let u_knot = self.unproject(u);
         let n = self.n;
         let k = self.n_knots;
-        let af = &self.axis_fractions;
+        let af = &self.axis_components;
         let qv = &self.q_values;
 
         if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
@@ -2056,7 +2047,7 @@ impl ImplicitDesignPsiDerivative {
         for i in 0..n {
             let base = i * k;
             for j in 0..k {
-                raw[[i, j]] = self.q_values[base + j] * self.axis_fractions[[base + j, axis]];
+                raw[[i, j]] = self.q_values[base + j] * self.axis_components[[base + j, axis]];
             }
         }
 
@@ -2073,7 +2064,7 @@ impl ImplicitDesignPsiDerivative {
         for i in 0..n {
             let base = i * k;
             for j in 0..k {
-                let s = self.axis_fractions[[base + j, axis]];
+                let s = self.axis_components[[base + j, axis]];
                 raw[[i, j]] = 2.0 * self.q_values[base + j] * s + self.t_values[base + j] * s * s;
             }
         }
@@ -2090,7 +2081,7 @@ impl ImplicitDesignPsiDerivative {
     pub fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
         assert!(axis < self.n_axes);
         assert_eq!(v.len(), self.n);
-        let af = &self.axis_fractions;
+        let af = &self.axis_components;
         let qv = &self.q_values;
         let tv = &self.t_values;
         let raw = self.accumulate_knot_vector(v, |idx| {
@@ -2114,7 +2105,7 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_e < self.n_axes);
         assert_ne!(axis_d, axis_e);
         assert_eq!(v.len(), self.n);
-        let af = &self.axis_fractions;
+        let af = &self.axis_components;
         let tv = &self.t_values;
         let raw =
             self.accumulate_knot_vector(v, |idx| tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]);
@@ -2130,7 +2121,7 @@ impl ImplicitDesignPsiDerivative {
         let u_knot = self.unproject(u);
         let n = self.n;
         let k = self.n_knots;
-        let af = &self.axis_fractions;
+        let af = &self.axis_components;
         let qv = &self.q_values;
         let tv = &self.t_values;
         let compute_row = |i: usize| -> f64 {
@@ -2181,7 +2172,7 @@ impl ImplicitDesignPsiDerivative {
         let u_knot = self.unproject(u);
         let n = self.n;
         let k = self.n_knots;
-        let af = &self.axis_fractions;
+        let af = &self.axis_components;
         let tv = &self.t_values;
         let compute_row = |i: usize| -> f64 {
             let base = i * k;
@@ -2230,8 +2221,8 @@ impl ImplicitDesignPsiDerivative {
             let base = i * k;
             for j in 0..k {
                 raw[[i, j]] = self.t_values[base + j]
-                    * self.axis_fractions[[base + j, axis_d]]
-                    * self.axis_fractions[[base + j, axis_e]];
+                    * self.axis_components[[base + j, axis_d]]
+                    * self.axis_components[[base + j, axis_e]];
             }
         }
         self.project_matrix(raw)
@@ -2262,6 +2253,108 @@ impl ImplicitDesignPsiDerivative {
             None => padded,
         }
     }
+}
+
+fn build_aniso_design_psi_derivatives_shared<F>(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    eta: &[f64],
+    p_final: usize,
+    ident_transform: Option<Array2<f64>>,
+    full_ident_transform: Option<Array2<f64>>,
+    n_poly: usize,
+    radial_scalars: F,
+) -> Result<AnisoBasisPsiDerivatives, BasisError>
+where
+    F: Fn(f64) -> Result<(f64, f64), BasisError> + Send + Sync,
+{
+    let n = data.nrows();
+    let k = centers.nrows();
+    let dim = data.ncols();
+    if eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "aniso design derivatives: eta.len()={} != data dimension {dim}",
+            eta.len()
+        )));
+    }
+
+    let nk = n * k;
+    let mut q_values = Array1::<f64>::zeros(nk);
+    let mut t_values = Array1::<f64>::zeros(nk);
+    let mut axis_components = Array2::<f64>::zeros((nk, dim));
+
+    let row_results: Result<Vec<_>, BasisError> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut data_row_buf = vec![0.0; dim];
+            let mut center_buf = vec![0.0; dim];
+            for a in 0..dim {
+                data_row_buf[a] = data[[i, a]];
+            }
+            let mut q_row = vec![0.0; k];
+            let mut t_row = vec![0.0; k];
+            let mut s_row = vec![vec![0.0; k]; dim];
+            for j in 0..k {
+                for a in 0..dim {
+                    center_buf[a] = centers[[j, a]];
+                }
+                let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                let (q, t) = radial_scalars(r)?;
+                q_row[j] = q;
+                t_row[j] = t;
+                for a in 0..dim {
+                    s_row[a][j] = s_vec[a];
+                }
+            }
+            Ok((i, q_row, t_row, s_row))
+        })
+        .collect();
+
+    for (i, q_row, t_row, s_row) in row_results? {
+        let base = i * k;
+        for j in 0..k {
+            q_values[base + j] = q_row[j];
+            t_values[base + j] = t_row[j];
+            for a in 0..dim {
+                axis_components[[base + j, a]] = s_row[a][j];
+            }
+        }
+    }
+
+    let implicit_operator = ImplicitDesignPsiDerivative::new(
+        q_values,
+        t_values,
+        axis_components,
+        ident_transform,
+        full_ident_transform,
+        n,
+        k,
+        n_poly,
+        dim,
+    );
+
+    let use_implicit_design = should_use_implicit_operators(n, p_final, dim);
+    let (design_first, design_second_diag) = if use_implicit_design {
+        (Vec::new(), Vec::new())
+    } else {
+        let design_first = (0..dim)
+            .map(|axis| implicit_operator.materialize_first(axis))
+            .collect();
+        let design_second_diag = (0..dim)
+            .map(|axis| implicit_operator.materialize_second_diag(axis))
+            .collect();
+        (design_first, design_second_diag)
+    };
+
+    Ok(AnisoBasisPsiDerivatives {
+        design_first,
+        design_second_diag,
+        penalties_first: vec![Vec::new(); dim],
+        penalties_second_diag: vec![Vec::new(); dim],
+        penalties_cross: Vec::new(),
+        penalties_cross_pairs: Vec::new(),
+        implicit_operator: Some(implicit_operator),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -7492,208 +7585,23 @@ fn build_matern_design_psi_aniso_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
 ) -> Result<AnisoBasisPsiDerivatives, BasisError> {
-    let n = data.nrows();
     let k = centers.nrows();
-    let dim = data.ncols();
-    if eta.len() != dim {
-        return Err(BasisError::DimensionMismatch(format!(
-            "Duchon aniso design derivatives: eta.len()={} != data dimension {dim}",
-            eta.len()
-        )));
-    }
-
-    // Determine output dimension after identifiability transform.
     let p_constrained = z_opt.map(|z| z.ncols()).unwrap_or(k);
     let n_poly = usize::from(include_intercept);
     let p_smooth = p_constrained + n_poly;
-
-    // Check whether the implicit path should be used for this problem size.
-    let use_implicit = should_use_implicit_operators(n, p_smooth, dim);
-
-    if use_implicit {
-        // ── Implicit path: store compact radial jets ──────────────────────
-        // Memory: O(n·k·(D+2)) instead of O(n·p·D).
-        let nk = n * k;
-        let mut q_values = Array1::<f64>::zeros(nk);
-        let mut t_values = Array1::<f64>::zeros(nk);
-        let mut axis_fractions = Array2::<f64>::zeros((nk, dim));
-
-        let row_results: Result<Vec<_>, BasisError> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut data_row_buf = vec![0.0; dim];
-                let mut center_buf = vec![0.0; dim];
-                for a in 0..dim {
-                    data_row_buf[a] = data[[i, a]];
-                }
-                let mut q_row = vec![0.0; k];
-                let mut t_row = vec![0.0; k];
-                let mut s_row = vec![vec![0.0; k]; dim];
-                for j in 0..k {
-                    for a in 0..dim {
-                        center_buf[a] = centers[[j, a]];
-                    }
-                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                    let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
-                    q_row[j] = q;
-                    t_row[j] = t;
-                    for a in 0..dim {
-                        s_row[a][j] = s_vec[a];
-                    }
-                }
-                Ok((i, q_row, t_row, s_row))
-            })
-            .collect();
-        for (i, q_row, t_row, s_row) in row_results? {
-            let base = i * k;
-            for j in 0..k {
-                q_values[base + j] = q_row[j];
-                t_values[base + j] = t_row[j];
-                for a in 0..dim {
-                    axis_fractions[[base + j, a]] = s_row[a][j];
-                }
-            }
-        }
-
-        let implicit_op = ImplicitDesignPsiDerivative::new(
-            q_values,
-            t_values,
-            axis_fractions,
-            z_opt.cloned(),
-            None, // no full_ident_transform for Matérn
-            n,
-            k,
-            n_poly,
-            dim,
-        );
-
-        // Penalty derivatives are assembled by the caller.
-        let penalties_first = vec![Vec::new(); dim];
-        let penalties_second_diag = vec![Vec::new(); dim];
-
-        Ok(AnisoBasisPsiDerivatives {
-            // Design derivative matrices left empty — all matvecs go through implicit_operator.
-            design_first: Vec::new(),
-            design_second_diag: Vec::new(),
-            design_cross_t: Array2::zeros((0, 0)),
-            s_components_raw: Vec::new(),
-            s_components_projected: Vec::new(),
-            penalties_first,
-            penalties_second_diag,
-            penalties_cross: Vec::new(),
-            penalties_cross_pairs: Vec::new(),
-            implicit_operator: Some(implicit_op),
-        })
-    } else {
-        // ── Dense path (original code) ────────────────────────────────────
-
-        // Raw kernel-level per-axis derivatives: (n x k) matrices.
-        let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
-        let mut kernel_second_diag = vec![Array2::<f64>::zeros((n, k)); dim];
-        let mut t_raw = Array2::<f64>::zeros((n, k));
-        let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
-
-        // Parallel over rows with pre-allocated thread-local buffers to avoid
-        // n*k Vec allocations in the anisotropic distance path.
-        let row_results: Result<Vec<_>, BasisError> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut data_row_buf = vec![0.0; dim];
-                let mut center_buf = vec![0.0; dim];
-                for a in 0..dim {
-                    data_row_buf[a] = data[[i, a]];
-                }
-                let mut t_row = vec![0.0; k];
-                let mut s_row = vec![vec![0.0; k]; dim];
-                let mut kf_row = vec![vec![0.0; k]; dim];
-                let mut ksd_row = vec![vec![0.0; k]; dim];
-                for j in 0..k {
-                    for a in 0..dim {
-                        center_buf[a] = centers[[j, a]];
-                    }
-                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                    let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
-                    t_row[j] = t;
-                    // Design matrix ψ-derivatives using UNNORMALIZED s_a = exp(2ψ_a)·h_a²:
-                    //   ∂X/∂ψ_a  = q · s_a                    (first derivative)
-                    //   ∂²X/∂ψ_a² = 2·q·s_a + t·s_a²          (diagonal second)
-                    //   ∂²X/∂ψ_a∂ψ_b = t·s_a·s_b              (cross, stored via t_raw)
-                    //
-                    // These are correct because ∂r/∂ψ_a = s_a/r with unnormalized s_a,
-                    // giving ∂φ/∂ψ_a = φ_r·(s_a/r) = q·s_a. The formulas would need
-                    // r² factors only if s_a were the FRACTIONAL quantity s_a/r².
-                    for a in 0..dim {
-                        s_row[a][j] = s_vec[a];
-                        kf_row[a][j] = q * s_vec[a];
-                        ksd_row[a][j] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
-                    }
-                }
-                Ok((i, t_row, s_row, kf_row, ksd_row))
-            })
-            .collect();
-        for (i, t_row, s_row, kf_row, ksd_row) in row_results? {
-            for j in 0..k {
-                t_raw[[i, j]] = t_row[j];
-                for a in 0..dim {
-                    s_components_raw[a][[i, j]] = s_row[a][j];
-                    kernel_first[a][[i, j]] = kf_row[a][j];
-                    kernel_second_diag[a][[i, j]] = ksd_row[a][j];
-                }
-            }
-        }
-
-        // Apply identifiability transform Z (ψ-independent).
-        let project = |mat: Array2<f64>| -> Array2<f64> {
-            if let Some(z) = z_opt {
-                fast_ab(&mat, z)
-            } else {
-                mat
-            }
-        };
-
-        let kernel_first: Vec<_> = kernel_first.into_iter().map(&project).collect();
-        let kernel_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&project).collect();
-        let design_cross_t = project(t_raw);
-
-        // Pad with intercept column (zero derivative for intercept).
-        let cols = kernel_first[0].ncols();
-        let total_cols = cols + usize::from(include_intercept);
-
-        let pad = |mat: Array2<f64>| -> Array2<f64> {
-            if include_intercept {
-                let mut out = Array2::<f64>::zeros((n, total_cols));
-                out.slice_mut(s![.., 0..cols]).assign(&mat);
-                out
-            } else {
-                mat
-            }
-        };
-
-        let design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
-        let design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
-        let design_cross_t = pad(design_cross_t);
-        let s_components_projected: Vec<_> = s_components_raw
-            .iter()
-            .map(|raw| pad(project(raw.clone())))
-            .collect();
-
-        // Penalty derivatives are assembled by the caller.
-        let penalties_first = vec![Vec::new(); dim];
-        let penalties_second_diag = vec![Vec::new(); dim];
-
-        Ok(AnisoBasisPsiDerivatives {
-            design_first,
-            design_second_diag,
-            design_cross_t,
-            s_components_raw,
-            s_components_projected,
-            penalties_first,
-            penalties_second_diag,
-            penalties_cross: Vec::new(),
-            penalties_cross_pairs: Vec::new(),
-            implicit_operator: None,
-        })
-    }
+    build_aniso_design_psi_derivatives_shared(
+        data,
+        centers,
+        eta,
+        p_smooth,
+        z_opt.cloned(),
+        None,
+        n_poly,
+        |r| {
+            let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
+            Ok((q, t))
+        },
+    )
 }
 
 /// Build per-axis ψ_a derivatives for anisotropic Matérn terms, including
@@ -7865,7 +7773,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
 /// The per-axis chain rule is identical:
 ///   ∂φ/∂ψ_a         = q · s_a
 ///   ∂²φ/(∂ψ_a²)     = 2q · s_a + t · s_a²
-///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b, stored via design_cross_t)
+///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b)
 fn build_duchon_design_psi_aniso_derivatives(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -7881,8 +7789,6 @@ fn build_duchon_design_psi_aniso_derivatives(
     let eta = spec.aniso_log_scales.as_deref().ok_or_else(|| {
         BasisError::InvalidInput("aniso derivatives require aniso_log_scales to be set".to_string())
     })?;
-    let n = data.nrows();
-    let k = centers.nrows();
     let dim = data.ncols();
     if eta.len() != dim {
         return Err(BasisError::DimensionMismatch(format!(
@@ -7908,208 +7814,19 @@ fn build_duchon_design_psi_aniso_derivatives(
         .map(|zf| zf.ncols())
         .unwrap_or(p_padded);
 
-    let use_implicit = should_use_implicit_operators(n, p_final, dim);
-
-    if use_implicit {
-        // ── Implicit path: store compact radial jets ──────────────────────
-        let nk = n * k;
-        let mut q_values = Array1::<f64>::zeros(nk);
-        let mut t_values = Array1::<f64>::zeros(nk);
-        let mut axis_fractions = Array2::<f64>::zeros((nk, dim));
-
-        let row_results: Result<Vec<_>, BasisError> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut data_row_buf = vec![0.0; dim];
-                let mut center_buf = vec![0.0; dim];
-                for a in 0..dim {
-                    data_row_buf[a] = data[[i, a]];
-                }
-                let mut q_row = vec![0.0; k];
-                let mut t_row = vec![0.0; k];
-                let mut s_row = vec![vec![0.0; k]; dim];
-                for j in 0..k {
-                    for a in 0..dim {
-                        center_buf[a] = centers[[j, a]];
-                    }
-                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
-                    q_row[j] = jets.q;
-                    t_row[j] = jets.t;
-                    for a in 0..dim {
-                        s_row[a][j] = s_vec[a];
-                    }
-                }
-                Ok((i, q_row, t_row, s_row))
-            })
-            .collect();
-        for (i, q_row, t_row, s_row) in row_results? {
-            let base = i * k;
-            for j in 0..k {
-                q_values[base + j] = q_row[j];
-                t_values[base + j] = t_row[j];
-                for a in 0..dim {
-                    axis_fractions[[base + j, a]] = s_row[a][j];
-                }
-            }
-        }
-
-        // For Duchon, the identifiability pipeline is:
-        //   raw knot (k) → Z_kernel → constrained (p_constrained)
-        //   → pad with poly_cols → padded (p_padded)
-        //   → full_ident_transform → final (p_final)
-        let full_ident = identifiability_transform.map(|zf| {
-            // Build the combined padding + full ident transform.
-            // The implicit operator handles Z_kernel internally, then pads,
-            // then applies zf. We need zf to be (p_padded × p_final).
-            zf.clone()
-        });
-
-        let implicit_op = ImplicitDesignPsiDerivative::new(
-            q_values,
-            t_values,
-            axis_fractions,
-            Some(z_kernel),
-            full_ident,
-            n,
-            k,
-            poly_cols,
-            dim,
-        );
-
-        let penalties_first = vec![Vec::new(); dim];
-        let penalties_second_diag = vec![Vec::new(); dim];
-
-        Ok(AnisoBasisPsiDerivatives {
-            design_first: Vec::new(),
-            design_second_diag: Vec::new(),
-            design_cross_t: Array2::zeros((0, 0)),
-            s_components_raw: Vec::new(),
-            s_components_projected: Vec::new(),
-            penalties_first,
-            penalties_second_diag,
-            penalties_cross: Vec::new(),
-            penalties_cross_pairs: Vec::new(),
-            implicit_operator: Some(implicit_op),
-        })
-    } else {
-        // ── Dense path (original code) ────────────────────────────────────
-
-        // Raw kernel-level per-axis derivatives: (n x k) matrices.
-        let mut kernel_first = vec![Array2::<f64>::zeros((n, k)); dim];
-        let mut kernel_second_diag = vec![Array2::<f64>::zeros((n, k)); dim];
-        let mut t_raw = Array2::<f64>::zeros((n, k));
-        let mut s_components_raw = vec![Array2::<f64>::zeros((n, k)); dim];
-
-        // Parallel over rows with pre-allocated thread-local buffers to avoid
-        // n*k Vec allocations.  Each thread writes into its own row slice.
-        let row_results: Result<Vec<_>, BasisError> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut data_row_buf = vec![0.0; dim];
-                let mut center_buf = vec![0.0; dim];
-                for a in 0..dim {
-                    data_row_buf[a] = data[[i, a]];
-                }
-                let mut t_row = vec![0.0; k];
-                let mut s_row = vec![vec![0.0; k]; dim];
-                let mut kf_row = vec![vec![0.0; k]; dim];
-                let mut ksd_row = vec![vec![0.0; k]; dim];
-                for j in 0..k {
-                    for a in 0..dim {
-                        center_buf[a] = centers[[j, a]];
-                    }
-                    let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
-                    let q = jets.q;
-                    let t = jets.t;
-                    t_row[j] = t;
-                    // Design matrix ψ-derivatives using UNNORMALIZED s_a = exp(2ψ_a)·h_a²:
-                    //   ∂X/∂ψ_a  = q · s_a           (first derivative)
-                    //   ∂²X/∂ψ_a² = 2·q·s_a + t·s_a² (diagonal second)
-                    //   ∂²X/∂ψ_a∂ψ_b = t·s_a·s_b     (cross, via t_raw)
-                    // Correct because ∂r/∂ψ_a = s_a/r with unnormalized s.
-                    for a in 0..dim {
-                        s_row[a][j] = s_vec[a];
-                        kf_row[a][j] = q * s_vec[a];
-                        ksd_row[a][j] = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
-                    }
-                }
-                Ok((i, t_row, s_row, kf_row, ksd_row))
-            })
-            .collect();
-        for (i, t_row, s_row, kf_row, ksd_row) in row_results? {
-            for j in 0..k {
-                t_raw[[i, j]] = t_row[j];
-                for a in 0..dim {
-                    s_components_raw[a][[i, j]] = s_row[a][j];
-                    kernel_first[a][[i, j]] = kf_row[a][j];
-                    kernel_second_diag[a][[i, j]] = ksd_row[a][j];
-                }
-            }
-        }
-
-        // Project through Z_kernel (null-space constraint), then pad with
-        // polynomial columns (zero derivative for the polynomial block).
-        let project_kernel = |mat: Array2<f64>| -> Array2<f64> { fast_ab(&mat, &z_kernel) };
-
-        let kernel_first: Vec<_> = kernel_first.into_iter().map(&project_kernel).collect();
-        let kernel_second_diag: Vec<_> = kernel_second_diag
-            .into_iter()
-            .map(&project_kernel)
-            .collect();
-        let design_cross_t = project_kernel(t_raw);
-
-        let pad = |mat: Array2<f64>| -> Array2<f64> {
-            if poly_cols > 0 {
-                let cols = mat.ncols();
-                let mut out = Array2::<f64>::zeros((n, cols + poly_cols));
-                out.slice_mut(s![.., 0..cols]).assign(&mat);
-                out
-            } else {
-                mat
-            }
-        };
-
-        let mut design_first: Vec<_> = kernel_first.into_iter().map(&pad).collect();
-        let mut design_second_diag: Vec<_> = kernel_second_diag.into_iter().map(&pad).collect();
-        let mut design_cross_t = pad(design_cross_t);
-        let mut s_components_projected: Vec<_> = s_components_raw
-            .iter()
-            .map(|raw| pad(project_kernel(raw.clone())))
-            .collect();
-
-        // Apply the full identifiability transform (if present).
-        if let Some(zf) = identifiability_transform {
-            design_first = design_first.into_iter().map(|m| fast_ab(&m, zf)).collect();
-            design_second_diag = design_second_diag
-                .into_iter()
-                .map(|m| fast_ab(&m, zf))
-                .collect();
-            design_cross_t = fast_ab(&design_cross_t, zf);
-            s_components_projected = s_components_projected
-                .into_iter()
-                .map(|m| fast_ab(&m, zf))
-                .collect();
-        }
-
-        // Penalty derivatives are assembled by the caller.
-        let penalties_first = vec![Vec::new(); dim];
-        let penalties_second_diag = vec![Vec::new(); dim];
-
-        Ok(AnisoBasisPsiDerivatives {
-            design_first,
-            design_second_diag,
-            design_cross_t,
-            s_components_raw,
-            s_components_projected,
-            penalties_first,
-            penalties_second_diag,
-            penalties_cross: Vec::new(),
-            penalties_cross_pairs: Vec::new(),
-            implicit_operator: None,
-        })
-    }
+    build_aniso_design_psi_derivatives_shared(
+        data,
+        centers,
+        eta,
+        p_final,
+        Some(z_kernel),
+        identifiability_transform.cloned(),
+        poly_cols,
+        |r| {
+            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
+            Ok((jets.q, jets.t))
+        },
+    )
 }
 
 /// Build per-axis ψ_a derivatives for anisotropic Duchon terms, including
