@@ -1588,6 +1588,7 @@ where
                 hessian: Derivative::Analytic,
                 n_params: k,
                 all_penalty_like: true,
+                has_psi_coords: false,
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
@@ -1695,6 +1696,7 @@ where
                 n_params: theta_dim,
                 // Mixture/SAS coords are design-moving (not penalty-like).
                 all_penalty_like: false,
+                has_psi_coords: true,
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),

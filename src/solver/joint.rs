@@ -1598,6 +1598,8 @@ impl<'a> JointRemlState<'a> {
             cost,
             steps,
             beta: None,
+            psi_gradient: None,
+            psi_indices: None,
         })
     }
 
@@ -2802,6 +2804,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             // Joint models have both rho (penalty) and potentially psi (design-moving)
             // coordinates. Conservatively false.
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),

@@ -2909,6 +2909,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             hessian: Derivative::Unavailable,
             n_params: theta_dim,
             all_penalty_like: false,
+            has_psi_coords: false,
             barrier_config: None,
         },
         cost_fn: |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
@@ -2986,6 +2987,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
                 hessian: Derivative::Unavailable,
                 n_params: theta_dim,
                 all_penalty_like: false,
+                has_psi_coords: false,
                 barrier_config: None,
             },
             OuterCapability {
@@ -2993,6 +2995,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
                 hessian: Derivative::Unavailable,
                 n_params: theta_dim,
                 all_penalty_like: false,
+                has_psi_coords: false,
                 barrier_config: None,
             },
         ],
