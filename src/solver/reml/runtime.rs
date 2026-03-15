@@ -2986,6 +2986,14 @@ impl<'a> RemlState<'a> {
 
     /// Shared tail for EFS: builds InnerSolution, computes cost (ValueOnly),
     /// and returns EFS step vector via `compute_efs_update`.
+    ///
+    /// When ψ (design-moving) coordinates are present in the inner solution's
+    /// `ext_coords`, this automatically switches to the hybrid path:
+    /// - Evaluates cost AND gradient (ValueAndGradient) instead of cost only
+    /// - Uses `compute_hybrid_efs_update` which combines EFS for ρ/τ coords
+    ///   with preconditioned gradient steps for ψ coords
+    /// - Returns the ψ-block gradient and indices in the `EfsEval` for
+    ///   backtracking by the outer iteration
     fn evaluate_unified_tail_efs(
         &self,
         rho: &Array1<f64>,
@@ -3003,7 +3011,10 @@ impl<'a> RemlState<'a> {
         penalty_quadratic: f64,
         barrier_config: Option<super::unified::BarrierConfig>,
     ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
-        use super::unified::{InnerSolutionBuilder, compute_efs_update, reml_laml_evaluate};
+        use super::unified::{
+            InnerSolutionBuilder, compute_efs_update, compute_hybrid_efs_update,
+            reml_laml_evaluate,
+        };
 
         let n_observations = self.y.len();
         let beta_for_barrier = beta.clone();
@@ -3024,11 +3035,31 @@ impl<'a> RemlState<'a> {
         .barrier_config(barrier_config)
         .build();
 
-        // Cost (ValueOnly — no gradient or Hessian needed for EFS).
+        // Check whether any ψ (design-moving) coordinates are present.
+        // If so, we need the hybrid path which requires the gradient.
+        let has_psi = inner_solution
+            .ext_coords
+            .iter()
+            .any(|c| !c.is_penalty_like);
+
+        // For pure EFS: cost only (no gradient needed).
+        // For hybrid EFS: cost + gradient (gradient needed for ψ block).
+        let eval_mode = if has_psi {
+            super::unified::EvalMode::ValueAndGradient
+        } else {
+            super::unified::EvalMode::ValueOnly
+        };
+
         let prior = {
             let pc = self.compute_soft_priorcost(rho);
             if pc.abs() > 0.0 {
-                Some((pc, Array1::zeros(rho.len()), None))
+                // For hybrid mode, we need the prior gradient too.
+                let prior_grad = if has_psi {
+                    self.compute_soft_priorgrad(rho)
+                } else {
+                    Array1::zeros(rho.len())
+                };
+                Some((pc, prior_grad, None))
             } else {
                 None
             }
@@ -3036,19 +3067,52 @@ impl<'a> RemlState<'a> {
         let cost_result = reml_laml_evaluate(
             &inner_solution,
             rho.as_slice().unwrap(),
-            super::unified::EvalMode::ValueOnly,
+            eval_mode,
             prior,
         )
         .map_err(|e| EstimationError::InvalidInput(e))?;
 
-        // EFS steps from inner solution.
-        let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
+        if has_psi {
+            // Hybrid path: EFS for ρ/τ + preconditioned gradient for ψ.
+            let gradient = cost_result.gradient.as_ref().expect(
+                "hybrid EFS requires gradient (ValueAndGradient mode should have computed it)",
+            );
+            let hybrid = compute_hybrid_efs_update(
+                &inner_solution,
+                rho.as_slice().unwrap(),
+                gradient.as_slice().unwrap(),
+            );
 
-        Ok(crate::solver::strategy::EfsEval {
-            cost: cost_result.cost,
-            steps,
-            beta: Some(beta_for_barrier),
-        })
+            let psi_gradient = if hybrid.psi_indices.is_empty() {
+                None
+            } else {
+                Some(ndarray::Array1::from_vec(hybrid.psi_gradient))
+            };
+            let psi_indices = if hybrid.psi_indices.is_empty() {
+                None
+            } else {
+                Some(hybrid.psi_indices)
+            };
+
+            Ok(crate::solver::strategy::EfsEval {
+                cost: cost_result.cost,
+                steps: hybrid.steps,
+                beta: Some(beta_for_barrier),
+                psi_gradient,
+                psi_indices,
+            })
+        } else {
+            // Pure EFS path: no ψ coordinates.
+            let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
+
+            Ok(crate::solver::strategy::EfsEval {
+                cost: cost_result.cost,
+                steps,
+                beta: Some(beta_for_barrier),
+                psi_gradient: None,
+                psi_indices: None,
+            })
+        }
     }
 
     /// Compute EFS (Extended Fellner-Schall) evaluation: runs the inner solve
