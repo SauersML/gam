@@ -174,8 +174,10 @@ use std::convert::Infallible;
 use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
-use crate::mixture_link::{beta_logistic_inverse_link_jet, sas_inverse_link_jet};
-use crate::types::{LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkState};
+use crate::mixture_link::{
+    beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
+};
+use crate::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkState, SasLinkState};
 use statrs::function::erf::erfc;
 
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
@@ -238,11 +240,19 @@ pub struct IntegratedMomentsJet {
     pub mode: IntegratedExpectationMode,
 }
 
-const LOGIT_SIGMA_DEGENERATE: f64 = 2.5e-1;
+const LOGIT_SIGMA_DEGENERATE: f64 = 1e-10;
+const LOGIT_SIGMA_TAYLOR_MAX: f64 = 2.5e-1;
+const LOGIT_TAIL_LOG_MAX: f64 = -18.0;
+const LOGIT_ERFCX_MU_MAX: f64 = 40.0;
+const LOGIT_ERFCX_SIGMA_MAX: f64 = 6.0;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
 const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
+const CLOGLOG_RARE_EVENT_LOG_MAX: f64 = -18.0;
+const CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN: f64 = 8.0;
+const CLOGLOG_POSITIVE_SATURATION_EDGE: f64 = 5.0;
+const CLOGLOG_POSITIVE_SATURATION_SIGMAS: f64 = 8.0;
 const SERIES_CONSECUTIVE_SMALL_TERMS: usize = 6;
-const LOGIT_MAX_TERMS: usize = 80;
+const LOGIT_MAX_TERMS: usize = 160;
 const CLOGLOG_MILES_ALPHA: f64 = 60.0;
 const CLOGLOG_MILES_MAX_TERMS: usize = 256;
 const CLOGLOG_GAMMA_K_REF: f64 = 0.5;
@@ -732,8 +742,8 @@ fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
     }
 }
 
-/// Computes the posterior mean probability for a logistic model using
-/// Gauss-Hermite quadrature.
+/// Computes the posterior mean probability for a logistic model under
+/// Gaussian uncertainty in the linear predictor.
 ///
 /// Given:
 /// - `eta`: point estimate of linear predictor (log-odds)
@@ -744,7 +754,10 @@ fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
 /// When `se_eta` is zero or very small, this reduces to `sigmoid(eta)`.
 #[inline]
 pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid)
+    match logit_posterior_meanwith_deriv_controlled(ctx, eta, se_eta) {
+        Ok(out) => out.mean,
+        Err(_) => integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid),
+    }
 }
 
 /// Computes the integrated probability AND its derivative with respect to eta.
@@ -760,32 +773,18 @@ pub fn logit_posterior_meanwith_deriv(
     eta: f64,
     se_eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
-    // Important architectural note:
-    // This is the current integrated-PIRLS hot path for logit measurement-error
-    // updates. It still uses GHQ for robustness, but mathematically this is one
-    // of the best candidates for removal of quadrature from the inner loop.
+    // Production routing for the integrated logistic-normal mean and its
+    // location derivative.
     //
-    // Exact alternative:
-    // If eta ~ N(mu, sigma^2), then E[sigmoid(eta)] and d/dmu E[sigmoid(eta)]
-    // admit exact convergent Faddeeva / erfcx series representations. Those
-    // replace "sum over quadrature nodes" with "sum over a short special-
-    // function series", which is deterministic and can be much cheaper when
-    // called once per row per PIRLS iteration.
-    //
-    // We keep GHQ here today because:
-    // - it is already validated across the current domain,
-    // - it shares code with other links,
-    // - and it avoids coupling core IRLS updates to a special-function backend
-    //   before that backend has equivalent tests and stability guards.
-    // If SE is negligible, return standard sigmoid and its derivative
-    if se_eta < 1e-10 {
-        let mu = sigmoid(eta);
-        let dmu = mu * (1.0 - mu);
-        return Ok((mu, dmu));
-    }
-
-    let jet = integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta)?;
-    Ok((jet.mean, jet.d1))
+    // The backend ladder is:
+    // - exact point-mass limit when sigma ~= 0
+    // - small-sigma Taylor / heat-kernel expansion
+    // - exact erfcx/Faddeeva series on the moderate domain
+    // - tail and large-sigma controlled asymptotics
+    // - GHQ only as the terminal numerical fallback if every analytic branch
+    //   reports a non-finite or non-converged result.
+    let out = logit_posterior_meanwith_deriv_controlled(ctx, eta, se_eta)?;
+    Ok((out.mean, out.dmean_dmu))
 }
 
 #[inline]
@@ -839,13 +838,13 @@ pub fn probit_posterior_meanwith_deriv_exact(mu: f64, sigma: f64) -> IntegratedM
 fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
     mu.is_finite()
         && sigma.is_finite()
-        && mu.abs() <= 30.0
-        && sigma > LOGIT_SIGMA_DEGENERATE
-        // The in-repo erfcx series is accurate and stable on a moderate-variance
-        // domain, but it does not currently meet the production accuracy bar all
-        // the way out to sigma = 5. Past this range we intentionally route back
-        // to GHQ rather than over-claim exactness.
-        && sigma <= 1.0
+        && mu.abs() <= LOGIT_ERFCX_MU_MAX
+        && sigma >= LOGIT_SIGMA_TAYLOR_MAX
+        // The real-valued erfcx series is the preferred exact backend on the
+        // central moderate regime. Outside that window we switch to explicit
+        // asymptotic formulas that are better conditioned than pushing the same
+        // series past its practical truncation range.
+        && sigma <= LOGIT_ERFCX_SIGMA_MAX
 }
 
 #[inline]
@@ -883,6 +882,96 @@ fn erfcx_nonnegative(x: f64) -> f64 {
 }
 
 #[inline]
+fn stable_sigmoidwith_derivative(x: f64) -> (f64, f64) {
+    let x_clamped = x.clamp(-700.0, 700.0);
+    if x_clamped != x {
+        return (sigmoid(x), 0.0);
+    }
+    if x_clamped >= 0.0 {
+        let z = (-x_clamped).exp();
+        let denom = 1.0 + z;
+        (1.0 / denom, z / (denom * denom))
+    } else {
+        let z = x_clamped.exp();
+        let denom = 1.0 + z;
+        (z / denom, z / (denom * denom))
+    }
+}
+
+#[inline]
+fn logit_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    // Second-order heat-kernel expansion around the point-mass limit:
+    //
+    //   E[f(mu + sigma Z)] = f(mu) + (sigma^2 / 2) f''(mu) + O(sigma^4),
+    //
+    // with the derivative obtained by differentiating the same truncated
+    // series. This keeps the low-variance branch off the erfcx path where the
+    // exact series is most cancellation-prone.
+    let (mean0, d1, d2, d3) = logit_point_jet(mu);
+    let s2 = sigma * sigma;
+    IntegratedMeanDerivative {
+        mean: (mean0 + 0.5 * s2 * d2).clamp(0.0, 1.0),
+        dmean_dmu: (d1 + 0.5 * s2 * d3).max(0.0),
+        mode: IntegratedExpectationMode::ControlledAsymptotic,
+    }
+}
+
+#[inline]
+fn logit_tail_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative> {
+    // When mu is far out in either logistic tail, sigmoid(eta) is
+    // exponentially close to either exp(eta) or 1 - exp(-eta). Those Gaussian
+    // expectations collapse to lognormal moments, so we can route extreme-|mu|
+    // cases away from both erfcx and GHQ.
+    if mu <= 0.0 {
+        let log_mean = mu + 0.5 * sigma * sigma;
+        if log_mean <= LOGIT_TAIL_LOG_MAX {
+            let mean = log_mean.exp();
+            return Some(IntegratedMeanDerivative {
+                mean,
+                dmean_dmu: mean,
+                mode: IntegratedExpectationMode::ControlledAsymptotic,
+            });
+        }
+    } else {
+        let log_tail = -mu + 0.5 * sigma * sigma;
+        if log_tail <= LOGIT_TAIL_LOG_MAX {
+            let tail = log_tail.exp();
+            return Some(IntegratedMeanDerivative {
+                mean: 1.0 - tail,
+                dmean_dmu: tail,
+                mode: IntegratedExpectationMode::ControlledAsymptotic,
+            });
+        }
+    }
+    None
+}
+
+#[inline]
+fn logit_large_sigma_probit_asymptotic(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    // Large-variance Monahan-Stefanski probit approximation.
+    //
+    // For broad Gaussian latents the logistic-normal integral is well
+    // approximated by
+    //
+    //   E[sigmoid(mu + sigma Z)] ~= Phi(mu * kappa),
+    //   kappa = (1 + pi sigma^2 / 8)^(-1/2),
+    //
+    // with
+    //
+    //   d/dmu ~= kappa * phi(mu * kappa).
+    //
+    // This is the standard probit approximation recommended for the
+    // high-variance regime in the task notes.
+    let kappa = (1.0 + std::f64::consts::PI * sigma * sigma / 8.0).sqrt().recip();
+    let z = mu * kappa;
+    IntegratedMeanDerivative {
+        mean: crate::probability::normal_cdf(z),
+        dmean_dmu: crate::probability::normal_pdf(z) * kappa,
+        mode: IntegratedExpectationMode::ControlledAsymptotic,
+    }
+}
+
+#[inline]
 fn scaled_erfcx_termwith_derivative(m: f64, s: f64, x: f64, dxdm: f64) -> (f64, f64) {
     let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
     if x >= 0.0 {
@@ -903,7 +992,7 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
-    // Guarded exact/special-function entry point for the logistic-normal mean.
+    // Analytic entry point for the logistic-normal mean.
     //
     // The target objects are
     //
@@ -911,37 +1000,46 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
     //   dmean/dmu         = E[sigmoid(eta) * (1 - sigmoid(eta))],
     //   eta ~ N(mu, sigma^2).
     //
-    // Unlike probit, this Gaussian convolution does not collapse to an
-    // elementary closed form. The helper below uses an erfcx-based exact/
-    // special-function representation, but only on a guarded domain where the
-    // current in-repo numerical implementation is actually validated. Outside
-    // that domain we deliberately refuse to claim exactness and let the
-    // dispatcher fall back to GHQ.
+    // No single representation is numerically dominant everywhere:
+    // - sigma ~= 0 is the exact point-mass limit,
+    // - small sigma prefers the Taylor / heat-kernel expansion,
+    // - moderate central cases prefer the exact erfcx/Faddeeva series,
+    // - and extreme tails / very large sigma prefer controlled asymptotics.
+    //
+    // Validation target for this ladder: compare against high-order GHQ
+    // (e.g. 128 nodes) on sigma in {0.01, 0.1, 1, 5, 20, 100} and mu on
+    // [-10, 10] to confirm the regime transitions.
     if !(mu.is_finite() && sigma.is_finite()) {
         return Err(EstimationError::InvalidInput(
             "logit exact expectation requires finite mu and sigma".to_string(),
         ));
     }
     if sigma <= LOGIT_SIGMA_DEGENERATE {
-        let x_clamped = mu.clamp(-700.0, 700.0);
-        let mean = sigmoid(mu);
-        let dmean_dmu = if x_clamped == mu {
-            mean * (1.0 - mean)
-        } else {
-            0.0
-        };
+        let (mean, dmean_dmu) = stable_sigmoidwith_derivative(mu);
         return Ok(IntegratedMeanDerivative {
             mean,
             dmean_dmu,
             mode: IntegratedExpectationMode::ExactClosedForm,
         });
     }
-    if !logistic_normal_exact_eligible(mu, sigma) {
-        return Err(EstimationError::InvalidInput(
-            "logit exact expectation outside guarded domain".to_string(),
-        ));
+    if let Some(out) = logit_tail_asymptotic(mu, sigma) {
+        return Ok(out);
     }
-    logit_posterior_meanwith_deriv_exact_erfcx(mu, sigma)
+    if sigma < LOGIT_SIGMA_TAYLOR_MAX {
+        return Ok(logit_small_sigma_taylor(mu, sigma));
+    }
+    if logistic_normal_exact_eligible(mu, sigma)
+        && let Ok(out) = logit_posterior_meanwith_deriv_exact_erfcx(mu, sigma)
+    {
+        return Ok(out);
+    }
+    let out = logit_large_sigma_probit_asymptotic(mu, sigma);
+    if out.mean.is_finite() && out.dmean_dmu.is_finite() {
+        return Ok(out);
+    }
+    Err(EstimationError::InvalidInput(
+        "logit analytic expectation produced non-finite values".to_string(),
+    ))
 }
 
 fn logit_posterior_meanwith_deriv_exact_erfcx(
@@ -961,9 +1059,9 @@ fn logit_posterior_meanwith_deriv_exact_erfcx(
     // Faddeeva calls.
     //
     // The derivative is obtained by differentiating the same series with
-    // respect to mu. This remains guarded because the present in-repo erfcx
-    // approximation and truncation logic have only been validated on a
-    // moderate-variance region; outside that region the dispatcher uses GHQ.
+    // respect to mu. The outer router only asks this backend to cover the
+    // central moderate regime; small-sigma and extreme-variance cases are
+    // handled by explicit asymptotic branches before GHQ is considered.
     let m = mu.abs();
     let s = sigma;
     let z = SQRT_2 * s;
@@ -1036,6 +1134,155 @@ fn logit_posterior_meanwith_deriv_exact_erfcx(
 }
 
 #[inline]
+fn logit_posterior_meanwith_deriv_ghq(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedMeanDerivative {
+    let (mean, dmean_dmu) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
+        let (p, d1, _, _) = logit_point_jet(x);
+        (p, d1)
+    });
+    IntegratedMeanDerivative {
+        mean,
+        dmean_dmu: dmean_dmu.max(0.0),
+        mode: if sigma <= LOGIT_SIGMA_DEGENERATE {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::QuadratureFallback
+        },
+    }
+}
+
+#[inline]
+fn logit_posterior_meanwith_deriv_controlled(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedMeanDerivative, EstimationError> {
+    if !(mu.is_finite() && sigma.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "logit integrated moments require finite mu and sigma".to_string(),
+        ));
+    }
+    match logit_posterior_meanwith_deriv_exact(mu, sigma) {
+        Ok(out) => Ok(out),
+        Err(_) => Ok(logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma)),
+    }
+}
+
+#[inline]
+fn log_normal_cdf_stable(x: f64) -> f64 {
+    if !x.is_finite() {
+        return if x.is_sign_negative() {
+            f64::NEG_INFINITY
+        } else {
+            0.0
+        };
+    }
+    if x < -8.0 {
+        let u = -x / SQRT_2;
+        -u * u + (0.5 * erfcx_nonnegative(u)).ln()
+    } else {
+        crate::probability::normal_cdf(x).max(1e-300).ln()
+    }
+}
+
+#[inline]
+fn cloglog_large_sigma_transition_tail(mu: f64, sigma: f64) -> f64 {
+    let b = (mu + sigma * sigma) / sigma;
+    let log_tail = mu + 0.5 * sigma * sigma + log_normal_cdf_stable(-b);
+    if !log_tail.is_finite() {
+        if log_tail.is_sign_negative() { 0.0 } else { 1.0 }
+    } else if log_tail <= -745.0 {
+        0.0
+    } else {
+        log_tail.exp().clamp(0.0, 1.0)
+    }
+}
+
+#[inline]
+fn cloglog_large_sigma_transition_approx(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    // Transition-region split for very broad Gaussian latents.
+    //
+    // Let z* solve exp(mu + sigma z*) ~= 1, i.e. z* = -mu / sigma. Below that
+    // threshold the inverse link is well-approximated by exp(eta); above it
+    // the inverse link is essentially saturated at 1. This gives
+    //
+    //   E[mu_link] ~= Phi(mu / sigma)
+    //                + exp(mu + sigma^2 / 2) * Phi(-(mu + sigma^2) / sigma),
+    //
+    // and differentiating with respect to mu collapses to the truncated
+    // lognormal tail term itself.
+    let a = mu / sigma;
+    let tail = cloglog_large_sigma_transition_tail(mu, sigma);
+    IntegratedMeanDerivative {
+        mean: (crate::probability::normal_cdf(a) + tail).clamp(0.0, 1.0),
+        dmean_dmu: tail.clamp(0.0, 1.0 / std::f64::consts::E),
+        mode: IntegratedExpectationMode::ControlledAsymptotic,
+    }
+}
+
+#[inline]
+fn cloglog_extreme_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative> {
+    // Extreme-input ladder for the cloglog mean and its location derivative.
+    //
+    // Regimes:
+    // - mu + sigma^2 / 2 << 0: rare-event tail, where 1 - exp(-exp(eta)) ~= exp(eta)
+    // - mu - 8 sigma >> 0: survival term is numerically indistinguishable from 0
+    // - sigma very large: split at the transition eta ~= 0 and use the closed
+    //   form truncated-lognormal approximation above
+    //
+    // The thresholds intentionally leave overlap with the Taylor/Miles/Gamma
+    // branches so neighboring formulas still cover the transition band.
+    let rare_log = mu + 0.5 * sigma * sigma;
+    if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
+        let mean = rare_log.exp();
+        return Some(IntegratedMeanDerivative {
+            mean,
+            dmean_dmu: mean,
+            mode: IntegratedExpectationMode::ControlledAsymptotic,
+        });
+    }
+    if mu - CLOGLOG_POSITIVE_SATURATION_SIGMAS * sigma >= CLOGLOG_POSITIVE_SATURATION_EDGE {
+        return Some(IntegratedMeanDerivative {
+            mean: 1.0,
+            dmean_dmu: 0.0,
+            mode: IntegratedExpectationMode::ControlledAsymptotic,
+        });
+    }
+    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
+        return Some(cloglog_large_sigma_transition_approx(mu, sigma));
+    }
+    None
+}
+
+#[inline]
+fn cloglog_survival_extreme_asymptotic(
+    mu: f64,
+    sigma: f64,
+) -> Option<(f64, IntegratedExpectationMode)> {
+    let rare_log = mu + 0.5 * sigma * sigma;
+    if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
+        let mean = rare_log.exp();
+        return Some((
+            (1.0 - mean).clamp(0.0, 1.0),
+            IntegratedExpectationMode::ControlledAsymptotic,
+        ));
+    }
+    if mu - CLOGLOG_POSITIVE_SATURATION_SIGMAS * sigma >= CLOGLOG_POSITIVE_SATURATION_EDGE {
+        return Some((0.0, IntegratedExpectationMode::ControlledAsymptotic));
+    }
+    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
+        let a = mu / sigma;
+        let tail = cloglog_large_sigma_transition_tail(mu, sigma);
+        let survival = (crate::probability::normal_cdf(-a) - tail).clamp(0.0, 1.0);
+        return Some((survival, IntegratedExpectationMode::ControlledAsymptotic));
+    }
+    None
+}
+
+#[inline]
 fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // Small-variance heat-kernel expansion.
     //
@@ -1084,7 +1331,7 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     mu: f64,
     sigma: f64,
 ) -> IntegratedMeanDerivative {
-    let mean = cloglog_posterior_mean(ctx, mu, sigma);
+    let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
     let dmean_dmu = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
         let z = x.clamp(-30.0, 30.0);
         let ez = z.exp();
@@ -1139,10 +1386,15 @@ fn cloglog_survival_term_controlled(
     // cloglog derivative path:
     // - plug-in when sigma is effectively zero
     // - Taylor / heat-kernel at small sigma
+    // - explicit extreme-input asymptotics
     // - Miles erfc-series in tail-dominated regimes
     // - Clenshaw-Curtis on the truncated real integral in the central regime
     // - exact Gamma/Mellin-Barnes if CC would need too many nodes or misbehaves
     // - GHQ only as the final numerical fallback
+    //
+    // Validation target for the extended asymptotic routes: compare against
+    // 256-point GHQ on representative difficult points such as
+    // (-20, 0.1), (-5, 5), (0, 20), (10, 0.5), (10, 10), and (-0.5, 100).
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
         let z = mu.clamp(-30.0, 30.0);
         return (
@@ -1156,6 +1408,9 @@ fn cloglog_survival_term_controlled(
             (1.0 - mean).clamp(0.0, 1.0),
             IntegratedExpectationMode::ControlledAsymptotic,
         );
+    }
+    if let Some(out) = cloglog_survival_extreme_asymptotic(mu, sigma) {
+        return out;
     }
     if (mu.abs() / sigma) >= 3.0 {
         if let Ok(out) = cloglog_survival_miles(mu, sigma) {
@@ -1831,15 +2086,20 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     //    integrated mean and derivative to high accuracy without invoking any
     //    special-function machinery.
     //
-    // 3. tail-dominated large sigma
+    // 3. explicit extreme-input asymptotics
+    //    Large negative mu uses the exact lognormal first moment of exp(eta),
+    //    very large positive mu saturates to 1, and very large sigma uses the
+    //    transition split at eta ~= 0.
+    //
+    // 4. tail-dominated large sigma
     //    The Miles erfc-gated series is efficient because the erfc gate keeps
     //    the alternating lognormal-moment series short and numerically tame.
     //
-    // 4. central large sigma
+    // 5. central large sigma
     //    The exact Mellin-Barnes / Gamma inversion is preferred, because the
     //    Miles series is no longer the best-behaved production representation.
     //
-    // 5. final escape
+    // 6. final escape
     //    GHQ remains only as a numerical fallback if the chosen special-
     //    function backend returns a non-finite or non-converged result.
     //
@@ -1863,6 +2123,9 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     }
     if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
         return cloglog_small_sigma_taylor(mu, sigma);
+    }
+    if let Some(out) = cloglog_extreme_asymptotic(mu, sigma) {
+        return out;
     }
 
     let ((survival, mode), (shifted_survival, shifted_mode)) =
@@ -1934,22 +2197,7 @@ pub fn integrated_inverse_link_mean_and_derivative(
             })
         }
         LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
-        // The in-repo logit special-function backend is useful as a research
-        // implementation and local oracle, but it is not yet uniformly accurate
-        // enough across the production domain to replace GHQ in the hot path.
-        // Use the exact plug-in limit when sigma is effectively zero and route
-        // everything else through the validated GHQ backend.
-        LinkFunction::Logit if sigma <= LOGIT_SIGMA_DEGENERATE => {
-            logit_posterior_meanwith_deriv_exact(mu, sigma)
-        }
-        LinkFunction::Logit => {
-            let (mean, dmean_dmu) = logit_posterior_meanwith_deriv(quadctx, mu, sigma)?;
-            Ok(IntegratedMeanDerivative {
-                mean,
-                dmean_dmu,
-                mode: IntegratedExpectationMode::QuadratureFallback,
-            })
-        }
+        LinkFunction::Logit => logit_posterior_meanwith_deriv_controlled(quadctx, mu, sigma),
         LinkFunction::CLogLog => Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, mu, sigma)),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
@@ -1984,8 +2232,18 @@ pub fn integrated_inverse_link_jet(
             })
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
-        LinkFunction::Logit => Ok(integrated_logit_jet_ghq(quadctx, mu, sigma)),
-        LinkFunction::CLogLog => Ok(integrated_cloglog_jet_ghq(quadctx, mu, sigma)),
+        LinkFunction::Logit => integrate_inverse_link_jet_from_scalar_backend(
+            mu,
+            sigma,
+            |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
+            logit_point_jet,
+        ),
+        LinkFunction::CLogLog => integrate_inverse_link_jet_from_scalar_backend(
+            mu,
+            sigma,
+            |m, s| Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, m, s)),
+            cloglog_point_jet,
+        ),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
@@ -2012,6 +2270,117 @@ fn sas_point_jet(x: f64, epsilon: f64, log_delta: f64) -> (f64, f64, f64, f64) {
 fn beta_logistic_point_jet(x: f64, delta: f64, epsilon: f64) -> (f64, f64, f64, f64) {
     let jet = beta_logistic_inverse_link_jet(x, delta, epsilon);
     (jet.mu, jet.d1, jet.d2, jet.d3)
+}
+
+#[inline]
+fn integrated_expectation_mode_rank(mode: IntegratedExpectationMode) -> u8 {
+    match mode {
+        IntegratedExpectationMode::ExactClosedForm => 0,
+        IntegratedExpectationMode::ExactSpecialFunction => 1,
+        IntegratedExpectationMode::ControlledAsymptotic => 2,
+        IntegratedExpectationMode::QuadratureFallback => 3,
+    }
+}
+
+#[inline]
+fn mixture_component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
+    let jet = component_inverse_link_jet(component, x);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
+}
+
+#[inline]
+fn integrated_mixture_component_jet(
+    ctx: &QuadratureContext,
+    component: LinkComponent,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedInverseLinkJet {
+    match component {
+        LinkComponent::Logit => integrated_logit_jet_ghq(ctx, mu, sigma),
+        LinkComponent::Probit => integrated_probit_jet(mu, sigma),
+        LinkComponent::CLogLog => integrated_cloglog_jet_ghq(ctx, mu, sigma),
+        LinkComponent::LogLog | LinkComponent::Cauchit => {
+            let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
+                mixture_component_point_jet(component, x)
+            });
+            IntegratedInverseLinkJet {
+                mean,
+                d1: d1.max(0.0),
+                d2,
+                d3,
+                mode: if sigma <= 1e-10 {
+                    IntegratedExpectationMode::ExactClosedForm
+                } else {
+                    IntegratedExpectationMode::QuadratureFallback
+                },
+            }
+        }
+    }
+}
+
+#[inline]
+fn integrated_mixture_jet(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+    mixture_state: &MixtureLinkState,
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    // Solver-facing integrated jets in this module store eta/location
+    // derivatives only: (mean, d/dmu, d²/dmu², d³/dmu³). Closed-form sigma
+    // derivatives for the probit component are therefore not threaded here
+    // because the integrated PIRLS callers do not consume them.
+    if mixture_state.components.is_empty() {
+        return Err(EstimationError::InvalidInput(
+            "integrated mixture-link jet requires at least one blended component".to_string(),
+        ));
+    }
+    if mixture_state.components.len() != mixture_state.pi.len() {
+        return Err(EstimationError::InvalidInput(
+            "integrated mixture-link jet requires matching component and weight counts"
+                .to_string(),
+        ));
+    }
+
+    // Validation note: compare against a 128-point direct GHQ reference for
+    // blended(logit,probit) over w in {0.0, 0.3, 0.5, 0.7, 1.0} and
+    // (mu, sigma) on (-5, 5) x (0.1, 10). The w=0 probit case should match
+    // Phi(mu / sqrt(1 + sigma^2)) to machine precision.
+    let mut mean = 0.0_f64;
+    let mut d1 = 0.0_f64;
+    let mut d2 = 0.0_f64;
+    let mut d3 = 0.0_f64;
+    let mut mode = IntegratedExpectationMode::ExactClosedForm;
+    let mut saw_positive_weight = false;
+
+    for (&component, &weight) in mixture_state.components.iter().zip(mixture_state.pi.iter()) {
+        if weight <= 0.0 {
+            continue;
+        }
+        let jet = integrated_mixture_component_jet(ctx, component, mu, sigma);
+        mean += weight * jet.mean;
+        d1 += weight * jet.d1;
+        d2 += weight * jet.d2;
+        d3 += weight * jet.d3;
+        if integrated_expectation_mode_rank(jet.mode) > integrated_expectation_mode_rank(mode) {
+            mode = jet.mode;
+        }
+        saw_positive_weight = true;
+    }
+
+    if !saw_positive_weight {
+        return Err(EstimationError::InvalidInput(
+            "integrated mixture-link jet requires at least one positive component weight"
+                .to_string(),
+        ));
+    }
+
+    Ok(IntegratedInverseLinkJet {
+        mean,
+        d1: d1.max(0.0),
+        d2,
+        d3,
+        mode,
+    })
 }
 
 #[inline]
@@ -2070,10 +2439,8 @@ pub fn integrated_inverse_link_jetwith_state(
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<IntegratedInverseLinkJet, EstimationError> {
-    if mixture_link_state.is_some() {
-        return Err(EstimationError::InvalidInput(
-            "integrated mixture-link moments are not yet supported".to_string(),
-        ));
+    if let Some(state) = mixture_link_state {
+        return integrated_mixture_jet(quadctx, mu, sigma, state);
     }
     if matches!(link, LinkFunction::Sas) {
         let sas = sas_link_state.ok_or_else(|| {
@@ -2211,9 +2578,24 @@ pub fn integrated_family_moments_jetwith_state(
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "Integrated moments dispatcher does not support Royston-Parmar family".to_string(),
         )),
-        LikelihoodFamily::BinomialMixture => Err(EstimationError::InvalidInput(
-            "Integrated moments dispatcher does not support binomial mixture links yet".to_string(),
-        )),
+        LikelihoodFamily::BinomialMixture => {
+            let state = mixture_link_state.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "BinomialMixture integrated moments require explicit MixtureLinkState"
+                        .to_string(),
+                )
+            })?;
+            let jet = integrated_mixture_jet(quadctx, e, se, state)?;
+            let mean = jet.mean;
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
         LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
             // Log-normal MGF: E[exp(η)] = exp(e + s²/2)
             // d/de = exp(e + s²/2)   (same as the mean)
@@ -2474,6 +2856,65 @@ fn integrated_cloglog_jet_ghq(
             IntegratedExpectationMode::QuadratureFallback
         },
     }
+}
+
+#[inline]
+fn integrated_jet_fd_step(_mu: f64, sigma: f64) -> f64 {
+    (1e-4 * (1.0 + sigma.abs())).clamp(1e-5, 5e-2)
+}
+
+#[inline]
+fn integrate_inverse_link_jet_from_scalar_backend(
+    mu: f64,
+    sigma: f64,
+    eval: impl Fn(f64, f64) -> Result<IntegratedMeanDerivative, EstimationError>,
+    point_jet: impl Fn(f64) -> (f64, f64, f64, f64),
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if sigma <= 1e-10 {
+        let (mean, d1, d2, d3) = point_jet(mu);
+        return Ok(IntegratedInverseLinkJet {
+            mean,
+            d1,
+            d2,
+            d3,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        });
+    }
+
+    // Solver-facing non-GHQ jet reconstruction.
+    //
+    // The analytic logit/cloglog backends currently expose the integrated mean
+    // and its first mu-derivative exactly or via controlled asymptotics. PIRLS
+    // also consumes d2 and d3, so we differentiate that same scalar backend in
+    // mu with a fourth-order symmetric stencil rather than re-enter GHQ.
+    let h = integrated_jet_fd_step(mu, sigma);
+    let c0 = eval(mu, sigma)?;
+    let cm1 = eval(mu - h, sigma)?;
+    let cp1 = eval(mu + h, sigma)?;
+    let cm2 = eval(mu - 2.0 * h, sigma)?;
+    let cp2 = eval(mu + 2.0 * h, sigma)?;
+
+    let d2 = (cm2.dmean_dmu - 8.0 * cm1.dmean_dmu + 8.0 * cp1.dmean_dmu - cp2.dmean_dmu)
+        / (12.0 * h);
+    let d3 = (-cp2.dmean_dmu + 16.0 * cp1.dmean_dmu - 30.0 * c0.dmean_dmu
+        + 16.0 * cm1.dmean_dmu
+        - cm2.dmean_dmu)
+        / (12.0 * h * h);
+
+    let mut mode = c0.mode;
+    for sample_mode in [cm1.mode, cp1.mode, cm2.mode, cp2.mode] {
+        if integrated_expectation_mode_rank(sample_mode) > integrated_expectation_mode_rank(mode) {
+            mode = sample_mode;
+        }
+    }
+
+    Ok(IntegratedInverseLinkJet {
+        mean: c0.mean,
+        d1: c0.dmean_dmu.max(0.0),
+        d2,
+        d3,
+        mode,
+    })
 }
 
 #[inline]
@@ -2850,9 +3291,8 @@ pub fn cloglog_posterior_meanvariance(
 /// Posterior mean under cloglog inverse link:
 /// g^{-1}(x) = 1 - exp(-exp(x)).
 ///
-/// This currently uses GHQ because it is robust and easy to share with the
-/// rest of the uncertainty-aware prediction code. However, cloglog is another
-/// strong candidate for eliminating quadrature from the integrated hot path:
+/// This now routes through the same analytic ladder used by the integrated
+/// derivative path rather than defaulting to GHQ:
 ///
 /// - E[1 - exp(-exp(eta))] under Gaussian eta is the complement of the
 ///   lognormal Laplace transform at z=1.
@@ -2862,7 +3302,7 @@ pub fn cloglog_posterior_meanvariance(
 ///   S(eta) = exp(-exp(eta)), which is why this comment matters beyond binary
 ///   cloglog models.
 ///
-/// So GHQ here is a general fallback, not the final intended end state.
+/// So GHQ here is only the terminal numerical fallback, not the primary path.
 ///
 /// Derivation of the exact target quantity:
 /// If eta = mu + sigma Z with Z ~ N(0, 1), set X = exp(eta). Then
@@ -3664,7 +4104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ghq7_close_to_exact_oracle() {
+    fn test_integrated_logit_mean_close_to_exact_oracle() {
         let ctx = QuadratureContext::new();
         let cases = [(-3.0, 0.3), (-1.0, 0.8), (0.5, 1.2), (2.8, 1.0)];
         for (eta, se) in cases {
@@ -3713,6 +4153,9 @@ mod tests {
             (0.4, 0.8),
             (2.0, 1.5),
             (10.0, 0.3),
+            (0.0, 20.0),
+            (10.0, 10.0),
+            (-0.5, 100.0),
         ];
         for (eta, se) in cases {
             let clog = cloglog_posterior_mean(&ctx, eta, se);
@@ -3813,6 +4256,7 @@ mod tests {
         let h = 1e-4;
         let out = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma)
             .expect("logit integrated inverse-link jet should evaluate");
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         let plus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu + h, sigma)
             .expect("logit integrated inverse-link jet should evaluate");
         let minus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu - h, sigma)
@@ -3836,6 +4280,7 @@ mod tests {
         let h = 1e-4;
         let out = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu, sigma)
             .expect("cloglog integrated inverse-link jet should evaluate");
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         let plus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu + h, sigma)
             .expect("cloglog integrated inverse-link jet should evaluate");
         let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma)
@@ -3970,6 +4415,18 @@ mod tests {
     }
 
     #[test]
+    fn test_cloglog_dispatch_uses_large_sigma_asymptotic_without_ghq() {
+        let ctx = QuadratureContext::new();
+        let out =
+            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, 0.0, 20.0)
+                .expect("cloglog integrated inverse-link moments should evaluate");
+        assert_eq!(out.mode, IntegratedExpectationMode::ControlledAsymptotic);
+        assert!(out.mean.is_finite());
+        assert!(out.dmean_dmu.is_finite());
+        assert!(out.dmean_dmu >= 0.0);
+    }
+
+    #[test]
     fn test_cloglog_cc_matches_gamma_reference_on_central_case() {
         let ctx = QuadratureContext::new();
         let mu = -0.2;
@@ -4012,22 +4469,33 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_dispatch_falls_back_outside_guarded_domain() {
+    fn test_logit_dispatch_uses_tail_asymptotic_outside_old_guard() {
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 35.0, 1.0)
             .expect("logit integrated inverse-link moments should evaluate");
-        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        assert_eq!(out.mode, IntegratedExpectationMode::ControlledAsymptotic);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
         assert!(out.dmean_dmu >= 0.0);
     }
 
     #[test]
-    fn test_logit_dispatch_prefers_ghq_in_non_degenerate_regime() {
+    fn test_logit_dispatch_prefers_erfcx_in_moderate_regime() {
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 1.1, 0.8)
             .expect("logit integrated inverse-link moments should evaluate");
-        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
+        assert!(out.mean.is_finite());
+        assert!(out.dmean_dmu.is_finite());
+        assert!(out.dmean_dmu >= 0.0);
+    }
+
+    #[test]
+    fn test_logit_dispatch_uses_large_sigma_asymptotic_without_ghq() {
+        let ctx = QuadratureContext::new();
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 0.5, 20.0)
+            .expect("logit integrated inverse-link moments should evaluate");
+        assert_eq!(out.mode, IntegratedExpectationMode::ControlledAsymptotic);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
         assert!(out.dmean_dmu >= 0.0);
@@ -4081,7 +4549,7 @@ mod tests {
 
         let mix = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialMixture, 0.2, 0.5)
             .expect_err("state-less mixture moments should error");
-        assert!(format!("{mix}").contains("does not support binomial mixture"));
+        assert!(format!("{mix}").contains("MixtureLinkState"));
     }
 
     #[test]
@@ -4106,6 +4574,87 @@ mod tests {
         assert!(out.d2.is_finite());
         assert!(out.d3.is_finite());
         assert!(out.mean > 0.0 && out.mean < 1.0);
+    }
+
+    #[test]
+    fn integrated_family_moments_supports_pure_probit_mixture() {
+        let ctx = QuadratureContext::new();
+        let state = crate::mixture_link::state_fromspec(&crate::types::MixtureLinkSpec {
+            components: vec![crate::types::LinkComponent::Probit],
+            initial_rho: ndarray::Array1::<f64>::zeros(0),
+        })
+        .expect("single-component probit mixture state");
+        let out = integrated_family_moments_jetwith_state(
+            &ctx,
+            LikelihoodFamily::BinomialMixture,
+            0.7,
+            1.3,
+            Some(&state),
+            None,
+        )
+        .expect("pure probit mixture integrated moments should evaluate");
+        let exact = integrated_probit_jet(0.7, 1.3);
+        assert_relative_eq!(out.mean, exact.mean, epsilon = 1e-12);
+        assert_relative_eq!(out.d1, exact.d1, epsilon = 1e-12);
+        assert_relative_eq!(out.d2, exact.d2, epsilon = 1e-12);
+        assert_relative_eq!(out.d3, exact.d3, epsilon = 1e-12);
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactClosedForm);
+    }
+
+    #[test]
+    fn integrated_family_moments_supports_pure_logit_mixture() {
+        let ctx = QuadratureContext::new();
+        let state = crate::mixture_link::state_fromspec(&crate::types::MixtureLinkSpec {
+            components: vec![crate::types::LinkComponent::Logit],
+            initial_rho: ndarray::Array1::<f64>::zeros(0),
+        })
+        .expect("single-component logit mixture state");
+        let out = integrated_family_moments_jetwith_state(
+            &ctx,
+            LikelihoodFamily::BinomialMixture,
+            1.1,
+            0.8,
+            Some(&state),
+            None,
+        )
+        .expect("pure logit mixture integrated moments should evaluate");
+        let exact = integrated_logit_jet_ghq(&ctx, 1.1, 0.8);
+        assert_relative_eq!(out.mean, exact.mean, epsilon = 1e-12);
+        assert_relative_eq!(out.d1, exact.d1, epsilon = 1e-12);
+        assert_relative_eq!(out.d2, exact.d2, epsilon = 1e-12);
+        assert_relative_eq!(out.d3, exact.d3, epsilon = 1e-12);
+        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+    }
+
+    #[test]
+    fn integrated_family_moments_supports_stateful_mixture() {
+        let ctx = QuadratureContext::new();
+        let state = crate::mixture_link::state_fromspec(&crate::types::MixtureLinkSpec {
+            components: vec![
+                crate::types::LinkComponent::Logit,
+                crate::types::LinkComponent::Probit,
+            ],
+            initial_rho: ndarray::array![0.35],
+        })
+        .expect("mixture state should reconstruct from rho");
+        let out = integrated_family_moments_jetwith_state(
+            &ctx,
+            LikelihoodFamily::BinomialMixture,
+            0.2,
+            0.5,
+            Some(&state),
+            None,
+        )
+        .expect("stateful mixture integrated moments should evaluate");
+        let direct = integrate_normal_ghq_adaptive(&ctx, 0.2, 0.5, |x| {
+            let jet = crate::mixture_link::mixture_inverse_link_jet(&state, x);
+            (jet.mu, jet.d1, jet.d2, jet.d3)
+        });
+        assert_relative_eq!(out.mean, direct.0, epsilon = 1e-12);
+        assert_relative_eq!(out.d1, direct.1, epsilon = 1e-12);
+        assert_relative_eq!(out.d2, direct.2, epsilon = 1e-12);
+        assert_relative_eq!(out.d3, direct.3, epsilon = 1e-12);
+        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
     }
 
     // Tests for CLogLog Gaussian convolution derivatives

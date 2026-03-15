@@ -167,6 +167,7 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
+    #[cfg(test)]
     pub(super) fn compute_lamlhessian_analytic_fallback(
         &self,
         rho: &Array1<f64>,

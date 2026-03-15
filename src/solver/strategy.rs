@@ -602,7 +602,6 @@ fn run_outer_with_plan(
 
     struct RawOuterCandidate {
         rho: Array1<f64>,
-        final_value: f64,
         iterations: usize,
         converged: bool,
     }
@@ -727,14 +726,12 @@ fn run_outer_with_plan(
                     match optimizer.run() {
                         Ok(sol) => Ok(RawOuterCandidate {
                             rho: sol.final_point.clone(),
-                            final_value: sol.final_value,
                             iterations: sol.iterations,
                             converged: true,
                         }),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             Ok(RawOuterCandidate {
                                 rho: last_solution.final_point.clone(),
-                                final_value: last_solution.final_value,
                                 iterations: last_solution.iterations,
                                 converged: false,
                             })
@@ -751,14 +748,12 @@ fn run_outer_with_plan(
                     match optimizer.run() {
                         Ok(sol) => Ok(RawOuterCandidate {
                             rho: sol.final_point.clone(),
-                            final_value: sol.final_value,
                             iterations: sol.iterations,
                             converged: true,
                         }),
                         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
                             Ok(RawOuterCandidate {
                                 rho: last_solution.final_point.clone(),
-                                final_value: last_solution.final_value,
                                 iterations: last_solution.iterations,
                                 converged: false,
                             })
@@ -834,14 +829,12 @@ fn run_outer_with_plan(
                 match optimizer.run() {
                     Ok(sol) => Ok(RawOuterCandidate {
                         rho: sol.final_point.clone(),
-                        final_value: sol.final_value,
                         iterations: sol.iterations,
                         converged: true,
                     }),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(RawOuterCandidate {
                             rho: last_solution.final_point.clone(),
-                            final_value: last_solution.final_value,
                             iterations: last_solution.iterations,
                             converged: false,
                         })
@@ -849,7 +842,6 @@ fn run_outer_with_plan(
                     Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
                         Ok(RawOuterCandidate {
                             rho: last_solution.final_point.clone(),
-                            final_value: last_solution.final_value,
                             iterations: last_solution.iterations,
                             converged: false,
                         })
@@ -930,7 +922,6 @@ fn run_outer_with_plan(
 
                 Ok(RawOuterCandidate {
                     rho,
-                    final_value: last_cost,
                     iterations: total_iter,
                     converged,
                 })
@@ -946,7 +937,6 @@ fn run_outer_with_plan(
                 run_coordinate_search(obj, seed, lo, hi, cs, cap.n_params).map(|r| {
                     RawOuterCandidate {
                         rho: r.rho,
-                        final_value: r.final_value,
                         iterations: r.iterations,
                         converged: true,
                     }

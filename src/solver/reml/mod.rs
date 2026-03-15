@@ -3,9 +3,8 @@ use self::reml_strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianS
 use super::*;
 use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
 use crate::linalg::sparse_exact::{
-    SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
-    assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
-    leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti,
+    SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
+    build_sparse_penalty_blocks, leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti,
 };
 use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
 use crate::types::SasLinkState;
@@ -13,6 +12,8 @@ use faer::Side;
 use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::s;
 use std::ops::Range;
+#[cfg(test)]
+use crate::linalg::sparse_exact::SparseTraceWorkspace;
 
 mod cache;
 mod eval;
@@ -1162,6 +1163,7 @@ impl ImplicitDerivativeOp {
         self.operator.p_out()
     }
 
+    #[cfg(test)]
     fn forward_mul_vec(&self, u: &Array1<f64>) -> Array1<f64> {
         match self.level {
             ImplicitDerivLevel::First(axis) => self.operator.forward_mul(axis, &u.view()),
@@ -1174,6 +1176,7 @@ impl ImplicitDerivativeOp {
         }
     }
 
+    #[cfg(test)]
     fn transpose_mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         match self.level {
             ImplicitDerivLevel::First(axis) => self.operator.transpose_mul(axis, &v.view()),
@@ -1275,6 +1278,7 @@ impl HyperDesignDerivative {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn t_dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.t().dot(rhs),
@@ -1288,6 +1292,7 @@ impl HyperDesignDerivative {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
@@ -1308,6 +1313,7 @@ impl HyperDesignDerivative {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn t_dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.t().dot(rhs),
@@ -1331,6 +1337,7 @@ impl HyperDesignDerivative {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn transpose_row_block(&self, rows: Range<usize>) -> Array2<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.slice(s![rows, ..]).t().to_owned(),
@@ -1368,6 +1375,7 @@ impl HyperDesignDerivative {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn scaled_add_to(
         &self,
         target: &mut Array2<f64>,
@@ -1483,6 +1491,7 @@ impl HyperDesignDerivative {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
@@ -1686,6 +1695,7 @@ impl DirectionalHyperParam {
         Ok(out)
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         x_tau_original: Array2<f64>,
         penalty_first_components: Vec<(usize, Array2<f64>)>,
@@ -1787,6 +1797,7 @@ impl DirectionalHyperParam {
             .transpose()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn x_tau_tau_nth_dense(&self, j: usize) -> Option<Array2<f64>> {
         self.x_tau_tau_original
             .as_ref()
@@ -1852,6 +1863,7 @@ impl DirectionalHyperParam {
         self.penaltysecond_components.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn penalty_total_at(
         &self,
         rho: &Array1<f64>,
@@ -1890,11 +1902,12 @@ struct SparseExactEvalData {
     logdet_h: f64,
     logdet_s_pos: f64,
     det1_values: Arc<Array1<f64>>,
+    #[cfg(test)]
     traceworkspace: Arc<Mutex<SparseTraceWorkspace>>,
 }
 
 #[derive(Clone)]
-struct FirthDenseOperator {
+pub(crate) struct FirthDenseOperator {
     // Exact Firth/Jeffreys objects on the identifiable subspace.
     //
     // Let X in R^{n×p} potentially be rank-deficient with rank r.

@@ -429,6 +429,8 @@ pub trait WorkingModel {
 pub(crate) struct IntegratedWorkingInput<'a> {
     pub quadctx: &'a crate::quadrature::QuadratureContext,
     pub se: ArrayView1<'a, f64>,
+    pub mixture_link_state: Option<&'a MixtureLinkState>,
+    pub sas_link_state: Option<&'a SasLinkState>,
 }
 
 pub struct WorkingDerivativeBuffersMut<'a> {
@@ -492,7 +494,8 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 | GlmLikelihoodFamily::BinomialProbit
                 | GlmLikelihoodFamily::BinomialCLogLog
                 | GlmLikelihoodFamily::BinomialSas
-                | GlmLikelihoodFamily::BinomialBetaLogistic,
+                | GlmLikelihoodFamily::BinomialBetaLogistic
+                | GlmLikelihoodFamily::BinomialMixture,
                 Some(integ),
             ) => {
                 update_glmvectors_integrated_by_family(
@@ -506,8 +509,8 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                     weights,
                     z,
                     derivatives,
-                    None,
-                    None,
+                    integ.mixture_link_state,
+                    integ.sas_link_state,
                 )?;
                 Ok(())
             }
@@ -531,8 +534,8 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::BinomialMixture, _) => Err(EstimationError::InvalidInput(
-                "BinomialMixture updates are handled by the PIRLS working model path".to_string(),
+            (GlmLikelihoodFamily::BinomialMixture, None) => Err(EstimationError::InvalidInput(
+                "BinomialMixture IRLS update requires explicit mixture link state".to_string(),
             )),
             (GlmLikelihoodFamily::GaussianIdentity, _) => {
                 update_glmvectors(
@@ -1329,31 +1332,50 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
             quadctx: &self.quadctx,
             se: se.view(),
+            mixture_link_state: self.link_kind.mixture_state(),
+            sas_link_state: self.link_kind.sas_state(),
         });
         match &self.link_kind {
             InverseLink::Mixture(_) => {
-                if integrated.is_some() {
-                    return Err(EstimationError::InvalidInput(
-                        "integrated binomial updates are not yet supported for mixture links"
-                            .to_string(),
-                    ));
+                if let Some(integ) = integrated {
+                    update_glmvectors_integrated_by_family(
+                        integ.quadctx,
+                        self.y,
+                        &self.workspace.eta_buf,
+                        integ.se,
+                        self.likelihood,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        Some(WorkingDerivativeBuffersMut {
+                            c: &mut self.last_c,
+                            d: &mut self.last_d,
+                            dmu_deta: &mut self.last_dmu_deta,
+                            d2mu_deta2: &mut self.last_d2mu_deta2,
+                            d3mu_deta3: &mut self.last_d3mu_deta3,
+                        }),
+                        integ.mixture_link_state,
+                        integ.sas_link_state,
+                    )?;
+                } else {
+                    update_glmvectors(
+                        self.y,
+                        &self.workspace.eta_buf,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        Some(WorkingDerivativeBuffersMut {
+                            c: &mut self.last_c,
+                            d: &mut self.last_d,
+                            dmu_deta: &mut self.last_dmu_deta,
+                            d2mu_deta2: &mut self.last_d2mu_deta2,
+                            d3mu_deta3: &mut self.last_d3mu_deta3,
+                        }),
+                    )?;
                 }
-                update_glmvectors(
-                    self.y,
-                    &self.workspace.eta_buf,
-                    &self.link_kind,
-                    self.priorweights,
-                    &mut self.lastmu,
-                    &mut self.lastweights,
-                    &mut self.lastz,
-                    Some(WorkingDerivativeBuffersMut {
-                        c: &mut self.last_c,
-                        d: &mut self.last_d,
-                        dmu_deta: &mut self.last_dmu_deta,
-                        d2mu_deta2: &mut self.last_d2mu_deta2,
-                        d3mu_deta3: &mut self.last_d3mu_deta3,
-                    }),
-                )?;
             }
             InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
                 if let Some(integ) = integrated {
@@ -5122,6 +5144,8 @@ pub fn update_glmvectors_integrated_by_family(
             | GlmLikelihoodFamily::BinomialProbit
             | GlmLikelihoodFamily::BinomialCLogLog
             | GlmLikelihoodFamily::BinomialSas
+            | GlmLikelihoodFamily::BinomialBetaLogistic
+            | GlmLikelihoodFamily::BinomialMixture
     ) {
         return Err(EstimationError::InvalidInput(format!(
             "Integrated updates are not supported for family {:?}",
