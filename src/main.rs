@@ -15,11 +15,11 @@ use gam::basis::{
 };
 use gam::construction::kronecker_product;
 use gam::estimate::{
-    AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, ExternalOptimOptions,
-    ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary, ParametricTermSummary,
-    PredictInput, SmoothTermSummary, UnifiedFitResult, UnifiedFitResultParts,
-    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
-    predict_gam_posterior_mean, predict_gamwith_uncertainty,
+    AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
+    ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
+    UnifiedFitResultParts, compute_continuous_smoothness_order, fit_gam, optimize_external_design,
+    predict_gam, predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -1048,14 +1048,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             fitted.resolvedspec,
             fitted.adaptive_diagnostics,
             fitted.saved_link_state,
-            match (
-                fitted.wiggle_knots,
-                fitted.wiggle_degree,
-                fitted.beta_link_wiggle,
-            ) {
-                (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
-                    Some((knots.to_vec(), degree, beta_link_wiggle))
-                }
+            match (fitted.wiggle_knots, fitted.wiggle_degree) {
+                (Some(knots), Some(degree)) => Some((knots.to_vec(), degree)),
                 _ => None,
             },
         )
@@ -1067,10 +1061,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let mut saved_fit = fit.clone();
     saved_fit.fitted_link = standard_saved_link_state.clone();
     let saved_termspec = frozenspec.clone();
-    if let Some((wiggle_knots, wiggle_degree, _)) = standard_wiggle_meta.as_ref() {
+    if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta.as_ref() {
         let beta_eta = fit
-            .block_states
-            .first()
+            .block_by_role(BlockRole::Mean)
             .ok_or_else(|| "standard wiggle fit is missing eta block".to_string())?
             .beta
             .clone();
@@ -1090,18 +1083,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 domain.domain_max
             );
         }
-        saved_fit = core_saved_fit_result(
-            beta_eta,
-            fit.lambdas.clone(),
-            1.0,
-            fit.covariance_conditional.clone(),
-            fit.covariance_conditional.clone(),
-            SavedFitSummary::from_blockwise_fit(&fit)?,
-        );
-        saved_fit.fitted_link = standard_saved_link_state.clone();
-    } else {
-        compact_fit_result_for_batch(&mut saved_fit);
     }
+    compact_fit_result_for_batch(&mut saved_fit);
 
     if let Some(out) = args.out {
         progress.set_stage("fit", "writing fitted model");
@@ -1121,10 +1104,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.fit_result = Some(saved_fit.clone());
         payload.data_schema = Some(ds.schema.clone());
         payload.link = link_choice.as_ref().map(link_choice_to_string);
-        if let Some((wiggle_knots, wiggle_degree, beta_link_wiggle)) = standard_wiggle_meta {
+        if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta {
             payload.linkwiggle_knots = Some(wiggle_knots);
             payload.linkwiggle_degree = Some(wiggle_degree);
-            payload.beta_link_wiggle = Some(beta_link_wiggle);
         }
         match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {
@@ -1513,20 +1495,17 @@ fn run_fitwith_predict_noise(
 /// - **BinomialLocationScale** with link wiggles: the wiggle-augmented q0
 ///   prediction path (probit-wiggle, joint conditional integration) is not
 ///   captured by `BinomialLocationScalePredictor`.
-/// - **Standard** with link wiggles: the `StandardPredictor` does not handle
-///   these augmented prediction paths.
+/// - **Standard** with link wiggles: the saved fit is a true two-block model,
+///   and `StandardPredictor` intentionally does not handle that shape.
 fn needs_special_predict_handling(model: &SavedModel) -> bool {
     match model.predict_model_class() {
         // Survival always needs specialised handling (time basis, entry/exit).
         PredictModelClass::Survival => true,
         // Binomial location-scale with link wiggles needs the hand-rolled path.
-        PredictModelClass::BinomialLocationScale => model.beta_link_wiggle.is_some(),
+        PredictModelClass::BinomialLocationScale => model.has_link_wiggle(),
         // Standard models with link wiggles need their special paths.
-        PredictModelClass::Standard => {
-            let family = model.likelihood();
-            model.beta_link_wiggle.is_some() && is_binomial_family(family)
-        }
-        PredictModelClass::GaussianLocationScale => model.beta_link_wiggle.is_some(),
+        PredictModelClass::Standard => model.has_link_wiggle(),
+        PredictModelClass::GaussianLocationScale => model.has_link_wiggle(),
     }
 }
 
@@ -2247,7 +2226,7 @@ fn run_predict_survival(
 /// Special-case binomial location-scale prediction.
 ///
 /// This handles the full binomial location-scale prediction pipeline.  When
-/// the model has link wiggles (`beta_link_wiggle`), this path is required because the
+/// the model has a saved link wiggle, this path is required because the
 /// probit-wiggle q0 augmentation and conditional integration over wiggle
 /// coefficients are not captured by `BinomialLocationScalePredictor`.
 /// For models without wiggles, the unified path in `run_predict` handles this
@@ -2695,8 +2674,8 @@ fn run_predict_gaussian_location_scale(
 /// Special-case standard prediction.
 ///
 /// This handles the standard case that cannot go through `PredictableModel`:
-/// - **Link wiggles**: standard binomial models with `beta_link_wiggle` use a
-///   hand-rolled path through `predict_standard_binomial_linkwiggle`.
+/// - **Link wiggles**: standard models with a saved `LinkWiggle` use a
+///   hand-rolled path through `predict_standard_linkwiggle`.
 ///
 /// For plain standard models (no wiggle), the unified path in
 /// `run_predict` handles prediction via `StandardPredictor`.
@@ -2724,27 +2703,17 @@ fn run_predict_standard(
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
     progress.advance_workflow(3);
 
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let beta = fit_saved.beta.clone();
-    if beta.len() != design.design.ncols() {
-        return Err(format!(
-            "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
-            beta.len(),
-            design.design.ncols()
-        ));
-    }
-
-    let offset = Array1::zeros(design.design.nrows());
     let family = model.likelihood();
-    if is_standard_binomial_linkwiggle_model(model, family, saved_link_kind) {
+    if is_standard_linkwiggle_model(model, saved_link_kind) {
+        let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let saved_link_kind = saved_link_kind
-            .ok_or_else(|| "standard binomial wiggle model is missing link metadata".to_string())?;
-        let (eta, mean, eta_se, mean_lo, mean_hi) = predict_standard_binomial_linkwiggle(
+            .ok_or_else(|| "standard link-wiggle model is missing link metadata".to_string())?;
+        let (eta, mean, eta_se, mean_lo, mean_hi) = predict_standard_linkwiggle(
             args,
             model,
             family,
+            &fit_saved,
             &design.design,
-            &beta,
             saved_link_kind,
             saved_mixture,
             saved_sas,
@@ -2768,6 +2737,17 @@ fn run_predict_standard(
         );
         return Ok(());
     }
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let beta = fit_saved.beta.clone();
+    if beta.len() != design.design.ncols() {
+        return Err(format!(
+            "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
+            beta.len(),
+            design.design.ncols()
+        ));
+    }
+
+    let offset = Array1::zeros(design.design.nrows());
     // Standard (no-wiggle) path: delegate to PredictableModel trait.
     let predictor = model
         .predictor()
@@ -2787,7 +2767,6 @@ fn run_predict_standard(
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture
     );
-    let fit_for_predict = fit_result_from_saved_model_for_prediction(model)?;
     let (eta, mean, se_opt, mut mean_lo, mut mean_hi) = if args.uncertainty {
         let options = gam::estimate::PredictUncertaintyOptions {
             confidence_level: args.level,
@@ -2796,7 +2775,7 @@ fn run_predict_standard(
             includeobservation_interval: false,
         };
         let pred = predictor
-            .predict_full_uncertainty(&pred_input, &fit_for_predict, &options)
+            .predict_full_uncertainty(&pred_input, &fit_saved, &options)
             .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
         (
             pred.eta,
@@ -2807,7 +2786,7 @@ fn run_predict_standard(
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         let pm = predictor
-            .predict_posterior_mean(&pred_input, &fit_for_predict)
+            .predict_posterior_mean(&pred_input, &fit_saved)
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
         (pm.eta, pm.mean, Some(pm.eta_standard_error), None, None)
     } else {
@@ -4082,31 +4061,22 @@ fn append_survival_timewiggle_columns(
 }
 
 fn apply_saved_linkwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
-    match (
-        model.linkwiggle_knots.as_ref(),
-        model.linkwiggle_degree,
-        model.beta_link_wiggle.as_ref(),
-    ) {
-        (None, None, None) => Ok(q0.clone()),
-        (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
-            let knot_arr = Array1::from_vec(knots.clone());
-            let block = buildwiggle_block_input_from_knots(
-                q0.view(),
-                &knot_arr,
-                degree,
-                2,
-                false,
-            )
-            .map_err(|e| format!("failed to evaluate saved link-wiggle basis: {e}"))?;
-            let xwiggle = match block.design {
-                DesignMatrix::Dense(m) => m,
-                _ => {
-                    return Err(
+    match model.saved_link_wiggle()? {
+        None => Ok(q0.clone()),
+        Some(runtime) => {
+            let knot_arr = Array1::from_vec(runtime.knots);
+            let block =
+                buildwiggle_block_input_from_knots(q0.view(), &knot_arr, runtime.degree, 2, false)
+                    .map_err(|e| format!("failed to evaluate saved link-wiggle basis: {e}"))?;
+            let xwiggle =
+                match block.design {
+                    DesignMatrix::Dense(m) => m,
+                    _ => return Err(
                         "saved link-wiggle basis design must be dense in current implementation"
                             .to_string(),
-                    )
-                }
-            };
+                    ),
+                };
+            let beta_link_wiggle = Array1::from_vec(runtime.beta);
             if beta_link_wiggle.len() != xwiggle.ncols() {
                 return Err(format!(
                     "saved link-wiggle dimension mismatch: beta_link_wiggle has {} coefficients but basis has {} columns",
@@ -4114,13 +4084,9 @@ fn apply_saved_linkwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1
                     xwiggle.ncols()
                 ));
             }
-            let w = xwiggle.dot(&Array1::from_vec(beta_link_wiggle.clone()));
+            let w = xwiggle.dot(&beta_link_wiggle);
             Ok(q0 + &w)
         }
-        _ => Err(
-            "saved model has partial link-wiggle metadata; expected knots+degree+beta_link_wiggle together"
-                .to_string(),
-        ),
     }
 }
 
@@ -4136,18 +4102,14 @@ fn saved_linkwiggle_basis(
     model: &SavedModel,
     basis_options: BasisOptions,
 ) -> Result<Option<Array2<f64>>, String> {
-    match (
-        model.linkwiggle_knots.as_ref(),
-        model.linkwiggle_degree,
-        model.beta_link_wiggle.as_ref(),
-    ) {
-        (None, None, None) => Ok(None),
-        (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
-            let knot_arr = Array1::from_vec(knots.clone());
+    match model.saved_link_wiggle()? {
+        None => Ok(None),
+        Some(runtime) => {
+            let knot_arr = Array1::from_vec(runtime.knots);
             let (basis, _) = create_basis::<Dense>(
                 q0.view(),
                 KnotSource::Provided(knot_arr.view()),
-                degree,
+                runtime.degree,
                 basis_options,
             )
             .map_err(|e| format!("failed to evaluate saved link-wiggle basis: {e}"))?;
@@ -4155,8 +4117,10 @@ fn saved_linkwiggle_basis(
             if full.ncols() < 3 {
                 return Err("saved link-wiggle basis has fewer than three columns".to_string());
             }
-            let (z, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
-                .map_err(|e| format!("failed to build saved link-wiggle constraint transform: {e}"))?;
+            let (z, _) = compute_geometric_constraint_transform(&knot_arr, runtime.degree, 2)
+                .map_err(|e| {
+                    format!("failed to build saved link-wiggle constraint transform: {e}")
+                })?;
             if full.ncols() != z.nrows() {
                 return Err(format!(
                     "saved link-wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
@@ -4165,6 +4129,7 @@ fn saved_linkwiggle_basis(
                 ));
             }
             let constrained = full.dot(&z);
+            let beta_link_wiggle = Array1::from_vec(runtime.beta);
             if beta_link_wiggle.len() != constrained.ncols() {
                 return Err(format!(
                     "saved link-wiggle dimension mismatch: beta_link_wiggle has {} coefficients but basis has {} columns",
@@ -4174,10 +4139,6 @@ fn saved_linkwiggle_basis(
             }
             Ok(Some(constrained))
         }
-        _ => Err(
-            "saved model has partial link-wiggle metadata; expected knots+degree+beta_link_wiggle together"
-                .to_string(),
-        ),
     }
 }
 
@@ -4224,10 +4185,15 @@ fn saved_linkwiggle_derivative_q0(
 ) -> Result<Array1<f64>, String> {
     match saved_linkwiggle_basis(q0, model, BasisOptions::first_derivative())? {
         Some(d_constrained) => {
-            let beta_link_wiggle = Array1::from_vec(model.beta_link_wiggle.clone().ok_or_else(|| {
-                "saved model is missing link-wiggle coefficients while derivative path requested"
-                    .to_string()
-            })?);
+            let beta_link_wiggle = Array1::from_vec(
+                model
+                    .saved_link_wiggle()?
+                    .ok_or_else(|| {
+                        "saved model is missing link-wiggle coefficients while derivative path requested"
+                            .to_string()
+                    })?
+                    .beta,
+            );
             Ok((d_constrained.dot(&beta_link_wiggle) + 1.0).mapv(|v| v.clamp(-1e6, 1e6)))
         }
         None => Ok(Array1::ones(q0.len())),
@@ -5671,12 +5637,31 @@ fn run_sample_standard_link_wiggle(
 
     // Saved fit result (joint [β_eta; β_wiggle])
     let fit = fit_result_from_saved_model_for_prediction(model)?;
-    let beta_link_wiggle = model
-        .beta_link_wiggle
-        .as_ref()
-        .ok_or_else(|| "link-wiggle model is missing beta_link_wiggle".to_string())?;
-    let p_wiggle = beta_link_wiggle.len();
-    let p_total = p_main + p_wiggle;
+    let wiggle_runtime = model
+        .saved_link_wiggle()?
+        .ok_or_else(|| "link-wiggle model is missing wiggle runtime metadata".to_string())?;
+    let mode_beta = fit
+        .block_by_role(BlockRole::Mean)
+        .ok_or_else(|| "standard link-wiggle model is missing Mean coefficient block".to_string())?
+        .beta
+        .clone();
+    let mode_theta = fit
+        .block_by_role(BlockRole::LinkWiggle)
+        .ok_or_else(|| {
+            "standard link-wiggle model is missing LinkWiggle coefficient block".to_string()
+        })?
+        .beta
+        .clone();
+    let p_wiggle = mode_theta.len();
+    let p_total = mode_beta.len() + p_wiggle;
+
+    if mode_beta.len() != p_main {
+        return Err(format!(
+            "link-wiggle sample: saved mean block has {} coefficients but rebuilt design has {} columns",
+            mode_beta.len(),
+            p_main,
+        ));
+    }
 
     if fit.beta.len() != p_total {
         return Err(format!(
@@ -5688,16 +5673,10 @@ fn run_sample_standard_link_wiggle(
         ));
     }
 
-    let mode_beta = fit.beta.slice(ndarray::s![0..p_main]).to_owned();
-    let mode_theta = fit.beta.slice(ndarray::s![p_main..]).to_owned();
-
     // Joint Hessian from saved inference
-    let hessian = fit
-        .penalized_hessian()
-        .ok_or_else(|| {
-            "link-wiggle model is missing penalized Hessian; refit with inference enabled"
-                .to_string()
-        })?;
+    let hessian = fit.penalized_hessian().ok_or_else(|| {
+        "link-wiggle model is missing penalized Hessian; refit with inference enabled".to_string()
+    })?;
     if hessian.nrows() != p_total || hessian.ncols() != p_total {
         return Err(format!(
             "link-wiggle sample: Hessian is {}x{} but expected {}x{}",
@@ -5708,49 +5687,40 @@ fn run_sample_standard_link_wiggle(
         ));
     }
 
-    // Build block-diagonal penalties from saved lambdas.
-    // The main block penalties come from the design, and the wiggle block
-    // penalties are difference penalties on the wiggle basis. We extract the
-    // block structure from the joint lambdas: first n_base_penalties belong to
-    // the main block, the rest to the wiggle block.
     let n_base_penalties = design.penalties.len();
-    let n_total_lambdas = fit.lambdas.len();
-    if n_total_lambdas < n_base_penalties {
+    let base_lambdas = fit
+        .block_by_role(BlockRole::Mean)
+        .ok_or_else(|| "standard link-wiggle model is missing Mean block lambdas".to_string())?
+        .lambdas
+        .view();
+    if base_lambdas.len() != n_base_penalties {
         return Err(format!(
-            "link-wiggle sample: {} saved lambdas but {} base penalties",
-            n_total_lambdas,
+            "link-wiggle sample: mean block has {} lambdas but rebuilt design has {} base penalties",
+            base_lambdas.len(),
             n_base_penalties,
         ));
     }
 
     // Base penalty: Σ λ_k S_k (p_main × p_main)
-    let base_lambdas = fit.lambdas.slice(ndarray::s![0..n_base_penalties]);
     let penalty_base = weighted_penalty_matrix(&design.penalties, base_lambdas)?;
 
-    // Wiggle penalty: extract from the saved joint Hessian's wiggle block.
-    // The wiggle penalty is the (p_wiggle × p_wiggle) lower-right block of
-    // the full penalty minus the likelihood contribution.
-    // Simpler approach: build difference penalties for the wiggle basis and
-    // weight by saved wiggle lambdas.
-    let wiggle_lambdas = fit.lambdas.slice(ndarray::s![n_base_penalties..]);
-    let knots = model
-        .linkwiggle_knots
-        .as_ref()
-        .ok_or_else(|| "missing linkwiggle_knots".to_string())?;
-    let degree = model
-        .linkwiggle_degree
-        .ok_or_else(|| "missing linkwiggle_degree".to_string())?;
+    // Wiggle penalty: rebuild constrained difference penalties for the saved
+    // wiggle basis and weight them by the saved LinkWiggle lambdas.
+    let wiggle_lambdas_owned = fit
+        .lambdas_linkwiggle()
+        .ok_or_else(|| "standard link-wiggle model is missing LinkWiggle lambdas".to_string())?;
+    let wiggle_lambdas = wiggle_lambdas_owned.view();
+    let degree = wiggle_runtime.degree;
 
     // Build wiggle penalty matrices (constrained difference penalties)
-    let knot_arr = Array1::from_vec(knots.clone());
+    let knot_arr = Array1::from_vec(wiggle_runtime.knots.clone());
     let (z_transform, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
         .map_err(|e| format!("wiggle constraint transform failed: {e}"))?;
     let p_constrained = z_transform.ncols();
     if p_constrained != p_wiggle {
         return Err(format!(
-            "wiggle constraint dimension mismatch: transform gives {} but beta_link_wiggle has {}",
-            p_constrained,
-            p_wiggle,
+            "wiggle constraint dimension mismatch: transform gives {} but wiggle runtime has {} coefficients",
+            p_constrained, p_wiggle,
         ));
     }
 
@@ -5809,7 +5779,7 @@ fn run_sample_standard_link_wiggle(
             return Err(format!(
                 "NUTS sampling with link wiggle is not supported for family {}",
                 family.pretty_name()
-            ))
+            ));
         }
     };
 
@@ -6162,30 +6132,32 @@ fn run_generate_standard(
         .map_err(|e| format!("failed to build design: {e}"))?;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let family = model.likelihood();
-    if is_standard_binomial_linkwiggle_model(model, family, model.resolved_inverse_link()?.as_ref())
-    {
+    if is_standard_linkwiggle_model(model, model.resolved_inverse_link()?.as_ref()) {
         let saved_link_kind = model
             .resolved_inverse_link()?
-            .ok_or_else(|| "standard binomial wiggle model is missing link metadata".to_string())?;
-        let beta = fit_saved.beta.clone();
-        if beta.len() != design.design.ncols() {
+            .ok_or_else(|| "standard link-wiggle model is missing link metadata".to_string())?;
+        let beta_eta = fit_saved
+            .block_by_role(BlockRole::Mean)
+            .ok_or_else(|| "standard wiggle model is missing Mean coefficient block".to_string())?
+            .beta
+            .clone();
+        if beta_eta.len() != design.design.ncols() {
             return Err(format!(
-                "model/design mismatch: model beta has {} coefficients but design has {} columns",
-                beta.len(),
+                "model/design mismatch: standard wiggle mean block has {} coefficients but design has {} columns",
+                beta_eta.len(),
                 design.design.ncols()
             ));
         }
-        let eta_base = design.design.dot(&beta);
+        let eta_base = design.design.dot(&beta_eta);
         let eta = apply_saved_linkwiggle(&eta_base, model)?;
         let mean = Array1::from_iter(
             eta.iter()
                 .map(|&v| inverse_link_mean_scalar(&saved_link_kind, v))
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        return Ok(gam::generative::GenerativeSpec {
-            mean,
-            noise: gam::generative::NoiseModel::Bernoulli,
-        });
+        let pred = gam::predict::PredictResult { eta, mean };
+        return generativespec_from_predict(pred, family, Some(fit_saved.standard_deviation))
+            .map_err(|e| format!("failed to build generative spec for link-wiggle model: {e}"));
     }
     // Standard (no-wiggle) path: delegate to PredictableModel.
     let predictor = model
@@ -6810,15 +6782,19 @@ fn summarizewiggle_domain(
     })
 }
 
-fn is_standard_binomial_linkwiggle_model(
-    model: &SavedModel,
-    family: LikelihoodFamily,
-    saved_link_kind: Option<&InverseLink>,
-) -> bool {
+fn is_standard_linkwiggle_model(model: &SavedModel, saved_link_kind: Option<&InverseLink>) -> bool {
     model.has_link_wiggle()
         && model.predict_model_class() == PredictModelClass::Standard
-        && is_binomial_family(family)
         && saved_link_kind.is_some()
+}
+
+/// Family-appropriate response-scale clamp bounds for prediction intervals.
+fn response_clamp_bounds_for_family(family: LikelihoodFamily) -> (f64, f64) {
+    match family {
+        LikelihoodFamily::GaussianIdentity => (f64::NEG_INFINITY, f64::INFINITY),
+        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => (0.0, f64::INFINITY),
+        _ => (1e-10, 1.0 - 1e-10), // binomial variants: probability in (0, 1)
+    }
 }
 
 fn inverse_link_mean_scalar(saved_link_kind: &InverseLink, eta: f64) -> Result<f64, String> {
@@ -6854,12 +6830,12 @@ fn integrated_inverse_link_mean_scalar(
     .map_err(|e| format!("integrated inverse-link evaluation failed: {e}"))
 }
 
-fn predict_standard_binomial_linkwiggle(
+fn predict_standard_linkwiggle(
     args: &PredictArgs,
     model: &SavedModel,
     family: LikelihoodFamily,
+    fit_saved: &UnifiedFitResult,
     design: &Array2<f64>,
-    beta: &Array1<f64>,
     saved_link_kind: &InverseLink,
     saved_mixture: Option<&MixtureLinkState>,
     saved_sas: Option<&SasLinkState>,
@@ -6875,24 +6851,39 @@ fn predict_standard_binomial_linkwiggle(
     ),
     String,
 > {
-    let eta_base = design.dot(beta);
+    let beta = fit_saved
+        .block_by_role(BlockRole::Mean)
+        .ok_or_else(|| "standard wiggle model is missing Mean coefficient block".to_string())?
+        .beta
+        .clone();
+    if beta.len() != design.ncols() {
+        return Err(format!(
+            "model/design mismatch: standard wiggle mean block has {} coefficients but new-data design has {} columns",
+            beta.len(),
+            design.ncols()
+        ));
+    }
+    let eta_base = design.dot(&beta);
     let eta = apply_saved_linkwiggle(&eta_base, model)?;
     let mean_mode = Array1::from_iter(
         eta.iter()
             .map(|&v| inverse_link_mean_scalar(saved_link_kind, v))
             .collect::<Result<Vec<_>, _>>()?,
     );
+    let wiggle_runtime = model
+        .saved_link_wiggle()?
+        .ok_or_else(|| "wiggle model is missing saved link-wiggle runtime".to_string())?;
     let wiggle_design = saved_linkwiggle_design(&eta_base, model)?
         .ok_or_else(|| "wiggle model is missing realized wiggle basis".to_string())?;
     let dq_dq0 = saved_linkwiggle_derivative_q0(&eta_base, model)?;
-    let pw = wiggle_design.ncols();
+    let pw = wiggle_runtime.beta.len();
     let p_main = beta.len();
     let p_total = p_main + pw;
     let eta_se = if args.mode == PredictModeArg::PosteriorMean || args.uncertainty {
         let cov_mat = covariance_from_model(model, args.covariance_mode)?;
         if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
             return Err(format!(
-                "covariance shape mismatch for standard binomial wiggle model: got {}x{}, expected {}x{}",
+                "covariance shape mismatch for standard link-wiggle model: got {}x{}, expected {}x{}",
                 cov_mat.nrows(),
                 cov_mat.ncols(),
                 p_total,
@@ -6939,8 +6930,9 @@ fn predict_standard_binomial_linkwiggle(
             saved_mixture_param_cov,
             saved_sas_param_cov,
         )?;
+        let (clamp_lo, clamp_hi) = response_clamp_bounds_for_family(family);
         let (lo, hi) =
-            response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+            response_interval_from_mean_sd(mean.view(), response_sd.view(), z, clamp_lo, clamp_hi);
         (Some(lo), Some(hi))
     } else {
         (None, None)
@@ -10236,7 +10228,7 @@ mod tests {
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
         parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_standard_binomial_linkwiggle, pretty_familyname,
+        parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
@@ -10647,7 +10639,7 @@ mod tests {
         wiggle_knots: Vec<f64>,
         wiggle_degree: usize,
     ) -> SavedModel {
-        let fit_result = core_saved_fit_result(
+        let mut fit_result = core_saved_fit_result(
             array![beta_eta],
             Array1::zeros(0),
             1.0,
@@ -10655,6 +10647,25 @@ mod tests {
             Some(covariance),
             saved_fit_summary_stub(),
         );
+        let beta_wiggle = Array1::from_vec(beta_link_wiggle.clone());
+        fit_result.blocks = vec![
+            gam::estimate::FittedBlock {
+                beta: array![beta_eta],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            gam::estimate::FittedBlock {
+                beta: beta_wiggle.clone(),
+                role: BlockRole::LinkWiggle,
+                edf: beta_wiggle.len() as f64,
+                lambdas: Array1::zeros(0),
+            },
+        ];
+        let mut beta_joint = Array1::zeros(1 + beta_wiggle.len());
+        beta_joint[0] = beta_eta;
+        beta_joint.slice_mut(s![1..]).assign(&beta_wiggle);
+        fit_result.beta = beta_joint;
         SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
             formula: "y ~ 1".to_string(),
@@ -10680,7 +10691,7 @@ mod tests {
             gaussian_response_scale: None,
             linkwiggle_knots: Some(wiggle_knots),
             linkwiggle_degree: Some(wiggle_degree),
-            beta_link_wiggle: Some(beta_link_wiggle),
+            beta_link_wiggle: None,
             baseline_timewiggle_knots: None,
             baseline_timewiggle_degree: None,
             baseline_timewiggle_penalty_orders: None,
@@ -10778,13 +10789,12 @@ mod tests {
             mode: PredictModeArg::PosteriorMean,
         };
         let design = Array2::<f64>::ones((3, 1));
-        let beta = array![0.1];
-        let (eta, mean, _, _, _) = predict_standard_binomial_linkwiggle(
+        let (eta, mean, _, _, _) = predict_standard_linkwiggle(
             &args,
             &model,
             LikelihoodFamily::BinomialLogit,
+            model.fit_result.as_ref().expect("fit result"),
             &design,
-            &beta,
             &InverseLink::Standard(LinkFunction::Logit),
             None,
             None,
@@ -13662,7 +13672,7 @@ mod tests {
             adaptive_regularization_diagnostics: None,
         });
         let err = apply_saved_linkwiggle(&q0, &model).expect_err("expected partial-metadata error");
-        assert!(err.contains("partial link-wiggle metadata"));
+        assert!(err.contains("link-wiggle"));
     }
 
     #[test]

@@ -90,7 +90,6 @@ pub struct StandardFitResult {
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
-    pub beta_link_wiggle: Option<Vec<f64>>,
 }
 
 pub struct SurvivalLocationScaleFitResult {
@@ -161,7 +160,6 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         adaptive_diagnostics: fitted.adaptive_diagnostics,
         wiggle_knots: None,
         wiggle_degree: None,
-        beta_link_wiggle: None,
     };
 
     let Some(wiggle) = request.wiggle else {
@@ -192,14 +190,6 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         &request.kappa_options,
     )?;
 
-    let beta_link_wiggle = solved
-        .fit
-        .block_states
-        .get(1)
-        .ok_or_else(|| "standard wiggle fit is missing link-wiggle block".to_string())?
-        .beta
-        .to_vec();
-
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
         fit: solved.fit,
@@ -208,7 +198,6 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         adaptive_diagnostics: result.adaptive_diagnostics,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
-        beta_link_wiggle: Some(beta_link_wiggle),
     })
 }
 

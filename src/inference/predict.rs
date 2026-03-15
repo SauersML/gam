@@ -1,4 +1,4 @@
-use crate::estimate::{EstimationError, FittedLinkState, UnifiedFitResult};
+use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
@@ -372,19 +372,27 @@ impl StandardPredictor {
         unified: &UnifiedFitResult,
         family: crate::types::LikelihoodFamily,
         link_kind: Option<InverseLink>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        if unified.n_blocks() != 1 || unified.block_by_role(BlockRole::LinkWiggle).is_some() {
+            return Err(
+                "StandardPredictor only supports single-block standard fits without link wiggles"
+                    .to_string(),
+            );
+        }
         let beta = unified
             .blocks
             .first()
             .map(|b| b.beta.clone())
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                "standard unified fit is missing its sole coefficient block".to_string()
+            })?;
         let covariance = unified.covariance_conditional.clone();
-        Self {
+        Ok(Self {
             beta,
             family,
             link_kind,
             covariance,
-        }
+        })
     }
 }
 

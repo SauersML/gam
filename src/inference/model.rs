@@ -257,6 +257,13 @@ pub enum PredictModelClass {
     Survival,
 }
 
+#[derive(Clone, Debug)]
+pub struct SavedLinkWiggleRuntime {
+    pub knots: Vec<f64>,
+    pub degree: usize,
+    pub beta: Vec<f64>,
+}
+
 impl FittedFamily {
     #[inline]
     pub fn likelihood(&self) -> LikelihoodFamily {
@@ -389,22 +396,76 @@ impl FittedModel {
         matches!(self.predict_model_class(), PredictModelClass::Survival)
     }
 
-    /// Whether this model has a link wiggle component (all three saved fields present).
+    pub fn saved_link_wiggle(&self) -> Result<Option<SavedLinkWiggleRuntime>, String> {
+        let payload = self.payload();
+        let (knots, degree) = match (
+            payload.linkwiggle_knots.as_ref(),
+            payload.linkwiggle_degree,
+        ) {
+            (None, None) => return Ok(None),
+            (Some(knots), Some(degree)) => (knots.clone(), degree),
+            _ => {
+                return Err(
+                    "saved model has partial link-wiggle metadata; expected linkwiggle_knots and linkwiggle_degree together"
+                        .to_string(),
+                )
+            }
+        };
+        let beta = match self.predict_model_class() {
+            PredictModelClass::Standard => {
+                if payload.beta_link_wiggle.is_some() {
+                    return Err(
+                        "standard link-wiggle coefficients must be stored in fit_result LinkWiggle block, not payload.beta_link_wiggle"
+                            .to_string(),
+                    );
+                }
+                let fit = payload.fit_result.as_ref().ok_or_else(|| {
+                    "standard link-wiggle model is missing canonical fit_result payload".to_string()
+                })?;
+                if fit.blocks.len() != 2
+                    || fit.blocks[0].role != BlockRole::Mean
+                    || fit.blocks[1].role != BlockRole::LinkWiggle
+                {
+                    return Err(
+                        "standard link-wiggle models must store blocks in [Mean, LinkWiggle] order"
+                            .to_string(),
+                    );
+                }
+                fit.block_by_role(BlockRole::LinkWiggle)
+                    .ok_or_else(|| {
+                        "standard link-wiggle model is missing LinkWiggle coefficient block"
+                            .to_string()
+                    })?
+                    .beta
+                    .to_vec()
+            }
+            _ => payload.beta_link_wiggle.clone().ok_or_else(|| {
+                "saved model has link-wiggle metadata but is missing payload.beta_link_wiggle"
+                    .to_string()
+            })?,
+        };
+        Ok(Some(SavedLinkWiggleRuntime {
+            knots,
+            degree,
+            beta,
+        }))
+    }
+
+    /// Whether this model has a link wiggle component with complete metadata.
     #[inline]
     pub fn has_link_wiggle(&self) -> bool {
-        let p = self.payload();
-        p.beta_link_wiggle.is_some()
-            && p.linkwiggle_knots.is_some()
-            && p.linkwiggle_degree.is_some()
+        self.saved_link_wiggle()
+            .map(|runtime| runtime.is_some())
+            .unwrap_or(false)
     }
 
     /// Number of wiggle coefficients (0 if no wiggle).
     #[inline]
     pub fn link_wiggle_dim(&self) -> usize {
-        self.payload()
-            .beta_link_wiggle
-            .as_ref()
-            .map_or(0, |b| b.len())
+        self.saved_link_wiggle()
+            .ok()
+            .flatten()
+            .map_or(0, |runtime| runtime.beta.len())
     }
 
     pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, String> {
@@ -536,14 +597,17 @@ impl FittedModel {
                     .map(|p| Box::new(p) as Box<dyn PredictableModel>)
             }
             PredictModelClass::Standard => {
+                if self.has_link_wiggle() {
+                    return None;
+                }
                 let family = self.family_state.likelihood();
                 let link_kind = self.resolved_inverse_link().ok().flatten();
 
                 // Prefer unified path when available.
                 if let Some(unified) = self.unified() {
-                    return Some(Box::new(StandardPredictor::from_unified(
-                        unified, family, link_kind,
-                    )));
+                    return StandardPredictor::from_unified(unified, family, link_kind)
+                        .ok()
+                        .map(|p| Box::new(p) as Box<dyn PredictableModel>);
                 }
 
                 // Legacy path: extract from UnifiedFitResult.
@@ -710,6 +774,21 @@ impl FittedModel {
         {
             return Err(
                 "saved location-scale survival model is missing block coefficients; refit with current CLI"
+                    .to_string(),
+            );
+        }
+
+        let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
+            || self.linkwiggle_degree.is_some()
+            || self.beta_link_wiggle.is_some()
+            || self
+                .fit_result
+                .as_ref()
+                .and_then(|fit| fit.block_by_role(BlockRole::LinkWiggle))
+                .is_some();
+        if has_any_saved_link_wiggle && self.saved_link_wiggle()?.is_none() {
+            return Err(
+                "saved model has incomplete link-wiggle state; expected metadata and coefficients"
                     .to_string(),
             );
         }
