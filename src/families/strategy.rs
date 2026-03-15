@@ -1,4 +1,4 @@
-use crate::estimate::{EstimationError, FitResult, FittedLinkState};
+use crate::estimate::{EstimationError, UnifiedFitResult, FittedLinkState};
 use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet};
 use crate::quadrature::{
@@ -73,7 +73,7 @@ pub fn strategy_for_family(
 
 pub fn strategy_from_fit(
     family: LikelihoodFamily,
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
 ) -> Result<ResolvedFamilyStrategy, EstimationError> {
     let inverse_link = match fit.fitted_link_state(family)? {
         FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(link)),

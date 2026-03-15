@@ -1,4 +1,5 @@
-use crate::custom_family::{BlockwiseFitResult, CustomFamily, ParameterBlockState};
+use crate::custom_family::{CustomFamily, ParameterBlockState};
+use crate::estimate::UnifiedFitResult;
 use crate::estimate::{EstimationError, PredictResult, predict_gam};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::DesignMatrix;
@@ -171,7 +172,7 @@ pub trait CustomFamilyGenerative: CustomFamily {
 /// Build custom-family generative spec from a fitted multi-block model.
 pub fn custom_generativespec<F: CustomFamilyGenerative>(
     family: &F,
-    fit: &BlockwiseFitResult,
+    fit: &UnifiedFitResult,
 ) -> Result<GenerativeSpec, String> {
     family.generativespec(&fit.block_states)
 }

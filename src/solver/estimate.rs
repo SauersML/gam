@@ -2869,7 +2869,7 @@ fn validate_fitted_link_parameters_estimation(
     }
 }
 
-// Old FitResult impl block deleted — methods now live on UnifiedFitResult.
+// Old FitResult impl block deleted (now UnifiedFitResult) — methods now live on UnifiedFitResult.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Unified fit result — single type for all model families
@@ -4035,7 +4035,7 @@ pub fn fit_gamwith_heuristic_lambdas<X>(
     heuristic_lambdas: Option<&[f64]>,
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
-) -> Result<FitResult, EstimationError>
+) -> Result<UnifiedFitResult, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
@@ -4062,7 +4062,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
-) -> Result<FitResult, EstimationError>
+) -> Result<UnifiedFitResult, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
@@ -4283,7 +4283,7 @@ pub fn fit_gam<X>(
     s_list: &[Array2<f64>],
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
-) -> Result<FitResult, EstimationError>
+) -> Result<UnifiedFitResult, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
