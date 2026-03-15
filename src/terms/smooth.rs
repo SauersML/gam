@@ -8316,8 +8316,20 @@ fn try_exact_joint_spatial_aniso_optimization(
         eval_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx
             .eval_full(theta)
         {
-            Ok((cost, grad, hess)) => {
+            Ok((cost, mut grad, mut hess)) => {
                 ctx.track_best(theta, cost);
+                // Project gradient and Hessian onto the constraint tangent space
+                // before passing to the outer optimizer (response.md §4b).
+                //
+                // The ψ-block gradient is projected: g_ψ ← P g_ψ = g_ψ − mean(g_ψ)·1
+                // This ensures the optimizer never sees the gauge direction (the
+                // flat direction 1 in ψ-space that corresponds to uniform scaling).
+                //
+                // The ψ-block Hessian is projected: H_ψψ ← P H_ψψ P
+                // This removes the zero eigenvalue along the gauge direction,
+                // making the Hessian well-conditioned on the constraint manifold.
+                project_psi_gradient(&mut grad, ctx.rho_dim, ctx.dims_per_term);
+                project_psi_hessian(&mut hess, ctx.rho_dim, ctx.dims_per_term);
                 Ok(OuterEval {
                     cost,
                     gradient: grad,
@@ -8358,28 +8370,370 @@ fn try_exact_joint_spatial_aniso_optimization(
         result.final_value,
         result.final_grad_norm,
     );
-    // Enforce sum-to-zero constraint on ψ coordinates for each aniso group.
+    // Enforce sum-to-zero constraint on ψ coordinates for each aniso group,
+    // with gauge-correct ρ_κ compensation (response.md §4a).
     let mut theta_star = result.rho;
-    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, dims_per_term);
+    let rho_kappa_indices: Vec<usize> = spatial_terms
+        .iter()
+        .map(|&term_idx| {
+            smooth_term_penalty_index(resolvedspec, baseline_design, term_idx).unwrap_or(0)
+        })
+        .collect();
+    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, dims_per_term, Some(&rho_kappa_indices));
     Ok(theta_star)
 }
 
-/// Enforce sum-to-zero constraint on ψ coordinates for identifiability.
+/// Enforce sum-to-zero constraint on ψ coordinates for identifiability, with
+/// gauge-correct compensation of the corresponding ρ_κ (isotropic log-scale)
+/// parameters.
 ///
-/// For each anisotropic group with d > 1 axes, the d ψ values are shifted
-/// so that their mean is zero: ψ_a ← ψ_a − mean(ψ).
-/// This preserves the anisotropy ratios while centering the log-scale coordinates.
-fn enforce_psi_sum_to_zero(theta: &mut Array1<f64>, rho_dim: usize, dims_per_term: &[usize]) {
+/// # Gauge invariance (see response.md §4)
+///
+/// For anisotropic Duchon/Matérn bases, the kernel depends on ψ only through
+/// the *anisotropy ratios* η_a = ψ_a − ψ̄ (where ψ̄ = mean(ψ)) and the
+/// isotropic scale κ = exp(ψ̄). There is therefore a gauge direction in the
+/// *joint* (ρ_κ, ψ) parameter space:
+///
+///   (δρ_κ, δψ) = (−c, c·1)
+///
+/// Shifting all ψ_a by +c while shifting ρ_κ by −c leaves the model unchanged
+/// (the effective scale κ/λ combination is preserved).
+///
+/// **Bug fixed here**: the previous implementation projected ψ alone
+/// (ψ_a ← ψ_a − ψ̄) without the compensating shift ρ_κ ← ρ_κ + ψ̄. This
+/// changed the model by discarding the isotropic scale component. The correct
+/// gauge-fixing projection must operate on the joint (ρ_κ, ψ) space.
+///
+/// # Parameters
+///
+/// - `theta`: mutable θ = [ρ_0, ..., ρ_{M-1}, ψ_0, ..., ψ_{K-1}] vector
+/// - `rho_dim`: number of ρ (log-lambda) parameters at the start of θ
+/// - `dims_per_term`: per-spatial-term dimensionality (1 for iso, D for aniso)
+/// - `rho_kappa_indices`: for each spatial term, the index into the ρ block
+///   (0..rho_dim) of the corresponding isotropic scale penalty parameter.
+///   If `None`, only the ψ centering is performed (legacy behavior, NOT
+///   gauge-correct — callers should provide this whenever possible).
+fn enforce_psi_sum_to_zero(
+    theta: &mut Array1<f64>,
+    rho_dim: usize,
+    dims_per_term: &[usize],
+    rho_kappa_indices: Option<&[usize]>,
+) {
     let mut offset = rho_dim;
-    for &d in dims_per_term {
+    for (term_slot, &d) in dims_per_term.iter().enumerate() {
         if d > 1 {
             let mean = theta.slice(s![offset..offset + d]).mean().unwrap_or(0.0);
-            for a in 0..d {
-                theta[offset + a] -= mean;
+            if mean.abs() > 1e-15 {
+                // Shift ψ_a ← ψ_a − mean(ψ)  (center to sum-to-zero)
+                for a in 0..d {
+                    theta[offset + a] -= mean;
+                }
+                // Gauge-correct compensation: ρ_κ ← ρ_κ + mean(ψ)
+                // This absorbs the isotropic component that was removed from ψ,
+                // preserving the model's effective scale. Without this shift,
+                // the projection changes the model (response.md §4a).
+                if let Some(rho_indices) = rho_kappa_indices {
+                    if let Some(&rho_idx) = rho_indices.get(term_slot) {
+                        debug_assert!(
+                            rho_idx < rho_dim,
+                            "rho_kappa_indices[{}]={} exceeds rho_dim={}",
+                            term_slot,
+                            rho_idx,
+                            rho_dim,
+                        );
+                        theta[rho_idx] += mean;
+                    }
+                }
             }
         }
         offset += d;
     }
+}
+
+/// Helmert contrast matrix: an orthonormal basis for the subspace 1⊥ ⊂ ℝ^D.
+///
+/// Returns a D×(D−1) matrix C satisfying:
+///   C^T C = I_{D−1}   (columns are orthonormal)
+///   C^T 1 = 0          (columns are orthogonal to the all-ones vector)
+///
+/// The standard normalized Helmert contrast construction:
+///
+///   C[i, j] = -1/√((j+1)(j+2))           if i <= j
+///   C[j+1, j] = (j+1)/√((j+1)(j+2))     if i = j+1
+///   C[i, j] = 0                            if i > j+1
+///
+/// for j = 0, ..., D−2 (column index), i = 0, ..., D−1 (row index).
+///
+/// This is the standard construction used for reparameterizing constrained
+/// parameters. Writing ψ = C ψ̃ automatically enforces Σψ_d = 0, and the
+/// reduced derivatives are (response.md §4d):
+///
+///   g̃ = C^T g_ψ       (projected gradient in reduced coordinates)
+///   H̃ = C^T H_ψψ C    (projected Hessian in reduced coordinates)
+///
+/// Properties (easily verified):
+///   C^T 1 = 0: column j sums to (j+1)·(-1/norm) + (j+1)/norm = 0.
+///   ||col_j||^2 = (j+1)/norm^2 + (j+1)^2/norm^2
+///     = ((j+1) + (j+1)^2)/((j+1)(j+2)) = (j+1)(j+2)/((j+1)(j+2)) = 1.
+///   C^T C = I_{D-1} (orthonormality follows from the Helmert structure).
+///
+/// # Panics
+///
+/// Panics if `d < 2` (the constraint is trivial or impossible for d < 2).
+pub(crate) fn helmert_contrast_matrix(d: usize) -> Array2<f64> {
+    assert!(d >= 2, "helmert_contrast_matrix requires d >= 2, got d={d}");
+    let mut c = Array2::<f64>::zeros((d, d - 1));
+    for j in 0..(d - 1) {
+        let jp1 = (j + 1) as f64;
+        let jp2 = (j + 2) as f64;
+        let norm = (jp1 * jp2).sqrt();
+        // Rows i = 0, ..., j: C[i, j] = -1/norm
+        for i in 0..=j {
+            c[[i, j]] = -1.0 / norm;
+        }
+        // Row i = j+1: C[j+1, j] = (j+1)/norm
+        if j + 1 < d {
+            c[[j + 1, j]] = jp1 / norm;
+        }
+        // Rows i > j+1: already zero.
+    }
+    c
+}
+
+/// Project the ψ-block gradient onto the tangent space of the sum-to-zero
+/// constraint manifold: g_ψ ← P g_ψ where P = I − (1/D)·11^T.
+///
+/// This removes the component along the gauge direction 1 (the all-ones vector),
+/// ensuring the optimizer never sees the flat (gauge) direction. The ρ block
+/// of the gradient is left unchanged.
+///
+/// See response.md §4b: the intrinsic gradient on the constraint manifold
+/// M = {ψ : 1^T ψ = 0} is ∇_M V = P g_ψ.
+pub(crate) fn project_psi_gradient(
+    gradient: &mut Array1<f64>,
+    rho_dim: usize,
+    dims_per_term: &[usize],
+) {
+    let mut offset = rho_dim;
+    for &d in dims_per_term {
+        if d > 1 {
+            let psi_grad = gradient.slice(s![offset..offset + d]);
+            let mean = psi_grad.mean().unwrap_or(0.0);
+            for a in 0..d {
+                gradient[offset + a] -= mean;
+            }
+        }
+        offset += d;
+    }
+}
+
+/// Project the ψ-block of a Hessian onto the constraint tangent space:
+/// H_M = P H_ψψ P, where P = I − (1/D)·11^T.
+///
+/// This removes the gauge direction from both rows and columns of the ψψ block,
+/// making the Hessian non-singular on the constraint manifold. The ρ-ρ block
+/// is left unchanged. Cross-blocks (ρ-ψ and ψ-ρ) are also projected to
+/// maintain consistency.
+///
+/// See response.md §4b: the intrinsic Hessian on the affine subspace M is
+/// H_M = P H_ψψ P restricted to 1⊥.
+pub(crate) fn project_psi_hessian(
+    hessian: &mut Array2<f64>,
+    rho_dim: usize,
+    dims_per_term: &[usize],
+) {
+    let n = hessian.nrows();
+    debug_assert_eq!(n, hessian.ncols(), "Hessian must be square");
+    let mut offset = rho_dim;
+    for &d in dims_per_term {
+        if d > 1 {
+            let df = d as f64;
+            // Project: H_block ← P H_block P where P = I − (1/D)·11^T.
+            // P H P = H − (1/D)·1·(1^T H) − (1/D)·(H 1)·1^T + (1/D^2)·1·(1^T H 1)·1^T
+
+            // ── ψψ sub-block: rows [offset..offset+d] × cols [offset..offset+d] ──
+            let mut row_means = vec![0.0_f64; d];
+            let mut col_means = vec![0.0_f64; d];
+            let mut grand_mean = 0.0_f64;
+            for a in 0..d {
+                for b in 0..d {
+                    let val = hessian[[offset + a, offset + b]];
+                    row_means[a] += val;
+                    col_means[b] += val;
+                    grand_mean += val;
+                }
+            }
+            for a in 0..d {
+                row_means[a] /= df;
+                col_means[a] /= df;
+            }
+            grand_mean /= df * df;
+            for a in 0..d {
+                for b in 0..d {
+                    hessian[[offset + a, offset + b]] +=
+                        -row_means[a] - col_means[b] + grand_mean;
+                }
+            }
+
+            // ── Cross-blocks with the ρ block (rows/cols 0..rho_dim) ──
+            // Project ψ rows/cols: subtract the mean along the ψ dimension.
+            for c in 0..rho_dim {
+                let mut mean_col = 0.0_f64;
+                for a in 0..d {
+                    mean_col += hessian[[offset + a, c]];
+                }
+                mean_col /= df;
+                for a in 0..d {
+                    hessian[[offset + a, c]] -= mean_col;
+                }
+                // Symmetric: also project ρ-ψ columns
+                let mut mean_row = 0.0_f64;
+                for a in 0..d {
+                    mean_row += hessian[[c, offset + a]];
+                }
+                mean_row /= df;
+                for a in 0..d {
+                    hessian[[c, offset + a]] -= mean_row;
+                }
+            }
+
+            // ── Cross-blocks with other ψ groups ──
+            let mut other_offset = rho_dim;
+            for &other_d in dims_per_term {
+                if other_offset != offset {
+                    for c in other_offset..other_offset + other_d {
+                        let mut mean_col = 0.0_f64;
+                        for a in 0..d {
+                            mean_col += hessian[[offset + a, c]];
+                        }
+                        mean_col /= df;
+                        for a in 0..d {
+                            hessian[[offset + a, c]] -= mean_col;
+                        }
+                        let mut mean_row = 0.0_f64;
+                        for a in 0..d {
+                            mean_row += hessian[[c, offset + a]];
+                        }
+                        mean_row /= df;
+                        for a in 0..d {
+                            hessian[[c, offset + a]] -= mean_row;
+                        }
+                    }
+                }
+                other_offset += other_d;
+            }
+        }
+        offset += d;
+    }
+}
+
+/// Compute a constraint-aware Newton step for the ψ block via Helmert
+/// reparameterization (response.md §4d).
+///
+/// Given the full-space gradient g_ψ ∈ ℝ^D and Hessian H_ψψ ∈ ℝ^{D×D}
+/// for an anisotropic group, computes the constrained step δψ ∈ 1⊥ via:
+///
+///   1. Reduce to free coordinates: g̃ = C^T g_ψ, H̃ = C^T H_ψψ C
+///      where C is the D×(D−1) Helmert contrast matrix.
+///   2. Solve the (D−1)-dimensional system: δψ̃ = −H̃^{-1} g̃
+///   3. Lift back: δψ = C δψ̃
+///
+/// The result satisfies 1^T δψ = 0 by construction (since C^T 1 = 0,
+/// the step lies in the tangent space of the constraint manifold).
+///
+/// This is equivalent to solving the KKT system (response.md §4c):
+///
+///   [H_ψψ  1] [δψ]   = - [g_ψ]
+///   [1^T   0] [λ ]       [0  ]
+///
+/// but avoids forming the (D+1)×(D+1) KKT matrix by working in the
+/// (D−1)-dimensional reduced space directly.
+///
+/// Returns `None` if the reduced Hessian is singular or the solve fails.
+pub(crate) fn constrained_psi_newton_step(
+    g_psi: &[f64],
+    h_psi: &Array2<f64>,
+) -> Option<Array1<f64>> {
+    let d = g_psi.len();
+    if d < 2 {
+        return Some(Array1::zeros(d));
+    }
+    debug_assert_eq!(h_psi.nrows(), d);
+    debug_assert_eq!(h_psi.ncols(), d);
+
+    let c = helmert_contrast_matrix(d);
+
+    // Reduced gradient: g̃ = C^T g_ψ  (size D−1)
+    let g_psi_arr = ArrayView1::from(g_psi);
+    let g_tilde = c.t().dot(&g_psi_arr);
+
+    // Reduced Hessian: H̃ = C^T H_ψψ C  (size (D−1)×(D−1))
+    let h_tilde = c.t().dot(&h_psi.dot(&c));
+
+    // Solve (D−1)×(D−1) system: H̃ δψ̃ = −g̃
+    // For small D (typically 2-10), direct Gaussian elimination is fine.
+    let neg_g_tilde = -&g_tilde;
+    let dm1 = d - 1;
+    let mut aug = Array2::<f64>::zeros((dm1, dm1 + 1));
+    aug.slice_mut(s![.., ..dm1]).assign(&h_tilde);
+    aug.slice_mut(s![.., dm1]).assign(&neg_g_tilde);
+
+    // Gaussian elimination with partial pivoting
+    for col in 0..dm1 {
+        // Find pivot
+        let mut max_val = aug[[col, col]].abs();
+        let mut max_row = col;
+        for row in (col + 1)..dm1 {
+            let val = aug[[row, col]].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = row;
+            }
+        }
+        if max_val < 1e-14 {
+            return None; // Singular reduced Hessian
+        }
+        if max_row != col {
+            for j in 0..=dm1 {
+                let tmp = aug[[col, j]];
+                aug[[col, j]] = aug[[max_row, j]];
+                aug[[max_row, j]] = tmp;
+            }
+        }
+        // Eliminate below
+        let pivot = aug[[col, col]];
+        for row in (col + 1)..dm1 {
+            let factor = aug[[row, col]] / pivot;
+            for j in col..=dm1 {
+                aug[[row, j]] -= factor * aug[[col, j]];
+            }
+        }
+    }
+
+    // Back-substitution
+    let mut delta_tilde = Array1::<f64>::zeros(dm1);
+    for col in (0..dm1).rev() {
+        let mut sum = aug[[col, dm1]];
+        for j in (col + 1)..dm1 {
+            sum -= aug[[col, j]] * delta_tilde[j];
+        }
+        if aug[[col, col]].abs() < 1e-14 {
+            return None;
+        }
+        delta_tilde[col] = sum / aug[[col, col]];
+    }
+
+    // Lift back to ambient space: δψ = C δψ̃
+    let delta_psi = c.dot(&delta_tilde);
+
+    // Verify constraint: 1^T δψ ≈ 0
+    debug_assert!(
+        delta_psi.sum().abs() < 1e-10,
+        "constrained Newton step violates sum-to-zero: sum = {}",
+        delta_psi.sum()
+    );
+
+    Some(delta_psi)
 }
 
 /// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
@@ -9018,7 +9372,7 @@ where
                 &nd,
                 true,
             ) {
-                Ok((cost, grad, hess)) => {
+                Ok((cost, mut grad, hess)) => {
                     ctx.track_best(theta, cost);
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
@@ -9029,12 +9383,16 @@ where
                                 .to_string(),
                         ));
                     }
+                    // Project ψ-block gradient and Hessian onto the constraint
+                    // tangent space (response.md §4b) to remove the gauge direction.
+                    project_psi_gradient(&mut grad, rho_dim, all_dims_ref);
                     let hessian_result = match hess {
-                        Some(h)
+                        Some(mut h)
                             if h.nrows() == theta.len()
                                 && h.ncols() == theta.len()
                                 && h.iter().all(|v| v.is_finite()) =>
                         {
+                            project_psi_hessian(&mut h, rho_dim, all_dims_ref);
                             HessianResult::Analytic(h)
                         }
                         _ => HessianResult::Unavailable,
@@ -9064,7 +9422,38 @@ where
     .map_err(|e| e.to_string())?;
 
     let mut theta_star = result.rho;
-    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, &all_dims);
+    // Enforce sum-to-zero on ψ coordinates with gauge-correct ρ_κ compensation.
+    //
+    // For the two-block case, we compute the penalty index mapping from the
+    // bootstrap designs. The combined ρ vector lays out mean penalties first,
+    // then noise penalties, matching the order of smooth_term_penalty_index
+    // within each block.
+    let noise_penalty_offset: usize = bootmean_design
+        .smooth
+        .terms
+        .iter()
+        .map(|t| t.penalties_local.len())
+        .sum();
+    let mean_rho_indices: Vec<usize> = mean_terms
+        .iter()
+        .map(|&ti| {
+            smooth_term_penalty_index(&best_meanspec, &bootmean_design, ti).unwrap_or(0)
+        })
+        .collect();
+    let noise_rho_indices: Vec<usize> = noise_terms
+        .iter()
+        .map(|&ti| {
+            smooth_term_penalty_index(&best_noisespec, &bootnoise_design, ti)
+                .map(|idx| noise_penalty_offset + idx)
+                .unwrap_or(0)
+        })
+        .collect();
+    let combined_rho_indices: Vec<usize> = mean_rho_indices
+        .iter()
+        .chain(noise_rho_indices.iter())
+        .copied()
+        .collect();
+    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, &all_dims, Some(&combined_rho_indices));
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, all_dims);
     let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
