@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::estimate::{FitGeometry, FitResult, UnifiedFitResult};
+use crate::estimate::{FitGeometry, UnifiedFitResult};
 use crate::faer_ndarray::FaerArrayView;
 use crate::linalg::utils::StableSolver;
 use crate::pirls;
@@ -436,7 +436,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
 
 /// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.
 pub fn compute_alo_diagnostics_from_fit(
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
@@ -451,7 +451,7 @@ pub fn compute_alo_diagnostics_from_fit(
 
 /// Compute ALO diagnostics from a fitted GAM result (primary API).
 pub fn compute_alo_diagnostics(
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
@@ -462,7 +462,7 @@ pub fn compute_alo_diagnostics(
 ///
 /// Extracts `FitGeometry` from `unified.geometry`, builds an `AloInput`
 /// via `from_geometry`, and delegates to `compute_alo_from_input`.
-/// This avoids requiring a full `FitResult` with PIRLS artifacts.
+/// This avoids requiring a full `UnifiedFitResult` with PIRLS artifacts.
 pub fn compute_alo_diagnostics_from_unified(
     unified: &UnifiedFitResult,
     design: &Array2<f64>,

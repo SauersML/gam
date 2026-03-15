@@ -1,4 +1,4 @@
-use crate::estimate::{BlockRole, FitResult, FittedLinkState, UnifiedFitResult};
+use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::inference::predict::{
     BinomialLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
     StandardPredictor, SurvivalPredictor,
@@ -46,7 +46,7 @@ pub struct FittedModelPayload {
     pub family_state: FittedFamily,
     pub family: String,
     #[serde(default)]
-    pub fit_result: Option<FitResult>,
+    pub fit_result: Option<UnifiedFitResult>,
     /// Unified (family-agnostic) representation of the fit result.
     #[serde(default)]
     pub unified: Option<UnifiedFitResult>,
@@ -538,7 +538,7 @@ impl FittedModel {
     /// When a `UnifiedFitResult` is available, the predictor is built from
     /// the unified representation (extracting beta from the first block and
     /// covariance from the unified result). Otherwise falls back to the
-    /// legacy `FitResult` path.
+    /// legacy `UnifiedFitResult` path.
     pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
         match self.predict_model_class() {
             PredictModelClass::GaussianLocationScale => {
@@ -559,7 +559,7 @@ impl FittedModel {
                     )));
                 }
 
-                // Legacy path: extract from FitResult.
+                // Legacy path: extract from UnifiedFitResult.
                 let fit = self.fit_result.as_ref()?;
                 let covariance = fit.beta_covariance().cloned();
                 Some(Box::new(StandardPredictor {

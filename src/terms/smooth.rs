@@ -19,7 +19,7 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
-    EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
+    EstimationError, ExternalOptimOptions, FitInference, FitOptions, UnifiedFitResult,
     FittedLinkState, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
@@ -318,14 +318,14 @@ pub struct TermCollectionDesign {
 
 #[derive(Clone)]
 pub struct FittedTermCollection {
-    pub fit: FitResult,
+    pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
 
 #[derive(Clone)]
 pub struct FittedTermCollectionWithSpec {
-    pub fit: FitResult,
+    pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
@@ -4912,7 +4912,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } else {
                 crate::pirls::PirlsStatus::StalledAtValidMinimum
             };
-            FitResult::try_from_parts(UnifiedFitResultParts {
+            UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
                 blocks: vec![crate::estimate::FittedBlock {
                     beta: beta.clone(),
                     role: crate::estimate::BlockRole::Mean,
@@ -7054,12 +7054,12 @@ fn fit_bounded_term_collection_forspec(
                 beta_standard_errors_corrected: None,
             };
             let covariance_conditional = inf.beta_covariance.clone();
-            let pirls_status_val = if fit.converged {
+            let pirls_status_val = if fit.outer_converged {
                 crate::pirls::PirlsStatus::Converged
             } else {
                 crate::pirls::PirlsStatus::StalledAtValidMinimum
             };
-            FitResult::try_from_parts(UnifiedFitResultParts {
+            UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
                 blocks: vec![crate::estimate::FittedBlock {
                     beta: beta_user.clone(),
                     role: crate::estimate::BlockRole::Mean,
@@ -7073,8 +7073,8 @@ fn fit_bounded_term_collection_forspec(
                 stable_penalty_term: penalty_term,
                 penalized_objective: fit.penalized_objective,
                 outer_iterations: fit.outer_iterations,
-                outer_converged: fit.converged,
-                outer_gradient_norm: fit.outer_final_gradient_norm,
+                outer_converged: fit.outer_converged,
+                outer_gradient_norm: fit.outer_gradient_norm,
                 standard_deviation: 1.0,
                 covariance_conditional,
                 covariance_corrected: None,
@@ -7096,7 +7096,7 @@ fn fit_bounded_term_collection_forspec(
 
 fn enforce_term_constraint_feasibility(
     design: &TermCollectionDesign,
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
 ) -> Result<(), EstimationError> {
     let tol = 1e-7;
     let smooth_start = design
@@ -7174,7 +7174,7 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
         .collect()
 }
 
-fn fit_score(fit: &FitResult) -> f64 {
+fn fit_score(fit: &UnifiedFitResult) -> f64 {
     if fit.reml_score.is_finite() {
         return fit.reml_score;
     }
@@ -9733,11 +9733,22 @@ where
 /// requires gradient information and builds its own quasi-Newton Hessian
 /// approximation, so it tolerates non-SPD Hessians at intermediate points.
 ///
-/// The function reconstructs the design at each ψ and calls the `exact_fn`
-/// callback for cost + gradient. The Hessian from `exact_fn` is used when
-/// available but the optimizer can proceed without it.
-fn try_two_block_bfgs_fallback<ExactFn>(
-    data: ArrayView2<'_, f64>,
+/// At each iteration, the design X(ψ) and penalties S(ψ) are rebuilt for
+/// both blocks at the current ψ values. The `exact_fn` callback returns
+/// cost + gradient + optional Hessian for the full θ = [ρ, ψ] vector,
+/// with ψ derivatives flowing through each block's own knot-cloud contrast
+/// matrix Z, ensuring correct block-level derivative accounting.
+///
+/// The key structural difference from the single-block aniso path
+/// (`try_exact_joint_spatial_aniso_optimization`): here each block's spatial
+/// terms produce their own `SpatialPsiDerivative` entries embedded into the
+/// joint parameter space at block-specific column ranges. The ext_coords
+/// that reach the unified REML evaluator therefore carry block-tagged
+/// derivative information, and cross-block ψ-ψ Hessian entries are zero
+/// by construction (spatial terms in different blocks are independent
+/// conditional on the inner mode).
+fn try_two_block_bfgs_fallback(
+    _data: ArrayView2<'_, f64>,
     best_meanspec: &TermCollectionSpec,
     best_noisespec: &TermCollectionSpec,
     mean_terms: &[usize],
@@ -9768,13 +9779,17 @@ fn try_two_block_bfgs_fallback<ExactFn>(
     let psi_dim = theta_dim - rho_dim;
 
     log::trace!(
-        "[two-block-bfgs-fallback] starting: rho_dim={}, psi_dim={}, dims_per_term={:?}",
+        "[two-block-bfgs-fallback] starting analytic BFGS: rho_dim={}, psi_dim={}, \
+         mean_spatial_terms={}, noise_spatial_terms={}, dims_per_term={:?}",
         rho_dim,
         psi_dim,
+        mean_terms.len(),
+        noise_terms.len(),
         all_dims,
     );
 
-    struct TwoBlockBfgsContext<'a> {
+    // Shared mutable state: best-tracking + references to immutable config.
+    struct TwoBlockBfgsState<'a> {
         best_meanspec: &'a TermCollectionSpec,
         best_noisespec: &'a TermCollectionSpec,
         mean_terms: &'a [usize],
@@ -9785,16 +9800,32 @@ fn try_two_block_bfgs_fallback<ExactFn>(
         best_cost: f64,
     }
 
-    impl<'a> TwoBlockBfgsContext<'a> {
+    impl<'a> TwoBlockBfgsState<'a> {
         fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
             if cost < self.best_cost {
                 self.best_cost = cost;
                 self.best_theta = theta.clone();
             }
         }
+
+        /// Rebuild specs at the current ψ values.
+        fn specs_at_psi(
+            &self,
+            theta: &Array1<f64>,
+        ) -> Result<(TermCollectionSpec, TermCollectionSpec), String> {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta,
+                self.rho_dim,
+                self.all_dims.to_vec(),
+            );
+            let (mean_lk, noise_lk) = log_kappa.split_at(self.mean_terms.len());
+            let ms = mean_lk.apply_tospec(self.best_meanspec, self.mean_terms)?;
+            let ns = noise_lk.apply_tospec(self.best_noisespec, self.noise_terms)?;
+            Ok((ms, ns))
+        }
     }
 
-    let mut ctx = TwoBlockBfgsContext {
+    let mut state = TwoBlockBfgsState {
         best_meanspec,
         best_noisespec,
         mean_terms,
@@ -9805,42 +9836,10 @@ fn try_two_block_bfgs_fallback<ExactFn>(
         best_cost: f64::INFINITY,
     };
 
-    // Evaluate cost + gradient + hessian at a given theta = [rho, psi].
-    // Each block's spatial psi derivatives are rebuilt at the current psi
-    // to provide analytic derivatives that account for the block structure.
-    let eval_full = |ctx: &TwoBlockBfgsContext<'_>,
-                     theta: &Array1<f64>,
-                     exact_fn: &mut dyn FnMut(
-        &Array1<f64>,
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-        &TermCollectionDesign,
-        &TermCollectionDesign,
-        bool,
-    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
-                     build_pair: &dyn Fn(
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-    ) -> Result<(TermCollectionDesign, TermCollectionDesign), String>|
-     -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-            theta,
-            ctx.rho_dim,
-            ctx.all_dims.to_vec(),
-        );
-        let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(ctx.mean_terms.len());
-        let meanspec_c = mean_log_kappa.apply_tospec(ctx.best_meanspec, ctx.mean_terms)?;
-        let noisespec_c = noise_log_kappa.apply_tospec(ctx.best_noisespec, ctx.noise_terms)?;
-        let (mean_design_c, noise_design_c) = build_pair(&meanspec_c, &noisespec_c)?;
-        exact_fn(
-            &theta.slice(s![..ctx.rho_dim]).to_owned(),
-            &meanspec_c,
-            &noisespec_c,
-            &mean_design_c,
-            &noise_design_c,
-            true,
-        )
-    };
+    // The exact_fn and build_pair are borrowed mutably/immutably; wrap in
+    // RefCells so the closure-based optimizer infrastructure can call them.
+    let exact_fn_cell = std::cell::RefCell::new(exact_fn);
+    let build_pair_ref = build_pair;
 
     let outer_config = OuterConfig {
         tolerance: kappa_options.rel_tol.max(1e-6),
@@ -9857,41 +9856,66 @@ fn try_two_block_bfgs_fallback<ExactFn>(
         initial_rho: Some(theta0.clone()),
     };
 
-    // Wrap the exact_fn + build_pair in RefCells so the closures can borrow them.
-    let exact_fn_cell = std::cell::RefCell::new(exact_fn);
-    let build_pair_cell = std::cell::RefCell::new(build_pair);
-
     let mut obj = ClosureObjective {
-        state: &mut ctx,
+        state: &mut state,
         cap: OuterCapability {
             gradient: Derivative::Analytic,
+            // Hessian is analytic when exact_fn returns Some(hess), but we
+            // declare it as such so BFGS can use it when available while
+            // still proceeding with its quasi-Newton approximation otherwise.
             hessian: Derivative::Analytic,
             n_params: theta_dim,
-            // ψ coordinates move the design, not penalty-like.
+            // ψ coordinates move the design matrix, so they are NOT penalty-like.
             all_penalty_like: false,
             barrier_config: None,
         },
-        cost_fn: |ctx: &mut &mut TwoBlockBfgsContext<'_>, theta: &Array1<f64>| {
-            // Cost-only evaluation: call exact_fn but discard gradient/hessian.
-            let result = eval_full(
-                ctx,
-                theta,
-                &mut *exact_fn_cell.borrow_mut(),
-                &*build_pair_cell.borrow(),
-            );
-            let cost = match result {
-                Ok((c, _, _)) => c,
+        cost_fn: |ctx: &mut &mut TwoBlockBfgsState<'_>, theta: &Array1<f64>| {
+            let cost = match ctx.specs_at_psi(theta) {
+                Ok((ms, ns)) => {
+                    match build_pair_ref(&ms, &ns) {
+                        Ok((md, nd)) => {
+                            match (&mut *exact_fn_cell.borrow_mut())(
+                                &theta.slice(s![..ctx.rho_dim]).to_owned(),
+                                &ms, &ns, &md, &nd,
+                                false, // gradient not needed for cost-only
+                            ) {
+                                Ok((c, _, _)) => c,
+                                Err(_) => f64::INFINITY,
+                            }
+                        }
+                        Err(_) => f64::INFINITY,
+                    }
+                }
                 Err(_) => f64::INFINITY,
             };
             ctx.track_best(theta, cost);
             Ok(cost)
         },
-        eval_fn: |ctx: &mut &mut TwoBlockBfgsContext<'_>, theta: &Array1<f64>| {
-            match eval_full(
-                ctx,
-                theta,
-                &mut *exact_fn_cell.borrow_mut(),
-                &*build_pair_cell.borrow(),
+        eval_fn: |ctx: &mut &mut TwoBlockBfgsState<'_>, theta: &Array1<f64>| {
+            let (ms, ns) = match ctx.specs_at_psi(theta) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            let (md, nd) = match build_pair_ref(&ms, &ns) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            match (&mut *exact_fn_cell.borrow_mut())(
+                &theta.slice(s![..ctx.rho_dim]).to_owned(),
+                &ms, &ns, &md, &nd,
+                true, // need gradient + hessian
             ) {
                 Ok((cost, grad, hess)) => {
                     ctx.track_best(theta, cost);
@@ -9918,10 +9942,10 @@ fn try_two_block_bfgs_fallback<ExactFn>(
                 }),
             }
         },
-        reset_fn: |_ctx: &mut &mut TwoBlockBfgsContext<'_>| {},
+        reset_fn: |_ctx: &mut &mut TwoBlockBfgsState<'_>| {},
         efs_fn: None::<
             fn(
-                &mut &mut TwoBlockBfgsContext<'_>,
+                &mut &mut TwoBlockBfgsState<'_>,
                 &Array1<f64>,
             ) -> Result<EfsEval, EstimationError>,
         >,
@@ -9934,7 +9958,8 @@ fn try_two_block_bfgs_fallback<ExactFn>(
     ) {
         Ok(result) => {
             log::trace!(
-                "[two-block-bfgs-fallback] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+                "[two-block-bfgs-fallback] converged in {} iterations, \
+                 final_value={:.6e}, grad_norm={:.6e}",
                 result.iterations,
                 result.final_value,
                 result.final_grad_norm,
@@ -9946,7 +9971,8 @@ fn try_two_block_bfgs_fallback<ExactFn>(
         }
         Err(e) => {
             log::warn!(
-                "[two-block-bfgs-fallback] BFGS also failed ({}), returning initial theta",
+                "[two-block-bfgs-fallback] BFGS also failed ({}), \
+                 returning initial theta",
                 e
             );
             Ok(theta0.clone())

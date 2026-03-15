@@ -6,10 +6,11 @@ use crate::basis::{
     evaluate_bsplinethird_derivative_scalar,
 };
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec,
     ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
+use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
@@ -1167,7 +1168,7 @@ pub struct BinomialLocationScaleWiggleTermSpec {
 
 #[derive(Debug)]
 pub struct BlockwiseTermFitResult {
-    pub fit: BlockwiseFitResult,
+    pub fit: UnifiedFitResult,
     pub meanspec_resolved: TermCollectionSpec,
     pub noisespec_resolved: TermCollectionSpec,
     pub mean_design: TermCollectionDesign,
@@ -1175,7 +1176,7 @@ pub struct BlockwiseTermFitResult {
 }
 
 struct BlockwiseTermFitResultParts {
-    pub fit: BlockwiseFitResult,
+    pub fit: UnifiedFitResult,
     pub meanspec_resolved: TermCollectionSpec,
     pub noisespec_resolved: TermCollectionSpec,
     pub mean_design: TermCollectionDesign,
@@ -1422,7 +1423,7 @@ fn slice_log_lambda_block(
 pub fn fit_gaussian_location_scale(
     spec: GaussianLocationScaleSpec,
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_gaussian_location_scale")?;
@@ -1482,7 +1483,7 @@ pub fn fit_gaussian_location_scale(
 pub fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_binomial_mean_wiggle")?;
@@ -1526,7 +1527,7 @@ pub fn fit_binomial_mean_wiggle(
 pub fn fit_poisson_log(
     spec: PoissonLogSpec,
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_poisson_log")?;
@@ -1543,7 +1544,7 @@ pub fn fit_poisson_log(
 pub fn fit_gamma_log(
     spec: GammaLogSpec,
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_gamma_log")?;
@@ -1567,7 +1568,7 @@ pub fn fit_gamma_log(
 pub fn fit_binomial_location_scale(
     spec: BinomialLocationScaleSpec,
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_binomial_location_scale")?;
@@ -1637,7 +1638,7 @@ pub fn fit_binomial_location_scale(
 pub fn fit_binomial_location_scalewiggle(
     spec: BinomialLocationScaleWiggleSpec,
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_binomial_location_scalewiggle")?;
@@ -1766,7 +1767,7 @@ trait LocationScaleFamilyBuilder {
     ) -> Self::Family;
     fn extract_primary_betas(
         &self,
-        fit: &BlockwiseFitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String>;
     fn build_psiderivative_blocks(
         &self,
@@ -2270,7 +2271,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 
     fn extract_primary_betas(
         &self,
-        fit: &BlockwiseFitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
         let mean_beta = fit
             .block_states
@@ -2384,7 +2385,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
 
     fn extract_primary_betas(
         &self,
-        fit: &BlockwiseFitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
         let mean_beta = fit
             .block_states
@@ -2516,7 +2517,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
 
     fn extract_primary_betas(
         &self,
-        fit: &BlockwiseFitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
         let mean_beta = fit
             .block_states

@@ -16,7 +16,7 @@ use gam::basis::{
 use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FitResultParts,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, UnifiedFitResult, UnifiedFitResultParts,
     FittedLinkState, ModelSummary, ParametricTermSummary, PredictInput, SmoothTermSummary,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
 };
@@ -540,7 +540,7 @@ fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOp
     Ok(options)
 }
 
-fn compact_fit_result_for_batch(fit: &mut FitResult) {
+fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     if let Some(inf) = fit.inference.as_mut() {
         inf.working_weights = Array1::zeros(0);
         inf.working_response = Array1::zeros(0);
@@ -944,7 +944,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         }
     }
     let (fit, design, resolvedspec, adaptive_regularization_diagnostics): (
-        FitResult,
+        UnifiedFitResult,
         gam::smooth::TermCollectionDesign,
         TermCollectionSpec,
         Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
@@ -6781,7 +6781,7 @@ fn compute_probit_q0_from_eta(
     Ok(q0)
 }
 
-fn compute_probit_q0_from_fit(fit: &gam::BlockwiseFitResult) -> Result<Array1<f64>, String> {
+fn compute_probit_q0_from_fit(fit: &gam::estimate::UnifiedFitResult) -> Result<Array1<f64>, String> {
     let eta_t = fit
         .block_states
         .first()
@@ -6825,7 +6825,7 @@ fn summarizewiggle_domain(
 }
 
 struct StandardBinomialLinkWiggleFitResult {
-    fit_result: FitResult,
+    fit_result: UnifiedFitResult,
     betawiggle: Vec<f64>,
     wiggle_knots: Vec<f64>,
     wiggle_degree: usize,
@@ -6833,7 +6833,7 @@ struct StandardBinomialLinkWiggleFitResult {
 
 fn fit_standard_binomial_linkwiggle(
     design: &gam::smooth::TermCollectionDesign,
-    base_fit: &FitResult,
+    base_fit: &UnifiedFitResult,
     y: &Array1<f64>,
     link_kind: InverseLink,
     wiggle_cfg: &LinkWiggleFormulaSpec,
@@ -7077,7 +7077,7 @@ fn build_location_scale_saved_model(
     training_headers: Vec<String>,
     resolved_termspec: TermCollectionSpec,
     resolved_termspec_noise: TermCollectionSpec,
-    fit_result: FitResult,
+    fit_result: UnifiedFitResult,
     beta_noise: Option<Vec<f64>>,
     noise_transform: Option<&ScaleDeviationTransform>,
     gaussian_response_scale: Option<f64>,
@@ -7180,7 +7180,7 @@ fn core_saved_fit_result(
     beta_covariance: Option<Array2<f64>>,
     beta_covariance_corrected: Option<Array2<f64>>,
     summary: SavedFitSummary,
-) -> FitResult {
+) -> UnifiedFitResult {
     let p = beta.len();
     // Saved models are part of the stable inference contract. Reject non-finite
     // values at construction time so JSON cannot silently encode them as null.
@@ -7223,7 +7223,7 @@ fn core_saved_fit_result(
         let covariance_corrected = inf.beta_covariance_corrected.clone();
         let penalized_objective =
             -0.5 * summary.deviance + summary.stable_penalty_term + summary.reml_score;
-        FitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+        UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
             blocks: vec![gam::estimate::FittedBlock {
                 beta: beta.clone(),
                 role: gam::estimate::BlockRole::Mean,
@@ -7277,7 +7277,7 @@ impl SavedFitSummary {
         Ok(self)
     }
 
-    fn from_blockwise_fit(fit: &gam::BlockwiseFitResult) -> Result<Self, String> {
+    fn from_blockwise_fit(fit: &gam::estimate::UnifiedFitResult) -> Result<Self, String> {
         let deviance = -2.0 * fit.log_likelihood;
         let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
         let max_abs_eta = fit
@@ -7332,7 +7332,7 @@ impl SavedFitSummary {
     }
 
     fn from_survival_location_scale_fit(
-        fit: &gam::survival_location_scale::SurvivalLocationScaleFitResult,
+        fit: &gam::estimate::UnifiedFitResult,
     ) -> Result<Self, String> {
         let deviance = -2.0 * fit.log_likelihood;
         let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
@@ -7390,14 +7390,14 @@ where
     Ok(())
 }
 
-fn saved_mixture_state_from_fit(fit: &FitResult) -> Option<gam::types::MixtureLinkState> {
+fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::MixtureLinkState> {
     match &fit.fitted_link {
         FittedLinkState::Mixture { state, .. } => Some(state.clone()),
         _ => None,
     }
 }
 
-fn saved_sas_state_from_fit(fit: &FitResult) -> Option<gam::types::SasLinkState> {
+fn saved_sas_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::SasLinkState> {
     match &fit.fitted_link {
         FittedLinkState::Sas { state, .. }
         | FittedLinkState::BetaLogistic { state, .. } => Some(state.clone()),
@@ -9500,7 +9500,7 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
     }
 }
 
-fn apply_inverse_link_state_to_fit_result(fit_result: &mut FitResult, inverse_link: &InverseLink) {
+fn apply_inverse_link_state_to_fit_result(fit_result: &mut UnifiedFitResult, inverse_link: &InverseLink) {
     let link = match inverse_link {
         InverseLink::Sas(state) => FittedLinkState::Sas {
             state: state.clone(),
@@ -9746,7 +9746,7 @@ fn covariance_block(cov: &Array2<f64>, start: usize, end: usize) -> Option<Array
 fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
     spec: &TermCollectionSpec,
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
     family: LikelihoodFamily,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -10053,7 +10053,7 @@ fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCov
     }
 }
 
-fn fit_result_from_saved_model_for_prediction(model: &SavedModel) -> Result<FitResult, String> {
+fn fit_result_from_saved_model_for_prediction(model: &SavedModel) -> Result<UnifiedFitResult, String> {
     model.fit_result.clone().ok_or_else(|| {
         "model is missing canonical fit_result payload; refit with current CLI".to_string()
     })
@@ -10236,7 +10236,7 @@ fn weighted_penalty_matrix(
     Ok(out)
 }
 
-fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
+fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
     let log_lambdas = ext.lambdas.mapv(|v| v.max(1e-300).ln());
     let edf = ext
         .inference
@@ -10260,7 +10260,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         .as_ref()
         .and_then(|inf| inf.beta_covariance_corrected.clone());
     let penalized_objective = -0.5 * ext.deviance + ext.stable_penalty_term + ext.reml_score;
-    FitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+    UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
         blocks: vec![gam::estimate::FittedBlock {
             beta: ext.beta.clone(),
             role: gam::estimate::BlockRole::Mean,
@@ -11285,7 +11285,7 @@ mod tests {
             },
         );
         let payload = serde_json::to_string(&fit).expect("serialize fit result");
-        let parsed: gam::estimate::FitResult =
+        let parsed: gam::estimate::UnifiedFitResult =
             serde_json::from_str(&payload).expect("deserialize fit result");
         assert_eq!(parsed.outer_gradient_norm, 0.25);
         assert_eq!(parsed.deviance, 1.5);

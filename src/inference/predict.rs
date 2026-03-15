@@ -1,4 +1,4 @@
-use crate::estimate::{EstimationError, FitResult, FittedLinkState, UnifiedFitResult};
+use crate::estimate::{EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
@@ -143,7 +143,7 @@ pub trait PredictableModel {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError>;
 
@@ -153,7 +153,7 @@ pub trait PredictableModel {
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError>;
 
     /// Number of coefficient blocks in the model.
@@ -228,7 +228,7 @@ impl PredictableModel for StandardPredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         predict_gamwith_uncertainty(
@@ -244,7 +244,7 @@ impl PredictableModel for StandardPredictor {
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         let cov = fit.beta_covariance().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -351,7 +351,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let _ = fit; // not needed for Gaussian LS intervals
@@ -382,7 +382,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Gaussian identity link: posterior mean = point estimate (no nonlinearity).
         let _ = fit;
@@ -580,7 +580,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let _ = fit; // not needed for binomial LS intervals
@@ -622,7 +622,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Full posterior mean with 2D quadrature over (eta_t, eta_s) uncertainty
         // is too complex to extract here. Return point prediction.
@@ -853,7 +853,7 @@ impl PredictableModel for SurvivalPredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let _ = fit; // not needed for survival LS intervals
@@ -899,7 +899,7 @@ impl PredictableModel for SurvivalPredictor {
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        fit: &FitResult,
+        fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Exact posterior mean integration not yet implemented for survival.
         // Return point prediction as approximation.
@@ -1160,7 +1160,7 @@ pub fn predict_gam_posterior_meanwith_fit<X>(
     offset: ArrayView1<'_, f64>,
     family: crate::types::LikelihoodFamily,
     covariance: ArrayView2<'_, f64>,
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
 ) -> Result<PredictPosteriorMeanResult, EstimationError>
 where
     X: Into<DesignMatrix>,
@@ -1263,7 +1263,7 @@ pub fn predict_gamwith_uncertainty<X>(
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     family: crate::types::LikelihoodFamily,
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
     options: &PredictUncertaintyOptions,
 ) -> Result<PredictUncertaintyResult, EstimationError>
 where
@@ -1518,7 +1518,7 @@ where
 
 /// Coefficient-level uncertainty and confidence intervals.
 pub fn coefficient_uncertainty(
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
     confidence_level: f64,
     covariance_mode: InferenceCovarianceMode,
 ) -> Result<CoefficientUncertaintyResult, EstimationError> {
@@ -1527,7 +1527,7 @@ pub fn coefficient_uncertainty(
 
 /// Coefficient-level uncertainty and confidence intervals with explicit covariance mode.
 pub fn coefficient_uncertaintywith_mode(
-    fit: &FitResult,
+    fit: &UnifiedFitResult,
     confidence_level: f64,
     covariance_mode: InferenceCovarianceMode,
 ) -> Result<CoefficientUncertaintyResult, EstimationError> {
