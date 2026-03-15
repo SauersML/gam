@@ -2295,6 +2295,469 @@ pub fn run_nuts_sampling_flattened_family(
 }
 
 // ============================================================================
+// Joint (β, θ) Link-Wiggle HMC
+// ============================================================================
+//
+// NUTS sampling over the joint parameter space [β_eta; β_wiggle] for models
+// with a B-spline link wiggle. The wiggle introduces a nonlinear coupling:
+//
+//   η(β_eta, β_wiggle) = q₀(β_eta) + B(q₀(β_eta)) · β_wiggle
+//
+// where B is a constrained B-spline basis evaluated at the base linear
+// predictor q₀ = X · β_eta. The gradient of log p(y|β_eta, β_wiggle) w.r.t.
+// β_eta picks up a chain-rule factor g'(q₀) = 1 + B'(q₀) · β_wiggle / range_width
+// from the dependence of B on q₀.
+//
+// Whitening uses the Cholesky of the joint Hessian at the mode, exactly as for
+// the standard NutsPosterior. C^1 linear extension outside the training knot
+// range prevents basis evaluation discontinuities.
+
+/// Fixed spline artifacts for link-wiggle posterior sampling.
+#[derive(Clone)]
+pub struct LinkWiggleSplineArtifacts {
+    /// Knot range (min, max) from training (in standardized [0,1] space of q₀)
+    pub knot_range: (f64, f64),
+    /// Full knot vector for B-splines
+    pub knot_vector: Array1<f64>,
+    /// Constraint transform Z (raw basis → constrained basis)
+    pub link_transform: Array2<f64>,
+    /// B-spline degree
+    pub degree: usize,
+}
+
+/// Whitened log-posterior target for joint (β_eta, β_wiggle) with analytical gradients.
+#[derive(Clone)]
+pub struct LinkWigglePosterior {
+    /// Main design matrix X (n × p_main)
+    x: Arc<Array2<f64>>,
+    y: Arc<Array1<f64>>,
+    weights: Arc<Array1<f64>>,
+    /// Penalty for main coefficients (p_main × p_main)
+    penalty_base: Arc<Array2<f64>>,
+    /// Penalty for wiggle coefficients (p_wiggle × p_wiggle)
+    penalty_link: Arc<Array2<f64>>,
+    mode_beta: Arc<Array1<f64>>,
+    mode_theta: Arc<Array1<f64>>,
+    spline: LinkWiggleSplineArtifacts,
+    /// L where LL^T = H^{-1} (joint Hessian)
+    chol: Array2<f64>,
+    /// L^T for gradient chain rule
+    chol_t: Array2<f64>,
+    p_base: usize,
+    p_link: usize,
+    n_samples: usize,
+    nuts_family: NutsFamily,
+    /// Dispersion parameter (only used for Gaussian)
+    scale: f64,
+}
+
+impl LinkWigglePosterior {
+    /// Standardize q₀ values to [0,1] range using training knot bounds.
+    #[inline]
+    fn standardized_z(&self, u: &Array1<f64>) -> (Array1<f64>, Array1<f64>, f64) {
+        let (min_u, max_u) = self.spline.knot_range;
+        let rw = (max_u - min_u).max(1e-6);
+        let z_raw: Array1<f64> = u.mapv(|v| (v - min_u) / rw);
+        let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
+        (z_raw, z_c, rw)
+    }
+
+    /// Creates a new link-wiggle posterior target.
+    pub fn new(
+        x: ArrayView2<f64>,
+        y: ArrayView1<f64>,
+        weights: ArrayView1<f64>,
+        penalty_base: ArrayView2<f64>,
+        penalty_link: ArrayView2<f64>,
+        mode_beta: ArrayView1<f64>,
+        mode_theta: ArrayView1<f64>,
+        hessian: ArrayView2<f64>,
+        spline: LinkWiggleSplineArtifacts,
+        nuts_family: NutsFamily,
+        scale: f64,
+    ) -> Result<Self, String> {
+        let n_samples = x.nrows();
+        let p_base = x.ncols();
+        let p_link = mode_theta.len();
+        let dim = p_base + p_link;
+        if hessian.nrows() != dim || hessian.ncols() != dim {
+            return Err(format!(
+                "LinkWigglePosterior: Hessian dim mismatch: {}x{} vs expected {}x{}",
+                hessian.nrows(),
+                hessian.ncols(),
+                dim,
+                dim,
+            ));
+        }
+        let hessian_owned = hessian.to_owned();
+        let chol_factor = hessian_owned
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("LinkWigglePosterior Cholesky failed: {:?}", e))?;
+        let l_h = chol_factor.lower_triangular();
+        let chol = solve_upper_triangular_transpose(&l_h, dim);
+        let chol_t = chol.t().to_owned();
+        Ok(Self {
+            x: Arc::new(x.to_owned()),
+            y: Arc::new(y.to_owned()),
+            weights: Arc::new(weights.to_owned()),
+            penalty_base: Arc::new(penalty_base.to_owned()),
+            penalty_link: Arc::new(penalty_link.to_owned()),
+            mode_beta: Arc::new(mode_beta.to_owned()),
+            mode_theta: Arc::new(mode_theta.to_owned()),
+            spline,
+            chol,
+            chol_t,
+            p_base,
+            p_link,
+            n_samples,
+            nuts_family,
+            scale,
+        })
+    }
+
+    /// Evaluate the wiggle basis and compute η = q₀ + B(q₀)·θ with C^1 linear extension.
+    fn evaluate_link(&self, u: &Array1<f64>, theta: &Array1<f64>) -> (Array2<f64>, Array1<f64>) {
+        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+        let n = u.len();
+        let n_raw = self
+            .spline
+            .knot_vector
+            .len()
+            .saturating_sub(self.spline.degree + 1);
+        let n_c = self.spline.link_transform.ncols();
+        if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+            return (Array2::zeros((n, 0)), u.clone());
+        }
+
+        let (z_raw, z_c, _) = self.standardized_z(u);
+        let Ok((b_raw_arc, _)) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(self.spline.knot_vector.view()),
+            self.spline.degree,
+            BasisOptions::value(),
+        ) else {
+            return (Array2::zeros((n, n_c)), u.clone());
+        };
+        let mut b_raw = b_raw_arc.as_ref().clone();
+
+        // C^1 linear extension outside [0, 1]:
+        // B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c)
+        let mut needs_ext = false;
+        for i in 0..n {
+            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                needs_ext = true;
+                break;
+            }
+        }
+        if needs_ext
+            && let Ok((b_prime_arc, _)) = create_basis::<Dense>(
+                z_c.view(),
+                KnotSource::Provided(self.spline.knot_vector.view()),
+                self.spline.degree,
+                BasisOptions::first_derivative(),
+            )
+        {
+            let b_prime = b_prime_arc.as_ref();
+            for i in 0..n {
+                let dz = z_raw[i] - z_c[i];
+                if dz.abs() <= 1e-12 {
+                    continue;
+                }
+                for j in 0..b_raw.ncols() {
+                    b_raw[[i, j]] += dz * b_prime[[i, j]];
+                }
+            }
+        }
+
+        let b = if self.spline.link_transform.nrows() == n_raw {
+            b_raw.dot(&self.spline.link_transform)
+        } else {
+            Array2::zeros((n, n_c))
+        };
+        (b.clone(), u + &b.dot(theta))
+    }
+
+    /// Compute dη/dq₀ = 1 + B'(q₀)·θ / range_width (chain-rule factor for β_eta gradient).
+    fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
+        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+        let n = u.len();
+        let mut g = Array1::<f64>::ones(n);
+        let (_, z_c, rw) = self.standardized_z(u);
+        let n_raw = self
+            .spline
+            .knot_vector
+            .len()
+            .saturating_sub(self.spline.degree + 1);
+        let n_c = self.spline.link_transform.ncols();
+        if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+            return g;
+        }
+
+        let Ok((b_prime_raw_arc, _)) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(self.spline.knot_vector.view()),
+            self.spline.degree,
+            BasisOptions::first_derivative(),
+        ) else {
+            return g;
+        };
+        let b_prime_raw = b_prime_raw_arc.as_ref();
+        if self.spline.link_transform.nrows() != n_raw {
+            return g;
+        }
+        let b_prime_constrained = b_prime_raw.dot(&self.spline.link_transform);
+        let dwiggle_dz = b_prime_constrained.dot(theta);
+        for i in 0..n {
+            g[i] = 1.0 + dwiggle_dz[i] / rw;
+        }
+        g
+    }
+
+    /// Compute log-posterior and gradient in whitened coordinates.
+    fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+        let dim = self.p_base + self.p_link;
+
+        // Un-whiten: q = mode + L·z
+        let mut mode = Array1::<f64>::zeros(dim);
+        mode.slice_mut(ndarray::s![0..self.p_base])
+            .assign(&self.mode_beta);
+        mode.slice_mut(ndarray::s![self.p_base..])
+            .assign(&self.mode_theta);
+        let q = &mode + &self.chol.dot(z);
+        let beta = q.slice(ndarray::s![0..self.p_base]).to_owned();
+        let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
+
+        // Compute η = q₀ + B(q₀)·θ where q₀ = X·β
+        let u = self.x.dot(&beta);
+        let (bwiggle, eta) = self.evaluate_link(&u, &theta);
+
+        // Log-likelihood and residuals via family dispatch
+        let ll;
+        let mut residual = Array1::<f64>::zeros(self.n_samples);
+        match self.nuts_family {
+            NutsFamily::Gaussian => {
+                let inv_scale_sq = 1.0 / (self.scale * self.scale).max(1e-10);
+                let mut ll_acc = 0.0;
+                for i in 0..self.n_samples {
+                    let r = self.y[i] - eta[i];
+                    let w = self.weights[i];
+                    ll_acc -= 0.5 * w * r * r * inv_scale_sq;
+                    residual[i] = w * r * inv_scale_sq;
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::BinomialLogit => {
+                let mut ll_acc = 0.0;
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i];
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    ll_acc += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
+                    let mu = NutsPosterior::sigmoid_stable(eta_i);
+                    residual[i] = w_i * (y_i - mu);
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::BinomialProbit => {
+                let mut ll_acc = 0.0;
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i];
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    let log_phi_pos = log_ndtr(eta_i);
+                    let log_phi_neg = log_ndtr(-eta_i);
+                    ll_acc += w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg);
+                    let log_phi = standard_normal_log_pdf(eta_i);
+                    let ratio_pos = (log_phi - log_phi_pos).exp();
+                    let ratio_neg = (log_phi - log_phi_neg).exp();
+                    residual[i] = w_i * (y_i * ratio_pos - (1.0 - y_i) * ratio_neg);
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::BinomialCLogLog => {
+                let mut ll_acc = 0.0;
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i];
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    let neg_exp_eta = (-eta_i.exp()).max(-700.0);
+                    let log_mu = neg_exp_eta.ln_1p().min(0.0).max(-700.0);
+                    let log_1m_mu = neg_exp_eta.min(0.0).max(-700.0);
+                    ll_acc += w_i * (y_i * log_mu + (1.0 - y_i) * log_1m_mu);
+                    let exp_eta = eta_i.exp().min(1e300);
+                    let exp_neg_exp_eta = neg_exp_eta.exp();
+                    let mu = (1.0 - exp_neg_exp_eta).clamp(1e-15, 1.0 - 1e-15);
+                    let dmudeta = exp_eta * exp_neg_exp_eta;
+                    residual[i] = w_i * (y_i - mu) * dmudeta / (mu * (1.0 - mu)).max(1e-30);
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::PoissonLog => {
+                let mut ll_acc = 0.0;
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    let mu = eta_i.exp();
+                    ll_acc += w_i * (y_i * eta_i - mu);
+                    residual[i] = w_i * (y_i - mu);
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::GammaLog => {
+                let mut ll_acc = 0.0;
+                let shape = 1.0 / self.scale.max(1e-10);
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    let mu = eta_i.exp();
+                    ll_acc += w_i * shape * (-y_i / mu - eta_i);
+                    residual[i] = w_i * shape * (y_i / mu - 1.0);
+                }
+                ll = ll_acc;
+            }
+        }
+
+        // Gradient w.r.t. θ (wiggle): ∂ℓ/∂θ = B(q₀)^T · residual − S_link · θ
+        let grad_theta = &bwiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
+
+        // Gradient w.r.t. β_eta: ∂ℓ/∂β = X^T · (residual ⊙ g'(q₀)) − S_base · β
+        // where g'(q₀) = dη/dq₀ is the chain-rule factor
+        let g_prime = self.compute_g_prime(&u, &theta);
+        let r_scaled: Array1<f64> = residual
+            .iter()
+            .zip(g_prime.iter())
+            .map(|(&r, &g)| r * g)
+            .collect();
+        let grad_beta = &fast_atv(&self.x, &r_scaled) - &self.penalty_base.dot(&beta);
+
+        // Penalty
+        let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta))
+            + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+
+        // Assemble joint gradient and transform to whitened space
+        let mut grad_q = Array1::<f64>::zeros(dim);
+        grad_q
+            .slice_mut(ndarray::s![0..self.p_base])
+            .assign(&grad_beta);
+        grad_q
+            .slice_mut(ndarray::s![self.p_base..])
+            .assign(&grad_theta);
+        (ll - penalty, self.chol_t.dot(&grad_q))
+    }
+
+    /// Get the Cholesky factor L for un-whitening samples.
+    pub fn chol(&self) -> &Array2<f64> {
+        &self.chol
+    }
+
+    /// Get the mode [β_eta; β_wiggle].
+    pub fn mode_joint(&self) -> Array1<f64> {
+        let dim = self.p_base + self.p_link;
+        let mut mode = Array1::<f64>::zeros(dim);
+        mode.slice_mut(ndarray::s![0..self.p_base])
+            .assign(&self.mode_beta);
+        mode.slice_mut(ndarray::s![self.p_base..])
+            .assign(&self.mode_theta);
+        mode
+    }
+}
+
+impl HamiltonianTarget<Array1<f64>> for LinkWigglePosterior {
+    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        let (logp, g) = self.compute_logp_and_grad(position);
+        grad.assign(&g);
+        logp
+    }
+}
+
+/// Runs NUTS sampling for joint (β_eta, β_wiggle) in a link-wiggle model.
+pub fn run_link_wiggle_nuts_sampling(
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    weights: ArrayView1<f64>,
+    penalty_base: ArrayView2<f64>,
+    penalty_link: ArrayView2<f64>,
+    mode_beta: ArrayView1<f64>,
+    mode_theta: ArrayView1<f64>,
+    hessian: ArrayView2<f64>,
+    spline: LinkWiggleSplineArtifacts,
+    nuts_family: NutsFamily,
+    scale: f64,
+    config: &NutsConfig,
+) -> Result<NutsResult, String> {
+    let dim = mode_beta.len() + mode_theta.len();
+    let target = LinkWigglePosterior::new(
+        x,
+        y,
+        weights,
+        penalty_base,
+        penalty_link,
+        mode_beta,
+        mode_theta,
+        hessian,
+        spline,
+        nuts_family,
+        scale,
+    )?;
+    let chol = target.chol().clone();
+    let mode_arr = target.mode_joint();
+
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
+        .map(|_| {
+            Array1::from_shape_fn(dim, |_| {
+                let u1: f64 = rng.random::<f64>().max(1e-10);
+                let u2: f64 = rng.random();
+                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
+            })
+        })
+        .collect();
+
+    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
+        target,
+        initial_positions,
+        config.target_accept,
+        mass_cfg,
+    );
+
+    let (samples_array, run_stats) = sampler
+        .run_progress(config.n_samples, config.nwarmup)
+        .map_err(|e| format!("Link-wiggle NUTS sampling failed: {e}"))?;
+    log::info!("Link-wiggle NUTS sampling complete: {}", run_stats);
+
+    // Un-whiten samples: β = mode + L·z
+    let shape = samples_array.shape();
+    let n_chains = shape[0];
+    let n_samples_out = shape[1];
+    let total_samples = n_chains * n_samples_out;
+
+    let mut samples = Array2::<f64>::zeros((total_samples, dim));
+    let mut z_buffer = Array1::<f64>::zeros(dim);
+    for chain in 0..n_chains {
+        for sample_i in 0..n_samples_out {
+            z_buffer.assign(&samples_array.slice(ndarray::s![chain, sample_i, ..]));
+            samples
+                .row_mut(chain * n_samples_out + sample_i)
+                .assign(&(&mode_arr + &chol.dot(&z_buffer)));
+        }
+    }
+
+    let posterior_mean = samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(dim));
+    let posterior_std = samples.std_axis(Axis(0), 0.0);
+    let (rhat, ess) = compute_split_rhat_and_ess(&samples_array);
+    let converged = rhat < 1.1 && ess > 100.0;
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat,
+        ess,
+        converged,
+    })
+}
+
+// ============================================================================
 // Joint (β, ρ) HMC for Skewed Posteriors
 // ============================================================================
 //

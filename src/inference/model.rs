@@ -389,6 +389,24 @@ impl FittedModel {
         matches!(self.predict_model_class(), PredictModelClass::Survival)
     }
 
+    /// Whether this model has a link wiggle component (all three saved fields present).
+    #[inline]
+    pub fn has_link_wiggle(&self) -> bool {
+        let p = self.payload();
+        p.beta_link_wiggle.is_some()
+            && p.linkwiggle_knots.is_some()
+            && p.linkwiggle_degree.is_some()
+    }
+
+    /// Number of wiggle coefficients (0 if no wiggle).
+    #[inline]
+    pub fn link_wiggle_dim(&self) -> usize {
+        self.payload()
+            .beta_link_wiggle
+            .as_ref()
+            .map_or(0, |b| b.len())
+    }
+
     pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, String> {
         let payload = self.payload();
         let raw = match &payload.family_state {
