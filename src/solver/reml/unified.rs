@@ -696,7 +696,8 @@ pub struct HyperCoord {
     /// This is activated for anisotropic ψ coordinates when the problem size
     /// exceeds the implicit operator memory threshold.
     pub b_operator: Option<Box<dyn HyperOperator>>,
-    /// ∂_i log|S|₊ — penalty pseudo-logdet first derivative.
+    /// ∂_i L_δ(S) — smooth penalty pseudo-logdet first derivative.
+    /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
     pub ld_s: f64,
     /// Whether B_i depends on β (true for ψ with non-Gaussian likelihood).
     /// When true, M_i[u] = D_β B_i[u] contributes to the exact outer Hessian.
@@ -725,7 +726,8 @@ pub struct HyperCoordPair {
     pub g: Array1<f64>,
     /// ∂²_ij H|_β — fixed-β Hessian second drift (p×p matrix).
     pub b_mat: Array2<f64>,
-    /// ∂²_ij log|S|₊ — penalty pseudo-logdet second derivative.
+    /// ∂²_ij L_δ(S) — smooth penalty pseudo-logdet second derivative.
+    /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
     pub ld_s: f64,
 }
 
@@ -957,18 +959,114 @@ impl ImplicitHyperOperator {
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Derivatives of log|S(ρ)|₊ with respect to ρ.
+/// Derivatives of the smooth pseudo-logdeterminant L_δ(S) with respect to ρ.
+///
+/// # Smooth δ-regularized pseudo-logdet
+///
+/// Instead of the hard ε-threshold truncation log|S|₊ = Σ_{σ_i > ε} log σ_i,
+/// we use the smooth relaxation from response.md Section 7:
+///
+///   L_δ(S) = log det(S + δI) − m₀ log δ
+///
+/// where m₀ is the known nullity of the penalty family (e.g., polynomial
+/// nullspace dimension for Duchon/TPS/Matérn splines, differencing order for
+/// B-splines).
+///
+/// ## Why the hard threshold is problematic
+///
+/// The hard ε-threshold creates artificial kinks in the REML/LAML objective
+/// when eigenvalues of S(ρ) cross ε as outer parameters θ vary. At these
+/// crossings, both the gradient and Hessian of log|S|₊ are discontinuous,
+/// which:
+/// - Causes BFGS line-search failures and poor convergence
+/// - Requires expensive leakage/moving-nullspace corrections (U₊ᵀ S_k U₀)
+/// - Makes the objective non-differentiable at exactly the points where
+///   the optimizer needs reliable gradient information
+///
+/// ## How L_δ recovers the pseudo-logdet
+///
+/// As δ → 0, the m₀ null eigenvalues contribute m₀ log δ to log det(S + δI),
+/// which is exactly cancelled by the −m₀ log δ correction. The remaining
+/// eigenvalues σ_i > 0 contribute log(σ_i + δ) → log σ_i. Thus L_δ → log|S|₊.
+///
+/// ## Leakage correction is automatic
+///
+/// Because (S + δI) is always full rank, there is no eigenspace partitioning
+/// and no moving-nullspace correction needed. The derivatives are simply:
+///
+///   ∂_k L_δ = tr((S + δI)⁻¹ S_k)
+///   ∂²_kl L_δ = tr((S + δI)⁻¹ S_kl) − tr((S + δI)⁻¹ S_l (S + δI)⁻¹ S_k)
+///
+/// No explicit leakage matrices, no nullspace partitioning, no eigenvalue
+/// thresholding. The full-rank inverse automatically captures what previously
+/// required the moving-nullspace correction terms.
 ///
 /// These are computed once from the penalty structure and shared between
 /// cost and gradient (and optionally Hessian).
+///
+/// Reference: response.md Section 7.
 #[derive(Clone, Debug)]
 pub struct PenaltyLogdetDerivs {
-    /// log|S(ρ)|₊ — the pseudo-logdeterminant value.
+    /// L_δ(S) — the smooth pseudo-logdeterminant value.
+    ///
+    /// L_δ(S) = log det(S + δI) − m₀ log δ, where m₀ is the total penalty
+    /// nullity and δ is chosen proportional to machine epsilon × spectral scale.
     pub value: f64,
-    /// ∂/∂ρₖ log|S|₊ — first derivatives (one per smoothing parameter).
+    /// ∂/∂ρₖ L_δ(S) — first derivatives (one per smoothing parameter).
+    ///
+    /// ∂_k L_δ = tr((S + δI)⁻¹ Aₖ) where Aₖ = λₖ Sₖ.
     pub first: Array1<f64>,
-    /// ∂²/(∂ρₖ∂ρₗ) log|S|₊ — second derivatives (for outer Hessian).
+    /// ∂²/(∂ρₖ∂ρₗ) L_δ(S) — second derivatives (for outer Hessian).
+    ///
+    /// ∂²_kl L_δ = δ_{kl} ∂_k L_δ − λₖ λₗ tr((S + δI)⁻¹ Sₖ (S + δI)⁻¹ Sₗ).
     pub second: Option<Array2<f64>>,
+}
+
+/// Default δ scale factor for the smooth pseudo-logdet regularization.
+///
+/// δ is set to SMOOTH_LOGDET_DELTA_SCALE × max(eigenvalues of S), ensuring
+/// the regularization is negligible relative to the spectral scale but
+/// sufficient to make (S + δI) full rank and C∞ smooth.
+///
+/// The exact value of δ matters less than the smoothness guarantee.
+/// Values in the range 1e-8 to 1e-12 all converge to the true pseudo-logdet
+/// but 1e-10 provides a good balance between numerical conditioning and
+/// accuracy.
+///
+/// Reference: response.md Section 7.
+pub(crate) const SMOOTH_LOGDET_DELTA_SCALE: f64 = 1e-10;
+
+/// Compute the smooth δ-regularized pseudo-logdet: L_δ(S) = log det(S + δI) − m₀ log δ.
+///
+/// This replaces the hard ε-threshold truncation of null eigenvalues.
+/// As δ → 0, L_δ converges to the true pseudo-logdet Σ_{σ_i > 0} log σ_i.
+/// The regularization ensures C∞ smoothness in outer parameters θ,
+/// eliminating artificial kinks when eigenvalues cross the threshold.
+///
+/// # Arguments
+/// * `eigenvalues` - Eigenvalues of S (may include zeros for null eigenvalues)
+/// * `nullity` - m₀, the known nullity of the penalty family
+/// * `delta` - Regularization parameter δ (typically SMOOTH_LOGDET_DELTA_SCALE × max eigenvalue)
+///
+/// Reference: response.md Section 7.
+pub(crate) fn smooth_pseudo_logdet(eigenvalues: &[f64], nullity: usize, delta: f64) -> f64 {
+    let log_det = eigenvalues.iter().map(|&s| (s + delta).ln()).sum::<f64>();
+    log_det - (nullity as f64) * delta.ln()
+}
+
+/// Choose δ for the smooth pseudo-logdet based on the spectral scale.
+///
+/// δ = SMOOTH_LOGDET_DELTA_SCALE × max(|eigenvalues|, 1.0)
+///
+/// The max(., 1.0) floor prevents δ from being too small when all eigenvalues
+/// are near zero (degenerate penalty), which would cause log(δ) to dominate.
+pub(crate) fn smooth_logdet_delta(eigenvalues: &[f64]) -> f64 {
+    let max_ev = eigenvalues
+        .iter()
+        .copied()
+        .fold(0.0_f64, |a, b| a.max(b.abs()))
+        .max(1.0);
+    SMOOTH_LOGDET_DELTA_SCALE * max_ev
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -1634,7 +1732,7 @@ pub fn reml_laml_evaluate(
             0.5 * hop.trace_logdet_h_k(&a_k_matrix, correction.as_ref())
         };
 
-        // Term 3: −½ ∂/∂ρₖ log|S|₊
+        // Term 3: −½ ∂/∂ρₖ L_δ(S) — smooth pseudo-logdet derivative.
         // Zero when include_logdet_s is false (MPL/PQL).
         let det_term = if !incl_logdet_s {
             0.0
@@ -3577,15 +3675,28 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
 /// Compute penalty logdet derivatives for a block-diagonal penalty structure.
 ///
 /// Given per-block penalty matrices and current log-lambdas, computes:
-/// - log|S(ρ)|₊ (the pseudo-logdeterminant)
-/// - ∂/∂ρₖ log|S|₊ = tr(S₊⁻¹ Aₖ) for each smoothing parameter k
+/// Compute the smooth δ-regularized pseudo-logdet and its ρ-derivatives
+/// for a blockwise penalty structure.
+///
+/// Computes:
+/// - L_δ(S) = log det(S + δI) − m₀ log δ  (the smooth pseudo-logdeterminant)
+/// - ∂/∂ρₖ L_δ = tr((S + δI)⁻¹ Aₖ) for each smoothing parameter k
+/// - ∂²/(∂ρₖ∂ρₗ) L_δ (second derivatives for the outer Hessian)
+///
+/// The smooth δ-regularization replaces the hard ε-threshold truncation,
+/// making the objective C∞ in outer parameters and eliminating the need for
+/// leakage/moving-nullspace corrections. See `PenaltyLogdetDerivs` for details.
 ///
 /// `per_block_rho[b]` contains the log-lambdas for block b.
 /// `per_block_penalties[b]` contains the penalty matrices for block b.
-/// `ridge` is the ridge to add for logdet stability (0 if not applicable).
+/// `per_block_nullity[b]` contains the penalty nullities for block b (one per penalty).
+/// `ridge` is an additional ridge for logdet stability (0 if not applicable).
+///
+/// Reference: response.md Section 7.
 pub fn compute_block_penalty_logdet_derivs(
     per_block_rho: &[Array1<f64>],
     per_block_penalties: &[&[Array2<f64>]],
+    per_block_nullity: &[&[usize]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
     use faer::Side;
@@ -3616,40 +3727,45 @@ pub fn compute_block_penalty_logdet_derivs(
             }
         }
 
-        // Eigendecomposition for logdet and pseudo-inverse.
+        // Eigendecomposition of S_b.
         let (eigs, vecs) = s_block
             .eigh(Side::Lower)
             .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
 
-        let max_ev = eigs.iter().copied().fold(0.0_f64, f64::max);
-        let tol = (p.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
+        // Compute δ proportional to machine epsilon × spectral scale.
+        let delta = smooth_logdet_delta(eigs.as_slice().unwrap());
 
-        // log|S_b|₊
-        let block_logdet: f64 = eigs.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum();
+        // Total block nullity m₀ = sum of per-penalty nullities.
+        // For a single-penalty block, this is the penalty's nullspace dimension.
+        // For multi-penalty blocks, we use the combined nullity of the penalty sum.
+        let block_nullity: usize = if b < per_block_nullity.len() {
+            per_block_nullity[b].iter().copied().max().unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Smooth pseudo-logdet: L_δ(S_b) = log det(S_b + δI) − m₀ log δ.
+        let block_logdet =
+            smooth_pseudo_logdet(eigs.as_slice().unwrap(), block_nullity, delta);
         log_det_total += block_logdet;
 
-        // S₊⁻¹ for trace derivatives: pseudo-inverse using active eigenvalues.
-        let n_active = eigs.iter().filter(|&&v| v > tol).count();
-        let mut w_factor = Array2::zeros((p, n_active));
-        let mut w_col = 0;
+        // (S + δI)⁻¹ for trace derivatives: full-rank inverse (no eigenspace
+        // partitioning needed). Every eigenvalue is shifted by δ, so all are positive.
+        //
+        // W_factor: W such that W Wᵀ = (S + δI)⁻¹.
+        // W_factor has shape (p, p) since (S + δI) is full rank.
+        let mut w_factor = Array2::zeros((p, p));
         for (idx, &ev) in eigs.iter().enumerate() {
-            if ev > tol {
-                let scale = 1.0 / ev.sqrt();
-                for row in 0..p {
-                    w_factor[[row, w_col]] = vecs[[row, idx]] * scale;
-                }
-                w_col += 1;
+            let scale = 1.0 / (ev + delta).sqrt();
+            for row in 0..p {
+                w_factor[[row, idx]] = vecs[[row, idx]] * scale;
             }
         }
 
         // For each smoothing parameter in this block:
-        // ∂/∂ρ_k log|S|₊ = tr(S₊⁻¹ A_k) = tr(S₊⁻¹ λ_k S_k)
+        // ∂/∂ρ_k L_δ = tr((S + δI)⁻¹ A_k) = tr(W Wᵀ A_k) = tr(Wᵀ A_k W).
         for (k, s_k) in penalties.iter().enumerate() {
             let a_k = s_k.mapv(|v| lambdas[k] * v);
-            // tr(S₊⁻¹ A_k) = tr(W Wᵀ A_k) = ‖A_k W‖²_F / ... no, use W Wᵀ form:
-            // tr(S₊⁻¹ A_k) = Σ_{i,j} S₊⁻¹[i,j] * A_k[j,i]
-            // = Σ_{i,j} (W Wᵀ)[i,j] * A_k[j,i]
-            // = tr(Wᵀ A_k W) since A_k is symmetric.
             let aw = a_k.dot(&w_factor);
             let trace: f64 = aw.iter().zip(w_factor.iter()).map(|(&a, &w)| a * w).sum();
             first[at + k] = trace;
@@ -3682,22 +3798,20 @@ pub fn compute_block_penalty_logdet_derivs(
         let (eigs, vecs) = s_block
             .eigh(faer::Side::Lower)
             .map_err(|e| format!("penalty det2 eigendecomposition failed for block {b}: {e}"))?;
-        let max_ev = eigs.iter().copied().fold(0.0_f64, f64::max);
-        let tol = (p.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
-        let n_active = eigs.iter().filter(|&&v| v > tol).count();
-        let mut w_factor = Array2::zeros((p, n_active));
-        let mut w_col = 0;
+
+        // Use the same δ as for the value computation.
+        let delta = smooth_logdet_delta(eigs.as_slice().unwrap());
+
+        // Full-rank (S + δI)⁻¹ factor: W such that W Wᵀ = (S + δI)⁻¹.
+        let mut w_factor = Array2::zeros((p, p));
         for (idx, &ev) in eigs.iter().enumerate() {
-            if ev > tol {
-                let scale = 1.0 / ev.sqrt();
-                for row in 0..p {
-                    w_factor[[row, w_col]] = vecs[[row, idx]] * scale;
-                }
-                w_col += 1;
+            let scale = 1.0 / (ev + delta).sqrt();
+            for row in 0..p {
+                w_factor[[row, idx]] = vecs[[row, idx]] * scale;
             }
         }
 
-        // Y_k = S₊⁻¹ A_k = W Wᵀ A_k → in reduced space: Y_k_r = Wᵀ A_k W
+        // Y_k = (S + δI)⁻¹ A_k = W Wᵀ A_k → in reduced space: Y_k_r = Wᵀ A_k W
         let kb = block_rho.len();
         let mut y_k_reduced = Vec::with_capacity(kb);
         for (k, s_k) in penalties.iter().enumerate() {
@@ -3707,9 +3821,13 @@ pub fn compute_block_penalty_logdet_derivs(
             y_k_reduced.push(y_kr);
         }
 
+        // Second derivatives of L_δ:
+        //   ∂²_kl L_δ = δ_{kl} ∂_k L_δ − λ_k λ_l tr((S+δI)⁻¹ S_k (S+δI)⁻¹ S_l)
+        //
+        // No leakage correction needed: (S + δI) is always full rank, so
+        // eigenspace partitioning and moving-nullspace terms vanish.
         for k in 0..kb {
             for l in 0..=k {
-                // det2[k,l] = δ_{kl} det1[k] - λ_k λ_l tr(S₊⁻¹ S_k S₊⁻¹ S_l)
                 let tr_ab: f64 = y_k_reduced[k]
                     .iter()
                     .zip(y_k_reduced[l].t().iter())
@@ -4592,16 +4710,18 @@ mod tests {
         let deviance = yty - 2.0 * beta.dot(&xty) + beta.dot(&xtx.dot(&beta));
         let log_likelihood = -0.5 * deviance;
 
-        // Penalty logdet: log|Σ λₖ Sₖ|₊
+        // Penalty logdet: L_δ(Σ λₖ Sₖ) = log det(S + δI) − m₀ log δ
         let mut s_total = Array2::zeros((p, p));
         s_total.scaled_add(lambdas[0], &s1);
         s_total.scaled_add(lambdas[1], &s2);
         let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
         let tol = 1e-10;
-        let log_det_s: f64 = s_eigs.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum();
         let penalty_rank = s_eigs.iter().filter(|&&v| v > tol).count();
+        let nullity = p - penalty_rank;
+        let delta = smooth_logdet_delta(s_eigs.as_slice().unwrap());
+        let log_det_s = smooth_pseudo_logdet(s_eigs.as_slice().unwrap(), nullity, delta);
 
-        // Penalty logdet first derivatives (numerical for correctness).
+        // Penalty logdet first derivatives (numerical FD using smooth L_δ).
         let mut det1 = Array1::zeros(rho.len());
         let eps = 1e-7;
         for k in 0..rho.len() {
@@ -4612,11 +4732,9 @@ mod tests {
             s_plus.scaled_add(lambdas_plus[0], &s1);
             s_plus.scaled_add(lambdas_plus[1], &s2);
             let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
-            let log_det_s_plus: f64 = s_eigs_plus
-                .iter()
-                .filter(|&&v| v > tol)
-                .map(|&v| v.ln())
-                .sum();
+            let delta_plus = smooth_logdet_delta(s_eigs_plus.as_slice().unwrap());
+            let log_det_s_plus =
+                smooth_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), nullity, delta_plus);
 
             let mut rho_minus = rho.to_vec();
             rho_minus[k] -= eps;
@@ -4625,11 +4743,9 @@ mod tests {
             s_minus.scaled_add(lambdas_minus[0], &s1);
             s_minus.scaled_add(lambdas_minus[1], &s2);
             let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
-            let log_det_s_minus: f64 = s_eigs_minus
-                .iter()
-                .filter(|&&v| v > tol)
-                .map(|&v| v.ln())
-                .sum();
+            let delta_minus = smooth_logdet_delta(s_eigs_minus.as_slice().unwrap());
+            let log_det_s_minus =
+                smooth_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), nullity, delta_minus);
 
             det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
         }
