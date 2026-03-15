@@ -13,7 +13,7 @@ pub mod types;
 
 pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
-pub use solver::{estimate, joint, mixture_link, pirls, seeding, smoothing, visualizer, workflow};
+pub use solver::{estimate, mixture_link, pirls, seeding, smoothing, visualizer, workflow};
 pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;

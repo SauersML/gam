@@ -3077,8 +3077,7 @@ impl<'a> RemlState<'a> {
         barrier_config: Option<super::unified::BarrierConfig>,
     ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
         use super::unified::{
-            InnerSolutionBuilder, compute_efs_update, compute_hybrid_efs_update,
-            reml_laml_evaluate,
+            InnerSolutionBuilder, compute_efs_update, compute_hybrid_efs_update, reml_laml_evaluate,
         };
 
         let n_observations = self.y.len();
@@ -3102,10 +3101,7 @@ impl<'a> RemlState<'a> {
 
         // Check whether any ψ (design-moving) coordinates are present.
         // If so, we need the hybrid path which requires the gradient.
-        let has_psi = inner_solution
-            .ext_coords
-            .iter()
-            .any(|c| !c.is_penalty_like);
+        let has_psi = inner_solution.ext_coords.iter().any(|c| !c.is_penalty_like);
 
         // For pure EFS: cost only (no gradient needed).
         // For hybrid EFS: cost + gradient (gradient needed for ψ block).
@@ -3129,13 +3125,9 @@ impl<'a> RemlState<'a> {
                 None
             }
         };
-        let cost_result = reml_laml_evaluate(
-            &inner_solution,
-            rho.as_slice().unwrap(),
-            eval_mode,
-            prior,
-        )
-        .map_err(|e| EstimationError::InvalidInput(e))?;
+        let cost_result =
+            reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), eval_mode, prior)
+                .map_err(|e| EstimationError::InvalidInput(e))?;
 
         if has_psi {
             // Hybrid path: EFS for ρ/τ + preconditioned gradient for ψ.
