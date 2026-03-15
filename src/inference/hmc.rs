@@ -24,7 +24,7 @@
 //! sharing across chains without duplication when general-mcmc clones the target.
 
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
-use crate::solver::reml::unified::compute_block_penalty_logdet_derivs;
+use crate::estimate::reml::unified::compute_block_penalty_logdet_derivs;
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -33,7 +33,6 @@ use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatr
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use polya_gamma::PolyaGamma;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as StdRng08};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -338,12 +337,13 @@ struct SharedData {
 ///
 /// Uses Arc for shared data to prevent memory explosion when cloned for chains.
 /// Uses faer for numerically stable Cholesky decomposition.
-#[derive(Clone)]
 /// Family mode for NUTS log-likelihood computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NutsFamily {
     Gaussian,
     BinomialLogit,
+    BinomialProbit,
+    BinomialCLogLog,
     PoissonLog,
     GammaLog,
 }
@@ -525,6 +525,8 @@ fn nuts_family_logp_and_grad(
 ) -> (f64, Array1<f64>) {
     match family {
         NutsFamily::BinomialLogit => logit_logp_and_grad(data, eta),
+        NutsFamily::BinomialProbit => probit_logp_and_grad(data, eta),
+        NutsFamily::BinomialCLogLog => cloglog_logp_and_grad(data, eta),
         NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
         NutsFamily::GammaLog => gamma_log_logp_and_grad(data, eta),
@@ -546,6 +548,120 @@ fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64
         ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
         let mu = NutsPosterior::sigmoid_stable(eta_i);
         residual[i] = w_i * (y_i - mu);
+    }
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
+}
+
+/// Probit regression log-likelihood and gradient.
+///
+/// log p(y|η) = Σ [y·log Φ(η) + (1-y)·log(1-Φ(η))],
+/// gradient_i = w_i · [y_i · φ(η_i)/Φ(η_i) − (1-y_i) · φ(η_i)/(1−Φ(η_i))]
+///
+/// Uses erfc-based log Φ for numerical stability.
+fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut residual = Array1::<f64>::zeros(n);
+
+    // Stable log Φ(x) = log(erfc(-x/√2) / 2) = log(erfc(-x/√2)) - ln(2)
+    // For large positive x: Φ(x) ≈ 1, log Φ(x) ≈ 0
+    // For large negative x: erfc result is tiny but nonzero; for extreme cases
+    // fall back to asymptotic log Φ(x) ≈ -x²/2 - log(-x) - 0.5·log(2π).
+    #[inline]
+    fn log_ndtr(x: f64) -> f64 {
+        let arg = -x * std::f64::consts::FRAC_1_SQRT_2;
+        let erfc_val = statrs::function::erf::erfc(arg);
+        if erfc_val > 0.0 {
+            erfc_val.ln() - std::f64::consts::LN_2
+        } else {
+            // Extreme negative x: asymptotic expansion
+            // log Φ(x) ≈ -x²/2 - log(-x) - 0.5·log(2π)
+            -0.5 * x * x - (-x).ln() - 0.918_938_533_204_672_7 // 0.5·ln(2π)
+        }
+    }
+
+    for i in 0..n {
+        let eta_i = eta[i];
+        let y_i = data.y[i];
+        let w_i = data.weights[i];
+
+        // log Φ(η) and log(1−Φ(η)) = log Φ(−η)
+        let log_phi_pos = log_ndtr(eta_i);
+        let log_phi_neg = log_ndtr(-eta_i);
+
+        ll += w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg);
+
+        // Gradient: y · φ/Φ − (1−y) · φ/(1−Φ)
+        // Compute ratios via exp(log φ − log Φ) for stability.
+        // log φ(x) = −x²/2 − 0.5·ln(2π)
+        let log_phi_val = -0.5 * eta_i * eta_i - 0.918_938_533_204_672_7;
+
+        // Inverse Mills ratio: φ(η)/Φ(η) = exp(log φ − log Φ)
+        let ratio_pos = (log_phi_val - log_phi_pos).exp();
+        // φ(η)/(1−Φ(η)) = exp(log φ − log Φ(−η))
+        let ratio_neg = (log_phi_val - log_phi_neg).exp();
+
+        let grad_i = y_i * ratio_pos - (1.0 - y_i) * ratio_neg;
+        residual[i] = w_i * grad_i;
+    }
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
+}
+
+/// Complementary log-log regression log-likelihood and gradient.
+///
+/// CLogLog link: μ = 1 − exp(−exp(η))
+/// log p(y|η) = Σ [y·log(1−exp(−exp(η))) + (1−y)·(−exp(η))]
+/// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
+fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut residual = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let eta_i = eta[i].clamp(-700.0, 700.0);
+        let y_i = data.y[i];
+        let w_i = data.weights[i];
+
+        let exp_eta = eta_i.exp();
+        // −exp(η) clamped to avoid overflow in exp(−exp(η))
+        let neg_exp_eta = (-exp_eta).clamp(-700.0, 0.0);
+
+        // log(1 − exp(−exp(η))): use log1p(−exp(−exp(η))) = log1p(exp(−exp(η))·(−1))
+        // For small exp(η), exp(−exp(η)) ≈ 1 − exp(η), so 1−exp(−exp(η)) ≈ exp(η)
+        // and log(1−exp(−exp(η))) ≈ η
+        let exp_neg_exp_eta = neg_exp_eta.exp(); // exp(−exp(η))
+        let log_mu = if exp_eta < 1e-6 {
+            // Small exp(η): log(1 - exp(-exp(η))) ≈ log(exp(η) - exp(η)²/2)
+            // ≈ η + log(1 - exp(η)/2) ≈ η for very small
+            (-exp_neg_exp_eta).ln_1p()
+        } else {
+            (-exp_neg_exp_eta).ln_1p()
+        };
+
+        // log(1−μ) = log(exp(−exp(η))) = −exp(η)
+        let log_one_minus_mu = -exp_eta;
+
+        ll += w_i * (y_i * log_mu + (1.0 - y_i) * log_one_minus_mu);
+
+        // Gradient: d/dη [y·log(μ) + (1-y)·log(1-μ)]
+        // = y · exp(η)·exp(−exp(η)) / (1−exp(−exp(η))) + (1-y)·(−exp(η))
+        //
+        // The ratio exp(η)·exp(−exp(η)) / (1−exp(−exp(η))) can be computed as
+        // exp(η) · exp(log(exp(−exp(η))) − log(1−exp(−exp(η))))
+        // = exp(η) · exp(−exp(η) − log_mu)
+        let grad_y1 = if log_mu.is_finite() && log_mu > -700.0 {
+            exp_eta * (neg_exp_eta - log_mu).exp()
+        } else {
+            // Fallback for extreme values: μ ≈ 0, ratio → 1
+            1.0
+        };
+        let grad_y0 = -exp_eta;
+
+        residual[i] = w_i * (y_i * grad_y1 + (1.0 - y_i) * grad_y0);
     }
 
     let grad_ll = fast_atv(&data.x, &residual);
@@ -1591,7 +1707,7 @@ pub fn run_logit_polya_gamma_gibbs(
 
     for chain in 0..config.n_chains {
         progress.begin_chain(chain, "polya-gamma gibbs");
-        let mut pg_rng = StdRng08::seed_from_u64(
+        let mut pg_rng = StdRng::seed_from_u64(
             config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
         );
         let pg = PolyaGamma::new(1.0);
@@ -1747,7 +1863,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
     let mut kept = 0usize;
     for chain in 0..config.n_chains {
-        let mut pg_rng = StdRng08::seed_from_u64(
+        let mut pg_rng = StdRng::seed_from_u64(
             config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
         );
         let pg = PolyaGamma::new(1.0);
@@ -2023,13 +2139,27 @@ pub fn run_nuts_sampling_flattened_family(
                 )
             }
         }
-        (LikelihoodFamily::BinomialProbit, FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialProbit NUTS is not implemented yet; use fit_gam/predict_gam for probit models"
-                .to_string(),
+        (LikelihoodFamily::BinomialProbit, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+            glm.x,
+            glm.y,
+            glm.weights,
+            glm.penalty_matrix,
+            glm.mode,
+            glm.hessian,
+            NutsFamily::BinomialProbit,
+            false,
+            config,
         ),
-        (LikelihoodFamily::BinomialCLogLog, FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialCLogLog NUTS is not implemented yet; use fit_gam/predict_gam for cloglog models"
-                .to_string(),
+        (LikelihoodFamily::BinomialCLogLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+            glm.x,
+            glm.y,
+            glm.weights,
+            glm.penalty_matrix,
+            glm.mode,
+            glm.hessian,
+            NutsFamily::BinomialCLogLog,
+            false,
+            config,
         ),
         (LikelihoodFamily::BinomialMixture, FamilyNutsInputs::Glm(_)) => Err(
             "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for blended inverse-link models"

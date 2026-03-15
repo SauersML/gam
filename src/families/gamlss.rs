@@ -1819,11 +1819,98 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
-    // Covered exact spatial families must use the unified exact-joint hyper
-    // path and must never fall back to the older finite-difference search.
-    // That exact path is the only implementation that knows how to evaluate
-    // the full profiled/Laplace objective over theta = [rho, psi] with the
-    // real joint Hessian required by NewtonTR/ARC.
+    // Macro to invoke the exact-joint spatial optimizer with shared closures.
+    // Both the required-exact and opportunistic-exact branches use identical
+    // inner-fit and outer-eval logic; only the error-handling wrapper differs.
+    // The exact path evaluates the full profiled/Laplace objective over
+    // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.
+    macro_rules! run_exact_joint_spatial {
+        () => {{
+            let joint_setup = build_two_block_exact_joint_setup(
+                builder.meanspec(),
+                builder.noisespec(),
+                mean_penalty_count,
+                noise_penalty_count,
+                extra_rho0.as_slice().unwrap_or(&[]),
+                kappa_options,
+            );
+            let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
+            let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+            optimize_two_block_spatial_length_scale_exact_joint(
+                data,
+                builder.meanspec(),
+                builder.noisespec(),
+                kappa_options,
+                &joint_setup,
+                |rho, _, _, mean_design, noise_design| {
+                    let fit = {
+                        let blocks = builder.build_blocks(
+                            rho,
+                            mean_design,
+                            noise_design,
+                            mean_beta_hint_cell.borrow().clone(),
+                            noise_beta_hint_cell.borrow().clone(),
+                        )?;
+                        let family = builder.build_family(mean_design, noise_design);
+                        fit_custom_family(&family, &blocks, options)?
+                    };
+                    let layout = GamlssLambdaLayout::two_block(
+                        builder.mean_penalty_count(mean_design),
+                        builder.noise_penalty_count(noise_design),
+                    );
+                    if fit.log_lambdas.len() >= layout.total() {
+                        mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                        noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
+                    }
+                    let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
+                    mean_beta_hint = Some(mean_beta);
+                    noise_beta_hint = Some(noise_beta);
+                    *mean_beta_hint_cell.borrow_mut() = mean_beta_hint.clone();
+                    *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
+                    Ok(fit)
+                },
+                |rho,
+                 meanspec_resolved,
+                 noisespec_resolved,
+                 mean_design,
+                 noise_design,
+                 need_hessian| {
+                    let blocks = builder.build_blocks(
+                        rho,
+                        mean_design,
+                        noise_design,
+                        mean_beta_hint_cell.borrow().clone(),
+                        noise_beta_hint_cell.borrow().clone(),
+                    )?;
+                    let family = builder.build_family(mean_design, noise_design);
+                    let psiderivative_blocks = builder.build_psiderivative_blocks(
+                        data,
+                        meanspec_resolved,
+                        noisespec_resolved,
+                        mean_design,
+                        noise_design,
+                    )?;
+                    let eval = evaluate_custom_family_joint_hyper(
+                        &family,
+                        &blocks,
+                        options,
+                        rho,
+                        &psiderivative_blocks,
+                        None,
+                        need_hessian,
+                    )?;
+                    if need_hessian && eval.outer_hessian.is_none() {
+                        return Err(
+                            "exact two-block spatial objective requires a full joint [rho, psi] hessian"
+                                .to_string(),
+                        );
+                    }
+                    Ok((eval.objective, eval.gradient, eval.outer_hessian))
+                },
+            )
+        }};
+    }
+
     let mut solved = if require_exact_spatial_joint {
         if !exact_joint_ready {
             return Err(
@@ -1831,178 +1918,15 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     .to_string(),
             );
         }
-        let joint_setup = build_two_block_exact_joint_setup(
-            builder.meanspec(),
-            builder.noisespec(),
-            mean_penalty_count,
-            noise_penalty_count,
-            extra_rho0.as_slice().unwrap_or(&[]),
-            kappa_options,
-        );
-        let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
-        let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
-        optimize_two_block_spatial_length_scale_exact_joint(
-            data,
-            builder.meanspec(),
-            builder.noisespec(),
-            kappa_options,
-            &joint_setup,
-            |rho, _, _, mean_design, noise_design| {
-                let fit = {
-                    let blocks = builder.build_blocks(
-                        rho,
-                        mean_design,
-                        noise_design,
-                        mean_beta_hint_cell.borrow().clone(),
-                        noise_beta_hint_cell.borrow().clone(),
-                    )?;
-                    let family = builder.build_family(mean_design, noise_design);
-                    fit_custom_family(&family, &blocks, options)?
-                };
-                let layout = GamlssLambdaLayout::two_block(
-                    builder.mean_penalty_count(mean_design),
-                    builder.noise_penalty_count(noise_design),
-                );
-                if fit.log_lambdas.len() >= layout.total() {
-                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                }
-                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                mean_beta_hint = Some(mean_beta);
-                noise_beta_hint = Some(noise_beta);
-                *mean_beta_hint_cell.borrow_mut() = mean_beta_hint.clone();
-                *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
-                Ok(fit)
-            },
-            |rho,
-             meanspec_resolved,
-             noisespec_resolved,
-             mean_design,
-             noise_design,
-             need_hessian| {
-                let blocks = builder.build_blocks(
-                    rho,
-                    mean_design,
-                    noise_design,
-                    mean_beta_hint_cell.borrow().clone(),
-                    noise_beta_hint_cell.borrow().clone(),
-                )?;
-                let family = builder.build_family(mean_design, noise_design);
-                let psiderivative_blocks = builder.build_psiderivative_blocks(
-                    data,
-                    meanspec_resolved,
-                    noisespec_resolved,
-                    mean_design,
-                    noise_design,
-                )?;
-                let eval = evaluate_custom_family_joint_hyper(
-                    &family,
-                    &blocks,
-                    options,
-                    rho,
-                    &psiderivative_blocks,
-                    None,
-                    need_hessian,
-                )?;
-                if need_hessian && eval.outer_hessian.is_none() {
-                    return Err(
-                        "exact two-block spatial objective requires a full joint [rho, psi] hessian"
-                            .to_string(),
-                    );
-                }
-                Ok((eval.objective, eval.gradient, eval.outer_hessian))
-            },
-        )
-        .map_err(|err| {
+        run_exact_joint_spatial!().map_err(|err| {
             format!(
                 "exact two-block spatial optimization failed and finite-difference fallback is disabled for this family: {err}"
             )
         })?
     } else if exact_joint_ready {
-        // The exact-joint path now handles its own fallback (Arc → BFGS)
+        // The exact-joint path now handles its own fallback (Arc -> BFGS)
         // internally via run_outer's fallback_sequence.
-        let joint_setup = build_two_block_exact_joint_setup(
-            builder.meanspec(),
-            builder.noisespec(),
-            mean_penalty_count,
-            noise_penalty_count,
-            extra_rho0.as_slice().unwrap_or(&[]),
-            kappa_options,
-        );
-        let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
-        let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
-        match optimize_two_block_spatial_length_scale_exact_joint(
-            data,
-            builder.meanspec(),
-            builder.noisespec(),
-            kappa_options,
-            &joint_setup,
-            |rho, _, _, mean_design, noise_design| {
-                let fit = {
-                    let blocks = builder.build_blocks(
-                        rho,
-                        mean_design,
-                        noise_design,
-                        mean_beta_hint_cell.borrow().clone(),
-                        noise_beta_hint_cell.borrow().clone(),
-                    )?;
-                    let family = builder.build_family(mean_design, noise_design);
-                    fit_custom_family(&family, &blocks, options)?
-                };
-                let layout = GamlssLambdaLayout::two_block(
-                    builder.mean_penalty_count(mean_design),
-                    builder.noise_penalty_count(noise_design),
-                );
-                if fit.log_lambdas.len() >= layout.total() {
-                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                }
-                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                mean_beta_hint = Some(mean_beta);
-                noise_beta_hint = Some(noise_beta);
-                *mean_beta_hint_cell.borrow_mut() = mean_beta_hint.clone();
-                *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
-                Ok(fit)
-            },
-            |rho,
-             meanspec_resolved,
-             noisespec_resolved,
-             mean_design,
-             noise_design,
-             need_hessian| {
-                let blocks = builder.build_blocks(
-                    rho,
-                    mean_design,
-                    noise_design,
-                    mean_beta_hint_cell.borrow().clone(),
-                    noise_beta_hint_cell.borrow().clone(),
-                )?;
-                let family = builder.build_family(mean_design, noise_design);
-                let psiderivative_blocks = builder.build_psiderivative_blocks(
-                    data,
-                    meanspec_resolved,
-                    noisespec_resolved,
-                    mean_design,
-                    noise_design,
-                )?;
-                let eval = evaluate_custom_family_joint_hyper(
-                    &family,
-                    &blocks,
-                    options,
-                    rho,
-                    &psiderivative_blocks,
-                    None,
-                    need_hessian,
-                )?;
-                if need_hessian && eval.outer_hessian.is_none() {
-                    return Err(
-                        "exact two-block spatial objective requires a full joint [rho, psi] hessian"
-                            .to_string(),
-                    );
-                }
-                Ok((eval.objective, eval.gradient, eval.outer_hessian))
-            },
-        ) {
+        match run_exact_joint_spatial!() {
             Ok(sol) => {
                 usedfd_spatial_search = false;
                 sol

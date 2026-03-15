@@ -1,5 +1,6 @@
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1662,6 +1663,33 @@ fn main() {
     );
     emit_stage_detail(&fake_usage_report);
     allviolations.extend(fake_usageviolations);
+
+    update_stage("scan inert touch calls");
+    let inert_touchviolations = scan_for_inert_touch_calls();
+    let inert_touch_report = format!(
+        "inert touch scan identified {} violation groups",
+        inert_touchviolations.len()
+    );
+    emit_stage_detail(&inert_touch_report);
+    allviolations.extend(inert_touchviolations);
+
+    update_stage("scan suspicious macro wrappers");
+    let suspicious_macroviolations = scan_for_suspicious_macro_wrappers();
+    let suspicious_macro_report = format!(
+        "suspicious macro scan identified {} violation groups",
+        suspicious_macroviolations.len()
+    );
+    emit_stage_detail(&suspicious_macro_report);
+    allviolations.extend(suspicious_macroviolations);
+
+    update_stage("scan assertion alias evasions");
+    let assertion_aliasviolations = scan_for_assertion_alias_evasions();
+    let assertion_alias_report = format!(
+        "assertion alias scan identified {} violation groups",
+        assertion_aliasviolations.len()
+    );
+    emit_stage_detail(&assertion_alias_report);
+    allviolations.extend(assertion_aliasviolations);
 
     update_stage("scan degenerate boolean composites");
     let degenerate_booleanviolations = scan_for_degenerate_boolean_expressions();
@@ -3561,6 +3589,1139 @@ fn is_in_target_directory(path: impl AsRef<Path>) -> bool {
 
 fn is_in_ignored_directory(path: impl AsRef<Path>) -> bool {
     is_in_target_directory(path.as_ref()) || is_in_hidden_directory(path.as_ref())
+}
+
+#[derive(Clone)]
+struct SimpleBoolHelper {
+    params: Vec<String>,
+    body_expr: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimpleMacroAliasKind {
+    IdentityExpr,
+    BlackBoxTouch,
+    SizeOfValTouch,
+}
+
+#[derive(Clone)]
+struct SimpleMacroAlias {
+    line_number: usize,
+    kind: SimpleMacroAliasKind,
+}
+
+struct UnsignedSymbolHints {
+    value_names: HashSet<String>,
+    method_names: HashSet<String>,
+}
+
+fn scan_for_inert_touch_calls() -> Vec<String> {
+    let mut allviolations = Vec::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !is_in_ignored_directory(e.path()))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let sanitized_bytes = strip_comments_and_strings_for_content(&content);
+        let sanitized = String::from_utf8_lossy(&sanitized_bytes);
+        let mut file_violations = Vec::new();
+
+        for (line_idx, line) in sanitized.lines().enumerate() {
+            let trimmed = line.trim();
+            let Some(statement) = trimmed.strip_suffix(';').map(str::trim) else {
+                continue;
+            };
+            if statement.contains('=') {
+                continue;
+            }
+            let Some((callee, args)) = extract_call_expression(statement) else {
+                continue;
+            };
+            let is_black_box = matches!(
+                callee.as_str(),
+                "std::hint::black_box" | "core::hint::black_box"
+            );
+            let is_size_of_val = matches!(
+                callee.as_str(),
+                "std::mem::size_of_val" | "core::mem::size_of_val"
+            );
+            if !is_black_box && !is_size_of_val {
+                continue;
+            }
+            if !is_simple_inert_touch_argument(&args) {
+                continue;
+            }
+
+            let reason = if is_black_box {
+                "standalone black_box touch on a simple path/reference is a fake use"
+            } else {
+                "standalone size_of_val touch on a simple path/reference is a fake use"
+            };
+            file_violations.push(format!("{}:{} -> {}", line_idx + 1, trimmed, reason));
+        }
+
+        if !file_violations.is_empty() {
+            allviolations.push(format_grouped_scan_error(
+                "inert touch calls",
+                path,
+                &file_violations,
+                "Use the value meaningfully or delete it. Standalone black_box/size_of_val touches do not count as real use.",
+            ));
+        }
+    }
+
+    allviolations
+}
+
+fn scan_for_suspicious_macro_wrappers() -> Vec<String> {
+    let mut allviolations = Vec::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !is_in_ignored_directory(e.path()))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let sanitized_bytes = strip_comments_and_strings_for_content(&content);
+        let sanitized = String::from_utf8_lossy(&sanitized_bytes);
+        let macros = collect_simple_macro_aliases(&sanitized);
+        let mut file_violations = Vec::new();
+
+        for (name, alias) in macros {
+            let reason = match alias.kind {
+                SimpleMacroAliasKind::IdentityExpr => {
+                    "macro_rules! expression passthrough wrapper hides the real assertion/use"
+                }
+                SimpleMacroAliasKind::BlackBoxTouch => {
+                    "macro_rules! wrapper performs only a black_box touch"
+                }
+                SimpleMacroAliasKind::SizeOfValTouch => {
+                    "macro_rules! wrapper performs only a size_of_val touch"
+                }
+            };
+            file_violations.push(format!(
+                "{}:macro `{}` -> {}",
+                alias.line_number, name, reason
+            ));
+        }
+
+        if !file_violations.is_empty() {
+            allviolations.push(format_grouped_scan_error(
+                "suspicious macro wrappers",
+                path,
+                &file_violations,
+                "Do not hide assertions or fake-use touches behind local passthrough macros.",
+            ));
+        }
+    }
+
+    allviolations
+}
+
+fn scan_for_assertion_alias_evasions() -> Vec<String> {
+    let mut allviolations = Vec::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !is_in_ignored_directory(e.path()))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let sanitized_bytes = strip_comments_and_strings_for_content(&content);
+        let sanitized = String::from_utf8_lossy(&sanitized_bytes).to_string();
+        let helpers = collect_simple_bool_helpers(&sanitized);
+        let macros = collect_simple_macro_aliases(&sanitized);
+        let line_depths = compute_line_brace_depths(&content);
+        let unsigned_hints = collect_unsigned_symbol_hints(&sanitized);
+        let mut file_violations = Vec::new();
+
+        for target in collect_boolean_macro_targets(&sanitized) {
+            let local_aliases =
+                collect_prior_bool_aliases(&sanitized, &line_depths, target.line_number);
+            let expanded = expand_assertion_expression(
+                &target.expression,
+                &local_aliases,
+                &helpers,
+                &macros,
+                0,
+            );
+            let Some(reason) =
+                detect_resolved_assertion_violation(&target.expression, &expanded, &unsigned_hints)
+            else {
+                continue;
+            };
+            let original = truncate_for_display(&collapse_whitespace(&target.expression), 160);
+            let resolved = truncate_for_display(&collapse_whitespace(&expanded), 160);
+            file_violations.push(format!(
+                "{}:{}({}) -> {} -> {}",
+                target.line_number, target.macro_name, original, resolved, reason
+            ));
+        }
+
+        if !file_violations.is_empty() {
+            allviolations.push(format_grouped_scan_error(
+                "assertion alias evasions",
+                path,
+                &file_violations,
+                "Do not route tautological or fake-use assertions through locals, helpers, or passthrough macros.",
+            ));
+        }
+    }
+
+    allviolations
+}
+
+fn format_grouped_scan_error(
+    title: &str,
+    path: &Path,
+    violations: &[String],
+    guidance: &str,
+) -> String {
+    let filename = path.to_str().unwrap_or("?");
+    let mut error_msg = format!(
+        "\n❌ ERROR: Found {} {} in {}:\n",
+        violations.len(),
+        title,
+        filename
+    );
+    for violation in violations {
+        error_msg.push_str(&format!("   {violation}\n"));
+    }
+    error_msg.push_str("\n⚠️ ");
+    error_msg.push_str(guidance);
+    error_msg.push('\n');
+    error_msg
+}
+
+fn collect_simple_macro_aliases(source: &str) -> HashMap<String, SimpleMacroAlias> {
+    let mut aliases = HashMap::new();
+    let bytes = source.as_bytes();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        let Some(rel) = source[idx..].find("macro_rules!") else {
+            break;
+        };
+        let macro_idx = idx + rel;
+        if macro_idx > 0 && is_ident_byte(bytes[macro_idx - 1]) {
+            idx = macro_idx + 1;
+            continue;
+        }
+
+        let mut cursor = macro_idx + "macro_rules!".len();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        let name_start = cursor;
+        while cursor < bytes.len() && is_ident_byte(bytes[cursor]) {
+            cursor += 1;
+        }
+        if name_start == cursor {
+            idx = macro_idx + 1;
+            continue;
+        }
+        let name = source[name_start..cursor].to_string();
+
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || !matches!(bytes[cursor], b'(' | b'[' | b'{') {
+            idx = macro_idx + 1;
+            continue;
+        }
+
+        let Some(close_idx) = find_matching_delimiter(bytes, cursor) else {
+            idx = macro_idx + 1;
+            continue;
+        };
+
+        let body = &source[cursor + 1..close_idx];
+        let Some(kind) = classify_simple_macro_alias(body) else {
+            idx = close_idx + 1;
+            continue;
+        };
+
+        let line_number = 1 + bytes[..macro_idx].iter().filter(|&&b| b == b'\n').count();
+        aliases.insert(name, SimpleMacroAlias { line_number, kind });
+        idx = close_idx + 1;
+    }
+
+    aliases
+}
+
+fn classify_simple_macro_alias(body: &str) -> Option<SimpleMacroAliasKind> {
+    let normalized = normalize_no_whitespace(body);
+    let placeholder = extract_macro_expr_placeholder(&normalized)?;
+    let arrow_idx = normalized.find("=>")?;
+    let expansion = normalized[arrow_idx + 2..].trim_end_matches(';');
+    let expansion = strip_outer_groups(strip_outer_groups(expansion));
+
+    if expansion == placeholder || expansion == format!("({placeholder})") {
+        return Some(SimpleMacroAliasKind::IdentityExpr);
+    }
+    if expansion.contains("black_box") && expansion.contains(&placeholder) {
+        return Some(SimpleMacroAliasKind::BlackBoxTouch);
+    }
+    if expansion.contains("size_of_val") && expansion.contains(&placeholder) {
+        return Some(SimpleMacroAliasKind::SizeOfValTouch);
+    }
+
+    None
+}
+
+fn extract_macro_expr_placeholder(normalized: &str) -> Option<String> {
+    let dollar_idx = normalized.find('$')?;
+    let after_dollar = &normalized[dollar_idx + 1..];
+    let ident_end = after_dollar
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or(after_dollar.len());
+    if ident_end == 0 {
+        return None;
+    }
+    let ident = &after_dollar[..ident_end];
+    let after_ident = &after_dollar[ident_end..];
+    if !after_ident.starts_with(":expr") {
+        return None;
+    }
+    Some(format!("${ident}"))
+}
+
+fn collect_simple_bool_helpers(source: &str) -> HashMap<String, SimpleBoolHelper> {
+    let mut helpers = HashMap::new();
+    let bytes = source.as_bytes();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        let Some(rel) = source[idx..].find("fn ") else {
+            break;
+        };
+        let fn_idx = idx + rel;
+        if fn_idx > 0 && is_ident_byte(bytes[fn_idx - 1]) {
+            idx = fn_idx + 1;
+            continue;
+        }
+
+        let mut cursor = fn_idx + 3;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        let name_start = cursor;
+        while cursor < bytes.len() && is_ident_byte(bytes[cursor]) {
+            cursor += 1;
+        }
+        if name_start == cursor {
+            idx = fn_idx + 1;
+            continue;
+        }
+        let name = source[name_start..cursor].to_string();
+
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'(' {
+            idx = fn_idx + 1;
+            continue;
+        }
+        let Some(params_end) = find_matching_delimiter(bytes, cursor) else {
+            idx = fn_idx + 1;
+            continue;
+        };
+        let params = &source[cursor + 1..params_end];
+        cursor = params_end + 1;
+
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let mut signature_tail = String::new();
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'{' {
+                break;
+            }
+            signature_tail.push(bytes[cursor] as char);
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'{' {
+            idx = fn_idx + 1;
+            continue;
+        }
+        if !normalize_no_whitespace(&signature_tail).contains("->bool") {
+            idx = cursor + 1;
+            continue;
+        }
+
+        let body_start = cursor;
+        let Some(body_end) = find_matching_delimiter(bytes, body_start) else {
+            idx = fn_idx + 1;
+            continue;
+        };
+        let body = &source[body_start + 1..body_end];
+        let Some(body_expr) = extract_helper_body_expression(body) else {
+            idx = body_end + 1;
+            continue;
+        };
+
+        helpers.insert(
+            name,
+            SimpleBoolHelper {
+                params: extract_parameter_names(params),
+                body_expr,
+            },
+        );
+        idx = body_end + 1;
+    }
+
+    helpers
+}
+
+fn extract_helper_body_expression(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("return ") {
+        return Some(rest.trim_end_matches(';').trim().to_string());
+    }
+    if !trimmed.contains(';') {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn extract_parameter_names(params: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for component in split_top_level_components(params) {
+        let trimmed = component.trim();
+        if trimmed.is_empty() || trimmed.starts_with('&') && trimmed.contains("self") {
+            continue;
+        }
+        if trimmed == "self" || trimmed == "&self" || trimmed == "&mut self" {
+            continue;
+        }
+        let Some(colon_idx) = trimmed.find(':') else {
+            continue;
+        };
+        let mut name = trimmed[..colon_idx].trim();
+        while let Some(rest) = name.strip_prefix('&') {
+            name = rest.trim_start();
+        }
+        if let Some(rest) = name.strip_prefix("mut ") {
+            name = rest.trim_start();
+        }
+        if let Some(rest) = name.strip_prefix("ref ") {
+            name = rest.trim_start();
+        }
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn normalize_no_whitespace(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn compute_line_brace_depths(source: &str) -> Vec<usize> {
+    let sanitized = strip_comments_and_strings_for_tokens(source);
+    let mut depths = vec![0usize];
+    let mut depth = 0usize;
+
+    for byte in sanitized {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'\n' => depths.push(depth),
+            _ => {}
+        }
+    }
+
+    depths
+}
+
+fn collect_prior_bool_aliases(
+    source: &str,
+    line_depths: &[usize],
+    target_line: usize,
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let lines: Vec<&str> = source.lines().collect();
+    if target_line == 0 || target_line > lines.len() {
+        return aliases;
+    }
+
+    let target_depth = *line_depths.get(target_line - 1).unwrap_or(&0);
+    let min_line = target_line.saturating_sub(80).max(1);
+
+    for line_number in (min_line..target_line).rev() {
+        let depth = *line_depths.get(line_number - 1).unwrap_or(&0);
+        if depth > target_depth {
+            continue;
+        }
+
+        let trimmed = lines[line_number - 1].trim();
+        if depth == 0
+            && (trimmed.starts_with("fn ")
+                || trimmed.starts_with("impl ")
+                || trimmed.starts_with("trait ")
+                || trimmed.starts_with("mod "))
+        {
+            break;
+        }
+
+        let Some((name, expr)) = parse_simple_let_assignment_line(trimmed) else {
+            continue;
+        };
+        aliases.entry(name).or_insert(expr);
+    }
+
+    aliases
+}
+
+fn parse_simple_let_assignment_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let after_let = trimmed.strip_prefix("let ")?.trim_start();
+    let after_let = after_let
+        .strip_prefix("mut ")
+        .unwrap_or(after_let)
+        .trim_start();
+    let eq_idx = after_let.find('=')?;
+    let lhs = after_let[..eq_idx].trim();
+    if lhs.contains('(') || lhs.contains('[') || lhs.contains('{') || lhs.contains(',') {
+        return None;
+    }
+    let name = lhs.split(':').next()?.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let expr = after_let[eq_idx + 1..].trim().trim_end_matches(';').trim();
+    if expr.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), expr.to_string()))
+}
+
+fn expand_assertion_expression(
+    expression: &str,
+    local_aliases: &HashMap<String, String>,
+    helpers: &HashMap<String, SimpleBoolHelper>,
+    macros: &HashMap<String, SimpleMacroAlias>,
+    depth: usize,
+) -> String {
+    if depth > 8 {
+        return collapse_whitespace(expression);
+    }
+
+    let stripped = strip_outer_groups(expression).trim();
+
+    if let Some(alias_expr) = local_aliases.get(stripped) {
+        return expand_assertion_expression(alias_expr, local_aliases, helpers, macros, depth + 1);
+    }
+
+    if let Some((macro_name, macro_args)) = extract_macro_invocation(stripped) {
+        if let Some(alias) = macros.get(&macro_name) {
+            let args = split_top_level_components(&macro_args);
+            let first_arg = args.first().copied().unwrap_or("").trim();
+            let resolved_arg =
+                expand_assertion_expression(first_arg, local_aliases, helpers, macros, depth + 1);
+            return match alias.kind {
+                SimpleMacroAliasKind::IdentityExpr => resolved_arg,
+                SimpleMacroAliasKind::BlackBoxTouch => {
+                    format!("__macro_black_box_touch__({resolved_arg})")
+                }
+                SimpleMacroAliasKind::SizeOfValTouch => {
+                    format!("__macro_size_of_val_touch__({resolved_arg})")
+                }
+            };
+        }
+    }
+
+    if let Some((callee, args_text)) = extract_call_expression(stripped) {
+        if let Some(helper) = helpers.get(&callee) {
+            let args = split_top_level_components(&args_text);
+            if args.len() == helper.params.len() {
+                let mut mapping = HashMap::new();
+                for (param, arg) in helper.params.iter().zip(args.iter()) {
+                    mapping.insert(
+                        param.as_str(),
+                        expand_assertion_expression(
+                            arg.trim(),
+                            local_aliases,
+                            helpers,
+                            macros,
+                            depth + 1,
+                        ),
+                    );
+                }
+                let substituted = substitute_identifiers(&helper.body_expr, &mapping);
+                return expand_assertion_expression(
+                    &substituted,
+                    local_aliases,
+                    helpers,
+                    macros,
+                    depth + 1,
+                );
+            }
+        }
+    }
+
+    let or_parts = split_top_level_boolean(stripped, BooleanJoin::Or);
+    if or_parts.len() > 1 {
+        return or_parts
+            .into_iter()
+            .map(|part| {
+                format!(
+                    "({})",
+                    expand_assertion_expression(part, local_aliases, helpers, macros, depth + 1)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" || ");
+    }
+
+    let and_parts = split_top_level_boolean(stripped, BooleanJoin::And);
+    if and_parts.len() > 1 {
+        return and_parts
+            .into_iter()
+            .map(|part| {
+                format!(
+                    "({})",
+                    expand_assertion_expression(part, local_aliases, helpers, macros, depth + 1)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" && ");
+    }
+
+    if let Some(rest) = strip_leading_negation(stripped) {
+        return format!(
+            "!({})",
+            expand_assertion_expression(rest, local_aliases, helpers, macros, depth + 1)
+        );
+    }
+
+    collapse_whitespace(stripped)
+}
+
+fn substitute_identifiers(expression: &str, mapping: &HashMap<&str, String>) -> String {
+    let mut out = String::with_capacity(expression.len());
+    let mut idx = 0usize;
+    let bytes = expression.as_bytes();
+
+    while idx < bytes.len() {
+        if !is_ident_byte(bytes[idx]) {
+            out.push(bytes[idx] as char);
+            idx += 1;
+            continue;
+        }
+
+        let start = idx;
+        idx += 1;
+        while idx < bytes.len() && is_ident_byte(bytes[idx]) {
+            idx += 1;
+        }
+        let token = &expression[start..idx];
+        if let Some(replacement) = mapping.get(token) {
+            out.push('(');
+            out.push_str(replacement);
+            out.push(')');
+        } else {
+            out.push_str(token);
+        }
+    }
+
+    out
+}
+
+fn detect_resolved_assertion_violation(
+    original: &str,
+    expanded: &str,
+    unsigned_hints: &UnsignedSymbolHints,
+) -> Option<String> {
+    if expanded.contains("__macro_black_box_touch__") {
+        return Some(
+            "assertion is routed through a macro wrapper that only performs a black_box touch"
+                .to_string(),
+        );
+    }
+    if expanded.contains("__macro_size_of_val_touch__") {
+        return Some(
+            "assertion is routed through a macro wrapper that only performs a size_of_val touch"
+                .to_string(),
+        );
+    }
+
+    let original_norm = normalize_assertion_expression_for_diff(original);
+    let expanded_norm = normalize_assertion_expression_for_diff(expanded);
+    let expanded_differs = original_norm != expanded_norm;
+
+    if let Some(reason) = analyze_degenerate_boolean_expression(expanded) {
+        if expanded_differs {
+            return Some(reason);
+        }
+    }
+
+    if let Some(reason) = detect_nonnegative_zero_comparison(expanded, unsigned_hints) {
+        return Some(reason);
+    }
+
+    if let Some(reason) = detect_nonnegative_cmp_matches(expanded, unsigned_hints) {
+        return Some(reason);
+    }
+
+    None
+}
+
+fn normalize_assertion_expression_for_diff(expression: &str) -> String {
+    let stripped = strip_outer_groups(expression).trim();
+
+    let or_parts = split_top_level_boolean(stripped, BooleanJoin::Or);
+    if or_parts.len() > 1 {
+        return or_parts
+            .into_iter()
+            .map(normalize_assertion_expression_for_diff)
+            .collect::<Vec<_>>()
+            .join("||");
+    }
+
+    let and_parts = split_top_level_boolean(stripped, BooleanJoin::And);
+    if and_parts.len() > 1 {
+        return and_parts
+            .into_iter()
+            .map(normalize_assertion_expression_for_diff)
+            .collect::<Vec<_>>()
+            .join("&&");
+    }
+
+    if let Some(rest) = strip_leading_negation(stripped) {
+        return format!("!{}", normalize_assertion_expression_for_diff(rest));
+    }
+
+    collapse_whitespace(stripped)
+}
+
+fn detect_nonnegative_zero_comparison(
+    expression: &str,
+    unsigned_hints: &UnsignedSymbolHints,
+) -> Option<String> {
+    let comparison = parse_comparison(expression)?;
+
+    if is_zero_literal(&comparison.right)
+        && is_nonnegative_subject(&comparison.left, unsigned_hints)
+    {
+        return match comparison.op {
+            ComparisonOp::Ge => Some(format!(
+                "non-negative size/dim/count comparison `{}` is always true",
+                format_comparison_expression(&comparison.left, comparison.op, &comparison.right)
+            )),
+            ComparisonOp::Lt => Some(format!(
+                "non-negative size/dim/count comparison `{}` can never be true",
+                format_comparison_expression(&comparison.left, comparison.op, &comparison.right)
+            )),
+            _ => None,
+        };
+    }
+
+    if is_zero_literal(&comparison.left)
+        && is_nonnegative_subject(&comparison.right, unsigned_hints)
+    {
+        return match comparison.op {
+            ComparisonOp::Le => Some(format!(
+                "non-negative size/dim/count comparison `{}` is always true",
+                format_comparison_expression(&comparison.left, comparison.op, &comparison.right)
+            )),
+            ComparisonOp::Gt => Some(format!(
+                "non-negative size/dim/count comparison `{}` can never be true",
+                format_comparison_expression(&comparison.left, comparison.op, &comparison.right)
+            )),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn detect_nonnegative_cmp_matches(
+    expression: &str,
+    unsigned_hints: &UnsignedSymbolHints,
+) -> Option<String> {
+    let Some((macro_name, macro_args)) = extract_macro_invocation(expression) else {
+        return None;
+    };
+    if macro_name != "matches" {
+        return None;
+    }
+
+    let args = split_top_level_components(&macro_args);
+    if args.len() < 2 {
+        return None;
+    }
+    let scrutinee = args[0].trim();
+    let pattern = args[1].trim();
+    let Some(subject) = extract_cmp_zero_subject(scrutinee) else {
+        return None;
+    };
+    if !is_nonnegative_subject(&subject, unsigned_hints) {
+        return None;
+    }
+
+    let normalized_pattern = normalize_no_whitespace(pattern);
+    let has_less =
+        normalized_pattern.contains("Ordering::Less") || normalized_pattern.contains("Less");
+    let has_equal =
+        normalized_pattern.contains("Ordering::Equal") || normalized_pattern.contains("Equal");
+    let has_greater =
+        normalized_pattern.contains("Ordering::Greater") || normalized_pattern.contains("Greater");
+
+    if has_equal && has_greater && !has_less {
+        return Some(
+            "matches!(value.cmp(&0), Greater | Equal) on a non-negative size/dim/count is always true"
+                .to_string(),
+        );
+    }
+    if has_less && !has_equal && !has_greater {
+        return Some(
+            "matches!(value.cmp(&0), Less) on a non-negative size/dim/count can never be true"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn extract_macro_invocation(expression: &str) -> Option<(String, String)> {
+    let stripped = strip_outer_groups(expression).trim();
+    let bytes = stripped.as_bytes();
+    let bang_idx = stripped.find('!')?;
+    let name = stripped[..bang_idx].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+    {
+        return None;
+    }
+
+    let mut cursor = bang_idx + 1;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= bytes.len() || !matches!(bytes[cursor], b'(' | b'[' | b'{') {
+        return None;
+    }
+
+    let close_idx = find_matching_delimiter(bytes, cursor)?;
+    if close_idx != bytes.len() - 1 {
+        return None;
+    }
+
+    Some((
+        name.to_string(),
+        stripped[cursor + 1..close_idx].trim().to_string(),
+    ))
+}
+
+fn extract_call_expression(expression: &str) -> Option<(String, String)> {
+    let stripped = strip_outer_groups(expression).trim();
+    let open_idx = stripped.find('(')?;
+    let bytes = stripped.as_bytes();
+    let close_idx = find_matching_delimiter(bytes, open_idx)?;
+    if close_idx != bytes.len() - 1 {
+        return None;
+    }
+    let callee = stripped[..open_idx].trim();
+    if callee.is_empty() {
+        return None;
+    }
+    Some((
+        callee.to_string(),
+        stripped[open_idx + 1..close_idx].trim().to_string(),
+    ))
+}
+
+fn extract_cmp_zero_subject(scrutinee: &str) -> Option<String> {
+    let (callee, arg) = extract_call_expression(scrutinee)?;
+    if !callee.ends_with(".cmp") {
+        return None;
+    }
+    if !is_zero_literal(&arg) {
+        return None;
+    }
+    Some(callee[..callee.len() - ".cmp".len()].trim().to_string())
+}
+
+fn is_simple_inert_touch_argument(argument: &str) -> bool {
+    let mut candidate = strip_outer_groups(argument).trim();
+
+    loop {
+        let stripped = candidate.trim_start();
+        if let Some(rest) = stripped.strip_prefix('&') {
+            candidate = rest;
+            continue;
+        }
+        if let Some(rest) = stripped.strip_prefix('*') {
+            candidate = rest;
+            continue;
+        }
+        if let Some(rest) = stripped.strip_prefix("mut ") {
+            candidate = rest;
+            continue;
+        }
+        candidate = stripped;
+        break;
+    }
+
+    if candidate.is_empty() {
+        return false;
+    }
+    if candidate.contains('(') || candidate.contains('[') || candidate.contains('{') {
+        return false;
+    }
+    if candidate
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.')))
+    {
+        return false;
+    }
+
+    candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn collect_unsigned_symbol_hints(source: &str) -> UnsignedSymbolHints {
+    let mut hints = UnsignedSymbolHints {
+        value_names: HashSet::new(),
+        method_names: HashSet::new(),
+    };
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = parse_unsigned_method_signature(trimmed) {
+            hints.method_names.insert(name);
+        }
+        if let Some(name) = parse_typed_unsigned_value_name(trimmed) {
+            hints.value_names.insert(name);
+        }
+    }
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some((name, expr)) = parse_simple_let_assignment_line(trimmed) else {
+            continue;
+        };
+        if is_obviously_nonnegative_expression(&expr, &hints) {
+            hints.value_names.insert(name);
+        }
+    }
+
+    hints
+}
+
+fn parse_unsigned_method_signature(line: &str) -> Option<String> {
+    let mut rest = line.trim();
+    if let Some(after_vis) = rest.strip_prefix("pub(crate) ") {
+        rest = after_vis;
+    } else if let Some(after_vis) = rest.strip_prefix("pub ") {
+        rest = after_vis;
+    }
+    if let Some(after_kw) = rest.strip_prefix("unsafe ") {
+        rest = after_kw;
+    }
+    if let Some(after_kw) = rest.strip_prefix("async ") {
+        rest = after_kw;
+    }
+    if let Some(after_kw) = rest.strip_prefix("const ") {
+        rest = after_kw;
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let name_end = rest
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = &rest[..name_end];
+    let return_idx = rest.find("->")?;
+    let return_ty = rest[return_idx + 2..].trim();
+    if !is_unsigned_type_annotation(return_ty) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn parse_typed_unsigned_value_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if let Some(after_let) = trimmed.strip_prefix("let ") {
+        let after_let = after_let
+            .strip_prefix("mut ")
+            .unwrap_or(after_let)
+            .trim_start();
+        let colon_idx = after_let.find(':')?;
+        let eq_idx = after_let.find('=')?;
+        if colon_idx > eq_idx {
+            return None;
+        }
+        let name = after_let[..colon_idx].trim();
+        let ty = after_let[colon_idx + 1..eq_idx].trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            || !is_unsigned_type_annotation(ty)
+        {
+            return None;
+        }
+        return Some(name.to_string());
+    }
+
+    let after_vis = trimmed
+        .strip_prefix("pub(crate) ")
+        .or_else(|| trimmed.strip_prefix("pub "))
+        .unwrap_or(trimmed);
+    let colon_idx = after_vis.find(':')?;
+    let name = after_vis[..colon_idx].trim();
+    let ty = after_vis[colon_idx + 1..].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || !is_unsigned_type_annotation(ty)
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn is_unsigned_type_annotation(ty: &str) -> bool {
+    let ty = ty
+        .trim()
+        .trim_end_matches(',')
+        .trim_end_matches('{')
+        .trim_end_matches(';')
+        .trim();
+    matches!(ty, "usize" | "u8" | "u16" | "u32" | "u64" | "u128")
+}
+
+fn is_obviously_nonnegative_expression(expr: &str, hints: &UnsignedSymbolHints) -> bool {
+    let stripped = strip_outer_groups(expr).trim();
+    if stripped.ends_with(".len()")
+        || stripped.ends_with(".count()")
+        || stripped.ends_with(".capacity()")
+        || stripped.ends_with(".nrows()")
+        || stripped.ends_with(".ncols()")
+        || stripped.contains("sum::<usize>()")
+    {
+        return true;
+    }
+    is_nonnegative_subject(stripped, hints)
+}
+
+fn is_nonnegative_subject(subject: &str, hints: &UnsignedSymbolHints) -> bool {
+    let stripped = strip_outer_groups(subject).trim();
+    if stripped.ends_with(".len()")
+        || stripped.ends_with(".count()")
+        || stripped.ends_with(".capacity()")
+        || stripped.ends_with(".nrows()")
+        || stripped.ends_with(".ncols()")
+    {
+        return true;
+    }
+
+    let Some(name) = extract_terminal_name(stripped) else {
+        return false;
+    };
+    hints.value_names.contains(&name)
+        || hints.method_names.contains(&name)
+        || looks_size_like_name(&name)
+}
+
+fn extract_terminal_name(expression: &str) -> Option<String> {
+    let stripped = strip_outer_groups(expression).trim();
+    if let Some((callee, _)) = extract_call_expression(stripped) {
+        let last = callee
+            .rsplit_once("::")
+            .map(|(_, rhs)| rhs)
+            .unwrap_or(callee.as_str())
+            .rsplit_once('.')
+            .map(|(_, rhs)| rhs)
+            .unwrap_or(callee.as_str());
+        if !last.is_empty()
+            && last
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Some(last.to_string());
+        }
+        return None;
+    }
+
+    let candidate = stripped
+        .rsplit_once("::")
+        .map(|(_, rhs)| rhs)
+        .unwrap_or(stripped)
+        .rsplit_once('.')
+        .map(|(_, rhs)| rhs)
+        .unwrap_or(stripped)
+        .trim();
+    if candidate.is_empty()
+        || !candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn looks_size_like_name(name: &str) -> bool {
+    matches!(name, "len" | "count" | "capacity" | "nrows" | "ncols")
+        || name.ends_with("_len")
+        || name.ends_with("_count")
+        || name.ends_with("_size")
+        || name.ends_with("_dim")
+}
+
+fn is_zero_literal(expression: &str) -> bool {
+    let mut stripped = strip_outer_groups(expression).trim();
+    while let Some(rest) = stripped.strip_prefix('&') {
+        stripped = rest.trim_start();
+    }
+    if stripped == "0" {
+        return true;
+    }
+    let Some(rest) = stripped.strip_prefix('0') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn scan_for_fake_usage() -> Vec<String> {

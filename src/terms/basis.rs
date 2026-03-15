@@ -4225,7 +4225,6 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
-    identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<
     (
@@ -4290,8 +4289,6 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         .collect();
     let mut d2_raw_eta_cross: Vec<Array2<f64>> =
         (0..num_cross).map(|_| Array2::zeros((p, z_cols))).collect();
-
-    let d_f64 = d as f64;
 
     // Precompute metric weights w_b = exp(2ψ_b) for each axis.
     // These are needed for the correct anisotropic gradient operator D₁
@@ -8160,7 +8157,6 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         spec.power,
         spec.nullspace_order,
         eta,
-        identifiability_transform.as_ref(),
         &mut workspace,
     )?;
 

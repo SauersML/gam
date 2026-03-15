@@ -3040,6 +3040,7 @@ fn default_beta_guess_external(
                         standard_normal_quantile(prevalence)
                             .unwrap_or_else(|_| (prevalence / (1.0 - prevalence)).ln())
                     }),
+                    LinkFunction::Log => unreachable!(),
                     LinkFunction::Identity => unreachable!(),
                 };
                 if mixture_link_state.is_some() {
@@ -4916,6 +4917,7 @@ pub fn update_glmvectors(
                     | LinkFunction::CLogLog
                     | LinkFunction::Sas
                     | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
+                    LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
                     LinkFunction::Identity => eta[i],
                 };
                 let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
@@ -5029,6 +5031,19 @@ pub(crate) fn update_glmvectors_integrated_for_link(
 ) -> Result<(), EstimationError> {
     let link = inverse_link.link_function();
     let family = match link {
+        LinkFunction::Log => {
+            update_glmvectors(
+                y,
+                eta,
+                inverse_link,
+                priorweights,
+                mu,
+                weights,
+                z,
+                derivatives,
+            )?;
+            return Ok(());
+        }
         LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
         LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
         LinkFunction::CLogLog => GlmLikelihoodFamily::BinomialCLogLog,
@@ -5198,6 +5213,16 @@ fn computeworkingweight_derivatives_from_eta(
         LinkFunction::Identity => {
             dmu_deta.fill(1.0);
         }
+        LinkFunction::Log => {
+            for i in 0..n {
+                let jet = standard_inverse_link_jet(inverse_link, eta[i].clamp(-700.0, 700.0))?;
+                c[i] = 0.0;
+                d[i] = 0.0;
+                dmu_deta[i] = jet.d1;
+                d2mu_deta2[i] = jet.d2;
+                d3mu_deta3[i] = jet.d3;
+            }
+        }
         LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
@@ -5212,6 +5237,7 @@ fn computeworkingweight_derivatives_from_eta(
                     | LinkFunction::CLogLog
                     | LinkFunction::Sas
                     | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
+                    LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
                     LinkFunction::Identity => eta[i],
                 };
                 let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
@@ -5922,6 +5948,13 @@ pub fn directionalworking_curvature_from_eta(
         LinkFunction::Identity => {
             directionalworking_curvature_identity(eta, priorweights, solveweights, eta_direction)
         }
+        LinkFunction::Log => directionalworking_curvature_diagonal_builtin(
+            &InverseLink::Standard(LinkFunction::Log),
+            eta,
+            priorweights,
+            solveweights,
+            eta_direction,
+        ),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less directional SAS curvature is unsupported; use directionalworking_curvature_from_etawith_state with SasLinkState"
                 .to_string(),
@@ -5949,7 +5982,8 @@ pub fn directionalworking_curvature_from_etawith_state(
         LinkFunction::Identity => {
             directionalworking_curvature_identity(eta, priorweights, solveweights, eta_direction)
         }
-        LinkFunction::Logit
+        LinkFunction::Log
+        | LinkFunction::Logit
         | LinkFunction::Probit
         | LinkFunction::CLogLog
         | LinkFunction::Sas
@@ -5966,6 +6000,7 @@ pub fn directionalworking_curvature_from_etawith_state(
 #[inline]
 fn likelihood_from_link(link: LinkFunction) -> GlmLikelihoodFamily {
     match link {
+        LinkFunction::Log => GlmLikelihoodFamily::PoissonLog,
         LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
         LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
         LinkFunction::CLogLog => GlmLikelihoodFamily::BinomialCLogLog,
@@ -6327,7 +6362,8 @@ fn calculate_scale(
         | LinkFunction::Probit
         | LinkFunction::CLogLog
         | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => {
+        | LinkFunction::BetaLogistic
+        | LinkFunction::Log => {
             // For binomial models (logistic regression), scale is fixed at 1.0
             // This follows mgcv's convention in gam.fit3.R
             1.0

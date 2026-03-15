@@ -23,7 +23,7 @@ use crate::estimate::{
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
-use crate::families::strategy::strategy_for_family;
+use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
@@ -289,6 +289,146 @@ pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
     pub random_effect_terms: Vec<RandomEffectTermSpec>,
     pub smooth_terms: Vec<SmoothTermSpec>,
+}
+
+impl TermCollectionSpec {
+    /// Validate that a term collection spec represents a fully frozen model
+    /// (i.e. all knots/centers are pre-computed, identifiability transforms are
+    /// baked in, and random-effect levels are fixed).
+    pub fn validate_frozen(&self, label: &str) -> Result<(), String> {
+        for linear in &self.linear_terms {
+            if let (Some(min), Some(max)) = (linear.coefficient_min, linear.coefficient_max)
+                && (!min.is_finite() || !max.is_finite() || min > max)
+            {
+                return Err(format!(
+                    "{label} linear term '{}' has invalid coefficient constraint [{min}, {max}]",
+                    linear.name
+                ));
+            }
+            if let Some(min) = linear.coefficient_min
+                && !min.is_finite()
+            {
+                return Err(format!(
+                    "{label} linear term '{}' has non-finite coefficient minimum {min}",
+                    linear.name
+                ));
+            }
+            if let Some(max) = linear.coefficient_max
+                && !max.is_finite()
+            {
+                return Err(format!(
+                    "{label} linear term '{}' has non-finite coefficient maximum {max}",
+                    linear.name
+                ));
+            }
+            if let LinearCoefficientGeometry::Bounded { min, max, prior } =
+                &linear.coefficient_geometry
+            {
+                if !min.is_finite() || !max.is_finite() || min >= max {
+                    return Err(format!(
+                        "{label} bounded term '{}' has invalid bounds [{min}, {max}]",
+                        linear.name
+                    ));
+                }
+                match prior {
+                    BoundedCoefficientPriorSpec::None
+                    | BoundedCoefficientPriorSpec::Uniform => {}
+                    BoundedCoefficientPriorSpec::Beta { a, b } => {
+                        if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
+                            return Err(format!(
+                                "{label} bounded term '{}' has invalid Beta prior ({a}, {b})",
+                                linear.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for st in &self.smooth_terms {
+            match &st.basis {
+                SmoothBasisSpec::BSpline1D { spec, .. } => {
+                    if !matches!(spec.knotspec, BSplineKnotSpec::Provided(_)) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::ThinPlate { spec, .. } => {
+                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: ThinPlate centers must be UserProvided",
+                            st.name
+                        ));
+                    }
+                    if matches!(
+                        spec.identifiability,
+                        SpatialIdentifiability::OrthogonalToParametric
+                    ) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: ThinPlate identifiability must be FrozenTransform or None",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::Matern { spec, .. } => {
+                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: Matern centers must be UserProvided",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::Duchon { spec, .. } => {
+                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: Duchon centers must be UserProvided",
+                            st.name
+                        ));
+                    }
+                    if matches!(
+                        spec.identifiability,
+                        SpatialIdentifiability::OrthogonalToParametric
+                    ) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::TensorBSpline { spec, .. } => {
+                    for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
+                        if !matches!(marginal.knotspec, BSplineKnotSpec::Provided(_)) {
+                            return Err(format!(
+                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided",
+                                st.name, dim
+                            ));
+                        }
+                    }
+                    if matches!(
+                        spec.identifiability,
+                        TensorBSplineIdentifiability::SumToZero
+                    ) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: tensor identifiability must be FrozenTransform or None",
+                            st.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        for rt in &self.random_effect_terms {
+            if rt.frozen_levels.is_none() {
+                return Err(format!(
+                    "{label} random-effect term '{}' is not frozen: missing frozen_levels",
+                    rt.name
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4535,6 +4675,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         rho_bound: 30.0,
         heuristic_lambdas: None,
         initial_rho: Some(initial_theta.clone()),
+        fallback_sequence: Vec::new(),
+        coordinate_search: None,
     };
 
     let mut obj = ClosureObjective {
@@ -5172,7 +5314,7 @@ fn evaluate_standard_familyobservations(
                     strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
-                let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                let mu_i: f64 = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 let dmu_deta = dmu_deta_raw.max(MU_DERIV_EPS);
                 let d2mu_deta2 = jet.d2;
                 let d3mu_deta3 = jet.d3;
@@ -8485,6 +8627,8 @@ fn try_exact_joint_spatial_aniso_optimization(
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
+        fallback_sequence: Vec::new(),
+        coordinate_search: None,
     };
 
     let mut obj = ClosureObjective {
@@ -8870,8 +9014,6 @@ where
 
     let baseline_score = score_fn(&baseline_fit);
     let mut theta0 = Array1::<f64>::zeros(spatial_terms.len());
-    let lower = Array1::<f64>::from_elem(spatial_terms.len(), kappa_options.min_length_scale.ln());
-    let upper = Array1::<f64>::from_elem(spatial_terms.len(), kappa_options.max_length_scale.ln());
     for (slot, &term_idx) in spatial_terms.iter().enumerate() {
         theta0[slot] = get_spatial_length_scale(resolvedspec, term_idx)
             .unwrap_or(kappa_options.min_length_scale)
@@ -9227,8 +9369,6 @@ where
     let total_terms = mean_terms.len() + noise_terms.len();
     if total_terms > 0 {
         let mut theta0 = Array1::<f64>::zeros(total_terms);
-        let lower = Array1::<f64>::from_elem(total_terms, kappa_options.min_length_scale.ln());
-        let upper = Array1::<f64>::from_elem(total_terms, kappa_options.max_length_scale.ln());
         for (slot, &term_idx) in mean_terms.iter().enumerate() {
             theta0[slot] = get_spatial_length_scale(&best_meanspec, term_idx)
                 .unwrap_or(kappa_options.min_length_scale)
