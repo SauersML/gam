@@ -350,7 +350,7 @@ pub struct LinkWiggleBlockInput {
 }
 
 #[derive(Clone)]
-pub struct SurvivalLocationScaleSpec {
+struct SurvivalLocationScaleSpec {
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
     pub event_target: Array1<f64>,
@@ -6260,7 +6260,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     }
 }
 
-pub fn fit_survival_location_scale(
+fn fit_survival_location_scale(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<UnifiedFitResult, String> {
     let prepared = prepare_survival_location_scale_model(&spec)?;

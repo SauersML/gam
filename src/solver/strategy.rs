@@ -1,7 +1,7 @@
 //! Central authority for outer smoothing-parameter optimization strategy.
 //!
-//! Every path that optimizes smoothing parameters (standard REML, joint flexible
-//! link, GAMLSS custom family, spatial kappa, etc.) declares its derivative
+//! Every path that optimizes smoothing parameters (standard REML, link-wiggle,
+//! GAMLSS custom family, spatial kappa, etc.) declares its derivative
 //! capability here and receives an [`OuterPlan`] that determines which solver
 //! and Hessian source to use.
 //!
