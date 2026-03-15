@@ -1147,41 +1147,61 @@ pub fn stable_reparameterizationwith_invariant(
         }
     }
 
-    // Positive-part pseudo-logdet on fixed structural rank.
-    let log_det: f64 = range_eigs_sorted
-        .iter()
-        .take(structural_rank)
-        .map(|&ev| ev.max(eigenvalue_floor).ln())
-        .sum();
+    // Smooth δ-regularized pseudo-logdet: L_δ(S) = log det(S + δI) − m₀ log δ.
+    //
+    // This replaces the hard ε-threshold truncation of null eigenvalues,
+    // making the objective C∞ in outer parameters θ and eliminating
+    // artificial kinks when eigenvalues cross the threshold.
+    //
+    // m₀ is the nullity: p_dim − structural_rank (number of null eigenvalues).
+    // δ is chosen proportional to machine epsilon × spectral scale.
+    //
+    // Reference: response.md Section 7.
+    let nullity = penalized_rank.saturating_sub(structural_rank);
+    let delta = {
+        let max_ev = range_eigs_sorted
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        1e-10 * max_ev
+    };
+    let log_det: f64 = {
+        let log_det_reg: f64 = range_eigs_sorted
+            .iter()
+            .take(penalized_rank)
+            .map(|&ev| (ev + delta).ln())
+            .sum();
+        log_det_reg - (nullity as f64) * delta.ln()
+    };
 
     let mut det1vec = vec![0.0; lambdas.len()];
 
-    // Build S⁺ = U diag(1/d) U' in the invariant penalized basis.
-    // Because we no longer rotate into the eigenbasis, S⁺ is a general
-    // (symmetric) matrix on the penalized block rather than diagonal.
-    let mut s_plus = Mat::<f64>::zeros(p, p);
-    for l in 0..structural_rank {
+    // Build (S + δI)⁻¹ = U diag(1/(d + δ)) U' in the invariant penalized basis.
+    //
+    // Unlike the old pseudoinverse S⁺ which used hard eigenvalue thresholding,
+    // the δ-regularized inverse includes ALL eigenvectors (both positive and
+    // null), shifted by δ. This makes it full rank and C∞ smooth, and
+    // automatically captures the leakage correction.
+    let mut s_reg_inv = Mat::<f64>::zeros(p, p);
+    for l in 0..penalized_rank {
         let eigenval = range_eigs_sorted[l];
-        let inv_d = if eigenval > eigenvalue_floor {
-            1.0 / eigenval
-        } else {
-            0.0
-        };
-        // S⁺[i,j] += (1/d_l) * U[i,l] * U[j,l]
+        let inv_d = 1.0 / (eigenval + delta);
+        // (S+δI)⁻¹[i,j] += (1/(d_l + δ)) * U[i,l] * U[j,l]
         for i in 0..penalized_rank {
             for j in 0..penalized_rank {
-                s_plus[(i, j)] += inv_d * range_rotation[(i, l)] * range_rotation[(j, l)];
+                s_reg_inv[(i, j)] += inv_d * range_rotation[(i, l)] * range_rotation[(j, l)];
             }
         }
     }
 
     for (k, lambda) in lambdas.iter().enumerate() {
         let s_k = &s_k_transformed_cache[k];
-        // tr(S⁺ S_k) via element-wise contraction on the penalized block.
+        // tr((S+δI)⁻¹ S_k) via element-wise contraction on the penalized block.
         let mut trace = 0.0_f64;
         for i in 0..penalized_rank {
             for j in 0..penalized_rank {
-                trace += s_plus[(i, j)] * s_k[(j, i)];
+                trace += s_reg_inv[(i, j)] * s_k[(j, i)];
             }
         }
         det1vec[k] = *lambda * trace;
@@ -1190,7 +1210,7 @@ pub fn stable_reparameterizationwith_invariant(
     #[cfg(debug_assertions)]
     {
         // Algebraic guardrail: keep the optimized det1 path tied to the general
-        // definition det1_k = lambda_k * tr(S⁺ S_k).
+        // definition det1_k = lambda_k * tr((S+δI)⁻¹ S_k).
         let mut maxdet1_mismatch = 0.0_f64;
         for (k, lambda) in lambdas.iter().enumerate() {
             let s_k = &s_k_transformed_cache[k];
@@ -1198,7 +1218,7 @@ pub fn stable_reparameterizationwith_invariant(
             matmul(
                 product.as_mut(),
                 Accum::Replace,
-                s_plus.as_ref(),
+                s_reg_inv.as_ref(),
                 s_k.as_ref(),
                 1.0,
                 Par::Seq,
