@@ -427,6 +427,25 @@ fn effectivelinkwiggle_formulaspec(
     })
 }
 
+fn linkname_supports_joint_wiggle(link: LinkFunction) -> bool {
+    !matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
+}
+
+fn linkchoice_supports_joint_wiggle(choice: &LinkChoice) -> bool {
+    choice.mixture_components.is_none() && linkname_supports_joint_wiggle(choice.link)
+}
+
+fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
+    matches!(
+        link,
+        InverseLink::Standard(LinkFunction::Identity)
+            | InverseLink::Standard(LinkFunction::Log)
+            | InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+    )
+}
+
 #[derive(Clone, Debug)]
 struct LinkFormulaSpec {
     link: String,
@@ -819,6 +838,29 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), link_choice.as_ref());
     let learn_linkwiggle = effective_linkwiggle.is_some();
+    if learn_linkwiggle
+        && matches!(
+            family,
+            LikelihoodFamily::BinomialMixture
+                | LikelihoodFamily::BinomialSas
+                | LikelihoodFamily::BinomialBetaLogistic
+        )
+    {
+        return Err(
+            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
+    if learn_linkwiggle
+        && link_choice
+            .as_ref()
+            .is_some_and(|choice| !linkchoice_supports_joint_wiggle(choice))
+    {
+        return Err(
+            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
     let mean_only_flexible_linkwiggle = link_choice
         .as_ref()
         .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible));
@@ -1352,6 +1394,14 @@ fn run_fitwith_predict_noise(
         }
         _ => InverseLink::Standard(effective_link),
     };
+    if formula_linkwiggle.is_some()
+        && !inverse_link_supports_joint_wiggle(&location_scale_link_kind)
+    {
+        return Err(
+            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
 
     let options = blockwise_options_from_fit_args(args)?;
     progress.set_stage("fit", "optimizing binomial location-scale model");
@@ -4437,6 +4487,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     parse_survival_distribution(&effective_survival_distribution)?;
     let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
+    if learn_linkwiggle && !inverse_link_supports_joint_wiggle(&survival_inverse_link) {
+        return Err(
+            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
     if likelihood_mode == SurvivalLikelihoodMode::Weibull {
         let baseline_args_requested = !effective_args
             .baseline_target
@@ -8883,14 +8939,19 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
                     .and_then(|s| s.strip_suffix(')'))
             })
         {
-            let components = parse_link_component_list(components_inner)?;
-            return Ok(Some(LinkChoice {
-                mode: LinkMode::Flexible,
-                link: LinkFunction::Logit,
-                mixture_components: Some(components),
-            }));
+            let _ = parse_link_component_list(components_inner)?;
+            return Err(
+                "flexible(...) does not support blended(...)/mixture(...) links; wiggle is only supported for jointly fit standard links"
+                    .to_string(),
+            );
         }
         let link = parse_linkname(inner)?;
+        if !linkname_supports_joint_wiggle(link) {
+            return Err(
+                "flexible(...) does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
+                    .to_string(),
+            );
+        }
         return Ok(Some(LinkChoice {
             mode: LinkMode::Flexible,
             link,
@@ -8917,6 +8978,12 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
     }
 
     let link = parse_linkname(&t)?;
+    if flexible_flag && !linkname_supports_joint_wiggle(link) {
+        return Err(
+            "--flexible-link does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
+                .to_string(),
+        );
+    }
     Ok(Some(LinkChoice {
         mode: if flexible_flag {
             LinkMode::Flexible
@@ -9107,10 +9174,12 @@ fn binomial_mean_linkwiggle_supports_family(
     family: LikelihoodFamily,
     link_choice: Option<&LinkChoice>,
 ) -> bool {
-    if !is_binomial_family(family) {
-        return false;
-    }
-    !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
+    matches!(
+        family,
+        LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+    ) && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
 }
 
 fn survival_link_usage() -> &'static str {
@@ -12232,34 +12301,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_link_choice_accepts_flexible_beta_logistic() {
-        let choice =
-            parse_link_choice(Some("flexible(beta-logistic)"), false).expect("parse link choice");
-        let choice = choice.expect("expected link choice");
-        assert!(matches!(choice.mode, LinkMode::Flexible));
-        assert!(matches!(choice.link, LinkFunction::BetaLogistic));
-        assert!(choice.mixture_components.is_none());
+    fn parse_link_choice_rejects_flexible_beta_logistic() {
+        let err = parse_link_choice(Some("flexible(beta-logistic)"), false)
+            .expect_err("flexible(beta-logistic) should be rejected");
+        assert!(err.contains("does not support sas/beta-logistic"));
     }
 
     #[test]
-    fn parse_link_choice_accepts_flexible_sas() {
-        let choice = parse_link_choice(Some("flexible(sas)"), false).expect("parse link choice");
-        let choice = choice.expect("expected link choice");
-        assert!(matches!(choice.mode, LinkMode::Flexible));
-        assert!(matches!(choice.link, LinkFunction::Sas));
-        assert!(choice.mixture_components.is_none());
+    fn parse_link_choice_rejects_flexible_sas() {
+        let err = parse_link_choice(Some("flexible(sas)"), false)
+            .expect_err("flexible(sas) should be rejected");
+        assert!(err.contains("does not support sas/beta-logistic"));
     }
 
     #[test]
-    fn parse_link_choice_accepts_flexible_blended_link() {
-        let choice = parse_link_choice(Some("flexible(blended(logit,probit))"), false)
-            .expect("parse flexible blended link");
-        let choice = choice.expect("expected link choice");
-        assert!(matches!(choice.mode, LinkMode::Flexible));
-        assert_eq!(
-            choice.mixture_components,
-            Some(vec![LinkComponent::Logit, LinkComponent::Probit])
-        );
+    fn parse_link_choice_rejects_flexible_blended_link() {
+        let err = parse_link_choice(Some("flexible(blended(logit,probit))"), false)
+            .expect_err("flexible(blended(...)) should be rejected");
+        assert!(err.contains("does not support blended(...)/mixture(...)"));
     }
 
     #[test]
@@ -12619,7 +12678,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_survival_inverse_link_accepts_flexible_blended_links() {
+    fn parse_survival_inverse_link_rejects_flexible_blended_links() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
             entry: "entry".to_string(),
@@ -12651,17 +12710,9 @@ mod tests {
         };
         args.link = Some("flexible(blended(logit,probit))".to_string());
         args.mixture_rho = Some("0.2".to_string());
-        let link = parse_survival_inverse_link(&args).expect("flexible blended survival link");
-        match link {
-            InverseLink::Mixture(state) => {
-                assert_eq!(
-                    state.components,
-                    vec![LinkComponent::Logit, LinkComponent::Probit]
-                );
-                assert_eq!(state.rho.len(), 1);
-            }
-            other => panic!("expected blended survival inverse link, got {other:?}"),
-        }
+        let err = parse_survival_inverse_link(&args)
+            .expect_err("flexible blended survival link should be rejected");
+        assert!(err.contains("does not support blended(...)/mixture(...)"));
     }
 
     #[test]
