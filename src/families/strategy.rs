@@ -1,4 +1,4 @@
-use crate::estimate::{EstimationError, UnifiedFitResult, FittedLinkState};
+use crate::estimate::{EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet};
 use crate::quadrature::{
@@ -288,7 +288,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
             LikelihoodFamily::GammaLog => {
                 // Default shape=1 (exponential) when not specified.
-                Ok(NoiseModel::Gamma { shape: gaussian_scale.unwrap_or(1.0).max(1e-6) })
+                Ok(NoiseModel::Gamma {
+                    shape: gaussian_scale.unwrap_or(1.0).max(1e-6),
+                })
             }
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic family strategy"

@@ -464,20 +464,25 @@ impl<'a> RemlState<'a> {
     pub(super) fn compute_lamlhessian_by_strategy(
         &self,
         rho: &Array1<f64>,
-        bundle: &EvalShared,
+        _bundle: &EvalShared,
         decision: HessianStrategyDecision,
     ) -> Result<Array2<f64>, EstimationError> {
+        // All strategies now route through the unified evaluator. Conservative
+        // degradation (dropping the log|H|₊ trace-curvature block) happens
+        // INSIDE compute_outer_hessian when it detects non-finite values.
         match decision.strategy {
             HessianEvalStrategyKind::SpectralExact => self.compute_lamlhessian_exact(rho),
             HessianEvalStrategyKind::AnalyticFallback => {
-                self.compute_lamlhessian_analytic_fallback(rho, Some(bundle))
+                // The unified evaluator will produce the conservative Hessian
+                // internally if trace-curvature terms are unstable.
+                self.compute_lamlhessian_exact(rho)
             }
             HessianEvalStrategyKind::DiagnosticNumeric => {
                 log::warn!(
-                    "Using diagnostic numeric Hessian strategy routing (reason={}); dispatching to deterministic analytic fallback.",
+                    "Diagnostic numeric Hessian strategy (reason={}); routing through unified evaluator.",
                     decision.reason
                 );
-                self.compute_lamlhessian_analytic_fallback(rho, Some(bundle))
+                self.compute_lamlhessian_exact(rho)
             }
         }
     }

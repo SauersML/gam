@@ -43,8 +43,7 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
-    SasLinkState,
+    Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -968,28 +967,21 @@ fn compute_smoothing_correction(
     }
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
-    // Prefer exact Hessian; if unavailable, use deterministic analytic fallback
-    // from the same objective surface (no runtime FD Hessian path).
+    // The unified evaluator handles conservative degradation internally
+    // (dropping the log|H|₊ trace-curvature block when it produces non-finite
+    // values), so compute_lamlhessian_consistent always returns a usable
+    // Hessian unless the PIRLS/bundle setup itself fails.
     let mut hessian_rho = match reml_state.compute_lamlhessian_consistent(final_rho) {
         Ok(h) => h,
         Err(err) => {
             log::warn!(
-                "LAML Hessian unavailable ({}); using analytic fallback Hessian for smoothing correction.",
+                "LAML Hessian unavailable ({}); skipping smoothing correction.",
                 err
             );
-            match reml_state.compute_lamlhessian_analytic_fallback_standalone(final_rho) {
-                Ok(h) => h,
-                Err(fallback_err) => {
-                    log::warn!(
-                        "Analytic fallback Hessian unavailable ({}); skipping smoothing correction.",
-                        fallback_err
-                    );
-                    return SmoothingCorrectionComputation {
-                        correction: None,
-                        hessian_rho: None,
-                    };
-                }
-            }
+            return SmoothingCorrectionComputation {
+                correction: None,
+                hessian_rho: None,
+            };
         }
     };
 
@@ -1560,8 +1552,7 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::strategy::{
-            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig,
-            OuterEval,
+            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
         };
 
         let outer_config = OuterConfig {
@@ -1603,14 +1594,12 @@ where
                     },
                 })
             },
-            reset_fn: |state: &mut &mut self::reml::RemlState<'_>| {
-                // No-op: PIRLS cache auto-manages warm start.
-                // State is accessed to satisfy the borrow checker.
-                let _ = state.x();
-            },
-            efs_fn: Some(|state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
-                state.compute_efs_steps(rho)
-            }),
+            reset_fn: None::<fn(&mut &mut self::reml::RemlState<'_>)>,
+            efs_fn: Some(
+                |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+                    state.compute_efs_steps(rho)
+                },
+            ),
         };
 
         let strategy_result =
@@ -1835,9 +1824,13 @@ where
 
                 // The unified evaluator returns gradient of length k + aux_dim.
                 // Pad to theta_dim if needed (should already match).
-                debug_assert_eq!(grad.len(), theta_dim,
+                debug_assert_eq!(
+                    grad.len(),
+                    theta_dim,
                     "unified evaluator gradient length {} != theta_dim {}",
-                    grad.len(), theta_dim);
+                    grad.len(),
+                    theta_dim
+                );
 
                 // SAS ridge/barrier cost and gradient corrections.
                 let sasridge = if use_sas && !use_beta_logistic {
@@ -1883,14 +1876,19 @@ where
                     hessian: HessianResult::Unavailable,
                 })
             },
-            reset_fn: |state: &mut &mut self::reml::RemlState<'_>| {
+            reset_fn: Some(|state: &mut &mut self::reml::RemlState<'_>| {
                 state.set_link_states(
                     initial_link_kind.mixture_state().cloned(),
                     initial_link_kind.sas_state().copied(),
                 );
                 let _ = state.x();
-            },
-            efs_fn: None::<fn(&mut &mut self::reml::RemlState<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+            }),
+            efs_fn: None::<
+                fn(
+                    &mut &mut self::reml::RemlState<'_>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
         };
         let strategy_result = crate::solver::strategy::run_outer(
             &mut obj,
@@ -2820,9 +2818,7 @@ pub enum FittedLinkState {
     },
 }
 
-fn validate_fitted_link_estimation(
-    fitted_link: &FittedLinkState,
-) -> Result<(), EstimationError> {
+fn validate_fitted_link_estimation(fitted_link: &FittedLinkState) -> Result<(), EstimationError> {
     match fitted_link {
         FittedLinkState::Standard(_) => Ok(()),
         FittedLinkState::Mixture { state, covariance } => {
@@ -2857,7 +2853,6 @@ fn validate_fitted_link_estimation(
         }
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Unified fit result — single type for all model families
@@ -3126,7 +3121,6 @@ impl FitInference {
     }
 }
 
-
 impl UnifiedFitResult {
     pub fn try_from_parts(parts: UnifiedFitResultParts) -> Result<Self, EstimationError> {
         let UnifiedFitResultParts {
@@ -3281,7 +3275,6 @@ impl UnifiedFitResult {
         .map(|_| ())
     }
 }
-
 
 impl UnifiedFitResult {
     /// Get the beta covariance matrix (conditional) if available.
@@ -3460,12 +3453,10 @@ impl UnifiedFitResult {
                 )),
             },
             crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link {
-                FittedLinkState::Mixture { state, covariance } => {
-                    Ok(FittedLinkState::Mixture {
-                        state: state.clone(),
-                        covariance: covariance.clone(),
-                    })
-                }
+                FittedLinkState::Mixture { state, covariance } => Ok(FittedLinkState::Mixture {
+                    state: state.clone(),
+                    covariance: covariance.clone(),
+                }),
                 _ => Err(EstimationError::InvalidInput(
                     "BinomialMixture requires fitted mixture link parameters".to_string(),
                 )),

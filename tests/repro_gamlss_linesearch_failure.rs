@@ -20,7 +20,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
             barrier_config: None,
             force_solver: None,
         },
-        cost_fn: |_ctx: &mut &mut (), x: &Array1<f64>| {
+        cost_fn: |ctx: &mut &mut (), x: &Array1<f64>| {
             let r2 = x.dot(x);
             if r2 <= 1e-24 {
                 Ok(833.403058988699)
@@ -28,7 +28,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                 Ok(f64::INFINITY)
             }
         },
-        eval_fn: |_ctx: &mut &mut (), x: &Array1<f64>| {
+        eval_fn: |ctx: &mut &mut (), x: &Array1<f64>| {
             let r2 = x.dot(x);
             if r2 <= 1e-24 {
                 Ok(OuterEval {
@@ -44,8 +44,13 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                 })
             }
         },
-        reset_fn: |_ctx: &mut &mut ()| {},
-        efs_fn: None::<fn(&mut &mut (), &Array1<f64>) -> Result<EfsEval, gam::solver::estimate::EstimationError>>,
+        reset_fn: None::<fn(&mut &mut ())>,
+        efs_fn: None::<
+            fn(
+                &mut &mut (),
+                &Array1<f64>,
+            ) -> Result<EfsEval, gam::solver::estimate::EstimationError>,
+        >,
     };
 
     let config = OuterConfig {

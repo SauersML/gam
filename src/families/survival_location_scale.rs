@@ -1,8 +1,7 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, fit_custom_family,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, fit_custom_family,
 };
-use crate::solver::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
@@ -16,6 +15,7 @@ use crate::mixture_link::{
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
+use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
@@ -392,9 +392,7 @@ pub fn survival_fit_from_parts(
     }
 
     // Build blocks for the unified representation.
-    use crate::solver::estimate::{
-        BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts,
-    };
+    use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let mut blocks = vec![
         FittedBlock {
             beta: beta_time.clone(),
@@ -3366,9 +3364,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u - &delta_q_exit_u);
             let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v - &entry_deltas.delta_q_v);
             let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v - &delta_q_exit_v);
-            if let (Some(x_t_en), Some(_)) =
-                (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
-            {
+            if let (Some(x_t_en), Some(_)) = (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref()) {
                 let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v
                     + &dh_h1_v * &delta_q_t_exit_u
                     + &q.h_time_h1 * &(&delta_q_t_exit_u * &xi_h1_v + &delta_q_t_exit_v * &xi_h1_u);
@@ -3421,9 +3417,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u - &delta_q_exit_u);
             let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v - &entry_deltas.delta_q_v);
             let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v - &delta_q_exit_v);
-            if let (Some(x_ls_en), Some(_)) =
-                (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
-            {
+            if let (Some(x_ls_en), Some(_)) = (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref()) {
                 let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v
                     + &dh_h1_v * &delta_q_ls_exit_u
                     + &q.h_time_h1

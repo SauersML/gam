@@ -262,37 +262,33 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        // Strategy-policy routing:
-        // - policy decides spectral exact vs analytic fallback vs diagnostic numeric,
-        // - math kernels remain strategy-local.
+        // All strategies now route through the unified evaluator, which handles
+        // conservative degradation internally (dropping the log|H|₊ trace-
+        // curvature block when it produces non-finite values).
+        //
+        // The policy is logged for diagnostics but no longer triggers a
+        // separate code path — the unified evaluator's internal fallback
+        // produces identical results to the former external analytic fallback.
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(rho, &bundle);
         if decision.strategy != HessianEvalStrategyKind::SpectralExact {
             if decision.reason == "active_subspace_unstable" {
                 let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
                 log::warn!(
-                    "Exact LAML Hessian downgraded via policy (reason={}, rel_gap={:.3e}).",
+                    "Exact LAML Hessian downgraded via policy (reason={}, rel_gap={:.3e}); \
+                     unified evaluator will degrade internally if needed.",
                     decision.reason,
                     rel_gap
                 );
             } else {
                 log::warn!(
-                    "Exact LAML Hessian downgraded via policy (reason={}).",
+                    "Exact LAML Hessian downgraded via policy (reason={}); \
+                     unified evaluator will degrade internally if needed.",
                     decision.reason
                 );
             }
-            return self.compute_lamlhessian_by_strategy(rho, &bundle, decision);
         }
-        match self.compute_lamlhessian_by_strategy(rho, &bundle, decision) {
-            Ok(h) => Ok(h),
-            Err(err) => {
-                log::warn!(
-                    "Exact LAML Hessian unavailable ({}); using analytic fallback Hessian.",
-                    err
-                );
-                self.compute_lamlhessian_analytic_fallback(rho, Some(&bundle))
-            }
-        }
+        self.compute_lamlhessian_exact(rho)
     }
 
     pub(crate) fn compute_lamlhessian_exact(
@@ -300,33 +296,20 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
-            let result = self.evaluate_unified_sparse(
-                rho,
-                &bundle,
-                super::unified::EvalMode::ValueGradientHessian,
-            )?;
-            return result.hessian.ok_or_else(|| {
-                EstimationError::RemlOptimizationFailed(
-                    "Sparse unified Hessian returned None".into(),
-                )
-            });
-        }
-        // Route through the unified evaluator.
-        let result =
-            self.evaluate_unified(rho, &bundle, super::unified::EvalMode::ValueGradientHessian)?;
-        if let Some(h) = result.hessian {
-            return Ok(h);
-        }
-        // Unified path returned None for Hessian; fall back to analytic approximation.
-        self.compute_lamlhessian_analytic_fallback(rho, Some(&bundle))
-    }
-
-    pub(crate) fn compute_lamlhessian_analytic_fallback_standalone(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        self.compute_lamlhessian_analytic_fallback(rho, None)
+        let mode = super::unified::EvalMode::ValueGradientHessian;
+        let result = if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
+            self.evaluate_unified_sparse(rho, &bundle, mode)?
+        } else {
+            self.evaluate_unified(rho, &bundle, mode)?
+        };
+        // The unified evaluator always returns Some(hessian) for VGH mode:
+        // either the exact Hessian or a conservative penalty-only fallback
+        // (computed internally when trace-curvature terms are non-finite).
+        result.hessian.ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(
+                "Unified Hessian returned None for VGH mode".into(),
+            )
+        })
     }
 
     pub(crate) fn compute_smoothing_correction_auto(
@@ -347,7 +330,10 @@ impl<'a> RemlState<'a> {
                 if let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov) {
                     let outer = Array2::<f64>::zeros((0, 0));
                     let unified_diag = super::unified::compute_corrected_covariance_diagonal(
-                        &[], &[], &outer, &hop,
+                        &[],
+                        &[],
+                        &outer,
+                        &hop,
                     );
                     if let Ok(diag) = unified_diag {
                         let p = base_cov.nrows();
@@ -359,9 +345,8 @@ impl<'a> RemlState<'a> {
                             max_dev,
                         );
                     }
-                    let unified_full = super::unified::compute_corrected_covariance(
-                        &[], &[], &outer, &hop,
-                    );
+                    let unified_full =
+                        super::unified::compute_corrected_covariance(&[], &[], &outer, &hop);
                     if let Ok(full) = unified_full {
                         log::trace!(
                             "[corrected-cov] unified full norm: {:.4e}",

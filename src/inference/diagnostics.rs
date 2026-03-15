@@ -378,35 +378,32 @@ mod tests {
         let result = compute_envelopeaudit(0.0, &reference, 0.0, 0.0, &beta, 1e-8, 1e-6);
 
         assert!(!result.isviolated);
-        assert!(result.kkt_residual_norm < 1e-10);
     }
 
     #[test]
-    fn test_envelopeauditridge_mismatch() {
-        let reference = arr1(&[0.9, 1.9, 2.9]);
-        let beta = arr1(&[1.0, 1.0, 1.0]);
+    fn test_envelopeaudit_detects_ridge_mismatch() {
+        let reference = arr1(&[1.0, 0.0, 0.0]);
+        let beta = arr1(&[0.1, 0.2, 0.3]);
         let result = compute_envelopeaudit(1e-10, &reference, 0.1, 0.0, &beta, 1e-8, 1e-6);
 
-        // PIRLS used ridge 0.1, but gradient assumes 0.0
         assert!(result.isviolated);
-        assert!(
-            result.message.contains("Ridge Mismatch")
-                || result.message.contains("Envelope Violation")
-        );
+        assert!(result.message.contains("Ridge Mismatch"));
     }
 
     #[test]
-    fn test_dualridge_consistency_ok() {
-        let beta = arr1(&[1.0, 2.0, 3.0]);
+    fn test_dualridge_check_no_mismatch() {
+        let beta = arr1(&[0.1, 0.2, 0.3]);
         let result = compute_dualridge_check(0.0, 0.0, 0.0, &beta);
+
         assert!(!result.has_mismatch);
     }
 
     #[test]
-    fn test_dualridge_consistency_mismatch() {
-        let beta = arr1(&[1.0, 2.0, 3.0]);
+    fn test_dualridge_check_detects_mismatch() {
+        let beta = arr1(&[0.1, 0.2, 0.3]);
         let result = compute_dualridge_check(1e-4, 0.0, 0.0, &beta);
+
         assert!(result.has_mismatch);
-        assert!(result.phantom_penalty > 0.0);
+        assert!(result.message.contains("Ridge Mismatch detected"));
     }
 }

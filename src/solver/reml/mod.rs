@@ -1470,7 +1470,10 @@ impl HyperDesignDerivative {
     /// Returns `None` for dense/embedded storage or for second-derivative levels.
     pub(crate) fn implicit_first_axis_info(
         &self,
-    ) -> Option<(std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>, usize)> {
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )> {
         match &self.storage {
             DerivativeMatrixStorage::Implicit(op) => match op.level {
                 ImplicitDerivLevel::First(axis) => Some((op.operator.clone(), axis)),
@@ -1822,7 +1825,10 @@ impl DirectionalHyperParam {
     /// Extract the implicit design derivative operator and axis, if available.
     pub(crate) fn implicit_first_axis_info(
         &self,
-    ) -> Option<(std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>, usize)> {
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )> {
         self.x_tau_original.implicit_first_axis_info()
     }
 

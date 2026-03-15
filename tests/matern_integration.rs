@@ -252,8 +252,7 @@ fn simulate_matern_aniso_3d(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>, A
         x[[i, 1]] = x2;
         x[[i, 2]] = x3;
 
-        let f = 1.0 * (-x1 * x1 / 2.0).exp()
-            + 0.3 * (std::f64::consts::PI * x2 * 0.5).sin();
+        let f = 1.0 * (-x1 * x1 / 2.0).exp() + 0.3 * (std::f64::consts::PI * x2 * 0.5).sin();
         y_true[i] = f;
         y[i] = f + noise_dist.sample(&mut rng);
     }

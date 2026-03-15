@@ -6,9 +6,9 @@ use crate::basis::{
     evaluate_bsplinethird_derivative_scalar,
 };
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyBlockPsiDerivative, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec,
-    ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
+    FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
+    evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -28,10 +28,9 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design,
-    optimize_two_block_spatial_length_scale,
-    optimize_two_block_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
+    freeze_spatial_length_scale_terms_from_design, optimize_two_block_spatial_length_scale,
+    optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
@@ -1290,7 +1289,8 @@ impl BlockwiseTermFitResult {
             noise_design,
         } = parts;
 
-        fit.validate_numeric_finiteness().map_err(|e| format!("{e}"))?;
+        fit.validate_numeric_finiteness()
+            .map_err(|e| format!("{e}"))?;
         if fit.block_states.len() < 2 {
             return Err(format!(
                 "BlockwiseTermFitResult requires at least 2 block states, got {}",
@@ -1364,7 +1364,8 @@ impl BlockwiseTermWiggleFitResult {
             wiggle_degree,
         } = parts;
 
-        fit.validate_numeric_finiteness().map_err(|e| format!("{e}"))?;
+        fit.validate_numeric_finiteness()
+            .map_err(|e| format!("{e}"))?;
         if fit.fit.block_states.len() < 3 {
             return Err(format!(
                 "BlockwiseTermWiggleFitResult requires at least 3 block states, got {}",
@@ -1524,7 +1525,6 @@ pub fn fit_binomial_mean_wiggle(
     ];
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
-
 
 pub fn fit_binomial_location_scale(
     spec: BinomialLocationScaleSpec,
@@ -3500,7 +3500,10 @@ impl Clone for GaussianLocationScaleFamily {
             mu_design: self.mu_design.clone(),
             log_sigma_design: self.log_sigma_design.clone(),
             cached_row_scalars: std::sync::RwLock::new(
-                self.cached_row_scalars.read().expect("lock poisoned").clone(),
+                self.cached_row_scalars
+                    .read()
+                    .expect("lock poisoned")
+                    .clone(),
             ),
         }
     }
@@ -4003,7 +4006,10 @@ impl GaussianLocationScaleFamily {
             eta_ls.get(0).copied().unwrap_or(f64::NAN),
         );
         {
-            let cache = self.cached_row_scalars.read().expect("cached_row_scalars lock poisoned");
+            let cache = self
+                .cached_row_scalars
+                .read()
+                .expect("cached_row_scalars lock poisoned");
             if let Some((k0, k1, ref scalars)) = *cache {
                 if k0 == key.0 && k1 == key.1 {
                     return Ok(scalars.clone());
@@ -4011,7 +4017,10 @@ impl GaussianLocationScaleFamily {
             }
         }
         let scalars = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
-        *self.cached_row_scalars.write().expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, scalars.clone()));
+        *self
+            .cached_row_scalars
+            .write()
+            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, scalars.clone()));
         Ok(scalars)
     }
 
@@ -5481,10 +5490,10 @@ impl GammaLogFamily {
 
 impl CustomFamily for GammaLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
         use crate::pirls::{
             WeightFamily, WeightLink, fisher_weight_dispatch, observed_weight_dispatch,
         };
-        use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
 
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
         let n = self.y.len();
@@ -5545,7 +5554,7 @@ impl CustomFamily for GammaLogFamily {
                     phi_gamma,
                     self.weights[i],
                     jet,
-                    m,  // h4 = exp(eta) = mu for log link
+                    m, // h4 = exp(eta) = mu for log link
                 );
                 // Also compute the Fisher weight via the unified dispatch.
                 // For Gamma-log this exercises the generic noncanonical path
@@ -5607,8 +5616,16 @@ impl CustomFamily for GammaLogFamily {
                         "[gamma-log] obs-weight deviation at i={i}: fisher={:.4e}, obs={:.4e}, \
                          c_obs={:.4e}, d_obs={:.4e}, c_fisher={:.4e}, d_fisher={:.4e}, \
                          w_gl={:.4e}, w_gi={:.4e}, w_obs_gl={:.4e}, w_obs_gi={:.4e}",
-                        w_fisher, w_obs, c_obs, d_obs, c_fisher, d_fisher,
-                        w_gl, w_gi, w_obs_gl, w_obs_gi,
+                        w_fisher,
+                        w_obs,
+                        c_obs,
+                        d_obs,
+                        c_fisher,
+                        d_fisher,
+                        w_gl,
+                        w_gi,
+                        w_obs_gl,
+                        w_obs_gi,
                     );
                 }
             }

@@ -201,7 +201,10 @@ impl<'a> RemlState<'a> {
     ) -> Result<(f64, Option<Array1<f64>>), EstimationError> {
         let mut d_vec = pirls_result.solve_c_array.clone();
         if d_vec.is_empty() {
-            return Ok((0.0, gradient_info.map(|(roots, _)| Array1::zeros(roots.len()))));
+            return Ok((
+                0.0,
+                gradient_info.map(|(roots, _)| Array1::zeros(roots.len())),
+            ));
         }
         for val in &mut d_vec {
             if !val.is_finite() {
@@ -211,7 +214,10 @@ impl<'a> RemlState<'a> {
 
         let p_eff = h_eff_eval.ncols();
         if p_eff == 0 {
-            return Ok((0.0, gradient_info.map(|(roots, _)| Array1::zeros(roots.len()))));
+            return Ok((
+                0.0,
+                gradient_info.map(|(roots, _)| Array1::zeros(roots.len())),
+            ));
         }
 
         // Compute the third-derivative projection for the TK value.
@@ -312,7 +318,11 @@ impl<'a> RemlState<'a> {
                     .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
                     .sum::<f64>()
                     / 6.0;
-                let correction = if correction.is_finite() { correction } else { 0.0 };
+                let correction = if correction.is_finite() {
+                    correction
+                } else {
+                    0.0
+                };
                 return Ok((correction, Some(tk_grad)));
             }
         } else {
@@ -401,7 +411,11 @@ impl<'a> RemlState<'a> {
                     .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
                     .sum::<f64>()
                     / 6.0;
-                let correction = if correction.is_finite() { correction } else { 0.0 };
+                let correction = if correction.is_finite() {
+                    correction
+                } else {
+                    0.0
+                };
                 return Ok((correction, Some(tk_grad)));
             }
         }
@@ -414,7 +428,11 @@ impl<'a> RemlState<'a> {
             .sum::<f64>()
             / 6.0;
 
-        let correction = if correction.is_finite() { correction } else { 0.0 };
+        let correction = if correction.is_finite() {
+            correction
+        } else {
+            0.0
+        };
         Ok((correction, None))
     }
 
@@ -493,8 +511,7 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
         use crate::mixture_link::{
-            inverse_link_jet_for_link_function,
-            inverse_link_pdfthird_derivative_for_inverse_link,
+            inverse_link_jet_for_link_function, inverse_link_pdfthird_derivative_for_inverse_link,
         };
         use crate::pirls::{VarianceJet, observed_weight_noncanonical};
 
@@ -528,19 +545,15 @@ impl<'a> RemlState<'a> {
             )?;
 
             // h4 = h''''(η), the fourth inverse-link derivative.
-            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(
-                &inv_link,
-                eta_clamped,
-            )?;
+            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&inv_link, eta_clamped)?;
 
             let mu = jet.mu;
             let vj = VarianceJet::bernoulli(mu);
             let pw = self.weights[i].max(0.0);
             let yi = self.y[i];
 
-            let (_, ci, di) = observed_weight_noncanonical(
-                yi, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, pw,
-            );
+            let (_, ci, di) =
+                observed_weight_noncanonical(yi, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, pw);
             c_obs[i] = ci;
             d_obs[i] = di;
         }
@@ -906,9 +919,18 @@ impl<'a> RemlState<'a> {
         let config = super::unified::BarrierConfig::from_constraints(Some(constraints))?;
         // Diagnostic: check curvature significance at a test point near bounds.
         {
-            let max_idx = config.constrained_indices.iter().max().copied().unwrap_or(0);
+            let max_idx = config
+                .constrained_indices
+                .iter()
+                .max()
+                .copied()
+                .unwrap_or(0);
             let mut beta_test = Array1::<f64>::zeros(max_idx + 1);
-            for (&idx, &lb) in config.constrained_indices.iter().zip(config.lower_bounds.iter()) {
+            for (&idx, &lb) in config
+                .constrained_indices
+                .iter()
+                .zip(config.lower_bounds.iter())
+            {
                 beta_test[idx] = lb + 0.01; // slightly above constraint
             }
             let significant = config.barrier_curvature_is_significant(&beta_test, 1.0, 0.05);
@@ -2441,8 +2463,7 @@ impl<'a> RemlState<'a> {
             for j in 0..p_dim {
                 let mut e_j = Array1::<f64>::zeros(p_dim);
                 e_j[j] = 1.0;
-                if let Ok(f_j) =
-                    crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
+                if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
                 {
                     h_inv_diag[j] = f_j[j];
 
@@ -2464,7 +2485,11 @@ impl<'a> RemlState<'a> {
                 .sum::<f64>()
                 / 6.0;
 
-            let correction = if correction.is_finite() { correction } else { 0.0 };
+            let correction = if correction.is_finite() {
+                correction
+            } else {
+                0.0
+            };
 
             let gradient = if compute_grad {
                 let k = penalty_roots.len();
@@ -2714,7 +2739,12 @@ impl<'a> RemlState<'a> {
         // We replicate the assembly from evaluate_unified here to be able to pass
         // ext_coords into the InnerSolution.
         self.evaluate_unified_with_ext_from_bundle(
-            rho, &bundle, mode, ext_coords, ext_pair_fn, rho_ext_pair_fn,
+            rho,
+            &bundle,
+            mode,
+            ext_coords,
+            ext_pair_fn,
+            rho_ext_pair_fn,
         )
     }
 
@@ -2740,9 +2770,9 @@ impl<'a> RemlState<'a> {
         >,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DenseSpectralOperator, DispersionHandling, GaussianDerivatives,
-            HessianOperator, InnerSolutionBuilder, PenaltyLogdetDerivs,
-            SinglePredictorGlmDerivatives, reml_laml_evaluate,
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, HessianOperator,
+            InnerSolutionBuilder, PenaltyLogdetDerivs, SinglePredictorGlmDerivatives,
+            reml_laml_evaluate,
         };
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -3122,8 +3152,8 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
     ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
         use super::unified::{
-            DenseSpectralOperator, DispersionHandling, GaussianDerivatives,
-            PenaltyLogdetDerivs, SinglePredictorGlmDerivatives,
+            DenseSpectralOperator, DispersionHandling, GaussianDerivatives, PenaltyLogdetDerivs,
+            SinglePredictorGlmDerivatives,
         };
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -3359,8 +3389,6 @@ impl<'a> RemlState<'a> {
         // No pair callbacks for link parameters: the outer Hessian for link
         // coords is left to BFGS (HessianResult::Unavailable). This matches
         // the current behavior where link parameters have gradient-only.
-        self.evaluate_unified_with_ext_from_bundle(
-            rho, &bundle, mode, ext_coords, None, None,
-        )
+        self.evaluate_unified_with_ext_from_bundle(rho, &bundle, mode, ext_coords, None, None)
     }
 }
