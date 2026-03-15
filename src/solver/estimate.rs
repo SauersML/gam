@@ -929,14 +929,14 @@ fn compute_smoothing_correction(
     // so each Jacobian column is one linear solve with H.
 
     // Use the same objective-consistent inner Hessian surface used by REML:
-    // - non-Firth: H = X'WX + S (+ stabilization if present)
+    // - non-Firth: H = X'W_HX + S (+ stabilization if present)
     // - Firth logit: H_total = H - d²Phi/dβ²
     // Fallback to PIRLS stabilized Hessian only if bundle recovery fails.
     //
     // Conclusion:
     //   J[:,k] = dβ̂/dρ_k must use the Jacobian of the actual stationarity
     //   system G*(β,ρ)=0, i.e. H_total for Firth-adjusted fits. Using only
-    //   X'WX+S here would be inconsistent with the fitted objective and would
+    //   X'W_HX+S here would be inconsistent with the fitted objective and would
     //   misstate smoothing-parameter uncertainty propagation.
     let h_trans = reml_state
         .objective_innerhessian(final_rho)
@@ -1230,20 +1230,49 @@ fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
     firth_override: Option<bool>,
 ) -> Result<(LinkFunction, bool), EstimationError> {
+    let reject_unsupported_firth = |label: &str| {
+        if firth_override == Some(true) {
+            Err(EstimationError::InvalidInput(format!(
+                "firth_bias_reduction is only implemented for BinomialLogit fitting; {label} does not support it"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+
     match family {
         crate::types::LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
         crate::types::LikelihoodFamily::BinomialLogit => {
             Ok((LinkFunction::Logit, firth_override.unwrap_or(true)))
         }
-        crate::types::LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
-        crate::types::LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
-        crate::types::LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
+        crate::types::LikelihoodFamily::BinomialProbit => {
+            reject_unsupported_firth("BinomialProbit")?;
+            Ok((LinkFunction::Probit, false))
+        }
+        crate::types::LikelihoodFamily::BinomialCLogLog => {
+            reject_unsupported_firth("BinomialCLogLog")?;
+            Ok((LinkFunction::CLogLog, false))
+        }
+        crate::types::LikelihoodFamily::BinomialSas => {
+            reject_unsupported_firth("BinomialSas")?;
+            Ok((LinkFunction::Sas, false))
+        }
         crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+            reject_unsupported_firth("BinomialBetaLogistic")?;
             Ok((LinkFunction::BetaLogistic, false))
         }
-        crate::types::LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
-        crate::types::LikelihoodFamily::PoissonLog => Ok((LinkFunction::Log, false)),
-        crate::types::LikelihoodFamily::GammaLog => Ok((LinkFunction::Log, false)),
+        crate::types::LikelihoodFamily::BinomialMixture => {
+            reject_unsupported_firth("BinomialMixture")?;
+            Ok((LinkFunction::Logit, false))
+        }
+        crate::types::LikelihoodFamily::PoissonLog => {
+            reject_unsupported_firth("PoissonLog")?;
+            Ok((LinkFunction::Log, false))
+        }
+        crate::types::LikelihoodFamily::GammaLog => {
+            reject_unsupported_firth("GammaLog")?;
+            Ok((LinkFunction::Log, false))
+        }
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -1327,10 +1356,11 @@ fn ensure_exact_directional_hyper_supported(
     // Current status:
     // - Dense exact path supports Firth-logit directional hyper-gradients for
     //   both penalty-only and design-moving directions.
-    // - Sparse exact path still rejects Firth-logit directional gradients.
+    // - Sparse exact path supports the same Firth-logit directional
+    //   hyper-gradients via sparse Cholesky solves plus the shared dense
+    //   Fisher-information reduction.
     //
-    // We intentionally do not block here so callers can use the dense path.
-    // Sparse limitations are reported at execution sites in `reml.rs`.
+    // No additional API-level restrictions are needed here.
     let _ = (link, firth_active, has_design_drift, context);
     Ok(())
 }
@@ -1576,7 +1606,6 @@ where
             heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
             initial_rho: None,
             fallback_sequence: Vec::new(),
-            coordinate_search: None,
         };
 
         let mut obj = ClosureObjective {
@@ -1684,7 +1713,6 @@ where
             heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
             initial_rho: None,
             fallback_sequence: Vec::new(),
-            coordinate_search: None,
         };
         let mut obj = ClosureObjective {
             state: &mut reml_state,
@@ -2248,6 +2276,7 @@ where
                 penalty_roots: pirls_res.reparam_result.rs_transformed.clone(),
                 rho_mode: rho_view,
                 nuts_family: joint_nuts_family,
+                firth_bias_reduction: pirls_res.firth_log_det().is_some(),
                 trigger_skewness: max_skewness,
             };
 
@@ -2828,7 +2857,9 @@ pub struct FitInference {
     pub working_response: Array1<f64>,
     pub reparam_qs: Option<Array2<f64>>,
     /// Conditional posterior covariance under fixed smoothing parameters:
-    /// Var(β | λ) ≈ (X'WX + S)^(-1)
+    /// Var(β | λ) ≈ (X'W_HX + S)^(-1), where `W_H` is the Hessian-side
+    /// PIRLS curvature (Fisher for canonical links, observed/clamped for
+    /// non-canonical links).
     pub beta_covariance: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
@@ -2932,9 +2963,9 @@ pub struct FittedBlock {
 /// diagnostics. Only populated when the inner solver provides the data.
 #[derive(Clone, Debug)]
 pub struct FitGeometry {
-    /// Joint penalized Hessian H = X'WX + S(λ) at convergence.
+    /// Joint penalized Hessian H = X'W_HX + S(λ) at convergence.
     pub penalized_hessian: Array2<f64>,
-    /// IRLS working weights at convergence.
+    /// Score-side Fisher IRLS weights paired with `working_response`.
     pub working_weights: Array1<f64>,
     /// IRLS working response at convergence.
     pub working_response: Array1<f64>,
@@ -3505,9 +3536,7 @@ impl UnifiedFitResult {
             | crate::types::LikelihoodFamily::GammaLog => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))
             }
-            crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "fitted_link_state is not defined for RoystonParmar".to_string(),
-            )),
+            crate::types::LikelihoodFamily::RoystonParmar => Ok(FittedLinkState::Standard(None)),
         }
     }
 }
@@ -4974,6 +5003,17 @@ mod fd_policy_tests {
         // <20 rule still triggers Firth because support per parameter is weak.
         assert!(should_enable_firth_from_class_support(425.0, 225));
         assert!(!should_enable_firth_from_class_support(460.0, 225));
+    }
+
+    #[test]
+    fn resolve_external_family_rejects_unsupported_firth_request() {
+        let err = resolve_external_family(LikelihoodFamily::PoissonLog, Some(true))
+            .expect_err("Poisson fitting should reject unsupported Firth requests explicitly");
+        assert!(
+            err.to_string()
+                .contains("firth_bias_reduction is only implemented for BinomialLogit fitting"),
+            "unexpected error: {err}"
+        );
     }
 
     fn build_tiny_design(n: usize) -> Array2<f64> {

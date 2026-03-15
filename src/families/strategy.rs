@@ -6,7 +6,7 @@ use crate::quadrature::{
     integrated_family_moments_jetwith_state, integrated_inverse_link_jetwith_state,
     integrated_inverse_link_mean_and_derivative, logit_posterior_meanvariance,
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
-    probit_posterior_meanvariance,
+    probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
 use ndarray::{Array1, ArrayView1};
@@ -116,16 +116,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     }
 
     fn inverse_link(&self, eta: f64) -> Result<f64, EstimationError> {
-        if matches!(self.family, LikelihoodFamily::RoystonParmar) {
-            return Ok(eta);
-        }
         self.inverse_link_jet(eta).map(|jet| jet.mu)
     }
 
     fn inverse_link_array(&self, eta: ArrayView1<'_, f64>) -> Result<Array1<f64>, EstimationError> {
-        if matches!(self.family, LikelihoodFamily::RoystonParmar) {
-            return Ok(eta.to_owned());
-        }
         let mut out = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {
             out[i] = self.inverse_link(eta[i])?;
@@ -186,10 +180,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
                 Ok((eta + 0.5 * se_eta * se_eta).exp())
             }
-            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "RoystonParmar posterior mean is not exposed via generic family strategy"
-                    .to_string(),
-            )),
+            LikelihoodFamily::RoystonParmar => Ok(survival_posterior_mean(quadctx, eta, se_eta)),
         }
     }
 
@@ -275,10 +266,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let m2 = (2.0 * eta + s2).exp() * (s2.exp() - 1.0);
                 Ok((m1, m2.max(0.0)))
             }
-            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "RoystonParmar posterior mean is not exposed via generic family strategy"
-                    .to_string(),
-            )),
+            LikelihoodFamily::RoystonParmar => {
+                Ok(survival_posterior_meanvariance(quadctx, eta, se_eta))
+            }
         }
     }
 

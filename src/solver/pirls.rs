@@ -422,6 +422,18 @@ fn build_penalized_symbolic(
 
 pub trait WorkingModel {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError>;
+
+    fn update_with_curvature(
+        &mut self,
+        beta: &Coefficients,
+        _curvature: HessianCurvatureKind,
+    ) -> Result<WorkingState, EstimationError> {
+        self.update(beta)
+    }
+
+    fn supports_observed_information_curvature(&self) -> bool {
+        false
+    }
 }
 
 /// Uncertainty inputs for integrated (GHQ) IRLS updates.
@@ -603,6 +615,12 @@ impl FirthDiagnostics {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HessianCurvatureKind {
+    Fisher,
+    Observed,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingState {
     pub eta: LinearPredictor,
@@ -617,6 +635,7 @@ pub struct WorkingState {
     // 0.5 * (deviance + penalty_term), so this corresponds to
     // 0.5 * ridge * ||beta||^2 on the log-likelihood scale.
     pub ridge_used: f64,
+    pub hessian_curvature: HessianCurvatureKind,
 }
 
 impl WorkingState {
@@ -1009,6 +1028,10 @@ struct GamWorkingModel<'a> {
     lastz: Array1<f64>,
     last_c: Array1<f64>,
     last_d: Array1<f64>,
+    lasthessian_weights: Array1<f64>,
+    lasthessian_c: Array1<f64>,
+    lasthessian_d: Array1<f64>,
+    lasthessian_curvature: HessianCurvatureKind,
     last_dmu_deta: Array1<f64>,
     last_d2mu_deta2: Array1<f64>,
     last_d3mu_deta3: Array1<f64>,
@@ -1025,6 +1048,7 @@ struct GamModelFinalState {
     e_transformed: Array2<f64>,
     finalmu: Array1<f64>,
     finalweights: Array1<f64>,
+    scoreweights: Array1<f64>,
     finalz: Array1<f64>,
     final_c: Array1<f64>,
     final_d: Array1<f64>,
@@ -1032,6 +1056,7 @@ struct GamModelFinalState {
     final_d2mu_deta2: Array1<f64>,
     final_d3mu_deta3: Array1<f64>,
     penalty_term: f64,
+    hessian_curvature: HessianCurvatureKind,
 }
 
 impl<'a> GamWorkingModel<'a> {
@@ -1100,6 +1125,10 @@ impl<'a> GamWorkingModel<'a> {
             lastz: Array1::zeros(n),
             last_c: Array1::zeros(n),
             last_d: Array1::zeros(n),
+            lasthessian_weights: Array1::zeros(n),
+            lasthessian_c: Array1::zeros(n),
+            lasthessian_d: Array1::zeros(n),
+            lasthessian_curvature: HessianCurvatureKind::Fisher,
             last_dmu_deta: Array1::zeros(n),
             last_d2mu_deta2: Array1::zeros(n),
             last_d3mu_deta3: Array1::zeros(n),
@@ -1127,6 +1156,10 @@ impl<'a> GamWorkingModel<'a> {
             lastz,
             last_c,
             last_d,
+            lasthessian_weights,
+            lasthessian_c,
+            lasthessian_d,
+            lasthessian_curvature,
             last_dmu_deta,
             last_d2mu_deta2,
             last_d3mu_deta3,
@@ -1149,14 +1182,16 @@ impl<'a> GamWorkingModel<'a> {
             coordinate_frame,
             e_transformed,
             finalmu: lastmu,
-            finalweights: lastweights,
+            finalweights: lasthessian_weights,
+            scoreweights: lastweights,
             finalz: lastz,
-            final_c: last_c,
-            final_d: last_d,
+            final_c: lasthessian_c,
+            final_d: lasthessian_d,
             final_dmu_deta: last_dmu_deta,
             final_d2mu_deta2: last_d2mu_deta2,
             final_d3mu_deta3: last_d3mu_deta3,
             penalty_term: last_penalty_term,
+            hessian_curvature: lasthessian_curvature,
         }
     }
 
@@ -1264,33 +1299,49 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    fn observed_binomial_score_jacobian_diagonal(
+    fn supports_observed_hessian_curvature(&self) -> bool {
+        supports_observed_hessian_curvature_for_inverse_link(&self.link_kind)
+    }
+
+    fn hessian_curvature_arrays(
         &self,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
-        let needsobserved_jacobian = matches!(
-            self.link_kind,
-            InverseLink::Sas(_) | InverseLink::BetaLogistic(_)
-        ) && matches!(
-            self.likelihood,
-            GlmLikelihoodFamily::BinomialSas | GlmLikelihoodFamily::BinomialBetaLogistic
-        );
-        if !needsobserved_jacobian {
-            return Ok(None);
+        requested: HessianCurvatureKind,
+    ) -> Result<
+        (
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            HessianCurvatureKind,
+        ),
+        EstimationError,
+    > {
+        if requested == HessianCurvatureKind::Fisher || !self.supports_observed_hessian_curvature()
+        {
+            return Ok((
+                self.lastweights.clone(),
+                self.last_c.clone(),
+                self.last_d.clone(),
+                HessianCurvatureKind::Fisher,
+            ));
         }
 
-        let n = self.y.len();
-        let mut neg_du_deta = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let aux = stabilized_binomial_aux_terms(
-                self.y[i],
-                self.priorweights[i].max(0.0),
-                self.lastmu[i],
-            );
-            let d1 = self.last_dmu_deta[i];
-            let d2 = self.last_d2mu_deta2[i];
-            neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
-        }
-        Ok(Some(neg_du_deta))
+        let (hessian_weights, hessian_c, hessian_d) = compute_observed_hessian_curvature_arrays(
+            &self.link_kind,
+            &self.workspace.eta_buf,
+            self.y,
+            &self.lastmu,
+            &self.last_dmu_deta,
+            &self.last_d2mu_deta2,
+            &self.last_d3mu_deta3,
+            &self.lastweights,
+            self.priorweights,
+        )?;
+        Ok((
+            hessian_weights,
+            hessian_c,
+            hessian_d,
+            HessianCurvatureKind::Observed,
+        ))
     }
 
     fn sparse_penalized_hessian(
@@ -1314,6 +1365,14 @@ impl<'a> GamWorkingModel<'a> {
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+        self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+    }
+
+    fn update_with_curvature(
+        &mut self,
+        beta: &Coefficients,
+        requested_curvature: HessianCurvatureKind,
+    ) -> Result<WorkingState, EstimationError> {
         let n = self.offset.len();
         if self.workspace.eta_buf.len() != n {
             self.workspace.eta_buf = Array1::zeros(n);
@@ -1542,19 +1601,23 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
-        let observed_diag = self.observed_binomial_score_jacobian_diagonal()?;
-        let hessian_diag = observed_diag.as_ref().unwrap_or(&weights);
+        let (hessian_weights, hessian_c, hessian_d, hessian_curvature) =
+            self.hessian_curvature_arrays(requested_curvature)?;
+        self.lasthessian_weights.assign(&hessian_weights);
+        self.lasthessian_c.assign(&hessian_c);
+        self.lasthessian_d.assign(&hessian_d);
+        self.lasthessian_curvature = hessian_curvature;
 
         let (penalized_hessian, sparsehessian, ridge_used) = if matches!(
             self.coordinate_design,
             WorkingCoordinateDesign::OriginalSparseNative
         ) {
             let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
-                self.sparse_penalized_hessian(hessian_diag, ridge)
+                self.sparse_penalized_hessian(&hessian_weights, ridge)
             })?;
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
         } else {
-            let mut penalized_hessian = self.penalized_hessian(hessian_diag)?;
+            let mut penalized_hessian = self.penalized_hessian(&hessian_weights)?;
             #[cfg(debug_assertions)]
             debug_assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
             let ridge_used = ensure_positive_definitewithridge(
@@ -1599,7 +1662,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             penalty_term,
             firth,
             ridge_used,
+            hessian_curvature,
         })
+    }
+
+    fn supports_observed_information_curvature(&self) -> bool {
+        self.supports_observed_hessian_curvature()
     }
 }
 
@@ -3231,6 +3299,8 @@ where
         .coefficient_lower_bounds
         .as_ref()
         .map(|_| Vec::new());
+    let mut consecutive_fisher_fallbacks = 0usize;
+    let mut force_fisher_for_rest = false;
 
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
@@ -3248,7 +3318,26 @@ where
 
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
-        let state = model.update(&beta)?;
+        let preferred_curvature = if model.supports_observed_information_curvature()
+            && !force_fisher_for_rest
+        {
+            HessianCurvatureKind::Observed
+        } else {
+            HessianCurvatureKind::Fisher
+        };
+        let mut used_fisher_fallback_this_iter = false;
+        let mut state = match model.update_with_curvature(&beta, preferred_curvature) {
+            Ok(state) => state,
+            Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
+                used_fisher_fallback_this_iter = true;
+                consecutive_fisher_fallbacks += 1;
+                if consecutive_fisher_fallbacks > 2 {
+                    force_fisher_for_rest = true;
+                }
+                model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?
+            }
+            Err(err) => return Err(err),
+        };
         let current_penalized = penalizedobjective(&state);
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
@@ -3391,7 +3480,7 @@ where
                 project_coefficients_to_lower_bounds(&mut candidatevec, lb);
             }
             let candidate_beta = Coefficients::new(candidatevec);
-            match model.update(&candidate_beta) {
+            match model.update_with_curvature(&candidate_beta, state.hessian_curvature) {
                 Ok(candidate_state) => {
                     let candidate_penalized = penalizedobjective(&candidate_state);
                     let actual_reduction = current_penalized - candidate_penalized;
@@ -3439,6 +3528,13 @@ where
                         && candidate_grad_finite
                         && eta_ok
                     {
+                        if preferred_curvature == HessianCurvatureKind::Observed {
+                            if state.hessian_curvature == HessianCurvatureKind::Observed
+                                && !used_fisher_fallback_this_iter
+                            {
+                                consecutive_fisher_fallbacks = 0;
+                            }
+                        }
                         // Accept Step
 
                         // Update Trust Region (Lambda)
@@ -3514,6 +3610,21 @@ where
 
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
+                        if state.hessian_curvature == HessianCurvatureKind::Observed
+                            && !used_fisher_fallback_this_iter
+                        {
+                            used_fisher_fallback_this_iter = true;
+                            consecutive_fisher_fallbacks += 1;
+                            if consecutive_fisher_fallbacks > 2 {
+                                force_fisher_for_rest = true;
+                            }
+                            state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
+                            regularized = state.hessian.clone();
+                            applied_lambda = 0.0;
+                            cached_sparse_regularized = None;
+                            loop_lambda = lambda;
+                            continue;
+                        }
                         // Reject Step
                         let stategrad_norm = state.gradient.dot(&state.gradient).sqrt();
                         // For bound-constrained problems, use the projected gradient
@@ -3569,6 +3680,21 @@ where
                     }
                 }
                 Err(_) => {
+                    if state.hessian_curvature == HessianCurvatureKind::Observed
+                        && !used_fisher_fallback_this_iter
+                    {
+                        used_fisher_fallback_this_iter = true;
+                        consecutive_fisher_fallbacks += 1;
+                        if consecutive_fisher_fallbacks > 2 {
+                            force_fisher_for_rest = true;
+                        }
+                        state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
+                        regularized = state.hessian.clone();
+                        applied_lambda = 0.0;
+                        cached_sparse_regularized = None;
+                        loop_lambda = lambda;
+                        continue;
+                    }
                     // Evaluation failed (NaN?)
                     loop_lambda *= lambda_factor;
                 }
@@ -3681,11 +3807,15 @@ pub enum PirlsStatus {
 /// # Fields
 ///
 /// * `beta_transformed`: The estimated coefficient vector in the STABLE, TRANSFORMED basis.
-/// * `penalized_hessian_transformed`: The penalized Hessian matrix at convergence (X'WX + S_λ) in the STABLE, TRANSFORMED basis.
+/// * `penalized_hessian_transformed`: The penalized Hessian matrix at convergence
+///   (`X'W_H X + S_λ`, with `W_H` equal to Fisher or observed curvature,
+///   depending on the accepted PIRLS step) in the STABLE, TRANSFORMED basis.
 /// * `deviance`: The final deviance value. Note that this means different things depending on the link function:
 ///    - For `LinkFunction::Identity` (Gaussian): This is the Residual Sum of Squares (RSS).
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
-/// * `finalweights`: The final IRLS weights at convergence.
+/// * `finalweights`: The final Hessian-side working weights at convergence.
+/// * `solveweights`: The final score-side Fisher weights used in
+///   `X'W(z-eta) - S beta`.
 /// * `reparam_result`: Contains the transformation matrix (`qs`) and other reparameterization data.
 ///
 /// # Point Estimate: Posterior Mode (MAP)
@@ -3725,26 +3855,30 @@ pub struct PirlsResult {
     /// Firth diagnostics in the converged PIRLS state.
     pub firth: FirthDiagnostics,
 
-    // The final IRLS weights at convergence
+    // The final diagonal weights defining the Hessian surface at convergence.
+    // For canonical links this matches Fisher weights. For non-canonical links
+    // this may be the clamped observed-information curvature used on the PIRLS
+    // left-hand side.
     pub finalweights: Array1<f64>,
     // Additional PIRLS state captured at the accepted step to support
     // cost/gradient consistency in the outer optimization
     pub final_offset: Array1<f64>,
     pub final_eta: Array1<f64>,
     pub finalmu: Array1<f64>,
+    /// Score-side Fisher weights used in `X'W(z-eta) - S beta`.
     pub solveweights: Array1<f64>,
     pub solveworking_response: Array1<f64>,
     pub solvemu: Array1<f64>,
     pub solve_dmu_deta: Array1<f64>,
     pub solve_d2mu_deta2: Array1<f64>,
     pub solve_d3mu_deta3: Array1<f64>,
-    /// First eta-derivative of the diagonal working curvature W(eta):
+    /// First eta-derivative of the diagonal Hessian curvature W_H(eta):
     /// c_i := dW_i/deta_i at the accepted PIRLS solution.
     ///
     /// This carries 3rd-order likelihood information used in exact dH/dρ
     /// terms for outer LAML derivatives.
     pub solve_c_array: Array1<f64>,
-    /// Second eta-derivative of the diagonal working curvature W(eta):
+    /// Second eta-derivative of the diagonal Hessian curvature W_H(eta):
     /// d_i := d²W_i/deta_i² at the accepted PIRLS solution.
     ///
     /// This carries 4th-order likelihood information used in exact d²H/dρ²
@@ -3758,6 +3892,7 @@ pub struct PirlsResult {
     pub lastgradient_norm: f64,
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
+    pub hessian_curvature: HessianCurvatureKind,
     /// Optional KKT diagnostics when inequality constraints were active.
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
     /// Linear inequality system enforced in transformed PIRLS coordinates:
@@ -3810,6 +3945,7 @@ impl PirlsResult {
             lastgradient_norm: self.lastgradient_norm,
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
+            hessian_curvature: self.hessian_curvature,
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
@@ -3822,6 +3958,8 @@ impl PirlsResult {
     pub(crate) fn rehydrate_after_reml_cache(
         &self,
         x_original: &DesignMatrix,
+        y: ArrayView1<'_, f64>,
+        priorweights: ArrayView1<'_, f64>,
         offset: ArrayView1<'_, f64>,
         inverse_link: &InverseLink,
     ) -> Result<Self, EstimationError> {
@@ -3829,12 +3967,33 @@ impl PirlsResult {
             return Ok(self.clone());
         }
 
-        let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
+        let (score_c_array, score_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             computeworkingweight_derivatives_from_eta(
                 inverse_link,
                 &self.final_eta,
-                self.solveweights.view(),
+                priorweights,
             )?;
+        let (finalweights, solve_c_array, solve_d_array) = if self.hessian_curvature
+            == HessianCurvatureKind::Observed
+        {
+            compute_observed_hessian_curvature_arrays(
+                inverse_link,
+                &self.final_eta,
+                y,
+                &self.solvemu,
+                &solve_dmu_deta,
+                &solve_d2mu_deta2,
+                &solve_d3mu_deta3,
+                &self.solveweights,
+                priorweights,
+            )?
+        } else {
+            (
+                self.solveweights.clone(),
+                score_c_array.clone(),
+                score_d_array.clone(),
+            )
+        };
         let x_dense = x_original
             .try_to_dense_arc("rehydrating compact REML PIRLS cache entry requires dense design")
             .map_err(EstimationError::InvalidInput)?;
@@ -3849,7 +4008,7 @@ impl PirlsResult {
             edf: self.edf,
             stable_penalty_term: self.stable_penalty_term,
             firth: self.firth.clone(),
-            finalweights: self.solveweights.clone(),
+            finalweights,
             final_offset: offset.to_owned(),
             final_eta: self.final_eta.clone(),
             finalmu: self.solvemu.clone(),
@@ -3867,6 +4026,7 @@ impl PirlsResult {
             lastgradient_norm: self.lastgradient_norm,
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
+            hessian_curvature: self.hessian_curvature,
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
@@ -3886,6 +4046,7 @@ fn assemble_pirls_result(
     penalty_term: f64,
     finalmu: &Array1<f64>,
     finalweights: &Array1<f64>,
+    scoreweights: &Array1<f64>,
     finalz: &Array1<f64>,
     final_c: &Array1<f64>,
     final_d: &Array1<f64>,
@@ -3916,7 +4077,7 @@ fn assemble_pirls_result(
         final_offset: offset.to_owned(),
         final_eta: final_eta_arr,
         finalmu: finalmu.clone(),
-        solveweights: finalweights.clone(),
+        solveweights: scoreweights.clone(),
         solveworking_response: finalz.clone(),
         solvemu: finalmu.clone(),
         solve_dmu_deta: final_dmu_deta.clone(),
@@ -3930,6 +4091,7 @@ fn assemble_pirls_result(
         lastgradient_norm: working_summary.lastgradient_norm,
         last_deviance_change: working_summary.last_deviance_change,
         last_step_halving: working_summary.last_step_halving,
+        hessian_curvature: working_summary.state.hessian_curvature,
         constraint_kkt: working_summary.constraint_kkt.clone(),
         linear_constraints_transformed,
         reparam_result,
@@ -4275,6 +4437,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             penalty_term,
             firth: FirthDiagnostics::Inactive,
             ridge_used,
+            hessian_curvature: HessianCurvatureKind::Fisher,
         };
 
         let working_summary = WorkingModelPirlsResult {
@@ -4329,6 +4492,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             lastgradient_norm: gradient_norm,
             last_deviance_change: 0.0,
             last_step_halving: 0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
@@ -4428,6 +4592,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         e_transformed,
         finalmu,
         finalweights,
+        scoreweights,
         finalz,
         final_c,
         final_d,
@@ -4435,13 +4600,14 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         final_d2mu_deta2,
         final_d3mu_deta3,
         penalty_term,
+        hessian_curvature: _hessian_curvature,
         ..
     } = final_state;
 
     let penalized_hessian_transformed = working_summary.state.hessian.to_dense();
     // P-IRLS already folded any stabilization ridge directly into the Hessian.
     // Keep that exact matrix so outer LAML derivatives stay consistent:
-    // H_eff = X'WX + S_λ + ridge I (if ridge_used > 0).
+    // H_eff = X'W_H X + S_λ + ridge I (if ridge_used > 0).
     let stabilizedhessian_transformed = penalized_hessian_transformed.clone();
 
     let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
@@ -4528,6 +4694,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         penalty_term,
         &finalmu,
         &finalweights,
+        &scoreweights,
         &finalz,
         &final_c,
         &final_d,
@@ -4729,12 +4896,12 @@ fn standard_inverse_link_jet(
 /// NOTE: For non-canonical links (probit, cloglog, SAS, mixture), the
 /// observed weight differs:
 ///   W_obs = W_F − (y−μ) · B,  B = (h''V − h'²V') / V²
-/// The observed c/d include residual-dependent corrections. The PIRLS
-/// inner solver correctly uses Fisher scoring for convergence (so these
-/// Fisher c/d are appropriate here). The outer REML/LAML evaluator
-/// applies the observed correction post-hoc via
-/// `RemlState::observed_cd_arrays` before constructing the
-/// `SinglePredictorGlmDerivatives` provider.
+/// The observed c/d include residual-dependent corrections. PIRLS keeps
+/// these Fisher carriers for the score-side RHS `X'W(z-eta) - S beta`,
+/// while the Newton/Laplace Hessian side may switch to the observed,
+/// clamped curvature surface. The accepted Hessian-side c/d arrays are
+/// stored separately in `PirlsResult::solve_c_array` / `solve_d_array`
+/// and consumed directly by the REML/LAML exact-derivative code.
 #[inline]
 fn bernoulli_geometry_from_jet(
     eta_raw: f64,
@@ -5386,6 +5553,88 @@ impl VarianceJet {
     }
 }
 
+const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
+const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
+
+#[inline]
+fn supports_observed_hessian_curvature_for_inverse_link(inverse_link: &InverseLink) -> bool {
+    matches!(
+        inverse_link,
+        InverseLink::Standard(LinkFunction::Probit | LinkFunction::CLogLog)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
+    )
+}
+
+#[inline]
+fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
+    match inverse_link {
+        InverseLink::Standard(LinkFunction::Logit | LinkFunction::Log) => eta.clamp(-700.0, 700.0),
+        InverseLink::Standard(LinkFunction::Identity) => eta,
+        _ => eta.clamp(-30.0, 30.0),
+    }
+}
+
+#[inline]
+fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
+    (fisher_weight.max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
+        .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
+}
+
+fn compute_observed_hessian_curvature_arrays(
+    inverse_link: &InverseLink,
+    eta: &Array1<f64>,
+    y: ArrayView1<'_, f64>,
+    mu: &Array1<f64>,
+    dmu_deta: &Array1<f64>,
+    d2mu_deta2: &Array1<f64>,
+    d3mu_deta3: &Array1<f64>,
+    fisher_weights: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+    debug_assert!(supports_observed_hessian_curvature_for_inverse_link(
+        inverse_link
+    ));
+    let n = eta.len();
+    let mut hessian_weights = Array1::<f64>::zeros(n);
+    let mut hessian_c = Array1::<f64>::zeros(n);
+    let mut hessian_d = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
+        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+            inverse_link,
+            eta_used,
+        )?;
+        let (w_obs, c_obs, d_obs) = observed_weight_noncanonical(
+            y[i],
+            mu[i],
+            dmu_deta[i],
+            d2mu_deta2[i],
+            d3mu_deta3[i],
+            h4,
+            VarianceJet::bernoulli(mu[i]),
+            1.0,
+            priorweights[i].max(0.0),
+        );
+        let fisher_floor = observed_hessian_weight_floor(fisher_weights[i]);
+        // Keep the Newton system SPD when the observed correction turns the
+        // local curvature non-positive. On clamped rows we freeze the
+        // higher-order drift terms too, so exact outer derivatives continue
+        // to differentiate the same accepted Hessian surface.
+        if w_obs.is_finite() && w_obs > fisher_floor {
+            hessian_weights[i] = w_obs;
+            hessian_c[i] = if c_obs.is_finite() { c_obs } else { 0.0 };
+            hessian_d[i] = if d_obs.is_finite() { d_obs } else { 0.0 };
+        } else {
+            hessian_weights[i] = fisher_floor;
+            hessian_c[i] = 0.0;
+            hessian_d[i] = 0.0;
+        }
+    }
+    Ok((hessian_weights, hessian_c, hessian_d))
+}
+
 /// Per-observation observed-information weights and their first two
 /// η-derivatives for a general exponential-dispersion family with a
 /// noncanonical link.
@@ -5856,169 +6105,18 @@ pub enum DirectionalWorkingCurvature {
     Diagonal(Array1<f64>),
 }
 
-fn directionalworking_curvature_diagonal_builtin(
-    inverse_link: &InverseLink,
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    solveweights: &Array1<f64>,
+pub fn directionalworking_curvature_from_c_array(
+    c_array: &Array1<f64>,
+    hessian_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    let (c, _, _, _, _) =
-        computeworkingweight_derivatives_from_eta(inverse_link, eta, priorweights)?;
-    let mut w_direction = &c * eta_direction;
+) -> DirectionalWorkingCurvature {
+    let mut w_direction = c_array * eta_direction;
     for i in 0..w_direction.len() {
-        if solveweights[i] <= 0.0 || !w_direction[i].is_finite() {
+        if hessian_weights[i] <= 0.0 || !w_direction[i].is_finite() {
             w_direction[i] = 0.0;
         }
     }
-    Ok(DirectionalWorkingCurvature::Diagonal(w_direction))
-}
-
-fn directionalworking_curvature_logit(
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    solveweights: &Array1<f64>,
-    eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    // Fast path using the closed-form binomial-logit weight derivative.
-    // For canonical logit link, the observed weight derivative c = w·(1−2p)
-    // where w = n·p·(1−p) and p = sigmoid(η). This is exactly what
-    // observed_weight_binomial_logit returns as its c component.
-    let n = eta.len();
-    let mut w_direction = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let eta_clamped = eta[i].clamp(-700.0, 700.0);
-        let p = 1.0 / (1.0 + (-eta_clamped).exp());
-        let (_, c_obs, _) = observed_weight_binomial_logit(1.0, p, priorweights[i]);
-        let val = c_obs * eta_direction[i];
-        w_direction[i] = if solveweights[i] <= 0.0 || !val.is_finite() {
-            0.0
-        } else {
-            val
-        };
-    }
-    Ok(DirectionalWorkingCurvature::Diagonal(w_direction))
-}
-
-fn directionalworking_curvature_probit(
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    solveweights: &Array1<f64>,
-    eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    directionalworking_curvature_diagonal_builtin(
-        &InverseLink::Standard(LinkFunction::Probit),
-        eta,
-        priorweights,
-        solveweights,
-        eta_direction,
-    )
-}
-
-fn directionalworking_curvature_cloglog(
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    solveweights: &Array1<f64>,
-    eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    directionalworking_curvature_diagonal_builtin(
-        &InverseLink::Standard(LinkFunction::CLogLog),
-        eta,
-        priorweights,
-        solveweights,
-        eta_direction,
-    )
-}
-
-fn directionalworking_curvature_identity(
-    eta: &Array1<f64>,
-    _: ArrayView1<'_, f64>,
-    _: &Array1<f64>,
-    _: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    // Gaussian identity has constant W in η, so W_τ = 0.
-    Ok(DirectionalWorkingCurvature::Diagonal(Array1::<f64>::zeros(
-        eta.len(),
-    )))
-}
-
-/// Family-dispatched directional derivative of the PIRLS working curvature.
-///
-/// This is the built-in GLM dispatch point for the abstract operator
-///   T[eta_direction] = dW/dτ,
-/// with `eta_direction = d eta / dτ`.
-///
-/// For the built-in Gaussian/binomial links the working curvature is diagonal
-/// in observation space, so the operator currently reduces to a diagonal
-/// vector. Keeping it behind this family dispatch avoids hard-coding the
-/// diagonal special case at higher layers like REML hyper-gradients.
-pub fn directionalworking_curvature_from_eta(
-    link: LinkFunction,
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    solveweights: &Array1<f64>,
-    eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    match link {
-        LinkFunction::Logit => {
-            directionalworking_curvature_logit(eta, priorweights, solveweights, eta_direction)
-        }
-        LinkFunction::Probit => {
-            directionalworking_curvature_probit(eta, priorweights, solveweights, eta_direction)
-        }
-        LinkFunction::CLogLog => {
-            directionalworking_curvature_cloglog(eta, priorweights, solveweights, eta_direction)
-        }
-        LinkFunction::Identity => {
-            directionalworking_curvature_identity(eta, priorweights, solveweights, eta_direction)
-        }
-        LinkFunction::Log => directionalworking_curvature_diagonal_builtin(
-            &InverseLink::Standard(LinkFunction::Log),
-            eta,
-            priorweights,
-            solveweights,
-            eta_direction,
-        ),
-        LinkFunction::Sas => Err(EstimationError::InvalidInput(
-            "state-less directional SAS curvature is unsupported; use directionalworking_curvature_from_etawith_state with SasLinkState"
-                .to_string(),
-        )),
-        LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
-            "state-less directional Beta-Logistic curvature is unsupported; use state-aware curvature dispatch with explicit link state".to_string(),
-        )),
-    }
-}
-
-/// State-aware directional derivative of PIRLS working curvature.
-///
-/// Unlike `directionalworking_curvature_from_eta`, this path evaluates
-/// curvature using the active parameterized inverse-link state (mixture/SAS)
-/// when present. This keeps REML directional derivatives consistent with the
-/// inner working model surface.
-pub fn directionalworking_curvature_from_etawith_state(
-    inverse_link: &InverseLink,
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    solveweights: &Array1<f64>,
-    eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    match inverse_link.link_function() {
-        LinkFunction::Identity => {
-            directionalworking_curvature_identity(eta, priorweights, solveweights, eta_direction)
-        }
-        LinkFunction::Log
-        | LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => directionalworking_curvature_diagonal_builtin(
-            inverse_link,
-            eta,
-            priorweights,
-            solveweights,
-            eta_direction,
-        ),
-    }
+    DirectionalWorkingCurvature::Diagonal(w_direction)
 }
 
 #[inline]

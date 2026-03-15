@@ -96,15 +96,12 @@ pub use terms::layout::{
 };
 pub use terms::smooth::{
     BoundedCoefficientPriorSpec, FittedTermCollection, FittedTermCollectionWithSpec,
-    LinearCoefficientGeometry, LinearTermSpec, MaternKappaOptimizationOptions,
-    RandomEffectTermSpec, RawSmoothDesign, ShapeConstraint, SmoothBasisSpec, SmoothDesign,
-    SmoothTerm, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TensorBSplineSpec,
-    TermCollectionDesign, TermCollectionSpec, TwoBlockMaternKappaOptimizationResult,
-    TwoBlockSpatialLengthScaleOptimizationResult, build_smooth_design,
+    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, RawSmoothDesign,
+    ShapeConstraint, SmoothBasisSpec, SmoothDesign, SmoothTerm, SmoothTermSpec,
+    SpatialLengthScaleOptimizationOptions, TensorBSplineSpec, TermCollectionDesign,
+    TermCollectionSpec, TwoBlockSpatialLengthScaleOptimizationResult, build_smooth_design,
     build_term_collection_design, fit_term_collection,
-    fit_term_collectionwith_matern_kappa_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization, get_spatial_aniso_log_scales,
-    get_spatial_length_scale, log_spatial_aniso_scales, optimize_two_block_matern_kappa,
-    optimize_two_block_spatial_length_scale,
+    get_spatial_length_scale, log_spatial_aniso_scales,
 };
 pub use types::{LikelihoodFamily, LinkFunction};

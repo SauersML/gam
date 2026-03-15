@@ -12,8 +12,7 @@ pub struct SmoothingBfgsOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub finite_diff_step: f64,
-    /// Retained for API compatibility.
-    /// This setting is only used by finite-difference fallback paths.
+    /// Maximum parameter dimension for finite-difference Hessian approximation.
     pub fdhessian_max_dim: usize,
     pub optimizer_kind: SmoothingOptimizerKind,
     pub seed_config: SeedConfig,

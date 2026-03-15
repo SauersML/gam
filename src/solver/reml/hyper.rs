@@ -335,7 +335,7 @@ impl<'a> RemlState<'a> {
         //   = ∂_τ L*(β̂,τ)
         //     + 0.5 tr(H_+^dagger H_τ)
         //     - 0.5 tr(S_+^dagger S_τ),
-        // where L* = -ℓ + 0.5 β'Sβ - Φ and H = X'WX + S - H_φ on the Firth path.
+        // where L* = -ℓ + 0.5 β'Sβ - Φ and H = X'W_HX + S - H_φ on the Firth path.
         //
         // The envelope theorem removes explicit β̂_τ terms from ∂_τ L*(β̂,τ);
         // β̂_τ appears only through total curvature drift H_τ.
@@ -579,7 +579,7 @@ impl<'a> RemlState<'a> {
         // `u` is the current predictor-space score contribution g pulled through
         // the PIRLS linearization, so X_τ^T g is represented by x_psi_t^T u.
         let xpsi_beta = x_psi_t.dot(&beta_eval);
-        let weighted_xpsi_beta = &pirls_result.solveweights * &xpsi_beta;
+        let weighted_xpsi_beta = &pirls_result.finalweights * &xpsi_beta;
         // Differentiate the stationarity equation
         //   0 = X^T g - S β̂
         // along the solution path β̂(τ):
@@ -662,7 +662,7 @@ impl<'a> RemlState<'a> {
         // Firth drifts. Gaussian identity branch uses profiled dispersion algebra:
         //   D_{p,τ} = 2*fit_block and profiled_fit_term = D_{p,τ}/(2φ̂).
 
-        let w = &pirls_result.solveweights;
+        let w = &pirls_result.finalweights;
         let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
         let mut h_psi = Self::weighted_cross(&x_psi_t, &x_dense, w);
         h_psi += &Self::weighted_cross(&x_dense, &x_psi_t, w);
@@ -712,14 +712,11 @@ impl<'a> RemlState<'a> {
                 Ok(profiled_fit_term + trace_term + pseudo_det_term)
             }
             _ => {
-                let runtime_link = self.runtime_inverse_link();
-                let w_direction = crate::pirls::directionalworking_curvature_from_etawith_state(
-                    &runtime_link,
-                    &pirls_result.final_eta,
-                    self.weights,
-                    &pirls_result.solveweights,
+                let w_direction = crate::pirls::directionalworking_curvature_from_c_array(
+                    &pirls_result.solve_c_array,
+                    &pirls_result.finalweights,
                     &eta_psi,
-                )?;
+                );
                 match &w_direction {
                     // Directional curvature derivative:
                     //   W_τ = T[η̇].
@@ -851,7 +848,7 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = &pirls_result.solveweights;
+        let w_diag = &pirls_result.finalweights;
         let c_array = &pirls_result.solve_c_array;
 
         // Whether third-derivative corrections are needed (non-Gaussian).
@@ -1331,7 +1328,7 @@ impl<'a> RemlState<'a> {
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = pirls_result.solveweights.clone();
+        let w_diag = pirls_result.finalweights.clone();
         let c_array = pirls_result.solve_c_array.clone();
         let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);

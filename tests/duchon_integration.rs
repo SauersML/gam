@@ -331,7 +331,6 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
         log_step: std::f64::consts::LN_2,
         min_length_scale: 1e-2,
         max_length_scale: 1e2,
-        allow_finite_difference_fallback: true,
     };
 
     let fitted: FittedTermCollectionWithSpec =
@@ -464,7 +463,6 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
         log_step: std::f64::consts::LN_2,
         min_length_scale: 1e-2,
         max_length_scale: 1e2,
-        allow_finite_difference_fallback: true,
     };
 
     let fitted: FittedTermCollectionWithSpec =

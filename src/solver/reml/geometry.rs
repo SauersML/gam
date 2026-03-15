@@ -284,7 +284,7 @@ impl<'a> RemlState<'a> {
 
         let x_tau_beta = hyper_dir.x_tau_original.dot(&beta);
         let s_tau_total = hyper_dir.penalty_total_at(rho, p)?;
-        let weighted_x_tau_beta = &pirls_result.solveweights * &x_tau_beta;
+        let weighted_x_tau_beta = &pirls_result.finalweights * &x_tau_beta;
         let mut g_psi = hyper_dir.x_tau_original.t_dot(&u)
             - self.x().transpose_vector_multiply(&weighted_x_tau_beta)
             - s_tau_total.dot(&beta);
@@ -293,7 +293,11 @@ impl<'a> RemlState<'a> {
         let mut firth_op_opt: Option<FirthDenseOperator> = None;
         let mut hphi_tau_kernel_opt: Option<FirthTauPartialKernel> = None;
         if firth_logit_active {
-            let op = if let Some(cached) = bundle.firth_dense_operator.as_ref() {
+            let op = if let Some(cached) = bundle
+                .firth_dense_operator_original
+                .as_ref()
+                .or(bundle.firth_dense_operator.as_ref())
+            {
                 cached.as_ref().clone()
             } else {
                 let x_dense_arc = self
@@ -321,6 +325,9 @@ impl<'a> RemlState<'a> {
             firth_op_opt = Some(op);
         }
 
+        // Sparse exact Firth directions reuse the penalized sparse Cholesky
+        // factor directly: each mode-response solve is O(nnz(L)) instead of
+        // falling back to a dense O(p^3) factorization.
         let beta_tau = solve_sparse_spd(&sparse.factor, &g_psi)?;
         let eta_tau = &x_tau_beta + &self.x().matrixvectormultiply(&beta_tau);
 
@@ -336,7 +343,7 @@ impl<'a> RemlState<'a> {
         let cross = self.sparse_exactweighted_cross_trace_xtau(
             &sparse.factor,
             &hyper_dir.x_tau_original,
-            &pirls_result.solveweights,
+            &pirls_result.finalweights,
         )?;
         let mut trace_h = trace_s_tau + 2.0 * cross;
 
@@ -364,14 +371,11 @@ impl<'a> RemlState<'a> {
                 Ok(dp_tau / (2.0 * phi) + 0.5 * trace_h - 0.5 * pseudo_det_trace)
             }
             SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature => {
-                let runtime_link = self.runtime_inverse_link();
-                let w_tau = crate::pirls::directionalworking_curvature_from_etawith_state(
-                    &runtime_link,
-                    &pirls_result.final_eta,
-                    self.weights,
-                    &pirls_result.solveweights,
+                let w_tau = crate::pirls::directionalworking_curvature_from_c_array(
+                    &pirls_result.solve_c_array,
+                    &pirls_result.finalweights,
                     &eta_tau,
-                )?;
+                );
                 let leverages = leverages_from_factor(&sparse.factor, self.x())?;
                 match w_tau {
                     DirectionalWorkingCurvature::Diagonal(diag) => {
@@ -461,7 +465,6 @@ impl<'a> RemlState<'a> {
             reason: "exact_preferred",
         }
     }
-
 
     pub(super) fn select_reml_geometry(&self, rho: &Array1<f64>) -> SparseRemlDecision {
         let p = self.p;

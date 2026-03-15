@@ -2575,9 +2575,25 @@ pub fn integrated_family_moments_jetwith_state(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
-        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-            "Integrated moments dispatcher does not support Royston-Parmar family".to_string(),
-        )),
+        LikelihoodFamily::RoystonParmar => {
+            let jet = integrated_inverse_link_jetwith_state(
+                quadctx,
+                LinkFunction::CLogLog,
+                e,
+                se,
+                mixture_link_state,
+                sas_link_state,
+            )?;
+            let mean = (1.0 - jet.mean).clamp(0.0, 1.0);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: -jet.d1,
+                d2: -jet.d2,
+                d3: -jet.d3,
+                mode: jet.mode,
+            })
+        }
         LikelihoodFamily::BinomialMixture => {
             let state = mixture_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(

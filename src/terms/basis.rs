@@ -1412,6 +1412,7 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinPlateBasisSpec {
     pub center_strategy: CenterStrategy,
+    pub length_scale: f64,
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
@@ -1542,6 +1543,7 @@ pub enum BasisMetadata {
     },
     ThinPlate {
         centers: Array2<f64>,
+        length_scale: f64,
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).
         input_scales: Option<Vec<f64>>,
@@ -3074,7 +3076,12 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let tps = create_thin_plate_spline_basiswithworkspace(data, centers.view(), workspace)?;
+    let tps = create_thin_plate_spline_basis_scaledwithworkspace(
+        data,
+        centers.view(),
+        spec.length_scale,
+        workspace,
+    )?;
     let identifiability_transform = spatial_identifiability_transform_from_design(
         data,
         tps.basis.view(),
@@ -3123,6 +3130,7 @@ pub fn build_thin_plate_basiswithworkspace(
         penaltyinfo,
         metadata: BasisMetadata::ThinPlate {
             centers,
+            length_scale: spec.length_scale,
             identifiability_transform,
             input_scales: None,
         },
@@ -9670,6 +9678,91 @@ fn thin_plate_kernel_from_dist2(dist2: f64, dimension: usize) -> Result<f64, Bas
     }
 }
 
+#[inline(always)]
+fn thin_plate_penalty_order(dimension: usize) -> usize {
+    match dimension {
+        1..=3 => 2,
+        _ => dimension / 2 + 1,
+    }
+}
+
+#[inline(always)]
+fn thin_plate_kernel_triplet_from_scaled_distance(
+    scaled_distance: f64,
+    dimension: usize,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !scaled_distance.is_finite() || scaled_distance < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate scaled distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if scaled_distance == 0.0 {
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    match dimension {
+        1 => {
+            let value = scaled_distance.powi(3);
+            let first = 3.0 * scaled_distance.powi(2);
+            let second = 6.0 * scaled_distance;
+            Ok((value, first, second))
+        }
+        2 => {
+            let log_r = scaled_distance.max(1e-300).ln();
+            let value = scaled_distance.powi(2) * log_r;
+            let first = 2.0 * scaled_distance * log_r + scaled_distance;
+            let second = 2.0 * log_r + 3.0;
+            Ok((value, first, second))
+        }
+        3 => Ok((-scaled_distance, -1.0, 0.0)),
+        _ => polyharmonic_kernel_triplet(
+            scaled_distance,
+            thin_plate_penalty_order(dimension),
+            dimension,
+        ),
+    }
+}
+
+#[inline(always)]
+fn thin_plate_kernel_psi_triplet_from_distance(
+    distance: f64,
+    length_scale: f64,
+    dimension: usize,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !distance.is_finite() || distance < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    // ThinPlate psi-derivative convention:
+    // the optimizer uses psi = log(kappa) = -log(length_scale), so the scaled
+    // radial argument is
+    //   r(psi) = ||x - c|| / length_scale = ||x - c|| * exp(psi).
+    //
+    // Therefore
+    //   dr/dpsi     = r
+    //   d²r/dpsi²   = r
+    //
+    // and for any TPS radial kernel phi(r),
+    //   d phi / dpsi       = phi_r(r) * r
+    //   d²phi / dpsi²      = phi_rr(r) * r² + phi_r(r) * r.
+    //
+    // This is exactly the chain rule requested by the math spec, translated to
+    // the code's stored inverse-length-scale parameterization.
+    let scaled_distance = distance / length_scale;
+    let (value, radial_first, radial_second) =
+        thin_plate_kernel_triplet_from_scaled_distance(scaled_distance, dimension)?;
+    let psi = radial_first * scaled_distance;
+    let psi_psi = radial_second * scaled_distance * scaled_distance + psi;
+    Ok((value, psi, psi_psi))
+}
+
 /// Creates a thin-plate regression spline basis (m=2) from data and knot locations.
 ///
 /// # Arguments
@@ -9692,6 +9785,15 @@ pub fn create_thin_plate_spline_basis(
 pub fn create_thin_plate_spline_basiswithworkspace(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
+    workspace: &mut BasisWorkspace,
+) -> Result<ThinPlateSplineBasis, BasisError> {
+    create_thin_plate_spline_basis_scaledwithworkspace(data, knots, 1.0, workspace)
+}
+
+fn create_thin_plate_spline_basis_scaledwithworkspace(
+    data: ArrayView2<f64>,
+    knots: ArrayView2<f64>,
+    length_scale: f64,
     workspace: &mut BasisWorkspace,
 ) -> Result<ThinPlateSplineBasis, BasisError> {
     let n = data.nrows();
@@ -9722,6 +9824,11 @@ pub fn create_thin_plate_spline_basiswithworkspace(
             "thin-plate spline requires finite data and knot values".to_string(),
         ));
     }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate length_scale must be finite and positive".to_string(),
+        ));
+    }
 
     let poly_cols = d + 1;
 
@@ -9738,7 +9845,7 @@ pub fn create_thin_plate_spline_basiswithworkspace(
                     let delta = data[[i, c]] - knots[[j, c]];
                     dist2 += delta * delta;
                 }
-                row[j] = thin_plate_kernel_from_dist2(dist2, d)?;
+                row[j] = thin_plate_kernel_from_dist2(dist2 / (length_scale * length_scale), d)?;
             }
             Ok(())
         });
@@ -9756,7 +9863,7 @@ pub fn create_thin_plate_spline_basiswithworkspace(
                 let delta = knots[[i, c]] - knots[[j, c]];
                 dist2 += delta * delta;
             }
-            let kij = thin_plate_kernel_from_dist2(dist2, d)?;
+            let kij = thin_plate_kernel_from_dist2(dist2 / (length_scale * length_scale), d)?;
             omega[[i, j]] = kij;
             omega[[j, i]] = kij;
         }
@@ -9802,6 +9909,282 @@ pub fn create_thin_plate_spline_basiswithworkspace(
         num_kernel_basis: kernel_cols,
         num_polynomial_basis: poly_cols,
         dimension: d,
+    })
+}
+
+fn active_thin_plate_penalty_derivatives(
+    penaltyinfo: &[PenaltyInfo],
+    primary_derivative: &Array2<f64>,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    penaltyinfo
+        .iter()
+        .filter(|info| info.active)
+        .map(|info| match &info.source {
+            PenaltySource::Primary => Ok(primary_derivative.clone()),
+            PenaltySource::DoublePenaltyNullspace => {
+                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
+            }
+            other => Err(BasisError::InvalidInput(format!(
+                "unexpected ThinPlate penalty source in psi-derivative path: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn build_thin_plate_design_psi_derivativeswithworkspace(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let z_kernel =
+        kernel_constraint_nullspace(centers, DuchonNullspaceOrder::Linear, &mut workspace.cache)?;
+    let n = data.nrows();
+    let k = centers.nrows();
+    let kernel_cols = z_kernel.ncols();
+    let poly_cols = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear).ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let mut out_psi = Array2::<f64>::zeros((n, total_cols));
+    let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
+
+    // Exact ThinPlate design derivatives in the stored psi = log(kappa)
+    // coordinates, with kappa = 1 / length_scale.
+    //
+    // For each design kernel entry
+    //   K_ij(psi) = phi(r_ij(psi)),
+    //   r_ij(psi) = ||x_i - c_j|| / length_scale = ||x_i - c_j|| exp(psi),
+    //
+    // the chain rule gives
+    //   r_ij,psi     = r_ij
+    //   r_ij,psipsi  = r_ij
+    //   K_ij,psi     = phi_r(r_ij) * r_ij
+    //   K_ij,psipsi  = phi_rr(r_ij) * r_ij^2 + phi_r(r_ij) * r_ij.
+    //
+    // The polynomial block [1, x_1, ..., x_d] is psi-independent, so its
+    // derivatives are identically zero. After differentiating the raw kernel
+    // block, the same frozen nullspace projection Z_kernel and frozen
+    // identifiability transform Z are applied:
+    //   K_c,psi     = K_psi Z_kernel
+    //   K_c,psipsi  = K_psipsi Z_kernel
+    //   X_psi       = [K_c,psi | 0] Z
+    //   X_psipsi    = [K_c,psipsi | 0] Z.
+    let derivative_result: Result<(), BasisError> = out_psi
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .zip(out_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
+        .enumerate()
+        .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
+            let mut local_psi = vec![0.0; k];
+            let mut local_psi_psi = vec![0.0; k];
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for axis in 0..data.ncols() {
+                    let delta = data[[i, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                let (_, phi_psi, phi_psi_psi) = thin_plate_kernel_psi_triplet_from_distance(
+                    dist2.sqrt(),
+                    spec.length_scale,
+                    data.ncols(),
+                )?;
+                local_psi[j] = phi_psi;
+                local_psi_psi[j] = phi_psi_psi;
+            }
+            for col in 0..kernel_cols {
+                let mut acc_psi = 0.0;
+                let mut acc_psi_psi = 0.0;
+                for j in 0..k {
+                    let z_jc = z_kernel[[j, col]];
+                    acc_psi += local_psi[j] * z_jc;
+                    acc_psi_psi += local_psi_psi[j] * z_jc;
+                }
+                row_psi[col] = acc_psi;
+                row_psi_psi[col] = acc_psi_psi;
+            }
+            Ok(())
+        });
+    derivative_result?;
+
+    if let Some(zf) = identifiability_transform {
+        if total_cols != zf.nrows() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "ThinPlate identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
+                total_cols,
+                zf.nrows()
+            )));
+        }
+        return Ok((fast_ab(&out_psi, zf), fast_ab(&out_psi_psi, zf)));
+    }
+
+    Ok((out_psi, out_psi_psi))
+}
+
+fn build_thin_plate_penalty_psi_derivativeswithworkspace(
+    centers: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let z_kernel =
+        kernel_constraint_nullspace(centers, DuchonNullspaceOrder::Linear, &mut workspace.cache)?;
+    let kernel_cols = z_kernel.ncols();
+    let poly_cols = polynomial_block_from_order(centers, DuchonNullspaceOrder::Linear).ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let mut omega_psi = Array2::<f64>::zeros((k, k));
+    let mut omega_psi_psi = Array2::<f64>::zeros((k, k));
+
+    // Exact ThinPlate bending-penalty derivatives.
+    //
+    // The raw curvature block is the center Gram matrix
+    //   Omega_ij(psi) = phi(r_ij(psi)),
+    //   r_ij(psi) = ||c_i - c_j|| / length_scale = ||c_i - c_j|| exp(psi).
+    //
+    // The same chain rule as the design block applies entrywise:
+    //   Omega_ij,psi     = phi_r(r_ij) * r_ij
+    //   Omega_ij,psipsi  = phi_rr(r_ij) * r_ij^2 + phi_r(r_ij) * r_ij.
+    //
+    // Because the kernel nullspace projector Z_kernel and the frozen
+    // identifiability transform Z do not depend on psi during optimization,
+    // the projected penalty derivatives are just congruences:
+    //   S_psi     = Z^T [diag(Z_kernel^T Omega_psi Z_kernel, 0)] Z
+    //   S_psipsi  = Z^T [diag(Z_kernel^T Omega_psipsi Z_kernel, 0)] Z.
+    //
+    // The double-penalty nullspace block is the projector onto the fixed
+    // polynomial nullspace after freezing, so its psi derivatives are zero.
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for axis in 0..d {
+                let delta = centers[[i, axis]] - centers[[j, axis]];
+                dist2 += delta * delta;
+            }
+            let (_, phi_psi, phi_psi_psi) =
+                thin_plate_kernel_psi_triplet_from_distance(dist2.sqrt(), spec.length_scale, d)?;
+            omega_psi[[i, j]] = phi_psi;
+            omega_psi[[j, i]] = phi_psi;
+            omega_psi_psi[[i, j]] = phi_psi_psi;
+            omega_psi_psi[[j, i]] = phi_psi_psi;
+        }
+    }
+
+    let kernel_psi = {
+        let zt_s = z_kernel.t().dot(&omega_psi);
+        zt_s.dot(&z_kernel)
+    };
+    let kernel_psi_psi = {
+        let zt_s = z_kernel.t().dot(&omega_psi_psi);
+        zt_s.dot(&z_kernel)
+    };
+
+    let mut s_psi = Array2::<f64>::zeros((total_cols, total_cols));
+    let mut s_psi_psi = Array2::<f64>::zeros((total_cols, total_cols));
+    s_psi
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&kernel_psi);
+    s_psi_psi
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&kernel_psi_psi);
+
+    Ok((
+        project_penalty_matrix(&s_psi, identifiability_transform),
+        project_penalty_matrix(&s_psi_psi, identifiability_transform),
+    ))
+}
+
+pub fn build_thin_plate_basis_log_kappa_derivative(
+    data: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+) -> Result<BasisPsiDerivativeResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_thin_plate_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
+}
+
+pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiDerivativeResult, BasisError> {
+    let base = build_thin_plate_basiswithworkspace(data, spec, workspace)?;
+    let (centers, identifiability_transform) = match &base.metadata {
+        BasisMetadata::ThinPlate {
+            centers,
+            identifiability_transform,
+            ..
+        } => (centers.clone(), identifiability_transform.clone()),
+        _ => {
+            return Err(BasisError::InvalidInput(
+                "ThinPlate derivative path expected ThinPlate metadata".to_string(),
+            ));
+        }
+    };
+    let (design_derivative, _) = build_thin_plate_design_psi_derivativeswithworkspace(
+        data,
+        centers.view(),
+        spec,
+        identifiability_transform.as_ref(),
+        workspace,
+    )?;
+    let (primary_derivative, _) = build_thin_plate_penalty_psi_derivativeswithworkspace(
+        centers.view(),
+        spec,
+        identifiability_transform.as_ref(),
+        workspace,
+    )?;
+    let penalties_derivative =
+        active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?;
+    Ok(BasisPsiDerivativeResult {
+        design_derivative,
+        penalties_derivative,
+    })
+}
+
+pub fn build_thin_plate_basis_log_kappasecond_derivative(
+    data: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_thin_plate_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
+}
+
+pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
+    let base = build_thin_plate_basiswithworkspace(data, spec, workspace)?;
+    let (centers, identifiability_transform) = match &base.metadata {
+        BasisMetadata::ThinPlate {
+            centers,
+            identifiability_transform,
+            ..
+        } => (centers.clone(), identifiability_transform.clone()),
+        _ => {
+            return Err(BasisError::InvalidInput(
+                "ThinPlate derivative path expected ThinPlate metadata".to_string(),
+            ));
+        }
+    };
+    let (_, designsecond_derivative) = build_thin_plate_design_psi_derivativeswithworkspace(
+        data,
+        centers.view(),
+        spec,
+        identifiability_transform.as_ref(),
+        workspace,
+    )?;
+    let (_, primarysecond_derivative) = build_thin_plate_penalty_psi_derivativeswithworkspace(
+        centers.view(),
+        spec,
+        identifiability_transform.as_ref(),
+        workspace,
+    )?;
+    let penaltiessecond_derivative =
+        active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primarysecond_derivative)?;
+    Ok(BasisPsiSecondDerivativeResult {
+        designsecond_derivative,
+        penaltiessecond_derivative,
     })
 }
 
@@ -11830,6 +12213,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: 1.0,
             double_penalty: true,
             identifiability: SpatialIdentifiability::default(),
         };
@@ -11858,6 +12242,7 @@ mod tests {
         ];
         let spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: 1.0,
             double_penalty: false,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
         };
@@ -11899,6 +12284,7 @@ mod tests {
         let specs = vec![
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
+                length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
             },
@@ -11907,11 +12293,13 @@ mod tests {
                     num_centers: 4,
                     max_iter: 5,
                 },
+                length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::UniformGrid { points_per_dim: 2 },
+                length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
             },
@@ -11922,6 +12310,7 @@ mod tests {
                     [0.0, 1.0],
                     [1.0, 1.0]
                 ]),
+                length_scale: 1.0,
                 double_penalty: false,
                 identifiability: SpatialIdentifiability::default(),
             },
@@ -14141,6 +14530,114 @@ mod tests {
                 .iter()
                 .all(|v| v.abs() < 1e-12),
             "nullspace shrinkage derivative should be zero"
+        );
+    }
+
+    #[test]
+    fn test_thin_plate_log_kappa_derivative_matchesfd() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 0.9,
+            double_penalty: true,
+            identifiability: SpatialIdentifiability::None,
+        };
+        let deriv = build_thin_plate_basis_log_kappa_derivative(data.view(), &spec)
+            .expect("analytic ThinPlate derivative should build");
+
+        let eps: f64 = 1e-6;
+        let kappa = 1.0 / spec.length_scale;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = ls_plus;
+        spec_minus.length_scale = ls_minus;
+        let plus = build_thin_plate_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
+
+        let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
+        let fd_primary = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+        let design_err = (&deriv.design_derivative - &fd_design)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let primary_err = (&deriv.penalties_derivative[0] - &fd_primary)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(design_err < 1e-5, "ThinPlate design derivative mismatch: {design_err}");
+        assert!(
+            primary_err < 1e-5,
+            "ThinPlate primary penalty derivative mismatch: {primary_err}"
+        );
+        assert_eq!(deriv.penalties_derivative.len(), 2);
+        assert!(
+            deriv.penalties_derivative[1]
+                .iter()
+                .all(|v| v.abs() < 1e-12),
+            "ThinPlate nullspace shrinkage derivative should be zero"
+        );
+    }
+
+    #[test]
+    fn test_thin_plate_log_kappasecond_derivative_matchesfd() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 0.9,
+            double_penalty: true,
+            identifiability: SpatialIdentifiability::None,
+        };
+        let analytic = build_thin_plate_basis_log_kappasecond_derivative(data.view(), &spec)
+            .expect("analytic ThinPlate second derivative should build");
+        let base = build_thin_plate_basis(data.view(), &spec).expect("base build");
+
+        let eps: f64 = 2e-5;
+        let kappa = 1.0 / spec.length_scale;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = ls_plus;
+        spec_minus.length_scale = ls_minus;
+        let plus = build_thin_plate_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
+
+        let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
+        let fd_primary =
+            (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0) + &minus.penalties[0])
+                / (eps * eps);
+        let design_err = (&analytic.designsecond_derivative - &fd_design)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let primary_err = (&analytic.penaltiessecond_derivative[0] - &fd_primary)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(
+            design_err < 5e-3,
+            "ThinPlate design second derivative mismatch: {design_err}"
+        );
+        assert!(
+            primary_err < 5e-3,
+            "ThinPlate primary penalty second derivative mismatch: {primary_err}"
+        );
+        assert_eq!(analytic.penaltiessecond_derivative.len(), 2);
+        assert!(
+            analytic.penaltiessecond_derivative[1]
+                .iter()
+                .all(|v| v.abs() < 1e-12),
+            "ThinPlate nullspace shrinkage second derivative should be zero"
         );
     }
 
