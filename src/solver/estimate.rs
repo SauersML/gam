@@ -2198,7 +2198,26 @@ where
 
             let rho_view = final_rho.view();
 
-            let is_logit = matches!(cfg.link_function(), LinkFunction::Logit);
+            let joint_nuts_family = match opts.family {
+                crate::types::LikelihoodFamily::GaussianIdentity => {
+                    crate::hmc::NutsFamily::Gaussian
+                }
+                crate::types::LikelihoodFamily::BinomialLogit
+                | crate::types::LikelihoodFamily::BinomialProbit
+                | crate::types::LikelihoodFamily::BinomialCLogLog
+                | crate::types::LikelihoodFamily::BinomialSas
+                | crate::types::LikelihoodFamily::BinomialBetaLogistic
+                | crate::types::LikelihoodFamily::BinomialMixture => {
+                    crate::hmc::NutsFamily::BinomialLogit
+                }
+                crate::types::LikelihoodFamily::PoissonLog => crate::hmc::NutsFamily::PoissonLog,
+                crate::types::LikelihoodFamily::GammaLog => crate::hmc::NutsFamily::GammaLog,
+                crate::types::LikelihoodFamily::RoystonParmar => {
+                    // Survival models use a separate HMC pathway;
+                    // fall back to Gaussian as a safe default.
+                    crate::hmc::NutsFamily::Gaussian
+                }
+            };
 
             let hmc_inputs = crate::hmc::JointBetaRhoInputs {
                 x: x_view,
@@ -2208,7 +2227,7 @@ where
                 hessian: hessian_view,
                 penalty_roots: pirls_res.reparam_result.rs_transformed.clone(),
                 rho_mode: rho_view,
-                is_logit,
+                nuts_family: joint_nuts_family,
                 trigger_skewness: max_skewness,
             };
 

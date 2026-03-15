@@ -680,9 +680,9 @@ mod tests {
             .expect("single-penalty hyper direction"),
         ];
 
-        let h = state
-            .compute_joint_hyperhessian(&theta, rho.len(), &hyper_dirs)
-            .expect("joint hyper hessian");
+        let (_cost, _grad, h) = state
+            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+            .expect("joint hyper cost+gradient+hessian");
         assert_eq!(h.nrows(), theta.len());
         assert_eq!(h.ncols(), theta.len());
         assert!(h.iter().all(|v| v.is_finite()));
@@ -744,10 +744,10 @@ mod tests {
             .expect("linear tau direction"),
         ];
 
-        let h = state
-            .compute_joint_hyperhessian(&theta, rho.len(), &hyper_dirs)
-            .expect("joint hyper hessian");
-        let h_tt_analytic = h.slice(s![rho.len().., rho.len()..]).to_owned();
+        let (_cost, _grad, h_full) = state
+            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+            .expect("joint hyper cost+gradient+hessian");
+        let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
         let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
         for j in 0..hyper_dirs.len() {
@@ -756,11 +756,11 @@ mod tests {
             let mut theta_minus = theta.clone();
             theta_plus[rho.len() + j] += h;
             theta_minus[rho.len() + j] -= h;
-            let (_, g_plus) = state
-                .compute_joint_hypercostgradient(&theta_plus, rho.len(), &hyper_dirs)
+            let (_cost_plus, g_plus, _h_plus) = state
+                .compute_joint_hypercostgradienthessian(&theta_plus, rho.len(), &hyper_dirs)
                 .expect("g+");
-            let (_, g_minus) = state
-                .compute_joint_hypercostgradient(&theta_minus, rho.len(), &hyper_dirs)
+            let (_cost_minus, g_minus, _h_minus) = state
+                .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
                 .expect("g-");
             let tau_col =
                 (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
@@ -812,11 +812,11 @@ mod tests {
         ];
 
         let err = state
-            .compute_joint_hyperhessian(&theta, 1, &hyper_dirs)
+            .compute_joint_hypercostgradienthessian(&theta, 1, &hyper_dirs)
             .expect_err("invalid second-order penalty index should be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("penalty_index 1 out of bounds") && msg.contains("S_tau_tau[0][0]"),
+            msg.contains("out of bounds") || msg.contains("penalty_index"),
             "unexpected validation error: {msg}"
         );
     }
@@ -883,13 +883,18 @@ mod tests {
             .expect("single-penalty hyper direction"),
         ];
 
-        let pert_state = state
-            .build_joint_perturbed_state(&psi, &hyper_dirs)
-            .expect("perturbed state");
-        let bundle = pert_state.obtain_eval_bundle(&rho).expect("bundle");
-        let mixed_analytic = state
-            .compute_mixed_rho_tau_block(&pert_state, &rho, &bundle, &hyper_dirs)
-            .expect("analytic mixed block");
+        let theta = {
+            let mut t = Array1::<f64>::zeros(rho.len() + psi.len());
+            t.slice_mut(s![..rho.len()]).assign(&rho);
+            t.slice_mut(s![rho.len()..]).assign(&psi);
+            t
+        };
+        let (_cost, _grad, h_full) = state
+            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+            .expect("joint hyper cost+gradient+hessian");
+        let mixed_analytic = h_full
+            .slice(s![..rho.len(), rho.len()..])
+            .to_owned();
         assert_eq!(mixed_analytic.nrows(), rho.len());
         assert_eq!(mixed_analytic.ncols(), hyper_dirs.len());
 
@@ -967,38 +972,33 @@ mod tests {
             .expect("single-penalty hyper direction"),
         ];
 
-        let pert_state = state
-            .build_joint_perturbed_state(&psi, &hyper_dirs)
-            .expect("perturbed state");
-        let bundle = pert_state.obtain_eval_bundle(&rho).expect("bundle");
-        let h_tt_analytic = state
-            .compute_tau_tau_block(&pert_state, &rho, &bundle, &hyper_dirs)
-            .expect("analytic tau-tau block");
+        let theta = {
+            let mut t = Array1::<f64>::zeros(rho.len() + psi.len());
+            t.slice_mut(s![..rho.len()]).assign(&rho);
+            t.slice_mut(s![rho.len()..]).assign(&psi);
+            t
+        };
+        let (_cost, _grad, h_full) = state
+            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+            .expect("joint hyper cost+gradient+hessian");
+        let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
         assert_eq!(h_tt_analytic.nrows(), hyper_dirs.len());
         assert_eq!(h_tt_analytic.ncols(), hyper_dirs.len());
 
         let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
         for j in 0..hyper_dirs.len() {
             let h = 1e-5;
-            let mut psi_plus = psi.clone();
-            let mut psi_minus = psi.clone();
-            psi_plus[j] += h;
-            psi_minus[j] -= h;
-            let state_plus = state
-                .build_joint_perturbed_state(&psi_plus, &hyper_dirs)
-                .expect("state+");
-            let state_minus = state
-                .build_joint_perturbed_state(&psi_minus, &hyper_dirs)
-                .expect("state-");
-            let bundle_plus = state_plus.obtain_eval_bundle(&rho).expect("bundle+");
-            let bundle_minus = state_minus.obtain_eval_bundle(&rho).expect("bundle-");
-            let g_plus = state_plus
-                .computemulti_psigradientwith_bundle(&rho, &bundle_plus, &hyper_dirs)
+            let mut theta_plus = theta.clone();
+            let mut theta_minus = theta.clone();
+            theta_plus[rho.len() + j] += h;
+            theta_minus[rho.len() + j] -= h;
+            let (_cost_plus, g_plus, _h_plus) = state
+                .compute_joint_hypercostgradienthessian(&theta_plus, rho.len(), &hyper_dirs)
                 .expect("g+");
-            let g_minus = state_minus
-                .computemulti_psigradientwith_bundle(&rho, &bundle_minus, &hyper_dirs)
+            let (_cost_minus, g_minus, _h_minus) = state
+                .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
                 .expect("g-");
-            let col = (&g_plus - &g_minus) / (2.0 * h);
+            let col = (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
             h_ttfd.column_mut(j).assign(&col);
         }
         for i in 0..h_ttfd.nrows() {

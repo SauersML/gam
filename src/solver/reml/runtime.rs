@@ -2225,75 +2225,14 @@ impl<'a> RemlState<'a> {
         // Log-likelihood: for both Gaussian and GLM, deviance = -2 * log_likelihood.
         let log_likelihood = -0.5 * pirls_result.deviance;
 
-        // Firth gradient: ∂Φ/∂ρ_k = −0.5 tr(H⁻¹ D(Hφ)[B_k]).
-        //
-        // The Firth/Jeffreys penalty Φ = 0.5 log|I(β)|₊ depends on ρ through β̂(ρ).
-        // Its ρ-derivative uses the implicit function theorem:
-        //   B_k = dβ̂/dρ_k = −H⁻¹ A_k β̂,
-        //   ∂Φ/∂ρ_k = 0.5 tr(I⁻¹ dI/dβ · B_k) = −0.5 tr(H⁻¹ D(Hφ)[B_k]).
-        //
-        // Only computed when Firth is active AND no constraint projection
-        // (the FirthDenseOperator is built in the unprojected reparameterized basis).
-        let (firth_gradient, firth_hessian) = if firth_logdet != 0.0
-            && free_basis_opt.is_none()
-            && mode != super::unified::EvalMode::ValueOnly
-        {
-            if let Some(firth_op) = bundle.firth_dense_operator.as_ref() {
-                let k = penalty_roots.len();
-                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-
-                // Precompute intermediates shared by gradient and Hessian.
-                let mut a_k_betas = Vec::with_capacity(k);
-                let mut v_ks = Vec::with_capacity(k);
-                let mut a_k_matrices = Vec::with_capacity(k);
-                for idx in 0..k {
-                    let r_k = &penalty_roots[idx];
-                    let lam_k = lambdas[idx];
-                    let r_beta = r_k.dot(&beta);
-                    let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
-                    let v_k = hessian_op.solve(&a_k_beta);
-                    let mut a_k = r_k.t().dot(r_k);
-                    a_k *= lam_k;
-                    a_k_betas.push(a_k_beta);
-                    v_ks.push(v_k);
-                    a_k_matrices.push(a_k);
-                }
-
-                // Firth gradient (same as before).
-                let mut fg = Array1::<f64>::zeros(k);
-                for idx in 0..k {
-                    let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
-                    let dir_k = firth_op.direction_from_deta(deta_k);
-                    let dhphi_k = firth_op.hphi_direction(&dir_k);
-                    fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
-                }
-
-                // Firth Hessian (only when outer Hessian is requested).
-                let fh = if mode == super::unified::EvalMode::ValueGradientHessian {
-                    // Use penalty-only A_k as the Hessian drift for the second mode
-                    // response. This is a first-order approximation: the exact drift
-                    // Ḣ_k = A_k + C[v_k] − D(H_φ)[B_k] would require the full
-                    // correction machinery, but the Firth Hessian itself is O(1/n),
-                    // so the resulting error is O(1/n²).
-                    Some(super::unified::compute_firth_hessian_contribution(
-                        firth_op,
-                        &*hessian_op,
-                        &beta,
-                        &v_ks,
-                        &a_k_matrices, // h_k_matrices ≈ a_k_matrices (first-order)
-                        &a_k_betas,
-                        &a_k_matrices,
-                    ))
-                } else {
-                    None
-                };
-
-                (Some(fg), fh)
-            } else {
-                (None, None)
-            }
+        // Firth operator: passed through to the unified evaluator which computes
+        // the Firth gradient and Hessian internally. Only active when Firth is
+        // enabled AND no constraint projection (the FirthDenseOperator is built
+        // in the unprojected reparameterized basis).
+        let firth_op = if firth_logdet != 0.0 && free_basis_opt.is_none() {
+            bundle.firth_dense_operator.clone()
         } else {
-            (None, None)
+            None
         };
 
         // Construct barrier config for monotonicity constraints when no
@@ -2319,8 +2258,7 @@ impl<'a> RemlState<'a> {
             tk_correction,
             tk_gradient,
             firth_logdet,
-            firth_gradient,
-            firth_hessian,
+            firth_op,
             nullspace_dim,
             dispersion,
             log_likelihood,
@@ -2545,65 +2483,13 @@ impl<'a> RemlState<'a> {
 
         let log_likelihood = -0.5 * pirls_result.deviance;
 
-        // Firth gradient and Hessian for sparse path.
-        //
-        // The sparse bundle caches a FirthDenseOperator built from the original
-        // (non-reparameterized) design matrix in `firth_dense_operator_original`.
-        // We reuse that cached operator here instead of rebuilding it each call.
-        let (firth_gradient, firth_hessian) =
-            if firth_logdet != 0.0 && mode != super::unified::EvalMode::ValueOnly {
-                if let Some(firth_op) = bundle.firth_dense_operator_original.as_ref() {
-                    let k = penalty_roots.len();
-                    let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-
-                    // Precompute intermediates shared by gradient and Hessian.
-                    let mut a_k_betas = Vec::with_capacity(k);
-                    let mut v_ks = Vec::with_capacity(k);
-                    let mut a_k_matrices = Vec::with_capacity(k);
-                    for idx in 0..k {
-                        let r_k = &penalty_roots[idx];
-                        let lam_k = lambdas[idx];
-                        let r_beta = r_k.dot(&beta);
-                        let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
-                        let v_k = hessian_op.solve(&a_k_beta);
-                        let mut a_k = r_k.t().dot(r_k);
-                        a_k *= lam_k;
-                        a_k_betas.push(a_k_beta);
-                        v_ks.push(v_k);
-                        a_k_matrices.push(a_k);
-                    }
-
-                    // Firth gradient (same as before).
-                    let mut fg = Array1::<f64>::zeros(k);
-                    for idx in 0..k {
-                        let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
-                        let dir_k = firth_op.direction_from_deta(deta_k);
-                        let dhphi_k = firth_op.hphi_direction(&dir_k);
-                        fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
-                    }
-
-                    // Firth Hessian (only when outer Hessian is requested).
-                    let fh = if mode == super::unified::EvalMode::ValueGradientHessian {
-                        Some(super::unified::compute_firth_hessian_contribution(
-                            firth_op,
-                            &*hessian_op,
-                            &beta,
-                            &v_ks,
-                            &a_k_matrices,
-                            &a_k_betas,
-                            &a_k_matrices,
-                        ))
-                    } else {
-                        None
-                    };
-
-                    (Some(fg), fh)
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
+        // Firth operator: passed through to the unified evaluator which computes
+        // the Firth gradient and Hessian internally.
+        let firth_op = if firth_logdet != 0.0 {
+            bundle.firth_dense_operator_original.clone()
+        } else {
+            None
+        };
 
         // Construct barrier config for monotonicity constraints.
         // The sparse path operates in the original (non-reparameterized)
@@ -2624,8 +2510,7 @@ impl<'a> RemlState<'a> {
             tk_correction,
             tk_gradient,
             firth_logdet,
-            firth_gradient,
-            firth_hessian,
+            firth_op,
             mp,
             dispersion,
             log_likelihood,
@@ -2648,8 +2533,7 @@ impl<'a> RemlState<'a> {
         tk_correction: f64,
         tk_gradient: Option<Array1<f64>>,
         firth_logdet: f64,
-        firth_gradient: Option<Array1<f64>>,
-        firth_hessian: Option<Array2<f64>>,
+        firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
         nullspace_dim: f64,
         dispersion: super::unified::DispersionHandling,
         log_likelihood: f64,
@@ -2672,8 +2556,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, tk_gradient)
-        .firth(firth_logdet, firth_gradient)
-        .firth_hessian(firth_hessian)
+        .firth(firth_logdet, firth_op)
         .nullspace_dim_override(nullspace_dim)
         .barrier_config(barrier_config)
         .build();
@@ -2925,55 +2808,12 @@ impl<'a> RemlState<'a> {
 
         let log_likelihood = -0.5 * pirls_result.deviance;
 
-        // Firth gradient & Hessian (ρ-only part; ψ-Firth flows through ext_coords).
-        let (firth_gradient, firth_hessian) = if firth_logdet != 0.0
-            && free_basis_opt.is_none()
-            && mode != super::unified::EvalMode::ValueOnly
-        {
-            if let Some(firth_op) = bundle.firth_dense_operator.as_ref() {
-                let k = penalty_roots.len();
-                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-                let mut a_k_betas = Vec::with_capacity(k);
-                let mut v_ks = Vec::with_capacity(k);
-                let mut a_k_matrices = Vec::with_capacity(k);
-                for idx in 0..k {
-                    let r_k = &penalty_roots[idx];
-                    let lam_k = lambdas[idx];
-                    let r_beta = r_k.dot(&beta);
-                    let a_k_beta = fast_atv(r_k, &r_beta).mapv(|v| lam_k * v);
-                    let v_k = hessian_op.solve(&a_k_beta);
-                    let mut a_k = r_k.t().dot(r_k);
-                    a_k *= lam_k;
-                    a_k_betas.push(a_k_beta);
-                    v_ks.push(v_k);
-                    a_k_matrices.push(a_k);
-                }
-                let mut fg = Array1::<f64>::zeros(k);
-                for idx in 0..k {
-                    let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
-                    let dir_k = firth_op.direction_from_deta(deta_k);
-                    let dhphi_k = firth_op.hphi_direction(&dir_k);
-                    fg[idx] = -0.5 * hessian_op.trace_hinv_product(&dhphi_k);
-                }
-                let fh = if mode == super::unified::EvalMode::ValueGradientHessian {
-                    Some(super::unified::compute_firth_hessian_contribution(
-                        firth_op,
-                        &*hessian_op,
-                        &beta,
-                        &v_ks,
-                        &a_k_matrices,
-                        &a_k_betas,
-                        &a_k_matrices,
-                    ))
-                } else {
-                    None
-                };
-                (Some(fg), fh)
-            } else {
-                (None, None)
-            }
+        // Firth operator: passed through to the unified evaluator which computes
+        // the Firth gradient and Hessian internally.
+        let firth_op = if firth_logdet != 0.0 && free_basis_opt.is_none() {
+            bundle.firth_dense_operator.clone()
         } else {
-            (None, None)
+            None
         };
 
         // Barrier config.
@@ -3000,8 +2840,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, tk_gradient)
-        .firth(firth_logdet, firth_gradient)
-        .firth_hessian(firth_hessian)
+        .firth(firth_logdet, firth_op)
         .nullspace_dim_override(nullspace_dim)
         .barrier_config(barrier_config)
         .ext_coords(ext_coords);
