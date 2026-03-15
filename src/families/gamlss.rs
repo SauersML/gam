@@ -29,7 +29,7 @@ use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design,
-    optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_bfgs,
+    optimize_two_block_spatial_length_scale,
     optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
@@ -1525,46 +1525,6 @@ pub fn fit_binomial_mean_wiggle(
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
 
-pub(crate) fn fit_poisson_log(
-    spec: PoissonLogSpec,
-    options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
-    let n = spec.y.len();
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, "fit_poisson_log")?;
-    validate_blockrows("eta", n, &spec.eta_block)?;
-
-    let family = PoissonLogFamily {
-        y: spec.y,
-        weights: spec.weights,
-    };
-    let blocks = vec![spec.eta_block.intospec("eta")?];
-    Ok(fit_custom_family(&family, &blocks, options)?)
-}
-
-pub(crate) fn fit_gamma_log(
-    spec: GammaLogSpec,
-    options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
-    let n = spec.y.len();
-    validate_len_match("weights vs y", n, spec.weights.len())?;
-    validateweights(&spec.weights, "fit_gamma_log")?;
-    validate_blockrows("eta", n, &spec.eta_block)?;
-    if !spec.shape.is_finite() || spec.shape <= 0.0 {
-        return Err(format!(
-            "fit_gamma_log: shape must be finite and > 0, got {}",
-            spec.shape
-        ));
-    }
-
-    let family = GammaLogFamily {
-        y: spec.y,
-        weights: spec.weights,
-        shape: spec.shape,
-    };
-    let blocks = vec![spec.eta_block.intospec("eta")?];
-    Ok(fit_custom_family(&family, &blocks, options)?)
-}
 
 pub fn fit_binomial_location_scale(
     spec: BinomialLocationScaleSpec,
@@ -1959,6 +1919,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             )
         })?
     } else if exact_joint_ready {
+        // The exact-joint path now handles its own fallback (Arc → BFGS)
+        // internally via run_outer's fallback_sequence.
         let joint_setup = build_two_block_exact_joint_setup(
             builder.meanspec(),
             builder.noisespec(),
@@ -2041,7 +2003,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 Ok((eval.objective, eval.gradient, eval.outer_hessian))
             },
         ) {
-            Ok(sol) => sol,
+            Ok(sol) => {
+                usedfd_spatial_search = false;
+                sol
+            }
             Err(err) => {
                 if !kappa_options.allow_finite_difference_fallback {
                     return Err(format!(
@@ -2049,148 +2014,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     ));
                 }
                 log::warn!(
-                    "exact two-block spatial optimization failed ({}); trying BFGS fallback",
+                    "exact two-block spatial optimization failed ({}); falling back to coordinate search",
                     err
                 );
-                match optimize_two_block_spatial_length_scale_bfgs(
-                    data,
-                    builder.meanspec(),
-                    builder.noisespec(),
-                    kappa_options,
-                    |mean_design, noise_design| {
-                        let theta = compose_theta_from_hints(
-                            builder.mean_penalty_count(mean_design),
-                            builder.noise_penalty_count(noise_design),
-                            &mean_log_lambda_hint,
-                            &noise_log_lambda_hint,
-                            &extra_rho0,
-                        );
-                        let blocks = builder.build_blocks(
-                            &theta,
-                            mean_design,
-                            noise_design,
-                            mean_beta_hint.clone(),
-                            noise_beta_hint.clone(),
-                        )?;
-                        let family = builder.build_family(mean_design, noise_design);
-                        let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
-                        let layout = GamlssLambdaLayout::two_block(
-                            builder.mean_penalty_count(mean_design),
-                            builder.noise_penalty_count(noise_design),
-                        );
-                        if fit.log_lambdas.len() >= layout.total() {
-                            mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                            noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                        }
-                        let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                        mean_beta_hint = Some(mean_beta);
-                        noise_beta_hint = Some(noise_beta);
-                        Ok(fit)
-                    },
-                    |fit| fit.penalized_objective,
-                ) {
-                    Ok(result) => {
-                        usedfd_spatial_search = true;
-                        result
-                    }
-                    Err(bfgs_err) => {
-                        log::warn!(
-                            "BFGS fallback also failed ({}); falling back to coordinate search",
-                            bfgs_err
-                        );
-                        usedfd_spatial_search = true;
-                        optimize_two_block_spatial_length_scale(
-                            data,
-                            builder.meanspec(),
-                            builder.noisespec(),
-                            kappa_options,
-                            |mean_design, noise_design| {
-                                let theta = compose_theta_from_hints(
-                                    builder.mean_penalty_count(mean_design),
-                                    builder.noise_penalty_count(noise_design),
-                                    &mean_log_lambda_hint,
-                                    &noise_log_lambda_hint,
-                                    &extra_rho0,
-                                );
-                                let blocks = builder.build_blocks(
-                                    &theta,
-                                    mean_design,
-                                    noise_design,
-                                    mean_beta_hint.clone(),
-                                    noise_beta_hint.clone(),
-                                )?;
-                                let family = builder.build_family(mean_design, noise_design);
-                                let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
-                                let layout = GamlssLambdaLayout::two_block(
-                                    builder.mean_penalty_count(mean_design),
-                                    builder.noise_penalty_count(noise_design),
-                                );
-                                if fit.log_lambdas.len() >= layout.total() {
-                                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                                }
-                                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                                mean_beta_hint = Some(mean_beta);
-                                noise_beta_hint = Some(noise_beta);
-                                Ok(fit)
-                            },
-                            |fit| fit.penalized_objective,
-                        )?
-                    }
-                }
-            }
-        }
-    } else {
-        if !kappa_options.allow_finite_difference_fallback {
-            return Err(
-                "finite-difference spatial length-scale optimization is disabled by default; enable allow_finite_difference_fallback to use the legacy coordinate-search path"
-                    .to_string(),
-            );
-        }
-        usedfd_spatial_search = true;
-        match optimize_two_block_spatial_length_scale_bfgs(
-            data,
-            builder.meanspec(),
-            builder.noisespec(),
-            kappa_options,
-            |mean_design, noise_design| {
-                let theta = compose_theta_from_hints(
-                    builder.mean_penalty_count(mean_design),
-                    builder.noise_penalty_count(noise_design),
-                    &mean_log_lambda_hint,
-                    &noise_log_lambda_hint,
-                    &extra_rho0,
-                );
-                let blocks = builder.build_blocks(
-                    &theta,
-                    mean_design,
-                    noise_design,
-                    mean_beta_hint.clone(),
-                    noise_beta_hint.clone(),
-                )?;
-                let family = builder.build_family(mean_design, noise_design);
-                let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
-                let layout = GamlssLambdaLayout::two_block(
-                    builder.mean_penalty_count(mean_design),
-                    builder.noise_penalty_count(noise_design),
-                );
-                if fit.log_lambdas.len() >= layout.total() {
-                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                }
-                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                mean_beta_hint = Some(mean_beta);
-                noise_beta_hint = Some(noise_beta);
-                Ok(fit)
-            },
-            |fit| fit.penalized_objective,
-        ) {
-            Ok(result) => result,
-            Err(bfgs_err) => {
-                log::warn!(
-                    "BFGS fallback failed ({}); falling back to coordinate search",
-                    bfgs_err
-                );
+                usedfd_spatial_search = true;
                 optimize_two_block_spatial_length_scale(
                     data,
                     builder.meanspec(),
@@ -2230,6 +2057,51 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 )?
             }
         }
+    } else {
+        if !kappa_options.allow_finite_difference_fallback {
+            return Err(
+                "finite-difference spatial length-scale optimization is disabled by default; enable allow_finite_difference_fallback to use the legacy coordinate-search path"
+                    .to_string(),
+            );
+        }
+        usedfd_spatial_search = true;
+        optimize_two_block_spatial_length_scale(
+            data,
+            builder.meanspec(),
+            builder.noisespec(),
+            kappa_options,
+            |mean_design, noise_design| {
+                let theta = compose_theta_from_hints(
+                    builder.mean_penalty_count(mean_design),
+                    builder.noise_penalty_count(noise_design),
+                    &mean_log_lambda_hint,
+                    &noise_log_lambda_hint,
+                    &extra_rho0,
+                );
+                let blocks = builder.build_blocks(
+                    &theta,
+                    mean_design,
+                    noise_design,
+                    mean_beta_hint.clone(),
+                    noise_beta_hint.clone(),
+                )?;
+                let family = builder.build_family(mean_design, noise_design);
+                let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
+                let layout = GamlssLambdaLayout::two_block(
+                    builder.mean_penalty_count(mean_design),
+                    builder.noise_penalty_count(noise_design),
+                );
+                if fit.log_lambdas.len() >= layout.total() {
+                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
+                }
+                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
+                mean_beta_hint = Some(mean_beta);
+                noise_beta_hint = Some(noise_beta);
+                Ok(fit)
+            },
+            |fit| fit.penalized_objective,
+        )?
     };
 
     if usedfd_spatial_search {

@@ -28,12 +28,8 @@ use crate::families::strategy::strategy_for_family;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
-use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::f64;
@@ -4560,6 +4556,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             n_params: n_theta,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
@@ -8262,7 +8259,9 @@ fn try_exact_joint_spatial_length_scale_optimization(
         // Isotropic analytic path: use the unified REML evaluator with
         // ext_coords for joint [ρ, κ] optimization via BFGS, analogous to
         // the anisotropic path but with a single κ per spatial term.
-        match try_exact_joint_spatial_isotropic_optimization(
+        // The fallback_sequence inside run_outer handles degradation to
+        // BFGS (gradient-only) and then coordinate search automatically.
+        try_exact_joint_spatial_isotropic_optimization(
             data,
             y,
             weights,
@@ -8277,63 +8276,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
             &lower,
             &upper,
             rho_dim,
-        ) {
-            Ok(theta) => theta,
-            Err(analytic_err) => {
-                // Fallback: derivative-free coordinate search if analytic path fails.
-                log::warn!(
-                    "[spatial-kappa] analytic isotropic optimization failed ({}), \
-                     falling back to coordinate search",
-                    analytic_err,
-                );
-                let dims_clone = dims_per_term.clone();
-                let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
-                    let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                        theta,
-                        rho_dim,
-                        dims_clone.clone(),
-                    );
-                    let spec_c = log_kappa
-                        .apply_tospec(resolvedspec, spatial_terms)
-                        .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
-                    let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
-                    match fit_term_collection_forspecwith_heuristic_lambdas(
-                        data,
-                        y,
-                        weights,
-                        offset,
-                        &spec_c,
-                        rho.as_slice(),
-                        family,
-                        options,
-                    ) {
-                        Ok(fit) => Ok(fit_score(&fit.fit)),
-                        Err(_) => Ok(f64::INFINITY),
-                    }
-                };
-
-                let initial_cost = eval_cost(&theta0).unwrap_or(f64::INFINITY);
-                let mut best_theta = theta0.clone();
-
-                coordinate_search_spatial(
-                    &theta0,
-                    initial_cost,
-                    &lower,
-                    &upper,
-                    kappa_options,
-                    &mut |action| match action {
-                        SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
-                        SpatialSearchAction::OnImprove(theta, _) => {
-                            best_theta = theta.clone();
-                            Ok(0.0)
-                        }
-                    },
-                )
-                .map_err(EstimationError::InvalidInput)?;
-
-                best_theta
-            }
-        }
+            kappa_options,
+        )?
     };
 
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
@@ -8543,6 +8487,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             // so EFS is not appropriate.
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         },
         cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
@@ -8648,6 +8593,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     rho_dim: usize,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
@@ -8772,6 +8718,8 @@ fn try_exact_joint_spatial_isotropic_optimization(
         best_cost: f64::INFINITY,
     };
 
+    use crate::solver::strategy::CoordinateSearchConfig;
+
     let outer_config = OuterConfig {
         tolerance: 1e-6,
         max_iter: 50,
@@ -8785,6 +8733,31 @@ fn try_exact_joint_spatial_isotropic_optimization(
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
+        fallback_sequence: vec![
+            // BFGS with analytic gradient (no Hessian)
+            OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+                force_solver: None,
+            },
+            // Derivative-free coordinate search as last resort
+            OuterCapability {
+                gradient: Derivative::Unavailable,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+                force_solver: Some(crate::solver::strategy::Solver::CoordinateSearch),
+            },
+        ],
+        coordinate_search: Some(CoordinateSearchConfig {
+            log_step: kappa_options.log_step,
+            max_coord_iters: kappa_options.max_outer_iter,
+            rel_tol: kappa_options.rel_tol,
+        }),
     };
 
     let mut obj = ClosureObjective {
@@ -8797,6 +8770,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             // not appropriate.
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         },
         cost_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
@@ -8852,166 +8826,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
     }
 }
 
-fn spatial_score_improves(candidate: f64, baseline: f64, rel_tol: f64) -> bool {
-    candidate.is_finite() && candidate + rel_tol * (1.0 + baseline.abs()) < baseline
-}
-
-/// Action requested by the coordinate search from the caller's callback.
-enum SpatialSearchAction<'a> {
-    /// Evaluate cost at the given theta.
-    EvalCost(&'a Array1<f64>),
-    /// Notify that a new best point was found.
-    OnImprove(&'a Array1<f64>, f64),
-}
-
-/// Generic coordinate search on a bounded log-space grid.
-///
-/// This is the shared optimization loop used by both single-block and two-block
-/// spatial length-scale optimization. The caller provides a single callback
-/// that handles both cost evaluation and realization:
-/// - `SpatialSearchAction::EvalCost(theta)` → return `Ok(cost)`
-/// - `SpatialSearchAction::OnImprove(theta, cost)` → realize the best point, return `Ok(0.0)`
-fn coordinate_search_spatial(
-    initial_theta: &Array1<f64>,
-    initial_cost: f64,
-    lower: &Array1<f64>,
-    upper: &Array1<f64>,
-    options: &SpatialLengthScaleOptimizationOptions,
-    callback: &mut dyn FnMut(SpatialSearchAction<'_>) -> Result<f64, String>,
-) -> Result<(), String> {
-    log::warn!(
-        "[coordinate_search_spatial] Using derivative-free coordinate search over {} parameters. \
-         This is slow — analytic REML derivatives should be wired through ext_coords instead.",
-        initial_theta.len()
-    );
-    let mut current_theta = initial_theta.clone();
-    let mut current_cost = initial_cost;
-    let mut any_improved = false;
-
-    for _ in 0..options.max_outer_iter {
-        let mut pass_improved = false;
-        for coord in 0..current_theta.len() {
-            let basevalue = current_theta[coord];
-            let basecost = current_cost;
-            let leftvalue = (basevalue - options.log_step).max(lower[coord]);
-            let rightvalue = (basevalue + options.log_step).min(upper[coord]);
-
-            let left_probe = coordinate_probe(&current_theta, coord, leftvalue);
-            let right_probe = coordinate_probe(&current_theta, coord, rightvalue);
-            let leftcost = if approx_same_point(&left_probe, &current_theta) {
-                f64::INFINITY
-            } else {
-                callback(SpatialSearchAction::EvalCost(&left_probe))?
-            };
-            let rightcost = if approx_same_point(&right_probe, &current_theta) {
-                f64::INFINITY
-            } else {
-                callback(SpatialSearchAction::EvalCost(&right_probe))?
-            };
-
-            // Quadratic interpolation attempt.
-            if leftcost.is_finite() && rightcost.is_finite() {
-                if let Some(interiorvalue) = quadratic_coordinate_minimizer(
-                    leftvalue, leftcost, basevalue, basecost, rightvalue, rightcost,
-                ) {
-                    let interiorvalue = interiorvalue.clamp(lower[coord], upper[coord]);
-                    if interiorvalue > leftvalue.min(rightvalue) + 1e-12
-                        && interiorvalue < leftvalue.max(rightvalue) - 1e-12
-                    {
-                        let interior_theta = coordinate_probe(&current_theta, coord, interiorvalue);
-                        let interiorcost =
-                            callback(SpatialSearchAction::EvalCost(&interior_theta))?;
-                        if spatial_score_improves(interiorcost, current_cost, options.rel_tol) {
-                            current_theta = interior_theta;
-                            current_cost = interiorcost;
-                            callback(SpatialSearchAction::OnImprove(&current_theta, current_cost))?;
-                            pass_improved = true;
-                            any_improved = true;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Greedy extension in the improving direction.
-            let (mut candidate_theta, mut candidatecost, direction) =
-                if spatial_score_improves(leftcost, basecost, options.rel_tol)
-                    && leftcost <= rightcost
-                {
-                    (left_probe, leftcost, -1.0_f64)
-                } else if spatial_score_improves(rightcost, basecost, options.rel_tol) {
-                    (right_probe, rightcost, 1.0_f64)
-                } else {
-                    continue;
-                };
-
-            loop {
-                let nextvalue = (candidate_theta[coord] + direction * options.log_step)
-                    .clamp(lower[coord], upper[coord]);
-                if (nextvalue - candidate_theta[coord]).abs() <= 1e-12 {
-                    break;
-                }
-                let next_theta = coordinate_probe(&candidate_theta, coord, nextvalue);
-                if approx_same_point(&next_theta, &candidate_theta) {
-                    break;
-                }
-                let nextcost = callback(SpatialSearchAction::EvalCost(&next_theta))?;
-                if !spatial_score_improves(nextcost, candidatecost, options.rel_tol) {
-                    break;
-                }
-                candidate_theta = next_theta;
-                candidatecost = nextcost;
-            }
-
-            if spatial_score_improves(candidatecost, current_cost, options.rel_tol) {
-                current_theta = candidate_theta;
-                current_cost = candidatecost;
-                callback(SpatialSearchAction::OnImprove(&current_theta, current_cost))?;
-                pass_improved = true;
-                any_improved = true;
-            }
-        }
-        if !pass_improved {
-            break;
-        }
-    }
-
-    let _ = (current_theta, current_cost, any_improved);
-    Ok(())
-}
-
-fn coordinate_probe(theta: &Array1<f64>, index: usize, value: f64) -> Array1<f64> {
-    let mut probe = theta.clone();
-    probe[index] = value;
-    probe
-}
-
-fn quadratic_coordinate_minimizer(
-    x_left: f64,
-    f_left: f64,
-    x_mid: f64,
-    f_mid: f64,
-    x_right: f64,
-    f_right: f64,
-) -> Option<f64> {
-    let d_left = x_left - x_mid;
-    let d_right = x_right - x_mid;
-    if d_left.abs() <= 1e-12 || d_right.abs() <= 1e-12 {
-        return None;
-    }
-    let a_left = (f_left - f_mid) / d_left;
-    let a_right = (f_right - f_mid) / d_right;
-    let curvature = (a_left - a_right) / (d_left - d_right);
-    if !curvature.is_finite() || curvature <= 0.0 {
-        return None;
-    }
-    let slope = a_left - curvature * d_left;
-    let x_star = x_mid - slope / (2.0 * curvature);
-    if !x_star.is_finite() {
-        return None;
-    }
-    Some(x_star)
-}
 
 fn optimize_single_block_spatial_length_scale<FitOut, FitFn, ScoreFn>(
     resolvedspec: &TermCollectionSpec,
@@ -9080,44 +8894,112 @@ where
         design: baseline_design.clone(),
         fit: baseline_fit.clone(),
     });
-    let mut best_eval = hyper_state
-        .realized(&theta0)
-        .expect("baseline spatial evaluation must be realized");
-    let hyper_state = std::cell::RefCell::new(hyper_state);
-    let fit_fn = std::cell::RefCell::new(fit_fn);
 
-    coordinate_search_spatial(
-        &theta0,
-        initial_cost,
-        &lower,
-        &upper,
-        kappa_options,
-        &mut |action| match action {
-            SpatialSearchAction::EvalCost(theta) => eval_single_block_spatial_cost(
-                &mut *hyper_state.borrow_mut(),
-                resolvedspec,
-                spatial_terms,
-                theta,
-                &mut *fit_fn.borrow_mut(),
-                &score_fn,
-            )
-            .map_err(|e| e.to_string()),
-            SpatialSearchAction::OnImprove(theta, cost) => {
-                let _ = cost;
-                best_eval = realize_single_block_spatial_eval(
-                    &mut *hyper_state.borrow_mut(),
-                    resolvedspec,
-                    spatial_terms,
-                    theta,
-                    &mut *fit_fn.borrow_mut(),
-                    &score_fn,
-                )
-                .map_err(|e| e.to_string())?;
-                Ok(0.0)
-            }
+    use crate::solver::strategy::{
+        ClosureObjective, CoordinateSearchConfig, Derivative, EfsEval, HessianResult,
+        OuterCapability, OuterConfig, OuterEval, Solver,
+    };
+
+    struct SingleBlockState<'a, FitOut: Clone, FitFn, ScoreFn> {
+        hyper: SpatialHyperState<FitOut>,
+        resolvedspec: &'a TermCollectionSpec,
+        spatial_terms: &'a [usize],
+        fit_fn: FitFn,
+        score_fn: ScoreFn,
+    }
+
+    let n_params = spatial_terms.len();
+    let mut state = SingleBlockState {
+        hyper: hyper_state,
+        resolvedspec,
+        spatial_terms,
+        fit_fn,
+        score_fn,
+    };
+
+    let mut obj = ClosureObjective {
+        state: &mut state,
+        cap: OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params,
+            all_penalty_like: false,
+            barrier_config: None,
+            force_solver: None,
         },
-    )
-    .map_err(|e| EstimationError::InvalidInput(e))?;
+        cost_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
+            eval_single_block_spatial_cost(
+                &mut ctx.hyper,
+                ctx.resolvedspec,
+                ctx.spatial_terms,
+                theta,
+                &mut ctx.fit_fn,
+                &ctx.score_fn,
+            )
+        },
+        eval_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
+            let cost = eval_single_block_spatial_cost(
+                &mut ctx.hyper,
+                ctx.resolvedspec,
+                ctx.spatial_terms,
+                theta,
+                &mut ctx.fit_fn,
+                &ctx.score_fn,
+            )?;
+            Ok(OuterEval {
+                cost,
+                gradient: Array1::zeros(theta.len()),
+                hessian: HessianResult::Unavailable,
+            })
+        },
+        reset_fn: |_ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>| {},
+        efs_fn: None::<
+            fn(&mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+        >,
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: kappa_options.rel_tol.max(1e-6),
+        max_iter: kappa_options.max_outer_iter.max(1),
+        fd_step: kappa_options.log_step,
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            ..Default::default()
+        },
+        rho_bound: kappa_options.max_length_scale.ln().abs().max(12.0),
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+        fallback_sequence: vec![
+            OuterCapability {
+                gradient: Derivative::Unavailable,
+                hessian: Derivative::Unavailable,
+                n_params,
+                all_penalty_like: false,
+                barrier_config: None,
+                force_solver: Some(Solver::CoordinateSearch),
+            },
+        ],
+        coordinate_search: Some(CoordinateSearchConfig {
+            log_step: kappa_options.log_step,
+            max_coord_iters: kappa_options.max_outer_iter,
+            rel_tol: kappa_options.rel_tol,
+        }),
+    };
+
+    let result = crate::solver::strategy::run_outer(
+        &mut obj, &outer_config, "single-block spatial length-scale",
+    )?;
+
+    // Realize the best point from the optimization.
+    let best_eval = realize_single_block_spatial_eval(
+        &mut state.hyper,
+        state.resolvedspec,
+        state.spatial_terms,
+        &result.rho,
+        &mut state.fit_fn,
+        &state.score_fn,
+    )?;
 
     Ok(SingleBlockSpatialLengthScaleOptimizationResult {
         resolvedspec: best_eval.spec,
@@ -9380,55 +9262,153 @@ where
             fit: best_fit.clone(),
         });
 
-        let initial_cost = if initial_score.is_finite() {
-            initial_score
-        } else {
-            f64::INFINITY
+        use crate::solver::strategy::{
+            ClosureObjective, CoordinateSearchConfig, Derivative, EfsEval, HessianResult,
+            OuterCapability, OuterConfig, OuterEval, Solver,
         };
-        let mut best_eval = hyper_state
-            .realized(&theta0)
-            .expect("baseline two-block spatial evaluation must be realized");
 
-        let hyper_state = std::cell::RefCell::new(hyper_state);
-        let fit_fn = std::cell::RefCell::new(fit_fn);
+        struct TwoBlockState<'a, FitOut: Clone, FitFn, ScoreFn> {
+            hyper: TwoBlockSpatialHyperState<FitOut>,
+            data: ArrayView2<'a, f64>,
+            best_meanspec: &'a TermCollectionSpec,
+            best_noisespec: &'a TermCollectionSpec,
+            mean_terms: &'a [usize],
+            noise_terms: &'a [usize],
+            fit_fn: FitFn,
+            score_fn: ScoreFn,
+        }
 
-        coordinate_search_spatial(
-            &theta0,
-            initial_cost,
-            &lower,
-            &upper,
-            kappa_options,
-            &mut |action| match action {
-                SpatialSearchAction::EvalCost(theta) => eval_two_block_spatial_cost(
-                    &mut *hyper_state.borrow_mut(),
-                    &best_meanspec,
-                    &best_noisespec,
-                    &mean_terms,
-                    &noise_terms,
-                    theta,
-                    &build_pair,
-                    &mut *fit_fn.borrow_mut(),
-                    &score_fn,
-                )
-                .map_err(|e| e.to_string()),
-                SpatialSearchAction::OnImprove(theta, cost) => {
-                    let _ = cost;
-                    best_eval = realize_two_block_spatial_eval(
-                        &mut *hyper_state.borrow_mut(),
-                        &best_meanspec,
-                        &best_noisespec,
-                        &mean_terms,
-                        &noise_terms,
-                        theta,
-                        &build_pair,
-                        &mut *fit_fn.borrow_mut(),
-                        &score_fn,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(0.0)
-                }
+        let mut state = TwoBlockState {
+            hyper: hyper_state,
+            data,
+            best_meanspec: &best_meanspec,
+            best_noisespec: &best_noisespec,
+            mean_terms: &mean_terms,
+            noise_terms: &noise_terms,
+            fit_fn,
+            score_fn,
+        };
+
+        type TBS<'a, FO, FF, SF> = TwoBlockState<'a, FO, FF, SF>;
+
+        let mut obj = ClosureObjective {
+            state: &mut state,
+            cap: OuterCapability {
+                gradient: Derivative::Unavailable,
+                hessian: Derivative::Unavailable,
+                n_params: total_terms,
+                all_penalty_like: false,
+                barrier_config: None,
+                force_solver: None,
             },
-        )?;
+            cost_fn: |ctx: &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
+                let data_view = ctx.data;
+                let bp = |ms: &TermCollectionSpec, ns: &TermCollectionSpec| -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
+                    let d_mean = build_term_collection_design(data_view, ms)
+                        .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
+                    let d_noise = build_term_collection_design(data_view, ns)
+                        .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
+                    Ok((d_mean, d_noise))
+                };
+                eval_two_block_spatial_cost(
+                    &mut ctx.hyper,
+                    ctx.best_meanspec,
+                    ctx.best_noisespec,
+                    ctx.mean_terms,
+                    ctx.noise_terms,
+                    theta,
+                    &bp,
+                    &mut ctx.fit_fn,
+                    &ctx.score_fn,
+                )
+            },
+            eval_fn: |ctx: &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
+                let data_view = ctx.data;
+                let bp = |ms: &TermCollectionSpec, ns: &TermCollectionSpec| -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
+                    let d_mean = build_term_collection_design(data_view, ms)
+                        .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
+                    let d_noise = build_term_collection_design(data_view, ns)
+                        .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
+                    Ok((d_mean, d_noise))
+                };
+                let cost = eval_two_block_spatial_cost(
+                    &mut ctx.hyper,
+                    ctx.best_meanspec,
+                    ctx.best_noisespec,
+                    ctx.mean_terms,
+                    ctx.noise_terms,
+                    theta,
+                    &bp,
+                    &mut ctx.fit_fn,
+                    &ctx.score_fn,
+                )?;
+                Ok(OuterEval {
+                    cost,
+                    gradient: Array1::zeros(theta.len()),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            reset_fn: |_ctx: &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>| {},
+            efs_fn: None::<
+                fn(&mut &mut TBS<'_, FitOut, FitFn, ScoreFn>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+            >,
+        };
+
+        let outer_config = OuterConfig {
+            tolerance: kappa_options.rel_tol.max(1e-6),
+            max_iter: kappa_options.max_outer_iter.max(1),
+            fd_step: kappa_options.log_step,
+            seed_config: crate::seeding::SeedConfig {
+                max_seeds: 1,
+                screening_budget: 1,
+                ..Default::default()
+            },
+            rho_bound: kappa_options.max_length_scale.ln().abs().max(12.0),
+            heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+            initial_rho: Some(theta0.clone()),
+            fallback_sequence: vec![
+                OuterCapability {
+                    gradient: Derivative::Unavailable,
+                    hessian: Derivative::Unavailable,
+                    n_params: total_terms,
+                    all_penalty_like: false,
+                    barrier_config: None,
+                    force_solver: Some(Solver::CoordinateSearch),
+                },
+            ],
+            coordinate_search: Some(CoordinateSearchConfig {
+                log_step: kappa_options.log_step,
+                max_coord_iters: kappa_options.max_outer_iter,
+                rel_tol: kappa_options.rel_tol,
+            }),
+        };
+
+        let result = crate::solver::strategy::run_outer(
+            &mut obj, &outer_config, "two-block spatial length-scale",
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Realize the best result from the optimization.
+        let data_view = state.data;
+        let realize_bp = |ms: &TermCollectionSpec, ns: &TermCollectionSpec| -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
+            let d_mean = build_term_collection_design(data_view, ms)
+                .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
+            let d_noise = build_term_collection_design(data_view, ns)
+                .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
+            Ok((d_mean, d_noise))
+        };
+        let best_eval = realize_two_block_spatial_eval(
+            &mut state.hyper,
+            state.best_meanspec,
+            state.best_noisespec,
+            state.mean_terms,
+            state.noise_terms,
+            &result.rho,
+            &realize_bp,
+            &mut state.fit_fn,
+            &state.score_fn,
+        )
+        .map_err(|e| e.to_string())?;
 
         best_meanspec = best_eval.meanspec;
         best_noisespec = best_eval.noisespec;
@@ -9563,140 +9543,188 @@ where
         format!("failed to freeze noise spatial basis centers during exact joint κ bootstrap: {e}")
     })?;
 
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let objective = CachedSecondOrderObjective::new(
-        |theta: &Array1<f64>| {
-            let log_kappa =
-                SpatialLogKappaCoords::from_theta_tail_with_dims(theta, rho_dim, all_dims.clone());
-            // split_at operates on logical term count, not flat ψ index.
-            let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(mean_terms.len());
-            let meanspec_c = match mean_log_kappa.apply_tospec(&best_meanspec, &mean_terms) {
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
+    };
+
+    let theta_dim = theta0.len();
+    let psi_dim = theta_dim - rho_dim;
+
+    struct TwoBlockExactJointState {
+        best_theta: Array1<f64>,
+        best_cost: f64,
+    }
+
+    impl TwoBlockExactJointState {
+        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            if cost < self.best_cost {
+                self.best_cost = cost;
+                self.best_theta = theta.clone();
+            }
+        }
+    }
+
+    let mut state = TwoBlockExactJointState {
+        best_theta: theta0.clone(),
+        best_cost: f64::INFINITY,
+    };
+
+    let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
+    let build_pair_ref = &build_pair;
+    let best_meanspec_ref = &best_meanspec;
+    let best_noisespec_ref = &best_noisespec;
+    let mean_terms_ref = &mean_terms;
+    let noise_terms_ref = &noise_terms;
+    let all_dims_ref = &all_dims;
+
+    let outer_config = OuterConfig {
+        tolerance: kappa_options.rel_tol.max(1e-6),
+        max_iter: kappa_options.max_outer_iter.max(1),
+        fd_step: 1e-4,
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            num_auxiliary_trailing: psi_dim,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+        fallback_sequence: vec![
+            OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: Derivative::Unavailable,
+                n_params: theta_dim,
+                all_penalty_like: false,
+                barrier_config: None,
+                force_solver: None,
+            },
+        ],
+        coordinate_search: None,
+    };
+
+    let mut obj = ClosureObjective {
+        state: &mut state,
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: theta_dim,
+            all_penalty_like: false,
+            barrier_config: None,
+            force_solver: None,
+        },
+        cost_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta, rho_dim, all_dims_ref.clone(),
+            );
+            let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
+            let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
                 Ok(v) => v,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "exact-joint spatial objective failed to apply mean log-kappa: {err}"
-                    )));
-                }
+                Err(_) => return Ok(f64::INFINITY),
             };
-            let noisespec_c = match noise_log_kappa.apply_tospec(&best_noisespec, &noise_terms) {
+            let ns = match noise_lk.apply_tospec(best_noisespec_ref, noise_terms_ref) {
                 Ok(v) => v,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "exact-joint spatial objective failed to apply noise log-kappa: {err}"
-                    )));
-                }
+                Err(_) => return Ok(f64::INFINITY),
             };
-            let (mean_design_c, noise_design_c) = match build_pair(&meanspec_c, &noisespec_c) {
+            let (md, nd) = match build_pair_ref(&ms, &ns) {
                 Ok(v) => v,
-                Err(err) => {
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "exact-joint spatial objective failed to build designs: {err}"
-                    )));
-                }
+                Err(_) => return Ok(f64::INFINITY),
             };
-            // Exact spatial joint optimization is now a true second-order path.
-            // The family callback must return the full profiled/Laplace Hessian
-            // in theta = [rho, psi]; NewtonTrustRegion is not allowed to run on
-            // a gradient-only surrogate here.
-            let (cost, grad, hess) = match exact_fn(
+            match (&mut *exact_fn_cell.borrow_mut())(
                 &theta.slice(s![..rho_dim]).to_owned(),
-                &meanspec_c,
-                &noisespec_c,
-                &mean_design_c,
-                &noise_design_c,
+                &ms, &ns, &md, &nd,
+                false,
+            ) {
+                Ok((c, _, _)) => {
+                    ctx.track_best(theta, c);
+                    Ok(c)
+                }
+                Err(_) => Ok(f64::INFINITY),
+            }
+        },
+        eval_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta, rho_dim, all_dims_ref.clone(),
+            );
+            let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
+            let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            let ns = match noise_lk.apply_tospec(best_noisespec_ref, noise_terms_ref) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            let (md, nd) = match build_pair_ref(&ms, &ns) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            match (&mut *exact_fn_cell.borrow_mut())(
+                &theta.slice(s![..rho_dim]).to_owned(),
+                &ms, &ns, &md, &nd,
                 true,
             ) {
                 Ok((cost, grad, hess)) => {
-                    let cost_finite = cost.is_finite();
-                    let grad_finite = grad.iter().all(|v| v.is_finite());
-                    let hessian_present = hess.is_some();
-                    let (hessrows, hess_cols, hess_finite, hess_shape_ok) = hess
-                        .as_ref()
-                        .map(|h| {
-                            (
-                                h.nrows(),
-                                h.ncols(),
-                                h.iter().all(|v| v.is_finite()),
-                                h.nrows() == theta.len() && h.ncols() == theta.len(),
-                            )
-                        })
-                        .unwrap_or((0, 0, false, false));
-                    if !cost_finite
-                        || !grad_finite
-                        || !hessian_present
-                        || !hess_shape_ok
-                        || !hess_finite
-                    {
-                        if let Some((theta_prev, cost_prev, grad_prev, hess_prev)) =
-                            last_eval.as_ref()
-                            && theta_prev.len() == theta.len()
+                    ctx.track_best(theta, cost);
+                    let hessian_result = match hess {
+                        Some(h)
+                            if h.nrows() == theta.len()
+                                && h.ncols() == theta.len()
+                                && h.iter().all(|v| v.is_finite()) =>
                         {
-                            return Ok((*cost_prev, grad_prev.clone(), hess_prev.clone()));
+                            HessianResult::Analytic(h)
                         }
-                        return Err(ObjectiveEvalError::recoverable(format!(
-                            "exact-joint spatial objective/gradient/hessian became non-finite or incomplete: cost_finite={cost_finite}, grad_all_finite={grad_finite}, hessian_present={hessian_present}, hessian_shape={}x{} expected {}x{}, hessian_all_finite={hess_finite}",
-                            hessrows,
-                            hess_cols,
-                            theta.len(),
-                            theta.len(),
-                        )));
-                    }
-                    last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
-                    (cost, grad, hess)
+                        _ => HessianResult::Unavailable,
+                    };
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: hessian_result,
+                    })
                 }
-                Err(err) => {
-                    if let Some((theta_prev, cost_prev, grad_prev, hess_prev)) = last_eval.as_ref()
-                        && theta_prev.len() == theta.len()
-                    {
-                        return Ok((*cost_prev, grad_prev.clone(), hess_prev.clone()));
-                    }
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "exact-joint spatial objective/gradient evaluation failed: {err}"
-                    )));
-                }
-            };
-            Ok((cost, grad, hess))
+                Err(_) => Ok(OuterEval {
+                    cost: f64::INFINITY,
+                    gradient: Array1::zeros(theta.len()),
+                    hessian: HessianResult::Unavailable,
+                }),
+            }
         },
-        1e-4,
-    );
-    let mut optimizer = NewtonTrustRegion::new(theta0.clone(), objective)
-        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("exact joint bounds must be valid"))
-        .with_tolerance(
-            Tolerance::new(kappa_options.rel_tol.max(1e-6))
-                .expect("exact joint tolerance must be valid"),
-        )
-        .with_max_iterations(
-            MaxIterations::new(kappa_options.max_outer_iter.max(1))
-                .expect("exact joint max iterations must be valid"),
-        );
-
-    let theta_star = match optimizer.run() {
-        Ok(sol) => sol.final_point,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-            last_solution.final_point
-        }
-        Err(err) => {
-            // NewtonTR failed — fall back to BFGS outer optimizer which is more
-            // robust (does not require SPD Hessian at every point).
-            log::warn!(
-                "[two-block-exact-joint] NewtonTR failed ({}); attempting BFGS fallback",
-                err,
-            );
-            try_two_block_bfgs_fallback(
-                data,
-                &best_meanspec,
-                &best_noisespec,
-                &mean_terms,
-                &noise_terms,
-                &theta0,
-                rho_dim,
-                &all_dims,
-                kappa_options,
-                &build_pair,
-                &mut exact_fn,
-            )?
-        }
+        reset_fn: |ctx: &mut &mut TwoBlockExactJointState| { let _ = ctx; },
+        efs_fn: None::<
+            fn(
+                &mut &mut TwoBlockExactJointState,
+                &Array1<f64>,
+            ) -> Result<EfsEval, EstimationError>,
+        >,
     };
+
+    let result = crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "two-block exact-joint spatial",
+    ).map_err(|e| e.to_string())?;
+
+    let mut theta_star = result.rho;
+    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, &all_dims);
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, all_dims);
     let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
@@ -9724,562 +9752,6 @@ where
         noise_design,
         fit,
     })
-}
-
-/// BFGS fallback for two-block exact joint spatial optimization.
-///
-/// When `NewtonTrustRegion` fails (e.g., due to indefinite Hessian), this
-/// provides a more robust BFGS-based path. The BFGS outer optimizer only
-/// requires gradient information and builds its own quasi-Newton Hessian
-/// approximation, so it tolerates non-SPD Hessians at intermediate points.
-///
-/// At each iteration, the design X(ψ) and penalties S(ψ) are rebuilt for
-/// both blocks at the current ψ values. The `exact_fn` callback returns
-/// cost + gradient + optional Hessian for the full θ = [ρ, ψ] vector,
-/// with ψ derivatives flowing through each block's own knot-cloud contrast
-/// matrix Z, ensuring correct block-level derivative accounting.
-///
-/// The key structural difference from the single-block aniso path
-/// (`try_exact_joint_spatial_aniso_optimization`): here each block's spatial
-/// terms produce their own `SpatialPsiDerivative` entries embedded into the
-/// joint parameter space at block-specific column ranges. The ext_coords
-/// that reach the unified REML evaluator therefore carry block-tagged
-/// derivative information, and cross-block ψ-ψ Hessian entries are zero
-/// by construction (spatial terms in different blocks are independent
-/// conditional on the inner mode).
-fn try_two_block_bfgs_fallback(
-    data: ArrayView2<'_, f64>,
-    best_meanspec: &TermCollectionSpec,
-    best_noisespec: &TermCollectionSpec,
-    mean_terms: &[usize],
-    noise_terms: &[usize],
-    theta0: &Array1<f64>,
-    rho_dim: usize,
-    all_dims: &[usize],
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    build_pair: &dyn Fn(
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-    ) -> Result<(TermCollectionDesign, TermCollectionDesign), String>,
-    exact_fn: &mut dyn FnMut(
-        &Array1<f64>,
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-        &TermCollectionDesign,
-        &TermCollectionDesign,
-        bool,
-    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
-) -> Result<Array1<f64>, String> {
-    use crate::solver::strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
-    };
-    let _ = data; // reserved for future use
-
-    let theta_dim = theta0.len();
-    let psi_dim = theta_dim - rho_dim;
-
-    log::trace!(
-        "[two-block-bfgs-fallback] starting analytic BFGS: rho_dim={}, psi_dim={}, \
-         mean_spatial_terms={}, noise_spatial_terms={}, dims_per_term={:?}",
-        rho_dim,
-        psi_dim,
-        mean_terms.len(),
-        noise_terms.len(),
-        all_dims,
-    );
-
-    // Shared mutable state: best-tracking + references to immutable config.
-    struct TwoBlockBfgsState<'a> {
-        best_meanspec: &'a TermCollectionSpec,
-        best_noisespec: &'a TermCollectionSpec,
-        mean_terms: &'a [usize],
-        noise_terms: &'a [usize],
-        rho_dim: usize,
-        all_dims: &'a [usize],
-        best_theta: Array1<f64>,
-        best_cost: f64,
-    }
-
-    impl<'a> TwoBlockBfgsState<'a> {
-        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
-            if cost < self.best_cost {
-                self.best_cost = cost;
-                self.best_theta = theta.clone();
-            }
-        }
-
-        /// Rebuild specs at the current ψ values.
-        fn specs_at_psi(
-            &self,
-            theta: &Array1<f64>,
-        ) -> Result<(TermCollectionSpec, TermCollectionSpec), String> {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                self.rho_dim,
-                self.all_dims.to_vec(),
-            );
-            let (mean_lk, noise_lk) = log_kappa.split_at(self.mean_terms.len());
-            let ms = mean_lk.apply_tospec(self.best_meanspec, self.mean_terms)?;
-            let ns = noise_lk.apply_tospec(self.best_noisespec, self.noise_terms)?;
-            Ok((ms, ns))
-        }
-    }
-
-    let mut state = TwoBlockBfgsState {
-        best_meanspec,
-        best_noisespec,
-        mean_terms,
-        noise_terms,
-        rho_dim,
-        all_dims,
-        best_theta: theta0.clone(),
-        best_cost: f64::INFINITY,
-    };
-
-    // The exact_fn and build_pair are borrowed mutably/immutably; wrap in
-    // RefCells so the closure-based optimizer infrastructure can call them.
-    let exact_fn_cell = std::cell::RefCell::new(exact_fn);
-    let build_pair_ref = build_pair;
-
-    let outer_config = OuterConfig {
-        tolerance: kappa_options.rel_tol.max(1e-6),
-        max_iter: kappa_options.max_outer_iter.max(1),
-        fd_step: 1e-5,
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: psi_dim,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-    };
-
-    let mut obj = ClosureObjective {
-        state: &mut state,
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            // Hessian is analytic when exact_fn returns Some(hess), but we
-            // declare it as such so BFGS can use it when available while
-            // still proceeding with its quasi-Newton approximation otherwise.
-            hessian: Derivative::Analytic,
-            n_params: theta_dim,
-            // ψ coordinates move the design matrix, so they are NOT penalty-like.
-            all_penalty_like: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut TwoBlockBfgsState<'_>, theta: &Array1<f64>| {
-            let cost = match ctx.specs_at_psi(theta) {
-                Ok((ms, ns)) => {
-                    match build_pair_ref(&ms, &ns) {
-                        Ok((md, nd)) => {
-                            match (&mut *exact_fn_cell.borrow_mut())(
-                                &theta.slice(s![..ctx.rho_dim]).to_owned(),
-                                &ms, &ns, &md, &nd,
-                                false, // gradient not needed for cost-only
-                            ) {
-                                Ok((c, _, _)) => c,
-                                Err(_) => f64::INFINITY,
-                            }
-                        }
-                        Err(_) => f64::INFINITY,
-                    }
-                }
-                Err(_) => f64::INFINITY,
-            };
-            ctx.track_best(theta, cost);
-            Ok(cost)
-        },
-        eval_fn: |ctx: &mut &mut TwoBlockBfgsState<'_>, theta: &Array1<f64>| {
-            let (ms, ns) = match ctx.specs_at_psi(theta) {
-                Ok(pair) => pair,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
-            };
-            let (md, nd) = match build_pair_ref(&ms, &ns) {
-                Ok(pair) => pair,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
-            };
-            match (&mut *exact_fn_cell.borrow_mut())(
-                &theta.slice(s![..ctx.rho_dim]).to_owned(),
-                &ms, &ns, &md, &nd,
-                true, // need gradient + hessian
-            ) {
-                Ok((cost, grad, hess)) => {
-                    ctx.track_best(theta, cost);
-                    let hessian_result = match hess {
-                        Some(h)
-                            if h.nrows() == theta.len()
-                                && h.ncols() == theta.len()
-                                && h.iter().all(|v| v.is_finite()) =>
-                        {
-                            HessianResult::Analytic(h)
-                        }
-                        _ => HessianResult::Unavailable,
-                    };
-                    Ok(OuterEval {
-                        cost,
-                        gradient: grad,
-                        hessian: hessian_result,
-                    })
-                }
-                Err(_) => Ok(OuterEval {
-                    cost: f64::INFINITY,
-                    gradient: Array1::zeros(theta.len()),
-                    hessian: HessianResult::Unavailable,
-                }),
-            }
-        },
-        reset_fn: |ctx: &mut &mut TwoBlockBfgsState<'_>| { let _ = ctx; },
-        efs_fn: None::<
-            fn(
-                &mut &mut TwoBlockBfgsState<'_>,
-                &Array1<f64>,
-            ) -> Result<EfsEval, EstimationError>,
-        >,
-    };
-
-    match crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "two-block spatial BFGS fallback",
-    ) {
-        Ok(result) => {
-            log::trace!(
-                "[two-block-bfgs-fallback] converged in {} iterations, \
-                 final_value={:.6e}, grad_norm={:.6e}",
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm,
-            );
-            let mut theta_star = result.rho;
-            // Enforce sum-to-zero constraint on ψ coordinates for aniso groups.
-            enforce_psi_sum_to_zero(&mut theta_star, rho_dim, all_dims);
-            Ok(theta_star)
-        }
-        Err(e) => {
-            log::warn!(
-                "[two-block-bfgs-fallback] BFGS also failed ({}), \
-                 returning initial theta",
-                e
-            );
-            Ok(theta0.clone())
-        }
-    }
-}
-
-/// BFGS fallback for two-block spatial length-scale optimization using
-/// finite-difference gradients via `run_outer`.
-///
-/// This sits between the exact-joint (NewtonTR with analytic derivatives) path
-/// and the derivative-free coordinate search. It re-uses the same `fit_fn` /
-/// `score_fn` closures as `optimize_two_block_spatial_length_scale` but wraps
-/// them in a `ClosureObjective` with `Derivative::Unavailable` so that
-/// `run_outer` automatically computes gradients via finite differences.
-pub fn optimize_two_block_spatial_length_scale_bfgs<FitOut, FitFn, ScoreFn>(
-    data: ArrayView2<'_, f64>,
-    meanspec: &TermCollectionSpec,
-    noisespec: &TermCollectionSpec,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    mut fit_fn: FitFn,
-    score_fn: ScoreFn,
-) -> Result<TwoBlockSpatialLengthScaleOptimizationResult<FitOut>, String>
-where
-    FitOut: Clone,
-    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    use crate::solver::strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
-    };
-
-    let mean_terms = spatial_length_scale_term_indices(meanspec);
-    let noise_terms = spatial_length_scale_term_indices(noisespec);
-
-    let build_pair = |ms: &TermCollectionSpec,
-                      ns: &TermCollectionSpec|
-     -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
-        let d_mean = build_term_collection_design(data, ms)
-            .map_err(|e| format!("failed to build mean design during BFGS κ optimization: {e}"))?;
-        let d_noise = build_term_collection_design(data, ns).map_err(|e| {
-            format!("failed to build noise design during BFGS κ optimization: {e}")
-        })?;
-        Ok((d_mean, d_noise))
-    };
-
-    let (bootmean_design, bootnoise_design) = build_pair(meanspec, noisespec)?;
-    let best_meanspec =
-        freeze_spatial_length_scale_terms_from_design(meanspec, &bootmean_design).map_err(|e| {
-            format!(
-                "failed to freeze mean spatial basis centers during BFGS κ bootstrap: {e}"
-            )
-        })?;
-    let best_noisespec = freeze_spatial_length_scale_terms_from_design(
-        noisespec,
-        &bootnoise_design,
-    )
-    .map_err(|e| {
-        format!(
-            "failed to freeze noise spatial basis centers during BFGS κ bootstrap: {e}"
-        )
-    })?;
-
-    let total_terms = mean_terms.len() + noise_terms.len();
-
-    if !kappa_options.enabled || total_terms == 0 {
-        let fit = fit_fn(&bootmean_design, &bootnoise_design)?;
-        return Ok(TwoBlockSpatialLengthScaleOptimizationResult {
-            resolved_meanspec: best_meanspec,
-            resolved_noisespec: best_noisespec,
-            mean_design: bootmean_design,
-            noise_design: bootnoise_design,
-            fit,
-        });
-    }
-
-    // Build the initial theta (log-length-scale per term, isotropic),
-    // matching the parameterization used by `optimize_two_block_spatial_length_scale`.
-    let mut theta0 = Array1::<f64>::zeros(total_terms);
-    for (slot, &term_idx) in mean_terms.iter().enumerate() {
-        theta0[slot] = get_spatial_length_scale(&best_meanspec, term_idx)
-            .unwrap_or(kappa_options.min_length_scale)
-            .clamp(kappa_options.min_length_scale, kappa_options.max_length_scale)
-            .ln();
-    }
-    for (slot, &term_idx) in noise_terms.iter().enumerate() {
-        theta0[mean_terms.len() + slot] =
-            get_spatial_length_scale(&best_noisespec, term_idx)
-                .unwrap_or(kappa_options.min_length_scale)
-                .clamp(kappa_options.min_length_scale, kappa_options.max_length_scale)
-                .ln();
-    }
-
-    log::trace!(
-        "[two-block-bfgs-fd] starting FD-BFGS: total_terms={}, mean_spatial_terms={}, noise_spatial_terms={}",
-        total_terms,
-        mean_terms.len(),
-        noise_terms.len(),
-    );
-
-    // State struct for tracking best solution found during optimization.
-    struct BfgsFdState<'a, FitOut: Clone> {
-        best_meanspec: &'a TermCollectionSpec,
-        best_noisespec: &'a TermCollectionSpec,
-        mean_terms: &'a [usize],
-        noise_terms: &'a [usize],
-        best_theta: Array1<f64>,
-        best_cost: f64,
-        best_fit: Option<FitOut>,
-        best_resolved_meanspec: Option<TermCollectionSpec>,
-        best_resolved_noisespec: Option<TermCollectionSpec>,
-        best_mean_design: Option<TermCollectionDesign>,
-        best_noise_design: Option<TermCollectionDesign>,
-    }
-
-    impl<'a, FitOut: Clone> BfgsFdState<'a, FitOut> {
-        fn track_best(
-            &mut self,
-            theta: &Array1<f64>,
-            cost: f64,
-            fit: &FitOut,
-            ms: &TermCollectionSpec,
-            ns: &TermCollectionSpec,
-            md: &TermCollectionDesign,
-            nd: &TermCollectionDesign,
-        ) {
-            if cost < self.best_cost {
-                self.best_cost = cost;
-                self.best_theta = theta.clone();
-                self.best_fit = Some(fit.clone());
-                self.best_resolved_meanspec = Some(ms.clone());
-                self.best_resolved_noisespec = Some(ns.clone());
-                self.best_mean_design = Some(md.clone());
-                self.best_noise_design = Some(nd.clone());
-            }
-        }
-
-        fn specs_at_theta(
-            &self,
-            theta: &Array1<f64>,
-        ) -> Result<(TermCollectionSpec, TermCollectionSpec), String> {
-            let mean_theta = theta.slice(s![0..self.mean_terms.len()]).to_owned();
-            let noise_theta = theta.slice(s![self.mean_terms.len()..]).to_owned();
-            let ms = apply_spatial_log_length_scales(
-                self.best_meanspec,
-                self.mean_terms,
-                &mean_theta,
-            )
-            .map_err(|e| e.to_string())?;
-            let ns = apply_spatial_log_length_scales(
-                self.best_noisespec,
-                self.noise_terms,
-                &noise_theta,
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((ms, ns))
-        }
-    }
-
-    let mut state = BfgsFdState {
-        best_meanspec: &best_meanspec,
-        best_noisespec: &best_noisespec,
-        mean_terms: &mean_terms,
-        noise_terms: &noise_terms,
-        best_theta: theta0.clone(),
-        best_cost: f64::INFINITY,
-        best_fit: None,
-        best_resolved_meanspec: None,
-        best_resolved_noisespec: None,
-        best_mean_design: None,
-        best_noise_design: None,
-    };
-
-    let fit_fn_cell = std::cell::RefCell::new(&mut fit_fn);
-    let score_fn_ref = &score_fn;
-    let build_pair_ref = &build_pair;
-
-    let outer_config = OuterConfig {
-        tolerance: kappa_options.rel_tol.max(1e-6),
-        max_iter: kappa_options.max_outer_iter.max(1),
-        fd_step: 1e-4,
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: 0,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-    };
-
-    let mut obj = ClosureObjective {
-        state: &mut state,
-        cap: OuterCapability {
-            gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
-            n_params: total_terms,
-            all_penalty_like: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut BfgsFdState<'_, FitOut>, theta: &Array1<f64>| {
-            let (ms, ns) = match ctx.specs_at_theta(theta) {
-                Ok(pair) => pair,
-                Err(_) => return Ok(f64::INFINITY),
-            };
-            let (md, nd) = match build_pair_ref(&ms, &ns) {
-                Ok(pair) => pair,
-                Err(_) => return Ok(f64::INFINITY),
-            };
-            match (&mut *fit_fn_cell.borrow_mut())(&md, &nd) {
-                Ok(fit) => {
-                    let cost = score_fn_ref(&fit);
-                    ctx.track_best(theta, cost, &fit, &ms, &ns, &md, &nd);
-                    Ok(cost)
-                }
-                Err(_) => Ok(f64::INFINITY),
-            }
-        },
-        eval_fn: |ctx: &mut &mut BfgsFdState<'_, FitOut>, theta: &Array1<f64>| {
-            // With Derivative::Unavailable, run_outer will use FD; the eval_fn
-            // just needs to return the cost with a zero gradient placeholder.
-            let (ms, ns) = match ctx.specs_at_theta(theta) {
-                Ok(pair) => pair,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
-            };
-            let (md, nd) = match build_pair_ref(&ms, &ns) {
-                Ok(pair) => pair,
-                Err(_) => {
-                    return Ok(OuterEval {
-                        cost: f64::INFINITY,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    });
-                }
-            };
-            match (&mut *fit_fn_cell.borrow_mut())(&md, &nd) {
-                Ok(fit) => {
-                    let cost = score_fn_ref(&fit);
-                    ctx.track_best(theta, cost, &fit, &ms, &ns, &md, &nd);
-                    Ok(OuterEval {
-                        cost,
-                        gradient: Array1::zeros(theta.len()),
-                        hessian: HessianResult::Unavailable,
-                    })
-                }
-                Err(_) => Ok(OuterEval {
-                    cost: f64::INFINITY,
-                    gradient: Array1::zeros(theta.len()),
-                    hessian: HessianResult::Unavailable,
-                }),
-            }
-        },
-        reset_fn: |ctx: &mut &mut BfgsFdState<'_, FitOut>| { let _ = ctx; },
-        efs_fn: None::<
-            fn(
-                &mut &mut BfgsFdState<'_, FitOut>,
-                &Array1<f64>,
-            ) -> Result<EfsEval, crate::solver::estimate::EstimationError>,
-        >,
-    };
-
-    match crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "two-block spatial BFGS FD fallback",
-    ) {
-        Ok(result) => {
-            log::trace!(
-                "[two-block-bfgs-fd] converged in {} iterations, \
-                 final_value={:.6e}, grad_norm={:.6e}",
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm,
-            );
-            // Use the best solution tracked during optimization.
-            let st = obj.state;
-            if let (Some(fit), Some(ms), Some(ns), Some(md), Some(nd)) = (
-                st.best_fit.take(),
-                st.best_resolved_meanspec.take(),
-                st.best_resolved_noisespec.take(),
-                st.best_mean_design.take(),
-                st.best_noise_design.take(),
-            ) {
-                log_spatial_aniso_scales(&ms);
-                log_spatial_aniso_scales(&ns);
-                Ok(TwoBlockSpatialLengthScaleOptimizationResult {
-                    resolved_meanspec: ms,
-                    resolved_noisespec: ns,
-                    mean_design: md,
-                    noise_design: nd,
-                    fit,
-                })
-            } else {
-                Err("BFGS FD fallback converged but no valid evaluation was recorded".to_string())
-            }
-        }
-        Err(e) => Err(format!("BFGS FD fallback failed: {e}")),
-    }
 }
 
 pub fn fit_term_collectionwith_matern_kappa_optimization(

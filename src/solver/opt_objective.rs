@@ -15,13 +15,13 @@ struct CachedFirstOrderSample {
     grad: Array1<f64>,
 }
 
-pub struct CachedFirstOrderObjective<F> {
+pub(in crate::solver) struct CachedFirstOrderObjective<F> {
     inner: F,
     last: Option<CachedFirstOrderSample>,
 }
 
 impl<F> CachedFirstOrderObjective<F> {
-    pub fn new(inner: F) -> Self {
+    pub(in crate::solver) fn new(inner: F) -> Self {
         Self { inner, last: None }
     }
 
@@ -68,14 +68,14 @@ struct CachedSecondOrderSample {
     hessian: Option<Array2<f64>>,
 }
 
-pub struct CachedSecondOrderObjective<F> {
+pub(in crate::solver) struct CachedSecondOrderObjective<F> {
     inner: F,
     finite_diff_step: f64,
     last: Option<CachedSecondOrderSample>,
 }
 
 impl<F> CachedSecondOrderObjective<F> {
-    pub fn new(inner: F, finite_diff_step: f64) -> Self {
+    pub(in crate::solver) fn new(inner: F, finite_diff_step: f64) -> Self {
         Self {
             inner,
             finite_diff_step,

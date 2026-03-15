@@ -4824,6 +4824,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             // Custom families enforce constraints via active-set QP in the inner
             // loop, not via log-barrier in the outer evaluator.
             barrier_config: None,
+            force_solver: None,
         },
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = if has_exact_hess {

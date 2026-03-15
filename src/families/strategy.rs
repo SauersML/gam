@@ -176,14 +176,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                     mixture_inverse_link_jet(state, x).mu
                 }))
             }
-            LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-                "PoissonLog posterior mean is not exposed via generic family strategy; use fit_poisson_log outputs directly"
-                    .to_string(),
-            )),
-            LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-                "GammaLog posterior mean is not exposed via generic family strategy; use fit_gamma_log outputs directly"
-                    .to_string(),
-            )),
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
+                Ok((eta + 0.5 * se_eta * se_eta).exp())
+            }
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar posterior mean is not exposed via generic family strategy"
                     .to_string(),
@@ -256,14 +252,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
-            LikelihoodFamily::PoissonLog => Err(EstimationError::InvalidInput(
-                "PoissonLog posterior moments are not exposed via generic family strategy; use fit_poisson_log outputs directly"
-                    .to_string(),
-            )),
-            LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-                "GammaLog posterior moments are not exposed via generic family strategy; use fit_gamma_log outputs directly"
-                    .to_string(),
-            )),
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+                // Log-normal moments: E[exp(η)] = exp(μ + σ²/2),
+                // Var[exp(η)] = exp(2μ + σ²)(exp(σ²) - 1)
+                let s2 = se_eta * se_eta;
+                let m1 = (eta + 0.5 * s2).exp();
+                let m2 = (2.0 * eta + s2).exp() * (s2.exp() - 1.0);
+                Ok((m1, m2.max(0.0)))
+            }
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar posterior mean is not exposed via generic family strategy"
                     .to_string(),
@@ -290,10 +286,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
             LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
-            LikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(
-                "GammaLog generative noise requires family shape; use fit_gamma_log outputs directly"
-                    .to_string(),
-            )),
+            LikelihoodFamily::GammaLog => {
+                // Default shape=1 (exponential) when not specified.
+                Ok(NoiseModel::Gamma { shape: gaussian_scale.unwrap_or(1.0).max(1e-6) })
+            }
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic family strategy"
                     .to_string(),

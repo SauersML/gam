@@ -52,6 +52,10 @@ pub struct OuterCapability {
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
+    /// When set, `plan()` bypasses its normal selection logic and returns the
+    /// specified solver directly. Only used in fallback_sequence entries to
+    /// force `CoordinateSearch` (which `plan()` never auto-selects).
+    pub force_solver: Option<Solver>,
 }
 
 /// Which solver algorithm to use for the outer optimization.
@@ -68,6 +72,9 @@ pub enum Solver {
     /// Needs no gradient or Hessian — only traces tr(H^{-1} A_k) and
     /// Frobenius norms from the inner solution.
     Efs,
+    /// Derivative-free coordinate search. Never auto-selected by `plan()`;
+    /// only reachable via `fallback_sequence` in `OuterConfig`.
+    CoordinateSearch,
 }
 
 /// How the Hessian will be obtained for the outer optimizer.
@@ -84,6 +91,8 @@ pub enum HessianSource {
     /// No explicit Hessian or gradient needed. EFS uses traces and
     /// Frobenius norms from the inner solution directly.
     EfsFixedPoint,
+    /// No gradient or Hessian needed. CoordinateSearch uses only `eval_cost`.
+    None,
 }
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
@@ -110,6 +119,19 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
     use Derivative::*;
     use HessianSource as H;
     use Solver as S;
+
+    if let Some(forced) = cap.force_solver {
+        let hessian_source = match forced {
+            S::Arc => H::Analytic,
+            S::NewtonTrustRegion => {
+                if cap.hessian == Analytic { H::Analytic } else { H::FiniteDifference }
+            }
+            S::Bfgs => H::BfgsApprox,
+            S::Efs => H::EfsFixedPoint,
+            S::CoordinateSearch => H::None,
+        };
+        return OuterPlan { solver: forced, hessian_source };
+    }
 
     match (cap.gradient, cap.hessian) {
         (Analytic, Analytic) => OuterPlan {
@@ -358,6 +380,18 @@ impl OuterResult {
     }
 }
 
+/// Configuration for coordinate search (derivative-free optimizer).
+#[derive(Clone, Debug)]
+pub struct CoordinateSearchConfig {
+    /// Step size in log-space for probing each coordinate.
+    pub log_step: f64,
+    /// Maximum number of full passes over all coordinates.
+    pub max_coord_iters: usize,
+    /// Relative tolerance: an improvement counts only if
+    /// `new_cost < old_cost * (1 - rel_tol)`.
+    pub rel_tol: f64,
+}
+
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 pub struct OuterConfig {
@@ -376,6 +410,13 @@ pub struct OuterConfig {
     /// If provided, use this as the sole starting point (skip seed generation
     /// and screening). Useful when the caller already has a good initial rho.
     pub initial_rho: Option<Array1<f64>>,
+    /// Ordered list of degraded capabilities to try when the primary plan
+    /// fails. Each entry triggers `plan()` with the degraded capability and
+    /// a fresh solver run. Empty by default (no fallback).
+    pub fallback_sequence: Vec<OuterCapability>,
+    /// Configuration for coordinate search. Only used when `plan()` selects
+    /// `Solver::CoordinateSearch` (via fallback).
+    pub coordinate_search: Option<CoordinateSearchConfig>,
 }
 
 impl Default for OuterConfig {
@@ -388,6 +429,8 @@ impl Default for OuterConfig {
             rho_bound: 30.0,
             heuristic_lambdas: None,
             initial_rho: None,
+            fallback_sequence: Vec::new(),
+            coordinate_search: None,
         }
     }
 }
@@ -405,6 +448,8 @@ pub struct OuterResult {
     pub final_grad_norm: f64,
     /// Whether the optimizer converged to a stationary point.
     pub converged: bool,
+    /// Which plan was actually used (may differ from initial if fallback fired).
+    pub plan_used: OuterPlan,
 }
 
 /// Run the outer smoothing-parameter optimization.
@@ -417,32 +462,87 @@ pub struct OuterResult {
 /// 3. Logs the plan (so FD is never silent).
 /// 4. Generates and screens seed candidates.
 /// 5. Runs the chosen solver on each screened seed.
-/// 6. Returns the best result.
+/// 6. If all seeds fail and `fallback_sequence` is non-empty, re-plans
+///    with degraded capability and retries.
+/// 7. Returns the best result (including which plan was actually used).
 pub fn run_outer(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
 ) -> Result<OuterResult, EstimationError> {
-    use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
-    use opt::{
-        Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion,
-        NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
-    };
-
     let cap = obj.capability();
-    let the_plan = plan(&cap);
-    log_plan(context, &cap, &the_plan);
 
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
+        let the_plan = plan(&cap);
         return Ok(OuterResult {
             rho: Array1::zeros(0),
             final_value: cost,
             iterations: 0,
             final_grad_norm: 0.0,
             converged: true,
+            plan_used: the_plan,
         });
     }
+
+    // Build the ordered list of capabilities to attempt: primary first, then
+    // each entry from fallback_sequence.
+    let mut attempts: Vec<OuterCapability> = Vec::with_capacity(1 + config.fallback_sequence.len());
+    attempts.push(cap.clone());
+    for fb in &config.fallback_sequence {
+        let mut degraded = fb.clone();
+        degraded.n_params = cap.n_params;
+        attempts.push(degraded);
+    }
+
+    let mut last_error: Option<EstimationError> = None;
+
+    for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
+        let the_plan = plan(attempt_cap);
+        if attempt_idx > 0 {
+            log::info!(
+                "[OUTER] {context}: primary plan failed; falling back to {the_plan}"
+            );
+        }
+        log_plan(context, attempt_cap, &the_plan);
+
+        obj.reset();
+
+        match run_outer_with_plan(obj, config, context, attempt_cap, &the_plan) {
+            Ok(mut result) => {
+                result.plan_used = the_plan;
+                return Ok(result);
+            }
+            Err(e) => {
+                log::debug!(
+                    "[OUTER] {context}: attempt {} (plan={the_plan}) failed: {e}",
+                    attempt_idx + 1
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "all plan attempts exhausted ({context})"
+        ))
+    }))
+}
+
+/// Execute a single plan attempt (seed generation → solver loop → best result).
+fn run_outer_with_plan(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    cap: &OuterCapability,
+    the_plan: &OuterPlan,
+) -> Result<OuterResult, EstimationError> {
+    use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
+    use opt::{
+        Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion,
+        NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
+    };
 
     let seeds = if let Some(ref rho) = config.initial_rho {
         vec![rho.clone()]
@@ -554,6 +654,7 @@ pub fn run_outer(
             iterations: candidate.iterations,
             final_grad_norm,
             converged: candidate.converged,
+            plan_used: *the_plan,
         })
     };
 
@@ -586,10 +687,6 @@ pub fn run_outer(
                                         Some(h)
                                     }
                                     HessianResult::Unavailable => {
-                                        // Plan expected analytic Hessian but this
-                                        // evaluation could not produce one. Fall
-                                        // back to FD for this step rather than
-                                        // panicking.
                                         log::debug!(
                                             "[OUTER] analytic Hessian expected but unavailable; falling back to FD for this step"
                                         );
@@ -597,13 +694,10 @@ pub fn run_outer(
                                     }
                                 }
                             }
-                            HessianSource::FiniteDifference => {
-                                // Authorized FD: CachedSecondOrderObjective
-                                // constructs it from gradient. Logged in
-                                // log_plan() at the top of run_outer.
-                                None
-                            }
-                            HessianSource::BfgsApprox | HessianSource::EfsFixedPoint => None,
+                            HessianSource::FiniteDifference => None,
+                            HessianSource::BfgsApprox
+                            | HessianSource::EfsFixedPoint
+                            | HessianSource::None => None,
                         };
                         Ok((eval.cost, eval.gradient, hessian))
                     },
@@ -683,8 +777,6 @@ pub fn run_outer(
                         }
                         Ok((eval.cost, eval.gradient))
                     } else {
-                        // No analytic gradient: construct FD gradient from
-                        // eval_cost. Central differences: 2*n_params evals.
                         let cost = obj.eval_cost(rho).map_err(|e| {
                             ObjectiveEvalError::recoverable(format!("outer eval_cost failed: {e}"))
                         })?;
@@ -760,17 +852,6 @@ pub fn run_outer(
                 }
             }
             Solver::Efs => {
-                // EFS (Extended Fellner-Schall) multiplicative fixed-point loop.
-                //
-                // Each iteration:
-                //   1. Run inner P-IRLS at current rho to get InnerSolution
-                //   2. Compute EFS step from traces tr(H^{-1} A_k) and Frobenius norms
-                //   3. Apply: rho_new = rho + step (additive in log-lambda space)
-                //   4. Clamp to bounds
-                //   5. Check convergence via step norm
-                //
-                // No line search needed — the multiplicative fixed-point is
-                // guaranteed to decrease REML for penalty-like coordinates.
                 let max_efs_iter = config.max_iter;
                 let efs_tol = config.tolerance;
                 let (lo, hi) = &bounds_template;
@@ -801,18 +882,8 @@ pub fn run_outer(
                     }
                     last_cost = efs_eval.cost;
 
-                    // Runtime barrier-curvature significance check.
-                    // When monotonicity constraints impose a log-barrier, the
-                    // barrier Hessian drift A_θ^barrier = -2τ·D(β̂_θ/(β̂-l)³)
-                    // is ignored by EFS. If max_j τ/(β_j-l_j)² exceeds a
-                    // fraction of the reference Hessian diagonal, bail out
-                    // and finalize at the current rho (the caller's
-                    // finalize_candidate will re-evaluate).
                     if let Some(ref barrier_cfg) = cap.barrier_config {
                         if let Some(ref beta) = efs_eval.beta {
-                            // Use 1.0 as reference diagonal — a conservative
-                            // baseline; the actual diagonal of X'WX+S is
-                            // typically O(n) so this threshold is generous.
                             let ref_diag = 1.0;
                             let threshold = 0.01;
                             if barrier_cfg.barrier_curvature_is_significant(
@@ -827,7 +898,6 @@ pub fn run_outer(
                         }
                     }
 
-                    // Apply steps and clamp to bounds.
                     let mut step_sq_sum = 0.0_f64;
                     for i in 0..cap.n_params {
                         let step_i = if i < efs_eval.steps.len() {
@@ -861,6 +931,22 @@ pub fn run_outer(
                     converged,
                 })
             }
+            Solver::CoordinateSearch => {
+                let cs = config.coordinate_search.as_ref().ok_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "CoordinateSearch selected but no coordinate_search config provided"
+                            .to_string(),
+                    )
+                })?;
+                let (lo, hi) = &bounds_template;
+                run_coordinate_search(obj, seed, lo, hi, cs, cap.n_params)
+                    .map(|r| RawOuterCandidate {
+                        rho: r.rho,
+                        final_value: r.final_value,
+                        iterations: r.iterations,
+                        converged: true,
+                    })
+            }
         };
 
         match result.and_then(|candidate| finalize_candidate(obj, candidate)) {
@@ -889,6 +975,144 @@ pub fn run_outer(
     })
 }
 
+/// Coordinate search result: (rho, final_value, iterations, converged).
+struct CoordSearchResult {
+    rho: Array1<f64>,
+    final_value: f64,
+    iterations: usize,
+}
+
+/// Derivative-free coordinate search over bounded log-space parameters.
+///
+/// This is the `run_outer` equivalent of the former `coordinate_search_spatial`
+/// from smooth.rs. It only uses `obj.eval_cost()`.
+fn run_coordinate_search(
+    obj: &mut dyn OuterObjective,
+    seed: &Array1<f64>,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    cs: &CoordinateSearchConfig,
+    n_params: usize,
+) -> Result<CoordSearchResult, EstimationError> {
+    log::warn!(
+        "[coordinate_search] Using derivative-free coordinate search over {} parameters. \
+         This is slow — analytic REML derivatives should be wired through ext_coords instead.",
+        n_params
+    );
+
+    let mut current_theta = seed.clone();
+    let mut current_cost = obj
+        .eval_cost(&current_theta)
+        .unwrap_or(f64::INFINITY);
+    let mut total_iters = 0_usize;
+
+    for pass in 0..cs.max_coord_iters {
+        total_iters = pass + 1;
+        let mut pass_improved = false;
+
+        for coord in 0..current_theta.len() {
+            let base_value = current_theta[coord];
+            let base_cost = current_cost;
+            let left_value = (base_value - cs.log_step).max(lower[coord]);
+            let right_value = (base_value + cs.log_step).min(upper[coord]);
+
+            let left_cost = if (left_value - base_value).abs() <= 1e-12 {
+                f64::INFINITY
+            } else {
+                let mut probe = current_theta.clone();
+                probe[coord] = left_value;
+                obj.eval_cost(&probe).unwrap_or(f64::INFINITY)
+            };
+            let right_cost = if (right_value - base_value).abs() <= 1e-12 {
+                f64::INFINITY
+            } else {
+                let mut probe = current_theta.clone();
+                probe[coord] = right_value;
+                obj.eval_cost(&probe).unwrap_or(f64::INFINITY)
+            };
+
+            // Quadratic interpolation attempt.
+            if left_cost.is_finite() && right_cost.is_finite() {
+                let d_left = left_value - base_value;
+                let d_right = right_value - base_value;
+                if d_left.abs() > 1e-15 && d_right.abs() > 1e-15 && (d_left - d_right).abs() > 1e-15 {
+                    let a_left = (left_cost - base_cost) / d_left;
+                    let a_right = (right_cost - base_cost) / d_right;
+                    let curvature = (a_left - a_right) / (d_left - d_right);
+                    if curvature.is_finite() && curvature > 0.0 {
+                        let slope = a_left - curvature * d_left;
+                        let x_star = base_value - slope / (2.0 * curvature);
+                        if x_star.is_finite() {
+                            let interior = x_star.clamp(lower[coord], upper[coord]);
+                            let lo_bound = left_value.min(right_value) + 1e-12;
+                            let hi_bound = left_value.max(right_value) - 1e-12;
+                            if interior > lo_bound && interior < hi_bound {
+                                let mut probe = current_theta.clone();
+                                probe[coord] = interior;
+                                let interior_cost = obj.eval_cost(&probe).unwrap_or(f64::INFINITY);
+                                if coord_search_improves(interior_cost, current_cost, cs.rel_tol) {
+                                    current_theta[coord] = interior;
+                                    current_cost = interior_cost;
+                                    pass_improved = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Greedy extension in improving direction.
+            let (mut cand_value, mut cand_cost, direction) =
+                if coord_search_improves(left_cost, base_cost, cs.rel_tol)
+                    && left_cost <= right_cost
+                {
+                    (left_value, left_cost, -1.0_f64)
+                } else if coord_search_improves(right_cost, base_cost, cs.rel_tol) {
+                    (right_value, right_cost, 1.0_f64)
+                } else {
+                    continue;
+                };
+
+            loop {
+                let next_value = (cand_value + direction * cs.log_step)
+                    .clamp(lower[coord], upper[coord]);
+                if (next_value - cand_value).abs() <= 1e-12 {
+                    break;
+                }
+                let mut probe = current_theta.clone();
+                probe[coord] = next_value;
+                let next_cost = obj.eval_cost(&probe).unwrap_or(f64::INFINITY);
+                if !coord_search_improves(next_cost, cand_cost, cs.rel_tol) {
+                    break;
+                }
+                cand_value = next_value;
+                cand_cost = next_cost;
+            }
+
+            if coord_search_improves(cand_cost, current_cost, cs.rel_tol) {
+                current_theta[coord] = cand_value;
+                current_cost = cand_cost;
+                pass_improved = true;
+            }
+        }
+
+        if !pass_improved {
+            break;
+        }
+    }
+
+    Ok(CoordSearchResult {
+        rho: current_theta,
+        final_value: current_cost,
+        iterations: total_iters,
+    })
+}
+
+fn coord_search_improves(new_cost: f64, old_cost: f64, rel_tol: f64) -> bool {
+    new_cost.is_finite() && new_cost < old_cost * (1.0 - rel_tol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +1125,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -915,6 +1140,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::NewtonTrustRegion);
@@ -929,6 +1155,7 @@ mod tests {
             n_params: 12,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -944,6 +1171,7 @@ mod tests {
                 n_params: n,
                 all_penalty_like: false,
                 barrier_config: None,
+                force_solver: None,
             };
             let p = plan(&cap);
             assert_eq!(p.solver, Solver::Bfgs);
@@ -959,6 +1187,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -972,6 +1201,7 @@ mod tests {
             n_params: 8,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
@@ -985,6 +1215,7 @@ mod tests {
             n_params: 9,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
@@ -998,6 +1229,7 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1012,6 +1244,7 @@ mod tests {
             n_params: 5,
             all_penalty_like: true,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         // With few params and analytic gradient, FD Newton is better.
@@ -1026,6 +1259,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         // Arc is always preferred when analytic Hessian is available.
@@ -1042,6 +1276,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1064,6 +1299,7 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             barrier_config: Some(barrier),
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1085,6 +1321,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             barrier_config: Some(barrier),
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1133,6 +1370,7 @@ mod tests {
             n_params: 0,
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -1159,6 +1397,7 @@ mod tests {
                 n_params: 1,
                 all_penalty_like: false,
                 barrier_config: None,
+                force_solver: None,
             },
             cost_fn: |st: &mut i32, rho: &Array1<f64>| {
                 let _ = (*st, rho.len());

@@ -2623,6 +2623,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             // coordinates. Conservatively false.
             all_penalty_like: false,
             barrier_config: None,
+            force_solver: None,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {

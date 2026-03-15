@@ -1671,6 +1671,18 @@ fn main() {
     emit_stage_detail(&dead_pub_report);
     allviolations.extend(dead_pubviolations);
 
+    // Enforce that `use opt::` imports only appear in the strategy module
+    // (and opt_objective.rs which wraps the opt crate). All optimizer access
+    // must go through `run_outer` in strategy.rs.
+    update_stage("scan direct opt crate imports");
+    let opt_importviolations = scan_for_direct_opt_imports();
+    let opt_import_report = format!(
+        "direct opt import scan identified {} violation groups",
+        opt_importviolations.len()
+    );
+    emit_stage_detail(&opt_import_report);
+    allviolations.extend(opt_importviolations);
+
     // If any violations were found, print them all and exit with error
     if !allviolations.is_empty() {
         update_stage("report validation errors");
