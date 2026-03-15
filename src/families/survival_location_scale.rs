@@ -5,6 +5,9 @@ use crate::custom_family::{
     fit_custom_family, resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
+use crate::families::gamlss::{
+    SelectedWiggleBasis, WiggleBlockConfig, select_wiggle_basis_from_seed,
+};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
@@ -3080,6 +3083,16 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn inverse_link_supports_joint_wiggle(inverse_link: &InverseLink) -> bool {
+    matches!(
+        inverse_link,
+        InverseLink::Standard(LinkFunction::Identity)
+            | InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+    )
 }
 
 fn validate_time_block(n: usize, b: &TimeBlockInput) -> Result<(), String> {
@@ -6272,11 +6285,71 @@ fn fit_survival_location_scale(
     finalize_survival_location_scale_fit(&prepared, &fit)
 }
 
+pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
+    pilot: &SurvivalLocationScaleTermFitResult,
+    wiggle_cfg: &WiggleBlockConfig,
+    wiggle_penalty_orders: &[usize],
+) -> Result<SelectedWiggleBasis, String> {
+    let eta_threshold = pilot
+        .threshold_design
+        .design
+        .dot(&pilot.fit.beta_threshold());
+    let eta_log_sigma = pilot
+        .log_sigma_design
+        .design
+        .dot(&pilot.fit.beta_log_sigma());
+    let sigma = eta_log_sigma.mapv(f64::exp);
+    let q_seed = Array1::from_iter(
+        eta_threshold
+            .iter()
+            .zip(sigma.iter())
+            .map(|(&threshold, &scale)| -threshold / scale.max(1e-12)),
+    );
+    select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+}
+
+fn linkwiggle_block_input_from_selected_basis(
+    selected_wiggle_basis: SelectedWiggleBasis,
+) -> LinkWiggleBlockInput {
+    let crate::families::gamlss::SelectedWiggleBasis { block, .. } = selected_wiggle_basis;
+    let crate::families::gamlss::ParameterBlockInput {
+        design,
+        penalties,
+        initial_log_lambdas,
+        initial_beta,
+        ..
+    } = block;
+    LinkWiggleBlockInput {
+        design,
+        penalties,
+        initial_log_lambdas,
+        initial_beta,
+    }
+}
+
+pub(crate) fn fit_survival_location_scale_terms_with_selected_wiggle(
+    data: ndarray::ArrayView2<'_, f64>,
+    mut spec: SurvivalLocationScaleTermSpec,
+    selected_wiggle_basis: SelectedWiggleBasis,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<SurvivalLocationScaleTermFitResult, String> {
+    spec.linkwiggle_block = Some(linkwiggle_block_input_from_selected_basis(
+        selected_wiggle_basis,
+    ));
+    fit_survival_location_scale_terms(data, spec, kappa_options)
+}
+
 pub(crate) fn fit_survival_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: SurvivalLocationScaleTermSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<SurvivalLocationScaleTermFitResult, String> {
+    if spec.linkwiggle_block.is_some() && !inverse_link_supports_joint_wiggle(&spec.inverse_link) {
+        return Err(
+            "fit_survival_location_scale_terms: link wiggle does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
     let threshold_boot_design =
         build_term_collection_design(data, &spec.thresholdspec).map_err(|e| e.to_string())?;
     let log_sigma_boot_design =

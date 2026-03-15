@@ -223,6 +223,13 @@ pub struct WiggleBlockConfig {
     pub double_penalty: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct SelectedWiggleBasis {
+    pub knots: Array1<f64>,
+    pub degree: usize,
+    pub block: ParameterBlockInput,
+}
+
 impl ParameterBlockInput {
     pub fn intospec(self, name: &str) -> Result<ParameterBlockSpec, String> {
         let p = self.design.ncols();
@@ -389,6 +396,39 @@ pub fn buildwiggle_block_input_from_seed(
     Ok((block, knots))
 }
 
+fn append_selected_wiggle_penalty_orders(
+    block: &mut ParameterBlockInput,
+    penalty_orders: &[usize],
+) -> Result<(), String> {
+    let p = block.design.ncols();
+    if p == 0 {
+        return Ok(());
+    }
+    for &order in penalty_orders {
+        if order <= 1 || order >= p {
+            continue;
+        }
+        let penalty =
+            create_difference_penalty_matrix(p, order, None).map_err(|e| e.to_string())?;
+        block.penalties.push(penalty);
+    }
+    Ok(())
+}
+
+pub(crate) fn select_wiggle_basis_from_seed(
+    seed: ArrayView1<'_, f64>,
+    cfg: &WiggleBlockConfig,
+    penalty_orders: &[usize],
+) -> Result<SelectedWiggleBasis, String> {
+    let (mut block, knots) = buildwiggle_block_input_from_seed(seed, cfg)?;
+    append_selected_wiggle_penalty_orders(&mut block, penalty_orders)?;
+    Ok(SelectedWiggleBasis {
+        knots,
+        degree: cfg.degree,
+        block,
+    })
+}
+
 fn validate_blockrows(name: &str, n: usize, block: &ParameterBlockInput) -> Result<(), String> {
     validate_len_match(
         &format!("block '{name}' offset vs response"),
@@ -465,6 +505,15 @@ fn validate_binomial_location_scale_termspec(
     Ok(())
 }
 
+fn inverse_link_supports_joint_wiggle(link_kind: &InverseLink) -> bool {
+    matches!(
+        link_kind,
+        InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+    )
+}
+
 fn validate_binomial_location_scalewiggle_termspec(
     data: ndarray::ArrayView2<'_, f64>,
     spec: &BinomialLocationScaleWiggleTermSpec,
@@ -474,6 +523,11 @@ fn validate_binomial_location_scalewiggle_termspec(
     validate_term_weights(data, n, &spec.weights, context)?;
     validate_binomial_response(&spec.y, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
+    if !inverse_link_supports_joint_wiggle(&spec.link_kind) {
+        return Err(format!(
+            "{context}: link wiggle does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+        ));
+    }
     if spec.wiggle_degree < 1 {
         return Err(format!(
             "{context}: wiggle_degree must be >= 1, got {}",
@@ -1487,6 +1541,12 @@ fn fit_binomial_mean_wiggle(
     ) {
         return Err("fit_binomial_mean_wiggle does not support identity link".to_string());
     }
+    if !inverse_link_supports_joint_wiggle(&spec.link_kind) {
+        return Err(
+            "fit_binomial_mean_wiggle does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
     if spec.wiggle_degree < 1 {
         return Err(format!(
             "fit_binomial_mean_wiggle: wiggle_degree must be >= 1, got {}",
@@ -2329,43 +2389,33 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
     )
 }
 
-pub(crate) fn fit_gaussian_location_scalewiggle_terms_auto(
-    data: ndarray::ArrayView2<'_, f64>,
-    spec: GaussianLocationScaleTermSpec,
-    wiggle_cfg: WiggleBlockConfig,
+pub(crate) fn select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+    pilot: &BlockwiseTermFitResult,
+    wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
-    options: &BlockwiseFitOptions,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermWiggleFitResult, String> {
-    let pilot = fit_gaussian_location_scale_terms(
-        data,
-        GaussianLocationScaleTermSpec {
-            y: spec.y.clone(),
-            weights: spec.weights.clone(),
-            meanspec: spec.meanspec.clone(),
-            log_sigmaspec: spec.log_sigmaspec.clone(),
-        },
-        options,
-        kappa_options,
-    )?;
-
+) -> Result<SelectedWiggleBasis, String> {
     let q_seed = pilot
         .fit
         .block_states
         .first()
         .ok_or_else(|| "pilot Gaussian wiggle fit is missing mean block".to_string())?
         .eta
-        .clone();
-    let (mut wiggle_block, wiggle_knots) =
-        buildwiggle_block_input_from_seed(q_seed.view(), &wiggle_cfg)?;
-    let pw = wiggle_block.design.ncols();
-    for &ord in wiggle_penalty_orders {
-        if ord <= 1 || ord >= pw {
-            continue;
-        }
-        let s = create_difference_penalty_matrix(pw, ord, None).map_err(|e| e.to_string())?;
-        wiggle_block.penalties.push(s);
-    }
+        .view();
+    select_wiggle_basis_from_seed(q_seed, wiggle_cfg, wiggle_penalty_orders)
+}
+
+pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: GaussianLocationScaleTermSpec,
+    selected_wiggle_basis: SelectedWiggleBasis,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BlockwiseTermWiggleFitResult, String> {
+    let SelectedWiggleBasis {
+        knots: wiggle_knots,
+        degree: wiggle_degree,
+        block: wiggle_block,
+    } = selected_wiggle_basis;
     let solved = fit_gaussian_location_scalewiggle_terms(
         data,
         GaussianLocationScaleWiggleTermSpec {
@@ -2374,7 +2424,7 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms_auto(
             meanspec: spec.meanspec,
             log_sigmaspec: spec.log_sigmaspec,
             wiggle_knots: wiggle_knots.clone(),
-            wiggle_degree: wiggle_cfg.degree,
+            wiggle_degree,
             wiggle_block,
         },
         options,
@@ -2384,7 +2434,7 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms_auto(
     BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
         fit: solved,
         wiggle_knots,
-        wiggle_degree: wiggle_cfg.degree,
+        wiggle_degree,
     })
 }
 
@@ -2437,27 +2487,11 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms(
     )
 }
 
-pub(crate) fn fit_binomial_location_scalewiggle_terms_auto(
-    data: ndarray::ArrayView2<'_, f64>,
-    spec: BinomialLocationScaleTermSpec,
-    wiggle_cfg: WiggleBlockConfig,
+pub(crate) fn select_binomial_location_scale_link_wiggle_basis_from_pilot(
+    pilot: &BlockwiseTermFitResult,
+    wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
-    options: &BlockwiseFitOptions,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermWiggleFitResult, String> {
-    let pilot = fit_binomial_location_scale_terms(
-        data,
-        BinomialLocationScaleTermSpec {
-            y: spec.y.clone(),
-            weights: spec.weights.clone(),
-            link_kind: spec.link_kind.clone(),
-            thresholdspec: spec.thresholdspec.clone(),
-            log_sigmaspec: spec.log_sigmaspec.clone(),
-        },
-        options,
-        kappa_options,
-    )?;
-
+) -> Result<SelectedWiggleBasis, String> {
     let eta_t = pilot
         .fit
         .block_states
@@ -2479,17 +2513,21 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms_auto(
             .zip(sigma.iter())
             .map(|(&t, &s)| -t / s.max(1e-12)),
     );
+    select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+}
 
-    let (mut wiggle_block, wiggle_knots) =
-        buildwiggle_block_input_from_seed(q_seed.view(), &wiggle_cfg)?;
-    let pw = wiggle_block.design.ncols();
-    for &ord in wiggle_penalty_orders {
-        if ord <= 1 || ord >= pw {
-            continue;
-        }
-        let s = create_difference_penalty_matrix(pw, ord, None).map_err(|e| e.to_string())?;
-        wiggle_block.penalties.push(s);
-    }
+pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleTermSpec,
+    selected_wiggle_basis: SelectedWiggleBasis,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BlockwiseTermWiggleFitResult, String> {
+    let SelectedWiggleBasis {
+        knots: wiggle_knots,
+        degree: wiggle_degree,
+        block: wiggle_block,
+    } = selected_wiggle_basis;
     let solved = fit_binomial_location_scalewiggle_terms(
         data,
         BinomialLocationScaleWiggleTermSpec {
@@ -2499,7 +2537,7 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms_auto(
             thresholdspec: spec.thresholdspec,
             log_sigmaspec: spec.log_sigmaspec,
             wiggle_knots: wiggle_knots.clone(),
-            wiggle_degree: wiggle_cfg.degree,
+            wiggle_degree,
             wiggle_block,
         },
         options,
@@ -2509,11 +2547,21 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms_auto(
     BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
         fit: solved,
         wiggle_knots,
-        wiggle_degree: wiggle_cfg.degree,
+        wiggle_degree,
     })
 }
 
-pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
+pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
+    pilot_design: &TermCollectionDesign,
+    pilot_fit: &UnifiedFitResult,
+    wiggle_cfg: &WiggleBlockConfig,
+    wiggle_penalty_orders: &[usize],
+) -> Result<SelectedWiggleBasis, String> {
+    let q_seed = pilot_design.design.dot(&pilot_fit.beta);
+    select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+}
+
+pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     data: ndarray::ArrayView2<'_, f64>,
     pilot_spec: &TermCollectionSpec,
     pilot_design: &TermCollectionDesign,
@@ -2521,8 +2569,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
     y: &Array1<f64>,
     weights: &Array1<f64>,
     link_kind: InverseLink,
-    wiggle_cfg: WiggleBlockConfig,
-    wiggle_penalty_orders: &[usize],
+    selected_wiggle_basis: SelectedWiggleBasis,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BinomialMeanWiggleTermFitResult, String> {
@@ -2532,21 +2579,15 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
         data,
         y.len(),
         weights,
-        "fit_binomial_mean_wiggle_terms_auto_from_pilot",
+        "fit_binomial_mean_wiggle_terms_with_selected_basis",
     )?;
-    validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_auto_from_pilot")?;
+    validate_binomial_response(y, "fit_binomial_mean_wiggle_terms_with_selected_basis")?;
 
-    let q_seed = pilot_design.design.dot(&pilot_fit.beta);
-    let (mut wiggle_block, wiggle_knots) =
-        buildwiggle_block_input_from_seed(q_seed.view(), &wiggle_cfg)?;
-    let pw = wiggle_block.design.ncols();
-    for &ord in wiggle_penalty_orders {
-        if ord <= 1 || ord >= pw {
-            continue;
-        }
-        let s = create_difference_penalty_matrix(pw, ord, None).map_err(|e| e.to_string())?;
-        wiggle_block.penalties.push(s);
-    }
+    let SelectedWiggleBasis {
+        knots: wiggle_knots,
+        degree: wiggle_degree,
+        block: wiggle_block,
+    } = selected_wiggle_basis;
 
     let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
     if spatial_terms.is_empty() {
@@ -2556,7 +2597,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
                 weights: weights.clone(),
                 link_kind,
                 wiggle_knots: wiggle_knots.clone(),
-                wiggle_degree: wiggle_cfg.degree,
+                wiggle_degree,
                 eta_block: ParameterBlockInput {
                     design: DesignMatrix::Dense(pilot_design.design.clone()),
                     offset: Array1::zeros(y.len()),
@@ -2573,7 +2614,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             resolvedspec: pilot_spec.clone(),
             design: pilot_design.clone(),
             wiggle_knots,
-            wiggle_degree: wiggle_cfg.degree,
+            wiggle_degree,
         });
     }
 
@@ -2674,7 +2715,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             weights: weights_cloned.clone(),
             link_kind: link_kind_cloned.clone(),
             wiggle_knots: wiggle_knots_cloned.clone(),
-            wiggle_degree: wiggle_cfg.degree,
+            wiggle_degree,
         };
         let eval = evaluate_custom_family_joint_hyper(
             &family,
@@ -2826,7 +2867,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
             weights: weights_cloned,
             link_kind: link_kind_cloned,
             wiggle_knots: wiggle_knots.clone(),
-            wiggle_degree: wiggle_cfg.degree,
+            wiggle_degree,
             eta_block: ParameterBlockInput {
                 design: DesignMatrix::Dense(design.design.clone()),
                 offset: Array1::zeros(y.len()),
@@ -2852,7 +2893,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_auto_from_pilot(
         resolvedspec,
         design,
         wiggle_knots,
-        wiggle_degree: wiggle_cfg.degree,
+        wiggle_degree,
     })
 }
 
@@ -7562,7 +7603,11 @@ impl BinomialMeanWiggleFamily {
             return Ok(0.0);
         }
         Ok(binomial_neglog_q_fourth_derivative_closed_form_dispatch(
-            y, weight, q, mu_clamped, &self.link_kind,
+            y,
+            weight,
+            q,
+            mu_clamped,
+            &self.link_kind,
         ))
     }
 
@@ -8085,14 +8130,12 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             // quantities are: dq_a/du = a_u, dq_b/du = a_u (since q_a = q_b = a),
             // dq_ab/du = b_u (since q_ab = b), and analogously for v.
             coeff_eta[row] = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4,
-                q_u, q_v, q_uv,
-                a, a, b,         // q_a, q_b, q_ab
-                a_u, a_v,        // dq_a_u, dq_a_v
-                a_u, a_v,        // dq_b_u, dq_b_v  (q_b = a so same perturbation)
-                a_uv, a_uv,     // d2q_a_uv, d2q_b_uv
-                b_u, b_v,        // dq_ab_u, dq_ab_v  (q_ab = b)
-                b_uv,            // d2q_ab_uv
+                m1, m2, m3, m4, q_u, q_v, q_uv, a, a, b, // q_a, q_b, q_ab
+                a_u, a_v, // dq_a_u, dq_a_v
+                a_u, a_v, // dq_b_u, dq_b_v  (q_b = a so same perturbation)
+                a_uv, a_uv, // d2q_a_uv, d2q_b_uv
+                b_u, b_v,  // dq_ab_u, dq_ab_v  (q_ab = b)
+                b_uv, // d2q_ab_uv
             );
 
             // ── eta-w block coefficients ──
@@ -8100,9 +8143,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             // matrix tier (B, B', B'', B''') the coefficient multiplies.
 
             // d²(m2·a)/dudv
-            let d2_c_b = m4 * q_u * q_v * a
-                + m3 * (q_uv * a + q_u * a_v + q_v * a_u)
-                + m2 * a_uv;
+            let d2_c_b = m4 * q_u * q_v * a + m3 * (q_uv * a + q_u * a_v + q_v * a_u) + m2 * a_uv;
             // d(m2·a)/du and d(m2·a)/dv
             let dc_b_u = m3 * q_u * a + m2 * a_u;
             let dc_b_v = m3 * q_v * a + m2 * a_v;
@@ -8116,9 +8157,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 
             coeff_etaw_b[row] = d2_c_b;
             coeff_etaw_d1[row] = dc_b_u * xi_v[row] + dc_b_v * xi_u[row] + d2_c_b1;
-            coeff_etaw_d2[row] = c_b_static * xi_u[row] * xi_v[row]
-                + dc_b1_u * xi_v[row]
-                + dc_b1_v * xi_u[row];
+            coeff_etaw_d2[row] =
+                c_b_static * xi_u[row] * xi_v[row] + dc_b1_u * xi_v[row] + dc_b1_v * xi_u[row];
             coeff_etaw_d3[row] = m1 * xi_u[row] * xi_v[row];
 
             // ── w-w block coefficients ──

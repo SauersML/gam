@@ -264,6 +264,14 @@ pub struct SavedLinkWiggleRuntime {
     pub beta: Vec<f64>,
 }
 
+fn saved_link_name_disallows_wiggle(link_name: &str) -> bool {
+    let link_name = link_name.trim().to_ascii_lowercase();
+    link_name == "sas"
+        || link_name == "beta-logistic"
+        || link_name.starts_with("blended(")
+        || link_name.starts_with("mixture(")
+}
+
 impl FittedFamily {
     #[inline]
     pub fn likelihood(&self) -> LikelihoodFamily {
@@ -411,6 +419,14 @@ impl FittedModel {
                 )
             }
         };
+        if let Some(link_name) = payload.link.as_deref()
+            && saved_link_name_disallows_wiggle(link_name)
+        {
+            return Err(
+                "link wiggle does not support SAS/BetaLogistic/Mixture links; refit without wiggle or with a jointly fitted standard link"
+                    .to_string(),
+            );
+        }
         let beta = match self.predict_model_class() {
             PredictModelClass::Standard => {
                 if payload.beta_link_wiggle.is_some() {

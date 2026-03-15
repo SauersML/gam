@@ -1,17 +1,20 @@
-use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::BlockwiseFitOptions;
 use crate::estimate::{EstimationError, FitOptions, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
     BlockwiseTermFitResultParts, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
-    ParameterBlockInput, WiggleBlockConfig, buildwiggle_block_input_from_seed,
-    fit_binomial_location_scale_terms, fit_binomial_location_scalewiggle_terms_auto,
-    fit_binomial_mean_wiggle_terms_auto_from_pilot, fit_gaussian_location_scale_terms,
-    fit_gaussian_location_scalewiggle_terms_auto,
+    WiggleBlockConfig, fit_binomial_location_scale_terms,
+    fit_binomial_location_scale_terms_with_selected_wiggle,
+    fit_binomial_mean_wiggle_terms_with_selected_basis, fit_gaussian_location_scale_terms,
+    fit_gaussian_location_scale_terms_with_selected_wiggle,
+    select_binomial_location_scale_link_wiggle_basis_from_pilot,
+    select_binomial_mean_link_wiggle_basis_from_pilot,
+    select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 use crate::families::survival_location_scale::{
-    LinkWiggleBlockInput, SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
-    fit_survival_location_scale_terms,
+    SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
+    fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
+    select_survival_link_wiggle_basis_from_pilot,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
@@ -106,36 +109,32 @@ pub enum FitResult {
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
 }
 
-fn augment_wiggle_penalties(
-    block: &mut ParameterBlockInput,
-    penalty_orders: &[usize],
-) -> Result<(), String> {
-    let p = block.design.ncols();
-    if p == 0 {
-        return Ok(());
-    }
-    for &order in penalty_orders {
-        if order <= 1 || order >= p {
-            continue;
-        }
-        let penalty =
-            create_difference_penalty_matrix(p, order, None).map_err(|e| e.to_string())?;
-        block.penalties.push(penalty);
-    }
-    Ok(())
-}
-
 fn resolved_wiggle_inverse_link(
     family: LikelihoodFamily,
     fit: &UnifiedFitResult,
     fallback: &InverseLink,
 ) -> Result<InverseLink, String> {
-    match fit.fitted_link_state(family).map_err(|e| e.to_string())? {
-        FittedLinkState::Standard(Some(link)) => Ok(InverseLink::Standard(link)),
-        FittedLinkState::Standard(None) => Ok(fallback.clone()),
-        FittedLinkState::Sas { state, .. } => Ok(InverseLink::Sas(state)),
-        FittedLinkState::BetaLogistic { state, .. } => Ok(InverseLink::BetaLogistic(state)),
-        FittedLinkState::Mixture { state, .. } => Ok(InverseLink::Mixture(state)),
+    let resolved = match fit.fitted_link_state(family).map_err(|e| e.to_string())? {
+        FittedLinkState::Standard(Some(link)) => InverseLink::Standard(link),
+        FittedLinkState::Standard(None) => fallback.clone(),
+        FittedLinkState::Sas { state, .. } => InverseLink::Sas(state),
+        FittedLinkState::BetaLogistic { state, .. } => InverseLink::BetaLogistic(state),
+        FittedLinkState::Mixture { state, .. } => InverseLink::Mixture(state),
+    };
+    ensure_joint_wiggle_supported(&resolved, "standard link wiggle")?;
+    Ok(resolved)
+}
+
+fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<(), String> {
+    match link {
+        InverseLink::Standard(crate::types::LinkFunction::Sas)
+        | InverseLink::Standard(crate::types::LinkFunction::BetaLogistic)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => Err(format!(
+            "{context} does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+        )),
+        InverseLink::Standard(_) => Ok(()),
     }
 }
 
@@ -170,8 +169,19 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         .ok_or_else(|| "standard wiggle workflow requires blockwise wiggle options".to_string())?;
     let wiggle_link_kind =
         resolved_wiggle_inverse_link(request.family, &result.fit, &wiggle.link_kind)?;
+    let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
+        &result.design,
+        &result.fit,
+        &WiggleBlockConfig {
+            degree: wiggle.wiggle.degree,
+            num_internal_knots: wiggle.wiggle.num_internal_knots,
+            penalty_order: 2,
+            double_penalty: wiggle.wiggle.double_penalty,
+        },
+        &wiggle.wiggle.penalty_orders,
+    )?;
 
-    let solved = fit_binomial_mean_wiggle_terms_auto_from_pilot(
+    let solved = fit_binomial_mean_wiggle_terms_with_selected_basis(
         request.data,
         &result.resolvedspec,
         &result.design,
@@ -179,13 +189,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         &request.y,
         &request.weights,
         wiggle_link_kind,
-        WiggleBlockConfig {
-            degree: wiggle.wiggle.degree,
-            num_internal_knots: wiggle.wiggle.num_internal_knots,
-            penalty_order: 2,
-            double_penalty: wiggle.wiggle.double_penalty,
-        },
-        &wiggle.wiggle.penalty_orders,
+        selected_wiggle_basis,
         &wiggle_options,
         &request.kappa_options,
     )?;
@@ -205,16 +209,31 @@ fn fit_gaussian_location_scale_model(
     request: GaussianLocationScaleFitRequest<'_>,
 ) -> Result<GaussianLocationScaleFitResult, String> {
     if let Some(wiggle_cfg) = request.wiggle {
-        let solved = fit_gaussian_location_scalewiggle_terms_auto(
+        let pilot = fit_gaussian_location_scale_terms(
             request.data,
-            request.spec,
-            WiggleBlockConfig {
+            GaussianLocationScaleTermSpec {
+                y: request.spec.y.clone(),
+                weights: request.spec.weights.clone(),
+                meanspec: request.spec.meanspec.clone(),
+                log_sigmaspec: request.spec.log_sigmaspec.clone(),
+            },
+            &request.options,
+            &request.kappa_options,
+        )?;
+        let selected_wiggle_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+            &pilot,
+            &WiggleBlockConfig {
                 degree: wiggle_cfg.degree,
                 num_internal_knots: wiggle_cfg.num_internal_knots,
                 penalty_order: 2,
                 double_penalty: wiggle_cfg.double_penalty,
             },
             &wiggle_cfg.penalty_orders,
+        )?;
+        let solved = fit_gaussian_location_scale_terms_with_selected_wiggle(
+            request.data,
+            request.spec,
+            selected_wiggle_basis,
             &request.options,
             &request.kappa_options,
         )?;
@@ -252,16 +271,36 @@ fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
 ) -> Result<BinomialLocationScaleFitResult, String> {
     if let Some(wiggle_cfg) = request.wiggle {
-        let solved = fit_binomial_location_scalewiggle_terms_auto(
+        ensure_joint_wiggle_supported(
+            &request.spec.link_kind,
+            "binomial location-scale link wiggle",
+        )?;
+        let pilot = fit_binomial_location_scale_terms(
             request.data,
-            request.spec,
-            WiggleBlockConfig {
+            BinomialLocationScaleTermSpec {
+                y: request.spec.y.clone(),
+                weights: request.spec.weights.clone(),
+                link_kind: request.spec.link_kind.clone(),
+                thresholdspec: request.spec.thresholdspec.clone(),
+                log_sigmaspec: request.spec.log_sigmaspec.clone(),
+            },
+            &request.options,
+            &request.kappa_options,
+        )?;
+        let selected_wiggle_basis = select_binomial_location_scale_link_wiggle_basis_from_pilot(
+            &pilot,
+            &WiggleBlockConfig {
                 degree: wiggle_cfg.degree,
                 num_internal_knots: wiggle_cfg.num_internal_knots,
                 penalty_order: 2,
                 double_penalty: wiggle_cfg.double_penalty,
             },
             &wiggle_cfg.penalty_orders,
+        )?;
+        let solved = fit_binomial_location_scale_terms_with_selected_wiggle(
+            request.data,
+            request.spec,
+            selected_wiggle_basis,
             &request.options,
             &request.kappa_options,
         )?;
@@ -315,46 +354,28 @@ fn fit_survival_location_scale_model(
         let mut wiggle_degree = None;
 
         let fit = if let Some(wiggle) = wiggle {
+            ensure_joint_wiggle_supported(&spec.inverse_link, "survival link wiggle")?;
             let mut pilot_spec = spec.clone();
             pilot_spec.linkwiggle_block = None;
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;
-            let eta_threshold = pilot
-                .threshold_design
-                .design
-                .dot(&pilot.fit.beta_threshold());
-            let eta_log_sigma = pilot
-                .log_sigma_design
-                .design
-                .dot(&pilot.fit.beta_log_sigma());
-            let sigma = eta_log_sigma.mapv(f64::exp);
-            let q_seed = Array1::from_iter(
-                eta_threshold
-                    .iter()
-                    .zip(sigma.iter())
-                    .map(|(&threshold, &scale)| -threshold / scale.max(1e-12)),
-            );
-            let (mut wiggle_block, knots) = buildwiggle_block_input_from_seed(
-                q_seed.view(),
+            let selected_wiggle_basis = select_survival_link_wiggle_basis_from_pilot(
+                &pilot,
                 &WiggleBlockConfig {
                     degree: wiggle.degree,
                     num_internal_knots: wiggle.num_internal_knots,
                     penalty_order: 2,
                     double_penalty: wiggle.double_penalty,
                 },
+                &wiggle.penalty_orders,
             )?;
-            augment_wiggle_penalties(&mut wiggle_block, &wiggle.penalty_orders)?;
-            wiggle_knots = Some(knots);
-            wiggle_degree = Some(wiggle.degree);
-            let inverse_link = spec.inverse_link.clone();
-            let mut wiggle_spec = spec;
-            wiggle_spec.inverse_link = inverse_link;
-            wiggle_spec.linkwiggle_block = Some(LinkWiggleBlockInput {
-                design: wiggle_block.design,
-                penalties: wiggle_block.penalties,
-                initial_log_lambdas: wiggle_block.initial_log_lambdas,
-                initial_beta: wiggle_block.initial_beta,
-            });
-            fit_survival_location_scale_terms(data, wiggle_spec, kappa_options)?
+            wiggle_knots = Some(selected_wiggle_basis.knots.clone());
+            wiggle_degree = Some(selected_wiggle_basis.degree);
+            fit_survival_location_scale_terms_with_selected_wiggle(
+                data,
+                spec,
+                selected_wiggle_basis,
+                kappa_options,
+            )?
         } else {
             fit_survival_location_scale_terms(data, spec, kappa_options)?
         };
