@@ -1759,9 +1759,8 @@ fn main() {
     emit_stage_detail(&dead_pub_report);
     allviolations.extend(dead_pubviolations);
 
-    // Enforce that `use opt::` imports only appear in the strategy module
-    // (and opt_objective.rs which wraps the opt crate). All optimizer access
-    // must go through `run_outer` in strategy.rs.
+    // Enforce that `use opt::` imports only appear in the strategy module.
+    // All optimizer access must go through `run_outer` in strategy.rs.
     update_stage("scan direct opt crate imports");
     let opt_importviolations = scan_for_direct_opt_imports();
     let opt_import_report = format!(
@@ -6107,10 +6106,10 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
     allviolations
 }
 
-/// Enforce that `use opt::` imports only appear in strategy.rs and opt_objective.rs.
+/// Enforce that `use opt::` imports only appear in strategy.rs.
 /// All optimizer access must go through `run_outer` in strategy.rs.
 fn scan_for_direct_opt_imports() -> Vec<String> {
-    let allowed_files: &[&str] = &["src/solver/strategy.rs", "src/solver/opt_objective.rs"];
+    let allowed_files: &[&str] = &["src/solver/strategy.rs"];
     let mut allviolations = Vec::new();
 
     for entry in WalkDir::new("src")

@@ -10,18 +10,28 @@
 //! Finite-difference Hessian fallback is _never_ silent. If a path cannot
 //! provide an analytic Hessian, that fact is visible in its
 //! [`OuterCapability`] declaration and in the resulting [`OuterPlan`].
-//! The previous pattern of returning `None` from a closure and letting
-//! `CachedSecondOrderObjective` silently FD is what this module replaces.
+//! The runner passes Hessian availability through to `opt`, which performs
+//! the finite-difference fill internally when the selected plan requires it.
 
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ndarray::{Array1, Array2};
+use opt::{
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FiniteDiffGradient,
+    FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
+    FixedPointSample, FixedPointStatus, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError,
+    ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution, Tolerance,
+    ZerothOrderObjective,
+};
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Derivative {
     /// Exact analytic derivative implemented and available.
     Analytic,
+    /// Derivative is available only via finite differences computed inside
+    /// `opt` from a lower-order objective interface.
+    FiniteDifference,
     /// No analytic derivative; must be approximated or skipped.
     Unavailable,
 }
@@ -52,9 +62,6 @@ pub struct OuterCapability {
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
-    /// When set, `plan()` bypasses its normal selection logic and returns the
-    /// specified solver directly.
-    pub force_solver: Option<Solver>,
 }
 
 /// Which solver algorithm to use for the outer optimization.
@@ -114,29 +121,15 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
     use HessianSource as H;
     use Solver as S;
 
-    if let Some(forced) = cap.force_solver {
-        let hessian_source = match forced {
-            S::Arc => H::Analytic,
-            S::NewtonTrustRegion => {
-                if cap.hessian == Analytic {
-                    H::Analytic
-                } else {
-                    H::FiniteDifference
-                }
-            }
-            S::Bfgs => H::BfgsApprox,
-            S::Efs => H::EfsFixedPoint,
-        };
-        return OuterPlan {
-            solver: forced,
-            hessian_source,
-        };
-    }
-
     match (cap.gradient, cap.hessian) {
         (Analytic, Analytic) => OuterPlan {
             solver: S::Arc,
             hessian_source: H::Analytic,
+        },
+
+        (Analytic, FiniteDifference) => OuterPlan {
+            solver: S::NewtonTrustRegion,
+            hessian_source: H::FiniteDifference,
         },
 
         // With few params, FD Hessian from analytic gradient is tolerable:
@@ -155,7 +148,11 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // a quantitative check each step via `barrier_curvature_is_significant`
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
-        (_, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
+        (Analytic, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
+            solver: S::Efs,
+            hessian_source: H::EfsFixedPoint,
+        },
+        (Unavailable, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
             solver: S::Efs,
             hessian_source: H::EfsFixedPoint,
         },
@@ -166,8 +163,13 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::BfgsApprox,
         },
 
-        // No analytic gradient: gradient-free methods or FD gradient + BFGS.
-        // Either way the optimizer only gets first-order (possibly FD) info.
+        (FiniteDifference, _) => OuterPlan {
+            solver: S::Bfgs,
+            hessian_source: H::BfgsApprox,
+        },
+
+        // No declared gradient: the runner will still approximate one from
+        // `eval_cost()` when BFGS is the only viable non-EFS strategy.
         (Unavailable, _) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
@@ -187,13 +189,17 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         }
         _ => String::new(),
     };
+    let grad_warning = match cap.gradient {
+        Derivative::FiniteDifference => " [FD gradient from cost-only objective]",
+        _ => "",
+    };
     let barrier_note = if cap.barrier_config.is_some() && cap.all_penalty_like && cap.n_params > 8 {
         " [EFS with runtime barrier-curvature guard]"
     } else {
         ""
     };
     log::info!(
-        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}{barrier_note}",
+        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{grad_warning}{hess_warning}{barrier_note}",
         cap.n_params,
         cap.gradient,
         cap.hessian,
@@ -211,6 +217,21 @@ pub struct OuterEval {
     pub cost: f64,
     pub gradient: Array1<f64>,
     pub hessian: HessianResult,
+}
+
+impl OuterEval {
+    /// Conventional representation of an infeasible trial point.
+    ///
+    /// `opt` translates the non-finite objective into a recoverable trial
+    /// failure so trust-region/line-search solvers retreat without the caller
+    /// needing to special-case infeasible regions locally.
+    pub fn infeasible(n_params: usize) -> Self {
+        Self {
+            cost: f64::INFINITY,
+            gradient: Array1::zeros(n_params),
+            hessian: HessianResult::Unavailable,
+        }
+    }
 }
 
 /// Explicit Hessian result replacing `Option<Array2<f64>>`.
@@ -242,7 +263,7 @@ impl HessianResult {
         matches!(self, HessianResult::Analytic(_))
     }
 
-    /// Convert to `Option<Array2<f64>>` for interop with legacy code.
+    /// Convert to the optional Hessian shape used by the opt bridge.
     pub fn into_option(self) -> Option<Array2<f64>> {
         match self {
             HessianResult::Analytic(h) => Some(h),
@@ -274,15 +295,20 @@ pub struct EfsEval {
 ///
 /// Every model path that optimizes smoothing parameters implements this trait.
 /// The runner function consumes it and handles solver selection,
-/// multi-start, FD Hessian construction, and logging.
+/// multi-start, and logging while delegating derivative fallback policy to
+/// `opt`.
 ///
 /// # Contract
 ///
 /// - `capability()` must be stable (same result across calls).
-/// - If `capability().hessian == Analytic`, then `eval()` must return
-///   `HessianResult::Analytic(_)`.
-/// - If `capability().hessian == Unavailable`, then `eval()` must return
-///   `HessianResult::Unavailable`. The runner handles FD or BFGS.
+/// - `eval()` may return `HessianResult::Unavailable` at individual trial
+///   points even when `capability().hessian == Analytic`; `opt` degrades that
+///   step to an FD Hessian instead of requiring the objective to fake a stale
+///   or non-finite Hessian.
+/// - Use `eval_cost()` / `OuterEval::infeasible()` for infeasible trial points.
+///   Return `Err(...)` for genuine evaluation breakdowns so the runner can mark
+///   the step as a recoverable solver failure and escalate to the next declared
+///   fallback plan if the full attempt still fails.
 /// - `eval_cost()` is used for seed screening (cheap, no gradient needed).
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
 /// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
@@ -372,8 +398,156 @@ where
     }
 }
 
+fn into_objective_error(context: &str, err: EstimationError) -> ObjectiveEvalError {
+    ObjectiveEvalError::recoverable(format!("{context}: {err}"))
+}
+
+struct OuterCostBridge<'a> {
+    obj: &'a mut dyn OuterObjective,
+}
+
+impl ZerothOrderObjective for OuterCostBridge<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.obj
+            .eval_cost(x)
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+    }
+}
+
+struct OuterFirstOrderBridge<'a> {
+    obj: &'a mut dyn OuterObjective,
+}
+
+impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.obj
+            .eval_cost(x)
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+    }
+}
+
+impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
+    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        let eval = self
+            .obj
+            .eval(x)
+            .map_err(|err| into_objective_error("outer eval failed", err))?;
+        Ok(FirstOrderSample {
+            value: eval.cost,
+            gradient: eval.gradient,
+        })
+    }
+}
+
+struct OuterSecondOrderBridge<'a> {
+    obj: &'a mut dyn OuterObjective,
+    hessian_source: HessianSource,
+}
+
+impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.obj
+            .eval_cost(x)
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+    }
+}
+
+impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
+    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        let eval = self
+            .obj
+            .eval(x)
+            .map_err(|err| into_objective_error("outer eval failed", err))?;
+        Ok(FirstOrderSample {
+            value: eval.cost,
+            gradient: eval.gradient,
+        })
+    }
+}
+
+impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
+    fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
+        let eval = self
+            .obj
+            .eval(x)
+            .map_err(|err| into_objective_error("outer eval failed", err))?;
+        let hessian = match self.hessian_source {
+            HessianSource::Analytic => eval.hessian.into_option(),
+            HessianSource::FiniteDifference
+            | HessianSource::BfgsApprox
+            | HessianSource::EfsFixedPoint => None,
+        };
+        Ok(SecondOrderSample {
+            value: eval.cost,
+            gradient: eval.gradient,
+            hessian,
+        })
+    }
+}
+
+struct OuterFixedPointBridge<'a> {
+    obj: &'a mut dyn OuterObjective,
+    barrier_config: Option<BarrierConfig>,
+}
+
+impl FixedPointObjective for OuterFixedPointBridge<'_> {
+    fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
+        let eval = self
+            .obj
+            .eval_efs(x)
+            .map_err(|err| into_objective_error("outer EFS eval failed", err))?;
+        let status = if let Some(ref barrier_cfg) = self.barrier_config {
+            if let Some(ref beta) = eval.beta {
+                let ref_diag = 1.0;
+                let threshold = 0.01;
+                if barrier_cfg.barrier_curvature_is_significant(beta, ref_diag, threshold) {
+                    FixedPointStatus::Stop
+                } else {
+                    FixedPointStatus::Continue
+                }
+            } else {
+                FixedPointStatus::Continue
+            }
+        } else {
+            FixedPointStatus::Continue
+        };
+        let step = if matches!(status, FixedPointStatus::Stop) {
+            Array1::zeros(x.len())
+        } else {
+            Array1::from_vec(eval.steps)
+        };
+        Ok(FixedPointSample {
+            value: eval.cost,
+            step,
+            status,
+        })
+    }
+}
+
+fn solution_into_outer_result(
+    solution: Solution,
+    converged: bool,
+    plan_used: OuterPlan,
+) -> OuterResult {
+    let final_grad_norm = solution
+        .final_gradient_norm
+        .or(solution.final_step_norm)
+        .unwrap_or(0.0);
+    OuterResult {
+        rho: solution.final_point,
+        final_value: solution.final_value,
+        iterations: solution.iterations,
+        final_grad_norm,
+        final_gradient: solution.final_gradient,
+        final_hessian: solution.final_hessian,
+        converged,
+        plan_used,
+    }
+}
+
 impl OuterResult {
-    /// Convert to legacy `SmoothingBfgsResult` for backwards compatibility.
+    /// Convert to the smoothing summary type consumed by downstream estimate
+    /// code.
     pub fn into_smoothing_result(self) -> crate::solver::smoothing::SmoothingBfgsResult {
         crate::solver::smoothing::SmoothingBfgsResult {
             rho: self.rho,
@@ -396,6 +570,9 @@ pub struct OuterConfig {
     pub max_iter: usize,
     /// Finite-difference step size for FD Hessian construction.
     pub fd_step: f64,
+    /// Optional per-coordinate lower/upper bounds for the outer coordinates.
+    /// When absent, the runner uses symmetric `[-rho_bound, +rho_bound]`.
+    pub bounds: Option<(Array1<f64>, Array1<f64>)>,
     /// Seed generation and screening configuration.
     pub seed_config: crate::seeding::SeedConfig,
     /// Bounds on rho coordinates (applied symmetrically as [-bound, +bound]).
@@ -417,6 +594,7 @@ impl Default for OuterConfig {
             tolerance: 1e-5,
             max_iter: 200,
             fd_step: 1e-4,
+            bounds: None,
             seed_config: crate::seeding::SeedConfig::default(),
             rho_bound: 30.0,
             heuristic_lambdas: None,
@@ -437,6 +615,10 @@ pub struct OuterResult {
     pub iterations: usize,
     /// Final gradient norm.
     pub final_grad_norm: f64,
+    /// Final gradient when the solver is gradient-based.
+    pub final_gradient: Option<Array1<f64>>,
+    /// Final Hessian when the solver tracks one.
+    pub final_hessian: Option<Array2<f64>>,
     /// Whether the optimizer converged to a stationary point.
     pub converged: bool,
     /// Which plan was actually used (may differ from initial if fallback fired).
@@ -476,6 +658,8 @@ pub fn run_outer(
             final_value: cost,
             iterations: 0,
             final_grad_norm: 0.0,
+            final_gradient: None,
+            final_hessian: None,
             converged: true,
             plan_used: the_plan,
         });
@@ -530,12 +714,6 @@ fn run_outer_with_plan(
     cap: &OuterCapability,
     the_plan: &OuterPlan,
 ) -> Result<OuterResult, EstimationError> {
-    use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
-    use opt::{
-        Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion,
-        NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
-    };
-
     let seeds = if let Some(ref rho) = config.initial_rho {
         vec![rho.clone()]
     } else {
@@ -578,118 +756,26 @@ fn run_outer_with_plan(
         scored.iter().map(|&(i, _)| seeds[i].clone()).collect()
     };
 
-    let lower = Array1::<f64>::from_elem(cap.n_params, -config.rho_bound);
-    let upper = Array1::<f64>::from_elem(cap.n_params, config.rho_bound);
+    let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
+        (
+            Array1::<f64>::from_elem(cap.n_params, -config.rho_bound),
+            Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
+        )
+    });
     let bounds_template = (lower, upper);
 
-    struct RawOuterCandidate {
-        rho: Array1<f64>,
-        iterations: usize,
-        converged: bool,
-    }
-
     let mut best: Option<OuterResult> = None;
-
-    let finalize_candidate = |obj: &mut dyn OuterObjective,
-                              candidate: RawOuterCandidate|
-     -> Result<OuterResult, EstimationError> {
-        obj.reset();
-        let (final_value, final_grad_norm) = if cap.gradient == Derivative::Analytic {
-            let eval = obj.eval(&candidate.rho)?;
-            if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "final outer evaluation returned non-finite cost/gradient".to_string(),
-                ));
-            }
-            let grad_norm = eval.gradient.dot(&eval.gradient).sqrt();
-            if !grad_norm.is_finite() {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "final outer gradient norm was non-finite".to_string(),
-                ));
-            }
-            (eval.cost, grad_norm)
-        } else {
-            let cost = obj.eval_cost(&candidate.rho)?;
-            if !cost.is_finite() {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "final outer cost was non-finite".to_string(),
-                ));
-            }
-            let mut grad = Array1::zeros(cap.n_params);
-            for i in 0..cap.n_params {
-                let h = config.fd_step * (1.0 + candidate.rho[i].abs());
-                let mut rp = candidate.rho.clone();
-                let mut rm = candidate.rho.clone();
-                rp[i] += h;
-                rm[i] -= h;
-                let fp = obj.eval_cost(&rp)?;
-                let fm = obj.eval_cost(&rm)?;
-                if !fp.is_finite() || !fm.is_finite() {
-                    return Err(EstimationError::RemlOptimizationFailed(
-                        "final outer finite-difference gradient used non-finite costs".to_string(),
-                    ));
-                }
-                grad[i] = (fp - fm) / (2.0 * h);
-            }
-            let grad_norm = grad.dot(&grad).sqrt();
-            if !grad_norm.is_finite() {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "final outer finite-difference gradient norm was non-finite".to_string(),
-                ));
-            }
-            (cost, grad_norm)
-        };
-        Ok(OuterResult {
-            rho: candidate.rho,
-            final_value,
-            iterations: candidate.iterations,
-            final_grad_norm,
-            converged: candidate.converged,
-            plan_used: *the_plan,
-        })
-    };
 
     for seed in &screened {
         obj.reset();
 
-        let result: Result<RawOuterCandidate, EstimationError> = match the_plan.solver {
+        let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc | Solver::NewtonTrustRegion => {
                 let hessian_source = the_plan.hessian_source;
-                let fd_step = config.fd_step;
-                let objective = CachedSecondOrderObjective::new(
-                    |rho: &Array1<f64>| {
-                        let eval = obj.eval(rho).map_err(|e| {
-                            ObjectiveEvalError::recoverable(format!("outer eval failed: {e}"))
-                        })?;
-                        if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "outer objective returned non-finite cost/gradient",
-                            ));
-                        }
-                        let hessian = match hessian_source {
-                            HessianSource::Analytic => match eval.hessian {
-                                HessianResult::Analytic(h) => {
-                                    if h.iter().any(|v| !v.is_finite()) {
-                                        return Err(ObjectiveEvalError::recoverable(
-                                            "analytic Hessian contained non-finite values",
-                                        ));
-                                    }
-                                    Some(h)
-                                }
-                                HessianResult::Unavailable => {
-                                    log::debug!(
-                                        "[OUTER] analytic Hessian expected but unavailable; falling back to FD for this step"
-                                    );
-                                    None
-                                }
-                            },
-                            HessianSource::FiniteDifference => None,
-                            HessianSource::BfgsApprox | HessianSource::EfsFixedPoint => None,
-                        };
-                        Ok((eval.cost, eval.gradient, hessian))
-                    },
-                    fd_step,
-                );
+                let objective = OuterSecondOrderBridge {
+                    obj,
+                    hessian_source,
+                };
 
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
@@ -702,19 +788,12 @@ fn run_outer_with_plan(
                     let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
                         .with_bounds(bounds)
                         .with_tolerance(tol)
-                        .with_max_iterations(max_iter);
+                        .with_max_iterations(max_iter)
+                        .with_fd_hessian_step(config.fd_step);
                     match optimizer.run() {
-                        Ok(sol) => Ok(RawOuterCandidate {
-                            rho: sol.final_point.clone(),
-                            iterations: sol.iterations,
-                            converged: true,
-                        }),
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
-                            Ok(RawOuterCandidate {
-                                rho: last_solution.final_point.clone(),
-                                iterations: last_solution.iterations,
-                                converged: false,
-                            })
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
                         Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                             "Arc solver failed: {e:?}"
@@ -724,19 +803,12 @@ fn run_outer_with_plan(
                     let mut optimizer = NewtonTrustRegion::new(seed.clone(), objective)
                         .with_bounds(bounds)
                         .with_tolerance(tol)
-                        .with_max_iterations(max_iter);
+                        .with_max_iterations(max_iter)
+                        .with_fd_hessian_step(config.fd_step);
                     match optimizer.run() {
-                        Ok(sol) => Ok(RawOuterCandidate {
-                            rho: sol.final_point.clone(),
-                            iterations: sol.iterations,
-                            converged: true,
-                        }),
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-                            Ok(RawOuterCandidate {
-                                rho: last_solution.final_point.clone(),
-                                iterations: last_solution.iterations,
-                                converged: false,
-                            })
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
                         Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                             "Newton trust-region solver failed: {e:?}"
@@ -746,169 +818,79 @@ fn run_outer_with_plan(
             }
             Solver::Bfgs => {
                 let gradient_available = cap.gradient == Derivative::Analytic;
-                let fd_step = config.fd_step;
-                let n_params = cap.n_params;
-                let objective = CachedFirstOrderObjective::new(|rho: &Array1<f64>| {
-                    if gradient_available {
-                        let eval = obj.eval(rho).map_err(|e| {
-                            ObjectiveEvalError::recoverable(format!("outer eval failed: {e}"))
-                        })?;
-                        if !eval.cost.is_finite() || eval.gradient.iter().any(|v| !v.is_finite()) {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "outer objective returned non-finite cost/gradient",
-                            ));
-                        }
-                        Ok((eval.cost, eval.gradient))
-                    } else {
-                        let cost = obj.eval_cost(rho).map_err(|e| {
-                            ObjectiveEvalError::recoverable(format!("outer eval_cost failed: {e}"))
-                        })?;
-                        if !cost.is_finite() {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "outer objective returned non-finite cost",
-                            ));
-                        }
-                        let mut grad = Array1::zeros(n_params);
-                        for i in 0..n_params {
-                            let h = fd_step * (1.0 + rho[i].abs());
-                            let mut rp = rho.clone();
-                            let mut rm = rho.clone();
-                            rp[i] += h;
-                            rm[i] -= h;
-                            let fp = obj.eval_cost(&rp).map_err(|e| {
-                                ObjectiveEvalError::recoverable(format!(
-                                    "outer FD eval_cost failed: {e}"
-                                ))
-                            })?;
-                            let fm = obj.eval_cost(&rm).map_err(|e| {
-                                ObjectiveEvalError::recoverable(format!(
-                                    "outer FD eval_cost failed: {e}"
-                                ))
-                            })?;
-                            grad[i] = if fp.is_finite() && fm.is_finite() {
-                                (fp - fm) / (2.0 * h)
-                            } else {
-                                0.0
-                            };
-                        }
-                        Ok((cost, grad))
-                    }
-                });
                 let (lo, hi) = &bounds_template;
-                let mut optimizer = Bfgs::new(seed.clone(), objective)
-                    .with_bounds(
-                        Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                            .expect("outer rho bounds must be valid"),
-                    )
-                    .with_tolerance(
-                        Tolerance::new(config.tolerance).expect("outer tolerance must be valid"),
-                    )
-                    .with_max_iterations(
-                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid"),
-                    );
-                match optimizer.run() {
-                    Ok(sol) => Ok(RawOuterCandidate {
-                        rho: sol.final_point.clone(),
-                        iterations: sol.iterations,
-                        converged: true,
-                    }),
-                    Err(BfgsError::MaxIterationsReached { last_solution }) => {
-                        Ok(RawOuterCandidate {
-                            rho: last_solution.final_point.clone(),
-                            iterations: last_solution.iterations,
-                            converged: false,
-                        })
+                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
+                    .expect("outer rho bounds must be valid");
+                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                let max_iter =
+                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                if gradient_available {
+                    let objective = OuterFirstOrderBridge { obj };
+                    let mut optimizer = Bfgs::new(seed.clone(), objective)
+                        .with_bounds(bounds)
+                        .with_tolerance(tol)
+                        .with_max_iterations(max_iter);
+                    match optimizer.run() {
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Err(BfgsError::MaxIterationsReached { last_solution }) => {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        }
+                        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "BFGS solver failed: {e:?}"
+                        ))),
                     }
-                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
-                        Ok(RawOuterCandidate {
-                            rho: last_solution.final_point.clone(),
-                            iterations: last_solution.iterations,
-                            converged: false,
-                        })
+                } else {
+                    let objective =
+                        FiniteDiffGradient::new(OuterCostBridge { obj }).with_step(config.fd_step);
+                    let mut optimizer = Bfgs::new(seed.clone(), objective)
+                        .with_bounds(bounds)
+                        .with_tolerance(tol)
+                        .with_max_iterations(max_iter);
+                    match optimizer.run() {
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Err(BfgsError::MaxIterationsReached { last_solution }) => {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        }
+                        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "BFGS solver failed: {e:?}"
+                        ))),
                     }
-                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                        "BFGS solver failed: {e:?}"
-                    ))),
                 }
             }
             Solver::Efs => {
-                let max_efs_iter = config.max_iter;
-                let efs_tol = config.tolerance;
                 let (lo, hi) = &bounds_template;
-
-                let mut rho = seed.clone();
-                let mut last_cost = f64::INFINITY;
-                let mut total_iter = 0_usize;
-                let mut converged = false;
-
-                for iter in 0..max_efs_iter {
-                    total_iter = iter + 1;
-
-                    let efs_eval = match obj.eval_efs(&rho) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            log::debug!("[OUTER] EFS iteration {iter} failed: {e}; using last rho");
-                            break;
-                        }
-                    };
-
-                    if !efs_eval.cost.is_finite() {
-                        log::debug!("[OUTER] EFS iteration {iter}: non-finite cost; stopping");
-                        break;
+                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
+                    .expect("outer rho bounds must be valid");
+                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                let max_iter =
+                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                let objective = OuterFixedPointBridge {
+                    obj,
+                    barrier_config: cap.barrier_config.clone(),
+                };
+                let mut optimizer = FixedPoint::new(seed.clone(), objective)
+                    .with_bounds(bounds)
+                    .with_tolerance(tol)
+                    .with_max_iterations(max_iter);
+                match optimizer.run() {
+                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                    Err(FixedPointError::MaxIterationsReached { last_solution }) => {
+                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
-                    last_cost = efs_eval.cost;
-
-                    if let Some(ref barrier_cfg) = cap.barrier_config {
-                        if let Some(ref beta) = efs_eval.beta {
-                            let ref_diag = 1.0;
-                            let threshold = 0.01;
-                            if barrier_cfg
-                                .barrier_curvature_is_significant(beta, ref_diag, threshold)
-                            {
-                                log::info!(
-                                    "[OUTER] EFS iter {iter}: barrier curvature significant \
-                                     (τ/(β-l)² > {threshold} × ref_diag); stopping EFS early"
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    let mut step_sq_sum = 0.0_f64;
-                    for i in 0..cap.n_params {
-                        let step_i = if i < efs_eval.steps.len() {
-                            efs_eval.steps[i]
-                        } else {
-                            0.0
-                        };
-                        let new_val = (rho[i] + step_i).clamp(lo[i], hi[i]);
-                        let actual_step = new_val - rho[i];
-                        step_sq_sum += actual_step * actual_step;
-                        rho[i] = new_val;
-                    }
-
-                    let step_norm = step_sq_sum.sqrt();
-                    log::trace!(
-                        "[OUTER] EFS iter {iter}: cost={:.6e}, step_norm={:.4e}",
-                        last_cost,
-                        step_norm
-                    );
-
-                    if step_norm < efs_tol {
-                        converged = true;
-                        break;
-                    }
+                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                        "fixed-point solver failed: {e:?}"
+                    ))),
                 }
-
-                Ok(RawOuterCandidate {
-                    rho,
-                    iterations: total_iter,
-                    converged,
-                })
             }
         };
 
-        match result.and_then(|candidate| finalize_candidate(obj, candidate)) {
+        match result {
             Ok(candidate) => {
                 let dominated = best.as_ref().is_some_and(|b| {
                     b.converged && (!candidate.converged || b.final_value <= candidate.final_value)
@@ -946,11 +928,24 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn plan_fd_hessian_selects_newton() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::FiniteDifference,
+            n_params: 3,
+            all_penalty_like: false,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::NewtonTrustRegion);
+        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
     }
 
     #[test]
@@ -961,7 +956,6 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::NewtonTrustRegion);
@@ -976,7 +970,6 @@ mod tests {
             n_params: 12,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -984,15 +977,14 @@ mod tests {
     }
 
     #[test]
-    fn plan_no_gradient_always_bfgs() {
+    fn plan_fd_gradient_always_bfgs() {
         for n in [1, 5, 20] {
             let cap = OuterCapability {
-                gradient: Derivative::Unavailable,
+                gradient: Derivative::FiniteDifference,
                 hessian: Derivative::Unavailable,
                 n_params: n,
                 all_penalty_like: false,
                 barrier_config: None,
-                force_solver: None,
             };
             let p = plan(&cap);
             assert_eq!(p.solver, Solver::Bfgs);
@@ -1001,14 +993,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_no_gradient_with_hessian_still_bfgs() {
+    fn plan_fd_gradient_with_hessian_still_bfgs() {
         let cap = OuterCapability {
-            gradient: Derivative::Unavailable,
+            gradient: Derivative::FiniteDifference,
             hessian: Derivative::Analytic,
             n_params: 3,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -1022,7 +1013,6 @@ mod tests {
             n_params: 8,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
@@ -1036,7 +1026,6 @@ mod tests {
             n_params: 9,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
@@ -1050,7 +1039,6 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1065,7 +1053,6 @@ mod tests {
             n_params: 5,
             all_penalty_like: true,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         // With few params and analytic gradient, FD Newton is better.
@@ -1080,7 +1067,6 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         // Arc is always preferred when analytic Hessian is available.
@@ -1097,7 +1083,6 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1120,7 +1105,6 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             barrier_config: Some(barrier),
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1142,7 +1126,6 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             barrier_config: Some(barrier),
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -1191,7 +1174,6 @@ mod tests {
             n_params: 0,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -1218,7 +1200,6 @@ mod tests {
                 n_params: 1,
                 all_penalty_like: false,
                 barrier_config: None,
-                force_solver: None,
             },
             cost_fn: |st: &mut i32, rho: &Array1<f64>| {
                 let _ = (*st, rho.len());

@@ -162,6 +162,13 @@ impl LikelihoodFamily {
         }
     }
 
+    /// Whether the shared Jeffreys/Firth implementation is available for this
+    /// likelihood family.
+    #[inline]
+    pub fn supports_firth(self) -> bool {
+        matches!(self, Self::BinomialLogit)
+    }
+
     #[inline]
     pub(crate) fn is_binomial(self) -> bool {
         matches!(
@@ -194,6 +201,11 @@ impl GlmLikelihoodFamily {
     #[inline]
     pub fn link_function(self) -> LinkFunction {
         LikelihoodFamily::from(self).link_function()
+    }
+
+    #[inline]
+    pub fn supports_firth(self) -> bool {
+        LikelihoodFamily::from(self).supports_firth()
     }
 }
 

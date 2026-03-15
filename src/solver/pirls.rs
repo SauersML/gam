@@ -1306,15 +1306,8 @@ impl<'a> GamWorkingModel<'a> {
     fn hessian_curvature_arrays(
         &self,
         requested: HessianCurvatureKind,
-    ) -> Result<
-        (
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            HessianCurvatureKind,
-        ),
-        EstimationError,
-    > {
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, HessianCurvatureKind), EstimationError>
+    {
         if requested == HessianCurvatureKind::Fisher || !self.supports_observed_hessian_curvature()
         {
             return Ok((
@@ -3318,13 +3311,12 @@ where
 
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
-        let preferred_curvature = if model.supports_observed_information_curvature()
-            && !force_fisher_for_rest
-        {
-            HessianCurvatureKind::Observed
-        } else {
-            HessianCurvatureKind::Fisher
-        };
+        let preferred_curvature =
+            if model.supports_observed_information_curvature() && !force_fisher_for_rest {
+                HessianCurvatureKind::Observed
+            } else {
+                HessianCurvatureKind::Fisher
+            };
         let mut used_fisher_fallback_this_iter = false;
         let mut state = match model.update_with_curvature(&beta, preferred_curvature) {
             Ok(state) => state,
@@ -3618,7 +3610,8 @@ where
                             if consecutive_fisher_fallbacks > 2 {
                                 force_fisher_for_rest = true;
                             }
-                            state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
+                            state =
+                                model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                             regularized = state.hessian.clone();
                             applied_lambda = 0.0;
                             cached_sparse_regularized = None;
@@ -3968,32 +3961,27 @@ impl PirlsResult {
         }
 
         let (score_c_array, score_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
-            computeworkingweight_derivatives_from_eta(
-                inverse_link,
-                &self.final_eta,
-                priorweights,
-            )?;
-        let (finalweights, solve_c_array, solve_d_array) = if self.hessian_curvature
-            == HessianCurvatureKind::Observed
-        {
-            compute_observed_hessian_curvature_arrays(
-                inverse_link,
-                &self.final_eta,
-                y,
-                &self.solvemu,
-                &solve_dmu_deta,
-                &solve_d2mu_deta2,
-                &solve_d3mu_deta3,
-                &self.solveweights,
-                priorweights,
-            )?
-        } else {
-            (
-                self.solveweights.clone(),
-                score_c_array.clone(),
-                score_d_array.clone(),
-            )
-        };
+            computeworkingweight_derivatives_from_eta(inverse_link, &self.final_eta, priorweights)?;
+        let (finalweights, solve_c_array, solve_d_array) =
+            if self.hessian_curvature == HessianCurvatureKind::Observed {
+                compute_observed_hessian_curvature_arrays(
+                    inverse_link,
+                    &self.final_eta,
+                    y,
+                    &self.solvemu,
+                    &solve_dmu_deta,
+                    &solve_d2mu_deta2,
+                    &solve_d3mu_deta3,
+                    &self.solveweights,
+                    priorweights,
+                )?
+            } else {
+                (
+                    self.solveweights.clone(),
+                    score_c_array.clone(),
+                    score_d_array.clone(),
+                )
+            };
         let x_dense = x_original
             .try_to_dense_arc("rehydrating compact REML PIRLS cache entry requires dense design")
             .map_err(EstimationError::InvalidInput)?;

@@ -35,7 +35,9 @@ use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::solver::strategy::{
     ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
 };
-use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction, SasLinkState};
+use crate::types::{
+    GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction, SasLinkState,
+};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
@@ -724,7 +726,9 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
         if let Some(se) = &self.covariate_se {
-            if let Some(family) = integrated_binomial_family_from_link(self.link, self.sas_link_state.is_some()) {
+            if let Some(family) =
+                integrated_binomial_family_from_link(self.link, self.sas_link_state.is_some())
+            {
                 if let Err(e) = crate::pirls::update_glmvectors_integrated_by_family(
                     &self.quadctx,
                     self.y,
@@ -1111,8 +1115,11 @@ impl<'a> JointModelState<'a> {
                 _ => InverseLink::Standard(self.link),
             };
             match self.link {
-                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog
-                | LinkFunction::Sas | LinkFunction::BetaLogistic => {
+                LinkFunction::Logit
+                | LinkFunction::Probit
+                | LinkFunction::CLogLog
+                | LinkFunction::Sas
+                | LinkFunction::BetaLogistic => {
                     if let Err(e) = crate::pirls::update_glmvectors_integrated_for_link(
                         &self.quadctx,
                         self.y,
@@ -2151,7 +2158,12 @@ impl<'a> JointRemlState<'a> {
                 // Fallback: identity-like root
                 Array2::eye(p_link)
             });
-            penalty_roots.push(embed_penalty_root(&link_root, p_base, p_base + p_link, p_total));
+            penalty_roots.push(embed_penalty_root(
+                &link_root,
+                p_base,
+                p_base + p_link,
+                p_total,
+            ));
         }
 
         // Concatenated beta.
@@ -2596,6 +2608,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         tolerance: config.reml_tol,
         max_iter: config.max_reml_iter,
         fd_step: 1e-4,
+        bounds: None,
         seed_config: SeedConfig {
             bounds: (-12.0, 12.0),
             max_seeds: if n_base < 4 { 12 } else { 16 },
@@ -2626,7 +2639,6 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
             // coordinates. Conservatively false.
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
         },
         cost_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
         eval_fn: |state: &mut JointRemlState<'_>, rho: &Array1<f64>| {

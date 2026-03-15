@@ -1913,16 +1913,17 @@ pub(crate) struct FirthDenseOperator {
     // Exact Firth/Jeffreys objects on the identifiable subspace.
     //
     // Let X in R^{n×p} potentially be rank-deficient with rank r.
-    // We compute a fixed orthonormal basis Q in R^{p×r} for Col(Xᵀ) and define:
-    //   X_r := X Q,
+    // With optional fixed observation weights a_i >= 0 we define A = diag(a),
+    // choose Q for the identifiable subspace of A^{1/2} X, and set:
+    //   X_r := A^{1/2} X Q          (A = I when no fixed observation weights),
     //   W   := diag(w), with w_i = mu_i (1 - mu_i), 0 < w_i <= 1/4 for finite logit eta,
-    //   Z   := W^{1/2} X_r,
-    //   I_r := X_rᵀ W X_r = Zᵀ Z.
+    //   I_r := X_rᵀ W X_r.
     //
     // Firth term is represented as:
     //   Phi(beta) = 0.5 log |I_r(beta)|,
-    // which equals 0.5 log|XᵀWX|_+ (pseudodeterminant in the full space) but is
-    // smooth because I_r is SPD as long as w_i > 0.
+    // which equals 0.5 log|Xᵀ A W X|_+ (pseudodeterminant in the full space)
+    // but is smooth because I_r is SPD as long as the identifiable weighted
+    // design has full column rank and w_i > 0.
     //
     // Mapping back to the full p-space uses:
     //   I_+^dagger = Q I_r^{-1} Qᵀ.
@@ -1932,16 +1933,25 @@ pub(crate) struct FirthDenseOperator {
     x_dense: Array2<f64>,
     x_dense_t: Array2<f64>,
     q_basis: Array2<f64>,
-    // X_r = XQ
+    // Reduced identifiable design. With fixed observation weights a_i this is
+    // diag(sqrt(a_i)) X Q; otherwise it is X Q.
     x_reduced: Array2<f64>,
-    // Reduced design used for M = X_r K_r X_r'.
-    // (Name kept for compatibility with existing callsites.)
+    // Reduced design used for M = Z K_r Zᵀ. Name kept for compatibility with
+    // existing callsites; Z equals x_reduced for the current implementation.
     z_reduced: Array2<f64>,
+    // Optional fixed case-weight square roots used when the Jeffreys term is
+    // formed from Xᵀ diag(case_weight ⊙ w(η)) X rather than Xᵀ diag(w(η)) X.
+    // Current contract: weighted operators are used only for Jeffreys
+    // value/gradient extraction in HMC. The exact directional REML derivatives
+    // remain the unweighted path.
+    observation_weight_sqrt: Option<Array1<f64>>,
     // I_r^{-1}
     k_reduced: Array2<f64>,
+    // 0.5 log|I_r| at the current eta.
+    half_log_det: f64,
     // h = diag(M), M = X_r K_r X_r'
     h_diag: Array1<f64>,
-    // Logistic derivatives: w', w'', w''', w'''' as n-vectors.
+    // Logistic Fisher-weight eta-derivatives: w', w'', w''', w'''' as n-vectors.
     w: Array1<f64>,
     w1: Array1<f64>,
     w2: Array1<f64>,
