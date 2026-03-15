@@ -1,4 +1,4 @@
-use crate::estimate::{BlockRole, FitResult, FittedLinkParameters, UnifiedFitResult};
+use crate::estimate::{BlockRole, FitResult, FittedLinkState, UnifiedFitResult};
 use crate::inference::predict::{
     BinomialLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
     StandardPredictor, SurvivalPredictor,
@@ -355,14 +355,14 @@ impl FittedModel {
         let Some(fit) = payload.fit_result.as_ref() else {
             return;
         };
-        match (&mut payload.family_state, &fit.fitted_link_parameters) {
+        match (&mut payload.family_state, &fit.fitted_link) {
             (
                 FittedFamily::Standard {
                     likelihood: LikelihoodFamily::BinomialSas,
                     sas_state,
                     ..
                 },
-                FittedLinkParameters::Sas { state, covariance },
+                FittedLinkState::Sas { state, covariance },
             ) => {
                 *sas_state = Some(*state);
                 payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
@@ -373,7 +373,7 @@ impl FittedModel {
                     sas_state,
                     ..
                 },
-                FittedLinkParameters::BetaLogistic { state, covariance },
+                FittedLinkState::BetaLogistic { state, covariance },
             ) => {
                 *sas_state = Some(*state);
                 payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
@@ -384,7 +384,7 @@ impl FittedModel {
                     mixture_state,
                     ..
                 },
-                FittedLinkParameters::Mixture { state, covariance },
+                FittedLinkState::Mixture { state, covariance },
             ) => {
                 *mixture_state = Some(state.clone());
                 payload.mixture_link_param_covariance =

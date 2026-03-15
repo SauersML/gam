@@ -77,7 +77,7 @@ pub use inference::model::{
 };
 pub use solver::estimate::{
     BlockRole, CoefficientUncertaintyResult, FitArtifacts, FitGeometry, FitOptions, FitResult,
-    FitResultParts, FittedBlock, FittedLinkParameters, InferenceCovarianceMode, MeanIntervalMethod,
+    FitResultParts, FittedBlock, FittedLinkParameters, FittedLinkState, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     UnifiedFitResult, UnifiedFitResultParts, coefficient_uncertainty,
     coefficient_uncertaintywith_mode,

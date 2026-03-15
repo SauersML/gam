@@ -1351,13 +1351,13 @@ where
         _ => None,
     };
     let link_kind = match fitted_link_state.as_ref() {
-        Some(FittedLinkState::Standard(link)) => Some(InverseLink::Standard(*link)),
+        Some(FittedLinkState::Standard(Some(link))) => Some(InverseLink::Standard(*link)),
         Some(FittedLinkState::Sas { state, .. }) => Some(InverseLink::Sas(*state)),
         Some(FittedLinkState::BetaLogistic { state, .. }) => {
             Some(InverseLink::BetaLogistic(*state))
         }
         Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state.clone())),
-        None => None,
+        Some(FittedLinkState::Standard(None)) | None => None,
     };
     let strategy = strategy_for_family(family, link_kind.as_ref());
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;

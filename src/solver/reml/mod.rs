@@ -1294,7 +1294,17 @@ impl HyperDesignDerivative {
             DerivativeMatrixStorage::Embedded(embedded) => embedded
                 .local
                 .dot(&rhs.slice(s![embedded.global_range.clone(), ..])),
-            DerivativeMatrixStorage::Implicit(op) => op.materialize_dense().dot(rhs),
+            DerivativeMatrixStorage::Implicit(op) => {
+                // Matrix-free: apply forward_mul_vec column-by-column.
+                let n = op.nrows();
+                let k = rhs.ncols();
+                let mut out = Array2::<f64>::zeros((n, k));
+                for j in 0..k {
+                    let col = rhs.column(j).to_owned();
+                    out.column_mut(j).assign(&op.forward_mul_vec(&col));
+                }
+                out
+            }
         }
     }
 
@@ -1307,7 +1317,17 @@ impl HyperDesignDerivative {
                     .assign(&embedded.local.t().dot(rhs));
                 out
             }
-            DerivativeMatrixStorage::Implicit(op) => op.materialize_dense().t().dot(rhs),
+            DerivativeMatrixStorage::Implicit(op) => {
+                // Matrix-free: apply transpose_mul_vec column-by-column.
+                let p = op.ncols();
+                let k = rhs.ncols();
+                let mut out = Array2::<f64>::zeros((p, k));
+                for j in 0..k {
+                    let col = rhs.column(j).to_owned();
+                    out.column_mut(j).assign(&op.transpose_mul_vec(&col));
+                }
+                out
+            }
         }
     }
 
@@ -1326,7 +1346,24 @@ impl HyperDesignDerivative {
                 out
             }
             DerivativeMatrixStorage::Implicit(op) => {
-                op.materialize_dense().slice(s![rows, ..]).t().to_owned()
+                // Matrix-free: rows [start..end] of the n×p derivative matrix
+                // become columns of the p×block_len output.  We extract each
+                // row via transpose_mul_vec on a unit vector e_i (length n),
+                // which returns the i-th row of the derivative matrix as a
+                // length-p column.  This avoids materializing the full n×p
+                // matrix and only probes the rows we actually need.
+                let n = op.nrows();
+                let p = op.ncols();
+                let block_len = rows.end.saturating_sub(rows.start);
+                let mut out = Array2::<f64>::zeros((p, block_len));
+                let mut e_i = Array1::<f64>::zeros(n);
+                for (col_idx, i) in rows.enumerate() {
+                    e_i[i] = 1.0;
+                    let row_as_col = op.transpose_mul_vec(&e_i);
+                    out.column_mut(col_idx).assign(&row_as_col);
+                    e_i[i] = 0.0;
+                }
+                out
             }
         }
     }
@@ -1365,17 +1402,26 @@ impl HyperDesignDerivative {
                     .scaled_add(amp, &embedded.local);
             }
             DerivativeMatrixStorage::Implicit(op) => {
-                let dense = op.materialize_dense();
-                if target.raw_dim() != dense.raw_dim() {
+                let n = op.nrows();
+                let p = op.ncols();
+                if target.nrows() != n || target.ncols() != p {
                     return Err(EstimationError::InvalidInput(format!(
                         "implicit hyper design derivative shape mismatch: target={}x{}, matrix={}x{}",
                         target.nrows(),
                         target.ncols(),
-                        dense.nrows(),
-                        dense.ncols()
+                        n,
+                        p
                     )));
                 }
-                target.scaled_add(amp, dense);
+                // Matrix-free: compute each column of X_psi via forward_mul on
+                // unit vectors, then scale-add into the target column.
+                let mut e_j = Array1::<f64>::zeros(p);
+                for j in 0..p {
+                    e_j[j] = 1.0;
+                    let col = op.forward_mul_vec(&e_j);
+                    target.column_mut(j).scaled_add(amp, &col);
+                    e_j[j] = 0.0;
+                }
             }
         }
         Ok(())

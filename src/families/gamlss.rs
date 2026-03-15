@@ -2086,7 +2086,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         noise_beta_hint = Some(noise_beta);
                         Ok(fit)
                     },
-                    |fit| fit.penalizedobjective,
+                    |fit| fit.penalized_objective,
                 )?
             }
         }
@@ -2133,7 +2133,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 noise_beta_hint = Some(noise_beta);
                 Ok(fit)
             },
-            |fit| fit.penalizedobjective,
+            |fit| fit.penalized_objective,
         )?
     };
 
@@ -12542,7 +12542,7 @@ mod tests {
             &spatial_kappa_options(),
         )
         .expect("gaussian location-scale spatial fit");
-        assert!(fit.fit.penalizedobjective.is_finite());
+        assert!(fit.fit.penalized_objective.is_finite());
         assert_eq!(fit.fit.block_states.len(), 2);
     }
 
@@ -12571,7 +12571,7 @@ mod tests {
             &spatial_kappa_options(),
         )
         .expect("binomial location-scale spatial fit");
-        assert!(fit.fit.penalizedobjective.is_finite());
+        assert!(fit.fit.penalized_objective.is_finite());
         assert_eq!(fit.fit.block_states.len(), 2);
     }
 
@@ -12612,7 +12612,7 @@ mod tests {
             &spatial_kappa_options(),
         )
         .expect("binomial location-scale wiggle spatial fit");
-        assert!(fit.fit.penalizedobjective.is_finite());
+        assert!(fit.fit.penalized_objective.is_finite());
         assert_eq!(fit.fit.block_states.len(), 3);
     }
 

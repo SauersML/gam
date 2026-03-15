@@ -538,7 +538,7 @@ impl<'a> RemlState<'a> {
             let pw = self.weights[i].max(0.0);
             let yi = self.y[i];
 
-            let (_w_obs, ci, di) = observed_weight_noncanonical(
+            let (_, ci, di) = observed_weight_noncanonical(
                 yi, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, pw,
             );
             c_obs[i] = ci;
@@ -898,43 +898,27 @@ impl<'a> RemlState<'a> {
     /// Construct a `BarrierConfig` from linear inequality constraints `A β ≥ b`
     /// by extracting rows that represent simple coordinate bounds (β_j ≥ b_i).
     ///
-    /// A row is a simple bound iff it has exactly one nonzero entry equal to 1.0.
-    /// Returns `None` if no simple-bound rows are found.
+    /// Delegates to `BarrierConfig::from_constraints` and logs a diagnostic
+    /// barrier-curvature check at a test point near the bounds.
     fn barrier_config_from_constraints(
         constraints: &crate::pirls::LinearInequalityConstraints,
     ) -> Option<super::unified::BarrierConfig> {
-        let mut indices = Vec::new();
-        let mut lower_bounds = Vec::new();
-        for i in 0..constraints.a.nrows() {
-            let row = constraints.a.row(i);
-            let mut single_col = None;
-            let mut is_simple = true;
-            for (j, &val) in row.iter().enumerate() {
-                if val.abs() < 1e-14 {
-                    continue;
-                }
-                if (val - 1.0).abs() < 1e-14 && single_col.is_none() {
-                    single_col = Some(j);
-                } else {
-                    is_simple = false;
-                    break;
-                }
+        let config = super::unified::BarrierConfig::from_constraints(Some(constraints))?;
+        // Diagnostic: check curvature significance at a test point near bounds.
+        {
+            let max_idx = config.constrained_indices.iter().max().copied().unwrap_or(0);
+            let mut beta_test = Array1::<f64>::zeros(max_idx + 1);
+            for (&idx, &lb) in config.constrained_indices.iter().zip(config.lower_bounds.iter()) {
+                beta_test[idx] = lb + 0.01; // slightly above constraint
             }
-            if is_simple {
-                if let Some(col) = single_col {
-                    indices.push(col);
-                    lower_bounds.push(constraints.b[i]);
-                }
-            }
+            let significant = config.barrier_curvature_is_significant(&beta_test, 1.0, 0.05);
+            log::trace!(
+                "[barrier] curvature significant={significant} (tau={:.2e}, n_constrained={})",
+                config.tau,
+                config.constrained_indices.len(),
+            );
         }
-        if indices.is_empty() {
-            return None;
-        }
-        Some(super::unified::BarrierConfig {
-            tau: 1e-6,
-            constrained_indices: indices,
-            lower_bounds,
-        })
+        Some(config)
     }
 
     pub(super) fn enforce_constraint_kkt(&self, pr: &PirlsResult) -> Result<(), EstimationError> {
@@ -3049,6 +3033,7 @@ impl<'a> RemlState<'a> {
         use super::unified::{InnerSolutionBuilder, compute_efs_update, reml_laml_evaluate};
 
         let n_observations = self.y.len();
+        let beta_for_barrier = beta.clone();
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
@@ -3089,6 +3074,7 @@ impl<'a> RemlState<'a> {
         Ok(crate::solver::strategy::EfsEval {
             cost: cost_result.cost,
             steps,
+            beta: Some(beta_for_barrier),
         })
     }
 

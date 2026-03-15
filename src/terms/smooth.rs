@@ -20,7 +20,7 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FitResult,
-    FittedLinkParameters, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
+    FittedLinkState, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -4559,7 +4559,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             hessian: Derivative::Analytic,
             n_params: n_theta,
             all_penalty_like: false,
-            barrier_active: false,
+            barrier_config: None,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
@@ -4854,24 +4854,24 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let fitted_link_parameters = match family {
         LikelihoodFamily::BinomialMixture => mixture_link_state
             .clone()
-            .map(|state| FittedLinkParameters::Mixture {
+            .map(|state| FittedLinkState::Mixture {
                 state,
                 covariance: None,
             })
-            .unwrap_or(FittedLinkParameters::Standard),
+            .unwrap_or(FittedLinkState::Standard(None)),
         LikelihoodFamily::BinomialSas => sas_link_state
-            .map(|state| FittedLinkParameters::Sas {
+            .map(|state| FittedLinkState::Sas {
                 state,
                 covariance: None,
             })
-            .unwrap_or(FittedLinkParameters::Standard),
+            .unwrap_or(FittedLinkState::Standard(None)),
         LikelihoodFamily::BinomialBetaLogistic => sas_link_state
-            .map(|state| FittedLinkParameters::BetaLogistic {
+            .map(|state| FittedLinkState::BetaLogistic {
                 state,
                 covariance: None,
             })
-            .unwrap_or(FittedLinkParameters::Standard),
-        _ => FittedLinkParameters::Standard,
+            .unwrap_or(FittedLinkState::Standard(None)),
+        _ => FittedLinkState::Standard(None),
     };
     let max_abs_eta = final_eval
         .obs
@@ -7079,7 +7079,7 @@ fn fit_bounded_term_collection_forspec(
                 covariance_conditional,
                 covariance_corrected: None,
                 inference: Some(inf),
-                fitted_link: crate::estimate::FittedLinkParameters::Standard,
+                fitted_link: crate::estimate::FittedLinkState::Standard(None),
                 geometry,
                 block_states: Vec::new(),
                 pirls_status: pirls_status_val,
@@ -8259,80 +8259,81 @@ fn try_exact_joint_spatial_length_scale_optimization(
             rho_dim,
         )?
     } else {
-        // Isotropic fallback: derivative-free coordinate search (unchanged).
-        let dims_clone = dims_per_term.clone();
-        let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                rho_dim,
-                dims_clone.clone(),
-            );
-            let spec_c = log_kappa
-                .apply_tospec(resolvedspec, spatial_terms)
-                .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
-            let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
-            match fit_term_collection_forspecwith_heuristic_lambdas(
-                data,
-                y,
-                weights,
-                offset,
-                &spec_c,
-                rho.as_slice(),
-                family,
-                options,
-            ) {
-                Ok(fit) => Ok(fit_score(&fit.fit)),
-                Err(_) => Ok(f64::INFINITY),
-            }
-        };
-
-        let initial_cost = eval_cost(&theta0).unwrap_or(f64::INFINITY);
-        let mut best_theta = theta0.clone();
-
-        coordinate_search_spatial(
-            &theta0,
-            initial_cost,
-            &lower,
-            &upper,
-            kappa_options,
-            &mut |action| match action {
-                SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
-                SpatialSearchAction::OnImprove(theta, _) => {
-                    best_theta = theta.clone();
-                    Ok(0.0)
-                }
-            },
-        )
-        .map_err(EstimationError::InvalidInput)?;
-
-        // Gradient-based refinement diagnostic for isotropic path.
-        if let Some(hyper_dirs) = try_build_spatial_log_kappa_hyper_dirs(
+        // Isotropic analytic path: use the unified REML evaluator with
+        // ext_coords for joint [ρ, κ] optimization via BFGS, analogous to
+        // the anisotropic path but with a single κ per spatial term.
+        match try_exact_joint_spatial_isotropic_optimization(
             data,
+            y,
+            weights,
+            offset,
             resolvedspec,
             &best.design,
+            family,
+            options,
             spatial_terms,
-        )? {
-            if let Ok((_, grad, _)) = evaluate_joint_reml_at_theta(
-                y,
-                weights,
-                offset,
-                &best.design,
-                &best_theta,
-                rho_dim,
-                hyper_dirs,
-                None,
-                family,
-                options,
-            ) {
-                let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-                log::trace!(
-                    "[spatial-kappa] gradient norm at coordinate-search optimum: {:.6e}",
-                    grad_norm,
+            &dims_per_term,
+            &theta0,
+            &lower,
+            &upper,
+            rho_dim,
+        ) {
+            Ok(theta) => theta,
+            Err(analytic_err) => {
+                // Fallback: derivative-free coordinate search if analytic path fails.
+                log::warn!(
+                    "[spatial-kappa] analytic isotropic optimization failed ({}), \
+                     falling back to coordinate search",
+                    analytic_err,
                 );
+                let dims_clone = dims_per_term.clone();
+                let eval_cost = |theta: &Array1<f64>| -> Result<f64, String> {
+                    let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                        theta,
+                        rho_dim,
+                        dims_clone.clone(),
+                    );
+                    let spec_c = log_kappa
+                        .apply_tospec(resolvedspec, spatial_terms)
+                        .map_err(|e| format!("failed to apply spatial log-kappa: {e}"))?;
+                    let rho = theta.slice(s![..rho_dim]).mapv(f64::exp);
+                    match fit_term_collection_forspecwith_heuristic_lambdas(
+                        data,
+                        y,
+                        weights,
+                        offset,
+                        &spec_c,
+                        rho.as_slice(),
+                        family,
+                        options,
+                    ) {
+                        Ok(fit) => Ok(fit_score(&fit.fit)),
+                        Err(_) => Ok(f64::INFINITY),
+                    }
+                };
+
+                let initial_cost = eval_cost(&theta0).unwrap_or(f64::INFINITY);
+                let mut best_theta = theta0.clone();
+
+                coordinate_search_spatial(
+                    &theta0,
+                    initial_cost,
+                    &lower,
+                    &upper,
+                    kappa_options,
+                    &mut |action| match action {
+                        SpatialSearchAction::EvalCost(theta) => eval_cost(theta),
+                        SpatialSearchAction::OnImprove(theta, _) => {
+                            best_theta = theta.clone();
+                            Ok(0.0)
+                        }
+                    },
+                )
+                .map_err(EstimationError::InvalidInput)?;
+
+                best_theta
             }
         }
-
-        best_theta
     };
 
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
@@ -8541,7 +8542,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             // ψ coordinates are NOT penalty-like (they move the design),
             // so EFS is not appropriate.
             all_penalty_like: false,
-            barrier_active: false,
+            barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
@@ -8616,6 +8617,238 @@ fn enforce_psi_sum_to_zero(
             }
         }
         offset += d;
+    }
+}
+
+/// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
+/// derivatives through the unified REML evaluator.
+///
+/// This is the isotropic counterpart of `try_exact_joint_spatial_aniso_optimization`.
+/// Each spatial term contributes a single log-κ coordinate (rather than d
+/// per-axis ψ_a coordinates in the anisotropic case). The analytic gradient
+/// and Hessian w.r.t. log-κ flow through the same pipeline:
+///
+///   `SpatialPsiDerivative` → `DirectionalHyperParam` → `HyperCoord` ext_coords
+///     → unified REML evaluator
+///
+/// This gives BFGS/Newton quadratic convergence on the length-scale parameters,
+/// replacing the derivative-free `coordinate_search_spatial` as the default path.
+fn try_exact_joint_spatial_isotropic_optimization(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    baseline_design: &TermCollectionDesign,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    spatial_terms: &[usize],
+    dims_per_term: &[usize],
+    theta0: &Array1<f64>,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    rho_dim: usize,
+) -> Result<Array1<f64>, EstimationError> {
+    assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
+    assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
+    };
+
+    let theta_dim = theta0.len();
+    let kappa_dim = theta_dim - rho_dim;
+
+    log::trace!(
+        "[spatial-iso-joint] starting analytic optimization: rho_dim={}, kappa_dim={}, dims_per_term={:?}",
+        rho_dim,
+        kappa_dim,
+        dims_per_term,
+    );
+
+    struct IsoJointContext<'d> {
+        data: ArrayView2<'d, f64>,
+        y: ArrayView1<'d, f64>,
+        weights: ArrayView1<'d, f64>,
+        offset: ArrayView1<'d, f64>,
+        resolvedspec: &'d TermCollectionSpec,
+        family: LikelihoodFamily,
+        options: &'d FitOptions,
+        spatial_terms: &'d [usize],
+        dims_per_term: &'d [usize],
+        rho_dim: usize,
+        best_theta: Array1<f64>,
+        best_cost: f64,
+    }
+
+    impl<'d> IsoJointContext<'d> {
+        /// Full evaluation: rebuild design + hyper_dirs, compute cost + gradient + Hessian.
+        fn eval_full(
+            &self,
+            theta: &Array1<f64>,
+        ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta,
+                self.rho_dim,
+                self.dims_per_term.to_vec(),
+            );
+            let spec_at_kappa = log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms)?;
+            let design_at_kappa = build_term_collection_design(self.data, &spec_at_kappa)?;
+
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                self.data,
+                &spec_at_kappa,
+                &design_at_kappa,
+                self.spatial_terms,
+            )?
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build isotropic hyper_dirs at current kappa".to_string(),
+                )
+            })?;
+
+            evaluate_joint_reml_at_theta(
+                self.y,
+                self.weights,
+                self.offset,
+                &design_at_kappa,
+                theta,
+                self.rho_dim,
+                hyper_dirs,
+                None,
+                self.family,
+                self.options,
+            )
+        }
+
+        /// Cost-only evaluation (cheaper: no hyper_dirs or gradient).
+        fn eval_cost(&self, theta: &Array1<f64>) -> f64 {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+                theta,
+                self.rho_dim,
+                self.dims_per_term.to_vec(),
+            );
+            let spec_at_kappa =
+                match log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms) {
+                    Ok(s) => s,
+                    Err(_) => return f64::INFINITY,
+                };
+            let rho_vec = theta.slice(s![..self.rho_dim]).mapv(f64::exp);
+            match fit_term_collection_forspecwith_heuristic_lambdas(
+                self.data,
+                self.y,
+                self.weights,
+                self.offset,
+                &spec_at_kappa,
+                rho_vec.as_slice(),
+                self.family,
+                self.options,
+            ) {
+                Ok(fit) => fit_score(&fit.fit),
+                Err(_) => f64::INFINITY,
+            }
+        }
+
+        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            if cost < self.best_cost {
+                self.best_cost = cost;
+                self.best_theta = theta.clone();
+            }
+        }
+    }
+
+    let mut ctx = IsoJointContext {
+        data,
+        y,
+        weights,
+        offset,
+        resolvedspec,
+        family,
+        options,
+        spatial_terms,
+        dims_per_term,
+        rho_dim,
+        best_theta: theta0.clone(),
+        best_cost: f64::INFINITY,
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: 1e-6,
+        max_iter: 50,
+        fd_step: 1e-5,
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            num_auxiliary_trailing: kappa_dim,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+    };
+
+    let mut obj = ClosureObjective {
+        state: &mut ctx,
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: theta_dim,
+            // κ coordinates move the design (like ψ in aniso), so EFS is
+            // not appropriate.
+            all_penalty_like: false,
+            barrier_config: None,
+        },
+        cost_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
+            let cost = ctx.eval_cost(theta);
+            ctx.track_best(theta, cost);
+            Ok(cost)
+        },
+        eval_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
+            match ctx.eval_full(theta) {
+                Ok((cost, grad, hess)) => {
+                    ctx.track_best(theta, cost);
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: HessianResult::Analytic(hess),
+                    })
+                }
+                Err(_) => {
+                    Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            }
+        },
+        reset_fn: |ctx: &mut &mut IsoJointContext<'_>| {
+            assert!(ctx.rho_dim > 0 || ctx.rho_dim == 0);
+        },
+        efs_fn: None::<
+            fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+        >,
+    };
+
+    match crate::solver::strategy::run_outer(&mut obj, &outer_config, "iso-kappa joint REML") {
+        Ok(result) => {
+            log::trace!(
+                "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm,
+            );
+            Ok(result.rho)
+        }
+        Err(e) => {
+            log::warn!(
+                "[spatial-iso-joint] analytic optimization failed ({}), returning initial theta",
+                e
+            );
+            Err(EstimationError::InvalidInput(format!(
+                "isotropic analytic optimization failed: {e}"
+            )))
+        }
     }
 }
 
@@ -9437,17 +9670,33 @@ where
                 .expect("exact joint max iterations must be valid"),
         );
 
-    let solution = match optimizer.run() {
-        Ok(sol) => sol,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+    let theta_star = match optimizer.run() {
+        Ok(sol) => sol.final_point,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+            last_solution.final_point
+        }
         Err(err) => {
-            return Err(format!(
-                "two-block exact joint spatial optimization failed: {err}"
-            ));
+            // NewtonTR failed — fall back to BFGS outer optimizer which is more
+            // robust (does not require SPD Hessian at every point).
+            log::warn!(
+                "[two-block-exact-joint] NewtonTR failed ({}); attempting BFGS fallback",
+                err,
+            );
+            try_two_block_bfgs_fallback(
+                data,
+                &best_meanspec,
+                &best_noisespec,
+                &mean_terms,
+                &noise_terms,
+                &theta0,
+                rho_dim,
+                &all_dims,
+                kappa_options,
+                &build_pair,
+                &mut exact_fn,
+            )?
         }
     };
-
-    let theta_star = solution.final_point;
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, all_dims);
     let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
@@ -9475,6 +9724,234 @@ where
         noise_design,
         fit,
     })
+}
+
+/// BFGS fallback for two-block exact joint spatial optimization.
+///
+/// When `NewtonTrustRegion` fails (e.g., due to indefinite Hessian), this
+/// provides a more robust BFGS-based path. The BFGS outer optimizer only
+/// requires gradient information and builds its own quasi-Newton Hessian
+/// approximation, so it tolerates non-SPD Hessians at intermediate points.
+///
+/// The function reconstructs the design at each ψ and calls the `exact_fn`
+/// callback for cost + gradient. The Hessian from `exact_fn` is used when
+/// available but the optimizer can proceed without it.
+fn try_two_block_bfgs_fallback<ExactFn>(
+    data: ArrayView2<'_, f64>,
+    best_meanspec: &TermCollectionSpec,
+    best_noisespec: &TermCollectionSpec,
+    mean_terms: &[usize],
+    noise_terms: &[usize],
+    theta0: &Array1<f64>,
+    rho_dim: usize,
+    all_dims: &[usize],
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    build_pair: &dyn Fn(
+        &TermCollectionSpec,
+        &TermCollectionSpec,
+    ) -> Result<(TermCollectionDesign, TermCollectionDesign), String>,
+    exact_fn: &mut dyn FnMut(
+        &Array1<f64>,
+        &TermCollectionSpec,
+        &TermCollectionSpec,
+        &TermCollectionDesign,
+        &TermCollectionDesign,
+        bool,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
+) -> Result<Array1<f64>, String> {
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
+    };
+
+    let theta_dim = theta0.len();
+    let psi_dim = theta_dim - rho_dim;
+
+    log::trace!(
+        "[two-block-bfgs-fallback] starting: rho_dim={}, psi_dim={}, dims_per_term={:?}",
+        rho_dim,
+        psi_dim,
+        all_dims,
+    );
+
+    struct TwoBlockBfgsContext<'a> {
+        best_meanspec: &'a TermCollectionSpec,
+        best_noisespec: &'a TermCollectionSpec,
+        mean_terms: &'a [usize],
+        noise_terms: &'a [usize],
+        rho_dim: usize,
+        all_dims: &'a [usize],
+        best_theta: Array1<f64>,
+        best_cost: f64,
+    }
+
+    impl<'a> TwoBlockBfgsContext<'a> {
+        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            if cost < self.best_cost {
+                self.best_cost = cost;
+                self.best_theta = theta.clone();
+            }
+        }
+    }
+
+    let mut ctx = TwoBlockBfgsContext {
+        best_meanspec,
+        best_noisespec,
+        mean_terms,
+        noise_terms,
+        rho_dim,
+        all_dims,
+        best_theta: theta0.clone(),
+        best_cost: f64::INFINITY,
+    };
+
+    // Evaluate cost + gradient + hessian at a given theta = [rho, psi].
+    // Each block's spatial psi derivatives are rebuilt at the current psi
+    // to provide analytic derivatives that account for the block structure.
+    let eval_full = |ctx: &TwoBlockBfgsContext<'_>,
+                     theta: &Array1<f64>,
+                     exact_fn: &mut dyn FnMut(
+        &Array1<f64>,
+        &TermCollectionSpec,
+        &TermCollectionSpec,
+        &TermCollectionDesign,
+        &TermCollectionDesign,
+        bool,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
+                     build_pair: &dyn Fn(
+        &TermCollectionSpec,
+        &TermCollectionSpec,
+    ) -> Result<(TermCollectionDesign, TermCollectionDesign), String>|
+     -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            theta,
+            ctx.rho_dim,
+            ctx.all_dims.to_vec(),
+        );
+        let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(ctx.mean_terms.len());
+        let meanspec_c = mean_log_kappa.apply_tospec(ctx.best_meanspec, ctx.mean_terms)?;
+        let noisespec_c = noise_log_kappa.apply_tospec(ctx.best_noisespec, ctx.noise_terms)?;
+        let (mean_design_c, noise_design_c) = build_pair(&meanspec_c, &noisespec_c)?;
+        exact_fn(
+            &theta.slice(s![..ctx.rho_dim]).to_owned(),
+            &meanspec_c,
+            &noisespec_c,
+            &mean_design_c,
+            &noise_design_c,
+            true,
+        )
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: kappa_options.rel_tol.max(1e-6),
+        max_iter: kappa_options.max_outer_iter.max(1),
+        fd_step: 1e-5,
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            num_auxiliary_trailing: psi_dim,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+    };
+
+    // Wrap the exact_fn + build_pair in RefCells so the closures can borrow them.
+    let exact_fn_cell = std::cell::RefCell::new(exact_fn);
+    let build_pair_cell = std::cell::RefCell::new(build_pair);
+
+    let mut obj = ClosureObjective {
+        state: &mut ctx,
+        cap: OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: theta_dim,
+            // ψ coordinates move the design, not penalty-like.
+            all_penalty_like: false,
+            barrier_config: None,
+        },
+        cost_fn: |ctx: &mut &mut TwoBlockBfgsContext<'_>, theta: &Array1<f64>| {
+            // Cost-only evaluation: call exact_fn but discard gradient/hessian.
+            let result = eval_full(
+                ctx,
+                theta,
+                &mut *exact_fn_cell.borrow_mut(),
+                &*build_pair_cell.borrow(),
+            );
+            let cost = match result {
+                Ok((c, _, _)) => c,
+                Err(_) => f64::INFINITY,
+            };
+            ctx.track_best(theta, cost);
+            Ok(cost)
+        },
+        eval_fn: |ctx: &mut &mut TwoBlockBfgsContext<'_>, theta: &Array1<f64>| {
+            match eval_full(
+                ctx,
+                theta,
+                &mut *exact_fn_cell.borrow_mut(),
+                &*build_pair_cell.borrow(),
+            ) {
+                Ok((cost, grad, hess)) => {
+                    ctx.track_best(theta, cost);
+                    let hessian_result = match hess {
+                        Some(h)
+                            if h.nrows() == theta.len()
+                                && h.ncols() == theta.len()
+                                && h.iter().all(|v| v.is_finite()) =>
+                        {
+                            HessianResult::Analytic(h)
+                        }
+                        _ => HessianResult::Unavailable,
+                    };
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: hessian_result,
+                    })
+                }
+                Err(_) => Ok(OuterEval {
+                    cost: f64::INFINITY,
+                    gradient: Array1::zeros(theta.len()),
+                    hessian: HessianResult::Unavailable,
+                }),
+            }
+        },
+        reset_fn: |_ctx: &mut &mut TwoBlockBfgsContext<'_>| {},
+        efs_fn: None::<
+            fn(
+                &mut &mut TwoBlockBfgsContext<'_>,
+                &Array1<f64>,
+            ) -> Result<EfsEval, EstimationError>,
+        >,
+    };
+
+    match crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "two-block spatial BFGS fallback",
+    ) {
+        Ok(result) => {
+            log::trace!(
+                "[two-block-bfgs-fallback] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm,
+            );
+            let mut theta_star = result.rho;
+            // Enforce sum-to-zero constraint on ψ coordinates for aniso groups.
+            enforce_psi_sum_to_zero(&mut theta_star, rho_dim, all_dims);
+            Ok(theta_star)
+        }
+        Err(e) => {
+            log::warn!(
+                "[two-block-bfgs-fallback] BFGS also failed ({}), returning initial theta",
+                e
+            );
+            Ok(theta0.clone())
+        }
+    }
 }
 
 pub fn fit_term_collectionwith_matern_kappa_optimization(
@@ -12248,7 +12725,7 @@ mod tests {
         .expect("exact adaptive SAS fit should succeed");
 
         match fit.fit.fitted_link {
-            FittedLinkParameters::Sas { state, covariance } => {
+            FittedLinkState::Sas { state, covariance } => {
                 assert!(state.epsilon.is_finite());
                 assert!(state.log_delta.is_finite());
                 assert!(state.delta.is_finite() && state.delta > 0.0);

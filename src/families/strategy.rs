@@ -76,7 +76,8 @@ pub fn strategy_from_fit(
     fit: &FitResult,
 ) -> Result<ResolvedFamilyStrategy, EstimationError> {
     let inverse_link = match fit.fitted_link_state(family)? {
-        FittedLinkState::Standard(link) => Some(InverseLink::Standard(link)),
+        FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(link)),
+        FittedLinkState::Standard(None) => None,
         FittedLinkState::Sas { state, .. } => Some(InverseLink::Sas(state)),
         FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(state)),
         FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state)),
