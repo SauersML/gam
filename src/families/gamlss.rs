@@ -1109,8 +1109,9 @@ fn try_binomial_alpha_betawarm_start(
     Ok((beta_t, beta_log_sigma, betaobs))
 }
 
+#[cfg(test)]
 #[derive(Clone)]
-pub struct GaussianLocationScaleSpec {
+struct GaussianLocationScaleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub mu_block: ParameterBlockInput,
@@ -1118,7 +1119,7 @@ pub struct GaussianLocationScaleSpec {
 }
 
 #[derive(Clone)]
-pub struct BinomialMeanWiggleSpec {
+struct BinomialMeanWiggleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
@@ -1144,8 +1145,9 @@ pub struct GammaLogSpec {
     pub eta_block: ParameterBlockInput,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
-pub struct BinomialLocationScaleSpec {
+struct BinomialLocationScaleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
@@ -1456,18 +1458,18 @@ fn enforce_spatial_psi_sum_to_zero(
     }
 }
 
-pub struct BinomialLocationScaleWorkflowResult {
+pub struct BinomialLocationScaleFitResult {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
-    pub betawiggle: Option<Vec<f64>>,
+    pub beta_link_wiggle: Option<Vec<f64>>,
 }
 
-pub struct GaussianLocationScaleWorkflowResult {
+pub struct GaussianLocationScaleFitResult {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
-    pub betawiggle: Option<Vec<f64>>,
+    pub beta_link_wiggle: Option<Vec<f64>>,
 }
 
 fn slice_log_lambda_block(
@@ -1488,7 +1490,8 @@ fn slice_log_lambda_block(
     Ok(log_lambdas.slice(s![start..end]).to_owned())
 }
 
-pub fn fit_gaussian_location_scale(
+#[cfg(test)]
+fn fit_gaussian_location_scale(
     spec: GaussianLocationScaleSpec,
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, String> {
@@ -1548,7 +1551,7 @@ pub fn fit_gaussian_location_scale(
     Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
-pub fn fit_binomial_mean_wiggle(
+fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, String> {
@@ -1592,7 +1595,8 @@ pub fn fit_binomial_mean_wiggle(
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
 
-pub fn fit_binomial_location_scale(
+#[cfg(test)]
+fn fit_binomial_location_scale(
     spec: BinomialLocationScaleSpec,
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, String> {
@@ -5913,33 +5917,33 @@ impl GaussianLocationScaleWiggleFamily {
     fn wiggle_dq_dq0(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d1 = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
-        if d1.ncols() != betawiggle.len() {
+        if d1.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 d1.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d1.dot(&betawiggle) + 1.0)
+        Ok(d1.dot(&beta_link_wiggle) + 1.0)
     }
 
     fn wiggle_d2q_dq02(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
-        if d2.ncols() != betawiggle.len() {
+        if d2.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle second-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle second-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 d2.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d2.dot(&betawiggle))
+        Ok(d2.dot(&beta_link_wiggle))
     }
 
     fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -5984,23 +5988,23 @@ impl GaussianLocationScaleWiggleFamily {
     fn wiggle_d3q_dq03(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d3 = self.wiggle_d3basis_constrained(q0)?;
-        if d3.ncols() != betawiggle.len() {
+        if d3.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle third-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle third-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 d3.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d3.dot(&betawiggle))
+        Ok(d3.dot(&beta_link_wiggle))
     }
 
     fn wiggle_d4q_dq04(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         if self.wiggle_degree < 4 {
             return Ok(Array1::zeros(q0.len()));
@@ -6018,11 +6022,11 @@ impl GaussianLocationScaleWiggleFamily {
                 z.nrows()
             ));
         }
-        if z.ncols() != betawiggle.len() {
+        if z.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle fourth-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle fourth-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 z.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
         let mut raw = vec![0.0; num_basis];
@@ -6036,12 +6040,12 @@ impl GaussianLocationScaleWiggleFamily {
             )
             .map_err(|e| format!("failed to evaluate wiggle fourth derivative basis: {e}"))?;
             let mut acc = 0.0;
-            for constrained_j in 0..betawiggle.len() {
+            for constrained_j in 0..beta_link_wiggle.len() {
                 let mut basis_j = 0.0;
                 for raw_k in 0..num_basis {
                     basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
                 }
-                acc += basis_j * betawiggle[constrained_j];
+                acc += basis_j * beta_link_wiggle[constrained_j];
             }
             out[i] = acc;
         }
@@ -6051,16 +6055,16 @@ impl GaussianLocationScaleWiggleFamily {
     fn wiggle_geometry(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<GaussianLocationScaleWiggleGeometry, String> {
         let basis = self.wiggle_design(q0)?;
         let basis_d1 = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
         let basis_d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
         let basis_d3 = self.wiggle_d3basis_constrained(q0)?;
-        let dq_dq0 = self.wiggle_dq_dq0(q0, betawiggle)?;
-        let d2q_dq02 = self.wiggle_d2q_dq02(q0, betawiggle)?;
-        let d3q_dq03 = self.wiggle_d3q_dq03(q0, betawiggle)?;
-        let d4q_dq04 = self.wiggle_d4q_dq04(q0, betawiggle)?;
+        let dq_dq0 = self.wiggle_dq_dq0(q0, beta_link_wiggle)?;
+        let d2q_dq02 = self.wiggle_d2q_dq02(q0, beta_link_wiggle)?;
+        let d3q_dq03 = self.wiggle_d3q_dq03(q0, beta_link_wiggle)?;
+        let d4q_dq04 = self.wiggle_d4q_dq04(q0, beta_link_wiggle)?;
         Ok(GaussianLocationScaleWiggleGeometry {
             basis,
             basis_d1,
@@ -7567,33 +7571,33 @@ impl BinomialMeanWiggleFamily {
     fn wiggle_dq_dq0(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d_constrained = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
-        if d_constrained.ncols() != betawiggle.len() {
+        if d_constrained.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 d_constrained.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d_constrained.dot(&betawiggle) + 1.0)
+        Ok(d_constrained.dot(&beta_link_wiggle) + 1.0)
     }
 
     fn wiggle_d2q_dq02(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
-        if d2.ncols() != betawiggle.len() {
+        if d2.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle second-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle second-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 d2.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d2.dot(&betawiggle))
+        Ok(d2.dot(&beta_link_wiggle))
     }
 
     fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -7638,30 +7642,30 @@ impl BinomialMeanWiggleFamily {
     fn wiggle_d3q_dq03(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d3 = self.wiggle_d3basis_constrained(q0)?;
-        if d3.ncols() != betawiggle.len() {
+        if d3.ncols() != beta_link_wiggle.len() {
             return Err(format!(
-                "wiggle third-derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                "wiggle third-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
                 d3.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d3.dot(&betawiggle))
+        Ok(d3.dot(&beta_link_wiggle))
     }
 
     fn wiggle_geometry(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<BinomialMeanWiggleGeometry, String> {
         let basis = self.wiggle_design(q0)?;
         let basis_d1 = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
         let basis_d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
-        let dq_dq0 = self.wiggle_dq_dq0(q0, betawiggle)?;
-        let d2q_dq02 = self.wiggle_d2q_dq02(q0, betawiggle)?;
-        let d3q_dq03 = self.wiggle_d3q_dq03(q0, betawiggle)?;
+        let dq_dq0 = self.wiggle_dq_dq0(q0, beta_link_wiggle)?;
+        let d2q_dq02 = self.wiggle_d2q_dq02(q0, beta_link_wiggle)?;
+        let d3q_dq03 = self.wiggle_d3q_dq03(q0, beta_link_wiggle)?;
         Ok(BinomialMeanWiggleGeometry {
             basis,
             basis_d1,
@@ -10476,50 +10480,50 @@ impl BinomialLocationScaleWiggleFamily {
     fn wiggle_dq_dq0(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d_constrained = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
-        if d_constrained.ncols() != betawiggle.len() {
+        if d_constrained.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle derivative col mismatch: got {}, expected {}",
                 d_constrained.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d_constrained.dot(&betawiggle) + 1.0)
+        Ok(d_constrained.dot(&beta_link_wiggle) + 1.0)
     }
 
     fn wiggle_d2q_dq02(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d2_constrained =
             self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
-        if d2_constrained.ncols() != betawiggle.len() {
+        if d2_constrained.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle second-derivative col mismatch: got {}, expected {}",
                 d2_constrained.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d2_constrained.dot(&betawiggle))
+        Ok(d2_constrained.dot(&beta_link_wiggle))
     }
 
     fn wiggle_d3q_dq03(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         let d3_constrained = self.wiggle_d3basis_constrained(q0)?;
-        if d3_constrained.ncols() != betawiggle.len() {
+        if d3_constrained.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle third-derivative col mismatch: got {}, expected {}",
                 d3_constrained.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
-        Ok(d3_constrained.dot(&betawiggle))
+        Ok(d3_constrained.dot(&beta_link_wiggle))
     }
 
     fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -10564,7 +10568,7 @@ impl BinomialLocationScaleWiggleFamily {
     fn wiggle_d4q_dq04(
         &self,
         q0: ArrayView1<'_, f64>,
-        betawiggle: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
         if self.wiggle_degree < 4 {
             return Ok(Array1::zeros(q0.len()));
@@ -10582,11 +10586,11 @@ impl BinomialLocationScaleWiggleFamily {
                 z.nrows()
             ));
         }
-        if z.ncols() != betawiggle.len() {
+        if z.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle fourth-derivative col mismatch: got {}, expected {}",
                 z.ncols(),
-                betawiggle.len()
+                beta_link_wiggle.len()
             ));
         }
         let mut raw = vec![0.0; num_basis];
@@ -10600,12 +10604,12 @@ impl BinomialLocationScaleWiggleFamily {
             )
             .map_err(|e| format!("failed to evaluate wiggle fourth derivative basis: {e}"))?;
             let mut acc = 0.0;
-            for constrained_j in 0..betawiggle.len() {
+            for constrained_j in 0..beta_link_wiggle.len() {
                 let mut basis_j = 0.0;
                 for raw_k in 0..num_basis {
                     basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
                 }
-                acc += basis_j * betawiggle[constrained_j];
+                acc += basis_j * beta_link_wiggle[constrained_j];
             }
             out[i] = acc;
         }
@@ -15360,11 +15364,11 @@ mod tests {
         let core_for_q0 =
             binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
                 .expect("core q0");
-        let betawiggle = Array1::from_vec(vec![0.1; wiggle_block.design.ncols()]);
+        let beta_link_wiggle = Array1::from_vec(vec![0.1; wiggle_block.design.ncols()]);
         let etaw = family
             .wiggle_design(core_for_q0.q0.view())
             .expect("wiggle design")
-            .dot(&betawiggle);
+            .dot(&beta_link_wiggle);
 
         let core = binomial_location_scale_core(
             &y,
@@ -15376,7 +15380,7 @@ mod tests {
         )
         .expect("core");
         let dq_dq0 = family
-            .wiggle_dq_dq0(core.q0.view(), betawiggle.view())
+            .wiggle_dq_dq0(core.q0.view(), beta_link_wiggle.view())
             .expect("dq/dq0");
         let (tws, lsws, w) = binomial_location_scale_working_sets(
             &y,

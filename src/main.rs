@@ -34,9 +34,7 @@ use gam::gamlss::{
     buildwiggle_block_input_from_seed,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
-use gam::hmc::{
-    FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family,
-};
+use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
     load_csvwith_schema,
@@ -67,11 +65,10 @@ use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
     SasLinkSpec, SasLinkState,
 };
-use gam::workflow::{
-    BinomialLocationScaleWorkflowRequest, FitModelRequest, FitModelResult,
-    GaussianLocationScaleWorkflowRequest, LinkWiggleWorkflowConfig,
-    StandardBinomialWiggleWorkflowConfig, StandardFitWorkflowRequest,
-    SurvivalLocationScaleWorkflowRequest, fit_model,
+use gam::{
+    BinomialLocationScaleFitRequest, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
+    SurvivalLocationScaleFitRequest, fit_model,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -943,9 +940,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sas_linkspec.as_ref(),
             "binomial mean-only link wiggle",
         )?;
-        Some(StandardBinomialWiggleWorkflowConfig {
+        Some(StandardBinomialWiggleConfig {
             link_kind,
-            wiggle: LinkWiggleWorkflowConfig {
+            wiggle: LinkWiggleConfig {
                 degree: wiggle_cfg.degree,
                 num_internal_knots: wiggle_cfg.num_internal_knots,
                 penalty_orders: wiggle_cfg.penalty_orders.clone(),
@@ -1006,7 +1003,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         )
     } else {
         progress.set_stage("fit", "optimizing penalized likelihood");
-        let fitted = match fit_model(FitModelRequest::Standard(StandardFitWorkflowRequest {
+        let fitted = match fit_model(FitRequest::Standard(StandardFitRequest {
             data: ds.values.view(),
             y: y.clone(),
             weights: weights.clone(),
@@ -1025,7 +1022,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 None
             },
         })) {
-            Ok(FitModelResult::Standard(result)) => result,
+            Ok(FitResult::Standard(result)) => result,
             Ok(_) => {
                 emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
                 return Err(
@@ -1043,9 +1040,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             fitted.resolvedspec,
             fitted.adaptive_diagnostics,
             fitted.saved_link_state,
-            match (fitted.wiggle_knots, fitted.wiggle_degree, fitted.betawiggle) {
-                (Some(knots), Some(degree), Some(betawiggle)) => {
-                    Some((knots.to_vec(), degree, betawiggle))
+            match (
+                fitted.wiggle_knots,
+                fitted.wiggle_degree,
+                fitted.beta_link_wiggle,
+            ) {
+                (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
+                    Some((knots.to_vec(), degree, beta_link_wiggle))
                 }
                 _ => None,
             },
@@ -1112,10 +1113,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.fit_result = Some(saved_fit.clone());
         payload.data_schema = Some(ds.schema.clone());
         payload.link = link_choice.as_ref().map(link_choice_to_string);
-        if let Some((wiggle_knots, wiggle_degree, betawiggle)) = standard_wiggle_meta {
-            payload.probitwiggle_knots = Some(wiggle_knots);
-            payload.probitwiggle_degree = Some(wiggle_degree);
-            payload.betawiggle = Some(betawiggle);
+        if let Some((wiggle_knots, wiggle_degree, beta_link_wiggle)) = standard_wiggle_meta {
+            payload.linkwiggle_knots = Some(wiggle_knots);
+            payload.linkwiggle_degree = Some(wiggle_degree);
+            payload.beta_link_wiggle = Some(beta_link_wiggle);
         }
         match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {
@@ -1201,8 +1202,8 @@ fn run_fitwith_predict_noise(
         let y_scaled = y.mapv(|v| v / response_scale);
         let options = blockwise_options_from_fit_args(args)?;
         progress.set_stage("fit", "optimizing gaussian location-scale model");
-        let solved = match fit_model(FitModelRequest::GaussianLocationScale(
-            GaussianLocationScaleWorkflowRequest {
+        let solved = match fit_model(FitRequest::GaussianLocationScale(
+            GaussianLocationScaleFitRequest {
                 data: ds.values.view(),
                 spec: GaussianLocationScaleTermSpec {
                     y: y_scaled,
@@ -1210,19 +1211,17 @@ fn run_fitwith_predict_noise(
                     meanspec: meanspec.clone(),
                     log_sigmaspec: noisespec.clone(),
                 },
-                wiggle: formula_linkwiggle
-                    .cloned()
-                    .map(|cfg| LinkWiggleWorkflowConfig {
-                        degree: cfg.degree,
-                        num_internal_knots: cfg.num_internal_knots,
-                        penalty_orders: cfg.penalty_orders,
-                        double_penalty: cfg.double_penalty,
-                    }),
+                wiggle: formula_linkwiggle.cloned().map(|cfg| LinkWiggleConfig {
+                    degree: cfg.degree,
+                    num_internal_knots: cfg.num_internal_knots,
+                    penalty_orders: cfg.penalty_orders,
+                    double_penalty: cfg.double_penalty,
+                }),
                 options,
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
             },
         )) {
-            Ok(FitModelResult::GaussianLocationScale(result)) => result,
+            Ok(FitResult::GaussianLocationScale(result)) => result,
             Ok(_) => {
                 emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
                 return Err(
@@ -1236,7 +1235,11 @@ fn run_fitwith_predict_noise(
             }
         };
         progress.advance_workflow(3);
-        let wiggle_meta = match (solved.wiggle_knots, solved.wiggle_degree, solved.betawiggle) {
+        let wiggle_meta = match (
+            solved.wiggle_knots,
+            solved.wiggle_degree,
+            solved.beta_link_wiggle,
+        ) {
             (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
             _ => None,
         };
@@ -1305,11 +1308,11 @@ fn run_fitwith_predict_noise(
                 Some(&gaussian_noise_transform),
                 Some(response_scale),
             );
-            if let Some((knots, degree, betawiggle)) = wiggle_meta {
-                model.probitwiggle_knots = Some(knots.mapv(|v| v * response_scale).to_vec());
-                model.probitwiggle_degree = Some(degree);
-                model.betawiggle = Some(
-                    betawiggle
+            if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
+                model.linkwiggle_knots = Some(knots.mapv(|v| v * response_scale).to_vec());
+                model.linkwiggle_degree = Some(degree);
+                model.beta_link_wiggle = Some(
+                    beta_link_wiggle
                         .into_iter()
                         .map(|coef| coef * response_scale)
                         .collect(),
@@ -1362,8 +1365,8 @@ fn run_fitwith_predict_noise(
 
     let options = blockwise_options_from_fit_args(args)?;
     progress.set_stage("fit", "optimizing binomial location-scale model");
-    let solved = match fit_model(FitModelRequest::BinomialLocationScale(
-        BinomialLocationScaleWorkflowRequest {
+    let solved = match fit_model(FitRequest::BinomialLocationScale(
+        BinomialLocationScaleFitRequest {
             data: ds.values.view(),
             spec: BinomialLocationScaleTermSpec {
                 y: y.clone(),
@@ -1372,19 +1375,17 @@ fn run_fitwith_predict_noise(
                 thresholdspec: meanspec.clone(),
                 log_sigmaspec: noisespec.clone(),
             },
-            wiggle: formula_linkwiggle
-                .cloned()
-                .map(|cfg| LinkWiggleWorkflowConfig {
-                    degree: cfg.degree,
-                    num_internal_knots: cfg.num_internal_knots,
-                    penalty_orders: cfg.penalty_orders,
-                    double_penalty: cfg.double_penalty,
-                }),
+            wiggle: formula_linkwiggle.cloned().map(|cfg| LinkWiggleConfig {
+                degree: cfg.degree,
+                num_internal_knots: cfg.num_internal_knots,
+                penalty_orders: cfg.penalty_orders,
+                double_penalty: cfg.double_penalty,
+            }),
             options,
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),
         },
     )) {
-        Ok(FitModelResult::BinomialLocationScale(result)) => result,
+        Ok(FitResult::BinomialLocationScale(result)) => result,
         Ok(_) => {
             emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
             return Err(
@@ -1412,8 +1413,14 @@ fn run_fitwith_predict_noise(
             );
         }
     }
-    let wiggle_meta = match (solved.wiggle_knots, solved.wiggle_degree, solved.betawiggle) {
-        (Some(knots), Some(degree), Some(betawiggle)) => Some((knots, degree, betawiggle)),
+    let wiggle_meta = match (
+        solved.wiggle_knots,
+        solved.wiggle_degree,
+        solved.beta_link_wiggle,
+    ) {
+        (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
+            Some((knots, degree, beta_link_wiggle))
+        }
         _ => None,
     };
     let fit = solved.fit.fit;
@@ -1473,10 +1480,10 @@ fn run_fitwith_predict_noise(
             likelihood: inverse_link_to_binomial_family(&location_scale_link_kind),
             base_link: Some(location_scale_link_kind.clone()),
         };
-        if let Some((knots, degree, betawiggle)) = wiggle_meta {
-            model.probitwiggle_knots = Some(knots.to_vec());
-            model.probitwiggle_degree = Some(degree);
-            model.betawiggle = Some(betawiggle);
+        if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
+            model.linkwiggle_knots = Some(knots.to_vec());
+            model.linkwiggle_degree = Some(degree);
+            model.beta_link_wiggle = Some(beta_link_wiggle);
         }
         write_model_json(out, &model)?;
         progress.advance_workflow(fit_total_steps);
@@ -1505,13 +1512,13 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
         // Survival always needs specialised handling (time basis, entry/exit).
         PredictModelClass::Survival => true,
         // Binomial location-scale with link wiggles needs the hand-rolled path.
-        PredictModelClass::BinomialLocationScale => model.betawiggle.is_some(),
+        PredictModelClass::BinomialLocationScale => model.beta_link_wiggle.is_some(),
         // Standard models with link wiggles need their special paths.
         PredictModelClass::Standard => {
             let family = model.likelihood();
-            model.betawiggle.is_some() && is_binomial_family(family)
+            model.beta_link_wiggle.is_some() && is_binomial_family(family)
         }
-        PredictModelClass::GaussianLocationScale => model.betawiggle.is_some(),
+        PredictModelClass::GaussianLocationScale => model.beta_link_wiggle.is_some(),
     }
 }
 
@@ -1913,7 +1920,7 @@ fn run_predict_survival(
             .unwrap_or("transformation"),
     )?;
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && !survival_timewiggle_is_present(model)
+        && !baseline_timewiggle_is_present(model)
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
@@ -1928,7 +1935,7 @@ fn run_predict_survival(
         eta_offset_exit[i] = eta_exit_i;
         derivative_offset_exit[i] = deriv_exit_i;
     }
-    let saved_timewiggle = saved_survival_timewiggle_components(
+    let saved_timewiggle = saved_baseline_timewiggle_components(
         &eta_offset_entry,
         &eta_offset_exit,
         &derivative_offset_exit,
@@ -2002,7 +2009,7 @@ fn run_predict_survival(
             .matrixvectormultiply(&beta_log_sigma);
         let sigma = eta_ls.mapv(f64::exp);
         let beta_link_wiggle = model
-            .betawiggle
+            .beta_link_wiggle
             .as_ref()
             .map(|v| Array1::from_vec(v.clone()));
         let x_link_wiggle = if beta_link_wiggle.is_some() {
@@ -2012,7 +2019,7 @@ fn run_predict_survival(
                     .zip(sigma.iter())
                     .map(|(&t, &s)| -t / s.max(1e-12)),
             );
-            saved_probitwiggle_design(&q0, model)?.map(DesignMatrix::Dense)
+            saved_linkwiggle_design(&q0, model)?.map(DesignMatrix::Dense)
         } else {
             None
         };
@@ -2233,7 +2240,7 @@ fn run_predict_survival(
 /// Special-case binomial location-scale prediction.
 ///
 /// This handles the full binomial location-scale prediction pipeline.  When
-/// the model has link wiggles (`betawiggle`), this path is required because the
+/// the model has link wiggles (`beta_link_wiggle`), this path is required because the
 /// probit-wiggle q0 augmentation and conditional integration over wiggle
 /// coefficients are not captured by `BinomialLocationScalePredictor`.
 /// For models without wiggles, the unified path in `run_predict` handles this
@@ -2318,9 +2325,9 @@ fn run_predict_binomial_location_scale(
             .zip(sigma.iter())
             .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
     );
-    let eta = apply_saved_probitwiggle(&q0, model)?.mapv(|v| v.clamp(-30.0, 30.0));
-    let wiggle_design = saved_probitwiggle_design(&q0, model)?;
-    let dq_dq0 = saved_probitwiggle_derivative_q0(&q0, model)?;
+    let eta = apply_saved_linkwiggle(&q0, model)?.mapv(|v| v.clamp(-30.0, 30.0));
+    let wiggle_design = saved_linkwiggle_design(&q0, model)?;
+    let dq_dq0 = saved_linkwiggle_derivative_q0(&q0, model)?;
     let p_t = beta_t.len();
     let p_ls = beta_noise.len();
     let pw = wiggle_design.as_ref().map(|m| m.ncols()).unwrap_or(0);
@@ -2414,12 +2421,12 @@ fn run_predict_binomial_location_scale(
             let xd_t_covtw = design_t.design.dot(&cov_tw);
             let xd_l_covlw = design_noise.design.dot(&cov_lw);
             let quadctx = gam::quadrature::QuadratureContext::new();
-            let betaw = Array1::from_vec(model.betawiggle.clone().ok_or_else(|| {
-                "binomial-location-scale wiggle model is missing betawiggle".to_string()
+            let betaw = Array1::from_vec(model.beta_link_wiggle.clone().ok_or_else(|| {
+                "binomial-location-scale wiggle model is missing beta_link_wiggle".to_string()
             })?);
             if betaw.len() != pw {
                 return Err(format!(
-                    "wiggle model/design mismatch: betawiggle has {} coefficients but expected {}",
+                    "wiggle model/design mismatch: beta_link_wiggle has {} coefficients but expected {}",
                     betaw.len(),
                     pw
                 ));
@@ -2461,7 +2468,7 @@ fn run_predict_binomial_location_scale(
                     |t, ls| {
                         let sigma = ls.exp().max(1e-12);
                         let q0 = (-t / sigma).clamp(-30.0, 30.0);
-                        let xw = saved_probitwiggle_basisrow_scalar(q0, model)?;
+                        let xw = saved_linkwiggle_basisrow_scalar(q0, model)?;
                         if xw.len() != pw {
                             return Err(format!(
                                 "saved link-wiggle scalar basis width mismatch: got {}, expected {}",
@@ -2616,13 +2623,13 @@ fn run_predict_gaussian_location_scale(
     let eta_noise = prepared_noise_design.dot(&beta_noise);
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
     let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
-    let eta = apply_saved_probitwiggle(&eta_mu_base, model)?;
+    let eta = apply_saved_linkwiggle(&eta_mu_base, model)?;
 
     let mut mean_lo = None;
     let mut mean_hi = None;
     if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
-        let wiggle_design = saved_probitwiggle_design(&eta_mu_base, model)?;
-        let dq_dq0 = saved_probitwiggle_derivative_q0(&eta_mu_base, model)?;
+        let wiggle_design = saved_linkwiggle_design(&eta_mu_base, model)?;
+        let dq_dq0 = saved_linkwiggle_derivative_q0(&eta_mu_base, model)?;
         let p_mu = beta_mu.len();
         let p_sigma = beta_noise.len();
         let p_w = wiggle_design.as_ref().map(|m| m.ncols()).unwrap_or(0);
@@ -2681,7 +2688,7 @@ fn run_predict_gaussian_location_scale(
 /// Special-case standard prediction.
 ///
 /// This handles the standard case that cannot go through `PredictableModel`:
-/// - **Link wiggles**: standard binomial models with `betawiggle` use a
+/// - **Link wiggles**: standard binomial models with `beta_link_wiggle` use a
 ///   hand-rolled path through `predict_standard_binomial_linkwiggle`.
 ///
 /// For plain standard models (no wiggle), the unified path in
@@ -3935,7 +3942,7 @@ fn build_survival_timewiggle_from_baseline(
 ) -> Result<SurvivalTimeWiggleBuild, String> {
     if eta_entry.len() != eta_exit.len() || eta_exit.len() != derivative_exit.len() {
         return Err(
-            "survival time wiggle requires matching entry/exit/derivative lengths".to_string(),
+            "baseline-timewiggle requires matching entry/exit/derivative lengths".to_string(),
         );
     }
     let n = eta_exit.len();
@@ -3957,14 +3964,14 @@ fn build_survival_timewiggle_from_baseline(
             .design
         {
             DesignMatrix::Dense(m) => m,
-            _ => return Err("survival time wiggle entry design must be dense".to_string()),
+            _ => return Err("baseline-timewiggle entry design must be dense".to_string()),
         };
     let design_exit =
         match buildwiggle_block_input_from_knots(eta_exit.view(), &knots, cfg.degree, 2, false)?
             .design
         {
             DesignMatrix::Dense(m) => m,
-            _ => return Err("survival time wiggle exit design must be dense".to_string()),
+            _ => return Err("baseline-timewiggle exit design must be dense".to_string()),
         };
     let knot_arr = knots.clone();
     let (basis_derivative, _) = create_basis::<Dense>(
@@ -3973,13 +3980,13 @@ fn build_survival_timewiggle_from_baseline(
         cfg.degree,
         BasisOptions::first_derivative(),
     )
-    .map_err(|e| format!("failed to build survival time wiggle derivative basis: {e}"))?;
+    .map_err(|e| format!("failed to build baseline-timewiggle derivative basis: {e}"))?;
     let full_derivative = basis_derivative.as_ref();
     let (z, _) = compute_geometric_constraint_transform(&knot_arr, cfg.degree, 2)
-        .map_err(|e| format!("failed to build survival time wiggle constraint transform: {e}"))?;
+        .map_err(|e| format!("failed to build baseline-timewiggle constraint transform: {e}"))?;
     if full_derivative.ncols() != z.nrows() {
         return Err(format!(
-            "survival time wiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
+            "baseline-timewiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
             full_derivative.ncols(),
             z.nrows()
         ));
@@ -4002,23 +4009,23 @@ fn build_survival_timewiggle_from_baseline(
     })
 }
 
-fn survival_timewiggle_is_present(model: &SavedModel) -> bool {
-    model.timewiggle_knots.is_some()
-        || model.timewiggle_degree.is_some()
-        || model.timewiggle_penalty_orders.is_some()
-        || model.timewiggle_double_penalty.is_some()
-        || model.betatimewiggle.is_some()
+fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
+    model.baseline_timewiggle_knots.is_some()
+        || model.baseline_timewiggle_degree.is_some()
+        || model.baseline_timewiggle_penalty_orders.is_some()
+        || model.baseline_timewiggle_double_penalty.is_some()
+        || model.beta_baseline_timewiggle.is_some()
 }
 
-fn saved_survival_timewiggle_spec(
+fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
 ) -> Result<Option<LinkWiggleFormulaSpec>, String> {
     match (
-        model.timewiggle_knots.as_ref(),
-        model.timewiggle_degree,
-        model.timewiggle_penalty_orders.as_ref(),
-        model.timewiggle_double_penalty,
-        model.betatimewiggle.as_ref(),
+        model.baseline_timewiggle_knots.as_ref(),
+        model.baseline_timewiggle_degree,
+        model.baseline_timewiggle_penalty_orders.as_ref(),
+        model.baseline_timewiggle_double_penalty,
+        model.beta_baseline_timewiggle.as_ref(),
     ) {
         (None, None, None, None, None) => Ok(None),
         (Some(knots), Some(degree), Some(penalty_orders), Some(double_penalty), Some(_)) => {
@@ -4030,7 +4037,7 @@ fn saved_survival_timewiggle_spec(
             }))
         }
         _ => Err(
-            "saved model has partial survival timewiggle metadata; expected knots+degree+penalty_order+double_penalty+betatimewiggle together"
+            "saved model has partial baseline-timewiggle metadata; expected knots+degree+penalty_order+double_penalty+beta_baseline_timewiggle together"
                 .to_string(),
         ),
     }
@@ -4067,14 +4074,14 @@ fn append_survival_timewiggle_columns(
     *x_derivative = new_derivative;
 }
 
-fn apply_saved_probitwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
+fn apply_saved_linkwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
     match (
-        model.probitwiggle_knots.as_ref(),
-        model.probitwiggle_degree,
-        model.betawiggle.as_ref(),
+        model.linkwiggle_knots.as_ref(),
+        model.linkwiggle_degree,
+        model.beta_link_wiggle.as_ref(),
     ) {
         (None, None, None) => Ok(q0.clone()),
-        (Some(knots), Some(degree), Some(betawiggle)) => {
+        (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
             let knot_arr = Array1::from_vec(knots.clone());
             let block = buildwiggle_block_input_from_knots(
                 q0.view(),
@@ -4093,42 +4100,42 @@ fn apply_saved_probitwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Arra
                     )
                 }
             };
-            if betawiggle.len() != xwiggle.ncols() {
+            if beta_link_wiggle.len() != xwiggle.ncols() {
                 return Err(format!(
-                    "saved link-wiggle dimension mismatch: betawiggle has {} coefficients but basis has {} columns",
-                    betawiggle.len(),
+                    "saved link-wiggle dimension mismatch: beta_link_wiggle has {} coefficients but basis has {} columns",
+                    beta_link_wiggle.len(),
                     xwiggle.ncols()
                 ));
             }
-            let w = xwiggle.dot(&Array1::from_vec(betawiggle.clone()));
+            let w = xwiggle.dot(&Array1::from_vec(beta_link_wiggle.clone()));
             Ok(q0 + &w)
         }
         _ => Err(
-            "saved model has partial link-wiggle metadata; expected knots+degree+betawiggle together"
+            "saved model has partial link-wiggle metadata; expected knots+degree+beta_link_wiggle together"
                 .to_string(),
         ),
     }
 }
 
-fn saved_probitwiggle_design(
+fn saved_linkwiggle_design(
     q0: &Array1<f64>,
     model: &SavedModel,
 ) -> Result<Option<Array2<f64>>, String> {
-    saved_probitwiggle_basis(q0, model, BasisOptions::value())
+    saved_linkwiggle_basis(q0, model, BasisOptions::value())
 }
 
-fn saved_probitwiggle_basis(
+fn saved_linkwiggle_basis(
     q0: &Array1<f64>,
     model: &SavedModel,
     basis_options: BasisOptions,
 ) -> Result<Option<Array2<f64>>, String> {
     match (
-        model.probitwiggle_knots.as_ref(),
-        model.probitwiggle_degree,
-        model.betawiggle.as_ref(),
+        model.linkwiggle_knots.as_ref(),
+        model.linkwiggle_degree,
+        model.beta_link_wiggle.as_ref(),
     ) {
         (None, None, None) => Ok(None),
-        (Some(knots), Some(degree), Some(betawiggle)) => {
+        (Some(knots), Some(degree), Some(beta_link_wiggle)) => {
             let knot_arr = Array1::from_vec(knots.clone());
             let (basis, _) = create_basis::<Dense>(
                 q0.view(),
@@ -4151,25 +4158,25 @@ fn saved_probitwiggle_basis(
                 ));
             }
             let constrained = full.dot(&z);
-            if betawiggle.len() != constrained.ncols() {
+            if beta_link_wiggle.len() != constrained.ncols() {
                 return Err(format!(
-                    "saved link-wiggle dimension mismatch: betawiggle has {} coefficients but basis has {} columns",
-                    betawiggle.len(),
+                    "saved link-wiggle dimension mismatch: beta_link_wiggle has {} coefficients but basis has {} columns",
+                    beta_link_wiggle.len(),
                     constrained.ncols()
                 ));
             }
             Ok(Some(constrained))
         }
         _ => Err(
-            "saved model has partial link-wiggle metadata; expected knots+degree+betawiggle together"
+            "saved model has partial link-wiggle metadata; expected knots+degree+beta_link_wiggle together"
                 .to_string(),
         ),
     }
 }
 
-fn saved_probitwiggle_basisrow_scalar(q0: f64, model: &SavedModel) -> Result<Array1<f64>, String> {
+fn saved_linkwiggle_basisrow_scalar(q0: f64, model: &SavedModel) -> Result<Array1<f64>, String> {
     let q = Array1::from_vec(vec![q0]);
-    let x = saved_probitwiggle_design(&q, model)?.ok_or_else(|| {
+    let x = saved_linkwiggle_design(&q, model)?.ok_or_else(|| {
         "saved model is missing link-wiggle metadata while wiggle path requested".to_string()
     })?;
     if x.nrows() != 1 {
@@ -4204,34 +4211,34 @@ fn invert_2x2with_jitter(a11: f64, a12: f64, a22: f64) -> [[f64; 2]; 2] {
     [[1.0 / d11.max(1e-8), 0.0], [0.0, 1.0 / d22.max(1e-8)]]
 }
 
-fn saved_probitwiggle_derivative_q0(
+fn saved_linkwiggle_derivative_q0(
     q0: &Array1<f64>,
     model: &SavedModel,
 ) -> Result<Array1<f64>, String> {
-    match saved_probitwiggle_basis(q0, model, BasisOptions::first_derivative())? {
+    match saved_linkwiggle_basis(q0, model, BasisOptions::first_derivative())? {
         Some(d_constrained) => {
-            let betawiggle = Array1::from_vec(model.betawiggle.clone().ok_or_else(|| {
+            let beta_link_wiggle = Array1::from_vec(model.beta_link_wiggle.clone().ok_or_else(|| {
                 "saved model is missing link-wiggle coefficients while derivative path requested"
                     .to_string()
             })?);
-            Ok((d_constrained.dot(&betawiggle) + 1.0).mapv(|v| v.clamp(-1e6, 1e6)))
+            Ok((d_constrained.dot(&beta_link_wiggle) + 1.0).mapv(|v| v.clamp(-1e6, 1e6)))
         }
         None => Ok(Array1::ones(q0.len())),
     }
 }
 
-fn saved_survival_timewiggle_components(
+fn saved_baseline_timewiggle_components(
     eta_entry: &Array1<f64>,
     eta_exit: &Array1<f64>,
     derivative_exit: &Array1<f64>,
     model: &SavedModel,
 ) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
     match (
-        model.timewiggle_knots.as_ref(),
-        model.timewiggle_degree,
-        model.timewiggle_penalty_orders.as_ref(),
-        model.timewiggle_double_penalty,
-        model.betatimewiggle.as_ref(),
+        model.baseline_timewiggle_knots.as_ref(),
+        model.baseline_timewiggle_degree,
+        model.baseline_timewiggle_penalty_orders.as_ref(),
+        model.baseline_timewiggle_double_penalty,
+        model.beta_baseline_timewiggle.as_ref(),
     ) {
         (None, None, None, None, None) => Ok(None),
         (Some(knots), Some(degree), Some(_), Some(_), Some(betaw)) => {
@@ -4246,7 +4253,7 @@ fn saved_survival_timewiggle_components(
             .design
             {
                 DesignMatrix::Dense(m) => m,
-                _ => return Err("saved survival time wiggle entry design must be dense".to_string()),
+                _ => return Err("saved baseline-timewiggle entry design must be dense".to_string()),
             };
             let exit = match buildwiggle_block_input_from_knots(
                 eta_exit.view(),
@@ -4258,11 +4265,11 @@ fn saved_survival_timewiggle_components(
             .design
             {
                 DesignMatrix::Dense(m) => m,
-                _ => return Err("saved survival time wiggle exit design must be dense".to_string()),
+                _ => return Err("saved baseline-timewiggle exit design must be dense".to_string()),
             };
             if entry.ncols() != betaw.len() || exit.ncols() != betaw.len() {
                 return Err(format!(
-                    "saved survival time wiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
+                    "saved baseline-timewiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
                     betaw.len(),
                     entry.ncols(),
                     exit.ncols()
@@ -4274,13 +4281,13 @@ fn saved_survival_timewiggle_components(
                 degree,
                 BasisOptions::first_derivative(),
             )
-            .map_err(|e| format!("failed to evaluate saved survival time wiggle derivative basis: {e}"))?;
+            .map_err(|e| format!("failed to evaluate saved baseline-timewiggle derivative basis: {e}"))?;
             let (z, _) = compute_geometric_constraint_transform(&knots, degree, 2)
-                .map_err(|e| format!("failed to reconstruct saved survival time wiggle transform: {e}"))?;
+                .map_err(|e| format!("failed to reconstruct saved baseline-timewiggle transform: {e}"))?;
             let mut derivative = basis_derivative.as_ref().dot(&z);
             if derivative.ncols() != betaw.len() {
                 return Err(format!(
-                    "saved survival time wiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
+                    "saved baseline-timewiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
                     betaw.len(),
                     derivative.ncols()
                 ));
@@ -4293,7 +4300,7 @@ fn saved_survival_timewiggle_components(
             Ok(Some((entry, exit, derivative)))
         }
         _ => Err(
-            "saved model has partial survival timewiggle metadata; expected knots+degree+penalty_order+double_penalty+betatimewiggle together"
+            "saved model has partial baseline-timewiggle metadata; expected knots+degree+penalty_order+double_penalty+beta_baseline_timewiggle together"
                 .to_string(),
         ),
     }
@@ -4655,23 +4662,21 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         };
         progress.set_stage("fit", "running survival location-scale optimization");
-        let fit = match fit_model(FitModelRequest::SurvivalLocationScale(
-            SurvivalLocationScaleWorkflowRequest {
+        let fit = match fit_model(FitRequest::SurvivalLocationScale(
+            SurvivalLocationScaleFitRequest {
                 data: ds.values.view(),
                 spec: buildtermspec(survival_inverse_link.clone()),
-                wiggle: effective_linkwiggle
-                    .clone()
-                    .map(|cfg| LinkWiggleWorkflowConfig {
-                        degree: cfg.degree,
-                        num_internal_knots: cfg.num_internal_knots,
-                        penalty_orders: cfg.penalty_orders,
-                        double_penalty: cfg.double_penalty,
-                    }),
+                wiggle: effective_linkwiggle.clone().map(|cfg| LinkWiggleConfig {
+                    degree: cfg.degree,
+                    num_internal_knots: cfg.num_internal_knots,
+                    penalty_orders: cfg.penalty_orders,
+                    double_penalty: cfg.double_penalty,
+                }),
                 kappa_options: kappa_options.clone(),
                 optimize_inverse_link: true,
             },
         )) {
-            Ok(FitModelResult::SurvivalLocationScale(result)) => result,
+            Ok(FitResult::SurvivalLocationScale(result)) => result,
             Ok(_) => {
                 return Err(classify_cli_error(
                     "internal survival location-scale workflow returned the wrong result variant"
@@ -4727,17 +4732,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.fit_result = Some(fit_result);
             payload.data_schema = Some(ds.schema.clone());
             payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
-            payload.probitwiggle_degree = fit.wiggle_degree;
-            payload.betawiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
-            payload.probitwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
-            payload.timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
-            payload.timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
-            payload.timewiggle_penalty_orders = effective_timewiggle
+            payload.linkwiggle_degree = fit.wiggle_degree;
+            payload.beta_link_wiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
+            payload.linkwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
+            payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
+            payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+            payload.baseline_timewiggle_penalty_orders = effective_timewiggle
                 .as_ref()
                 .map(|cfg| cfg.penalty_orders.clone());
-            payload.timewiggle_double_penalty =
+            payload.baseline_timewiggle_double_penalty =
                 effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-            payload.betatimewiggle = timewiggle_build.as_ref().map(|_| {
+            payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|_| {
                 fit.fit
                     .fit
                     .beta_time()
@@ -5090,14 +5095,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_time_knots = time_build.knots.clone();
         payload.survival_time_keep_cols = time_build.keep_cols.clone();
         payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-        payload.timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
-        payload.timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
-        payload.timewiggle_penalty_orders = effective_timewiggle
+        payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
+        payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+        payload.baseline_timewiggle_penalty_orders = effective_timewiggle
             .as_ref()
             .map(|cfg| cfg.penalty_orders.clone());
-        payload.timewiggle_double_penalty =
+        payload.baseline_timewiggle_double_penalty =
             effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-        payload.betatimewiggle = timewiggle_build.as_ref().map(|w| {
+        payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|w| {
             let start = time_build.x_exit_time.ncols();
             let end = start + w.design_exit.ncols();
             beta.slice(s![start..end]).to_vec()
@@ -5351,7 +5356,7 @@ fn run_sample_survival(
     let baseline_cfg = survival_baseline_config_from_model(model)?;
     let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
-    let saved_timewiggle = saved_survival_timewiggle_components(
+    let saved_timewiggle = saved_baseline_timewiggle_components(
         &eta_offset_entry,
         &eta_offset_exit,
         &derivative_offset_exit,
@@ -5400,13 +5405,14 @@ fn run_sample_survival(
         let start = p_time;
         let end = start + exit_w.ncols();
         let wiggle_lambda_offset = penalty_blocks.len();
-        let wiggle_cfg = saved_survival_timewiggle_spec(model)?.ok_or_else(|| {
-            "saved survival timewiggle model missing timewiggle metadata".to_string()
+        let wiggle_cfg = saved_baseline_timewiggle_spec(model)?.ok_or_else(|| {
+            "saved baseline-timewiggle model missing baseline-timewiggle metadata".to_string()
         })?;
         let wiggle_degree = wiggle_cfg.degree;
-        let wiggle_knots = Array1::from_vec(model.timewiggle_knots.clone().ok_or_else(|| {
-            "saved survival timewiggle model missing timewiggle_knots".to_string()
-        })?);
+        let wiggle_knots =
+            Array1::from_vec(model.baseline_timewiggle_knots.clone().ok_or_else(|| {
+                "saved baseline-timewiggle model missing baseline_timewiggle_knots".to_string()
+            })?);
         let mut seed = Array1::<f64>::zeros(2 * n);
         for i in 0..n {
             seed[i] = eta_offset_entry[i];
@@ -5440,7 +5446,7 @@ fn run_sample_survival(
     }
     let ridge_lambda = model.survivalridge_lambda.unwrap_or(1e-4);
     let ridge_range_start =
-        if time_build.basisname == "linear" && !survival_timewiggle_is_present(model) {
+        if time_build.basisname == "linear" && !baseline_timewiggle_is_present(model) {
             1
         } else {
             0
@@ -5500,7 +5506,7 @@ fn run_sample_survival(
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && !survival_timewiggle_is_present(model)
+        && !baseline_timewiggle_is_present(model)
     {
         model_surv
             .set_structural_monotonicity(true, p_time)
@@ -5529,7 +5535,7 @@ fn run_sample_survival(
         monotonicity,
         survivalspec,
         saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-            && !survival_timewiggle_is_present(model),
+            && !baseline_timewiggle_is_present(model),
         p_time,
         beta0.view(),
         hessian.view(),
@@ -5547,7 +5553,7 @@ fn run_sample_standard(
     family: LikelihoodFamily,
     cfg: &NutsConfig,
 ) -> Result<gam::hmc::NutsResult, String> {
-    if model.betawiggle.is_some() {
+    if model.beta_link_wiggle.is_some() {
         return Err(
             "sample for standard binomial link-wiggle models is not implemented yet".to_string(),
         );
@@ -5834,7 +5840,7 @@ fn run_generate_gaussian_location_scale(
     let eta_noise = preparednoise_design.dot(&beta_noise);
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
     let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
-    let mean = apply_saved_probitwiggle(&mean_base, model)?;
+    let mean = apply_saved_linkwiggle(&mean_base, model)?;
     Ok(gam::generative::GenerativeSpec {
         mean,
         noise: gam::generative::NoiseModel::Gaussian { sigma },
@@ -5907,7 +5913,7 @@ fn run_generate_binomial_location_scale(
             .zip(sigma.iter())
             .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
     );
-    let eta = apply_saved_probitwiggle(&q0, model)?;
+    let eta = apply_saved_linkwiggle(&q0, model)?;
     let mean = Array1::from_iter(
         eta.iter()
             .copied()
@@ -5958,7 +5964,7 @@ fn run_generate_standard_or_flexible(
             ));
         }
         let eta_base = design.design.dot(&beta);
-        let eta = apply_saved_probitwiggle(&eta_base, model)?;
+        let eta = apply_saved_linkwiggle(&eta_base, model)?;
         let mean = Array1::from_iter(
             eta.iter()
                 .map(|&v| inverse_link_mean_scalar(&saved_link_kind, v))
@@ -6597,7 +6603,7 @@ fn is_standard_binomial_linkwiggle_model(
     family: LikelihoodFamily,
     saved_link_kind: Option<&InverseLink>,
 ) -> bool {
-    model.betawiggle.is_some()
+    model.beta_link_wiggle.is_some()
         && model.predict_model_class() == PredictModelClass::Standard
         && is_binomial_family(family)
         && saved_link_kind.is_some()
@@ -6658,15 +6664,15 @@ fn predict_standard_binomial_linkwiggle(
     String,
 > {
     let eta_base = design.dot(beta);
-    let eta = apply_saved_probitwiggle(&eta_base, model)?;
+    let eta = apply_saved_linkwiggle(&eta_base, model)?;
     let mean_mode = Array1::from_iter(
         eta.iter()
             .map(|&v| inverse_link_mean_scalar(saved_link_kind, v))
             .collect::<Result<Vec<_>, _>>()?,
     );
-    let wiggle_design = saved_probitwiggle_design(&eta_base, model)?
+    let wiggle_design = saved_linkwiggle_design(&eta_base, model)?
         .ok_or_else(|| "wiggle model is missing realized wiggle basis".to_string())?;
-    let dq_dq0 = saved_probitwiggle_derivative_q0(&eta_base, model)?;
+    let dq_dq0 = saved_linkwiggle_derivative_q0(&eta_base, model)?;
     let pw = wiggle_design.ncols();
     let p_main = beta.len();
     let p_total = p_main + pw;
@@ -10007,7 +10013,7 @@ mod tests {
         BoundedCoefficientPriorSpec, CliFirthValidation, ColumnKindTag, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, LikelihoodFamily, LinkChoice, LinkMode, MODEL_VERSION,
         ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalBaselineConfig,
-        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_probitwiggle,
+        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_linkwiggle,
         build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
@@ -10016,8 +10022,8 @@ mod tests {
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_binomial_linkwiggle, pretty_familyname,
         run_generate_gaussian_location_scale, run_generate_standard_or_flexible,
-        run_predict_binomial_location_scale, saved_probitwiggle_derivative_q0,
-        saved_probitwiggle_design, summarizewiggle_domain,
+        run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
+        saved_linkwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
         validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
         write_survival_prediction_csv,
@@ -10302,14 +10308,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: Some(response_scale),
-            probitwiggle_knots: None,
-            probitwiggle_degree: None,
-            betawiggle: None,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: None,
+            linkwiggle_degree: None,
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -10345,7 +10351,7 @@ mod tests {
         beta_t: f64,
         beta_ls: f64,
         covariance: Array2<f64>,
-        betawiggle: Option<Vec<f64>>,
+        beta_link_wiggle: Option<Vec<f64>>,
         wiggle_knots: Option<Vec<f64>>,
         wiggle_degree: Option<usize>,
     ) -> SavedModel {
@@ -10378,14 +10384,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: wiggle_knots,
-            probitwiggle_degree: wiggle_degree,
-            betawiggle,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: wiggle_knots,
+            linkwiggle_degree: wiggle_degree,
+            beta_link_wiggle,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -10422,7 +10428,7 @@ mod tests {
         covariance: Array2<f64>,
         link: LinkFunction,
         family: LikelihoodFamily,
-        betawiggle: Vec<f64>,
+        beta_link_wiggle: Vec<f64>,
         wiggle_knots: Vec<f64>,
         wiggle_degree: usize,
     ) -> SavedModel {
@@ -10457,14 +10463,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: Some(wiggle_knots),
-            probitwiggle_degree: Some(wiggle_degree),
-            betawiggle: Some(betawiggle),
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: Some(wiggle_knots),
+            linkwiggle_degree: Some(wiggle_degree),
+            beta_link_wiggle: Some(beta_link_wiggle),
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -10535,14 +10541,14 @@ mod tests {
         let knots = Array1::from_vec(vec![-2.0, -2.0, -2.0, 2.0, 2.0, 2.0]);
         let wiggle_block = buildwiggle_block_input_from_knots(q_seed.view(), &knots, 2, 2, false)
             .expect("wiggle block");
-        let betawiggle = vec![0.05; wiggle_block.design.ncols()];
-        let cov = Array2::eye(1 + betawiggle.len()) * 1e-2;
+        let beta_link_wiggle = vec![0.05; wiggle_block.design.ncols()];
+        let cov = Array2::eye(1 + beta_link_wiggle.len()) * 1e-2;
         let model = intercept_only_binomial_mean_wiggle_model(
             0.1,
             cov,
             LinkFunction::Logit,
             LikelihoodFamily::BinomialLogit,
-            betawiggle,
+            beta_link_wiggle,
             knots.to_vec(),
             2,
         );
@@ -10584,14 +10590,14 @@ mod tests {
         let knots = Array1::from_vec(vec![-2.0, -2.0, -2.0, 2.0, 2.0, 2.0]);
         let wiggle_block = buildwiggle_block_input_from_knots(q_seed.view(), &knots, 2, 2, false)
             .expect("wiggle block");
-        let betawiggle = vec![0.02; wiggle_block.design.ncols()];
-        let cov = Array2::eye(1 + betawiggle.len()) * 1e-2;
+        let beta_link_wiggle = vec![0.02; wiggle_block.design.ncols()];
+        let cov = Array2::eye(1 + beta_link_wiggle.len()) * 1e-2;
         let model = intercept_only_binomial_mean_wiggle_model(
             -0.2,
             cov,
             LinkFunction::Probit,
             LikelihoodFamily::BinomialProbit,
-            betawiggle,
+            beta_link_wiggle,
             knots.to_vec(),
             2,
         );
@@ -10640,15 +10646,15 @@ mod tests {
     fn mcwiggle_posterior_mean(
         beta_t: f64,
         beta_ls: f64,
-        betawiggle: &[f64],
+        beta_link_wiggle: &[f64],
         cov_diag: &[f64],
         model: &SavedModel,
         draws: usize,
         seed: u64,
     ) -> f64 {
-        assert_eq!(cov_diag.len(), 2 + betawiggle.len());
+        assert_eq!(cov_diag.len(), 2 + beta_link_wiggle.len());
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut beta_draws = Array2::<f64>::zeros((draws, betawiggle.len()));
+        let mut beta_draws = Array2::<f64>::zeros((draws, beta_link_wiggle.len()));
         let mut q0_draws = Array1::<f64>::zeros(draws);
         for i in 0..draws {
             let z_t: f64 = StandardNormal.sample(&mut rng);
@@ -10656,12 +10662,12 @@ mod tests {
             let t = beta_t + cov_diag[0].max(0.0).sqrt() * z_t;
             let ls = beta_ls + cov_diag[1].max(0.0).sqrt() * z_ls;
             q0_draws[i] = (-t / ls.exp().max(1e-12)).clamp(-30.0, 30.0);
-            for j in 0..betawiggle.len() {
+            for j in 0..beta_link_wiggle.len() {
                 let zw: f64 = StandardNormal.sample(&mut rng);
-                beta_draws[[i, j]] = betawiggle[j] + cov_diag[2 + j].max(0.0).sqrt() * zw;
+                beta_draws[[i, j]] = beta_link_wiggle[j] + cov_diag[2 + j].max(0.0).sqrt() * zw;
             }
         }
-        let wiggle_design = saved_probitwiggle_design(&q0_draws, model)
+        let wiggle_design = saved_linkwiggle_design(&q0_draws, model)
             .expect("wiggle design")
             .expect("wiggle model should produce basis");
         let mut acc = 0.0;
@@ -11689,14 +11695,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: None,
-            probitwiggle_degree: None,
-            betawiggle: None,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: None,
+            linkwiggle_degree: None,
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: Some("start".to_string()),
             survival_exit: Some("stop".to_string()),
             survival_event: Some("event".to_string()),
@@ -11733,7 +11739,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_survival_timewiggle_components_return_none_without_metadata() {
+    fn saved_baseline_timewiggle_components_return_none_without_metadata() {
         let eta = array![0.1, 0.2];
         let deriv = array![0.3, 0.4];
         let model = SavedModel::from_payload(FittedModelPayload {
@@ -11759,14 +11765,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: None,
-            probitwiggle_degree: None,
-            betawiggle: None,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: None,
+            linkwiggle_degree: None,
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: Some("entry".to_string()),
             survival_exit: Some("exit".to_string()),
             survival_event: Some("event".to_string()),
@@ -11796,13 +11802,13 @@ mod tests {
             resolved_termspec_noise: None,
             adaptive_regularization_diagnostics: None,
         });
-        let got = super::saved_survival_timewiggle_components(&eta, &eta, &deriv, &model)
-            .expect("timewiggle metadata check");
+        let got = super::saved_baseline_timewiggle_components(&eta, &eta, &deriv, &model)
+            .expect("baseline-timewiggle metadata check");
         assert!(got.is_none());
     }
 
     #[test]
-    fn run_predict_survival_supports_saved_timewiggle_model() {
+    fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         let age_entry = array![10.0, 12.0];
         let age_exit = array![20.0, 24.0];
         let baseline_cfg = SurvivalBaselineConfig {
@@ -11822,14 +11828,14 @@ mod tests {
             ]),
             "timewiggle(degree=3, internal_knots=4)",
         )
-        .expect("timewiggle cfg");
+        .expect("baseline-timewiggle cfg");
         let built = super::build_survival_timewiggle_from_baseline(
             &eta_entry,
             &eta_exit,
             &derivative_exit,
             &wiggle_cfg,
         )
-        .expect("timewiggle build");
+        .expect("baseline-timewiggle build");
         let beta = Array1::<f64>::zeros(built.design_exit.ncols() + 1);
         let p = beta.len();
         let fit_result = core_saved_fit_result(
@@ -11863,14 +11869,16 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: None,
-            probitwiggle_degree: None,
-            betawiggle: None,
-            timewiggle_knots: Some(built.knots.to_vec()),
-            timewiggle_degree: Some(built.degree),
-            timewiggle_penalty_orders: Some(wiggle_cfg.penalty_orders.clone()),
-            timewiggle_double_penalty: Some(wiggle_cfg.double_penalty),
-            betatimewiggle: Some(Array1::<f64>::zeros(built.design_exit.ncols()).to_vec()),
+            linkwiggle_knots: None,
+            linkwiggle_degree: None,
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: Some(built.knots.to_vec()),
+            baseline_timewiggle_degree: Some(built.degree),
+            baseline_timewiggle_penalty_orders: Some(wiggle_cfg.penalty_orders.clone()),
+            baseline_timewiggle_double_penalty: Some(wiggle_cfg.double_penalty),
+            beta_baseline_timewiggle: Some(
+                Array1::<f64>::zeros(built.design_exit.ncols()).to_vec(),
+            ),
             survival_entry: Some("entry".to_string()),
             survival_exit: Some("exit".to_string()),
             survival_event: Some("event".to_string()),
@@ -11903,7 +11911,7 @@ mod tests {
         let data = array![[10.0, 20.0], [12.0, 24.0]];
         let col_map = HashMap::from([("entry".to_string(), 0usize), ("exit".to_string(), 1usize)]);
         let out_dir = tempdir().expect("tempdir");
-        let out_path = out_dir.path().join("survival_timewiggle_pred.csv");
+        let out_path = out_dir.path().join("survival_baseline_timewiggle_pred.csv");
         let args = PredictArgs {
             model: PathBuf::from("unused.model.json"),
             new_data: PathBuf::from("unused.csv"),
@@ -13101,7 +13109,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_probitwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
+    fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
         let q0 = array![-1.25, -0.2, 0.35, 1.4];
         let knots = vec![-2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0];
         let design = create_basis::<Dense>(
@@ -13113,7 +13121,7 @@ mod tests {
         .expect("build raw basis")
         .0;
         let constrained_cols = design.ncols().saturating_sub(2);
-        let betawiggle = (0..constrained_cols)
+        let beta_link_wiggle = (0..constrained_cols)
             .map(|j| match j % 5 {
                 0 => 0.2,
                 1 => -0.15,
@@ -13143,14 +13151,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: Some(knots),
-            probitwiggle_degree: Some(3),
-            betawiggle: Some(betawiggle.clone()),
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: Some(knots),
+            linkwiggle_degree: Some(3),
+            beta_link_wiggle: Some(beta_link_wiggle.clone()),
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -13181,18 +13189,17 @@ mod tests {
             adaptive_regularization_diagnostics: None,
         });
 
-        let exact = saved_probitwiggle_derivative_q0(&q0, &model).expect("exact derivative");
-        let constrained_deriv = saved_probitwiggle_design(&q0, &model)
+        let exact = saved_linkwiggle_derivative_q0(&q0, &model).expect("exact derivative");
+        let constrained_deriv = saved_linkwiggle_design(&q0, &model)
             .expect("design path should succeed")
             .expect("wiggle design")
             .ncols();
-        assert_eq!(constrained_deriv, betawiggle.len());
+        assert_eq!(constrained_deriv, beta_link_wiggle.len());
 
-        let d_basis =
-            super::saved_probitwiggle_basis(&q0, &model, BasisOptions::first_derivative())
-                .expect("derivative basis")
-                .expect("wiggle derivative basis");
-        let expected = d_basis.dot(&Array1::from_vec(betawiggle)) + 1.0;
+        let d_basis = super::saved_linkwiggle_basis(&q0, &model, BasisOptions::first_derivative())
+            .expect("derivative basis")
+            .expect("wiggle derivative basis");
+        let expected = d_basis.dot(&Array1::from_vec(beta_link_wiggle)) + 1.0;
         for i in 0..q0.len() {
             assert!(
                 (exact[i] - expected[i]).abs() <= 1e-12,
@@ -13315,7 +13322,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_probitwiggle_design_returnsnonewhen_metadata_missing() {
+    fn saved_linkwiggle_design_returnsnonewhen_metadata_missing() {
         let q0 = array![-0.3, 0.2];
         let model = SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
@@ -13338,14 +13345,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: None,
-            probitwiggle_degree: None,
-            betawiggle: None,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: None,
+            linkwiggle_degree: None,
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -13375,12 +13382,12 @@ mod tests {
             resolved_termspec_noise: None,
             adaptive_regularization_diagnostics: None,
         });
-        let design = saved_probitwiggle_design(&q0, &model).expect("wiggle design");
+        let design = saved_linkwiggle_design(&q0, &model).expect("wiggle design");
         assert!(design.is_none());
     }
 
     #[test]
-    fn apply_saved_probitwiggle_rejects_partial_metadata() {
+    fn apply_saved_linkwiggle_rejects_partial_metadata() {
         let q0 = array![-0.2, 0.1];
         let model = SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
@@ -13403,14 +13410,14 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
-            probitwiggle_knots: Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
-            probitwiggle_degree: Some(2),
-            betawiggle: None,
-            timewiggle_knots: None,
-            timewiggle_degree: None,
-            timewiggle_penalty_orders: None,
-            timewiggle_double_penalty: None,
-            betatimewiggle: None,
+            linkwiggle_knots: Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
+            linkwiggle_degree: Some(2),
+            beta_link_wiggle: None,
+            baseline_timewiggle_knots: None,
+            baseline_timewiggle_degree: None,
+            baseline_timewiggle_penalty_orders: None,
+            baseline_timewiggle_double_penalty: None,
+            beta_baseline_timewiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -13440,8 +13447,7 @@ mod tests {
             resolved_termspec_noise: None,
             adaptive_regularization_diagnostics: None,
         });
-        let err =
-            apply_saved_probitwiggle(&q0, &model).expect_err("expected partial-metadata error");
+        let err = apply_saved_linkwiggle(&q0, &model).expect_err("expected partial-metadata error");
         assert!(err.contains("partial link-wiggle metadata"));
     }
 
@@ -13500,7 +13506,7 @@ mod tests {
     fn probit_location_scalewiggle_posterior_mean_matches_mc_in_largevariance_regime() {
         let beta_t = -0.4;
         let beta_ls = -1.3;
-        let betawiggle = vec![0.25, -0.1, 0.05];
+        let beta_link_wiggle = vec![0.25, -0.1, 0.05];
         let cov_diag = vec![0.2, 10.0, 0.4, 0.3, 0.2];
         let cov = array![
             [cov_diag[0], 0.0, 0.0, 0.0, 0.0],
@@ -13513,13 +13519,20 @@ mod tests {
             beta_t,
             beta_ls,
             cov,
-            Some(betawiggle.clone()),
+            Some(beta_link_wiggle.clone()),
             Some(vec![-3.0, -3.0, -3.0, -3.0, 0.0, 3.0, 3.0, 3.0, 3.0]),
             Some(3),
         );
         let predicted = posterior_mean_prediction_for_model(&model);
-        let mc =
-            mcwiggle_posterior_mean(beta_t, beta_ls, &betawiggle, &cov_diag, &model, 80_000, 99);
+        let mc = mcwiggle_posterior_mean(
+            beta_t,
+            beta_ls,
+            &beta_link_wiggle,
+            &cov_diag,
+            &model,
+            80_000,
+            99,
+        );
         assert!(
             (predicted - mc).abs() < 0.03,
             "wiggle posterior mean should match Monte Carlo in the hard regime: predicted={predicted}, mc={mc}"
