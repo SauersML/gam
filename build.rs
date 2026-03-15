@@ -5242,12 +5242,36 @@ fn analyze_degenerate_boolean_expression_inner(expression: &str, depth: usize) -
     analyze_degenerate_boolean_expression_inner(without_negation, depth + 1)
 }
 
+/// Returns true if the normalized expression contains a masked string literal
+/// (a run of 'x' characters that replaced the original string content during
+/// `strip_comments_and_strings_for_content`).  Two atoms that differ only in
+/// their string-literal contents will look identical after masking, so we must
+/// skip the raw-equality duplicate check when masked strings are present.
+fn contains_masked_string_literal(normalized: &str) -> bool {
+    // After normalization (whitespace stripped), a masked string literal shows
+    // up as a run of 3+ consecutive 'x' characters (quote + at least one
+    // content char + quote, all mapped to 'x').  We use 3 as the threshold to
+    // avoid matching short identifiers like "xx".
+    let mut consecutive = 0u32;
+    for ch in normalized.chars() {
+        if ch == 'x' {
+            consecutive += 1;
+            if consecutive >= 3 {
+                return true;
+            }
+        } else {
+            consecutive = 0;
+        }
+    }
+    false
+}
+
 fn diagnose_boolean_pair(
     join: BooleanJoin,
     left: &ParsedBoolAtom,
     right: &ParsedBoolAtom,
 ) -> Option<String> {
-    if left.raw == right.raw {
+    if left.raw == right.raw && !contains_masked_string_literal(&left.raw) {
         return Some(format!(
             "duplicate clause repeated on both sides of `{}`",
             join.symbol()

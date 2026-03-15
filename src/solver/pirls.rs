@@ -426,7 +426,7 @@ pub trait WorkingModel {
     fn update_with_curvature(
         &mut self,
         beta: &Coefficients,
-        _curvature: HessianCurvatureKind,
+        _: HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
         self.update(beta)
     }
@@ -4588,7 +4588,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         final_d2mu_deta2,
         final_d3mu_deta3,
         penalty_term,
-        hessian_curvature: _hessian_curvature,
         ..
     } = final_state;
 
@@ -5581,7 +5580,7 @@ fn compute_observed_hessian_curvature_arrays(
     fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-    debug_assert!(supports_observed_hessian_curvature_for_inverse_link(
+    assert!(supports_observed_hessian_curvature_for_inverse_link(
         inverse_link
     ));
     let n = eta.len();

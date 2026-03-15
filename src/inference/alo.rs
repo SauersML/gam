@@ -57,6 +57,7 @@ const LEVERAGE_HIGH_THRESHOLD: f64 = 0.99;
 const LEVERAGE_VERY_HIGH_THRESHOLD: f64 = 0.999;
 const LEVERAGE_RATE_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
 const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
+const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 #[inline]
 fn percentile_index(sample_size: usize, quantile: f64) -> usize {
@@ -74,6 +75,27 @@ fn percentile_from_sorted(sorted: &[f64], quantile: f64) -> f64 {
     } else {
         sorted[percentile_index(sorted.len(), quantile)]
     }
+}
+
+#[inline]
+fn multiblock_col_offsets(block_designs: &[Array2<f64>]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(block_designs.len());
+    let mut off = 0usize;
+    for design in block_designs {
+        offsets.push(off);
+        off += design.ncols();
+    }
+    offsets
+}
+
+#[inline]
+fn multiblock_alo_chunk_size(p_tot: usize, n_blocks: usize, n_obs: usize) -> usize {
+    if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
+        return 1;
+    }
+    let bytes_per_obs = (p_tot * n_blocks * std::mem::size_of::<f64>()).max(1);
+    let budget_obs = (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / bytes_per_obs).max(1);
+    budget_obs.min(n_obs)
 }
 
 fn compute_alo_diagnostics_from_pirls_impl(
@@ -604,45 +626,8 @@ pub fn compute_multiblock_alo(
         )));
     }
 
-    // --- Precompute Q_b = H⁻¹ X_bᵀ for each block ---
-    // Each Q_b is p_tot × n.
-    let q_blocks: Vec<Array2<f64>> = {
-        let mut blocks = Vec::with_capacity(b);
-        for blk in 0..b {
-            let x_b = &input.block_designs[blk];
-            debug_assert_eq!(x_b.nrows(), n);
-            // Q_b = H⁻¹ X_bᵀ  via direct multiplication (H⁻¹ is already provided).
-            let p_b = x_b.ncols();
-            let mut q = Array2::<f64>::zeros((p_tot, n));
-            // q[:,i] = H⁻¹ · x_b[i,:]ᵀ
-            // Batched: Q = H⁻¹ · X_bᵀ
-            for i in 0..n {
-                for k in 0..p_tot {
-                    let mut acc = 0.0f64;
-                    // Column offset of block b in the joint parameter vector.
-                    let col_offset: usize =
-                        input.block_designs[..blk].iter().map(|d| d.ncols()).sum();
-                    for j in 0..p_b {
-                        acc += input.penalized_hessian_inv[(k, col_offset + j)] * x_b[(i, j)];
-                    }
-                    q[(k, i)] = acc;
-                }
-            }
-            blocks.push(q);
-        }
-        blocks
-    };
-
-    // Precompute column offsets for each block.
-    let col_offsets: Vec<usize> = {
-        let mut offsets = Vec::with_capacity(b);
-        let mut off = 0usize;
-        for blk in 0..b {
-            offsets.push(off);
-            off += input.block_designs[blk].ncols();
-        }
-        offsets
-    };
+    let col_offsets = multiblock_col_offsets(input.block_designs);
+    let chunk_size = multiblock_alo_chunk_size(p_tot, b, n);
 
     let ib = Array2::<f64>::eye(b);
 
@@ -651,183 +636,161 @@ pub fn compute_multiblock_alo(
     let mut alo_variance = Vec::with_capacity(n);
     let mut cook_distance = Array1::<f64>::zeros(n);
 
-    for i in 0..n {
-        // --- Assemble A_i = G_i = X_i H⁻¹ X_iᵀ  (B × B) ---
-        // A_i[a, bb] = x_{a,i}ᵀ · Q_{bb}[:,i]
-        //            = Σ_k X_a[i,k] · Q_{bb}[off_a + k, i]
-        let mut a_i = Array2::<f64>::zeros((b, b));
-        for a in 0..b {
-            let x_a = &input.block_designs[a];
-            let p_a = x_a.ncols();
-            let off_a = col_offsets[a];
-            for bb in 0..b {
-                let q_bb = &q_blocks[bb];
-                let mut dot = 0.0f64;
-                for k in 0..p_a {
-                    dot += x_a[(i, k)] * q_bb[(off_a + k, i)];
+    for chunk_start in (0..n).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size).min(n);
+        let chunk_len = chunk_end - chunk_start;
+        let mut q_blocks = Vec::with_capacity(b);
+        for blk in 0..b {
+            let x_chunk_t = input.block_designs[blk]
+                .slice(s![chunk_start..chunk_end, ..])
+                .t()
+                .to_owned();
+            let off_b = col_offsets[blk];
+            let h_slice = input
+                .penalized_hessian_inv
+                .slice(s![.., off_b..off_b + x_chunk_t.nrows()])
+                .to_owned();
+            q_blocks.push(h_slice.dot(&x_chunk_t));
+        }
+
+        for local_i in 0..chunk_len {
+            let i = chunk_start + local_i;
+            // --- Assemble A_i = G_i = X_i H⁻¹ X_iᵀ  (B × B) ---
+            let mut a_i = Array2::<f64>::zeros((b, b));
+            for a in 0..b {
+                let x_a = &input.block_designs[a];
+                let p_a = x_a.ncols();
+                let off_a = col_offsets[a];
+                for bb in 0..b {
+                    let q_bb = &q_blocks[bb];
+                    let mut dot = 0.0f64;
+                    for k in 0..p_a {
+                        dot += x_a[(i, k)] * q_bb[(off_a + k, local_i)];
+                    }
+                    a_i[(a, bb)] = dot;
                 }
-                a_i[(a, bb)] = dot;
             }
-        }
 
-        // H_ii = A_i W_i  (B × B), used only for leverage computation.
-        let w_i = &input.block_weights[i];
-        let mut h_ii = Array2::<f64>::zeros((b, b));
-        for r in 0..b {
-            for c in 0..b {
-                let mut v = 0.0f64;
-                for k in 0..b {
-                    v += a_i[(r, k)] * w_i[(k, c)];
+            let w_i = &input.block_weights[i];
+            let mut h_ii = Array2::<f64>::zeros((b, b));
+            for r in 0..b {
+                for c in 0..b {
+                    let mut v = 0.0f64;
+                    for k in 0..b {
+                        v += a_i[(r, k)] * w_i[(k, c)];
+                    }
+                    h_ii[(r, c)] = v;
                 }
-                h_ii[(r, c)] = v;
             }
-        }
 
-        // Leverage = tr(H_ii) = tr(A_i W_i)
-        let mut tr = 0.0f64;
-        for d in 0..b {
-            tr += h_ii[(d, d)];
-        }
-        leverage[i] = tr;
-
-        // --- ALO correction using W_i⁻¹-free formula ---
-        // Δη_i = A_i (I - W_i A_i)⁻¹ s_i
-        //
-        // This avoids requiring W_i⁻¹, which is critical when W_i is
-        // singular (e.g. boundary observations in survival models).
-        let s_i = &input.scores[i];
-        let eta_i = &input.eta_hat[i];
-
-        // Compute (I - W_i A_i)  (B × B)
-        // (W_i A_i)[r,c] = Σ_k W_i[r,k] A_i[k,c]
-        let mut imwa = ib.clone();
-        for r in 0..b {
-            for c in 0..b {
-                let mut wa_rc = 0.0f64;
-                for k in 0..b {
-                    wa_rc += w_i[(r, k)] * a_i[(k, c)];
-                }
-                imwa[(r, c)] -= wa_rc;
-            }
-        }
-
-        // Check conditioning of (I - W_i A_i).  If near-singular, regularise.
-        let imwa_det = det_small(&imwa, b);
-        let imwa_to_solve = if imwa_det.abs() < 1e-12 {
-            let eps = 1e-6;
-            let mut reg = imwa.clone();
+            let mut tr = 0.0f64;
             for d in 0..b {
-                reg[(d, d)] += eps;
+                tr += h_ii[(d, d)];
             }
-            reg
-        } else {
-            imwa
-        };
+            leverage[i] = tr;
 
-        // Solve (I - W_i A_i) v = s_i  for v
-        let v_i = solve_small(&imwa_to_solve, s_i, b);
+            let s_i = &input.scores[i];
+            let eta_i = &input.eta_hat[i];
 
-        // Δη_i = A_i v_i
-        let mut delta_eta = Array1::<f64>::zeros(b);
-        for r in 0..b {
-            let mut acc = 0.0f64;
-            for k in 0..b {
-                acc += a_i[(r, k)] * v_i[k];
-            }
-            delta_eta[r] = acc;
-        }
-
-        // η̃_i = η̂_i + Δη_i
-        let mut corrected = eta_i.clone();
-        for d in 0..b {
-            corrected[d] += delta_eta[d];
-        }
-        eta_tilde.push(corrected);
-
-        // --- Cook-type ALO influence: D_i = Δη_iᵀ W_i Δη_i ---
-        let mut cook = 0.0f64;
-        for r in 0..b {
-            let mut w_delta_r = 0.0f64;
-            for k in 0..b {
-                w_delta_r += w_i[(r, k)] * delta_eta[k];
-            }
-            cook += delta_eta[r] * w_delta_r;
-        }
-        cook_distance[i] = cook;
-
-        // --- ALO variance diagonals ---
-        // Var(Δη_i) ≈ A_i (I - W_i A_i)⁻¹ W_i (I - A_i W_i)⁻¹ A_iᵀ
-        //
-        // Let M = (I - W_i A_i)⁻¹.  We already have the factored form.
-        // We also need (I - A_i W_i)⁻¹ = ((I - W_i A_i)ᵀ)⁻¹ is NOT the
-        // same in general.  Compute (I - A_i W_i) separately.
-        let mut imaw = ib.clone();
-        for r in 0..b {
-            for c in 0..b {
-                let mut aw_rc = 0.0f64;
-                for k in 0..b {
-                    aw_rc += a_i[(r, k)] * w_i[(k, c)];
+            let mut imwa = ib.clone();
+            for r in 0..b {
+                for c in 0..b {
+                    let mut wa_rc = 0.0f64;
+                    for k in 0..b {
+                        wa_rc += w_i[(r, k)] * a_i[(k, c)];
+                    }
+                    imwa[(r, c)] -= wa_rc;
                 }
-                imaw[(r, c)] -= aw_rc;
-            }
-        }
-
-        let imaw_det = det_small(&imaw, b);
-        let imaw_to_solve = if imaw_det.abs() < 1e-12 {
-            let eps = 1e-6;
-            let mut reg = imaw.clone();
-            for d in 0..b {
-                reg[(d, d)] += eps;
-            }
-            reg
-        } else {
-            imaw
-        };
-
-        // We need the full variance matrix diagonal.  Build it column by column.
-        // V = A_i M W_i Mᵀ' A_iᵀ  where M = (I - W_i A_i)⁻¹, M' = (I - A_i W_i)⁻¹
-        // Actually: V = A_i · (I-W_i A_i)⁻¹ · W_i · (I-A_i W_i)⁻¹ · A_iᵀ
-        //
-        // Compute column-by-column: for each column c of A_iᵀ (= row c of A_i),
-        // solve (I - A_i W_i) u_c = a_i[c,:] (the c-th row of A_i as a column),
-        // then multiply W_i u_c, then solve (I - W_i A_i) t_c = W_i u_c,
-        // then V[:,c] = A_i t_c.  The diagonal entry is V[c,c] = a_i[c,:] · t_c.
-        //
-        // But we only need diag(V), so:
-        // V[d,d] = (A_i t_d)[d] = Σ_k A_i[d,k] t_d[k]  where t_d solves
-        //   (I - W_i A_i) t_d = W_i u_d  and  (I - A_i W_i) u_d = A_i^T[:,d]
-        let mut var_diag = Array1::<f64>::zeros(b);
-        for d in 0..b {
-            // A_iᵀ[:,d] = A_i[d,:] as a column vector
-            let mut a_col_d = Array1::<f64>::zeros(b);
-            for k in 0..b {
-                a_col_d[k] = a_i[(d, k)];
             }
 
-            // Solve (I - A_i W_i) u_d = a_col_d
-            let u_d = solve_small(&imaw_to_solve, &a_col_d, b);
+            let imwa_det = det_small(&imwa, b);
+            let imwa_to_solve = if imwa_det.abs() < 1e-12 {
+                let eps = 1e-6;
+                let mut reg = imwa.clone();
+                for d in 0..b {
+                    reg[(d, d)] += eps;
+                }
+                reg
+            } else {
+                imwa
+            };
 
-            // w_u_d = W_i u_d
-            let mut w_u_d = Array1::<f64>::zeros(b);
+            let v_i = solve_small(&imwa_to_solve, s_i, b);
+
+            let mut delta_eta = Array1::<f64>::zeros(b);
             for r in 0..b {
                 let mut acc = 0.0f64;
                 for k in 0..b {
-                    acc += w_i[(r, k)] * u_d[k];
+                    acc += a_i[(r, k)] * v_i[k];
                 }
-                w_u_d[r] = acc;
+                delta_eta[r] = acc;
             }
 
-            // Solve (I - W_i A_i) t_d = w_u_d
-            let t_d = solve_small(&imwa_to_solve, &w_u_d, b);
-
-            // V[d,d] = A_i[d,:] · t_d
-            let mut v_dd = 0.0f64;
-            for k in 0..b {
-                v_dd += a_i[(d, k)] * t_d[k];
+            let mut corrected = eta_i.clone();
+            for d in 0..b {
+                corrected[d] += delta_eta[d];
             }
-            var_diag[d] = v_dd.max(0.0);
+            eta_tilde.push(corrected);
+
+            let mut cook = 0.0f64;
+            for r in 0..b {
+                let mut w_delta_r = 0.0f64;
+                for k in 0..b {
+                    w_delta_r += w_i[(r, k)] * delta_eta[k];
+                }
+                cook += delta_eta[r] * w_delta_r;
+            }
+            cook_distance[i] = cook;
+
+            let mut imaw = ib.clone();
+            for r in 0..b {
+                for c in 0..b {
+                    let mut aw_rc = 0.0f64;
+                    for k in 0..b {
+                        aw_rc += a_i[(r, k)] * w_i[(k, c)];
+                    }
+                    imaw[(r, c)] -= aw_rc;
+                }
+            }
+
+            let imaw_det = det_small(&imaw, b);
+            let imaw_to_solve = if imaw_det.abs() < 1e-12 {
+                let eps = 1e-6;
+                let mut reg = imaw.clone();
+                for d in 0..b {
+                    reg[(d, d)] += eps;
+                }
+                reg
+            } else {
+                imaw
+            };
+
+            let mut var_diag = Array1::<f64>::zeros(b);
+            for d in 0..b {
+                let mut a_col_d = Array1::<f64>::zeros(b);
+                for k in 0..b {
+                    a_col_d[k] = a_i[(d, k)];
+                }
+
+                let u_d = solve_small(&imaw_to_solve, &a_col_d, b);
+                let mut w_u_d = Array1::<f64>::zeros(b);
+                for r in 0..b {
+                    let mut acc = 0.0f64;
+                    for k in 0..b {
+                        acc += w_i[(r, k)] * u_d[k];
+                    }
+                    w_u_d[r] = acc;
+                }
+
+                let t_d = solve_small(&imwa_to_solve, &w_u_d, b);
+                let mut v_dd = 0.0f64;
+                for k in 0..b {
+                    v_dd += a_i[(d, k)] * t_d[k];
+                }
+                var_diag[d] = v_dd.max(0.0);
+            }
+            alo_variance.push(var_diag);
         }
-        alo_variance.push(var_diag);
     }
 
     Ok(MultiBlockAloDiagnostics {
@@ -856,64 +819,46 @@ pub fn compute_multiblock_alo_leverages(
     let b = n_blocks;
     let p_tot = penalized_hessian_inv.nrows();
 
-    // Precompute column offsets.
-    let col_offsets: Vec<usize> = {
-        let mut offsets = Vec::with_capacity(b);
-        let mut off = 0usize;
-        for blk in 0..b {
-            offsets.push(off);
-            off += block_designs[blk].ncols();
-        }
-        offsets
-    };
-
-    // Precompute Q_b = H⁻¹ X_bᵀ for each block.
-    let q_blocks: Vec<Array2<f64>> = {
-        let mut blocks = Vec::with_capacity(b);
-        for blk in 0..b {
-            let x_b = &block_designs[blk];
-            let p_b = x_b.ncols();
-            let off_b = col_offsets[blk];
-            let mut q = Array2::<f64>::zeros((p_tot, n));
-            for i in 0..n {
-                for k in 0..p_tot {
-                    let mut acc = 0.0f64;
-                    for j in 0..p_b {
-                        acc += penalized_hessian_inv[(k, off_b + j)] * x_b[(i, j)];
-                    }
-                    q[(k, i)] = acc;
-                }
-            }
-            blocks.push(q);
-        }
-        blocks
-    };
+    let col_offsets = multiblock_col_offsets(block_designs);
+    let chunk_size = multiblock_alo_chunk_size(p_tot, b, n);
 
     let mut leverage = Array1::<f64>::zeros(n);
 
-    for i in 0..n {
-        // Assemble G_i = X_i H⁻¹ X_iᵀ (B × B), then H_ii = G_i W_i.
-        // We only need tr(H_ii) = Σ_d (G_i W_i)_{dd}.
-        let w_i = &block_weights[i];
-
-        // For tr(H_ii) = tr(G_i W_i) = Σ_{a,k} G_i[a,k] W_i[k,a]
-        let mut tr = 0.0f64;
-        for a in 0..b {
-            let x_a = &block_designs[a];
-            let p_a = x_a.ncols();
-            let off_a = col_offsets[a];
-            for k in 0..b {
-                // G_i[a, k]
-                let q_k = &q_blocks[k];
-                let mut g_ak = 0.0f64;
-                for j in 0..p_a {
-                    g_ak += x_a[(i, j)] * q_k[(off_a + j, i)];
-                }
-                // Accumulate G_i[a,k] * W_i[k,a]
-                tr += g_ak * w_i[(k, a)];
-            }
+    for chunk_start in (0..n).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size).min(n);
+        let chunk_len = chunk_end - chunk_start;
+        let mut q_blocks = Vec::with_capacity(b);
+        for blk in 0..b {
+            let x_chunk_t = block_designs[blk]
+                .slice(s![chunk_start..chunk_end, ..])
+                .t()
+                .to_owned();
+            let off_b = col_offsets[blk];
+            let h_slice = penalized_hessian_inv
+                .slice(s![.., off_b..off_b + x_chunk_t.nrows()])
+                .to_owned();
+            q_blocks.push(h_slice.dot(&x_chunk_t));
         }
-        leverage[i] = tr;
+
+        for local_i in 0..chunk_len {
+            let i = chunk_start + local_i;
+            let w_i = &block_weights[i];
+            let mut tr = 0.0f64;
+            for a in 0..b {
+                let x_a = &block_designs[a];
+                let p_a = x_a.ncols();
+                let off_a = col_offsets[a];
+                for k in 0..b {
+                    let q_k = &q_blocks[k];
+                    let mut g_ak = 0.0f64;
+                    for j in 0..p_a {
+                        g_ak += x_a[(i, j)] * q_k[(off_a + j, local_i)];
+                    }
+                    tr += g_ak * w_i[(k, a)];
+                }
+            }
+            leverage[i] = tr;
+        }
     }
 
     Ok(leverage)

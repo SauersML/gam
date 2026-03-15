@@ -684,7 +684,7 @@ mod tests {
             .expect("single-penalty hyper direction"),
         ];
 
-        let (_cost, _grad, h) = state
+        let (_, _, h) = state
             .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         assert_eq!(h.nrows(), theta.len());
@@ -748,7 +748,7 @@ mod tests {
             .expect("linear tau direction"),
         ];
 
-        let (_cost, _grad, h_full) = state
+        let (_, _, h_full) = state
             .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
@@ -760,10 +760,10 @@ mod tests {
             let mut theta_minus = theta.clone();
             theta_plus[rho.len() + j] += h;
             theta_minus[rho.len() + j] -= h;
-            let (_cost_plus, g_plus, _h_plus) = state
+            let (_, g_plus, _) = state
                 .compute_joint_hypercostgradienthessian(&theta_plus, rho.len(), &hyper_dirs)
                 .expect("g+");
-            let (_cost_minus, g_minus, _h_minus) = state
+            let (_, g_minus, _) = state
                 .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
                 .expect("g-");
             let tau_col =
@@ -893,7 +893,7 @@ mod tests {
             t.slice_mut(s![rho.len()..]).assign(&psi);
             t
         };
-        let (_cost, _grad, h_full) = state
+        let (_, _, h_full) = state
             .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         let mixed_analytic = h_full.slice(s![..rho.len(), rho.len()..]).to_owned();
@@ -980,7 +980,7 @@ mod tests {
             t.slice_mut(s![rho.len()..]).assign(&psi);
             t
         };
-        let (_cost, _grad, h_full) = state
+        let (_, _, h_full) = state
             .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
@@ -994,10 +994,10 @@ mod tests {
             let mut theta_minus = theta.clone();
             theta_plus[rho.len() + j] += h;
             theta_minus[rho.len() + j] -= h;
-            let (_cost_plus, g_plus, _h_plus) = state
+            let (_, g_plus, _) = state
                 .compute_joint_hypercostgradienthessian(&theta_plus, rho.len(), &hyper_dirs)
                 .expect("g+");
-            let (_cost_minus, g_minus, _h_minus) = state
+            let (_, g_minus, _) = state
                 .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
                 .expect("g-");
             let col =

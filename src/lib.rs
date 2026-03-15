@@ -13,7 +13,7 @@ pub mod types;
 
 pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
-pub use solver::{estimate, joint, mixture_link, pirls, seeding, smoothing, visualizer};
+pub use solver::{estimate, joint, mixture_link, pirls, seeding, smoothing, visualizer, workflow};
 pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;
@@ -24,22 +24,21 @@ pub use families::survival_location_scale;
 
 pub use families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResultParts, CustomFamily, FamilyEvaluation,
-    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, blockwise_fit_from_parts,
-    fit_custom_family,
+    ParameterBlockSpec, ParameterBlockState, blockwise_fit_from_parts, fit_custom_family,
 };
 pub use families::gamlss::{
     BinomialLocationScaleFamily, BinomialLocationScaleSpec, BinomialLocationScaleTermSpec,
-    BinomialLocationScaleWiggleFamily, BinomialLocationScaleWiggleSpec,
-    BinomialLocationScaleWiggleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
-    BinomialLocationScaleWorkflowResult, BinomialMeanWiggleFamily, BinomialMeanWiggleSpec,
+    BinomialLocationScaleWiggleFamily, BinomialLocationScaleWiggleTermSpec,
+    BinomialLocationScaleWiggleWorkflowConfig, BinomialLocationScaleWorkflowResult,
+    BinomialMeanWiggleFamily, BinomialMeanWiggleSpec, BinomialMeanWiggleTermFitResult,
     BlockwiseTermFitResult, BlockwiseTermWiggleFitResult, FamilyMetadata, GammaLogFamily,
     GammaLogSpec, GaussianLocationScaleFamily, GaussianLocationScaleSpec,
     GaussianLocationScaleTermSpec, ParameterBlockInput, ParameterLink, PoissonLogFamily,
     PoissonLogSpec, WiggleBlockConfig, buildwiggle_block_input_from_knots,
     buildwiggle_block_input_from_seed, fit_binomial_location_scale,
     fit_binomial_location_scale_terms, fit_binomial_location_scale_termsworkflow,
-    fit_binomial_location_scalewiggle, fit_binomial_location_scalewiggle_terms,
-    fit_binomial_location_scalewiggle_terms_auto, fit_binomial_mean_wiggle,
+    fit_binomial_location_scalewiggle_terms, fit_binomial_location_scalewiggle_terms_auto,
+    fit_binomial_mean_wiggle, fit_binomial_mean_wiggle_terms_auto_from_pilot,
     fit_gaussian_location_scale, fit_gaussian_location_scale_terms,
 };
 pub use families::strategy::{
@@ -47,10 +46,12 @@ pub use families::strategy::{
 };
 pub use families::survival_location_scale::{
     CovariateBlockInput, CovariateBlockKind, LinkWiggleBlockInput, ResidualDistribution,
-    ResidualDistributionOps, SurvivalLocationScaleFitResultParts,
-    SurvivalLocationScalePredictInput, SurvivalLocationScalePredictResult,
-    SurvivalLocationScalePredictUncertaintyResult, SurvivalLocationScaleSpec, TimeBlockInput,
-    TimeDependentCovariateBlockInput, fit_survival_location_scale, predict_survival_location_scale,
+    ResidualDistributionOps, SurvivalCovariateTermBlockTemplate,
+    SurvivalLocationScaleFitResultParts, SurvivalLocationScalePredictInput,
+    SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
+    SurvivalLocationScaleSpec, SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
+    TimeBlockInput, TimeDependentCovariateBlockInput, fit_survival_location_scale,
+    fit_survival_location_scale_terms, predict_survival_location_scale,
     predict_survival_location_scale_posterior_mean,
     predict_survival_location_scalewith_uncertainty, survival_fit_from_parts,
 };
@@ -81,6 +82,13 @@ pub use solver::estimate::{
     UnifiedFitResultParts, coefficient_uncertainty, coefficient_uncertaintywith_mode, fit_gam,
     optimize_external_design, predict_gam, predict_gam_posterior_mean,
     predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
+};
+pub use solver::workflow::{
+    BinomialLocationScaleWorkflowRequest, FitModelRequest, FitModelResult,
+    FlexibleLinkWorkflowRequest, FlexibleLinkWorkflowResult, GaussianLocationScaleWorkflowRequest,
+    LinkWiggleWorkflowConfig, StandardBinomialWiggleWorkflowConfig, StandardFitWorkflowRequest,
+    StandardFitWorkflowResult, SurvivalLocationScaleWorkflowRequest,
+    SurvivalLocationScaleWorkflowResult, fit_model,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,

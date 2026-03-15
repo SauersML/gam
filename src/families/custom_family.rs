@@ -14,20 +14,13 @@ use crate::solver::estimate::reml::unified::{
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
-use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
+use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use thiserror::Error;
-
-/// Optional known link metadata when a family uses a learnable wiggle correction.
-#[derive(Debug, Clone, Copy)]
-pub struct KnownLinkWiggle {
-    pub base_link: LinkFunction,
-    pub wiggle_block: Option<usize>,
-}
 
 /// Static specification for one parameter block in a custom family.
 #[derive(Clone)]
@@ -165,11 +158,6 @@ pub trait CustomFamily {
     /// before it can return a mathematically valid result.
     fn requires_joint_outer_hyper_path(&self) -> bool {
         false
-    }
-
-    /// Optional metadata describing a known link with learnable wiggle.
-    fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
-        None
     }
 
     /// Optional dynamic geometry hook for blocks whose design/offset depend on
@@ -891,6 +879,93 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub x_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+    pub implicit_operator: Option<Arc<crate::terms::basis::ImplicitDesignPsiDerivative>>,
+    pub implicit_axis: usize,
+    pub implicit_group_id: Option<usize>,
+}
+
+pub(crate) fn resolve_custom_family_x_psi(
+    deriv: &CustomFamilyBlockPsiDerivative,
+    n: usize,
+    p: usize,
+    label: &str,
+) -> Result<Array2<f64>, String> {
+    if deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p {
+        return Ok(deriv.x_psi.clone());
+    }
+    if let Some(op) = deriv.implicit_operator.as_ref() {
+        let x = op.materialize_first(deriv.implicit_axis);
+        if x.nrows() != n || x.ncols() != p {
+            return Err(format!(
+                "{label} implicit x_psi shape mismatch: got {}x{}, expected {}x{}",
+                x.nrows(),
+                x.ncols(),
+                n,
+                p
+            ));
+        }
+        return Ok(x);
+    }
+    Err(format!(
+        "{label} x_psi shape mismatch: got {}x{}, expected {}x{}",
+        deriv.x_psi.nrows(),
+        deriv.x_psi.ncols(),
+        n,
+        p
+    ))
+}
+
+pub(crate) fn resolve_custom_family_x_psi_psi(
+    deriv_i: &CustomFamilyBlockPsiDerivative,
+    deriv_j: &CustomFamilyBlockPsiDerivative,
+    local_j: usize,
+    n: usize,
+    p: usize,
+    label: &str,
+) -> Result<Array2<f64>, String> {
+    if let Some(op) = deriv_i.implicit_operator.as_ref() {
+        let same_group = deriv_i.implicit_group_id.is_some()
+            && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
+        let x = if same_group {
+            if deriv_i.implicit_axis == deriv_j.implicit_axis {
+                op.materialize_second_diag(deriv_i.implicit_axis)
+            } else {
+                op.materialize_second_cross(deriv_i.implicit_axis, deriv_j.implicit_axis)
+            }
+        } else {
+            Array2::<f64>::zeros((n, p))
+        };
+        if x.nrows() != n || x.ncols() != p {
+            return Err(format!(
+                "{label} implicit x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
+                x.nrows(),
+                x.ncols(),
+                n,
+                p
+            ));
+        }
+        return Ok(x);
+    }
+
+    if let Some(x_psi_psi) = deriv_i.x_psi_psi.as_ref()
+        && let Some(x_ab) = x_psi_psi.get(local_j)
+    {
+        if x_ab.nrows() == n && x_ab.ncols() == p {
+            return Ok(x_ab.clone());
+        }
+        if x_ab.is_empty() {
+            return Ok(Array2::<f64>::zeros((n, p)));
+        }
+        return Err(format!(
+            "{label} x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
+            x_ab.nrows(),
+            x_ab.ncols(),
+            n,
+            p
+        ));
+    }
+
+    Ok(Array2::<f64>::zeros((n, p)))
 }
 
 #[derive(Clone)]
@@ -3399,7 +3474,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
 
     // No d²H provider for the generic single-block fallback.
     let compute_d2h =
-        |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
+        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
 
     // Route through joint_outer_evaluate — same unified path as the multi-block case.
     joint_outer_evaluate(
@@ -4476,7 +4551,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
 
     // No d²H provider for the generic single-block fallback.
     let compute_d2h =
-        |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
+        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
 
     let eval_result = joint_outer_evaluate(
         &inner,
@@ -4904,13 +4979,10 @@ pub fn fit_custom_family<F: CustomFamily>(
         .map_err(CustomFamilyError::Optimization);
     }
 
-    // Known-link wiggle families formerly took an early exit here (rho fixed
-    // at initial values, no outer optimization). That was a stabilization hack:
-    // full Newton outer REML was fragile for these families due to ill-conditioned
-    // exact block solves. We now keep them inside `run_outer`, but still avoid
-    // advertising an exact Hessian capability for the wiggle path.
-    let skip_exact_hessian_for_wiggle =
-        include_exact_newton_logdet_h(family) && family.known_link_wiggle().is_some();
+    // Exact Hessians are primary whenever the assembled family can supply them.
+    // If a particular outer step is ill-conditioned, strategy fallback handles
+    // the downgrade; we do not suppress second-order capability preemptively
+    // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
     use crate::solver::strategy::{
@@ -4928,18 +5000,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     let has_exact_hess = include_exact_newton_logdet_h(family);
     let n_rho = rho0.len();
 
-    let outer_max_iter = if has_exact_hess && !skip_exact_hessian_for_wiggle {
-        options.outer_max_iter.min(3).max(1)
-    } else {
-        options.outer_max_iter
-    };
-
-    let hessian_deriv = if skip_exact_hessian_for_wiggle {
-        // Known-link wiggle families keep the outer solve in first-order mode;
-        // they do not currently expose the `eval_efs` callback required for an
-        // actual EFS fixed-point iteration.
-        Derivative::Unavailable
-    } else if has_exact_hess {
+    let hessian_deriv = if has_exact_hess {
         Derivative::Analytic
     } else {
         Derivative::Unavailable
@@ -4970,14 +5031,14 @@ pub fn fit_custom_family<F: CustomFamily>(
         all_penalty_like: false,
         barrier_config: None,
     };
-    let fallback_sequence = if has_exact_hess && !skip_exact_hessian_for_wiggle {
+    let fallback_sequence = if has_exact_hess {
         vec![gradient_fallback, fd_gradient_fallback]
     } else {
         vec![fd_gradient_fallback]
     };
     let outer_config = OuterConfig {
         tolerance: options.outer_tol,
-        max_iter: outer_max_iter,
+        max_iter: options.outer_max_iter,
         fd_step: 1e-4,
         bounds: None,
         seed_config: crate::seeding::SeedConfig::default(),
@@ -5924,6 +5985,9 @@ mod tests {
             x_psi_psi: None,
             s_psi_psi: None,
             s_psi_psi_components: None,
+            implicit_operator: None,
+            implicit_axis: 0,
+            implicit_group_id: None,
         };
         let result = evaluate_custom_family_joint_hyper(
             &OneBlockExactPsiHookFamily,
@@ -6095,7 +6159,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,
