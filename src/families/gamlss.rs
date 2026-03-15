@@ -7288,9 +7288,11 @@ struct BinomialMeanWiggleGeometry {
     basis: Array2<f64>,
     basis_d1: Array2<f64>,
     basis_d2: Array2<f64>,
+    basis_d3: Array2<f64>,
     dq_dq0: Array1<f64>,
     d2q_dq02: Array1<f64>,
     d3q_dq03: Array1<f64>,
+    d4q_dq04: Array1<f64>,
 }
 
 struct BinomialMeanWiggleJointPsiDirection {
@@ -7453,6 +7455,57 @@ impl BinomialMeanWiggleFamily {
         Ok(d3.dot(&beta_link_wiggle))
     }
 
+    fn wiggle_d4q_dq04(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        if self.wiggle_degree < 4 {
+            return Ok(Array1::zeros(q0.len()));
+        }
+        let z = self.wiggle_constraint_transform()?;
+        let num_basis = self
+            .wiggle_knots
+            .len()
+            .checked_sub(self.wiggle_degree + 1)
+            .ok_or_else(|| "wiggle knot vector too short for fourth derivative".to_string())?;
+        if z.nrows() != num_basis {
+            return Err(format!(
+                "wiggle fourth-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
+                num_basis,
+                z.nrows()
+            ));
+        }
+        if z.ncols() != beta_link_wiggle.len() {
+            return Err(format!(
+                "wiggle fourth-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
+                z.ncols(),
+                beta_link_wiggle.len()
+            ));
+        }
+        let mut raw = vec![0.0; num_basis];
+        let mut out = Array1::<f64>::zeros(q0.len());
+        for (i, &q0_i) in q0.iter().enumerate() {
+            evaluate_bspline_fourth_derivative_scalar(
+                q0_i,
+                self.wiggle_knots.view(),
+                self.wiggle_degree,
+                &mut raw,
+            )
+            .map_err(|e| format!("failed to evaluate wiggle fourth derivative basis: {e}"))?;
+            let mut acc = 0.0;
+            for constrained_j in 0..beta_link_wiggle.len() {
+                let mut basis_j = 0.0;
+                for raw_k in 0..num_basis {
+                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
+                }
+                acc += basis_j * beta_link_wiggle[constrained_j];
+            }
+            out[i] = acc;
+        }
+        Ok(out)
+    }
+
     fn wiggle_geometry(
         &self,
         q0: ArrayView1<'_, f64>,
@@ -7461,16 +7514,20 @@ impl BinomialMeanWiggleFamily {
         let basis = self.wiggle_design(q0)?;
         let basis_d1 = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
         let basis_d2 = self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
+        let basis_d3 = self.wiggle_d3basis_constrained(q0)?;
         let dq_dq0 = self.wiggle_dq_dq0(q0, beta_link_wiggle)?;
         let d2q_dq02 = self.wiggle_d2q_dq02(q0, beta_link_wiggle)?;
         let d3q_dq03 = self.wiggle_d3q_dq03(q0, beta_link_wiggle)?;
+        let d4q_dq04 = self.wiggle_d4q_dq04(q0, beta_link_wiggle)?;
         Ok(BinomialMeanWiggleGeometry {
             basis,
             basis_d1,
             basis_d2,
+            basis_d3,
             dq_dq0,
             d2q_dq02,
             d3q_dq03,
+            d4q_dq04,
         })
     }
 
@@ -7495,6 +7552,18 @@ impl BinomialMeanWiggleFamily {
         } else {
             binomial_neglog_q_derivatives_from_jet(y, weight, jet.mu, jet.d1, jet.d2, jet.d3)
         })
+    }
+
+    fn neglog_q_fourth_derivative(&self, y: f64, weight: f64, q: f64) -> Result<f64, String> {
+        let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+            .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+        let (mu_clamped, clamp_active) = clamped_binomial_probability(jet.mu);
+        if clamp_active {
+            return Ok(0.0);
+        }
+        Ok(binomial_neglog_q_fourth_derivative_closed_form_dispatch(
+            y, weight, q, mu_clamped, &self.link_kind,
+        ))
     }
 
     fn dense_eta_design_fromspecs<'a>(
@@ -7788,6 +7857,320 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             &d_h_eta_eta,
             &d_h_eta_w,
             &d_h_ww,
+        )))
+    }
+
+    /// Exact second-order directional derivative D²H[u,v] of the joint Hessian
+    /// for the BinomialMeanWiggle two-block model (eta, wiggle).
+    ///
+    /// # Mathematical derivation
+    ///
+    /// The negative log-likelihood Hessian element for indices (a, b) in the
+    /// joint coefficient vector is:
+    ///
+    ///   H_ab = m2 * q_a * q_b + m1 * q_ab
+    ///
+    /// where m_k = d^k F / dq^k (k-th derivative of the negative log-likelihood
+    /// w.r.t. the effective predictor q), q_a = dq/d(beta_a), and q_ab =
+    /// d²q/(d(beta_a) d(beta_b)).
+    ///
+    /// The effective predictor is q = q0 + w(q0) where q0 = X_eta * beta_eta
+    /// and w(q0) = B(q0) * beta_w is the link wiggle.  Write:
+    ///   a = dq/dq0 = 1 + B'·beta_w       (geometry first derivative)
+    ///   b = d²q/dq0² = B''·beta_w         (geometry second derivative)
+    ///   c = d³q/dq0³ = B'''·beta_w        (geometry third derivative)
+    ///   d = d⁴q/dq0⁴ = B''''·beta_w       (geometry fourth derivative)
+    ///
+    /// For a perturbation direction u = (u_eta, u_w), the chain-rule
+    /// perturbations are:
+    ///   q_u   = a·xi_u + phi_u             (first-order predictor perturbation)
+    ///   a_u   = b·xi_u + basis1_u          (perturbation of geometry factor a)
+    ///   b_u   = c·xi_u + basis2_u          (perturbation of geometry factor b)
+    ///   c_u   = d·xi_u + basis3_u          (perturbation of geometry factor c)
+    ///
+    /// where xi_u = X_eta·u_eta, phi_u = B·u_w, basis_k_u = B^(k)·u_w.
+    ///
+    /// Mixed second-order perturbations (u,v) are:
+    ///   q_uv  = b·xi_u·xi_v + basis1_u·xi_v + basis1_v·xi_u
+    ///   a_uv  = c·xi_u·xi_v + basis2_u·xi_v + basis2_v·xi_u
+    ///   b_uv  = d·xi_u·xi_v + basis3_u·xi_v + basis3_v·xi_u
+    ///
+    /// ## Block decomposition
+    ///
+    /// **eta-eta block** (X_eta' diag(coeff) X_eta):
+    ///   The Hessian element for eta indices (i,j) factors as
+    ///     H(eta_i, eta_j) = [m2·a² + m1·b] · x_eta(i)·x_eta(j)
+    ///   so D²H_eta_eta[u,v] = X_eta' diag(coeff_eta) X_eta
+    ///   where coeff_eta uses `second_directionalhessian_coeff_fromobjective_q_terms`
+    ///   with q_a=a, q_b=a, q_ab=b and their chain-rule perturbations.
+    ///
+    /// **eta-w block** (X_eta' diag(...) [B, B', B'', B''']):
+    ///   The static Hessian is:
+    ///     H(eta_i, w_j) = (m2·a)·x_eta(i)·B_j + m1·x_eta(i)·B'_j
+    ///   Taking D²[u,v] requires differentiating both the scalar coefficients
+    ///   (m2·a, m1) and the basis matrices (B, B' depend on q0 via the chain
+    ///   rule dB_j/du = B'_j·xi_u).  The full product rule gives four basis-matrix
+    ///   tiers: B, B', B'', B'''.
+    ///
+    /// **w-w block** (B' diag(...) B, etc.):
+    ///   The static Hessian is H(w_i, w_j) = m2·B_i·B_j.
+    ///   D²[u,v] expands via the product rule on m2, B_i, B_j, each of which
+    ///   depends on beta through q and q0.  This gives terms involving
+    ///   B·B, B'·B, B'·B', and B''·B (all symmetrised).
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let x_eta = self.dense_eta_design_fromspecs(specs)?;
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
+        let p_eta = x_eta.ncols();
+        let pw = geom.basis.ncols();
+        let total = p_eta + pw;
+        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint second d_beta length mismatch: got {} and {}, expected {}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len(),
+                total
+            ));
+        }
+
+        // Split directions into eta and wiggle components.
+        let u_eta = d_beta_u_flat.slice(s![0..p_eta]).to_owned();
+        let v_eta = d_beta_v_flat.slice(s![0..p_eta]).to_owned();
+        let uw = d_beta_u_flat.slice(s![p_eta..total]).to_owned();
+        let vw = d_beta_v_flat.slice(s![p_eta..total]).to_owned();
+
+        // Per-row linear-predictor perturbations from each direction.
+        let xi_u = x_eta.dot(&u_eta); // eta perturbation in direction u
+        let xi_v = x_eta.dot(&v_eta); // eta perturbation in direction v
+        let phi_u = geom.basis.dot(&uw); // direct wiggle basis, direction u
+        let phi_v = geom.basis.dot(&vw); // direct wiggle basis, direction v
+        let b1u = geom.basis_d1.dot(&uw); // first-derivative basis, direction u
+        let b1v = geom.basis_d1.dot(&vw);
+        let b2u = geom.basis_d2.dot(&uw); // second-derivative basis, direction u
+        let b2v = geom.basis_d2.dot(&vw);
+        let b3u = geom.basis_d3.dot(&uw); // third-derivative basis, direction u
+        let b3v = geom.basis_d3.dot(&vw);
+
+        // Per-row chain-rule perturbations of q, a = dq/dq0, b = d²q/dq0²:
+        //   q_u = a·xi_u + phi_u
+        //   a_u = b·xi_u + basis1_u
+        //   b_u = c·xi_u + basis2_u
+        //   c_u = d·xi_u + basis3_u
+        // Mixed second-order perturbations:
+        //   q_uv = b·xi_u·xi_v + basis1_u·xi_v + basis1_v·xi_u
+        //   a_uv = c·xi_u·xi_v + basis2_u·xi_v + basis2_v·xi_u
+        //   b_uv = d·xi_u·xi_v + basis3_u·xi_v + basis3_v·xi_u
+
+        // Scaled basis matrices for the cross-product terms in the w-w and eta-w
+        // blocks (same pattern as GaussianLocationScaleWiggleFamily).
+        let basis_u = scale_matrix_rows(&geom.basis_d1, &xi_u)?; // dB/du = B'·xi_u
+        let basis_v = scale_matrix_rows(&geom.basis_d1, &xi_v)?; // dB/dv = B'·xi_v
+        let basis_uv = scale_matrix_rows(&geom.basis_d2, &(&xi_u * &xi_v))?; // d²B/dudv = B''·xi_u·xi_v
+        // Per-row coefficient arrays for assembling the block-matrix products.
+        let mut coeff_eta = Array1::<f64>::zeros(n);
+
+        // Coefficients for the eta-w block: X_eta' diag(c_*) M where M ∈ {B, B', B'', B'''}
+        //
+        // The static cross-Hessian is:
+        //   H(eta_i, w_j) = (m2·a)·x_i·B_j + m1·x_i·B'_j
+        // where B_j and B'_j are row evaluations of basis column j.
+        //
+        // Write C_B = m2·a (scalar coefficient multiplying B in the cross block)
+        // and   C_B1 = m1  (scalar coefficient multiplying B' in the cross block).
+        //
+        // Product rule on C_B·B:
+        //   d(C_B·B)/du = (dC_B/du)·B + C_B·B'·xi_u
+        //   d²(C_B·B)/dudv = (d²C_B/dudv)·B + (dC_B/du)·B'·xi_v
+        //                   + (dC_B/dv)·B'·xi_u + C_B·B''·xi_u·xi_v
+        //
+        // Product rule on C_B1·B':
+        //   d²(C_B1·B')/dudv = (d²C_B1/dudv)·B' + (dC_B1/du)·B''·xi_v
+        //                     + (dC_B1/dv)·B''·xi_u + C_B1·B'''·xi_u·xi_v
+        //
+        // Derivatives of the scalar coefficients:
+        //   C_B  = m2·a
+        //   dC_B/du  = m3·q_u·a + m2·a_u
+        //   dC_B/dv  = m3·q_v·a + m2·a_v
+        //   d²C_B/dudv = m4·q_u·q_v·a + m3·(q_uv·a + q_u·a_v + q_v·a_u) + m2·a_uv
+        //
+        //   C_B1 = m1
+        //   dC_B1/du = m2·q_u
+        //   dC_B1/dv = m2·q_v
+        //   d²C_B1/dudv = m3·q_u·q_v + m2·q_uv
+        //
+        // Grouping by basis-matrix tier:
+        //   B:   d²C_B/dudv
+        //   B':  (dC_B/du)·xi_v + (dC_B/dv)·xi_u + d²C_B1/dudv
+        //   B'': C_B·xi_u·xi_v + (dC_B1/du)·xi_v + (dC_B1/dv)·xi_u
+        //   B''': C_B1·xi_u·xi_v
+        let mut coeff_etaw_b = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d1 = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d2 = Array1::<f64>::zeros(n);
+        let mut coeff_etaw_d3 = Array1::<f64>::zeros(n);
+
+        // Coefficients for the w-w block.
+        //
+        // The static w-w Hessian is:
+        //   H(w_i, w_j) = m2·B_i·B_j
+        //
+        // Note: there is no m1·q_ij term because d²q/(d(beta_w_i) d(beta_w_j)) = 0
+        // (the basis vectors B_i enter q linearly in beta_w).
+        //
+        // Product rule on m2·B_i·B_j, treating each factor as depending on beta:
+        //   d²(m2·B_i·B_j)/dudv
+        //     = (d²m2/dudv)·B_i·B_j                        → B'diag B  (symmetrised)
+        //     + (dm2/du)·(B'_i·xi_v·B_j + B_i·B'_j·xi_v)  → dw_u terms
+        //     + (dm2/dv)·(B'_i·xi_u·B_j + B_i·B'_j·xi_u)  → dw_v terms
+        //     + m2·(B''_i·xi_u·xi_v·B_j + B'_i·xi_u·B'_j·xi_v
+        //          + B'_i·xi_v·B'_j·xi_u + B_i·B''_j·xi_u·xi_v)
+        //
+        // where dm2/du = m3·q_u, dm2/dv = m3·q_v, d²m2/dudv = m4·q_u·q_v + m3·q_uv.
+        //
+        // Following the Gaussian LS wiggle pattern, we express this via:
+        //   xt_diag_x_dense(B, dw_uv)                    — coeff: d²m2
+        //   xt_diag_y_dense(basis_u, dw_v, B) + transpose — dB/du weighted by dm2/dv
+        //   xt_diag_y_dense(basis_v, dw_u, B) + transpose — dB/dv weighted by dm2/du
+        //   xt_diag_y_dense(basis_uv, w, B) + transpose   — d²B/dudv weighted by m2
+        //   xt_diag_y_dense(basis_u, w, basis_v) + transpose — dB/du·dB/dv weighted by m2
+        let mut dw = Array1::<f64>::zeros(n);
+        let mut dw_u = Array1::<f64>::zeros(n);
+        let mut dw_v = Array1::<f64>::zeros(n);
+        let mut dw_uv = Array1::<f64>::zeros(n);
+
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let m4 = self.neglog_q_fourth_derivative(self.y[row], self.weights[row], q)?;
+            let a = geom.dq_dq0[row];
+            let b = geom.d2q_dq02[row];
+            let c = geom.d3q_dq03[row];
+            let d = geom.d4q_dq04[row];
+
+            // Chain-rule perturbations in direction u.
+            let q_u = a * xi_u[row] + phi_u[row];
+            let a_u = b * xi_u[row] + b1u[row];
+            let b_u = c * xi_u[row] + b2u[row];
+
+            // Chain-rule perturbations in direction v.
+            let q_v = a * xi_v[row] + phi_v[row];
+            let a_v = b * xi_v[row] + b1v[row];
+            let b_v = c * xi_v[row] + b2v[row];
+
+            // Mixed second-order perturbations.
+            let q_uv = b * xi_u[row] * xi_v[row] + b1u[row] * xi_v[row] + b1v[row] * xi_u[row];
+            let a_uv = c * xi_u[row] * xi_v[row] + b2u[row] * xi_v[row] + b2v[row] * xi_u[row];
+            let b_uv = d * xi_u[row] * xi_v[row] + b3u[row] * xi_v[row] + b3v[row] * xi_u[row];
+
+            // ── eta-eta block ──
+            // H(eta_i, eta_j) uses q_a = a, q_b = a, q_ab = b (absorbing x_eta
+            // into the matrix product).  The perturbations of these geometric
+            // quantities are: dq_a/du = a_u, dq_b/du = a_u (since q_a = q_b = a),
+            // dq_ab/du = b_u (since q_ab = b), and analogously for v.
+            coeff_eta[row] = second_directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, m4,
+                q_u, q_v, q_uv,
+                a, a, b,         // q_a, q_b, q_ab
+                a_u, a_v,        // dq_a_u, dq_a_v
+                a_u, a_v,        // dq_b_u, dq_b_v  (q_b = a so same perturbation)
+                a_uv, a_uv,     // d2q_a_uv, d2q_b_uv
+                b_u, b_v,        // dq_ab_u, dq_ab_v  (q_ab = b)
+                b_uv,            // d2q_ab_uv
+            );
+
+            // ── eta-w block coefficients ──
+            // See the derivation in the docstring above.  We group by which basis
+            // matrix tier (B, B', B'', B''') the coefficient multiplies.
+
+            // d²(m2·a)/dudv
+            let d2_c_b = m4 * q_u * q_v * a
+                + m3 * (q_uv * a + q_u * a_v + q_v * a_u)
+                + m2 * a_uv;
+            // d(m2·a)/du and d(m2·a)/dv
+            let dc_b_u = m3 * q_u * a + m2 * a_u;
+            let dc_b_v = m3 * q_v * a + m2 * a_v;
+            // m2·a (static coefficient for B in the cross block)
+            let c_b_static = m2 * a;
+            // d²(m1)/dudv
+            let d2_c_b1 = m3 * q_u * q_v + m2 * q_uv;
+            // d(m1)/du and d(m1)/dv
+            let dc_b1_u = m2 * q_u;
+            let dc_b1_v = m2 * q_v;
+
+            coeff_etaw_b[row] = d2_c_b;
+            coeff_etaw_d1[row] = dc_b_u * xi_v[row] + dc_b_v * xi_u[row] + d2_c_b1;
+            coeff_etaw_d2[row] = c_b_static * xi_u[row] * xi_v[row]
+                + dc_b1_u * xi_v[row]
+                + dc_b1_v * xi_u[row];
+            coeff_etaw_d3[row] = m1 * xi_u[row] * xi_v[row];
+
+            // ── w-w block coefficients ──
+            // The w-w static Hessian coefficient is m2 (for B'diag B).
+            dw[row] = m2;
+            dw_u[row] = m3 * q_u;
+            dw_v[row] = m3 * q_v;
+            dw_uv[row] = m4 * q_u * q_v + m3 * q_uv;
+        }
+
+        // ── Assemble eta-eta block ──
+        let d2_h_eta_eta = xt_diag_x_dense(&x_eta, &coeff_eta)?;
+
+        // ── Assemble eta-w block ──
+        // The second-order directional derivative of the cross block H_eta_w is:
+        //   d²H_eta_w[u,v] = X_eta' diag(coeff_etaw_b)  B
+        //                   + X_eta' diag(coeff_etaw_d1) B'
+        //                   + X_eta' diag(coeff_etaw_d2) B''
+        //                   + X_eta' diag(coeff_etaw_d3) B'''
+        let d2_h_eta_w = xt_diag_y_dense(&x_eta, &coeff_etaw_b, &geom.basis)?
+            + &xt_diag_y_dense(&x_eta, &coeff_etaw_d1, &geom.basis_d1)?
+            + &xt_diag_y_dense(&x_eta, &coeff_etaw_d2, &geom.basis_d2)?
+            + &xt_diag_y_dense(&x_eta, &coeff_etaw_d3, &geom.basis_d3)?;
+
+        // ── Assemble w-w block ──
+        // Following the Gaussian LS wiggle pattern (lines 6351-6363), the w-w
+        // second directional derivative is assembled from scaled basis products:
+        //
+        //   d²(m2·B_i·B_j)/dudv decomposition:
+        //     (d²m2)     · B_i·B_j        → xt_diag_x(B, dw_uv)
+        //     (dm2/du)   · dB_j/dv · B_i  → xt_diag_y(basis_v, dw_u, B) + transpose
+        //     (dm2/dv)   · dB_j/du · B_i  → xt_diag_y(basis_u, dw_v, B) + transpose
+        //     m2 · d²B_j/dudv · B_i       → xt_diag_y(basis_uv, dw, B) + transpose
+        //     m2 · dB_i/du · dB_j/dv      → xt_diag_y(basis_u, dw, basis_v) + transpose
+        let a_ab = xt_diag_y_dense(&basis_uv, &dw, &geom.basis)?;
+        let a_ij = xt_diag_y_dense(&basis_u, &dw, &basis_v)?;
+        let a_iwj = xt_diag_y_dense(&basis_u, &dw_v, &geom.basis)?;
+        let a_jwi = xt_diag_y_dense(&basis_v, &dw_u, &geom.basis)?;
+        let d2_h_ww = &a_ab
+            + &a_ab.t()
+            + &a_ij
+            + &a_ij.t()
+            + &a_iwj
+            + &a_iwj.t()
+            + &a_jwi
+            + &a_jwi.t()
+            + &xt_diag_x_dense(&geom.basis, &dw_uv)?;
+
+        Ok(Some(binomial_pack_mean_wiggle_joint_symmetrichessian(
+            &d2_h_eta_eta,
+            &d2_h_eta_w,
+            &d2_h_ww,
         )))
     }
 
