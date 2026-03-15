@@ -785,6 +785,33 @@ pub fn inverse_link_jet_for_link_function(
     link.jet(eta)
 }
 
+#[inline]
+fn royston_parmar_inverse_link_jet(eta: f64) -> InverseLinkJet {
+    const SURVIVAL_ETA_CLAMP: f64 = 30.0;
+
+    let z = eta.clamp(-SURVIVAL_ETA_CLAMP, SURVIVAL_ETA_CLAMP);
+    let hazard = z.exp();
+    let survival = (-hazard).exp();
+    if eta < -SURVIVAL_ETA_CLAMP || eta > SURVIVAL_ETA_CLAMP {
+        return InverseLinkJet {
+            mu: survival,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
+    }
+
+    let d1 = -hazard * survival;
+    let d2 = hazard * (hazard - 1.0) * survival;
+    let d3 = (-hazard * hazard * hazard + 3.0 * hazard * hazard - hazard) * survival;
+    InverseLinkJet {
+        mu: survival,
+        d1,
+        d2,
+        d3,
+    }
+}
+
 pub fn inverse_link_jet_for_family(
     family: LikelihoodFamily,
     eta: f64,
@@ -859,9 +886,7 @@ pub fn inverse_link_jet_for_family(
                 sas_link_state,
             )
         }
-        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-            "RoystonParmar inverse-link jet is not defined in mixture-link dispatcher".to_string(),
-        )),
+        LikelihoodFamily::RoystonParmar => Ok(royston_parmar_inverse_link_jet(eta)),
     }
 }
 

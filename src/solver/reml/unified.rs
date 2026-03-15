@@ -237,9 +237,10 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 ///
 /// where B = (h''V − h'²V') / (φV²).  For canonical links (logit for
 /// binomial, log for Poisson), B = 0 so observed = Fisher and the arrays
-/// are populated with the Fisher values unchanged.  The observed
-/// correction is applied in `RemlState::observed_cd_arrays` at the
-/// construction sites in `runtime.rs`.
+/// are populated with the Fisher values unchanged. These arrays are carried
+/// out of PIRLS as the accepted Hessian-side curvature surface and passed
+/// through `RemlState::hessian_cd_arrays` at the construction sites in
+/// `runtime.rs`.
 ///
 /// The link-parameter ext_coord path (build_sas_link_ext_coords /
 /// build_mixture_link_ext_coords) independently uses observed weight
@@ -257,10 +258,11 @@ pub struct SinglePredictorGlmDerivatives {
 
 impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
     fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
-        // The Hessian derivative is dH/dρₖ = Aₖ + D_β(X'WX)[−vₖ].
+        // The Hessian derivative is dH/dρₖ = Aₖ + D_β(X'W_HX)[−vₖ].
         // Since vₖ = H⁻¹(Aₖβ̂) = −dβ̂/dρₖ, the β-direction is −vₖ, giving:
-        //   D_β(X'WX)[−vₖ] = X' diag(c · X(−vₖ)) X = −X' diag(c ⊙ Xvₖ) X
-        // where c = dW/dη (the third-derivative weight array).
+        //   D_β(X'W_HX)[−vₖ] = X' diag(c · X(−vₖ)) X
+        //                     = −X' diag(c ⊙ Xvₖ) X
+        // where c = dW_H/dη (the Hessian-side third-derivative weight array).
         //
         // This method returns the correction (dH/dρₖ − Aₖ), which is NEGATIVE.
         let x = self.x_transformed.to_dense_arc();
@@ -549,7 +551,7 @@ impl BarrierConfig {
     /// indicating that EFS (which ignores the barrier Hessian drift) would be
     /// unreliable. If β is infeasible, conservatively returns `true`.
     ///
-    /// `ref_diag` should be a representative diagonal of X'WX + S (e.g. the
+    /// `ref_diag` should be a representative diagonal of X'W_HX + S (e.g. the
     /// median or mean). A typical `threshold` is 0.01–0.1.
     pub fn barrier_curvature_is_significant(
         &self,
@@ -1150,7 +1152,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    pub fn firth(mut self, logdet: f64, op: Option<std::sync::Arc<super::FirthDenseOperator>>) -> Self {
+    pub fn firth(
+        mut self,
+        logdet: f64,
+        op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    ) -> Self {
         self.firth_logdet = logdet;
         self.firth_op = op;
         self
@@ -1867,10 +1873,7 @@ pub fn compute_firth_hessian_contribution(
 ///
 /// When available, tr(H⁻¹ C[u]) for C[u] = Xᵀ diag(c ⊙ Xu) X simplifies to uᵀ z_c,
 /// replacing an O(p²) solve with an O(p) dot product.
-fn compute_adjoint_z_c(
-    ing: &ScalarGlmIngredients<'_>,
-    hop: &dyn HessianOperator,
-) -> Array1<f64> {
+fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator) -> Array1<f64> {
     let x = ing.x.to_dense_arc();
     let x_ref = x.as_ref();
     let n = x_ref.nrows();
@@ -2244,7 +2247,9 @@ fn compute_outer_hessian(
                         let c_trace = rhs.dot(z_c);
                         let d_trace = glm_ingredients
                             .as_ref()
-                            .and_then(|ing| compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[kk], hop))
+                            .and_then(|ing| {
+                                compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[kk], hop)
+                            })
                             .unwrap_or(0.0);
                         base + c_trace + d_trace
                     } else {
@@ -2270,7 +2275,9 @@ fn compute_outer_hessian(
                         let c_trace = rhs.dot(z_c);
                         let d_trace = glm_ingredients
                             .as_ref()
-                            .and_then(|ing| compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[ll], hop))
+                            .and_then(|ing| {
+                                compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[ll], hop)
+                            })
                             .unwrap_or(0.0);
                         c_trace + d_trace
                     } else {
@@ -2382,15 +2389,14 @@ fn compute_outer_hessian(
                     if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = glm_ingredients
-                                .as_ref()
-                                .and_then(|ing| compute_fourth_derivative_trace(
+                            if let Some(d_trace) = glm_ingredients.as_ref().and_then(|ing| {
+                                compute_fourth_derivative_trace(
                                     ing,
                                     &v_ks[rho_idx],
                                     &ext_v[ext_idx],
                                     hop,
-                                ))
-                            {
+                                )
+                            }) {
                                 h2_trace += d_trace;
                             }
                         } else {
@@ -2497,12 +2503,9 @@ fn compute_outer_hessian(
                     if effective_deriv.has_corrections() {
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = glm_ingredients
-                                .as_ref()
-                                .and_then(|ing| compute_fourth_derivative_trace(
-                                    ing, &ext_v[ii], &ext_v[jj], hop,
-                                ))
-                            {
+                            if let Some(d_trace) = glm_ingredients.as_ref().and_then(|ing| {
+                                compute_fourth_derivative_trace(ing, &ext_v[ii], &ext_v[jj], hop)
+                            }) {
                                 h2_trace += d_trace;
                             }
                         } else {
@@ -2573,8 +2576,8 @@ fn compute_outer_hessian(
         // ── Q_{kl} (penalty quadratic curvature) ──
         for kk in 0..k {
             for ll in kk..k {
-                let q_kl_raw = -a_k_betas[ll].dot(&v_ks[kk])
-                    + if kk == ll { rho_a_vals[kk] } else { 0.0 };
+                let q_kl_raw =
+                    -a_k_betas[ll].dot(&v_ks[kk]) + if kk == ll { rho_a_vals[kk] } else { 0.0 };
                 let q_kl = if is_profiled {
                     q_kl_raw / profiled_phi
                         - 2.0 * rho_a_vals[kk] * rho_a_vals[ll]

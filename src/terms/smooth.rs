@@ -8,7 +8,9 @@ use crate::basis::{
     build_duchon_basis_log_kappasecond_derivative, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivative,
     build_matern_basis_log_kappasecond_derivative, build_matern_collocation_operator_matrices,
-    build_thin_plate_basis, estimate_penalty_nullity, filter_active_penalty_candidates,
+    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
+    build_thin_plate_basis_log_kappasecond_derivative, estimate_penalty_nullity,
+    filter_active_penalty_candidates,
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
@@ -841,6 +843,7 @@ fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
+            SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(feature_cols.len()),
             SmoothBasisSpec::Matern { feature_cols, .. } => Some(feature_cols.len()),
             SmoothBasisSpec::Duchon { feature_cols, .. } => Some(feature_cols.len()),
             _ => None,
@@ -1017,33 +1020,23 @@ impl TwoBlockExactJointHyperSetup {
     }
 }
 
-#[rustfmt::skip]
-pub type TwoBlockMaternKappaOptimizationResult<FitOut> = TwoBlockSpatialLengthScaleOptimizationResult<FitOut>;
-
 #[derive(Debug, Clone)]
 pub struct SpatialLengthScaleOptimizationOptions {
     /// Enable outer-loop optimization over spatial κ (= 1 / length_scale)
     /// for supported radial-kernel smooths.
-    /// Currently this applies only to Matérn terms.
+    /// This applies to ThinPlate, Matérn, and hybrid Duchon terms.
     pub enabled: bool,
-    /// Maximum number of coordinate-descent passes over supported spatial terms.
+    /// Maximum number of outer iterations in the exact joint [rho, psi] solve.
     pub max_outer_iter: usize,
-    /// Relative improvement threshold for accepting a κ update.
+    /// Relative improvement threshold for terminating the outer solve.
     pub rel_tol: f64,
-    /// Half-width of local search bracket in log(length_scale) units.
+    /// Initial log(length_scale) perturbation used for seed construction.
     pub log_step: f64,
     /// Minimum allowed length_scale during κ search.
     pub min_length_scale: f64,
     /// Maximum allowed length_scale during κ search.
     pub max_length_scale: f64,
-    /// Allow the legacy finite-difference / coordinate-search spatial optimizer.
-    ///
-    /// This is intentionally opt-in. The default exact spatial path should not
-    /// silently degrade to the older finite-difference search.
-    pub allow_finite_difference_fallback: bool,
 }
-
-pub type MaternKappaOptimizationOptions = SpatialLengthScaleOptimizationOptions;
 
 impl Default for SpatialLengthScaleOptimizationOptions {
     fn default() -> Self {
@@ -1051,11 +1044,10 @@ impl Default for SpatialLengthScaleOptimizationOptions {
             enabled: true,
             max_outer_iter: 3,
             rel_tol: 1e-4,
-            // Search around current scale by approximately x0.5 and x2.0.
+            // Seed auxiliary candidates around current scale by approximately x0.5 and x2.0.
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
-            allow_finite_difference_fallback: false,
         }
     }
 }
@@ -1330,10 +1322,12 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
     match metadata {
         BasisMetadata::ThinPlate {
             centers,
+            length_scale,
             identifiability_transform: None,
             input_scales,
         } => BasisMetadata::ThinPlate {
             centers,
+            length_scale,
             identifiability_transform: Some(Array2::eye(raw_cols)),
             input_scales,
         },
@@ -1501,12 +1495,14 @@ fn build_shape_constraint_design_1d(
             SmoothBasisSpec::ThinPlate { .. },
             BasisMetadata::ThinPlate {
                 centers,
+                length_scale,
                 identifiability_transform,
                 ..
             },
         ) => {
             let evalspec = ThinPlateBasisSpec {
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
+                length_scale: *length_scale,
                 double_penalty: false,
                 identifiability: identifiability_transform
                     .as_ref()
@@ -3111,10 +3107,12 @@ fn with_spatial_identifiability_transform(
     match metadata {
         BasisMetadata::ThinPlate {
             centers,
+            length_scale,
             identifiability_transform,
             input_scales,
         } => BasisMetadata::ThinPlate {
             centers: centers.clone(),
+            length_scale: *length_scale,
             identifiability_transform: transform
                 .cloned()
                 .or_else(|| identifiability_transform.clone()),
@@ -4441,7 +4439,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 ) -> Result<FittedTermCollection, EstimationError> {
     // Exact adaptive-regularization hyperfit.
     //
-    // This replaces the old MM-plus-coordinate-search approximation with the
+    // This replaces the old MM-plus-approximate hyperfit with the
     // exact pseudo-Laplace objective agreed in the math notes:
     //
     //   L_tilde(theta)
@@ -4676,7 +4674,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         heuristic_lambdas: None,
         initial_rho: Some(initial_theta.clone()),
         fallback_sequence: Vec::new(),
-        coordinate_search: None,
     };
 
     let mut obj = ClosureObjective {
@@ -7303,10 +7300,7 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
     spec.smooth_terms
         .iter()
         .enumerate()
-        .filter_map(|(idx, term)| match term.basis {
-            SmoothBasisSpec::Matern { .. } => Some(idx),
-            _ => None,
-        })
+        .filter_map(|(idx, _)| get_spatial_length_scale(spec, idx).map(|_| idx))
         .collect()
 }
 
@@ -7320,338 +7314,6 @@ fn fit_score(fit: &UnifiedFitResult) -> f64 {
     } else {
         f64::INFINITY
     }
-}
-
-fn approx_same_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if (a[i] - b[i]).abs() > 1e-12 {
-            return false;
-        }
-    }
-    true
-}
-
-#[derive(Clone)]
-struct TwoBlockHyperEval<FitOut: Clone> {
-    theta: Array1<f64>,
-    cost: f64,
-    meanspec: TermCollectionSpec,
-    noisespec: TermCollectionSpec,
-    mean_design: TermCollectionDesign,
-    noise_design: TermCollectionDesign,
-    fit: FitOut,
-}
-
-#[derive(Clone)]
-struct TwoBlockHyperScore {
-    theta: Array1<f64>,
-    cost: f64,
-}
-
-struct TwoBlockSpatialHyperState<FitOut: Clone> {
-    evals: Vec<TwoBlockHyperScore>,
-    realized: Option<TwoBlockHyperEval<FitOut>>,
-    max_evals: usize,
-}
-
-impl<FitOut: Clone> TwoBlockSpatialHyperState<FitOut> {
-    fn new(max_evals: usize) -> Self {
-        Self {
-            evals: Vec::new(),
-            realized: None,
-            max_evals: max_evals.max(1),
-        }
-    }
-
-    fn get(&self, theta: &Array1<f64>) -> Option<f64> {
-        if let Some(realized) = self.realized.as_ref()
-            && approx_same_point(&realized.theta, theta)
-        {
-            return Some(realized.cost);
-        }
-        self.evals
-            .iter()
-            .find(|entry| approx_same_point(&entry.theta, theta))
-            .map(|entry| entry.cost)
-    }
-
-    fn remember(&mut self, theta: Array1<f64>, cost: f64) {
-        if let Some(idx) = self
-            .evals
-            .iter()
-            .position(|entry| approx_same_point(&entry.theta, &theta))
-        {
-            self.evals[idx].cost = cost;
-            return;
-        }
-        self.evals.push(TwoBlockHyperScore { theta, cost });
-        if self.evals.len() > self.max_evals {
-            self.evals.remove(0);
-        }
-    }
-
-    fn remember_realized(&mut self, eval: TwoBlockHyperEval<FitOut>) {
-        self.remember(eval.theta.clone(), eval.cost);
-        self.realized = Some(eval);
-    }
-
-    fn realized(&self, theta: &Array1<f64>) -> Option<TwoBlockHyperEval<FitOut>> {
-        self.realized
-            .as_ref()
-            .filter(|entry| approx_same_point(&entry.theta, theta))
-            .cloned()
-    }
-}
-
-#[derive(Clone)]
-struct SpatialHyperEval<FitOut: Clone> {
-    theta: Array1<f64>,
-    cost: f64,
-    spec: TermCollectionSpec,
-    design: TermCollectionDesign,
-    fit: FitOut,
-}
-
-#[derive(Clone)]
-struct SpatialHyperScore {
-    theta: Array1<f64>,
-    cost: f64,
-}
-
-struct SpatialHyperState<FitOut: Clone> {
-    evals: Vec<SpatialHyperScore>,
-    realized: Option<SpatialHyperEval<FitOut>>,
-    max_evals: usize,
-}
-
-impl<FitOut: Clone> SpatialHyperState<FitOut> {
-    fn new(max_evals: usize) -> Self {
-        Self {
-            evals: Vec::new(),
-            realized: None,
-            max_evals: max_evals.max(1),
-        }
-    }
-
-    fn get(&self, theta: &Array1<f64>) -> Option<f64> {
-        if let Some(realized) = self.realized.as_ref()
-            && approx_same_point(&realized.theta, theta)
-        {
-            return Some(realized.cost);
-        }
-        self.evals
-            .iter()
-            .find(|entry| approx_same_point(&entry.theta, theta))
-            .map(|entry| entry.cost)
-    }
-
-    fn remember(&mut self, theta: Array1<f64>, cost: f64) {
-        if let Some(idx) = self
-            .evals
-            .iter()
-            .position(|entry| approx_same_point(&entry.theta, &theta))
-        {
-            self.evals[idx].cost = cost;
-            return;
-        }
-        self.evals.push(SpatialHyperScore { theta, cost });
-        if self.evals.len() > self.max_evals {
-            self.evals.remove(0);
-        }
-    }
-
-    fn remember_realized(&mut self, eval: SpatialHyperEval<FitOut>) {
-        self.remember(eval.theta.clone(), eval.cost);
-        self.realized = Some(eval);
-    }
-
-    fn realized(&self, theta: &Array1<f64>) -> Option<SpatialHyperEval<FitOut>> {
-        self.realized
-            .as_ref()
-            .filter(|entry| approx_same_point(&entry.theta, theta))
-            .cloned()
-    }
-}
-
-fn realize_single_block_spatial_eval<FitOut, FitFn, ScoreFn>(
-    hyper_state: &mut SpatialHyperState<FitOut>,
-    resolvedspec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-    theta: &Array1<f64>,
-    fit_fn: &mut FitFn,
-    score_fn: &ScoreFn,
-) -> Result<SpatialHyperEval<FitOut>, EstimationError>
-where
-    FitOut: Clone,
-    FitFn: FnMut(&TermCollectionSpec) -> Result<(TermCollectionDesign, FitOut), EstimationError>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    if let Some(realized) = hyper_state.realized(theta) {
-        return Ok(realized);
-    }
-    let candspec = apply_spatial_log_length_scales(resolvedspec, spatial_terms, theta)?;
-    let (cand_design, cand_fit) = fit_fn(&candspec)?;
-    let cand_score = score_fn(&cand_fit);
-    let eval = SpatialHyperEval {
-        theta: theta.clone(),
-        cost: if cand_score.is_finite() {
-            cand_score
-        } else {
-            f64::INFINITY
-        },
-        spec: candspec,
-        design: cand_design,
-        fit: cand_fit,
-    };
-    hyper_state.remember_realized(eval.clone());
-    Ok(eval)
-}
-
-fn eval_single_block_spatial_cost<FitOut, FitFn, ScoreFn>(
-    hyper_state: &mut SpatialHyperState<FitOut>,
-    resolvedspec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-    theta: &Array1<f64>,
-    fit_fn: &mut FitFn,
-    score_fn: &ScoreFn,
-) -> Result<f64, EstimationError>
-where
-    FitOut: Clone,
-    FitFn: FnMut(&TermCollectionSpec) -> Result<(TermCollectionDesign, FitOut), EstimationError>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    if let Some(cached_cost) = hyper_state.get(theta) {
-        return Ok(cached_cost);
-    }
-    Ok(realize_single_block_spatial_eval(
-        hyper_state,
-        resolvedspec,
-        spatial_terms,
-        theta,
-        fit_fn,
-        score_fn,
-    )?
-    .cost)
-}
-
-fn realize_two_block_spatial_eval<FitOut, BuildFn, FitFn, ScoreFn>(
-    hyper_state: &mut TwoBlockSpatialHyperState<FitOut>,
-    best_meanspec: &TermCollectionSpec,
-    best_noisespec: &TermCollectionSpec,
-    mean_terms: &[usize],
-    noise_terms: &[usize],
-    theta: &Array1<f64>,
-    build_pair: &BuildFn,
-    fit_fn: &mut FitFn,
-    score_fn: &ScoreFn,
-) -> Result<TwoBlockHyperEval<FitOut>, EstimationError>
-where
-    FitOut: Clone,
-    BuildFn: Fn(
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-    ) -> Result<(TermCollectionDesign, TermCollectionDesign), String>,
-    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    if let Some(realized) = hyper_state.realized(theta) {
-        return Ok(realized);
-    }
-    let mean_theta = theta.slice(s![0..mean_terms.len()]).to_owned();
-    let noise_theta = theta.slice(s![mean_terms.len()..]).to_owned();
-    let cand_meanspec = apply_spatial_log_length_scales(best_meanspec, mean_terms, &mean_theta)?;
-    let cand_noisespec =
-        apply_spatial_log_length_scales(best_noisespec, noise_terms, &noise_theta)?;
-    let (candmean_design, candnoise_design) =
-        build_pair(&cand_meanspec, &cand_noisespec).map_err(EstimationError::InvalidInput)?;
-    let cand_fit =
-        fit_fn(&candmean_design, &candnoise_design).map_err(EstimationError::InvalidInput)?;
-    let cand_score = score_fn(&cand_fit);
-    let eval = TwoBlockHyperEval {
-        theta: theta.clone(),
-        cost: if cand_score.is_finite() {
-            cand_score
-        } else {
-            f64::INFINITY
-        },
-        meanspec: cand_meanspec,
-        noisespec: cand_noisespec,
-        mean_design: candmean_design,
-        noise_design: candnoise_design,
-        fit: cand_fit,
-    };
-    hyper_state.remember_realized(eval.clone());
-    Ok(eval)
-}
-
-fn eval_two_block_spatial_cost<FitOut, BuildFn, FitFn, ScoreFn>(
-    hyper_state: &mut TwoBlockSpatialHyperState<FitOut>,
-    best_meanspec: &TermCollectionSpec,
-    best_noisespec: &TermCollectionSpec,
-    mean_terms: &[usize],
-    noise_terms: &[usize],
-    theta: &Array1<f64>,
-    build_pair: &BuildFn,
-    fit_fn: &mut FitFn,
-    score_fn: &ScoreFn,
-) -> Result<f64, EstimationError>
-where
-    FitOut: Clone,
-    BuildFn: Fn(
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-    ) -> Result<(TermCollectionDesign, TermCollectionDesign), String>,
-    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    if let Some(cached_cost) = hyper_state.get(theta) {
-        return Ok(cached_cost);
-    }
-    Ok(realize_two_block_spatial_eval(
-        hyper_state,
-        best_meanspec,
-        best_noisespec,
-        mean_terms,
-        noise_terms,
-        theta,
-        build_pair,
-        fit_fn,
-        score_fn,
-    )?
-    .cost)
-}
-
-#[derive(Clone)]
-struct SingleBlockSpatialLengthScaleOptimizationResult<FitOut: Clone> {
-    resolvedspec: TermCollectionSpec,
-    design: TermCollectionDesign,
-    fit: FitOut,
-}
-
-fn apply_spatial_log_length_scales(
-    spec: &TermCollectionSpec,
-    term_indices: &[usize],
-    theta: &Array1<f64>,
-) -> Result<TermCollectionSpec, EstimationError> {
-    // This is a boundary helper for the stored model parameterization:
-    //   length_scale = exp(theta).
-    // Exact-joint analytic code should work in SpatialLogKappaCoords and call
-    // SpatialLogKappaCoords::apply_tospec instead of using this directly.
-    if term_indices.len() != theta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "spatial log-length-scale dimension mismatch: terms={} theta={}",
-            term_indices.len(),
-            theta.len()
-        )));
-    }
-    let mut updated = spec.clone();
-    for (slot, &term_idx) in term_indices.iter().enumerate() {
-        set_spatial_length_scale(&mut updated, term_idx, theta[slot].exp())?;
-    }
-    Ok(updated)
 }
 
 fn external_opts_for_design(
@@ -8049,6 +7711,18 @@ fn try_build_spatial_term_log_kappa_derivative(
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
     } = match &termspec.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_thin_plate_basis_log_kappa_derivative(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -8073,12 +7747,26 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_duchon_basis_log_kappa_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        _ => return Ok(None),
+        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+            return Ok(None);
+        }
     };
     let BasisPsiSecondDerivativeResult {
         designsecond_derivative: local_x_psi_psi,
         penaltiessecond_derivative: local_s_psi_psi,
     } = match &termspec.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_thin_plate_basis_log_kappasecond_derivative(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -8103,7 +7791,9 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_duchon_basis_log_kappasecond_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        _ => return Ok(None),
+        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+            return Ok(None);
+        }
     };
 
     if local_x_psi.ncols() != smooth_term.coeff_range.len() {
@@ -8383,8 +8073,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     // ───────────────────────────────────────────────────────────────────────
     //  Anisotropic analytic path: when any term has d > 1 axes, use the
-    //  unified REML evaluator with ext_coords for joint [ρ, ψ] optimization
-    //  instead of derivative-free coordinate search.
+    //  unified REML evaluator with ext_coords for joint [ρ, ψ] optimization.
     //
     //  The key advantage: analytic gradient + Hessian w.r.t. ψ_a via the
     //  AnisoBasisPsiDerivatives → DirectionalHyperParam → HyperCoord pipeline,
@@ -8412,7 +8101,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         // ext_coords for joint [ρ, κ] optimization via BFGS, analogous to
         // the anisotropic path but with a single κ per spatial term.
         // The fallback_sequence inside run_outer handles degradation to
-        // BFGS (gradient-only) and then coordinate search automatically.
+        // BFGS (gradient-only) when the analytic Hessian is unavailable.
         try_exact_joint_spatial_isotropic_optimization(
             data,
             y,
@@ -8466,8 +8155,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
 ///   `AnisoBasisPsiDerivatives` → `SpatialPsiDerivative` → `DirectionalHyperParam`
 ///     → `build_tau_unified_objects` → `HyperCoord` ext_coords → unified evaluator
 ///
-/// This replaces the derivative-free `coordinate_search_spatial` for the
-/// anisotropic case, giving Newton/BFGS quadratic convergence on the
+/// This is the analytic anisotropic path, giving Newton/BFGS quadratic convergence on the
 /// anisotropy parameters while jointly optimizing the smoothing parameters.
 ///
 /// The ψ_a are parameterized as log-scale coordinates with a sum-to-zero
@@ -8494,7 +8182,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        OuterEval, Solver,
     };
 
     let theta_dim = theta0.len();
@@ -8520,7 +8208,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         spatial_terms: &'d [usize],
         dims_per_term: &'d [usize],
         rho_dim: usize,
-        best_theta: Array1<f64>,
         best_cost: f64,
     }
 
@@ -8592,9 +8279,9 @@ fn try_exact_joint_spatial_aniso_optimization(
         }
 
         fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            let _ = theta;
             if cost < self.best_cost {
                 self.best_cost = cost;
-                self.best_theta = theta.clone();
             }
         }
     }
@@ -8610,7 +8297,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         spatial_terms,
         dims_per_term,
         rho_dim,
-        best_theta: theta0.clone(),
         best_cost: f64::INFINITY,
     };
 
@@ -8627,8 +8313,14 @@ fn try_exact_joint_spatial_aniso_optimization(
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: Vec::new(),
-        coordinate_search: None,
+        fallback_sequence: vec![OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: theta_dim,
+            all_penalty_like: false,
+            barrier_config: None,
+            force_solver: Some(Solver::Bfgs),
+        }],
     };
 
     let mut obj = ClosureObjective {
@@ -8674,27 +8366,23 @@ fn try_exact_joint_spatial_aniso_optimization(
         >,
     };
 
-    match crate::solver::strategy::run_outer(&mut obj, &outer_config, "aniso-psi joint REML") {
-        Ok(result) => {
-            log::trace!(
-                "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm,
-            );
-            // Enforce sum-to-zero constraint on ψ coordinates for each aniso group.
-            let mut theta_star = result.rho;
-            enforce_psi_sum_to_zero(&mut theta_star, rho_dim, dims_per_term);
-            Ok(theta_star)
-        }
-        Err(e) => {
-            log::warn!(
-                "[spatial-aniso-joint] analytic optimization failed ({}), falling back to initial theta",
-                e
-            );
-            Ok(theta0.clone())
-        }
-    }
+    let result =
+        crate::solver::strategy::run_outer(&mut obj, &outer_config, "aniso-psi joint REML")
+            .map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+                ))
+            })?;
+    log::trace!(
+        "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+        result.iterations,
+        result.final_value,
+        result.final_grad_norm,
+    );
+    // Enforce sum-to-zero constraint on ψ coordinates for each aniso group.
+    let mut theta_star = result.rho;
+    enforce_psi_sum_to_zero(&mut theta_star, rho_dim, dims_per_term);
+    Ok(theta_star)
 }
 
 /// Enforce sum-to-zero constraint on ψ coordinates for identifiability.
@@ -8726,8 +8414,7 @@ fn enforce_psi_sum_to_zero(theta: &mut Array1<f64>, rho_dim: usize, dims_per_ter
 ///   `SpatialPsiDerivative` → `DirectionalHyperParam` → `HyperCoord` ext_coords
 ///     → unified REML evaluator
 ///
-/// This gives BFGS/Newton quadratic convergence on the length-scale parameters,
-/// replacing the derivative-free `coordinate_search_spatial` as the default path.
+/// This gives BFGS/Newton quadratic convergence on the length-scale parameters.
 fn try_exact_joint_spatial_isotropic_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -8749,7 +8436,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        OuterEval, Solver,
     };
 
     let theta_dim = theta0.len();
@@ -8773,7 +8460,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         spatial_terms: &'d [usize],
         dims_per_term: &'d [usize],
         rho_dim: usize,
-        best_theta: Array1<f64>,
         best_cost: f64,
     }
 
@@ -8846,9 +8532,9 @@ fn try_exact_joint_spatial_isotropic_optimization(
         }
 
         fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            let _ = theta;
             if cost < self.best_cost {
                 self.best_cost = cost;
-                self.best_theta = theta.clone();
             }
         }
     }
@@ -8864,11 +8550,8 @@ fn try_exact_joint_spatial_isotropic_optimization(
         spatial_terms,
         dims_per_term,
         rho_dim,
-        best_theta: theta0.clone(),
         best_cost: f64::INFINITY,
     };
-
-    use crate::solver::strategy::CoordinateSearchConfig;
 
     let outer_config = OuterConfig {
         tolerance: 1e-6,
@@ -8884,30 +8567,17 @@ fn try_exact_joint_spatial_isotropic_optimization(
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
         fallback_sequence: vec![
-            // BFGS with analytic gradient (no Hessian)
+            // Explicit degradation to gradient-only BFGS after the primary
+            // analytic-Hessian attempt fails.
             OuterCapability {
                 gradient: Derivative::Analytic,
                 hessian: Derivative::Unavailable,
                 n_params: theta_dim,
                 all_penalty_like: false,
                 barrier_config: None,
-                force_solver: None,
-            },
-            // Derivative-free coordinate search as last resort
-            OuterCapability {
-                gradient: Derivative::Unavailable,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                barrier_config: None,
-                force_solver: Some(crate::solver::strategy::Solver::CoordinateSearch),
+                force_solver: Some(Solver::Bfgs),
             },
         ],
-        coordinate_search: Some(CoordinateSearchConfig {
-            log_step: kappa_options.log_step,
-            max_coord_iters: kappa_options.max_outer_iter,
-            rel_tol: kappa_options.rel_tol,
-        }),
     };
 
     let mut obj = ClosureObjective {
@@ -8950,210 +8620,20 @@ fn try_exact_joint_spatial_isotropic_optimization(
         >,
     };
 
-    match crate::solver::strategy::run_outer(&mut obj, &outer_config, "iso-kappa joint REML") {
-        Ok(result) => {
-            log::trace!(
-                "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm,
-            );
-            Ok(result.rho)
-        }
-        Err(e) => {
-            log::warn!(
-                "[spatial-iso-joint] analytic optimization failed ({}), returning initial theta",
-                e
-            );
-            Err(EstimationError::InvalidInput(format!(
-                "isotropic analytic optimization failed: {e}"
-            )))
-        }
-    }
-}
-
-fn optimize_single_block_spatial_length_scale<FitOut, FitFn, ScoreFn>(
-    resolvedspec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    mut fit_fn: FitFn,
-    score_fn: ScoreFn,
-) -> Result<SingleBlockSpatialLengthScaleOptimizationResult<FitOut>, EstimationError>
-where
-    FitOut: Clone,
-    FitFn: FnMut(&TermCollectionSpec) -> Result<(TermCollectionDesign, FitOut), EstimationError>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    let (baseline_design, baseline_fit) = fit_fn(resolvedspec)?;
-    if !kappa_options.enabled || spatial_terms.is_empty() {
-        return Ok(SingleBlockSpatialLengthScaleOptimizationResult {
-            resolvedspec: resolvedspec.clone(),
-            design: baseline_design,
-            fit: baseline_fit,
-        });
-    }
-    if kappa_options.max_outer_iter == 0 {
-        return Err(EstimationError::InvalidInput(
-            "spatial kappa optimization requires max_outer_iter >= 1".to_string(),
-        ));
-    }
-    if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
-        return Err(EstimationError::InvalidInput(
-            "spatial kappa optimization requires log_step > 0".to_string(),
-        ));
-    }
-    if !(kappa_options.min_length_scale.is_finite()
-        && kappa_options.max_length_scale.is_finite()
-        && kappa_options.min_length_scale > 0.0
-        && kappa_options.max_length_scale >= kappa_options.min_length_scale)
-    {
-        return Err(EstimationError::InvalidInput(
-            "spatial kappa optimization requires valid positive length_scale bounds".to_string(),
-        ));
-    }
-
-    let baseline_score = score_fn(&baseline_fit);
-    let mut theta0 = Array1::<f64>::zeros(spatial_terms.len());
-    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-        theta0[slot] = get_spatial_length_scale(resolvedspec, term_idx)
-            .unwrap_or(kappa_options.min_length_scale)
-            .clamp(
-                kappa_options.min_length_scale,
-                kappa_options.max_length_scale,
-            )
-            .ln();
-    }
-
-    let mut hyper_state = SpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
-    let initial_cost = if baseline_score.is_finite() {
-        baseline_score
-    } else {
-        f64::INFINITY
-    };
-    hyper_state.remember_realized(SpatialHyperEval {
-        theta: theta0.clone(),
-        cost: initial_cost,
-        spec: resolvedspec.clone(),
-        design: baseline_design.clone(),
-        fit: baseline_fit.clone(),
-    });
-
-    use crate::solver::strategy::{
-        ClosureObjective, CoordinateSearchConfig, Derivative, EfsEval, HessianResult,
-        OuterCapability, OuterConfig, OuterEval, Solver,
-    };
-
-    struct SingleBlockState<'a, FitOut: Clone, FitFn, ScoreFn> {
-        hyper: SpatialHyperState<FitOut>,
-        resolvedspec: &'a TermCollectionSpec,
-        spatial_terms: &'a [usize],
-        fit_fn: FitFn,
-        score_fn: ScoreFn,
-    }
-
-    let n_params = spatial_terms.len();
-    let mut state = SingleBlockState {
-        hyper: hyper_state,
-        resolvedspec,
-        spatial_terms,
-        fit_fn,
-        score_fn,
-    };
-
-    let mut obj = ClosureObjective {
-        state: &mut state,
-        cap: OuterCapability {
-            gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
-            n_params,
-            all_penalty_like: false,
-            barrier_config: None,
-            force_solver: None,
-        },
-        cost_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>,
-                  theta: &Array1<f64>| {
-            eval_single_block_spatial_cost(
-                &mut ctx.hyper,
-                ctx.resolvedspec,
-                ctx.spatial_terms,
-                theta,
-                &mut ctx.fit_fn,
-                &ctx.score_fn,
-            )
-        },
-        eval_fn: |ctx: &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>,
-                  theta: &Array1<f64>| {
-            let cost = eval_single_block_spatial_cost(
-                &mut ctx.hyper,
-                ctx.resolvedspec,
-                ctx.spatial_terms,
-                theta,
-                &mut ctx.fit_fn,
-                &ctx.score_fn,
-            )?;
-            Ok(OuterEval {
-                cost,
-                gradient: Array1::zeros(theta.len()),
-                hessian: HessianResult::Unavailable,
-            })
-        },
-        reset_fn: None::<fn(&mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>)>,
-        efs_fn: None::<
-            fn(
-                &mut &mut SingleBlockState<'_, FitOut, FitFn, ScoreFn>,
-                &Array1<f64>,
-            ) -> Result<EfsEval, EstimationError>,
-        >,
-    };
-
-    let outer_config = OuterConfig {
-        tolerance: kappa_options.rel_tol.max(1e-6),
-        max_iter: kappa_options.max_outer_iter.max(1),
-        fd_step: kappa_options.log_step,
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            ..Default::default()
-        },
-        rho_bound: kappa_options.max_length_scale.ln().abs().max(12.0),
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![OuterCapability {
-            gradient: Derivative::Unavailable,
-            hessian: Derivative::Unavailable,
-            n_params,
-            all_penalty_like: false,
-            barrier_config: None,
-            force_solver: Some(Solver::CoordinateSearch),
-        }],
-        coordinate_search: Some(CoordinateSearchConfig {
-            log_step: kappa_options.log_step,
-            max_coord_iters: kappa_options.max_outer_iter,
-            rel_tol: kappa_options.rel_tol,
-        }),
-    };
-
-    let result = crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "single-block spatial length-scale",
-    )?;
-
-    // Realize the best point from the optimization.
-    let best_eval = realize_single_block_spatial_eval(
-        &mut state.hyper,
-        state.resolvedspec,
-        state.spatial_terms,
-        &result.rho,
-        &mut state.fit_fn,
-        &state.score_fn,
-    )?;
-
-    Ok(SingleBlockSpatialLengthScaleOptimizationResult {
-        resolvedspec: best_eval.spec,
-        design: best_eval.design,
-        fit: best_eval.fit,
-    })
+    let result =
+        crate::solver::strategy::run_outer(&mut obj, &outer_config, "iso-kappa joint REML")
+            .map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+                ))
+            })?;
+    log::trace!(
+        "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+        result.iterations,
+        result.final_value,
+        result.final_grad_norm,
+    );
+    Ok(result.rho)
 }
 
 fn set_spatial_length_scale(
@@ -9167,6 +8647,10 @@ fn set_spatial_length_scale(
         )));
     };
     match &mut term.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
         SmoothBasisSpec::Matern { spec, .. } => {
             spec.length_scale = length_scale;
             Ok(())
@@ -9186,6 +8670,7 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
+            SmoothBasisSpec::ThinPlate { spec, .. } => Some(spec.length_scale),
             SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
             SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
             _ => None,
@@ -9259,321 +8744,31 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
             *input_scales = meta_scales.clone();
         }
         if let (
-            SmoothBasisSpec::ThinPlate { input_scales, .. },
+            SmoothBasisSpec::ThinPlate {
+                spec: s,
+                input_scales,
+                ..
+            },
             BasisMetadata::ThinPlate {
+                centers,
+                length_scale,
+                identifiability_transform,
                 input_scales: meta_scales,
                 ..
             },
         ) = (&mut term.basis, &fitted.metadata)
         {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.length_scale = *length_scale;
+            if let Some(z) = identifiability_transform {
+                s.identifiability = SpatialIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                };
+            }
             *input_scales = meta_scales.clone();
         }
     }
     Ok(frozen)
-}
-
-pub fn optimize_two_block_matern_kappa<FitOut, FitFn, ScoreFn>(
-    data: ArrayView2<'_, f64>,
-    meanspec: &TermCollectionSpec,
-    noisespec: &TermCollectionSpec,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    fit_fn: FitFn,
-    score_fn: ScoreFn,
-) -> Result<TwoBlockMaternKappaOptimizationResult<FitOut>, String>
-where
-    FitOut: Clone,
-    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    optimize_two_block_spatial_length_scale(
-        data,
-        meanspec,
-        noisespec,
-        kappa_options,
-        fit_fn,
-        score_fn,
-    )
-}
-
-pub fn optimize_two_block_spatial_length_scale<FitOut, FitFn, ScoreFn>(
-    data: ArrayView2<'_, f64>,
-    meanspec: &TermCollectionSpec,
-    noisespec: &TermCollectionSpec,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    mut fit_fn: FitFn,
-    score_fn: ScoreFn,
-) -> Result<TwoBlockSpatialLengthScaleOptimizationResult<FitOut>, String>
-where
-    FitOut: Clone,
-    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
-    ScoreFn: Fn(&FitOut) -> f64,
-{
-    let mean_terms = spatial_length_scale_term_indices(meanspec);
-    let noise_terms = spatial_length_scale_term_indices(noisespec);
-
-    let build_pair = |ms: &TermCollectionSpec,
-                      ns: &TermCollectionSpec|
-     -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
-        let d_mean = build_term_collection_design(data, ms)
-            .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
-        let d_noise = build_term_collection_design(data, ns)
-            .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
-        Ok((d_mean, d_noise))
-    };
-
-    let (mut bestmean_design, mut bestnoise_design) = build_pair(meanspec, noisespec)?;
-    let mut best_meanspec =
-        freeze_spatial_length_scale_terms_from_design(meanspec, &bestmean_design).map_err(|e| {
-            format!(
-                "failed to freeze mean spatial basis centers during κ optimization bootstrap: {e}"
-            )
-        })?;
-    let mut best_noisespec = freeze_spatial_length_scale_terms_from_design(
-        noisespec,
-        &bestnoise_design,
-    )
-    .map_err(|e| {
-        format!("failed to freeze noise spatial basis centers during κ optimization bootstrap: {e}")
-    })?;
-    let mut best_fit = fit_fn(&bestmean_design, &bestnoise_design)?;
-    let initial_score = score_fn(&best_fit);
-    if !initial_score.is_finite() {
-        log::debug!("[location-scale][kappa] initial profiled score is non-finite");
-    }
-
-    if !kappa_options.enabled || (mean_terms.is_empty() && noise_terms.is_empty()) {
-        return Ok(TwoBlockSpatialLengthScaleOptimizationResult {
-            resolved_meanspec: best_meanspec,
-            resolved_noisespec: best_noisespec,
-            mean_design: bestmean_design,
-            noise_design: bestnoise_design,
-            fit: best_fit,
-        });
-    }
-    if kappa_options.max_outer_iter == 0 {
-        return Err("spatial κ optimization requires max_outer_iter >= 1".to_string());
-    }
-    if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
-        return Err("spatial κ optimization requires log_step > 0".to_string());
-    }
-    if !(kappa_options.min_length_scale.is_finite()
-        && kappa_options.max_length_scale.is_finite()
-        && kappa_options.min_length_scale > 0.0
-        && kappa_options.max_length_scale >= kappa_options.min_length_scale)
-    {
-        return Err(
-            "spatial κ optimization requires valid positive length_scale bounds".to_string(),
-        );
-    }
-
-    let total_terms = mean_terms.len() + noise_terms.len();
-    if total_terms > 0 {
-        let mut theta0 = Array1::<f64>::zeros(total_terms);
-        for (slot, &term_idx) in mean_terms.iter().enumerate() {
-            theta0[slot] = get_spatial_length_scale(&best_meanspec, term_idx)
-                .unwrap_or(kappa_options.min_length_scale)
-                .clamp(
-                    kappa_options.min_length_scale,
-                    kappa_options.max_length_scale,
-                )
-                .ln();
-        }
-        for (slot, &term_idx) in noise_terms.iter().enumerate() {
-            theta0[mean_terms.len() + slot] = get_spatial_length_scale(&best_noisespec, term_idx)
-                .unwrap_or(kappa_options.min_length_scale)
-                .clamp(
-                    kappa_options.min_length_scale,
-                    kappa_options.max_length_scale,
-                )
-                .ln();
-        }
-
-        let mut hyper_state =
-            TwoBlockSpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
-
-        hyper_state.remember_realized(TwoBlockHyperEval {
-            theta: theta0.clone(),
-            cost: if initial_score.is_finite() {
-                initial_score
-            } else {
-                f64::INFINITY
-            },
-            meanspec: best_meanspec.clone(),
-            noisespec: best_noisespec.clone(),
-            mean_design: bestmean_design.clone(),
-            noise_design: bestnoise_design.clone(),
-            fit: best_fit.clone(),
-        });
-
-        use crate::solver::strategy::{
-            ClosureObjective, CoordinateSearchConfig, Derivative, EfsEval, HessianResult,
-            OuterCapability, OuterConfig, OuterEval, Solver,
-        };
-
-        struct TwoBlockState<'a, FitOut: Clone, FitFn, ScoreFn> {
-            hyper: TwoBlockSpatialHyperState<FitOut>,
-            data: ArrayView2<'a, f64>,
-            best_meanspec: &'a TermCollectionSpec,
-            best_noisespec: &'a TermCollectionSpec,
-            mean_terms: &'a [usize],
-            noise_terms: &'a [usize],
-            fit_fn: FitFn,
-            score_fn: ScoreFn,
-        }
-
-        let mut state = TwoBlockState {
-            hyper: hyper_state,
-            data,
-            best_meanspec: &best_meanspec,
-            best_noisespec: &best_noisespec,
-            mean_terms: &mean_terms,
-            noise_terms: &noise_terms,
-            fit_fn,
-            score_fn,
-        };
-
-        type TBS<'a, FO, FF, SF> = TwoBlockState<'a, FO, FF, SF>;
-
-        let mut obj = ClosureObjective {
-            state: &mut state,
-            cap: OuterCapability {
-                gradient: Derivative::Unavailable,
-                hessian: Derivative::Unavailable,
-                n_params: total_terms,
-                all_penalty_like: false,
-                barrier_config: None,
-                force_solver: None,
-            },
-            cost_fn: |ctx: &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
-                let data_view = ctx.data;
-                let bp = |ms: &TermCollectionSpec, ns: &TermCollectionSpec| -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
-                    let d_mean = build_term_collection_design(data_view, ms)
-                        .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
-                    let d_noise = build_term_collection_design(data_view, ns)
-                        .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
-                    Ok((d_mean, d_noise))
-                };
-                eval_two_block_spatial_cost(
-                    &mut ctx.hyper,
-                    ctx.best_meanspec,
-                    ctx.best_noisespec,
-                    ctx.mean_terms,
-                    ctx.noise_terms,
-                    theta,
-                    &bp,
-                    &mut ctx.fit_fn,
-                    &ctx.score_fn,
-                )
-            },
-            eval_fn: |ctx: &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>, theta: &Array1<f64>| {
-                let data_view = ctx.data;
-                let bp = |ms: &TermCollectionSpec, ns: &TermCollectionSpec| -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
-                    let d_mean = build_term_collection_design(data_view, ms)
-                        .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
-                    let d_noise = build_term_collection_design(data_view, ns)
-                        .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
-                    Ok((d_mean, d_noise))
-                };
-                let cost = eval_two_block_spatial_cost(
-                    &mut ctx.hyper,
-                    ctx.best_meanspec,
-                    ctx.best_noisespec,
-                    ctx.mean_terms,
-                    ctx.noise_terms,
-                    theta,
-                    &bp,
-                    &mut ctx.fit_fn,
-                    &ctx.score_fn,
-                )?;
-                Ok(OuterEval {
-                    cost,
-                    gradient: Array1::zeros(theta.len()),
-                    hessian: HessianResult::Unavailable,
-                })
-            },
-            reset_fn: None::<fn(&mut &mut TBS<'_, FitOut, FitFn, ScoreFn>)>,
-            efs_fn: None::<
-                fn(
-                    &mut &mut TBS<'_, FitOut, FitFn, ScoreFn>,
-                    &Array1<f64>,
-                ) -> Result<EfsEval, EstimationError>,
-            >,
-        };
-
-        let outer_config = OuterConfig {
-            tolerance: kappa_options.rel_tol.max(1e-6),
-            max_iter: kappa_options.max_outer_iter.max(1),
-            fd_step: kappa_options.log_step,
-            seed_config: crate::seeding::SeedConfig {
-                max_seeds: 1,
-                screening_budget: 1,
-                ..Default::default()
-            },
-            rho_bound: kappa_options.max_length_scale.ln().abs().max(12.0),
-            heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-            initial_rho: Some(theta0.clone()),
-            fallback_sequence: vec![OuterCapability {
-                gradient: Derivative::Unavailable,
-                hessian: Derivative::Unavailable,
-                n_params: total_terms,
-                all_penalty_like: false,
-                barrier_config: None,
-                force_solver: Some(Solver::CoordinateSearch),
-            }],
-            coordinate_search: Some(CoordinateSearchConfig {
-                log_step: kappa_options.log_step,
-                max_coord_iters: kappa_options.max_outer_iter,
-                rel_tol: kappa_options.rel_tol,
-            }),
-        };
-
-        let result = crate::solver::strategy::run_outer(
-            &mut obj,
-            &outer_config,
-            "two-block spatial length-scale",
-        )
-        .map_err(|e| e.to_string())?;
-
-        // Realize the best result from the optimization.
-        let data_view = state.data;
-        let realize_bp = |ms: &TermCollectionSpec,
-                          ns: &TermCollectionSpec|
-         -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
-            let d_mean = build_term_collection_design(data_view, ms)
-                .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
-            let d_noise = build_term_collection_design(data_view, ns)
-                .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
-            Ok((d_mean, d_noise))
-        };
-        let best_eval = realize_two_block_spatial_eval(
-            &mut state.hyper,
-            state.best_meanspec,
-            state.best_noisespec,
-            state.mean_terms,
-            state.noise_terms,
-            &result.rho,
-            &realize_bp,
-            &mut state.fit_fn,
-            &state.score_fn,
-        )
-        .map_err(|e| e.to_string())?;
-
-        best_meanspec = best_eval.meanspec;
-        best_noisespec = best_eval.noisespec;
-        bestmean_design = best_eval.mean_design;
-        bestnoise_design = best_eval.noise_design;
-        best_fit = best_eval.fit;
-    }
-
-    log_spatial_aniso_scales(&best_meanspec);
-    log_spatial_aniso_scales(&best_noisespec);
-    Ok(TwoBlockSpatialLengthScaleOptimizationResult {
-        resolved_meanspec: best_meanspec,
-        resolved_noisespec: best_noisespec,
-        mean_design: bestmean_design,
-        noise_design: bestnoise_design,
-        fit: best_fit,
-    })
 }
 
 pub fn optimize_two_block_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn>(
@@ -9693,28 +8888,26 @@ where
 
     use crate::solver::strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        OuterEval, Solver,
     };
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
 
     struct TwoBlockExactJointState {
-        best_theta: Array1<f64>,
         best_cost: f64,
     }
 
     impl TwoBlockExactJointState {
         fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            let _ = theta;
             if cost < self.best_cost {
                 self.best_cost = cost;
-                self.best_theta = theta.clone();
             }
         }
     }
 
     let mut state = TwoBlockExactJointState {
-        best_theta: theta0.clone(),
         best_cost: f64::INFINITY,
     };
 
@@ -9745,9 +8938,8 @@ where
             n_params: theta_dim,
             all_penalty_like: false,
             barrier_config: None,
-            force_solver: None,
+            force_solver: Some(Solver::Bfgs),
         }],
-        coordinate_search: None,
     };
 
     let mut obj = ClosureObjective {
@@ -9908,28 +9100,6 @@ where
     })
 }
 
-pub fn fit_term_collectionwith_matern_kappa_optimization(
-    data: ArrayView2<'_, f64>,
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    offset: Array1<f64>,
-    spec: &TermCollectionSpec,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    fit_term_collectionwith_spatial_length_scale_optimization(
-        data,
-        y,
-        weights,
-        offset,
-        spec,
-        family,
-        options,
-        kappa_options,
-    )
-}
-
 pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: Array1<f64>,
@@ -9951,11 +9121,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // optimizer is expected to consume a real joint Hessian. NewtonTrustRegion
     // and ARC are not meant to run on a gradient-only surrogate here.
     //
-    // Only Matern terms participate in this outer solve.
-    // If an eligible spatial basis does not expose exact log-kappa derivatives,
-    // the default behavior is now to fail rather than silently degrade to the
-    // older bounded coordinate-search path. That legacy fallback remains
-    // available only when explicitly enabled in the spatial options.
+    // Any smooth with an explicit spatial length scale participates in this
+    // outer solve. If an eligible spatial basis does not expose exact
+    // log-kappa derivatives, that is now a hard error.
     let mut resolvedspec = spec.clone();
     let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     let n = data.nrows();
@@ -10053,55 +9221,10 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 adaptive_diagnostics: best.adaptive_diagnostics,
             });
         }
-        if !kappa_options.allow_finite_difference_fallback {
-            return Err(EstimationError::InvalidInput(
-                "exact joint spatial length-scale path is unavailable and finite-difference fallback is disabled by default"
-                    .to_string(),
-            ));
-        }
-        log::debug!(
-            "[spatial-kappa] exact joint path unavailable for one or more spatial terms; \
-             falling back to bounded coordinate-search spatial length-scale optimization"
-        );
-        let fallback = optimize_single_block_spatial_length_scale(
-            &resolvedspec,
-            &spatial_terms,
-            kappa_options,
-            |candspec| {
-                let out = fit_term_collection_forspec(
-                    data,
-                    y.view(),
-                    weights.view(),
-                    offset.view(),
-                    candspec,
-                    family,
-                    options,
-                )?;
-                Ok((out.design.clone(), out))
-            },
-            |out: &FittedTermCollection| fit_score(&out.fit),
-        )?;
-        let fallback_score = fit_score(&fallback.fit.fit);
-        if fallback_score <= initial_score + 1e-10 {
-            log_spatial_aniso_scales(&fallback.resolvedspec);
-            return Ok(FittedTermCollectionWithSpec {
-                fit: fallback.fit.fit,
-                design: fallback.design,
-                resolvedspec: fallback.resolvedspec,
-                adaptive_diagnostics: fallback.fit.adaptive_diagnostics,
-            });
-        }
-        log::warn!(
-            "[spatial-kappa] coordinate-search fallback score regressed ({:.6e} -> {:.6e}); keeping baseline",
-            initial_score,
-            fallback_score
-        );
-        return Ok(FittedTermCollectionWithSpec {
-            fit: best.fit,
-            design: best.design,
-            resolvedspec,
-            adaptive_diagnostics: best.adaptive_diagnostics,
-        });
+        return Err(EstimationError::InvalidInput(
+            "exact joint spatial length-scale path is unavailable for one or more eligible spatial terms"
+                .to_string(),
+        ));
     }
 
     Ok(FittedTermCollectionWithSpec {
@@ -10149,6 +9272,43 @@ mod tests {
         resid.dot(&resid).sqrt()
     }
 
+    fn isotropic_two_block_exact_joint_setup(
+        meanspec: &TermCollectionSpec,
+        noisespec: &TermCollectionSpec,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> TwoBlockExactJointHyperSetup {
+        let mean_terms = spatial_length_scale_term_indices(meanspec);
+        let noise_terms = spatial_length_scale_term_indices(noisespec);
+        let mean_log_kappa =
+            SpatialLogKappaCoords::from_length_scales(meanspec, &mean_terms, kappa_options);
+        let noise_log_kappa =
+            SpatialLogKappaCoords::from_length_scales(noisespec, &noise_terms, kappa_options);
+        let dims_per_term = mean_log_kappa
+            .dims_per_term()
+            .iter()
+            .chain(noise_log_kappa.dims_per_term().iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let log_kappa0 = SpatialLogKappaCoords::new_with_dims(
+            Array1::from_iter(
+                mean_log_kappa
+                    .as_array()
+                    .iter()
+                    .chain(noise_log_kappa.as_array().iter())
+                    .copied(),
+            ),
+            dims_per_term.clone(),
+        );
+        TwoBlockExactJointHyperSetup::new(
+            Array1::zeros(0),
+            Array1::zeros(0),
+            Array1::zeros(0),
+            log_kappa0,
+            SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options),
+            SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options),
+        )
+    }
+
     #[test]
     fn smooth_design_assembles_terms_and_penalties() {
         let data = array![
@@ -10184,6 +9344,7 @@ mod tests {
                     feature_cols: vec![1, 2],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
                         double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
@@ -10225,6 +9386,7 @@ mod tests {
                 feature_cols: vec![0, 1],
                 spec: ThinPlateBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
+                    length_scale: 1.0,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
                 },
@@ -10251,6 +9413,7 @@ mod tests {
                 feature_cols: vec![0],
                 spec: ThinPlateBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                    length_scale: 1.0,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
                 },
@@ -10283,6 +9446,7 @@ mod tests {
                 feature_cols: vec![0, 1, 2],
                 spec: ThinPlateBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
+                    length_scale: 1.0,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::default(),
                 },
@@ -10423,6 +9587,7 @@ mod tests {
                     feature_cols: vec![1, 2],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
                         double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
@@ -10467,6 +9632,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::default(),
                     },
@@ -10518,6 +9684,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::default(),
                     },
@@ -10576,6 +9743,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     },
@@ -10637,6 +9805,7 @@ mod tests {
                         feature_cols: vec![1],
                         spec: ThinPlateBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            length_scale: 1.0,
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         },
@@ -10650,6 +9819,7 @@ mod tests {
                         feature_cols: vec![2],
                         spec: ThinPlateBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            length_scale: 1.0,
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         },
@@ -10694,6 +9864,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     },
@@ -10704,13 +9875,15 @@ mod tests {
         };
         let fit_design = build_term_collection_design(data.view(), &fitspec).unwrap();
         let term_meta = &fit_design.smooth.terms[0].metadata;
-        let (centers, z) = match term_meta {
+        let (centers, length_scale, z) = match term_meta {
             BasisMetadata::ThinPlate {
                 centers,
+                length_scale,
                 identifiability_transform,
                 ..
             } => (
                 centers.clone(),
+                *length_scale,
                 identifiability_transform
                     .clone()
                     .expect("fit-time Option 5 should store transform"),
@@ -10727,6 +9900,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::UserProvided(centers),
+                        length_scale,
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::FrozenTransform { transform: z },
                     },
@@ -11330,7 +10504,6 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
-                allow_finite_difference_fallback: true,
             },
         )
         .expect("optimized fit should succeed");
@@ -11359,7 +10532,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_two_block_spatial_length_scalefreezes_matern_centers() {
+    fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
         let n = 40usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
@@ -11398,28 +10571,40 @@ mod tests {
             smooth_terms: vec![matern_term("noise_matern", 1.1)],
         };
 
-        let solved = optimize_two_block_spatial_length_scale(
+        let kappa_options = SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 1,
+            rel_tol: 1e-6,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-3,
+            max_length_scale: 1e3,
+        };
+        let joint_setup =
+            isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
+        let theta_dim = joint_setup.theta0().len();
+
+        let solved = optimize_two_block_spatial_length_scale_exact_joint(
             data.view(),
             &meanspec,
             &noisespec,
-            &SpatialLengthScaleOptimizationOptions {
-                enabled: true,
-                max_outer_iter: 1,
-                rel_tol: 1e-6,
-                log_step: std::f64::consts::LN_2,
-                min_length_scale: 1e-3,
-                max_length_scale: 1e3,
-                allow_finite_difference_fallback: true,
-            },
-            |mean_design, noise_design| {
+            &kappa_options,
+            &joint_setup,
+            |rho, _, _, mean_design, noise_design| {
+                assert!(rho.is_empty());
                 Ok(mean_design.design.ncols() as f64
                     + noise_design.design.ncols() as f64
                     + mean_design.penalties.len() as f64
                     + noise_design.penalties.len() as f64)
             },
-            |score| *score,
+            |_rho, _, _, _, _, need_hessian| {
+                Ok((
+                    0.0,
+                    Array1::zeros(theta_dim),
+                    need_hessian.then(|| Array2::zeros((theta_dim, theta_dim))),
+                ))
+            },
         )
-        .expect("two-block κ optimization should succeed");
+        .expect("exact joint two-block κ optimization should succeed");
 
         for resolved in [&solved.resolved_meanspec, &solved.resolved_noisespec] {
             match &resolved.smooth_terms[0].basis {
@@ -11499,6 +10684,109 @@ mod tests {
                 .expect("derivative call should succeed")
                 .is_some(),
             "Matérn term should expose an exact derivative"
+        );
+    }
+
+    #[test]
+    fn exact_thin_plate_log_kappa_derivative_uses_feature_columns_only() {
+        let n = 28usize;
+        let p = 15usize;
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.17 * i as f64).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            for j in 2..p {
+                data[[i, j]] = ((i + 3 * j) as f64 * 0.07).cos();
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "thinplate".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
+                        length_scale: 0.7,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec)
+            .expect("baseline ThinPlate design should build");
+        let frozenspec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+            .expect("freezing ThinPlate centers from design should succeed");
+
+        match &frozenspec.smooth_terms[0].basis {
+            SmoothBasisSpec::ThinPlate { spec, .. } => match &spec.center_strategy {
+                CenterStrategy::UserProvided(centers) => {
+                    assert_eq!(centers.ncols(), 2, "frozen centers should stay term-local");
+                }
+                _ => panic!("expected frozen user-provided centers"),
+            },
+            _ => panic!("expected ThinPlate term"),
+        }
+
+        let smooth_term = &design.smooth.terms[0];
+        let termspec = &frozenspec.smooth_terms[0];
+        let BasisPsiDerivativeResult {
+            design_derivative: local_x_psi,
+            penalties_derivative: local_s_psi,
+        } = match &termspec.basis {
+            SmoothBasisSpec::ThinPlate {
+                feature_cols, spec, ..
+            } => {
+                let x = select_columns(data.view(), feature_cols)
+                    .expect("select ThinPlate feature cols");
+                crate::basis::build_thin_plate_basis_log_kappa_derivative(x.view(), spec)
+                    .expect("direct ThinPlate derivative should build")
+            }
+            _ => panic!("expected ThinPlate term"),
+        };
+        let BasisPsiSecondDerivativeResult {
+            designsecond_derivative: local_x_psi_psi,
+            penaltiessecond_derivative: local_s_psi_psi,
+        } = match &termspec.basis {
+            SmoothBasisSpec::ThinPlate {
+                feature_cols, spec, ..
+            } => {
+                let x = select_columns(data.view(), feature_cols)
+                    .expect("select ThinPlate feature cols");
+                crate::basis::build_thin_plate_basis_log_kappasecond_derivative(x.view(), spec)
+                    .expect("direct ThinPlate second derivative should build")
+            }
+            _ => panic!("expected ThinPlate term"),
+        };
+        assert_eq!(local_x_psi.ncols(), smooth_term.coeff_range.len());
+        assert_eq!(local_x_psi_psi.ncols(), smooth_term.coeff_range.len());
+        assert!(!local_s_psi.is_empty());
+        assert_eq!(local_s_psi.len(), local_s_psi_psi.len());
+        assert!(local_s_psi.iter().all(|s| {
+            s.nrows() == smooth_term.coeff_range.len() && s.ncols() == smooth_term.coeff_range.len()
+        }));
+        assert!(local_s_psi_psi.iter().all(|s| {
+            s.nrows() == smooth_term.coeff_range.len() && s.ncols() == smooth_term.coeff_range.len()
+        }));
+
+        let derivative =
+            try_build_spatial_term_log_kappa_derivative(data.view(), &frozenspec, &design, 0);
+        assert!(
+            derivative.is_ok(),
+            "exact ThinPlate log-kappa derivative should use only feature_cols; got {derivative:?}"
+        );
+        let derivative = derivative.expect("derivative call should succeed");
+        assert!(
+            derivative.is_some(),
+            "ThinPlate term should expose an exact derivative"
         );
     }
 
@@ -11685,7 +10973,6 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
-                allow_finite_difference_fallback: true,
             },
         )
         .expect("optimized fit should succeed");
@@ -11781,7 +11068,6 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
-                allow_finite_difference_fallback: true,
             },
         )
         .expect("binomial-logit Matérn spatial κ optimization should succeed");
@@ -11795,82 +11081,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_search_single_block_spatial_fallback_optimizes_length_scale() {
-        let data = array![
-            [0.0, 0.1],
-            [0.2, 0.0],
-            [0.4, 0.3],
-            [0.6, 0.5],
-            [0.8, 0.7],
-            [1.0, 0.9],
-        ];
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "matern".to_string(),
-                basis: SmoothBasisSpec::Matern {
-                    feature_cols: vec![0, 1],
-                    spec: MaternBasisSpec {
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: 4.0,
-                        nu: MaternNu::FiveHalves,
-                        include_intercept: false,
-                        double_penalty: false,
-                        identifiability: MaternIdentifiability::CenterSumToZero,
-                        aniso_log_scales: None,
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-            }],
-        };
-        let spatial_terms = spatial_length_scale_term_indices(&spec);
-        let target_length_scale = 0.35_f64;
-        let baseline_score = (get_spatial_length_scale(&spec, 0)
-            .expect("baseline length scale")
-            .ln()
-            - target_length_scale.ln())
-        .powi(2);
-
-        let optimized = optimize_single_block_spatial_length_scale(
-            &spec,
-            &spatial_terms,
-            &SpatialLengthScaleOptimizationOptions {
-                enabled: true,
-                max_outer_iter: 8,
-                rel_tol: 1e-8,
-                log_step: std::f64::consts::LN_2,
-                min_length_scale: 1e-3,
-                max_length_scale: 1e3,
-                allow_finite_difference_fallback: true,
-            },
-            |candspec| {
-                let design = build_term_collection_design(data.view(), candspec)?;
-                let length_scale =
-                    get_spatial_length_scale(candspec, 0).expect("candidate length scale");
-                Ok((design, length_scale))
-            },
-            |length_scale: &f64| (length_scale.ln() - target_length_scale.ln()).powi(2),
-        )
-        .expect("coordinate-search single-block fallback should succeed");
-
-        let optimized_length_scale =
-            get_spatial_length_scale(&optimized.resolvedspec, 0).expect("optimized length scale");
-        let optimized_score = (optimized_length_scale.ln() - target_length_scale.ln()).powi(2);
-        assert!(
-            optimized_score < baseline_score,
-            "expected coordinate-search fallback to improve score: baseline={baseline_score}, optimized={optimized_score}"
-        );
-        assert!(
-            (optimized_length_scale.ln() - target_length_scale.ln()).abs() < 1e-3,
-            "expected optimizer to recover target scale in log-space: got {optimized_length_scale}"
-        );
-        assert_eq!(optimized.design.design.nrows(), data.nrows());
-    }
-
-    #[test]
-    fn duchon_terms_are_excluded_from_kappa_optimization() {
+    fn duchon_terms_participate_in_kappa_optimization() {
         let data = array![
             [0.0, 0.1],
             [0.2, 0.0],
@@ -11900,10 +11111,7 @@ mod tests {
             }],
         };
 
-        assert!(
-            spatial_length_scale_term_indices(&spec).is_empty(),
-            "Duchon terms should not participate in κ optimization"
-        );
+        assert_eq!(spatial_length_scale_term_indices(&spec), vec![0]);
 
         let fit_opts = FitOptions {
             mixture_link: None,
@@ -11922,16 +11130,18 @@ mod tests {
         let weights = Array1::ones(data.nrows());
         let offset = Array1::zeros(data.nrows());
 
-        let baseline = fit_term_collection_forspec(
-            data.view(),
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &spec,
-            LikelihoodFamily::GaussianIdentity,
-            &fit_opts,
-        )
-        .expect("baseline Duchon fit should succeed");
+        let design = build_term_collection_design(data.view(), &spec)
+            .expect("baseline Duchon design should build");
+        let frozenspec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+            .expect("freezing Duchon centers from design should succeed");
+        let derivative =
+            try_build_spatial_term_log_kappa_derivative(data.view(), &frozenspec, &design, 0);
+        assert!(
+            derivative
+                .expect("Duchon exact derivative call should succeed")
+                .is_some(),
+            "Duchon term should expose an exact derivative"
+        );
 
         let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
             data.view(),
@@ -11943,25 +11153,30 @@ mod tests {
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
-        .expect("Duchon fit should bypass κ optimization");
+        .expect("Duchon fit should use exact κ optimization");
 
-        let baseline_ls = match &spec.smooth_terms[0].basis {
-            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
-            _ => panic!("expected Duchon term"),
-        };
         let optimized_ls = match &optimized.resolvedspec.smooth_terms[0].basis {
             SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
             _ => panic!("expected Duchon term"),
         };
-        assert_eq!(optimized_ls, baseline_ls);
-        assert_eq!(
-            optimized.design.design.ncols(),
-            baseline.design.design.ncols()
-        );
+        assert!(optimized_ls.is_some());
+        match &optimized.resolvedspec.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                assert!(matches!(
+                    spec.center_strategy,
+                    CenterStrategy::UserProvided(_)
+                ));
+                assert!(matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::FrozenTransform { .. }
+                ));
+            }
+            _ => panic!("expected Duchon term"),
+        }
     }
 
     #[test]
-    fn optimize_two_block_spatial_length_scalefreezes_duchon_centers() {
+    fn exact_joint_two_block_spatial_length_scale_freezes_duchon_centers() {
         let n = 40usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
@@ -11999,28 +11214,40 @@ mod tests {
             smooth_terms: vec![duchon_term("noise_duchon", 1.1)],
         };
 
-        let solved = optimize_two_block_spatial_length_scale(
+        let kappa_options = SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 1,
+            rel_tol: 1e-6,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-3,
+            max_length_scale: 1e3,
+        };
+        let joint_setup =
+            isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
+        let theta_dim = joint_setup.theta0().len();
+
+        let solved = optimize_two_block_spatial_length_scale_exact_joint(
             data.view(),
             &meanspec,
             &noisespec,
-            &SpatialLengthScaleOptimizationOptions {
-                enabled: true,
-                max_outer_iter: 1,
-                rel_tol: 1e-6,
-                log_step: std::f64::consts::LN_2,
-                min_length_scale: 1e-3,
-                max_length_scale: 1e3,
-                allow_finite_difference_fallback: true,
-            },
-            |mean_design, noise_design| {
+            &kappa_options,
+            &joint_setup,
+            |rho, _, _, mean_design, noise_design| {
+                assert!(rho.is_empty());
                 Ok(mean_design.design.ncols() as f64
                     + noise_design.design.ncols() as f64
                     + mean_design.penalties.len() as f64
                     + noise_design.penalties.len() as f64)
             },
-            |score| *score,
+            |_rho, _, _, _, _, need_hessian| {
+                Ok((
+                    0.0,
+                    Array1::zeros(theta_dim),
+                    need_hessian.then(|| Array2::zeros((theta_dim, theta_dim))),
+                ))
+            },
         )
-        .expect("two-block spatial length-scale optimization should succeed");
+        .expect("exact joint two-block spatial length-scale optimization should succeed");
 
         for resolved in [&solved.resolved_meanspec, &solved.resolved_noisespec] {
             match &resolved.smooth_terms[0].basis {

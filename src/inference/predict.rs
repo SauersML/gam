@@ -24,11 +24,6 @@ fn apply_family_inverse_link(
     family: crate::types::LikelihoodFamily,
     link_kind: Option<&InverseLink>,
 ) -> Result<Array1<f64>, EstimationError> {
-    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
-        return Err(EstimationError::InvalidInput(
-            "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
-        ));
-    }
     strategy_for_family(family, link_kind).inverse_link_array(eta.view())
 }
 
@@ -956,19 +951,19 @@ pub struct SurvivalPredictor {
 
 impl SurvivalPredictor {
     /// Build a `SurvivalPredictor` from a `UnifiedFitResult`, extracting betas
-    /// from blocks by role: Location/Mean → beta_threshold, Scale → beta_log_sigma.
+    /// from blocks by role: Threshold (or legacy Location/Mean) ->
+    /// beta_threshold, Scale -> beta_log_sigma.
     pub(crate) fn from_unified(
         unified: &UnifiedFitResult,
         inverse_link: InverseLink,
     ) -> Result<Self, EstimationError> {
         let beta_threshold = unified
-            .block_by_role(BlockRole::Location)
+            .block_by_role(BlockRole::Threshold)
+            .or_else(|| unified.block_by_role(BlockRole::Location))
             .or_else(|| unified.block_by_role(BlockRole::Mean))
             .map(|b| b.beta.clone())
             .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Survival model missing location/mean (threshold) block".to_string(),
-                )
+                EstimationError::InvalidInput("Survival model missing threshold block".to_string())
             })?;
         let beta_log_sigma = unified
             .block_by_role(BlockRole::Scale)
@@ -1251,7 +1246,7 @@ impl PredictableModel for SurvivalPredictor {
     }
 
     fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Location, BlockRole::Scale]
+        vec![BlockRole::Threshold, BlockRole::Scale]
     }
 }
 
@@ -1361,6 +1356,10 @@ pub struct CoefficientUncertaintyResult {
 
 /// Generic engine prediction for external designs.
 /// This API is domain-agnostic: callers provide only design matrix, coefficients, offset, and family.
+///
+/// For `RoystonParmar`, callers must supply the exit-side cumulative-hazard
+/// design and offset so that `eta = log(H(t))`; the response-scale prediction is
+/// the survival probability `exp(-exp(eta))`.
 pub fn predict_gam<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
@@ -1375,11 +1374,6 @@ where
         predict_gam_dimension_mismatch_message(x.nrows(), x.ncols(), beta.len(), offset.len())
     {
         return Err(EstimationError::InvalidInput(message));
-    }
-    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
-        return Err(EstimationError::InvalidInput(
-            "predict_gam does not support RoystonParmar; use survival prediction APIs".to_string(),
-        ));
     }
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
@@ -1447,12 +1441,6 @@ where
             covariance.ncols()
         )));
     }
-    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
-        return Err(EstimationError::InvalidInput(
-            "predict_gam_posterior_mean does not support RoystonParmar; use survival prediction APIs"
-                .to_string(),
-        ));
-    }
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
@@ -1513,12 +1501,6 @@ where
             covariance.nrows(),
             covariance.ncols()
         )));
-    }
-    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
-        return Err(EstimationError::InvalidInput(
-            "predict_gam_posterior_meanwith_fit does not support RoystonParmar; use survival prediction APIs"
-                .to_string(),
-        ));
     }
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
@@ -1794,10 +1776,26 @@ where
             &mean - &mean_standard_error.mapv(|s| z * s),
             &mean + &mean_standard_error.mapv(|s| z * s),
         ),
-        MeanIntervalMethod::TransformEta => (
-            apply_family_inverse_link(&eta_lower, family, link_kind.as_ref())?,
-            apply_family_inverse_link(&eta_upper, family, link_kind.as_ref())?,
-        ),
+        MeanIntervalMethod::TransformEta => {
+            let transformed_lower =
+                apply_family_inverse_link(&eta_lower, family, link_kind.as_ref())?;
+            let transformed_upper =
+                apply_family_inverse_link(&eta_upper, family, link_kind.as_ref())?;
+            (
+                Array1::from_iter(
+                    transformed_lower
+                        .iter()
+                        .zip(transformed_upper.iter())
+                        .map(|(&lo, &hi)| lo.min(hi)),
+                ),
+                Array1::from_iter(
+                    transformed_lower
+                        .iter()
+                        .zip(transformed_upper.iter())
+                        .map(|(&lo, &hi)| lo.max(hi)),
+                ),
+            )
+        }
     };
 
     if matches!(
@@ -1808,6 +1806,7 @@ where
             | crate::types::LikelihoodFamily::BinomialSas
             | crate::types::LikelihoodFamily::BinomialBetaLogistic
             | crate::types::LikelihoodFamily::BinomialMixture
+            | crate::types::LikelihoodFamily::RoystonParmar
     ) {
         mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
         mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
@@ -1924,8 +1923,46 @@ pub fn coefficient_uncertaintywith_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::estimate::{
+        BlockRole, FittedBlock, FittedLinkState, FitArtifacts, UnifiedFitResult,
+        UnifiedFitResultParts,
+    };
+    use crate::pirls::PirlsStatus;
     use crate::types::LinkFunction;
-    use ndarray::{Array2, array};
+    use ndarray::{Array1, Array2, array};
+
+    fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: beta.clone(),
+                role: BlockRole::Mean,
+                edf: 0.0,
+                lambdas: Array1::zeros(0),
+            }],
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            log_likelihood: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: Some(covariance),
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts { pirls: None },
+            inner_cycles: 0,
+        })
+        .expect("test fit")
+    }
 
     #[test]
     fn predict_posterior_mean_probit_matches_closed_form_reference() {
@@ -1971,5 +2008,98 @@ mod tests {
         .mean;
         assert!((out.mean[0] - expected).abs() <= 1e-12);
         assert!((out.mean[1] - expected).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn predict_royston_parmar_point_prediction_returns_survival_probability() {
+        let x = array![[1.0], [1.0]];
+        let beta = array![0.4];
+        let offset = array![0.0, 0.8];
+        let out = predict_gam(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::RoystonParmar,
+        )
+        .expect("royston-parmar point prediction");
+        let expected_eta = array![0.4, 1.2];
+        let expected_mean =
+            expected_eta.mapv(|eta| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
+        assert_eq!(out.eta, expected_eta);
+        for i in 0..out.mean.len() {
+            assert!((out.mean[i] - expected_mean[i]).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn predict_royston_parmar_posterior_mean_matches_quadrature_and_fit_path() {
+        let x = array![[1.0], [1.0]];
+        let beta = array![0.35];
+        let offset = array![0.0, 0.0];
+        let covariance = Array2::from_diag(&array![0.09]);
+        let fit = test_fit_with_covariance(beta.clone(), covariance.clone());
+
+        let out = predict_gam_posterior_mean(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::RoystonParmar,
+            covariance.view(),
+        )
+        .expect("royston-parmar posterior mean");
+        let out_with_fit = predict_gam_posterior_meanwith_fit(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::RoystonParmar,
+            covariance.view(),
+            &fit,
+        )
+        .expect("royston-parmar posterior mean with fit");
+
+        let quadctx = crate::quadrature::QuadratureContext::new();
+        let expected = crate::quadrature::survival_posterior_mean(&quadctx, 0.35, 0.3);
+        for i in 0..out.mean.len() {
+            assert!((out.mean[i] - expected).abs() <= 1e-12);
+            assert!((out_with_fit.mean[i] - expected).abs() <= 1e-12);
+            assert!((out_with_fit.mean[i] - out.mean[i]).abs() <= 1e-12);
+            assert!(
+                (out_with_fit.eta_standard_error[i] - out.eta_standard_error[i]).abs() <= 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn predict_royston_parmar_uncertainty_clamps_and_orders_intervals() {
+        let x = array![[1.0]];
+        let beta = array![0.6];
+        let offset = array![0.0];
+        let covariance = Array2::from_diag(&array![0.25]);
+        let fit = test_fit_with_covariance(beta.clone(), covariance);
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+        };
+
+        let out = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::RoystonParmar,
+            &fit,
+            &options,
+        )
+        .expect("royston-parmar uncertainty");
+
+        let quadctx = crate::quadrature::QuadratureContext::new();
+        let (_, variance) = crate::quadrature::survival_posterior_meanvariance(&quadctx, 0.6, 0.5);
+        assert!((out.mean[0] - (-(0.6_f64.exp())).exp()).abs() <= 1e-12);
+        assert!((out.eta_standard_error[0] - 0.5).abs() <= 1e-12);
+        assert!((out.mean_standard_error[0] - variance.sqrt()).abs() <= 1e-12);
+        assert!(out.mean_lower[0] <= out.mean_upper[0]);
+        assert!((0.0..=1.0).contains(&out.mean_lower[0]));
+        assert!((0.0..=1.0).contains(&out.mean_upper[0]));
     }
 }

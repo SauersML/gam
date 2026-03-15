@@ -66,7 +66,6 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         heuristic_lambdas: None,
         initial_rho: Some(Array1::zeros(3)),
         fallback_sequence: vec![],
-        coordinate_search: None,
     };
 
     let result = gam::solver::strategy::run_outer(&mut obj, &config, "repro-linesearch");

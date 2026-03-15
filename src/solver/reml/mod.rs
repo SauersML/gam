@@ -2,18 +2,20 @@ use self::cache::AtomicFlagGuard;
 use self::reml_strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
 use super::*;
 use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
+#[cfg(test)]
+use crate::linalg::sparse_exact::SparseTraceWorkspace;
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
     build_sparse_penalty_blocks, leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti,
 };
-use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
+use crate::pirls::{
+    DirectionalWorkingCurvature, PirlsWorkspace, directionalworking_curvature_from_c_array,
+};
 use crate::types::SasLinkState;
 use faer::Side;
 use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::s;
 use std::ops::Range;
-#[cfg(test)]
-use crate::linalg::sparse_exact::SparseTraceWorkspace;
 
 mod cache;
 mod eval;
@@ -139,7 +141,7 @@ mod tests {
         // B from implicit solve:
         //   H B = X_τ^T g - X^T W(X_τ β̂) - S_τ β̂.
         let x_tau_beta = x_tau.dot(&beta);
-        let weighted_x_tau_beta = &pr.solveweights * &x_tau_beta;
+        let weighted_x_tau_beta = &pr.finalweights * &x_tau_beta;
         let rhs = x_tau.t().dot(&u) - x.t().dot(&weighted_x_tau_beta) - s_tau.dot(&beta);
         let chol = h_orig.cholesky(Side::Lower).expect("chol(H)");
         let b_analytic = chol.solvevec(&rhs);
@@ -148,16 +150,13 @@ mod tests {
         //   H_τ = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ,
         // with W_τ provided by the family directional curvature callback.
         let eta_dot = &x_tau_beta + &x.dot(&b_analytic);
-        let w_direction = directionalworking_curvature_from_eta(
-            LinkFunction::Logit,
-            &pr.final_eta,
-            state.weights,
-            &pr.solveweights,
+        let w_direction = directionalworking_curvature_from_c_array(
+            &pr.solve_c_array,
+            &pr.finalweights,
             &eta_dot,
-        )
-        .expect("directional working curvature should evaluate for logit");
-        let wx = RemlState::row_scale(&x, &pr.solveweights);
-        let wx_tau = RemlState::row_scale(&x_tau, &pr.solveweights);
+        );
+        let wx = RemlState::row_scale(&x, &pr.finalweights);
+        let wx_tau = RemlState::row_scale(&x_tau, &pr.finalweights);
         let mut xwtau_x = x.clone();
         match w_direction {
             super::DirectionalWorkingCurvature::Diagonal(diag) => {
@@ -631,6 +630,10 @@ mod tests {
             g_sparse_branch.is_finite(),
             "non-finite sparse exact directional firth value"
         );
+        // Validation target for a real sparse near-separation fit:
+        // compare the full REML gradient, including the sparse-Cholesky Firth
+        // term, against finite differences of the objective and expect about
+        // 1e-5 relative agreement when the factorization stays well-behaved.
         // Sparse branch now runs its own sparse solves/traces plus dense reduced
         // Firth blocks, so exact numerical equality with dense spectral path is
         // not guaranteed in this synthetic bundle setup. Guard the branch behavior:
@@ -893,9 +896,7 @@ mod tests {
         let (_cost, _grad, h_full) = state
             .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
-        let mixed_analytic = h_full
-            .slice(s![..rho.len(), rho.len()..])
-            .to_owned();
+        let mixed_analytic = h_full.slice(s![..rho.len(), rho.len()..]).to_owned();
         assert_eq!(mixed_analytic.nrows(), rho.len());
         assert_eq!(mixed_analytic.ncols(), hyper_dirs.len());
 
@@ -999,7 +1000,8 @@ mod tests {
             let (_cost_minus, g_minus, _h_minus) = state
                 .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
                 .expect("g-");
-            let col = (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
+            let col =
+                (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
             h_ttfd.column_mut(j).assign(&col);
         }
         for i in 0..h_ttfd.nrows() {

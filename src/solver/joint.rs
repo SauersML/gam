@@ -2614,7 +2614,6 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         heuristic_lambdas: heuristic_lambdas,
         initial_rho: None,
         fallback_sequence: Vec::new(),
-        coordinate_search: None,
     };
 
     let mut obj = ClosureObjective {

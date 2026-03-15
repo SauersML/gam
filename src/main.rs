@@ -19,7 +19,7 @@ use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
     UnifiedFitResultParts, compute_continuous_smoothness_order, fit_gam, optimize_external_design,
-    predict_gam,
+    predict_gam, predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -2102,25 +2102,26 @@ fn run_predict_survival(
             p
         ));
     }
-    let eta = x_exit.dot(&beta) + eta_offset_exit;
-    let (mean, se_default) = if args.mode == PredictModeArg::PosteriorMean {
+    let (eta, mean) = if args.mode == PredictModeArg::PosteriorMean {
         let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-        if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
-            return Err(format!(
-                "covariance shape mismatch: got {}x{}, expected {}x{}",
-                cov_mat.nrows(),
-                cov_mat.ncols(),
-                beta.len(),
-                beta.len()
-            ));
-        }
-        let se = linear_predictor_se(x_exit.view(), &cov_mat);
-        (
-            survival_posterior_mean_from_eta(eta.view(), se.view()),
-            Some(se),
+        let pred = predict_gam_posterior_mean(
+            x_exit.view(),
+            beta.view(),
+            eta_offset_exit.view(),
+            LikelihoodFamily::RoystonParmar,
+            cov_mat.view(),
         )
+        .map_err(|e| format!("survival posterior-mean prediction failed: {e}"))?;
+        (pred.eta, pred.mean)
     } else {
-        (survival_probability_from_eta(eta.view()), None)
+        let pred = predict_gam(
+            x_exit.view(),
+            beta.view(),
+            eta_offset_exit.view(),
+            LikelihoodFamily::RoystonParmar,
+        )
+        .map_err(|e| format!("survival prediction failed: {e}"))?;
+        (pred.eta, pred.mean)
     };
     let mut eta_se = None;
     let mut mean_lo = None;
@@ -2129,33 +2130,33 @@ fn run_predict_survival(
         if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
             return Err(format!("--level must be in (0,1), got {}", args.level));
         }
-        let se = if let Some(se) = se_default.as_ref() {
-            se.clone()
-        } else {
-            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
-                return Err(format!(
-                    "covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov_mat.nrows(),
-                    cov_mat.ncols(),
-                    beta.len(),
-                    beta.len()
-                ));
-            }
-            linear_predictor_se(x_exit.view(), &cov_mat)
-        };
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        eta_se = Some(se.clone());
-        let response_sd = response_sd_from_eta_for_family(
+        let uncertainty = predict_gamwith_uncertainty(
+            x_exit.view(),
+            beta.view(),
+            eta_offset_exit.view(),
             LikelihoodFamily::RoystonParmar,
-            eta.view(),
-            se.view(),
-            None,
-            None,
-            None,
-            None,
-        )?;
-        let (lo, hi) = response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+            &fit_saved,
+            &gam::estimate::PredictUncertaintyOptions {
+                confidence_level: args.level,
+                covariance_mode: infer_covariance_mode(args.covariance_mode),
+                mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+                includeobservation_interval: false,
+            },
+        )
+        .map_err(|e| format!("survival uncertainty prediction failed: {e}"))?;
+        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        eta_se = Some(uncertainty.eta_standard_error.clone());
+        let (lo, hi) = if args.mode == PredictModeArg::PosteriorMean {
+            response_interval_from_mean_sd(
+                mean.view(),
+                uncertainty.mean_standard_error.view(),
+                z,
+                0.0,
+                1.0,
+            )
+        } else {
+            (uncertainty.mean_lower, uncertainty.mean_upper)
+        };
         mean_lo = Some(lo);
         mean_hi = Some(hi);
     }
@@ -4632,7 +4633,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 heuristic_lambdas: Some(init.to_vec()),
                 initial_rho: None,
                 fallback_sequence: Vec::new(),
-                coordinate_search: None,
             };
             let mut obj = ClosureObjective {
                 state: (),
@@ -6646,12 +6646,14 @@ fn freeze_term_collectionspec(
                 },
                 BasisMetadata::ThinPlate {
                     centers,
+                    length_scale,
                     identifiability_transform,
                     input_scales: meta_scales,
                     ..
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
+                s.length_scale = *length_scale;
                 s.identifiability = match identifiability_transform {
                     Some(z) => SpatialIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -8577,6 +8579,7 @@ fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
                     center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
+                    length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                 },
@@ -9966,18 +9969,6 @@ fn fit_result_from_saved_model_for_prediction(
     model.fit_result.clone().ok_or_else(|| {
         "model is missing canonical fit_result payload; refit with current CLI".to_string()
     })
-}
-
-fn survival_posterior_mean_from_eta(
-    eta: ArrayView1<'_, f64>,
-    eta_se: ArrayView1<'_, f64>,
-) -> Array1<f64> {
-    let quadctx = gam::quadrature::QuadratureContext::new();
-    Array1::from_iter(
-        eta.iter()
-            .zip(eta_se.iter())
-            .map(|(&e, &se)| gam::quadrature::survival_posterior_mean(&quadctx, e, se)),
-    )
 }
 
 fn response_sd_from_eta_for_family(
@@ -11400,6 +11391,7 @@ mod tests {
                         feature_cols: vec![0],
                         spec: ThinPlateBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                            length_scale: 1.0,
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },
@@ -11413,6 +11405,7 @@ mod tests {
                         feature_cols: vec![1],
                         spec: ThinPlateBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                            length_scale: 1.0,
                             double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },

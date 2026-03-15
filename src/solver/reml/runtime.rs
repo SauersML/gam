@@ -478,87 +478,18 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Returns `true` when the current link is the canonical link for the
-    /// binomial family (i.e. the standard logit link without mixture or
-    /// SAS reparametrisation).  For canonical links the observed and Fisher
-    /// weight derivatives coincide, so no correction is needed.
-    fn is_binomial_canonical_link(&self) -> bool {
-        matches!(
-            self.runtime_inverse_link(),
-            InverseLink::Standard(LinkFunction::Logit)
-        )
-    }
-
-    /// Compute **observed-information** `c_obs` and `d_obs` arrays that
-    /// replace the Fisher `c_F` / `d_F` stored in `PirlsResult` for
-    /// non-canonical binomial links.
-    ///
-    /// For canonical links (logit) this returns the Fisher arrays unchanged
-    /// (bit-identical).
-    ///
-    /// The observed-information corrections account for the residual-
-    /// dependent term `B = (h''V − h'²V') / (φV²)`:
-    ///
-    /// ```text
-    /// c_obs = c_F + h'·B − (y−μ)·B_η
-    /// d_obs = d_F + h''·B + 2h'·B_η − (y−μ)·B_ηη
-    /// ```
-    ///
-    /// These are needed for exact ρ-direction Hessian drifts `dH/dρ_k` in
-    /// the outer REML/LAML evaluator when the link is non-canonical.
-    fn observed_cd_arrays(
+    /// Returns the eta-derivative carriers for the exact Hessian surface that
+    /// PIRLS accepted at the mode. For canonical links these coincide with the
+    /// Fisher arrays; for non-canonical links they carry the clamped observed-
+    /// information curvature used on the PIRLS left-hand side.
+    fn hessian_cd_arrays(
         &self,
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
-        use crate::mixture_link::{
-            inverse_link_jet_for_link_function, inverse_link_pdfthird_derivative_for_inverse_link,
-        };
-        use crate::pirls::{VarianceJet, observed_weight_noncanonical};
-
-        // For canonical binomial-logit, B = 0 so observed = Fisher.
-        if self.is_binomial_canonical_link() {
-            return Ok((
-                pirls_result.solve_c_array.clone(),
-                pirls_result.solve_d_array.clone(),
-            ));
-        }
-
-        let inv_link = self.runtime_inverse_link();
-        let n = pirls_result.final_eta.len();
-        let mut c_obs = Array1::<f64>::zeros(n);
-        let mut d_obs = Array1::<f64>::zeros(n);
-        let phi = 1.0_f64; // binomial dispersion
-
-        for i in 0..n {
-            let eta_i = pirls_result.final_eta[i];
-            let eta_clamped = match inv_link.link_function() {
-                LinkFunction::Logit => eta_i.clamp(-700.0, 700.0),
-                LinkFunction::Identity => eta_i,
-                _ => eta_i.clamp(-30.0, 30.0),
-            };
-
-            let jet = inverse_link_jet_for_link_function(
-                inv_link.link_function(),
-                eta_clamped,
-                inv_link.mixture_state(),
-                inv_link.sas_state(),
-            )?;
-
-            // h4 = h''''(η), the fourth inverse-link derivative.
-            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&inv_link, eta_clamped)?;
-
-            let mu = jet.mu;
-            let vj = VarianceJet::bernoulli(mu);
-            let pw = self.weights[i].max(0.0);
-            let yi = self.y[i];
-
-            let (_, ci, di) =
-                observed_weight_noncanonical(yi, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, pw);
-            c_obs[i] = ci;
-            d_obs[i] = di;
-        }
-
-        Ok((c_obs, d_obs))
+        Ok((
+            pirls_result.solve_c_array.clone(),
+            pirls_result.solve_d_array.clone(),
+        ))
     }
 
     /// Compute soft prior cost without needing workspace
@@ -645,19 +576,9 @@ impl<'a> RemlState<'a> {
     /// PIRLS folds any stabilization ridge directly into the penalized objective:
     ///   l_p(β; ρ) = l(β) - 0.5 * βᵀ (S_λ + ridge I) β.
     /// Therefore the curvature used in LAML is
-    ///   H_eff = X'WX + S_λ + ridge I,
+    ///   H_eff = X'W_HX + S_λ + ridge I,
     /// and adding another ridge here places the Laplace expansion on a different surface.
     ///
-    /// NOTE(observed-hessian): W here is the Fisher (expected information)
-    /// weight W_F = h'(η)²/V(μ). For non-canonical links (probit, cloglog,
-    /// SAS, mixture), the Laplace approximation is more accurate when using
-    /// the observed Hessian W_obs = W_F − (y−μ)·B at the converged β̂.
-    /// For canonical links (logit for binomial, log for Poisson), W_obs = W_F
-    /// so the current code is exact.
-    ///
-    /// The ρ-direction c/d arrays have been corrected to use observed
-    /// weight derivatives (via `observed_cd_arrays`). Upgrading H itself
-    /// to the observed Hessian remains a potential future improvement.
     pub(super) fn effectivehessian(
         &self,
         pr: &PirlsResult,
@@ -1491,7 +1412,7 @@ impl<'a> RemlState<'a> {
         let sparse_system = assemble_and_factor_sparse_penalized_system(
             &mut workspace,
             x_sparse,
-            &pirls_result.solveweights,
+            &pirls_result.finalweights,
             &s_lambda,
             ridge_passport.delta,
         )?;
@@ -1572,6 +1493,8 @@ impl<'a> RemlState<'a> {
                     };
                 return Ok(Arc::new(cached.rehydrate_after_reml_cache(
                     self.x(),
+                    self.y,
+                    self.weights,
                     self.offset.view(),
                     &pirls_config.link_kind,
                 )?));
@@ -2085,10 +2008,10 @@ impl<'a> RemlState<'a> {
         (
             Box<dyn super::unified::HessianDerivativeProvider>,
             super::unified::DispersionHandling,
-            f64,                       // tk_correction
-            Option<Array1<f64>>,       // tk_gradient
-            f64,                       // firth_logdet
-            f64,                       // log_likelihood
+            f64,                                               // tk_correction
+            Option<Array1<f64>>,                               // tk_gradient
+            f64,                                               // firth_logdet
+            f64,                                               // log_likelihood
             Option<std::sync::Arc<super::FirthDenseOperator>>, // firth_op
             Option<super::unified::BarrierConfig>,
         ),
@@ -2109,9 +2032,9 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
             } else {
-                // Use observed-information c/d for non-canonical links;
-                // for canonical logit this returns the Fisher arrays unchanged.
-                let (c_array, d_array) = self.observed_cd_arrays(pirls_result)?;
+                // Differentiate the same Hessian-side curvature arrays that the
+                // inner PIRLS solve accepted at the mode.
+                let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
@@ -2235,18 +2158,48 @@ impl<'a> RemlState<'a> {
         (
             super::unified::DispersionHandling,
             Box<dyn super::unified::HessianDerivativeProvider>,
-            f64, // firth_logdet
-            f64, // log_likelihood
+            f64,                                               // firth_logdet
+            f64,                                               // log_likelihood
             Option<std::sync::Arc<super::FirthDenseOperator>>, // firth_op
             Option<super::unified::BarrierConfig>,
         ),
         EstimationError,
     > {
         use super::unified::{
-            DispersionHandling, GaussianDerivatives, SinglePredictorGlmDerivatives,
+            DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
+            SinglePredictorGlmDerivatives,
         };
 
         let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+
+        // Firth log-det and operator. Sparse exact still uses the same dense
+        // Fisher-information reduction as the dense backend; only the H^{-1}
+        // applications move to the sparse Cholesky operator.
+        let firth_logdet = if self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+        {
+            pirls_result.firth_log_det().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let firth_op = if firth_logdet != 0.0 {
+            if let Some(cached) = bundle.firth_dense_operator_original.clone() {
+                Some(cached)
+            } else {
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact REML runtime requires dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta,
+                )?))
+            }
+        } else {
+            None
+        };
 
         // Dispersion and derivative provider depend on family.
         let (dispersion, deriv_provider): (_, Box<dyn super::unified::HessianDerivativeProvider>) =
@@ -2256,40 +2209,35 @@ impl<'a> RemlState<'a> {
                     Box::new(GaussianDerivatives),
                 )
             } else {
-                // Use observed-information c/d for non-canonical links.
-                let (c_array, d_array) = self.observed_cd_arrays(pirls_result)?;
+                // Differentiate the same Hessian-side curvature arrays that the
+                // inner PIRLS solve accepted at the mode.
+                let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
                 (
                     DispersionHandling::Fixed {
                         phi: 1.0,
                         include_logdet_h: true,
                         include_logdet_s: true,
                     },
-                    Box::new(SinglePredictorGlmDerivatives {
-                        c_array,
-                        d_array: Some(d_array),
-                        x_transformed: self.x().clone(),
-                    }),
+                    {
+                        let base = SinglePredictorGlmDerivatives {
+                            c_array,
+                            d_array: Some(d_array),
+                            x_transformed: self.x().clone(),
+                        };
+                        // Match the dense exact path: when Firth-logit is
+                        // active, the directional log|H_total| drift includes
+                        // -D(H_phi)[B_k]. The sparse backend differs only in how
+                        // B_k = H^{-1} rhs is solved.
+                        if let Some(firth_op) = firth_op.clone() {
+                            Box::new(FirthAwareGlmDerivatives { base, firth_op })
+                        } else {
+                            Box::new(base)
+                        }
+                    },
                 )
             };
 
-        // Firth log-det.
-        let firth_logdet = if self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
-        {
-            pirls_result.firth_log_det().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
         let log_likelihood = -0.5 * pirls_result.deviance;
-
-        // Firth operator: passed through to the unified evaluator which computes
-        // the Firth gradient and Hessian internally.
-        let firth_op = if firth_logdet != 0.0 {
-            bundle.firth_dense_operator_original.clone()
-        } else {
-            None
-        };
 
         // Construct barrier config for monotonicity constraints.
         // The sparse path operates in the original (non-reparameterized)
@@ -2654,9 +2602,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
-        use super::unified::{
-            PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root,
-        };
+        use super::unified::{PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root};
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -2699,7 +2645,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Build the family-dependent context via the shared sparse helper.
-        let (dispersion, deriv_provider, firth_logdet, log_likelihood, _firth_op, barrier_config) =
+        let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
         // TK correction (non-Gaussian only). EFS is ValueOnly so we only need
@@ -2718,8 +2664,7 @@ impl<'a> RemlState<'a> {
             for j in 0..p_dim {
                 let mut e_j = Array1::<f64>::zeros(p_dim);
                 e_j[j] = 1.0;
-                if let Ok(f_j) =
-                    crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
+                if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
                 {
                     h_inv_diag[j] = f_j[j];
                 }
@@ -2750,6 +2695,7 @@ impl<'a> RemlState<'a> {
             deriv_provider,
             tk_correction,
             firth_logdet,
+            firth_op,
             mp,
             dispersion,
             log_likelihood,
@@ -3052,6 +2998,7 @@ impl<'a> RemlState<'a> {
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
         firth_logdet: f64,
+        firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
         nullspace_dim: f64,
         dispersion: super::unified::DispersionHandling,
         log_likelihood: f64,
@@ -3074,7 +3021,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, None)
-        .firth(firth_logdet, None)
+        .firth(firth_logdet, firth_op)
         .nullspace_dim_override(nullspace_dim)
         .barrier_config(barrier_config)
         .build();
@@ -3213,7 +3160,7 @@ impl<'a> RemlState<'a> {
             _tk_gradient,
             firth_logdet,
             log_likelihood,
-            _firth_op,
+            firth_op,
             barrier_config,
         ) = self.build_dense_derivative_context(
             pirls_result,
@@ -3235,6 +3182,7 @@ impl<'a> RemlState<'a> {
             deriv_provider,
             tk_correction,
             firth_logdet,
+            firth_op,
             nullspace_dim,
             dispersion,
             log_likelihood,

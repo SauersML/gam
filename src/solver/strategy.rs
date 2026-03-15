@@ -53,8 +53,7 @@ pub struct OuterCapability {
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
     /// When set, `plan()` bypasses its normal selection logic and returns the
-    /// specified solver directly. Only used in fallback_sequence entries to
-    /// force `CoordinateSearch` (which `plan()` never auto-selects).
+    /// specified solver directly.
     pub force_solver: Option<Solver>,
 }
 
@@ -72,9 +71,6 @@ pub enum Solver {
     /// Needs no gradient or Hessian — only traces tr(H^{-1} A_k) and
     /// Frobenius norms from the inner solution.
     Efs,
-    /// Derivative-free coordinate search. Never auto-selected by `plan()`;
-    /// only reachable via `fallback_sequence` in `OuterConfig`.
-    CoordinateSearch,
 }
 
 /// How the Hessian will be obtained for the outer optimizer.
@@ -91,8 +87,6 @@ pub enum HessianSource {
     /// No explicit Hessian or gradient needed. EFS uses traces and
     /// Frobenius norms from the inner solution directly.
     EfsFixedPoint,
-    /// No gradient or Hessian needed. CoordinateSearch uses only `eval_cost`.
-    None,
 }
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
@@ -132,7 +126,6 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             }
             S::Bfgs => H::BfgsApprox,
             S::Efs => H::EfsFixedPoint,
-            S::CoordinateSearch => H::None,
         };
         return OuterPlan {
             solver: forced,
@@ -394,18 +387,6 @@ impl OuterResult {
     }
 }
 
-/// Configuration for coordinate search (derivative-free optimizer).
-#[derive(Clone, Debug)]
-pub struct CoordinateSearchConfig {
-    /// Step size in log-space for probing each coordinate.
-    pub log_step: f64,
-    /// Maximum number of full passes over all coordinates.
-    pub max_coord_iters: usize,
-    /// Relative tolerance: an improvement counts only if
-    /// `new_cost < old_cost * (1 - rel_tol)`.
-    pub rel_tol: f64,
-}
-
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 pub struct OuterConfig {
@@ -428,9 +409,6 @@ pub struct OuterConfig {
     /// fails. Each entry triggers `plan()` with the degraded capability and
     /// a fresh solver run. Empty by default (no fallback).
     pub fallback_sequence: Vec<OuterCapability>,
-    /// Configuration for coordinate search. Only used when `plan()` selects
-    /// `Solver::CoordinateSearch` (via fallback).
-    pub coordinate_search: Option<CoordinateSearchConfig>,
 }
 
 impl Default for OuterConfig {
@@ -444,7 +422,6 @@ impl Default for OuterConfig {
             heuristic_lambdas: None,
             initial_rho: None,
             fallback_sequence: Vec::new(),
-            coordinate_search: None,
         }
     }
 }
@@ -479,6 +456,11 @@ pub struct OuterResult {
 /// 6. If all seeds fail and `fallback_sequence` is non-empty, re-plans
 ///    with degraded capability and retries.
 /// 7. Returns the best result (including which plan was actually used).
+///
+/// All outer optimization fallbacks MUST be declared via `fallback_sequence`.
+/// Do not wrap `run_outer` calls in try/catch with ad-hoc solver recovery;
+/// instead, populate `fallback_sequence` with progressively simpler
+/// `OuterCapability` entries.
 pub fn run_outer(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -702,9 +684,7 @@ fn run_outer_with_plan(
                                 }
                             },
                             HessianSource::FiniteDifference => None,
-                            HessianSource::BfgsApprox
-                            | HessianSource::EfsFixedPoint
-                            | HessianSource::None => None,
+                            HessianSource::BfgsApprox | HessianSource::EfsFixedPoint => None,
                         };
                         Ok((eval.cost, eval.gradient, hessian))
                     },
@@ -926,22 +906,6 @@ fn run_outer_with_plan(
                     converged,
                 })
             }
-            Solver::CoordinateSearch => {
-                let cs = config.coordinate_search.as_ref().ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(
-                        "CoordinateSearch selected but no coordinate_search config provided"
-                            .to_string(),
-                    )
-                })?;
-                let (lo, hi) = &bounds_template;
-                run_coordinate_search(obj, seed, lo, hi, cs, cap.n_params).map(|r| {
-                    RawOuterCandidate {
-                        rho: r.rho,
-                        iterations: r.iterations,
-                        converged: true,
-                    }
-                })
-            }
         };
 
         match result.and_then(|candidate| finalize_candidate(obj, candidate)) {
@@ -968,143 +932,6 @@ fn run_outer_with_plan(
             screened.len()
         ))
     })
-}
-
-/// Coordinate search result: (rho, final_value, iterations, converged).
-struct CoordSearchResult {
-    rho: Array1<f64>,
-    final_value: f64,
-    iterations: usize,
-}
-
-/// Derivative-free coordinate search over bounded log-space parameters.
-///
-/// This is the `run_outer` equivalent of the former `coordinate_search_spatial`
-/// from smooth.rs. It only uses `obj.eval_cost()`.
-fn run_coordinate_search(
-    obj: &mut dyn OuterObjective,
-    seed: &Array1<f64>,
-    lower: &Array1<f64>,
-    upper: &Array1<f64>,
-    cs: &CoordinateSearchConfig,
-    n_params: usize,
-) -> Result<CoordSearchResult, EstimationError> {
-    log::warn!(
-        "[coordinate_search] Using derivative-free coordinate search over {} parameters. \
-         This is slow — analytic REML derivatives should be wired through ext_coords instead.",
-        n_params
-    );
-
-    let mut current_theta = seed.clone();
-    let mut current_cost = obj.eval_cost(&current_theta).unwrap_or(f64::INFINITY);
-    let mut total_iters = 0_usize;
-
-    for pass in 0..cs.max_coord_iters {
-        total_iters = pass + 1;
-        let mut pass_improved = false;
-
-        for coord in 0..current_theta.len() {
-            let base_value = current_theta[coord];
-            let base_cost = current_cost;
-            let left_value = (base_value - cs.log_step).max(lower[coord]);
-            let right_value = (base_value + cs.log_step).min(upper[coord]);
-
-            let left_cost = if (left_value - base_value).abs() <= 1e-12 {
-                f64::INFINITY
-            } else {
-                let mut probe = current_theta.clone();
-                probe[coord] = left_value;
-                obj.eval_cost(&probe).unwrap_or(f64::INFINITY)
-            };
-            let right_cost = if (right_value - base_value).abs() <= 1e-12 {
-                f64::INFINITY
-            } else {
-                let mut probe = current_theta.clone();
-                probe[coord] = right_value;
-                obj.eval_cost(&probe).unwrap_or(f64::INFINITY)
-            };
-
-            // Quadratic interpolation attempt.
-            if left_cost.is_finite() && right_cost.is_finite() {
-                let d_left = left_value - base_value;
-                let d_right = right_value - base_value;
-                if d_left.abs() > 1e-15 && d_right.abs() > 1e-15 && (d_left - d_right).abs() > 1e-15
-                {
-                    let a_left = (left_cost - base_cost) / d_left;
-                    let a_right = (right_cost - base_cost) / d_right;
-                    let curvature = (a_left - a_right) / (d_left - d_right);
-                    if curvature.is_finite() && curvature > 0.0 {
-                        let slope = a_left - curvature * d_left;
-                        let x_star = base_value - slope / (2.0 * curvature);
-                        if x_star.is_finite() {
-                            let interior = x_star.clamp(lower[coord], upper[coord]);
-                            let lo_bound = left_value.min(right_value) + 1e-12;
-                            let hi_bound = left_value.max(right_value) - 1e-12;
-                            if interior > lo_bound && interior < hi_bound {
-                                let mut probe = current_theta.clone();
-                                probe[coord] = interior;
-                                let interior_cost = obj.eval_cost(&probe).unwrap_or(f64::INFINITY);
-                                if coord_search_improves(interior_cost, current_cost, cs.rel_tol) {
-                                    current_theta[coord] = interior;
-                                    current_cost = interior_cost;
-                                    pass_improved = true;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Greedy extension in improving direction.
-            let (mut cand_value, mut cand_cost, direction) =
-                if coord_search_improves(left_cost, base_cost, cs.rel_tol)
-                    && left_cost <= right_cost
-                {
-                    (left_value, left_cost, -1.0_f64)
-                } else if coord_search_improves(right_cost, base_cost, cs.rel_tol) {
-                    (right_value, right_cost, 1.0_f64)
-                } else {
-                    continue;
-                };
-
-            loop {
-                let next_value =
-                    (cand_value + direction * cs.log_step).clamp(lower[coord], upper[coord]);
-                if (next_value - cand_value).abs() <= 1e-12 {
-                    break;
-                }
-                let mut probe = current_theta.clone();
-                probe[coord] = next_value;
-                let next_cost = obj.eval_cost(&probe).unwrap_or(f64::INFINITY);
-                if !coord_search_improves(next_cost, cand_cost, cs.rel_tol) {
-                    break;
-                }
-                cand_value = next_value;
-                cand_cost = next_cost;
-            }
-
-            if coord_search_improves(cand_cost, current_cost, cs.rel_tol) {
-                current_theta[coord] = cand_value;
-                current_cost = cand_cost;
-                pass_improved = true;
-            }
-        }
-
-        if !pass_improved {
-            break;
-        }
-    }
-
-    Ok(CoordSearchResult {
-        rho: current_theta,
-        final_value: current_cost,
-        iterations: total_iters,
-    })
-}
-
-fn coord_search_improves(new_cost: f64, old_cost: f64, rel_tol: f64) -> bool {
-    new_cost.is_finite() && new_cost < old_cost * (1.0 - rel_tol)
 }
 
 #[cfg(test)]

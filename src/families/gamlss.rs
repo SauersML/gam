@@ -28,7 +28,7 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_two_block_spatial_length_scale,
+    freeze_spatial_length_scale_terms_from_design,
     optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
@@ -1788,10 +1788,6 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
-    let mut spatial_search_options = options.clone();
-    spatial_search_options.use_remlobjective = false;
-    spatial_search_options.compute_covariance = false;
-    spatial_search_options.outer_max_iter = 1;
     let extra_rho0 = builder.extra_rho0()?;
 
     let mean_boot_design =
@@ -1805,17 +1801,9 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         freeze_spatial_length_scale_terms_from_design(builder.noisespec(), &noise_boot_design)
             .map_err(|e| e.to_string())?;
 
-    let exact_joint_ready = builder.exact_spatial_joint_supported()
-        && matches!(
-            (
-                build_block_spatial_psi_derivatives(data, &mean_bootspec, &mean_boot_design)?,
-                build_block_spatial_psi_derivatives(data, &noise_bootspec, &noise_boot_design)?,
-            ),
-            (Some(_), Some(_))
-        );
+    let exact_joint_ready = builder.exact_spatial_joint_supported();
 
     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
-    let mut usedfd_spatial_search = false;
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
@@ -1919,133 +1907,18 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             );
         }
         run_exact_joint_spatial!().map_err(|err| {
-            format!(
-                "exact two-block spatial optimization failed and finite-difference fallback is disabled for this family: {err}"
-            )
+            format!("exact two-block spatial optimization failed: {err}")
         })?
-    } else if exact_joint_ready {
-        // The exact-joint path now handles its own fallback (Arc -> BFGS)
-        // internally via run_outer's fallback_sequence.
-        match run_exact_joint_spatial!() {
-            Ok(sol) => {
-                usedfd_spatial_search = false;
-                sol
-            }
-            Err(err) => {
-                if !kappa_options.allow_finite_difference_fallback {
-                    return Err(format!(
-                        "exact two-block spatial optimization failed ({err}); finite-difference fallback is disabled by default"
-                    ));
-                }
-                log::warn!(
-                    "exact two-block spatial optimization failed ({}); falling back to coordinate search",
-                    err
-                );
-                usedfd_spatial_search = true;
-                optimize_two_block_spatial_length_scale(
-                    data,
-                    builder.meanspec(),
-                    builder.noisespec(),
-                    kappa_options,
-                    |mean_design, noise_design| {
-                        let theta = compose_theta_from_hints(
-                            builder.mean_penalty_count(mean_design),
-                            builder.noise_penalty_count(noise_design),
-                            &mean_log_lambda_hint,
-                            &noise_log_lambda_hint,
-                            &extra_rho0,
-                        );
-                        let blocks = builder.build_blocks(
-                            &theta,
-                            mean_design,
-                            noise_design,
-                            mean_beta_hint.clone(),
-                            noise_beta_hint.clone(),
-                        )?;
-                        let family = builder.build_family(mean_design, noise_design);
-                        let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
-                        let layout = GamlssLambdaLayout::two_block(
-                            builder.mean_penalty_count(mean_design),
-                            builder.noise_penalty_count(noise_design),
-                        );
-                        if fit.log_lambdas.len() >= layout.total() {
-                            mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                            noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                        }
-                        let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                        mean_beta_hint = Some(mean_beta);
-                        noise_beta_hint = Some(noise_beta);
-                        Ok(fit)
-                    },
-                    |fit| fit.penalized_objective,
-                )?
-            }
-        }
     } else {
-        if !kappa_options.allow_finite_difference_fallback {
+        if !exact_joint_ready {
             return Err(
-                "finite-difference spatial length-scale optimization is disabled by default; enable allow_finite_difference_fallback to use the legacy coordinate-search path"
-                    .to_string(),
+                "exact two-block spatial optimization is unavailable for this family".to_string(),
             );
         }
-        usedfd_spatial_search = true;
-        optimize_two_block_spatial_length_scale(
-            data,
-            builder.meanspec(),
-            builder.noisespec(),
-            kappa_options,
-            |mean_design, noise_design| {
-                let theta = compose_theta_from_hints(
-                    builder.mean_penalty_count(mean_design),
-                    builder.noise_penalty_count(noise_design),
-                    &mean_log_lambda_hint,
-                    &noise_log_lambda_hint,
-                    &extra_rho0,
-                );
-                let blocks = builder.build_blocks(
-                    &theta,
-                    mean_design,
-                    noise_design,
-                    mean_beta_hint.clone(),
-                    noise_beta_hint.clone(),
-                )?;
-                let family = builder.build_family(mean_design, noise_design);
-                let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
-                let layout = GamlssLambdaLayout::two_block(
-                    builder.mean_penalty_count(mean_design),
-                    builder.noise_penalty_count(noise_design),
-                );
-                if fit.log_lambdas.len() >= layout.total() {
-                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                }
-                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
-                mean_beta_hint = Some(mean_beta);
-                noise_beta_hint = Some(noise_beta);
-                Ok(fit)
-            },
-            |fit| fit.penalized_objective,
-        )?
+        run_exact_joint_spatial!().map_err(|err| {
+            format!("exact two-block spatial optimization failed: {err}")
+        })?
     };
-
-    if usedfd_spatial_search {
-        let theta = compose_theta_from_hints(
-            builder.mean_penalty_count(&solved.mean_design),
-            builder.noise_penalty_count(&solved.noise_design),
-            &mean_log_lambda_hint,
-            &noise_log_lambda_hint,
-            &extra_rho0,
-        );
-        let blocks = builder.build_blocks(
-            &theta,
-            &solved.mean_design,
-            &solved.noise_design,
-            mean_beta_hint.clone(),
-            noise_beta_hint.clone(),
-        )?;
-        let family = builder.build_family(&solved.mean_design, &solved.noise_design);
-        solved.fit = fit_custom_family(&family, &blocks, options)?;
-    }
 
     builder.augment_result_designs(&mut solved.mean_design, &mut solved.noise_design);
 
@@ -11761,7 +11634,6 @@ mod tests {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 0.1,
             max_length_scale: 2.0,
-            allow_finite_difference_fallback: false,
         }
     }
 

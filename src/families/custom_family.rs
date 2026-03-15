@@ -4916,7 +4916,8 @@ pub fn fit_custom_family<F: CustomFamily>(
 
     use crate::estimate::EstimationError;
     use crate::solver::strategy::{
-        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+        plan, ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig,
+        OuterEval, Solver,
     };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
@@ -4942,18 +4943,6 @@ pub fn fit_custom_family<F: CustomFamily>(
         options.outer_max_iter
     };
 
-    let outer_config = OuterConfig {
-        tolerance: options.outer_tol,
-        max_iter: outer_max_iter,
-        fd_step: 1e-4,
-        seed_config: crate::seeding::SeedConfig::default(),
-        rho_bound: 30.0,
-        heuristic_lambdas: None,
-        initial_rho: Some(rho0.clone()),
-        fallback_sequence: Vec::new(),
-        coordinate_search: None,
-    };
-
     let hessian_deriv = if force_efs_for_wiggle {
         // For wiggle families, skip the fragile exact Hessian. EFS doesn't
         // need it — it uses only cost + gradient for the fixed-point step.
@@ -4964,25 +4953,49 @@ pub fn fit_custom_family<F: CustomFamily>(
         Derivative::Unavailable
     };
 
+    let primary_cap = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: hessian_deriv,
+        n_params: n_rho,
+        // Wiggle families have only penalty-like λ coordinates (B-spline
+        // difference penalties), so EFS applies. Non-wiggle custom families
+        // may have ψ (design-moving) coordinates — conservatively false.
+        all_penalty_like: force_efs_for_wiggle,
+        // Custom families enforce constraints via active-set QP in the inner
+        // loop, not via log-barrier in the outer evaluator.
+        barrier_config: None,
+        force_solver: None,
+    };
+    let fallback_sequence = if plan(&primary_cap).solver == Solver::Bfgs {
+        Vec::new()
+    } else {
+        vec![OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: n_rho,
+            all_penalty_like: false,
+            barrier_config: None,
+            force_solver: Some(Solver::Bfgs),
+        }]
+    };
+    let outer_config = OuterConfig {
+        tolerance: options.outer_tol,
+        max_iter: outer_max_iter,
+        fd_step: 1e-4,
+        seed_config: crate::seeding::SeedConfig::default(),
+        rho_bound: 30.0,
+        heuristic_lambdas: None,
+        initial_rho: Some(rho0.clone()),
+        fallback_sequence,
+    };
+
     let mut obj = ClosureObjective {
         state: CustomOuterState {
             warm_cache: None,
             last_eval: None,
             last_error: None,
         },
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: hessian_deriv,
-            n_params: n_rho,
-            // Wiggle families have only penalty-like λ coordinates (B-spline
-            // difference penalties), so EFS applies. Non-wiggle custom families
-            // may have ψ (design-moving) coordinates — conservatively false.
-            all_penalty_like: force_efs_for_wiggle,
-            // Custom families enforce constraints via active-set QP in the inner
-            // loop, not via log-barrier in the outer evaluator.
-            barrier_config: None,
-            force_solver: None,
-        },
+        cap: primary_cap,
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = if has_exact_hess {
                 None
@@ -5128,70 +5141,14 @@ pub fn fit_custom_family<F: CustomFamily>(
         .map(|e| format!(" last objective error: {e}"))
         .unwrap_or_default();
 
-    // Determine rho_star: either from the optimizer or fall back to rho0.
-    let (rho_star, outer_iters, outer_grad_norm) = match outer_result {
-        Ok(result) => (result.rho, result.iterations, result.final_grad_norm),
-        Err(e) => {
-            log::warn!(
-                "Outer smoothing optimization failed ({e}); \
-                 falling back to inner fit at initial smoothing parameters.{last_error_detail}"
-            );
-            let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
-            match inner_blockwise_fit(family, specs, &per_block, options, None) {
-                Ok(mut inner) => {
-                    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-                    let covariance_conditional = compute_joint_covariance_required(
-                        family,
-                        specs,
-                        &inner.block_states,
-                        &per_block,
-                        options,
-                    )?;
-                    let reml_term = if include_exact_newton_logdet_h(family) {
-                        0.5 * inner.block_logdet_h
-                    } else {
-                        0.0
-                    } - if include_exact_newton_logdet_s(family, options) {
-                        0.5 * inner.block_logdet_s
-                    } else {
-                        0.0
-                    };
-                    let reml_term = if reml_term.is_finite() {
-                        reml_term
-                    } else {
-                        0.0
-                    };
-                    let geometry =
-                        compute_joint_geometry(family, specs, &inner.block_states, &per_block);
-                    return blockwise_fit_from_parts(BlockwiseFitResultParts {
-                        block_states: inner.block_states,
-                        log_likelihood: inner.log_likelihood,
-                        log_lambdas: rho0.clone(),
-                        lambdas: rho0.mapv(f64::exp),
-                        covariance_conditional,
-                        penalized_objective: finite_penalizedobjective(
-                            inner.log_likelihood,
-                            inner.penalty_value,
-                            reml_term,
-                        ),
-                        outer_iterations: 0,
-                        outer_gradient_norm: 0.0,
-                        inner_cycles: inner.cycles,
-                        outer_converged: inner.converged,
-                        geometry,
-                    })
-                    .map_err(CustomFamilyError::Optimization);
-                }
-                Err(inner_err) => {
-                    return Err(format!(
-                        "outer smoothing optimization failed and fallback inner fit \
-                         at rho0 also failed: {inner_err}.{last_error_detail}"
-                    )
-                    .into());
-                }
-            }
-        }
-    };
+    let outer_result = outer_result.map_err(|e| {
+        format!(
+            "outer smoothing optimization failed after exhausting strategy fallbacks: {e}.{last_error_detail}"
+        )
+    })?;
+    let rho_star = outer_result.rho;
+    let outer_iters = outer_result.iterations;
+    let outer_grad_norm = outer_result.final_grad_norm;
 
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
     let final_seed = obj.state.warm_cache.clone();
