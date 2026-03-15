@@ -4851,7 +4851,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         inv_lapweight: w.inv_lapweight,
     })
     .collect::<Vec<_>>();
-    let fitted_link_parameters = match family {
+    let fitted_link = match family {
         LikelihoodFamily::BinomialMixture => mixture_link_state
             .clone()
             .map(|state| FittedLinkState::Mixture {
@@ -4932,7 +4932,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 covariance_conditional,
                 covariance_corrected: None,
                 inference: Some(inf),
-                fitted_link: fitted_link_parameters,
+                fitted_link,
                 geometry,
                 block_states: Vec::new(),
                 pirls_status: pirls_status_val,
@@ -9748,7 +9748,7 @@ where
 /// by construction (spatial terms in different blocks are independent
 /// conditional on the inner mode).
 fn try_two_block_bfgs_fallback(
-    _data: ArrayView2<'_, f64>,
+    data: ArrayView2<'_, f64>,
     best_meanspec: &TermCollectionSpec,
     best_noisespec: &TermCollectionSpec,
     mean_terms: &[usize],
@@ -9774,6 +9774,7 @@ fn try_two_block_bfgs_fallback(
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
         OuterEval,
     };
+    let _ = data; // reserved for future use
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -9942,7 +9943,7 @@ fn try_two_block_bfgs_fallback(
                 }),
             }
         },
-        reset_fn: |_ctx: &mut &mut TwoBlockBfgsState<'_>| {},
+        reset_fn: |ctx: &mut &mut TwoBlockBfgsState<'_>| { let _ = ctx; },
         efs_fn: None::<
             fn(
                 &mut &mut TwoBlockBfgsState<'_>,
@@ -9977,6 +9978,307 @@ fn try_two_block_bfgs_fallback(
             );
             Ok(theta0.clone())
         }
+    }
+}
+
+/// BFGS fallback for two-block spatial length-scale optimization using
+/// finite-difference gradients via `run_outer`.
+///
+/// This sits between the exact-joint (NewtonTR with analytic derivatives) path
+/// and the derivative-free coordinate search. It re-uses the same `fit_fn` /
+/// `score_fn` closures as `optimize_two_block_spatial_length_scale` but wraps
+/// them in a `ClosureObjective` with `Derivative::Unavailable` so that
+/// `run_outer` automatically computes gradients via finite differences.
+pub fn optimize_two_block_spatial_length_scale_bfgs<FitOut, FitFn, ScoreFn>(
+    data: ArrayView2<'_, f64>,
+    meanspec: &TermCollectionSpec,
+    noisespec: &TermCollectionSpec,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    mut fit_fn: FitFn,
+    score_fn: ScoreFn,
+) -> Result<TwoBlockSpatialLengthScaleOptimizationResult<FitOut>, String>
+where
+    FitOut: Clone,
+    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
+    ScoreFn: Fn(&FitOut) -> f64,
+{
+    use crate::solver::strategy::{
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
+    };
+
+    let mean_terms = spatial_length_scale_term_indices(meanspec);
+    let noise_terms = spatial_length_scale_term_indices(noisespec);
+
+    let build_pair = |ms: &TermCollectionSpec,
+                      ns: &TermCollectionSpec|
+     -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
+        let d_mean = build_term_collection_design(data, ms)
+            .map_err(|e| format!("failed to build mean design during BFGS κ optimization: {e}"))?;
+        let d_noise = build_term_collection_design(data, ns).map_err(|e| {
+            format!("failed to build noise design during BFGS κ optimization: {e}")
+        })?;
+        Ok((d_mean, d_noise))
+    };
+
+    let (bootmean_design, bootnoise_design) = build_pair(meanspec, noisespec)?;
+    let best_meanspec =
+        freeze_spatial_length_scale_terms_from_design(meanspec, &bootmean_design).map_err(|e| {
+            format!(
+                "failed to freeze mean spatial basis centers during BFGS κ bootstrap: {e}"
+            )
+        })?;
+    let best_noisespec = freeze_spatial_length_scale_terms_from_design(
+        noisespec,
+        &bootnoise_design,
+    )
+    .map_err(|e| {
+        format!(
+            "failed to freeze noise spatial basis centers during BFGS κ bootstrap: {e}"
+        )
+    })?;
+
+    let total_terms = mean_terms.len() + noise_terms.len();
+
+    if !kappa_options.enabled || total_terms == 0 {
+        let fit = fit_fn(&bootmean_design, &bootnoise_design)?;
+        return Ok(TwoBlockSpatialLengthScaleOptimizationResult {
+            resolved_meanspec: best_meanspec,
+            resolved_noisespec: best_noisespec,
+            mean_design: bootmean_design,
+            noise_design: bootnoise_design,
+            fit,
+        });
+    }
+
+    // Build the initial theta (log-length-scale per term, isotropic),
+    // matching the parameterization used by `optimize_two_block_spatial_length_scale`.
+    let mut theta0 = Array1::<f64>::zeros(total_terms);
+    for (slot, &term_idx) in mean_terms.iter().enumerate() {
+        theta0[slot] = get_spatial_length_scale(&best_meanspec, term_idx)
+            .unwrap_or(kappa_options.min_length_scale)
+            .clamp(kappa_options.min_length_scale, kappa_options.max_length_scale)
+            .ln();
+    }
+    for (slot, &term_idx) in noise_terms.iter().enumerate() {
+        theta0[mean_terms.len() + slot] =
+            get_spatial_length_scale(&best_noisespec, term_idx)
+                .unwrap_or(kappa_options.min_length_scale)
+                .clamp(kappa_options.min_length_scale, kappa_options.max_length_scale)
+                .ln();
+    }
+
+    log::trace!(
+        "[two-block-bfgs-fd] starting FD-BFGS: total_terms={}, mean_spatial_terms={}, noise_spatial_terms={}",
+        total_terms,
+        mean_terms.len(),
+        noise_terms.len(),
+    );
+
+    // State struct for tracking best solution found during optimization.
+    struct BfgsFdState<'a, FitOut: Clone> {
+        best_meanspec: &'a TermCollectionSpec,
+        best_noisespec: &'a TermCollectionSpec,
+        mean_terms: &'a [usize],
+        noise_terms: &'a [usize],
+        best_theta: Array1<f64>,
+        best_cost: f64,
+        best_fit: Option<FitOut>,
+        best_resolved_meanspec: Option<TermCollectionSpec>,
+        best_resolved_noisespec: Option<TermCollectionSpec>,
+        best_mean_design: Option<TermCollectionDesign>,
+        best_noise_design: Option<TermCollectionDesign>,
+    }
+
+    impl<'a, FitOut: Clone> BfgsFdState<'a, FitOut> {
+        fn track_best(
+            &mut self,
+            theta: &Array1<f64>,
+            cost: f64,
+            fit: &FitOut,
+            ms: &TermCollectionSpec,
+            ns: &TermCollectionSpec,
+            md: &TermCollectionDesign,
+            nd: &TermCollectionDesign,
+        ) {
+            if cost < self.best_cost {
+                self.best_cost = cost;
+                self.best_theta = theta.clone();
+                self.best_fit = Some(fit.clone());
+                self.best_resolved_meanspec = Some(ms.clone());
+                self.best_resolved_noisespec = Some(ns.clone());
+                self.best_mean_design = Some(md.clone());
+                self.best_noise_design = Some(nd.clone());
+            }
+        }
+
+        fn specs_at_theta(
+            &self,
+            theta: &Array1<f64>,
+        ) -> Result<(TermCollectionSpec, TermCollectionSpec), String> {
+            let mean_theta = theta.slice(s![0..self.mean_terms.len()]).to_owned();
+            let noise_theta = theta.slice(s![self.mean_terms.len()..]).to_owned();
+            let ms = apply_spatial_log_length_scales(
+                self.best_meanspec,
+                self.mean_terms,
+                &mean_theta,
+            )
+            .map_err(|e| e.to_string())?;
+            let ns = apply_spatial_log_length_scales(
+                self.best_noisespec,
+                self.noise_terms,
+                &noise_theta,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((ms, ns))
+        }
+    }
+
+    let mut state = BfgsFdState {
+        best_meanspec: &best_meanspec,
+        best_noisespec: &best_noisespec,
+        mean_terms: &mean_terms,
+        noise_terms: &noise_terms,
+        best_theta: theta0.clone(),
+        best_cost: f64::INFINITY,
+        best_fit: None,
+        best_resolved_meanspec: None,
+        best_resolved_noisespec: None,
+        best_mean_design: None,
+        best_noise_design: None,
+    };
+
+    let fit_fn_cell = std::cell::RefCell::new(&mut fit_fn);
+    let score_fn_ref = &score_fn;
+    let build_pair_ref = &build_pair;
+
+    let outer_config = OuterConfig {
+        tolerance: kappa_options.rel_tol.max(1e-6),
+        max_iter: kappa_options.max_outer_iter.max(1),
+        fd_step: 1e-4,
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            num_auxiliary_trailing: 0,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+    };
+
+    let mut obj = ClosureObjective {
+        state: &mut state,
+        cap: OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params: total_terms,
+            all_penalty_like: false,
+            barrier_config: None,
+        },
+        cost_fn: |ctx: &mut &mut BfgsFdState<'_, FitOut>, theta: &Array1<f64>| {
+            let (ms, ns) = match ctx.specs_at_theta(theta) {
+                Ok(pair) => pair,
+                Err(_) => return Ok(f64::INFINITY),
+            };
+            let (md, nd) = match build_pair_ref(&ms, &ns) {
+                Ok(pair) => pair,
+                Err(_) => return Ok(f64::INFINITY),
+            };
+            match (&mut *fit_fn_cell.borrow_mut())(&md, &nd) {
+                Ok(fit) => {
+                    let cost = score_fn_ref(&fit);
+                    ctx.track_best(theta, cost, &fit, &ms, &ns, &md, &nd);
+                    Ok(cost)
+                }
+                Err(_) => Ok(f64::INFINITY),
+            }
+        },
+        eval_fn: |ctx: &mut &mut BfgsFdState<'_, FitOut>, theta: &Array1<f64>| {
+            // With Derivative::Unavailable, run_outer will use FD; the eval_fn
+            // just needs to return the cost with a zero gradient placeholder.
+            let (ms, ns) = match ctx.specs_at_theta(theta) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            let (md, nd) = match build_pair_ref(&ms, &ns) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return Ok(OuterEval {
+                        cost: f64::INFINITY,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    });
+                }
+            };
+            match (&mut *fit_fn_cell.borrow_mut())(&md, &nd) {
+                Ok(fit) => {
+                    let cost = score_fn_ref(&fit);
+                    ctx.track_best(theta, cost, &fit, &ms, &ns, &md, &nd);
+                    Ok(OuterEval {
+                        cost,
+                        gradient: Array1::zeros(theta.len()),
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+                Err(_) => Ok(OuterEval {
+                    cost: f64::INFINITY,
+                    gradient: Array1::zeros(theta.len()),
+                    hessian: HessianResult::Unavailable,
+                }),
+            }
+        },
+        reset_fn: |ctx: &mut &mut BfgsFdState<'_, FitOut>| { let _ = ctx; },
+        efs_fn: None::<
+            fn(
+                &mut &mut BfgsFdState<'_, FitOut>,
+                &Array1<f64>,
+            ) -> Result<EfsEval, crate::solver::estimate::EstimationError>,
+        >,
+    };
+
+    match crate::solver::strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "two-block spatial BFGS FD fallback",
+    ) {
+        Ok(result) => {
+            log::trace!(
+                "[two-block-bfgs-fd] converged in {} iterations, \
+                 final_value={:.6e}, grad_norm={:.6e}",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm,
+            );
+            // Use the best solution tracked during optimization.
+            let st = obj.state;
+            if let (Some(fit), Some(ms), Some(ns), Some(md), Some(nd)) = (
+                st.best_fit.take(),
+                st.best_resolved_meanspec.take(),
+                st.best_resolved_noisespec.take(),
+                st.best_mean_design.take(),
+                st.best_noise_design.take(),
+            ) {
+                log_spatial_aniso_scales(&ms);
+                log_spatial_aniso_scales(&ns);
+                Ok(TwoBlockSpatialLengthScaleOptimizationResult {
+                    resolved_meanspec: ms,
+                    resolved_noisespec: ns,
+                    mean_design: md,
+                    noise_design: nd,
+                    fit,
+                })
+            } else {
+                Err("BFGS FD fallback converged but no valid evaluation was recorded".to_string())
+            }
+        }
+        Err(e) => Err(format!("BFGS FD fallback failed: {e}")),
     }
 }
 

@@ -1,7 +1,8 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
+use crate::solver::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
@@ -265,12 +266,8 @@ pub struct SurvivalLocationScaleSpec {
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
 }
 
-/// Type alias: the old `SurvivalLocationScaleFitResult` is now `UnifiedFitResult`.
-pub type SurvivalLocationScaleFitResult = crate::solver::estimate::UnifiedFitResult;
-
-/// Helper struct mirroring the old `SurvivalLocationScaleFitResultParts` so
-/// callers can build a `SurvivalLocationScaleFitResult` from survival-specific
-/// fields without knowing about the unified layout.
+/// Helper struct so callers can build a `UnifiedFitResult` from
+/// survival-specific fields without knowing about the unified layout.
 pub struct SurvivalLocationScaleFitResultParts {
     pub beta_time: Array1<f64>,
     pub beta_threshold: Array1<f64>,
@@ -289,11 +286,10 @@ pub struct SurvivalLocationScaleFitResultParts {
     pub geometry: Option<FitGeometry>,
 }
 
-/// Build a `SurvivalLocationScaleFitResult` (= `UnifiedFitResult`) from
-/// survival-specific fields.
+/// Build a `UnifiedFitResult` from survival-specific fields.
 pub fn survival_fit_from_parts(
     parts: SurvivalLocationScaleFitResultParts,
-) -> Result<SurvivalLocationScaleFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let SurvivalLocationScaleFitResultParts {
         beta_time,
         beta_threshold,
@@ -1998,7 +1994,7 @@ struct PredictionLinearPredictors {
 
 fn prediction_linear_predictors(
     input: &SurvivalLocationScalePredictInput,
-    fit: &SurvivalLocationScaleFitResult,
+    fit: &UnifiedFitResult,
 ) -> Result<PredictionLinearPredictors, String> {
     validate_predict_inverse_link(&input.inverse_link)?;
     let n = input.x_time_exit.nrows();
@@ -3581,7 +3577,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
 pub fn fit_survival_location_scale(
     spec: SurvivalLocationScaleSpec,
-) -> Result<SurvivalLocationScaleFitResult, String> {
+) -> Result<UnifiedFitResult, String> {
     let n = spec.event_target.len();
     if n == 0 {
         return Err("fit_survival_location_scale: empty dataset".to_string());
@@ -3869,7 +3865,7 @@ pub fn fit_survival_location_scale(
     } else {
         vec![timespec, thresholdspec, log_sigmaspec]
     };
-    let fit: BlockwiseFitResult = fit_custom_family(&family, &blockspecs, &options)?;
+    let fit: UnifiedFitResult = fit_custom_family(&family, &blockspecs, &options)?;
 
     let k_time = spec.time_block.penalties.len();
     let k_t = threshold_prep.penalties.len();
@@ -3944,7 +3940,7 @@ pub fn fit_survival_location_scale(
 
 pub fn predict_survival_location_scale(
     input: &SurvivalLocationScalePredictInput,
-    fit: &SurvivalLocationScaleFitResult,
+    fit: &UnifiedFitResult,
 ) -> Result<SurvivalLocationScalePredictResult, String> {
     let predictors = prediction_linear_predictors(input, fit)?;
     let n = input.x_time_exit.nrows();
@@ -3973,7 +3969,7 @@ pub fn predict_survival_location_scale(
 
 pub fn predict_survival_location_scale_posterior_mean(
     input: &SurvivalLocationScalePredictInput,
-    fit: &SurvivalLocationScaleFitResult,
+    fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
 ) -> Result<SurvivalLocationScalePredictResult, String> {
     // Uncertainty-aware survival posterior mean with conditional Gaussian
@@ -4296,7 +4292,7 @@ pub fn predict_survival_location_scale_posterior_mean(
 
 pub fn predict_survival_location_scalewith_uncertainty(
     input: &SurvivalLocationScalePredictInput,
-    fit: &SurvivalLocationScaleFitResult,
+    fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
     posterior_mean: bool,
     include_response_sd: bool,
@@ -4510,7 +4506,7 @@ mod tests {
         beta_threshold: Array1<f64>,
         beta_log_sigma: Array1<f64>,
         beta_link_wiggle: Option<Array1<f64>>,
-    ) -> SurvivalLocationScaleFitResult {
+    ) -> UnifiedFitResult {
         let lambdas_linkwiggle = beta_link_wiggle.as_ref().map(|_| Array1::zeros(0));
         survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
             beta_time,

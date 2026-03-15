@@ -1197,7 +1197,7 @@ pub struct ExternalOptimResult {
     pub artifacts: FitArtifacts,
     pub inference: Option<FitInference>,
     pub reml_score: f64,
-    pub fitted_link_parameters: FittedLinkState,
+    pub fitted_link: FittedLinkState,
 }
 
 #[derive(Clone)]
@@ -2481,7 +2481,7 @@ where
         },
         inference,
         reml_score: outer_result.final_value,
-        fitted_link_parameters: if let Some(state) = final_mixture_state {
+        fitted_link: if let Some(state) = final_mixture_state {
             FittedLinkState::Mixture {
                 state,
                 covariance: final_mixture_param_covariance,
@@ -2805,12 +2805,6 @@ pub struct FitInference {
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
 }
 
-/// Type alias: the old `FitResult` is now `UnifiedFitResult`.
-pub type FitResult = UnifiedFitResult;
-
-/// Type alias: the old `FitResultParts` is now `UnifiedFitResultParts`.
-pub type FitResultParts = UnifiedFitResultParts;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FittedLinkState {
     Standard(Option<LinkFunction>),
@@ -2828,10 +2822,7 @@ pub enum FittedLinkState {
     },
 }
 
-/// Backward-compatible alias.
-pub type FittedLinkParameters = FittedLinkState;
-
-fn validate_fitted_link_parameters_estimation(
+fn validate_fitted_link_estimation(
     fitted_link: &FittedLinkState,
 ) -> Result<(), EstimationError> {
     match fitted_link {
@@ -2869,7 +2860,6 @@ fn validate_fitted_link_parameters_estimation(
     }
 }
 
-// Old FitResult impl block deleted (now UnifiedFitResult) — methods now live on UnifiedFitResult.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Unified fit result — single type for all model families
@@ -3060,6 +3050,19 @@ where
     Ok(())
 }
 
+/// Public wrapper returning `String` errors for use outside the estimation module.
+pub fn ensure_finite_scalar(name: &str, value: f64) -> Result<(), String> {
+    ensure_finite_scalar_estimation(name, value).map_err(|e| e.to_string())
+}
+
+/// Public wrapper returning `String` errors for use outside the estimation module.
+pub fn validate_all_finite<I: IntoIterator<Item = f64>>(
+    label: &str,
+    values: I,
+) -> Result<(), String> {
+    validate_all_finite_estimation(label, values).map_err(|e| e.to_string())
+}
+
 impl FitGeometry {
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
         validate_all_finite_estimation(
@@ -3125,7 +3128,6 @@ impl FitInference {
     }
 }
 
-// Old FitResult::try_from_parts / validate deleted — now handled by UnifiedFitResult.
 
 impl UnifiedFitResult {
     pub fn try_from_parts(parts: UnifiedFitResultParts) -> Result<Self, EstimationError> {
@@ -3210,7 +3212,7 @@ impl UnifiedFitResult {
                 state.eta.iter().copied(),
             )?;
         }
-        validate_fitted_link_parameters_estimation(&fitted_link)?;
+        validate_fitted_link_estimation(&fitted_link)?;
 
         // Build the flat beta vector from all blocks.
         let beta = {
@@ -3282,7 +3284,6 @@ impl UnifiedFitResult {
     }
 }
 
-// Old From impls and to_unified deleted — the types are now unified.
 
 impl UnifiedFitResult {
     /// Get the beta covariance matrix (conditional) if available.
@@ -4261,7 +4262,7 @@ where
         covariance_conditional,
         covariance_corrected,
         inference: result.inference,
-        fitted_link: result.fitted_link_parameters,
+        fitted_link: result.fitted_link,
         geometry,
         block_states: Vec::new(),
         pirls_status: result.pirls_status,
