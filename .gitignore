@@ -73,12 +73,21 @@ bench/us48_scale_experiment/
 bench/biobank_scale/
 rust_digest.txt
 
+# Python virtual environments
+.venv-bench/
+.venv-biobank/
+.venv*/
+.pytest_cache/
+
 # Lean/Lake build artifacts
 .lake/
 *.olean
 *.olean.trace
 *.ilean
 *.c
+
+# Agent prompts (local scratch)
+prompts/
 
 # local codex worktrees
 .claude/worktrees/
