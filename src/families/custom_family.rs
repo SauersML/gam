@@ -13,9 +13,9 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HyperCoord, HyperCoordPair, HyperOperator, InnerSolutionBuilder,
-    compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
-    reml_laml_evaluate,
+    HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
+    InnerSolutionBuilder, compute_block_penalty_logdet_derivs, embed_penalty_root,
+    penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -633,6 +633,16 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Whether the family's exact joint ψ workspace should also be built for
+    /// first-order ψ terms during outer gradient evaluation.
+    ///
+    /// Default `false` avoids forcing every family to pay workspace setup cost
+    /// on gradient-only outer evaluations. Families with expensive shared state
+    /// that is reused by both first- and second-order ψ calculus can opt in.
+    fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
+        false
+    }
+
     /// Optional mixed beta/psi Hessian drift D_beta H_psi[u].
     ///
     /// This is the missing T_i[u] object in the full exact joint profiled
@@ -712,6 +722,9 @@ pub struct BlockwiseInnerResult {
     pub converged: bool,
     pub block_logdet_h: f64,
     pub block_logdet_s: f64,
+    /// Cached assembled penalty matrices S(ρ) = Σ_k exp(ρ_k) S_k per block.
+    /// Avoids redundant re-assembly in the outer objective evaluation.
+    pub s_lambdas: Vec<Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -1578,44 +1591,6 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
     }
 }
 
-struct DenseAddedHyperOperator {
-    base: Box<dyn HyperOperator>,
-    dense_addition: Array2<f64>,
-}
-
-impl HyperOperator for DenseAddedHyperOperator {
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.base.mul_vec(v) + self.dense_addition.dot(v)
-    }
-
-    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
-        self.base.bilinear(v, u) + u.dot(&self.dense_addition.dot(v))
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        self.base.to_dense() + &self.dense_addition
-    }
-
-    fn is_implicit(&self) -> bool {
-        self.base.is_implicit()
-    }
-}
-
-fn maybe_add_dense_to_operator(
-    base: Option<Box<dyn HyperOperator>>,
-    dense_addition: Array2<f64>,
-) -> Option<Box<dyn HyperOperator>> {
-    if dense_addition.iter().all(|v| *v == 0.0) {
-        return base;
-    }
-    base.map(|op| {
-        Box::new(DenseAddedHyperOperator {
-            base: op,
-            dense_addition,
-        }) as Box<dyn HyperOperator>
-    })
-}
-
 fn shared_dense_design_cache() -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>
 {
     static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
@@ -1748,6 +1723,10 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
 }
 
 pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
+    fn first_order_terms(&self, _: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        Ok(None)
+    }
+
     fn second_order_terms(
         &self,
         psi_i: usize,
@@ -3437,10 +3416,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut cycles_done = 0usize;
     // Pre-allocate per-block eta backup buffers to avoid O(n) allocation
     // per block per cycle in the backtracking line search.
-    let mut eta_backups: Vec<Array1<f64>> = states
-        .iter()
-        .map(|s| Array1::zeros(s.eta.len()))
-        .collect();
+    let mut eta_backups: Vec<Array1<f64>> =
+        states.iter().map(|s| Array1::zeros(s.eta.len())).collect();
 
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
@@ -3690,6 +3667,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
         converged,
         block_logdet_h,
         block_logdet_s,
+        s_lambdas,
     })
 }
 
@@ -3912,17 +3890,14 @@ fn joint_outer_evaluate(
     } else {
         None
     };
-    for (b, spec) in specs.iter().enumerate() {
+    for (b, _spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
-        let p = end - start;
-        let lambdas = per_block[b].mapv(f64::exp);
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s_lambda.scaled_add(lambdas[k], s);
-        }
+        // Reuse pre-assembled S(ρ) from inner_blockwise_fit instead of
+        // re-computing lambdas and accumulating penalties from scratch.
+        let s_lambda = &inner.s_lambdas[b];
         s_joint
             .slice_mut(ndarray::s![start..end, start..end])
-            .assign(&s_lambda);
+            .assign(s_lambda);
         if moderidge > 0.0 {
             for d in start..end {
                 s_joint[[d, d]] += moderidge;
@@ -4560,6 +4535,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
     penalty_counts: &[usize],
     s_pinv: Option<&Array2<f64>>,
     hessian_beta_independent: bool,
+    psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<Vec<HyperCoord>, String> {
     let ranges = block_param_ranges(specs);
     let total = beta_flat.len();
@@ -4574,9 +4550,29 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
 
         for (local_idx, deriv) in block_derivs.iter().enumerate() {
             // 1. Get family-provided likelihood objects (joint flattened space).
-            let psi_terms = family
-                .exact_newton_joint_psi_terms(synced_states, specs, derivative_blocks, psi_global)?
-                .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total));
+            let psi_terms = if let Some(workspace) = psi_workspace.as_ref() {
+                if let Some(terms) = workspace.first_order_terms(psi_global)? {
+                    terms
+                } else {
+                    family
+                        .exact_newton_joint_psi_terms(
+                            synced_states,
+                            specs,
+                            derivative_blocks,
+                            psi_global,
+                        )?
+                        .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
+                }
+            } else {
+                family
+                    .exact_newton_joint_psi_terms(
+                        synced_states,
+                        specs,
+                        derivative_blocks,
+                        psi_global,
+                    )?
+                    .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
+            };
 
             // 2. Assemble S_ψ from penalty derivatives, embed into joint space.
             let s_psi_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
@@ -4591,13 +4587,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             } else {
                 &psi_terms.hessian_psi + &s_psi
             };
-            let b_operator =
-                maybe_add_dense_to_operator(psi_terms.hessian_psi_operator, dense_b.clone());
-            let b_mat = if b_operator.is_some() {
-                Array2::<f64>::zeros((0, 0))
-            } else {
-                dense_b
-            };
             let ld_s = if let Some(sp) = s_pinv {
                 trace_product(sp, &s_psi)
             } else {
@@ -4607,11 +4596,10 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             coords.push(HyperCoord {
                 a,
                 g,
-                b_mat,
-                b_operator,
+                drift: HyperCoordDrift::from_parts(Some(dense_b), psi_terms.hessian_psi_operator),
                 ld_s,
                 b_depends_on_beta: !hessian_beta_independent,
-                // ψ coordinates move the design/likelihood, so b_mat need not
+                // ψ coordinates move the design/likelihood, so the Hessian drift need not
                 // be PSD. They are NOT penalty-like.
                 is_penalty_like: false,
             });
@@ -5110,6 +5098,16 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
 
         // Build ψ HyperCoords, pair callbacks, and drift derivative callback.
         let hessian_beta_independent = !family.exact_newton_joint_hessian_beta_dependent();
+        let psi_workspace =
+            if need_hessian || family.exact_newton_joint_psi_workspace_for_first_order_terms() {
+                family.exact_newton_joint_psi_workspace(
+                    &synced_joint_states,
+                    specs,
+                    derivative_blocks,
+                )?
+            } else {
+                None
+            };
 
         let psi_coords = build_psi_hyper_coords(
             family,
@@ -5121,17 +5119,8 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             &penalty_counts,
             s_pinv_joint.as_ref(),
             hessian_beta_independent,
+            psi_workspace.clone(),
         )?;
-
-        let psi_workspace = if need_hessian {
-            family.exact_newton_joint_psi_workspace(
-                &synced_joint_states,
-                specs,
-                derivative_blocks,
-            )?
-        } else {
-            None
-        };
 
         let (ext_ext_fn, rho_ext_fn, drift_fn) = if need_hessian {
             let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
@@ -5927,7 +5916,8 @@ pub fn fit_custom_family<F: CustomFamily>(
                 {
                     // Warm-start proximity check: discard warm cache if rho
                     // jumped too far from the cached point.
-                    let seed_ok = outer.warm_cache
+                    let seed_ok = outer
+                        .warm_cache
                         .as_ref()
                         .map(|c| {
                             c.rho.len() == rho.len()
