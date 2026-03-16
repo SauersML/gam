@@ -2478,14 +2478,8 @@ impl<'a> RemlState<'a> {
             let n_obs = d_vec.len();
 
             let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
-            // Hat leverages for the trace-based gradient.
-            let x_dense = if compute_grad {
-                Some(self.x().to_dense_arc())
-            } else {
-                None
-            };
-            let mut hat_leverages = if compute_grad {
-                Array1::<f64>::zeros(n_obs)
+            let hat_leverages = if compute_grad {
+                crate::linalg::sparse_exact::leverages_from_factor(&sparse.factor, self.x())?
             } else {
                 Array1::<f64>::zeros(0)
             };
@@ -2496,15 +2490,6 @@ impl<'a> RemlState<'a> {
                 if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
                 {
                     h_inv_diag[j] = f_j[j];
-
-                    // Accumulate hat leverage: hat[i] += X[i,j] * (X f_j)[i]
-                    if compute_grad {
-                        let xd = x_dense.as_ref().unwrap();
-                        let x_fj: Array1<f64> = self.x().matrixvectormultiply(&f_j);
-                        for i in 0..n_obs {
-                            hat_leverages[i] += xd[[i, j]] * x_fj[i];
-                        }
-                    }
                 }
             }
 

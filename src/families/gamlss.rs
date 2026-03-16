@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::sync::Arc;
-
 use crate::basis::{
     BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
     create_difference_penalty_matrix, evaluate_bspline_fourth_derivative_scalar,
@@ -11,7 +10,7 @@ use crate::custom_family::{
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
+    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -4083,12 +4082,12 @@ fn build_two_block_custom_family_joint_psi_operator(
     let channels = vec![
         CustomFamilyJointDesignChannel::new(
             left_range.clone(),
-            Arc::new(left_design.clone()),
+            shared_dense_arc(left_design),
             left_action,
         ),
         CustomFamilyJointDesignChannel::new(
             right_range.clone(),
-            Arc::new(right_design.clone()),
+            shared_dense_arc(right_design),
             right_action,
         ),
     ];
@@ -4124,6 +4123,149 @@ fn build_two_block_custom_family_joint_psi_operator(
         channels,
         pair_contributions,
     ))))
+}
+
+fn build_binomial_location_scale_joint_psi_action(
+    block_states: &[ParameterBlockState],
+    derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    psi_index: usize,
+    pt: usize,
+    pls: usize,
+) -> Result<Option<BinomialLocationScaleJointPsiAction>, String> {
+    if block_states.len() != 2 || derivative_blocks.len() != 2 {
+        return Err(format!(
+            "BinomialLocationScaleFamily joint psi action expects 2 blocks and 2 derivative block lists, got {} and {}",
+            block_states.len(),
+            derivative_blocks.len()
+        ));
+    }
+    let n = block_states[0].eta.len();
+    let beta_t = &block_states[BinomialLocationScaleFamily::BLOCK_T].beta;
+    let beta_ls = &block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
+    let mut global = 0usize;
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            if global == psi_index {
+                match block_idx {
+                    BinomialLocationScaleFamily::BLOCK_T => {
+                        let action = match CustomFamilyPsiDesignAction::from_first_derivative(
+                            deriv,
+                            n,
+                            pt,
+                            0..n,
+                            "BinomialLocationScaleFamily threshold",
+                        ) {
+                            Ok(action) => action,
+                            Err(_) => return Ok(None),
+                        };
+                        return Ok(Some(BinomialLocationScaleJointPsiAction {
+                            block_idx,
+                            local_idx,
+                            z_t_psi: action.forward_mul(beta_t.view()),
+                            z_ls_psi: Array1::zeros(n),
+                            x_t_psi: Some(action),
+                            x_ls_psi: None,
+                        }));
+                    }
+                    BinomialLocationScaleFamily::BLOCK_LOG_SIGMA => {
+                        let action = match CustomFamilyPsiDesignAction::from_first_derivative(
+                            deriv,
+                            n,
+                            pls,
+                            0..n,
+                            "BinomialLocationScaleFamily log-sigma",
+                        ) {
+                            Ok(action) => action,
+                            Err(_) => return Ok(None),
+                        };
+                        return Ok(Some(BinomialLocationScaleJointPsiAction {
+                            block_idx,
+                            local_idx,
+                            z_t_psi: Array1::zeros(n),
+                            z_ls_psi: action.forward_mul(beta_ls.view()),
+                            x_t_psi: None,
+                            x_ls_psi: Some(action),
+                        }));
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            global += 1;
+        }
+    }
+    Ok(None)
+}
+
+fn build_binomial_location_scale_wiggle_joint_psi_action(
+    block_states: &[ParameterBlockState],
+    derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    psi_index: usize,
+    pt: usize,
+    pls: usize,
+) -> Result<Option<BinomialLocationScaleJointPsiAction>, String> {
+    if block_states.len() != 3 || derivative_blocks.len() != 3 {
+        return Err(format!(
+            "BinomialLocationScaleWiggleFamily joint psi action expects 3 blocks and 3 derivative block lists, got {} and {}",
+            block_states.len(),
+            derivative_blocks.len()
+        ));
+    }
+    let n = block_states[0].eta.len();
+    let beta_t = &block_states[BinomialLocationScaleWiggleFamily::BLOCK_T].beta;
+    let beta_ls = &block_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].beta;
+    let mut global = 0usize;
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            if global == psi_index {
+                match block_idx {
+                    BinomialLocationScaleWiggleFamily::BLOCK_T => {
+                        let action = match CustomFamilyPsiDesignAction::from_first_derivative(
+                            deriv,
+                            n,
+                            pt,
+                            0..n,
+                            "BinomialLocationScaleWiggleFamily threshold",
+                        ) {
+                            Ok(action) => action,
+                            Err(_) => return Ok(None),
+                        };
+                        return Ok(Some(BinomialLocationScaleJointPsiAction {
+                            block_idx,
+                            local_idx,
+                            z_t_psi: action.forward_mul(beta_t.view()),
+                            z_ls_psi: Array1::zeros(n),
+                            x_t_psi: Some(action),
+                            x_ls_psi: None,
+                        }));
+                    }
+                    BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA => {
+                        let action = match CustomFamilyPsiDesignAction::from_first_derivative(
+                            deriv,
+                            n,
+                            pls,
+                            0..n,
+                            "BinomialLocationScaleWiggleFamily log-sigma",
+                        ) {
+                            Ok(action) => action,
+                            Err(_) => return Ok(None),
+                        };
+                        return Ok(Some(BinomialLocationScaleJointPsiAction {
+                            block_idx,
+                            local_idx,
+                            z_t_psi: Array1::zeros(n),
+                            z_ls_psi: action.forward_mul(beta_ls.view()),
+                            x_t_psi: None,
+                            x_ls_psi: Some(action),
+                        }));
+                    }
+                    BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE => return Ok(None),
+                    _ => return Ok(None),
+                }
+            }
+            global += 1;
+        }
+    }
+    Ok(None)
 }
 
 fn gaussian_joint_psisecondhessian_fromweights(
@@ -7488,6 +7630,48 @@ impl BinomialMeanWiggleFamily {
         }
         Ok(None)
     }
+
+    fn exact_newton_joint_psi_action(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        p_eta: usize,
+    ) -> Result<Option<(CustomFamilyPsiDesignAction, Array1<f64>)>, String> {
+        if block_states.len() != 2 || derivative_blocks.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily joint psi action expects 2 blocks and 2 derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let n = self.y.len();
+        let beta_eta = &block_states[Self::BLOCK_ETA].beta;
+        let mut global = 0usize;
+        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+            for deriv in block_derivs {
+                if global == psi_index {
+                    if block_idx != Self::BLOCK_ETA {
+                        return Ok(None);
+                    }
+                    let action = match CustomFamilyPsiDesignAction::from_first_derivative(
+                        deriv,
+                        n,
+                        p_eta,
+                        0..n,
+                        "BinomialMeanWiggleFamily eta",
+                    ) {
+                        Ok(action) => action,
+                        Err(_) => return Ok(None),
+                    };
+                    let z_eta_psi = action.forward_mul(beta_eta.view());
+                    return Ok(Some((action, z_eta_psi)));
+                }
+                global += 1;
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl CustomFamily for BinomialMeanWiggleFamily {
@@ -8048,16 +8232,6 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             ));
         }
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
-        let Some(dir_a) = self.exact_newton_joint_psi_direction(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            &x_eta,
-        )?
-        else {
-            return Ok(None);
-        };
-
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
@@ -8068,6 +8242,29 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
         let pw = geom.basis.ncols();
+        let implicit_dir = self.exact_newton_joint_psi_action(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            p_eta,
+        )?;
+        let dense_dir = if implicit_dir.is_none() {
+            self.exact_newton_joint_psi_direction(
+                block_states,
+                derivative_blocks,
+                psi_index,
+                &x_eta,
+            )?
+        } else {
+            None
+        };
+        let z_eta_psi = if let Some((_, ref z_eta_psi)) = implicit_dir {
+            z_eta_psi
+        } else if let Some(ref dir_a) = dense_dir {
+            &dir_a.z_eta_psi
+        } else {
+            return Ok(None);
+        };
 
         let mut objective_psi = 0.0;
         let mut score_eta_xa = Array1::<f64>::zeros(n);
@@ -8088,7 +8285,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         for row in 0..n {
             let q = eta[row] + etaw[row];
             let (m1, m2, m3) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
-            let z_a = dir_a.z_eta_psi[row];
+            let z_a = z_eta_psi[row];
             let a = geom.dq_dq0[row];
             let b = geom.d2q_dq02[row];
             let c = geom.d3q_dq03[row];
@@ -8113,11 +8310,50 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             coeff_ww_db[row] = m2 * z_a;
         }
 
+        let score_w = geom.basis.t().dot(&score_w_b) + geom.basis_d1.t().dot(&score_w_d1);
+
+        if let Some((action, _)) = implicit_dir {
+            let score_eta = action.transpose_mul(score_eta_xa.view()) + x_eta.t().dot(&score_eta_x);
+            let score_psi = binomial_pack_mean_wiggle_joint_score(&score_eta, &score_w);
+            let x_eta_arc = shared_dense_arc(x_eta.as_ref());
+            let basis_arc = Arc::new(geom.basis.clone());
+            let basis_d1_arc = Arc::new(geom.basis_d1.clone());
+            let basis_d2_arc = Arc::new(geom.basis_d2.clone());
+            let zeros = Array1::<f64>::zeros(n);
+            let operator = CustomFamilyJointPsiOperator::new(
+                p_eta + pw,
+                vec![
+                    CustomFamilyJointDesignChannel::new(0..p_eta, Arc::clone(&x_eta_arc), Some(action)),
+                    CustomFamilyJointDesignChannel::new(p_eta..p_eta + pw, Arc::clone(&basis_arc), None),
+                    CustomFamilyJointDesignChannel::new(p_eta..p_eta + pw, Arc::clone(&basis_d1_arc), None),
+                    CustomFamilyJointDesignChannel::new(p_eta..p_eta + pw, Arc::clone(&basis_d2_arc), None),
+                ],
+                vec![
+                    CustomFamilyJointDesignPairContribution::new(0, 0, coeff_eta_eta_xa_x.clone(), coeff_eta_eta_xx.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 1, coeff_eta_w_xa_b.clone(), coeff_eta_w_x_b.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 0, coeff_eta_w_xa_b.clone(), coeff_eta_w_x_b.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 2, coeff_eta_w_xa_d1.clone(), coeff_eta_w_x_d1.clone()),
+                    CustomFamilyJointDesignPairContribution::new(2, 0, coeff_eta_w_xa_d1.clone(), coeff_eta_w_x_d1.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 3, zeros.clone(), coeff_eta_w_x_d2.clone()),
+                    CustomFamilyJointDesignPairContribution::new(3, 0, zeros.clone(), coeff_eta_w_x_d2.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 1, zeros.clone(), coeff_ww_bb.clone()),
+                    CustomFamilyJointDesignPairContribution::new(2, 1, zeros.clone(), coeff_ww_db.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 2, zeros, coeff_ww_db.clone()),
+                ],
+            );
+            return Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+                objective_psi,
+                score_psi,
+                hessian_psi: Array2::zeros((0, 0)),
+                hessian_psi_operator: Some(Box::new(operator)),
+            }));
+        }
+
+        let dir_a = dense_dir.expect("dense psi direction should exist when implicit direction is absent");
         let score_psi = binomial_pack_mean_wiggle_joint_score(
             &(dir_a.x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
-            &(geom.basis.t().dot(&score_w_b) + geom.basis_d1.t().dot(&score_w_d1)),
+            &score_w,
         );
-
         let a_eta_eta = xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_eta_xa_x, &x_eta)?;
         let h_eta_eta = &a_eta_eta + &a_eta_eta.t() + &xt_diag_x_dense(&x_eta, &coeff_eta_eta_xx)?;
         let h_eta_w = xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_w_xa_b, &geom.basis)?
@@ -8128,7 +8364,6 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
         let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();
 
-        debug_assert_eq!(score_psi.len(), p_eta + pw);
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
@@ -8534,6 +8769,15 @@ struct BinomialLocationScaleJointPsiDirection {
     local_idx: usize,
     x_t_psi: Array2<f64>,
     x_ls_psi: Array2<f64>,
+    z_t_psi: Array1<f64>,
+    z_ls_psi: Array1<f64>,
+}
+
+struct BinomialLocationScaleJointPsiAction {
+    block_idx: usize,
+    local_idx: usize,
+    x_t_psi: Option<CustomFamilyPsiDesignAction>,
+    x_ls_psi: Option<CustomFamilyPsiDesignAction>,
     z_t_psi: Array1<f64>,
     z_ls_psi: Array1<f64>,
 }
@@ -9283,17 +9527,6 @@ impl BinomialLocationScaleFamily {
             return Err("BinomialLocationScaleFamily input size mismatch".to_string());
         }
 
-        let Some(psi_dir) = self.exact_newton_joint_psi_direction(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            x_t,
-            x_ls,
-        )?
-        else {
-            return Ok(None);
-        };
-
         // Joint fixed-beta psi terms for the coupled 2-block probit model.
         //
         // We work over the flattened coefficient vector beta = [beta_t; beta_ls]
@@ -9400,10 +9633,36 @@ impl BinomialLocationScaleFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let total = pt + pls;
-        let x_t_psi = &psi_dir.x_t_psi;
-        let x_ls_psi = &psi_dir.x_ls_psi;
-        let z_t = &psi_dir.z_t_psi;
-        let z_ls = &psi_dir.z_ls_psi;
+        let implicit_dir =
+            build_binomial_location_scale_joint_psi_action(block_states, derivative_blocks, psi_index, pt, pls)?;
+        let dense_dir = if implicit_dir.is_none() {
+            self.exact_newton_joint_psi_direction(
+                block_states,
+                derivative_blocks,
+                psi_index,
+                x_t,
+                x_ls,
+            )?
+        } else {
+            None
+        };
+        let (block_idx, local_idx, z_t, z_ls) = if let Some(ref psi_dir) = implicit_dir {
+            (
+                psi_dir.block_idx,
+                psi_dir.local_idx,
+                &psi_dir.z_t_psi,
+                &psi_dir.z_ls_psi,
+            )
+        } else if let Some(ref psi_dir) = dense_dir {
+            (
+                psi_dir.block_idx,
+                psi_dir.local_idx,
+                &psi_dir.z_t_psi,
+                &psi_dir.z_ls_psi,
+            )
+        } else {
+            return Ok(None);
+        };
 
         let mut r_t = Array1::<f64>::zeros(n);
         let mut r_ls = Array1::<f64>::zeros(n);
@@ -9440,18 +9699,10 @@ impl BinomialLocationScaleFamily {
             objective_psi += r_t[i] * z_t[i] + r_ls[i] * z_ls[i];
         }
 
-        let mut score_psi = Array1::<f64>::zeros(total);
-        score_psi
-            .slice_mut(s![0..pt])
-            .assign(&(x_t_psi.t().dot(&r_t) + x_t.t().dot(&dr_t)));
-        score_psi
-            .slice_mut(s![pt..pt + pls])
-            .assign(&(x_ls_psi.t().dot(&r_ls) + x_ls.t().dot(&dr_ls)));
-
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator(
             derivative_blocks,
-            psi_dir.block_idx,
-            psi_dir.local_idx,
+            block_idx,
+            local_idx,
             Self::BLOCK_T,
             Self::BLOCK_LOG_SIGMA,
             "BinomialLocationScaleFamily threshold",
@@ -9465,9 +9716,42 @@ impl BinomialLocationScaleFamily {
             &dh_tl,
             &dh_ll,
         )?;
+        let score_psi = if let Some(ref psi_dir) = implicit_dir {
+            let score_t = psi_dir
+                .x_t_psi
+                .as_ref()
+                .map(|action: &CustomFamilyPsiDesignAction| action.transpose_mul(r_t.view()))
+                .unwrap_or_else(|| Array1::zeros(pt))
+                + x_t.t().dot(&dr_t);
+            let score_ls = psi_dir
+                .x_ls_psi
+                .as_ref()
+                .map(|action: &CustomFamilyPsiDesignAction| action.transpose_mul(r_ls.view()))
+                .unwrap_or_else(|| Array1::zeros(pls))
+                + x_ls.t().dot(&dr_ls);
+            let mut score = Array1::<f64>::zeros(total);
+            score.slice_mut(s![0..pt]).assign(&score_t);
+            score.slice_mut(s![pt..pt + pls]).assign(&score_ls);
+            score
+        } else {
+            let psi_dir =
+                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            let mut score = Array1::<f64>::zeros(total);
+            score
+                .slice_mut(s![0..pt])
+                .assign(&(psi_dir.x_t_psi.t().dot(&r_t) + x_t.t().dot(&dr_t)));
+            score
+                .slice_mut(s![pt..pt + pls])
+                .assign(&(psi_dir.x_ls_psi.t().dot(&r_ls) + x_ls.t().dot(&dr_ls)));
+            score
+        };
         let hessian_psi = if hessian_psi_operator.is_some() {
             Array2::<f64>::zeros((0, 0))
         } else {
+            let psi_dir =
+                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            let x_t_psi = &psi_dir.x_t_psi;
+            let x_ls_psi = &psi_dir.x_ls_psi;
             let h_tt_block = xt_diag_y_dense(&x_t_psi, &h_tt, x_t)?
                 + &xt_diag_y_dense(x_t, &h_tt, &x_t_psi)?
                 + &xt_diag_x_dense(x_t, &dh_tt)?;
@@ -10973,9 +11257,53 @@ impl BinomialLocationScaleWiggleFamily {
         let pls = x_ls.ncols();
         let pw = b0.ncols();
         let total = pt + pls + pw;
+        let implicit_dir =
+            build_binomial_location_scale_wiggle_joint_psi_action(block_states, derivative_blocks, psi_index, pt, pls)?;
+        let dense_dir = if implicit_dir.is_none() {
+            self.exact_newton_joint_psi_direction(
+                block_states,
+                derivative_blocks,
+                psi_index,
+                x_t,
+                x_ls,
+            )?
+        } else {
+            None
+        };
+        let (z_t_psi, z_ls_psi) = if let Some(ref dir_a) = implicit_dir {
+            (&dir_a.z_t_psi, &dir_a.z_ls_psi)
+        } else if let Some(ref dir_a) = dense_dir {
+            (&dir_a.z_t_psi, &dir_a.z_ls_psi)
+        } else {
+            return Ok(None);
+        };
         let mut objective_psi = 0.0;
-        let mut score_psi = Array1::<f64>::zeros(total);
-        let mut hessian_psi = Array2::<f64>::zeros((total, total));
+
+        let mut score_t_xa = Array1::<f64>::zeros(n);
+        let mut score_t_x = Array1::<f64>::zeros(n);
+        let mut score_ls_xa = Array1::<f64>::zeros(n);
+        let mut score_ls_x = Array1::<f64>::zeros(n);
+        let mut score_w_b = Array1::<f64>::zeros(n);
+        let mut score_w_d1 = Array1::<f64>::zeros(n);
+
+        let mut coeff_tt_w = Array1::<f64>::zeros(n);
+        let mut coeff_tt_d = Array1::<f64>::zeros(n);
+        let mut coeff_tl_w = Array1::<f64>::zeros(n);
+        let mut coeff_tl_d = Array1::<f64>::zeros(n);
+        let mut coeff_ll_w = Array1::<f64>::zeros(n);
+        let mut coeff_ll_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b_w = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d1_w = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d1_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d2_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b_w = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d1_w = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d1_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d2_d = Array1::<f64>::zeros(n);
+        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_db = Array1::<f64>::zeros(n);
 
         // Exact likelihood-only joint psi terms for the probit wiggle family.
         //
@@ -11024,12 +11352,11 @@ impl BinomialLocationScaleWiggleFamily {
             let q = q0 + etaw[row];
             let q0_geom = nonwiggle_q_derivs(eta_t[row], sigma[row], ds[row], d2s[row], d3s[row]);
             let r_sigma = 1.0 / sigma[row].max(1e-12);
-            let q0_a = -r_sigma * dir_a.z_t_psi[row] - q0 * dir_a.z_ls_psi[row];
-            let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
-            let q0_ls_a = q0_geom.q_tl * dir_a.z_t_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
-            let q0_tl_a = q0_geom.q_tl_ls * dir_a.z_ls_psi[row];
-            let q0_ll_a =
-                q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_a = -r_sigma * z_t_psi[row] - q0 * z_ls_psi[row];
+            let q0_t_a = q0_geom.q_tl * z_ls_psi[row];
+            let q0_ls_a = q0_geom.q_tl * z_t_psi[row] + q0_geom.q_ll * z_ls_psi[row];
+            let q0_tl_a = q0_geom.q_tl_ls * z_ls_psi[row];
+            let q0_ll_a = q0_geom.q_tl_ls * z_t_psi[row] + q0_geom.q_ll_ls * z_ls_psi[row];
 
             let q_t = m[row] * q0_geom.q_t;
             let q_ls = m[row] * q0_geom.q_ls;
@@ -11047,13 +11374,6 @@ impl BinomialLocationScaleWiggleFamily {
                 + g2[row] * (2.0 * q0_geom.q_ls * q0_ls_a + q0_a * q0_geom.q_ll)
                 + m[row] * q0_ll_a;
 
-            let brow = b0.row(row);
-            let drow = d0.row(row);
-            let ddrow = dd0.row(row);
-            let qw_a = drow.to_owned() * q0_a;
-            let q_tw_a = ddrow.to_owned() * (q0_a * q0_geom.q_t) + &(drow.to_owned() * q0_t_a);
-            let q_lw_a = ddrow.to_owned() * (q0_a * q0_geom.q_ls) + &(drow.to_owned() * q0_ls_a);
-
             let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
@@ -11061,149 +11381,163 @@ impl BinomialLocationScaleWiggleFamily {
                 core.mu[row],
                 &self.link_kind,
             );
+            let alpha = m[row] * q0_a;
+            objective_psi += loss_1 * alpha;
 
-            objective_psi += loss_1 * m[row] * q0_a;
+            score_t_xa[row] = loss_1 * q_t;
+            score_t_x[row] = loss_2 * alpha * q_t + loss_1 * q_t_a;
+            score_ls_xa[row] = loss_1 * q_ls;
+            score_ls_x[row] = loss_2 * alpha * q_ls + loss_1 * q_ls_a;
+            score_w_b[row] = loss_2 * alpha;
+            score_w_d1[row] = loss_1 * q0_a;
 
-            let xtr = x_t.row(row);
-            let xlsr = x_ls.row(row);
-            let xta = dir_a.x_t_psi.row(row);
-            let xlsa = dir_a.x_ls_psi.row(row);
+            coeff_tt_w[row] = loss_2 * q_t * q_t + loss_1 * q_tt;
+            coeff_tt_d[row] = loss_3 * alpha * q_t * q_t
+                + 2.0 * loss_2 * q_t * q_t_a
+                + loss_2 * alpha * q_tt
+                + loss_1 * q_tt_a;
+            coeff_tl_w[row] = loss_2 * q_t * q_ls + loss_1 * q_tl;
+            coeff_tl_d[row] = loss_3 * alpha * q_t * q_ls
+                + loss_2 * (q_t_a * q_ls + q_t * q_ls_a)
+                + loss_2 * alpha * q_tl
+                + loss_1 * q_tl_a;
+            coeff_ll_w[row] = loss_2 * q_ls * q_ls + loss_1 * q_ll;
+            coeff_ll_d[row] = loss_3 * alpha * q_ls * q_ls
+                + 2.0 * loss_2 * q_ls * q_ls_a
+                + loss_2 * alpha * q_ll
+                + loss_1 * q_ll_a;
 
-            let mut b = Array1::<f64>::zeros(total);
-            b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
-            b.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls));
-            b.slice_mut(s![pt + pls..]).assign(&brow.to_owned());
+            coeff_tw_b_w[row] = loss_2 * q_t;
+            coeff_tw_b_d[row] = loss_3 * alpha * q_t + loss_2 * q_t_a;
+            coeff_tw_d1_w[row] = loss_1 * q0_geom.q_t;
+            coeff_tw_d1_d[row] =
+                loss_2 * (q_t * q0_a + alpha * q0_geom.q_t) + loss_1 * q0_t_a;
+            coeff_tw_d2_d[row] = loss_1 * q0_a * q0_geom.q_t;
 
-            let mut c_a = Array1::<f64>::zeros(total);
-            c_a.slice_mut(s![0..pt])
-                .assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
-            c_a.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
-            c_a.slice_mut(s![pt + pls..]).assign(&qw_a);
+            coeff_lw_b_w[row] = loss_2 * q_ls;
+            coeff_lw_b_d[row] = loss_3 * alpha * q_ls + loss_2 * q_ls_a;
+            coeff_lw_d1_w[row] = loss_1 * q0_geom.q_ls;
+            coeff_lw_d1_d[row] =
+                loss_2 * (q_ls * q0_a + alpha * q0_geom.q_ls) + loss_1 * q0_ls_a;
+            coeff_lw_d2_d[row] = loss_1 * q0_a * q0_geom.q_ls;
 
-            score_psi += &(loss_2 * m[row] * q0_a * &b + loss_1 * &c_a);
-
-            let mut q_mat = Array2::<f64>::zeros((total, total));
-            {
-                let tt = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                    * q_tt;
-                let tl = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_tl;
-                let ll = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_ll;
-                q_mat.slice_mut(s![0..pt, 0..pt]).assign(&tt);
-                q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
-                q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
-                let tw = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.to_owned() * q0_geom.q_t).insert_axis(Axis(0)));
-                let lw = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)));
-                q_mat.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
-                q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
-                mirror_upper_to_lower(&mut q_mat);
-            }
-
-            let mut r_a = Array2::<f64>::zeros((total, total));
-            {
-                let tt = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                    * q_tt_a
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                        * q_tt
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xta.to_owned().insert_axis(Axis(0)))
-                        * q_tt;
-                let tl = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_tl_a
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_tl
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_tl;
-                let ll = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_ll_a
-                    + xlsa
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_ll;
-                r_a.slice_mut(s![0..pt, 0..pt]).assign(&tt);
-                r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
-                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
-                let tw = xta
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.to_owned() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_a.insert_axis(Axis(0)));
-                let lw = xlsa
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_a.insert_axis(Axis(0)));
-                r_a.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
-                r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
-                mirror_upper_to_lower(&mut r_a);
-            }
-
-            let bb = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let ca_bt = c_a
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let b_cat = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_a.view().insert_axis(Axis(0)));
-            hessian_psi += &(loss_3 * m[row] * q0_a * bb
-                + loss_2 * (ca_bt + b_cat + (m[row] * q0_a) * q_mat)
-                + loss_1 * r_a);
+            coeff_ww_bb[row] = loss_3 * alpha;
+            coeff_ww_db[row] = loss_2 * q0_a;
         }
+        let score_t = if let Some(ref dir_a) = implicit_dir {
+            dir_a.x_t_psi
+                .as_ref()
+                .map(|action: &CustomFamilyPsiDesignAction| action.transpose_mul(score_t_xa.view()))
+                .unwrap_or_else(|| Array1::zeros(pt))
+                + x_t.t().dot(&score_t_x)
+        } else {
+            let dir_a =
+                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            dir_a.x_t_psi.t().dot(&score_t_xa) + x_t.t().dot(&score_t_x)
+        };
+        let score_ls = if let Some(ref dir_a) = implicit_dir {
+            dir_a.x_ls_psi
+                .as_ref()
+                .map(|action: &CustomFamilyPsiDesignAction| action.transpose_mul(score_ls_xa.view()))
+                .unwrap_or_else(|| Array1::zeros(pls))
+                + x_ls.t().dot(&score_ls_x)
+        } else {
+            let dir_a =
+                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            dir_a.x_ls_psi.t().dot(&score_ls_xa) + x_ls.t().dot(&score_ls_x)
+        };
+        let score_w = b0.t().dot(&score_w_b) + d0.t().dot(&score_w_d1);
+        let mut score_psi = Array1::<f64>::zeros(total);
+        score_psi.slice_mut(s![0..pt]).assign(&score_t);
+        score_psi.slice_mut(s![pt..pt + pls]).assign(&score_ls);
+        score_psi.slice_mut(s![pt + pls..total]).assign(&score_w);
+
+        if let Some(dir_a) = implicit_dir {
+            let basis_arc = Arc::new(b0.clone());
+            let basis_d1_arc = Arc::new(d0.clone());
+            let basis_d2_arc = Arc::new(dd0.clone());
+            let zeros = Array1::<f64>::zeros(n);
+            let operator = CustomFamilyJointPsiOperator::new(
+                total,
+                vec![
+                    CustomFamilyJointDesignChannel::new(0..pt, shared_dense_arc(x_t), dir_a.x_t_psi),
+                    CustomFamilyJointDesignChannel::new(pt..pt + pls, shared_dense_arc(x_ls), dir_a.x_ls_psi),
+                    CustomFamilyJointDesignChannel::new(pt + pls..total, Arc::clone(&basis_arc), None),
+                    CustomFamilyJointDesignChannel::new(pt + pls..total, Arc::clone(&basis_d1_arc), None),
+                    CustomFamilyJointDesignChannel::new(pt + pls..total, Arc::clone(&basis_d2_arc), None),
+                ],
+                vec![
+                    CustomFamilyJointDesignPairContribution::new(0, 0, coeff_tt_w.clone(), coeff_tt_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 1, coeff_tl_w.clone(), coeff_tl_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 0, coeff_tl_w.clone(), coeff_tl_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 1, coeff_ll_w.clone(), coeff_ll_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 2, coeff_tw_b_w.clone(), coeff_tw_b_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(2, 0, coeff_tw_b_w.clone(), coeff_tw_b_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 3, coeff_tw_d1_w.clone(), coeff_tw_d1_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(3, 0, coeff_tw_d1_w.clone(), coeff_tw_d1_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(0, 4, zeros.clone(), coeff_tw_d2_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(4, 0, zeros.clone(), coeff_tw_d2_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 2, coeff_lw_b_w.clone(), coeff_lw_b_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(2, 1, coeff_lw_b_w.clone(), coeff_lw_b_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 3, coeff_lw_d1_w.clone(), coeff_lw_d1_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(3, 1, coeff_lw_d1_w.clone(), coeff_lw_d1_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(1, 4, zeros.clone(), coeff_lw_d2_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(4, 1, zeros.clone(), coeff_lw_d2_d.clone()),
+                    CustomFamilyJointDesignPairContribution::new(2, 2, zeros.clone(), coeff_ww_bb.clone()),
+                    CustomFamilyJointDesignPairContribution::new(3, 2, zeros.clone(), coeff_ww_db.clone()),
+                    CustomFamilyJointDesignPairContribution::new(2, 3, zeros, coeff_ww_db.clone()),
+                ],
+            );
+            return Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+                objective_psi,
+                score_psi,
+                hessian_psi: Array2::zeros((0, 0)),
+                hessian_psi_operator: Some(Box::new(operator)),
+            }));
+        }
+
+        let dir_a =
+            dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+        let h_tt_block = xt_diag_y_dense(&dir_a.x_t_psi, &coeff_tt_w, x_t)?
+            + &xt_diag_y_dense(x_t, &coeff_tt_w, &dir_a.x_t_psi)?
+            + &xt_diag_x_dense(x_t, &coeff_tt_d)?;
+        let h_tl_block = xt_diag_y_dense(&dir_a.x_t_psi, &coeff_tl_w, x_ls)?
+            + &xt_diag_y_dense(x_t, &coeff_tl_w, &dir_a.x_ls_psi)?
+            + &xt_diag_y_dense(x_t, &coeff_tl_d, x_ls)?;
+        let h_ll_block = xt_diag_y_dense(&dir_a.x_ls_psi, &coeff_ll_w, x_ls)?
+            + &xt_diag_y_dense(x_ls, &coeff_ll_w, &dir_a.x_ls_psi)?
+            + &xt_diag_x_dense(x_ls, &coeff_ll_d)?;
+        let h_tw = xt_diag_y_dense(&dir_a.x_t_psi, &coeff_tw_b_w, &b0)?
+            + &xt_diag_y_dense(x_t, &coeff_tw_b_d, &b0)?
+            + &xt_diag_y_dense(&dir_a.x_t_psi, &coeff_tw_d1_w, &d0)?
+            + &xt_diag_y_dense(x_t, &coeff_tw_d1_d, &d0)?
+            + &xt_diag_y_dense(x_t, &coeff_tw_d2_d, &dd0)?;
+        let h_lw = xt_diag_y_dense(&dir_a.x_ls_psi, &coeff_lw_b_w, &b0)?
+            + &xt_diag_y_dense(x_ls, &coeff_lw_b_d, &b0)?
+            + &xt_diag_y_dense(&dir_a.x_ls_psi, &coeff_lw_d1_w, &d0)?
+            + &xt_diag_y_dense(x_ls, &coeff_lw_d1_d, &d0)?
+            + &xt_diag_y_dense(x_ls, &coeff_lw_d2_d, &dd0)?;
+        let a_ww = xt_diag_y_dense(&d0, &coeff_ww_db, &b0)?;
+        let h_ww = xt_diag_x_dense(&b0, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+
+        let mut hessian_psi = Array2::<f64>::zeros((total, total));
+        hessian_psi.slice_mut(s![0..pt, 0..pt]).assign(&h_tt_block);
+        hessian_psi
+            .slice_mut(s![0..pt, pt..pt + pls])
+            .assign(&h_tl_block);
+        hessian_psi
+            .slice_mut(s![pt..pt + pls, pt..pt + pls])
+            .assign(&h_ll_block);
+        hessian_psi
+            .slice_mut(s![0..pt, pt + pls..total])
+            .assign(&h_tw);
+        hessian_psi
+            .slice_mut(s![pt..pt + pls, pt + pls..total])
+            .assign(&h_lw);
+        hessian_psi
+            .slice_mut(s![pt + pls..total, pt + pls..total])
+            .assign(&h_ww);
+        mirror_upper_to_lower(&mut hessian_psi);
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,

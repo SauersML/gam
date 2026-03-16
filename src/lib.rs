@@ -18,10 +18,12 @@ pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;
 pub use families::gamlss;
+pub use families::prevalence_slope;
 pub use families::survival;
 pub use families::survival_location_scale;
 pub use solver::workflow::{
     BinomialLocationScaleFitRequest, FitRequest, FitResult, GaussianLocationScaleFitRequest,
-    LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
+    LinkWiggleConfig, PrevalenceSlopeFitRequest, PrevalenceSlopeFitResult,
+    StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult, fit_model,
 };

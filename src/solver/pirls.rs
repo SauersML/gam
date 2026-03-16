@@ -1407,12 +1407,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         match &self.link_kind {
             InverseLink::Mixture(_) => {
                 if let Some(integ) = integrated {
-                    update_glmvectors_integrated_by_family(
+                    update_glmvectors_integrated_for_link(
                         integ.quadctx,
                         self.y,
                         &self.workspace.eta_buf,
                         integ.se,
-                        self.likelihood,
+                        &self.link_kind,
                         self.priorweights,
                         &mut self.lastmu,
                         &mut self.lastweights,
@@ -1424,8 +1424,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             d2mu_deta2: &mut self.last_d2mu_deta2,
                             d3mu_deta3: &mut self.last_d3mu_deta3,
                         }),
-                        integ.mixture_link_state,
-                        integ.sas_link_state,
                     )?;
                 } else {
                     update_glmvectors(
@@ -1448,12 +1446,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             }
             InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
                 if let Some(integ) = integrated {
-                    update_glmvectors_integrated_by_family(
+                    update_glmvectors_integrated_for_link(
                         integ.quadctx,
                         self.y,
                         &self.workspace.eta_buf,
                         integ.se,
-                        self.likelihood,
+                        &self.link_kind,
                         self.priorweights,
                         &mut self.lastmu,
                         &mut self.lastweights,
@@ -1465,8 +1463,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             d2mu_deta2: &mut self.last_d2mu_deta2,
                             d3mu_deta3: &mut self.last_d3mu_deta3,
                         }),
-                        None,
-                        self.link_kind.sas_state(),
                     )?;
                 } else {
                     update_glmvectors(
@@ -5178,7 +5174,54 @@ pub fn update_glmvectors_by_family(
     family.irls_update(y, eta, priorweights, mu, weights, z, None, None)
 }
 
-/// Updates GLM working vectors using integrated (uncertainty-aware) likelihood.
+fn integrated_inverse_link_from_family(
+    family: GlmLikelihoodFamily,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> Result<InverseLink, EstimationError> {
+    match family {
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog => {
+            Ok(InverseLink::Standard(family.link_function()))
+        }
+        GlmLikelihoodFamily::BinomialSas => {
+            let state = sas_link_state.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Integrated BinomialSas update requires explicit SasLinkState".to_string(),
+                )
+            })?;
+            Ok(InverseLink::Sas(*state))
+        }
+        GlmLikelihoodFamily::BinomialBetaLogistic => {
+            let state = sas_link_state.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Integrated BinomialBetaLogistic update requires explicit SasLinkState"
+                        .to_string(),
+                )
+            })?;
+            Ok(InverseLink::BetaLogistic(*state))
+        }
+        GlmLikelihoodFamily::BinomialMixture => {
+            let state = mixture_link_state.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Integrated BinomialMixture update requires explicit MixtureLinkState"
+                        .to_string(),
+                )
+            })?;
+            Ok(InverseLink::Mixture(state.clone()))
+        }
+        GlmLikelihoodFamily::GaussianIdentity
+        | GlmLikelihoodFamily::PoissonLog
+        | GlmLikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
+            "Integrated link-runtime update is not supported for family {:?}",
+            family
+        ))),
+    }
+}
+
+/// Updates Bernoulli-family GLM working vectors using an integrated
+/// (uncertainty-aware) inverse-link runtime.
 ///
 /// For the calibrator, we model:
 ///   μᵢ = E[σ(ηᵢ + ε)] where ε ~ N(0, SEᵢ²)
@@ -5227,9 +5270,88 @@ pub fn update_glmvectors_by_family(
 ///   exact non-GHQ representations (Gamma / erfc / asymptotic series), which
 ///   is also relevant to survival transforms of the form exp(-exp(eta)).
 ///
+/// This is the canonical integrated PIRLS update for binomial-style inverse
+/// links. The runtime `InverseLink` carries the exact link state, so callers do
+/// not have to thread `family + optional SAS/Mixture state` separately. Family
+///-level integrated updates should reconstruct an `InverseLink` and delegate
+/// here.
+#[inline]
+pub fn update_glmvectors_integrated_for_link(
+    quadctx: &crate::quadrature::QuadratureContext,
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    se: ArrayView1<f64>,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) -> Result<(), EstimationError> {
+    let link = inverse_link.link_function();
+    if !matches!(
+        inverse_link,
+        InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
+    ) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Integrated link-runtime update is not supported for inverse link {:?}",
+            inverse_link
+        )));
+    }
+    let n = eta.len();
+    let zero_on_nonsmooth = matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
+    let mut derivatives = derivatives;
+    for i in 0..n {
+        let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
+            quadctx,
+            link,
+            eta[i],
+            se[i],
+            inverse_link.mixture_state(),
+            inverse_link.sas_state(),
+        )?;
+        let local_jet = MixtureInverseLinkJet {
+            mu: jet.mean,
+            d1: jet.d1,
+            d2: jet.d2,
+            d3: jet.d3,
+        };
+        let e = eta[i].clamp(-700.0, 700.0);
+        let geom = bernoulli_geometry_from_jet(
+            eta[i],
+            e,
+            y[i],
+            priorweights[i],
+            local_jet,
+            false,
+            zero_on_nonsmooth,
+        );
+        mu[i] = geom.mu;
+        weights[i] = geom.weight;
+        z[i] = geom.z;
+        if let Some(derivs) = derivatives.as_mut() {
+            derivs.c[i] = geom.c;
+            derivs.d[i] = geom.d;
+            derivs.dmu_deta[i] = local_jet.d1;
+            derivs.d2mu_deta2[i] = local_jet.d2;
+            derivs.d3mu_deta3[i] = local_jet.d3;
+        }
+    }
+    Ok(())
+}
+
 /// Family-dispatched integrated GLM vector update helper.
 ///
-/// This is the intended dispatch point for eliminating GHQ link-by-link:
+/// This is the adapter from structural likelihood families onto the canonical
+/// link-runtime implementation above. It keeps existing family-based call sites
+/// working while making the `InverseLink` path authoritative.
+///
+/// This remains the intended dispatch point for eliminating GHQ link-by-link:
 /// - `BinomialProbit` uses the exact Gaussian-probit convolution identity,
 /// - `BinomialLogit` uses the best validated exact/special-function path and
 ///   otherwise falls back,
@@ -5264,61 +5386,20 @@ pub fn update_glmvectors_integrated_by_family(
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<(), EstimationError> {
-    if !matches!(
-        family,
-        GlmLikelihoodFamily::BinomialLogit
-            | GlmLikelihoodFamily::BinomialProbit
-            | GlmLikelihoodFamily::BinomialCLogLog
-            | GlmLikelihoodFamily::BinomialSas
-            | GlmLikelihoodFamily::BinomialBetaLogistic
-            | GlmLikelihoodFamily::BinomialMixture
-    ) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Integrated updates are not supported for family {:?}",
-            family
-        )));
-    }
-    let n = eta.len();
-    let zero_on_nonsmooth =
-        matches!(family, GlmLikelihoodFamily::BinomialLogit) && logit_clampzero_enabled();
-    let mut derivatives = derivatives;
-    for i in 0..n {
-        let moments = crate::quadrature::integrated_family_moments_jetwith_state(
-            quadctx,
-            family.into(),
-            eta[i],
-            se[i],
-            mixture_link_state,
-            sas_link_state,
-        )?;
-        let local_jet = MixtureInverseLinkJet {
-            mu: moments.mean,
-            d1: moments.d1,
-            d2: moments.d2,
-            d3: moments.d3,
-        };
-        let e = eta[i].clamp(-700.0, 700.0);
-        let geom = bernoulli_geometry_from_jet(
-            eta[i],
-            e,
-            y[i],
-            priorweights[i],
-            local_jet,
-            false,
-            zero_on_nonsmooth,
-        );
-        mu[i] = geom.mu;
-        weights[i] = geom.weight;
-        z[i] = geom.z;
-        if let Some(derivs) = derivatives.as_mut() {
-            derivs.c[i] = geom.c;
-            derivs.d[i] = geom.d;
-            derivs.dmu_deta[i] = local_jet.d1;
-            derivs.d2mu_deta2[i] = local_jet.d2;
-            derivs.d3mu_deta3[i] = local_jet.d3;
-        }
-    }
-    Ok(())
+    let inverse_link =
+        integrated_inverse_link_from_family(family, mixture_link_state, sas_link_state)?;
+    update_glmvectors_integrated_for_link(
+        quadctx,
+        y,
+        eta,
+        se,
+        &inverse_link,
+        priorweights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    )
 }
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
