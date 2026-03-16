@@ -5427,17 +5427,25 @@ impl CustomFamily for GaussianLocationScaleFamily {
             eta_log_sigma.as_slice_memory_order(),
         ) {
             for i in 0..n {
+                let wi = w_s[i];
+                if wi == 0.0 {
+                    continue;
+                }
                 let sigma_i = safe_exp(ls_s[i]).max(1e-12);
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let r = y_s[i] - mu_s[i];
-                ll += w_s[i] * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
+                ll += wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
             }
         } else {
             for i in 0..n {
+                let wi = self.weights[i];
+                if wi == 0.0 {
+                    continue;
+                }
                 let sigma_i = safe_exp(eta_log_sigma[i]).max(1e-12);
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let r = self.y[i] - etamu[i];
-                ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
+                ll += wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
             }
         }
         Ok(ll)
