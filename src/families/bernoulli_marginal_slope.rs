@@ -748,6 +748,12 @@ struct BernoulliMarginalSlopeRowExactContext {
 }
 
 #[derive(Clone)]
+struct BernoulliMarginalSlopeRowPrimaryBase {
+    gradient: Array1<f64>,
+    hessian: Array2<f64>,
+}
+
+#[derive(Clone)]
 struct BernoulliMarginalSlopeExactEvalCache {
     slices: BlockSlices,
     primary: PrimarySlices,
@@ -755,6 +761,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     h_node_design: Option<Array2<f64>>,
     score_warp_obs: Option<(Array2<f64>, Array1<f64>)>,
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
+    row_primary_base: Vec<BernoulliMarginalSlopeRowPrimaryBase>,
 }
 
 struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
@@ -933,6 +940,23 @@ impl BernoulliMarginalSlopeFamily {
                 self.build_row_exact_context(row, block_states, &h_nodes, score_warp_obs.as_ref())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let row_primary_base = (0..self.y.len())
+            .map(|row| {
+                self.compute_row_primary_gradient_hessian_uncached(
+                    row,
+                    block_states,
+                    &primary,
+                    &row_contexts[row],
+                    &h_nodes,
+                    h_node_design.as_ref(),
+                    score_warp_obs.as_ref(),
+                )
+                .map(|(gradient, hessian)| BernoulliMarginalSlopeRowPrimaryBase {
+                    gradient,
+                    hessian,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -940,6 +964,7 @@ impl BernoulliMarginalSlopeFamily {
             h_node_design,
             score_warp_obs,
             row_contexts,
+            row_primary_base,
         })
     }
 
@@ -1407,11 +1432,27 @@ impl BernoulliMarginalSlopeFamily {
     fn row_primary_gradient_hessian(
         &self,
         row: usize,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<(Array1<f64>, Array2<f64>), String> {
-        let primary = &cache.primary;
-        let row_ctx = &cache.row_contexts[row];
+        let Some(base) = cache.row_primary_base.get(row) else {
+            return Err(format!(
+                "bernoulli marginal-slope row base cache missing row {row}"
+            ));
+        };
+        Ok((base.gradient.clone(), base.hessian.clone()))
+    }
+
+    fn compute_row_primary_gradient_hessian_uncached(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        h_nodes: &Array1<f64>,
+        h_node_design: Option<&Array2<f64>>,
+        score_warp_obs: Option<&(Array2<f64>, Array1<f64>)>,
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
         let mut grad = Array1::<f64>::zeros(primary.total);
         let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
         for a in 0..primary.total {
@@ -1422,9 +1463,9 @@ impl BernoulliMarginalSlopeFamily {
                 primary,
                 &[da.clone()],
                 row_ctx,
-                &cache.h_nodes,
-                cache.h_node_design.as_ref(),
-                cache.score_warp_obs.as_ref(),
+                h_nodes,
+                h_node_design,
+                score_warp_obs,
             )?;
             for b in a..primary.total {
                 let db = unit_primary_direction(primary, b);
@@ -1434,9 +1475,9 @@ impl BernoulliMarginalSlopeFamily {
                     primary,
                     &[da.clone(), db.clone()],
                     row_ctx,
-                    &cache.h_nodes,
-                    cache.h_node_design.as_ref(),
-                    cache.score_warp_obs.as_ref(),
+                    h_nodes,
+                    h_node_design,
+                    score_warp_obs,
                 )?;
                 hess[[a, b]] = value;
                 hess[[b, a]] = value;
@@ -1657,52 +1698,340 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         need_hessian: bool,
     ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-        let slices = block_slices(block_states);
-        let primary = primary_slices(&slices);
+        let cache = self.build_exact_eval_cache(block_states)?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
         let n = self.y.len();
         let mut gradient = Array1::<f64>::zeros(slices.total);
         let mut hessian = need_hessian.then(|| Array2::<f64>::zeros((slices.total, slices.total)));
-        let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
-        let beta_w = if slices.w.is_some() {
-            Some(&block_states[block_states.len() - 1].beta)
-        } else {
-            None
-        };
         let mut ll = 0.0;
         for i in 0..n {
             let row_neglog = self.row_neglog_directional_from_primary(
                 i,
                 block_states,
-                &primary,
+                primary,
                 &[],
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
+                &cache.row_contexts[i],
+                &cache.h_nodes,
+                cache.h_node_design.as_ref(),
+                cache.score_warp_obs.as_ref(),
             )?;
             ll -= row_neglog;
 
-            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(
-                i,
-                block_states,
-                &primary,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            gradient -= &self.pullback_primary_vector(i, &slices, &primary, &f_pi);
+            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(i, block_states, &cache)?;
+            gradient -= &self.pullback_primary_vector(i, slices, primary, &f_pi);
             if let Some(ref mut hmat) = hessian {
-                self.add_pullback_primary_hessian(hmat, i, &slices, &primary, &f_pipi);
+                self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
             }
         }
         Ok((ll, gradient, hessian))
+    }
+
+    fn exact_newton_joint_psi_terms_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let Some((block_idx, _)) =
+            self.embedded_psi_vector(0, slices, derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let idx_primary = if block_idx == 0 { 0 } else { 1 };
+        let mut objective_psi = 0.0;
+        let mut score_psi = Array1::<f64>::zeros(slices.total);
+        let mut hessian_psi = Array2::<f64>::zeros((slices.total, slices.total));
+        for row in 0..self.y.len() {
+            let Some(dir) = self.row_primary_psi_direction(
+                row,
+                block_states,
+                derivative_blocks,
+                psi_index,
+                primary,
+            )?
+            else {
+                continue;
+            };
+            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(row, block_states, cache)?;
+            let third = self.row_primary_third_contracted(row, block_states, cache, &dir)?;
+            let (_, left_vec) = self
+                .embedded_psi_vector(row, slices, derivative_blocks, psi_index)?
+                .ok_or_else(|| "missing bernoulli marginal-slope psi vector".to_string())?;
+            objective_psi += f_pi.dot(&dir);
+            score_psi += &(left_vec.clone() * f_pi[idx_primary]);
+            score_psi += &self.pullback_primary_vector(row, slices, primary, &f_pipi.dot(&dir));
+
+            let right_vec = self.pullback_primary_vector(
+                row,
+                slices,
+                primary,
+                &f_pipi.row(idx_primary).to_owned(),
+            );
+            hessian_psi += &left_vec
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&right_vec.view().insert_axis(Axis(0)));
+            hessian_psi += &right_vec
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&left_vec.view().insert_axis(Axis(0)));
+            self.add_pullback_primary_hessian(&mut hessian_psi, row, slices, primary, &third);
+        }
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi,
+            hessian_psi_operator: None,
+        }))
+    }
+
+    fn exact_newton_joint_psisecond_order_terms_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let Some((block_i, _)) = self.embedded_psi_vector(0, slices, derivative_blocks, psi_i)?
+        else {
+            return Ok(None);
+        };
+        let Some((block_j, _)) = self.embedded_psi_vector(0, slices, derivative_blocks, psi_j)?
+        else {
+            return Ok(None);
+        };
+        let idx_i = if block_i == 0 { 0 } else { 1 };
+        let idx_j = if block_j == 0 { 0 } else { 1 };
+        let mut objective_psi_psi = 0.0;
+        let mut score_psi_psi = Array1::<f64>::zeros(slices.total);
+        let mut hessian_psi_psi = Array2::<f64>::zeros((slices.total, slices.total));
+        for row in 0..self.y.len() {
+            let Some(dir_i) = self.row_primary_psi_direction(
+                row,
+                block_states,
+                derivative_blocks,
+                psi_i,
+                primary,
+            )?
+            else {
+                continue;
+            };
+            let Some(dir_j) = self.row_primary_psi_direction(
+                row,
+                block_states,
+                derivative_blocks,
+                psi_j,
+                primary,
+            )?
+            else {
+                continue;
+            };
+            let dir_ij = self
+                .row_primary_psi_second_direction(
+                    row,
+                    block_states,
+                    derivative_blocks,
+                    psi_i,
+                    psi_j,
+                    primary,
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(row, block_states, cache)?;
+            let third_i = self.row_primary_third_contracted(row, block_states, cache, &dir_i)?;
+            let third_j = self.row_primary_third_contracted(row, block_states, cache, &dir_j)?;
+            let fourth =
+                self.row_primary_fourth_contracted(row, block_states, cache, &dir_i, &dir_j)?;
+            let (_, left_i) = self
+                .embedded_psi_vector(row, slices, derivative_blocks, psi_i)?
+                .ok_or_else(|| "missing bernoulli marginal-slope psi_i vector".to_string())?;
+            let (_, left_j) = self
+                .embedded_psi_vector(row, slices, derivative_blocks, psi_j)?
+                .ok_or_else(|| "missing bernoulli marginal-slope psi_j vector".to_string())?;
+            let left_ij = self
+                .embedded_psi_second_vector(row, slices, derivative_blocks, psi_i, psi_j)?
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
+
+            objective_psi_psi += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
+            if left_ij.iter().any(|v| v.abs() > 0.0) {
+                let idx_ij = if left_ij
+                    .slice(s![slices.marginal.clone()])
+                    .iter()
+                    .any(|v| v.abs() > 0.0)
+                {
+                    0
+                } else {
+                    1
+                };
+                score_psi_psi += &(left_ij.clone() * f_pi[idx_ij]);
+            }
+            score_psi_psi += &(left_i.clone() * f_pipi.row(idx_i).dot(&dir_j));
+            score_psi_psi += &(left_j.clone() * f_pipi.row(idx_j).dot(&dir_i));
+            score_psi_psi +=
+                &self.pullback_primary_vector(row, slices, primary, &f_pipi.dot(&dir_ij));
+            score_psi_psi +=
+                &self.pullback_primary_vector(row, slices, primary, &third_i.dot(&dir_j));
+
+            if left_ij.iter().any(|v| v.abs() > 0.0) {
+                let idx_ij = if left_ij
+                    .slice(s![slices.marginal.clone()])
+                    .iter()
+                    .any(|v| v.abs() > 0.0)
+                {
+                    0
+                } else {
+                    1
+                };
+                let right_ij = self.pullback_primary_vector(
+                    row,
+                    slices,
+                    primary,
+                    &f_pipi.row(idx_ij).to_owned(),
+                );
+                hessian_psi_psi += &left_ij
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&right_ij.view().insert_axis(Axis(0)));
+                hessian_psi_psi += &right_ij
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&left_ij.view().insert_axis(Axis(0)));
+            }
+
+            let scalar_ij = f_pipi[[idx_i, idx_j]];
+            hessian_psi_psi += &(left_i
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&left_j.view().insert_axis(Axis(0)))
+                * scalar_ij);
+            hessian_psi_psi += &(left_j
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&left_i.view().insert_axis(Axis(0)))
+                * scalar_ij);
+
+            let right_i =
+                self.pullback_primary_vector(row, slices, primary, &third_j.row(idx_i).to_owned());
+            hessian_psi_psi += &left_i
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&right_i.view().insert_axis(Axis(0)));
+            hessian_psi_psi += &right_i
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&left_i.view().insert_axis(Axis(0)));
+
+            let right_j =
+                self.pullback_primary_vector(row, slices, primary, &third_i.row(idx_j).to_owned());
+            hessian_psi_psi += &left_j
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&right_j.view().insert_axis(Axis(0)));
+            hessian_psi_psi += &right_j
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&left_j.view().insert_axis(Axis(0)));
+
+            self.add_pullback_primary_hessian(&mut hessian_psi_psi, row, slices, primary, &fourth);
+            let third_ij = self.row_primary_third_contracted(row, block_states, cache, &dir_ij)?;
+            self.add_pullback_primary_hessian(
+                &mut hessian_psi_psi,
+                row,
+                slices,
+                primary,
+                &third_ij,
+            );
+        }
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+        }))
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let Some((block_idx, _)) =
+            self.embedded_psi_vector(0, slices, derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let idx_primary = if block_idx == 0 { 0 } else { 1 };
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row in 0..self.y.len() {
+            let row_dir =
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
+            let Some(psi_dir) = self.row_primary_psi_direction(
+                row,
+                block_states,
+                derivative_blocks,
+                psi_index,
+                primary,
+            )?
+            else {
+                continue;
+            };
+            let psi_action = self
+                .row_primary_psi_action_on_direction(
+                    row,
+                    slices,
+                    derivative_blocks,
+                    psi_index,
+                    d_beta_flat,
+                    primary,
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+            let third_beta =
+                self.row_primary_third_contracted(row, block_states, cache, &row_dir)?;
+            let fourth =
+                self.row_primary_fourth_contracted(row, block_states, cache, &row_dir, &psi_dir)?;
+            let (_, left_vec) = self
+                .embedded_psi_vector(row, slices, derivative_blocks, psi_index)?
+                .ok_or_else(|| "missing bernoulli marginal-slope psi vector".to_string())?;
+            let right_vec = self.pullback_primary_vector(
+                row,
+                slices,
+                primary,
+                &third_beta.row(idx_primary).to_owned(),
+            );
+            out += &left_vec
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&right_vec.view().insert_axis(Axis(0)));
+            out += &right_vec
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&left_vec.view().insert_axis(Axis(0)));
+            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &fourth);
+            let third_action =
+                self.row_primary_third_contracted(row, block_states, cache, &psi_action)?;
+            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &third_action);
+        }
+        Ok(Some(out))
     }
 }
 
 impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         true
     }
 
@@ -1772,29 +2101,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(block_states);
-        let primary = primary_slices(&slices);
-        let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
-        let beta_w = slices
-            .w
-            .as_ref()
-            .map(|_| &block_states[block_states.len() - 1].beta);
+        let cache = self.build_exact_eval_cache(block_states)?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
         let mut out = Array2::<f64>::zeros((slices.total, slices.total));
         for row in 0..self.y.len() {
             let row_dir =
-                self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
-            let third = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &row_dir,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            self.add_pullback_primary_hessian(&mut out, row, &slices, &primary, &third);
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
+            let third = self.row_primary_third_contracted(row, block_states, &cache, &row_dir)?;
+            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &third);
         }
         Ok(Some(out))
     }
@@ -1805,32 +2120,18 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(block_states);
-        let primary = primary_slices(&slices);
-        let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
-        let beta_w = slices
-            .w
-            .as_ref()
-            .map(|_| &block_states[block_states.len() - 1].beta);
+        let cache = self.build_exact_eval_cache(block_states)?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
         let mut out = Array2::<f64>::zeros((slices.total, slices.total));
         for row in 0..self.y.len() {
             let row_u =
-                self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_u_flat)?;
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
             let row_v =
-                self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_v_flat)?;
-            let fourth = self.row_primary_fourth_contracted(
-                row,
-                block_states,
-                &primary,
-                &row_u,
-                &row_v,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            self.add_pullback_primary_hessian(&mut out, row, &slices, &primary, &fourth);
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
+            let fourth =
+                self.row_primary_fourth_contracted(row, block_states, &cache, &row_u, &row_v)?;
+            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &fourth);
         }
         Ok(Some(out))
     }
@@ -1842,82 +2143,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let slices = block_slices(block_states);
-        let primary = primary_slices(&slices);
-        let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
-        let beta_w = slices
-            .w
-            .as_ref()
-            .map(|_| &block_states[block_states.len() - 1].beta);
-        let Some((block_idx, _)) =
-            self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
-        else {
-            return Ok(None);
-        };
-        let idx_primary = if block_idx == 0 { 0 } else { 1 };
-        let mut objective_psi = 0.0;
-        let mut score_psi = Array1::<f64>::zeros(slices.total);
-        let mut hessian_psi = Array2::<f64>::zeros((slices.total, slices.total));
-        for row in 0..self.y.len() {
-            let Some(dir) = self.row_primary_psi_direction(
-                row,
-                block_states,
-                derivative_blocks,
-                psi_index,
-                &primary,
-            )?
-            else {
-                continue;
-            };
-            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(
-                row,
-                block_states,
-                &primary,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let third = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &dir,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let (_, left_vec) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_index)?
-                .ok_or_else(|| "missing bernoulli marginal-slope psi vector".to_string())?;
-            objective_psi += f_pi.dot(&dir);
-            score_psi += &(left_vec.clone() * f_pi[idx_primary]);
-            score_psi += &self.pullback_primary_vector(row, &slices, &primary, &f_pipi.dot(&dir));
-
-            let right_vec = self.pullback_primary_vector(
-                row,
-                &slices,
-                &primary,
-                &f_pipi.row(idx_primary).to_owned(),
-            );
-            hessian_psi += &left_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_vec.view().insert_axis(Axis(0)));
-            hessian_psi += &right_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_vec.view().insert_axis(Axis(0)));
-            self.add_pullback_primary_hessian(&mut hessian_psi, row, &slices, &primary, &third);
-        }
-        Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi,
-            score_psi,
-            hessian_psi,
-            hessian_psi_operator: None,
-        }))
+        let cache = self.build_exact_eval_cache(block_states)?;
+        self.exact_newton_joint_psi_terms_from_cache(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            &cache,
+        )
     }
 
     fn exact_newton_joint_psisecond_order_terms(
@@ -1928,227 +2160,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let slices = block_slices(block_states);
-        let primary = primary_slices(&slices);
-        let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
-        let beta_w = slices
-            .w
-            .as_ref()
-            .map(|_| &block_states[block_states.len() - 1].beta);
-        let Some((block_i, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)?
-        else {
-            return Ok(None);
-        };
-        let Some((block_j, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_j)?
-        else {
-            return Ok(None);
-        };
-        let idx_i = if block_i == 0 { 0 } else { 1 };
-        let idx_j = if block_j == 0 { 0 } else { 1 };
-        let mut objective_psi_psi = 0.0;
-        let mut score_psi_psi = Array1::<f64>::zeros(slices.total);
-        let mut hessian_psi_psi = Array2::<f64>::zeros((slices.total, slices.total));
-        for row in 0..self.y.len() {
-            let Some(dir_i) = self.row_primary_psi_direction(
-                row,
-                block_states,
-                derivative_blocks,
-                psi_i,
-                &primary,
-            )?
-            else {
-                continue;
-            };
-            let Some(dir_j) = self.row_primary_psi_direction(
-                row,
-                block_states,
-                derivative_blocks,
-                psi_j,
-                &primary,
-            )?
-            else {
-                continue;
-            };
-            let dir_ij = self
-                .row_primary_psi_second_direction(
-                    row,
-                    block_states,
-                    derivative_blocks,
-                    psi_i,
-                    psi_j,
-                    &primary,
-                )?
-                .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
-            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(
-                row,
-                block_states,
-                &primary,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let third_i = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &dir_i,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let third_j = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &dir_j,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let fourth = self.row_primary_fourth_contracted(
-                row,
-                block_states,
-                &primary,
-                &dir_i,
-                &dir_j,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let (_, left_i) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_i)?
-                .ok_or_else(|| "missing bernoulli marginal-slope psi_i vector".to_string())?;
-            let (_, left_j) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_j)?
-                .ok_or_else(|| "missing bernoulli marginal-slope psi_j vector".to_string())?;
-            let left_ij = self
-                .embedded_psi_second_vector(row, &slices, derivative_blocks, psi_i, psi_j)?
-                .map(|(_, v)| v)
-                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
-
-            objective_psi_psi += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
-            if left_ij.iter().any(|v| v.abs() > 0.0) {
-                let idx_ij = if left_ij
-                    .slice(s![slices.marginal.clone()])
-                    .iter()
-                    .any(|v| v.abs() > 0.0)
-                {
-                    0
-                } else {
-                    1
-                };
-                score_psi_psi += &(left_ij.clone() * f_pi[idx_ij]);
-            }
-            score_psi_psi += &(left_i.clone() * f_pipi.row(idx_i).dot(&dir_j));
-            score_psi_psi += &(left_j.clone() * f_pipi.row(idx_j).dot(&dir_i));
-            score_psi_psi +=
-                &self.pullback_primary_vector(row, &slices, &primary, &f_pipi.dot(&dir_ij));
-            score_psi_psi +=
-                &self.pullback_primary_vector(row, &slices, &primary, &third_i.dot(&dir_j));
-
-            if left_ij.iter().any(|v| v.abs() > 0.0) {
-                let idx_ij = if left_ij
-                    .slice(s![slices.marginal.clone()])
-                    .iter()
-                    .any(|v| v.abs() > 0.0)
-                {
-                    0
-                } else {
-                    1
-                };
-                let right_ij = self.pullback_primary_vector(
-                    row,
-                    &slices,
-                    &primary,
-                    &f_pipi.row(idx_ij).to_owned(),
-                );
-                hessian_psi_psi += &left_ij
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&right_ij.view().insert_axis(Axis(0)));
-                hessian_psi_psi += &right_ij
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&left_ij.view().insert_axis(Axis(0)));
-            }
-
-            let scalar_ij = f_pipi[[idx_i, idx_j]];
-            hessian_psi_psi += &(left_i
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_j.view().insert_axis(Axis(0)))
-                * scalar_ij);
-            hessian_psi_psi += &(left_j
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_i.view().insert_axis(Axis(0)))
-                * scalar_ij);
-
-            let right_i = self.pullback_primary_vector(
-                row,
-                &slices,
-                &primary,
-                &third_j.row(idx_i).to_owned(),
-            );
-            hessian_psi_psi += &left_i
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_i.view().insert_axis(Axis(0)));
-            hessian_psi_psi += &right_i
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_i.view().insert_axis(Axis(0)));
-
-            let right_j = self.pullback_primary_vector(
-                row,
-                &slices,
-                &primary,
-                &third_i.row(idx_j).to_owned(),
-            );
-            hessian_psi_psi += &left_j
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_j.view().insert_axis(Axis(0)));
-            hessian_psi_psi += &right_j
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_j.view().insert_axis(Axis(0)));
-
-            self.add_pullback_primary_hessian(
-                &mut hessian_psi_psi,
-                row,
-                &slices,
-                &primary,
-                &fourth,
-            );
-            let third_ij = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &dir_ij,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            self.add_pullback_primary_hessian(
-                &mut hessian_psi_psi,
-                row,
-                &slices,
-                &primary,
-                &third_ij,
-            );
-        }
-        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
-            objective_psi_psi,
-            score_psi_psi,
-            hessian_psi_psi,
-        }))
+        let cache = self.build_exact_eval_cache(block_states)?;
+        self.exact_newton_joint_psisecond_order_terms_from_cache(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            &cache,
+        )
     }
 
     fn exact_newton_joint_psihessian_directional_derivative(
@@ -2159,109 +2178,110 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(block_states);
-        let primary = primary_slices(&slices);
-        let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
-        let beta_w = slices
-            .w
-            .as_ref()
-            .map(|_| &block_states[block_states.len() - 1].beta);
-        let Some((block_idx, _)) =
-            self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
-        else {
-            return Ok(None);
-        };
-        let idx_primary = if block_idx == 0 { 0 } else { 1 };
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
-        for row in 0..self.y.len() {
-            let row_dir =
-                self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
-            let Some(psi_dir) = self.row_primary_psi_direction(
-                row,
-                block_states,
-                derivative_blocks,
-                psi_index,
-                &primary,
-            )?
-            else {
-                continue;
-            };
-            let psi_action = self
-                .row_primary_psi_action_on_direction(
-                    row,
-                    &slices,
-                    derivative_blocks,
-                    psi_index,
-                    d_beta_flat,
-                    &primary,
-                )?
-                .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
-            let third_beta = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &row_dir,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let fourth = self.row_primary_fourth_contracted(
-                row,
-                block_states,
-                &primary,
-                &row_dir,
-                &psi_dir,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            let (_, left_vec) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_index)?
-                .ok_or_else(|| "missing bernoulli marginal-slope psi vector".to_string())?;
-            let right_vec = self.pullback_primary_vector(
-                row,
-                &slices,
-                &primary,
-                &third_beta.row(idx_primary).to_owned(),
-            );
-            out += &left_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_vec.view().insert_axis(Axis(0)));
-            out += &right_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_vec.view().insert_axis(Axis(0)));
-            self.add_pullback_primary_hessian(&mut out, row, &slices, &primary, &fourth);
-            let third_action = self.row_primary_third_contracted(
-                row,
-                block_states,
-                &primary,
-                &psi_action,
-                &h_nodes,
-                h_node_design.as_ref(),
-                score_warp_obs.as_ref(),
-                beta_w,
-            )?;
-            self.add_pullback_primary_hessian(&mut out, row, &slices, &primary, &third_action);
-        }
-        Ok(Some(out))
+        let cache = self.build_exact_eval_cache(block_states)?;
+        self.exact_newton_joint_psihessian_directional_derivative_from_cache(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &cache,
+        )
+    }
+
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(Some(Arc::new(
+            BernoulliMarginalSlopeExactNewtonJointPsiWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+                derivative_blocks.to_vec(),
+            )?,
+        )))
     }
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        Ok(match block_idx {
-            2 => self.score_warp_constraints.clone(),
-            3 => self.link_dev_constraints.clone(),
-            _ => None,
+        let slices = block_slices(block_states);
+        if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
+            return Ok(self.score_warp_constraints.clone());
+        }
+        let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
+        if slices
+            .w
+            .as_ref()
+            .is_some_and(|_| block_idx == link_block_idx)
+        {
+            return Ok(self.link_dev_constraints.clone());
+        }
+        Ok(None)
+    }
+}
+
+impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
+    fn new(
+        family: BernoulliMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+        derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    ) -> Result<Self, String> {
+        let cache = family.build_exact_eval_cache(&block_states)?;
+        Ok(Self {
+            family,
+            block_states,
+            derivative_blocks,
+            cache,
         })
+    }
+}
+
+impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
+    fn first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.family.exact_newton_joint_psi_terms_from_cache(
+            &self.block_states,
+            &self.derivative_blocks,
+            psi_index,
+            &self.cache,
+        )
+    }
+
+    fn second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.family
+            .exact_newton_joint_psisecond_order_terms_from_cache(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_i,
+                psi_j,
+                &self.cache,
+            )
+    }
+
+    fn hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_psihessian_directional_derivative_from_cache(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_index,
+                d_beta_flat,
+                &self.cache,
+            )
     }
 }
 

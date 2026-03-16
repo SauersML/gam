@@ -793,10 +793,11 @@ pub struct HyperCoord {
     pub b_depends_on_beta: bool,
     /// Whether this coordinate is "penalty-like" (τ) vs "design-moving" (ψ).
     ///
-    /// Penalty-like coordinates (τ) have `b_mat = ∂H/∂τ` that is PSD because
-    /// it derives from penalty matrix derivatives (similar to ρ coordinates).
-    /// Design-moving coordinates (ψ) have `b_mat` that contains design-motion
-    /// and likelihood-curvature terms and need not be PSD or even sign-definite.
+    /// Penalty-like coordinates (τ) have Hessian drifts derived from penalty
+    /// matrix derivatives (similar to ρ coordinates), so they are PSD.
+    /// Design-moving coordinates (ψ) have Hessian drifts that contain
+    /// design-motion and likelihood-curvature terms and need not be PSD or even
+    /// sign-definite.
     ///
     /// This flag controls eligibility for EFS (Fellner-Schall) updates.
     /// See [`compute_efs_update`] for details.
@@ -1796,7 +1797,10 @@ pub fn reml_laml_evaluate(
     // all k + ext_dim coordinates.
     let stochastic_trace_values: Option<Vec<f64>> = if use_stochastic_traces {
         // Check if any ext coordinate uses implicit operators.
-        let any_operator = solution.ext_coords.iter().any(|c| c.b_operator.is_some());
+        let any_operator = solution
+            .ext_coords
+            .iter()
+            .any(|c| c.drift.uses_operator_fast_path());
 
         if any_operator {
             let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
@@ -1823,15 +1827,19 @@ pub fn reml_laml_evaluate(
             let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
             let mut implicit_ops: Vec<&ImplicitHyperOperator> = Vec::new();
             for coord in solution.ext_coords.iter() {
-                if let Some(ref op) = coord.b_operator {
+                if let Some(op) = coord
+                    .drift
+                    .operator_ref()
+                    .filter(|_| coord.drift.uses_operator_fast_path())
+                {
                     ext_has_operator.push(true);
                     if let Some(imp) = op.as_implicit() {
                         implicit_ops.push(imp);
                     }
-                    generic_ops.push(op.as_ref());
+                    generic_ops.push(op);
                 } else {
                     ext_has_operator.push(false);
-                    let mut h_i = coord.b_mat.clone();
+                    let mut h_i = coord.drift.materialize();
                     if effective_deriv.has_corrections() {
                         let v_i = hop.solve(&coord.g);
                         if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
@@ -1905,7 +1913,7 @@ pub fn reml_laml_evaluate(
 
             // ext-coordinates: dH_i = B_i + correction(v_i)
             for coord in solution.ext_coords.iter() {
-                let mut h_i = coord.b_mat.clone();
+                let mut h_i = coord.drift.materialize();
                 if effective_deriv.has_corrections() {
                     let v_i = hop.solve(&coord.g);
                     if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
@@ -2008,10 +2016,15 @@ pub fn reml_laml_evaluate(
             } else {
                 None
             };
-            if let Some(ref op) = coord.b_operator {
-                0.5 * hop.trace_logdet_h_k_operator(op.as_ref(), correction.as_ref())
+            if let Some(op) = coord
+                .drift
+                .operator_ref()
+                .filter(|_| coord.drift.uses_operator_fast_path())
+            {
+                0.5 * hop.trace_logdet_h_k_operator(op, correction.as_ref())
             } else {
-                0.5 * hop.trace_logdet_h_k(&coord.b_mat, correction.as_ref())
+                let h_i = coord.drift.materialize();
+                0.5 * hop.trace_logdet_h_k(&h_i, correction.as_ref())
             }
         };
 
@@ -2396,10 +2409,11 @@ fn compute_outer_hessian(
     // Check if any ext coordinate uses implicit operators and if the problem
     // is large enough to warrant stochastic cross-traces instead of
     // materializing p x p Hessian drift matrices.
-    let any_ext_implicit = solution
-        .ext_coords
-        .iter()
-        .any(|c| c.b_operator.as_ref().map_or(false, |op| op.is_implicit()));
+    let any_ext_implicit = solution.ext_coords.iter().any(|c| {
+        c.drift.operator_ref().map_or(false, |op| {
+            c.drift.uses_operator_fast_path() && op.is_implicit()
+        })
+    });
     let total_p = hop.dim();
     // Stochastic cross-traces are only used when:
     // (1) implicit operators are present
@@ -2420,31 +2434,30 @@ fn compute_outer_hessian(
 
     // Precompute ext mode responses and total Hessian drifts.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
-    let mut ext_h_matrices: Vec<Array2<f64>> = Vec::with_capacity(ext_dim);
+    let mut ext_h_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_dim);
 
     for coord in solution.ext_coords.iter() {
         let v_i = hop.solve(&coord.g);
 
         if use_stochastic_cross_traces {
-            if let Some(ref op) = coord.b_operator {
+            if let Some(op) = coord
+                .drift
+                .operator_ref()
+                .filter(|_| coord.drift.uses_operator_fast_path())
+            {
                 if op.is_implicit() {
                     // Skip dense materialization: stochastic cross-traces
                     // will use the implicit operator directly.
                     ext_v.push(v_i);
-                    ext_h_matrices.push(Array2::zeros((0, 0)));
+                    ext_h_matrices.push(None);
                     continue;
                 }
             }
         }
 
-        // Materialize the Hessian drift matrix. When an implicit operator is
-        // present and b_mat is a zero-sized placeholder, fall back to dense
-        // materialization through the operator.
-        let mut h_i = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
-            coord.b_operator.as_ref().unwrap().to_dense()
-        } else {
-            coord.b_mat.clone()
-        };
+        // Materialize the full Hessian drift when we are not staying on the
+        // operator-only fast path.
+        let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
             if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
                 h_i += &corr;
@@ -2452,7 +2465,7 @@ fn compute_outer_hessian(
         }
 
         ext_v.push(v_i);
-        ext_h_matrices.push(h_i);
+        ext_h_matrices.push(Some(h_i));
     }
 
     // ── Stochastic second-order cross-trace precomputation ──
@@ -2484,15 +2497,24 @@ fn compute_outer_hessian(
 
         // ext coordinates: dense or operator-backed.
         for (ei, coord) in solution.ext_coords.iter().enumerate() {
-            if let Some(ref op) = coord.b_operator {
+            if let Some(op) = coord
+                .drift
+                .operator_ref()
+                .filter(|_| coord.drift.uses_operator_fast_path())
+            {
                 coord_has_operator.push(true);
                 if let Some(imp) = op.as_implicit() {
                     impl_ops.push(imp);
                 }
-                generic_ops.push(op.as_ref());
+                generic_ops.push(op);
                 continue;
             }
-            dense_mats.push(ext_h_matrices[ei].clone());
+            dense_mats.push(
+                ext_h_matrices[ei]
+                    .as_ref()
+                    .expect("dense ext Hessian drift should be materialized")
+                    .clone(),
+            );
             coord_has_operator.push(false);
         }
 
@@ -2684,7 +2706,9 @@ fn compute_outer_hessian(
                     } else {
                         hop.trace_logdet_hessian_cross(
                             &h_k_matrices[rho_idx],
-                            &ext_h_matrices[ext_idx],
+                            ext_h_matrices[ext_idx]
+                                .as_ref()
+                                .expect("dense ext Hessian drift should be materialized"),
                         )
                     };
 
@@ -2692,19 +2716,13 @@ fn compute_outer_hessian(
                     //           = H⁻¹(−g_{ρ,ext} + A_ρ v_ext + Ḣ_ext v_ρ)
                     // where Ḣ_ext = B_ext + C[β_ext] already encodes the −C[v_ext] v_ρ.
                     //
-                    // When using stochastic cross-traces, ext_h_matrices[ext_idx]
-                    // may be a zero-sized placeholder. Use the implicit operator
-                    // for the matvec when needed.
-                    let ext_h_v_rho = if ext_h_matrices[ext_idx].nrows() == 0 {
-                        // Implicit operator path.
-                        let coord = &solution.ext_coords[ext_idx];
-                        if let Some(ref op) = coord.b_operator {
-                            op.mul_vec(&v_ks[rho_idx])
-                        } else {
-                            coord.b_mat.dot(&v_ks[rho_idx])
-                        }
+                    // When using stochastic cross-traces, operator-only
+                    // coordinates do not materialize a dense Hessian drift, so
+                    // the drift object handles the matvec directly.
+                    let ext_h_v_rho = if let Some(h_i) = ext_h_matrices[ext_idx].as_ref() {
+                        h_i.dot(&v_ks[rho_idx])
                     } else {
-                        ext_h_matrices[ext_idx].dot(&v_ks[rho_idx])
+                        solution.ext_coords[ext_idx].drift.apply(&v_ks[rho_idx])
                     };
                     let mut rhs = ext_h_v_rho;
                     rhs += &a_k_matrices[rho_idx].dot(&ext_v[ext_idx]);
@@ -2794,28 +2812,26 @@ fn compute_outer_hessian(
                     let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
                         -sct[[k + ii, k + jj]]
                     } else {
-                        hop.trace_logdet_hessian_cross(&ext_h_matrices[ii], &ext_h_matrices[jj])
+                        hop.trace_logdet_hessian_cross(
+                            ext_h_matrices[ii]
+                                .as_ref()
+                                .expect("dense ext Hessian drift should be materialized"),
+                            ext_h_matrices[jj]
+                                .as_ref()
+                                .expect("dense ext Hessian drift should be materialized"),
+                        )
                     };
 
                     // β_{ij} = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
-                    // When stochastic cross-traces are active, ext_h_matrices may
-                    // be zero-sized placeholders. Use implicit operators directly.
-                    let hj_vi = if ext_h_matrices[jj].nrows() == 0 {
-                        if let Some(ref op) = coord_j.b_operator {
-                            op.mul_vec(&ext_v[ii])
-                        } else {
-                            coord_j.b_mat.dot(&ext_v[ii])
-                        }
+                    // When stochastic cross-traces are active, operator-only
+                    // coordinates do not materialize a dense Hessian drift.
+                    let hj_vi = if let Some(h_j) = ext_h_matrices[jj].as_ref() {
+                        h_j.dot(&ext_v[ii])
                     } else {
-                        ext_h_matrices[jj].dot(&ext_v[ii])
+                        coord_j.drift.apply(&ext_v[ii])
                     };
                     let mut rhs = hj_vi;
-                    // Use the implicit operator for B_i · v_j when available.
-                    let bi_vj = if let Some(ref op) = coord_i.b_operator {
-                        op.mul_vec(&ext_v[jj])
-                    } else {
-                        coord_i.b_mat.dot(&ext_v[jj])
-                    };
+                    let bi_vj = coord_i.drift.apply(&ext_v[jj]);
                     rhs += &bi_vj;
                     rhs -= &pair.g;
 
@@ -3129,18 +3145,28 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         // update stable and cheap.
         // Operator-backed coordinates stay operator-backed here; dense
         // materialization is only the backend default, not the canonical path.
-        let trace_term = if let Some(ref op) = coord.b_operator {
-            hop.trace_hinv_operator(op.as_ref())
+        let trace_term = if let Some(op) = coord
+            .drift
+            .operator_ref()
+            .filter(|_| coord.drift.uses_operator_fast_path())
+        {
+            hop.trace_hinv_operator(op)
         } else {
-            hop.trace_hinv_h_k(&coord.b_mat, None)
+            let h_i = coord.drift.materialize();
+            hop.trace_hinv_h_k(&h_i, None)
         };
         let numerator = 2.0 * a_i_eff - trace_term;
 
         // Denominator: tr(H⁻¹ B_i H⁻¹ B_i) = ||Y_i||²_F where Y_i = H⁻¹ B_i
-        let denominator = if let Some(ref op) = coord.b_operator {
-            hop.hinv_operator_frobenius_sq(op.as_ref())
+        let denominator = if let Some(op) = coord
+            .drift
+            .operator_ref()
+            .filter(|_| coord.drift.uses_operator_fast_path())
+        {
+            hop.hinv_operator_frobenius_sq(op)
         } else {
-            let y_i = hop.solve_multi(&coord.b_mat);
+            let h_i = coord.drift.materialize();
+            let y_i = hop.solve_multi(&h_i);
             (&y_i * &y_i).sum()
         };
 
@@ -3312,16 +3338,26 @@ pub fn compute_hybrid_efs_update(
                 coord.a
             };
 
-            let trace_term = if let Some(ref op) = coord.b_operator {
-                hop.trace_hinv_operator(op.as_ref())
+            let trace_term = if let Some(op) = coord
+                .drift
+                .operator_ref()
+                .filter(|_| coord.drift.uses_operator_fast_path())
+            {
+                hop.trace_hinv_operator(op)
             } else {
-                hop.trace_hinv_h_k(&coord.b_mat, None)
+                let h_i = coord.drift.materialize();
+                hop.trace_hinv_h_k(&h_i, None)
             };
             let numerator = 2.0 * a_i_eff - trace_term;
-            let denominator = if let Some(ref op) = coord.b_operator {
-                hop.hinv_operator_frobenius_sq(op.as_ref())
+            let denominator = if let Some(op) = coord
+                .drift
+                .operator_ref()
+                .filter(|_| coord.drift.uses_operator_fast_path())
+            {
+                hop.hinv_operator_frobenius_sq(op)
             } else {
-                let y_i = hop.solve_multi(&coord.b_mat);
+                let h_i = coord.drift.materialize();
+                let y_i = hop.solve_multi(&h_i);
                 (&y_i * &y_i).sum()
             };
 
@@ -3361,10 +3397,15 @@ pub fn compute_hybrid_efs_update(
         let mut y_psi: Vec<ndarray::Array2<f64>> = Vec::with_capacity(n_psi);
         for &li in &psi_local_indices {
             let coord = &solution.ext_coords[li];
-            if let Some(ref op) = coord.b_operator {
-                y_psi.push(hop.solve_operator_columns(op.as_ref()));
+            if let Some(op) = coord
+                .drift
+                .operator_ref()
+                .filter(|_| coord.drift.uses_operator_fast_path())
+            {
+                y_psi.push(hop.solve_operator_columns(op));
             } else {
-                y_psi.push(hop.solve_multi(&coord.b_mat));
+                let h_i = coord.drift.materialize();
+                y_psi.push(hop.solve_multi(&h_i));
             }
         }
 

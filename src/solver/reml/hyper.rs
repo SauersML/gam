@@ -267,8 +267,7 @@ impl<'a> RemlState<'a> {
                 .map(|j| super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    b_mat: Array2::zeros((0, 0)),
-                    b_operator: None,
+                    drift: super::unified::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -425,11 +424,11 @@ impl<'a> RemlState<'a> {
                 None
             };
 
-            // Materialize the dense B_j matrix. When b_operator is active, we use
-            // a zero-sized placeholder since the unified evaluator checks
-            // b_operator.is_some() before accessing b_mat.
-            let b_j = if b_operator.is_some() {
-                Array2::<f64>::zeros((0, 0))
+            // Materialize the dense B_j matrix only when we are not using the
+            // operator-backed fast path. The HyperCoord drift wrapper can carry
+            // either representation cleanly, without a dummy payload contract.
+            let dense_b = if b_operator.is_some() {
+                None
             } else {
                 let mut b_j = Self::weighted_cross(&x_tau_j, x_dense, w_diag);
                 b_j += &Self::weighted_cross(x_dense, &x_tau_j, w_diag);
@@ -456,7 +455,7 @@ impl<'a> RemlState<'a> {
                     }
                 }
 
-                b_j
+                Some(b_j)
             };
 
             // --- ld_s_j: smooth penalty pseudo-logdet derivative ---
@@ -468,8 +467,7 @@ impl<'a> RemlState<'a> {
             coords.push(super::unified::HyperCoord {
                 a: a_j,
                 g: g_j,
-                b_mat: b_j,
-                b_operator,
+                drift: super::unified::HyperCoordDrift::from_parts(dense_b, b_operator),
                 ld_s: ld_s_j,
                 b_depends_on_beta,
                 is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -510,8 +508,7 @@ impl<'a> RemlState<'a> {
                 .map(|j| super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    b_mat: Array2::zeros((0, 0)),
-                    b_operator: None,
+                    drift: super::unified::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -613,16 +610,17 @@ impl<'a> RemlState<'a> {
             coords.push(super::unified::HyperCoord {
                 a: a_j,
                 g: g_j,
-                b_mat: Array2::<f64>::zeros((0, 0)),
-                b_operator: Some(Box::new(super::unified::SparseDirectionalHyperOperator {
-                    x_tau: dir.x_tau_original.clone(),
-                    x_design: x_design.clone(),
-                    w_diag: w_diag.clone(),
-                    s_tau: s_tau_j,
-                    c_x_tau_beta,
-                    firth_hphi_tau_partial,
-                    p: p_dim,
-                })),
+                drift: super::unified::HyperCoordDrift::from_operator(Box::new(
+                    super::unified::SparseDirectionalHyperOperator {
+                        x_tau: dir.x_tau_original.clone(),
+                        x_design: x_design.clone(),
+                        w_diag: w_diag.clone(),
+                        s_tau: s_tau_j,
+                        c_x_tau_beta,
+                        firth_hphi_tau_partial,
+                        p: p_dim,
+                    },
+                )),
                 ld_s: ld_s_j,
                 b_depends_on_beta: !is_gaussian_identity,
                 is_penalty_like: dir.is_penalty_like,
@@ -1596,8 +1594,7 @@ impl<'a> RemlState<'a> {
                 .map(|_| super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    b_mat: Array2::zeros((0, 0)),
-                    b_operator: None,
+                    drift: super::unified::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: true,
                     is_penalty_like: false,
@@ -1705,8 +1702,7 @@ impl<'a> RemlState<'a> {
             coords.push(super::unified::HyperCoord {
                 a: a_j,
                 g: g_j,
-                b_mat: b_j,
-                b_operator: None,
+                drift: super::unified::HyperCoordDrift::from_dense(b_j),
                 ld_s: 0.0,
                 // Link parameters affect working weights through the link,
                 // and the working weights depend on β through η = Xβ,
@@ -1768,8 +1764,7 @@ impl<'a> RemlState<'a> {
                 .map(|_| super::unified::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    b_mat: Array2::zeros((0, 0)),
-                    b_operator: None,
+                    drift: super::unified::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: true,
                     is_penalty_like: false,
@@ -1867,8 +1862,7 @@ impl<'a> RemlState<'a> {
             coords.push(super::unified::HyperCoord {
                 a: a_j,
                 g: g_j,
-                b_mat: b_j,
-                b_operator: None,
+                drift: super::unified::HyperCoordDrift::from_dense(b_j),
                 ld_s: 0.0,
                 b_depends_on_beta: true,
                 is_penalty_like: false,
