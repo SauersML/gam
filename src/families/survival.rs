@@ -1280,8 +1280,8 @@ impl WorkingModelSurvival {
         rho: &Array1<f64>,
     ) -> Result<crate::estimate::reml::unified::InnerSolution<'static>, EstimationError> {
         use crate::estimate::reml::unified::{
-            DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder, PenaltyLogdetDerivs,
-            compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
+            DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder, PenaltyCoordinate,
+            PenaltyLogdetDerivs, compute_block_penalty_logdet_derivs, penalty_matrix_root,
         };
 
         let p = beta.len();
@@ -1292,12 +1292,16 @@ impl WorkingModelSurvival {
         let hop = DenseSpectralOperator::from_symmetric(&h_dense)
             .map_err(EstimationError::InvalidInput)?;
 
-        // --- Penalty roots (embedded in full parameter space) ---
-        let mut penalty_roots = Vec::with_capacity(k_count);
+        // --- Unified penalty coordinates ---
+        let mut penalty_coords = Vec::with_capacity(k_count);
         for block in &self.penalties.blocks {
             let root = penalty_matrix_root(&block.matrix).map_err(EstimationError::InvalidInput)?;
-            let embedded = embed_penalty_root(&root, block.range.start, block.range.end, p);
-            penalty_roots.push(embedded);
+            penalty_coords.push(PenaltyCoordinate::from_block_root(
+                root,
+                block.range.start,
+                block.range.end,
+                p,
+            ));
         }
 
         // --- Penalty logdet derivatives ---
@@ -1361,7 +1365,7 @@ impl WorkingModelSurvival {
             beta.clone(),
             n_observations,
             Box::new(hop),
-            penalty_roots,
+            penalty_coords,
             penalty_logdet,
             DispersionHandling::Fixed {
                 phi: 1.0,

@@ -14,8 +14,8 @@ use crate::smooth::{
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    InnerSolutionBuilder, MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs,
-    embed_penalty_root, penalty_matrix_root, reml_laml_evaluate,
+    InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
+    compute_block_penalty_logdet_derivs, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -4771,7 +4771,7 @@ struct ExtCoordBundle {
 /// This is the bridge between the custom family's joint Hessian infrastructure
 /// and the unified REML/LAML evaluator. It:
 /// 1. Receives a unified [`HessianOperator`] backend (dense or matrix-free)
-/// 2. Builds penalty roots in the joint parameter space
+/// 2. Builds unified penalty coordinates for the rho block
 /// 3. Computes penalty logdet derivatives
 /// 4. Assembles an `InnerSolution` and calls `reml_laml_evaluate`
 ///
@@ -4795,14 +4795,13 @@ fn unified_joint_cost_gradient(
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    // Build penalty roots in joint basis from the joint block ranges.
-    let mut penalty_roots_joint = Vec::new();
+    // Build unified penalty coordinates from the original block-local roots.
+    let mut penalty_coords = Vec::new();
     for (b, spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
         for s_k in spec.penalties.iter() {
             let root = penalty_matrix_root(s_k)?;
-            let embedded = embed_penalty_root(&root, start, end, total);
-            penalty_roots_joint.push(embedded);
+            penalty_coords.push(PenaltyCoordinate::from_block_root(root, start, end, total));
         }
     }
 
@@ -4839,7 +4838,7 @@ fn unified_joint_cost_gradient(
         beta_flat.clone(),
         n_observations,
         hessian_op,
-        penalty_roots_joint,
+        penalty_coords,
         penalty_logdet,
         DispersionHandling::Fixed {
             phi: 1.0,

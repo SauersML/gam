@@ -95,24 +95,33 @@ pub trait HessianOperator: Send + Sync {
     /// H⁻¹ M — multi-column solve.
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64>;
 
-    /// H⁻¹ B for an operator-backed Hessian drift.
+    /// tr(H⁻¹ A H⁻¹ B) for dense symmetric Hessian drifts.
     ///
-    /// Default implementation materializes `B` densely and dispatches to
-    /// `solve_multi`. Backends with native operator-column solves should
-    /// override this to avoid unnecessary dense materialization.
-    fn solve_operator_columns(&self, op: &dyn HyperOperator) -> Array2<f64> {
-        self.solve_multi(&op.to_dense())
+    /// This is the second-order trace object used by EFS denominators and the
+    /// ψ-block trace Gram preconditioner. The default implementation computes
+    /// both solved column stacks exactly and contracts them as
+    /// `tr((H⁻¹A)(H⁻¹B))`.
+    fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let solved_a = self.solve_multi(a);
+        let solved_b = self.solve_multi(b);
+        (&solved_a.t() * &solved_b).sum()
     }
 
-    /// ||H⁻¹ B||²_F for an operator-backed Hessian drift.
+    /// tr(H⁻¹ A H⁻¹ B) for a dense drift `A` and an operator-backed drift `B`.
     ///
-    /// This is the EFS denominator for penalty-like extended coordinates.
-    /// Default implementation reuses `solve_operator_columns`, but sparse
-    /// backends should override it to accumulate the Frobenius norm without
-    /// forcing a full dense `B` materialization.
-    fn hinv_operator_frobenius_sq(&self, op: &dyn HyperOperator) -> f64 {
-        let solved = self.solve_operator_columns(op);
-        (&solved * &solved).sum()
+    /// Default implementation materializes the operator and dispatches to the
+    /// dense cross-trace path. Matrix-free and sparse backends should override
+    /// this to avoid dense operator materialization.
+    fn trace_hinv_matrix_operator_cross(&self, matrix: &Array2<f64>, op: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_product_cross(matrix, &op.to_dense())
+    }
+
+    /// tr(H⁻¹ A H⁻¹ B) for operator-backed Hessian drifts.
+    ///
+    /// Default implementation materializes both operators densely. Backends
+    /// with native operator-aware cross traces should override this.
+    fn trace_hinv_operator_cross(&self, left: &dyn HyperOperator, right: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_product_cross(&left.to_dense(), &right.to_dense())
     }
 
     /// tr(G_ε(H) A) — trace for the logdet gradient ∂_i log|R_ε(H)|.
@@ -1714,7 +1723,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty roots.
+    /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
             let total_p = self.beta.len();
@@ -1783,6 +1792,66 @@ fn penalty_a_k_beta(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) 
 
 fn penalty_a_k_quadratic(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) -> f64 {
     coord.quadratic(beta, lambda)
+}
+
+fn trace_hinv_penalty_cross(
+    hop: &dyn HessianOperator,
+    left: &PenaltyCoordinate,
+    left_lambda: f64,
+    right: &PenaltyCoordinate,
+    right_lambda: f64,
+) -> f64 {
+    match (
+        left.uses_operator_fast_path(),
+        right.uses_operator_fast_path(),
+    ) {
+        (true, true) => {
+            let left_op = left.scaled_operator(left_lambda, None);
+            let right_op = right.scaled_operator(right_lambda, None);
+            hop.trace_hinv_operator_cross(&left_op, &right_op)
+        }
+        (true, false) => {
+            let left_op = left.scaled_operator(left_lambda, None);
+            let right_matrix = right.scaled_dense_matrix(right_lambda);
+            hop.trace_hinv_matrix_operator_cross(&right_matrix, &left_op)
+        }
+        (false, true) => {
+            let left_matrix = left.scaled_dense_matrix(left_lambda);
+            let right_op = right.scaled_operator(right_lambda, None);
+            hop.trace_hinv_matrix_operator_cross(&left_matrix, &right_op)
+        }
+        (false, false) => {
+            let left_matrix = left.scaled_dense_matrix(left_lambda);
+            let right_matrix = right.scaled_dense_matrix(right_lambda);
+            hop.trace_hinv_product_cross(&left_matrix, &right_matrix)
+        }
+    }
+}
+
+fn trace_hinv_drift_cross(
+    hop: &dyn HessianOperator,
+    left: &HyperCoordDrift,
+    right: &HyperCoordDrift,
+) -> f64 {
+    let left_op = left.operator_ref().filter(|_| left.uses_operator_fast_path());
+    let right_op = right.operator_ref().filter(|_| right.uses_operator_fast_path());
+
+    match (left_op, right_op) {
+        (Some(op_left), Some(op_right)) => hop.trace_hinv_operator_cross(op_left, op_right),
+        (Some(op_left), None) => {
+            let right_matrix = right.materialize();
+            hop.trace_hinv_matrix_operator_cross(&right_matrix, op_left)
+        }
+        (None, Some(op_right)) => {
+            let left_matrix = left.materialize();
+            hop.trace_hinv_matrix_operator_cross(&left_matrix, op_right)
+        }
+        (None, None) => {
+            let left_matrix = left.materialize();
+            let right_matrix = right.materialize();
+            hop.trace_hinv_product_cross(&left_matrix, &right_matrix)
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2243,7 +2312,7 @@ pub fn reml_laml_evaluate(
             let v_k = &rho_v_ks
                 .as_ref()
                 .expect("rho mode responses required for Firth gradient")[idx];
-            let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_k).mapv(|v| -v);
+            let deta_k: Array1<f64> = firth_op.x_dense.dot(v_k).mapv(|v| -v);
             let dir_k = firth_op.direction_from_deta(deta_k);
             let dhphi_k = firth_op.hphi_direction(&dir_k);
             grad[idx] += -0.5 * hop.trace_hinv_product(&dhphi_k);
@@ -2697,37 +2766,13 @@ fn compute_outer_hessian(
             coord_has_operator.push(false);
         }
 
-        let estimator = StochasticTraceEstimator::with_defaults();
-        let dense_refs: Vec<&Array2<f64>> = dense_mats.iter().collect();
-        let raw_cross = if generic_ops.len() == impl_ops.len() {
-            estimator.estimate_second_order_traces(hop, &dense_refs, &impl_ops)
-        } else {
-            estimator.estimate_second_order_traces_with_operators(hop, &dense_refs, &generic_ops)
-        };
-
-        // Re-map from [dense_0..N, operator_0..M] to [rho_0..k, ext_0..D].
-        let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
-        let mut original_to_raw: Vec<usize> = Vec::with_capacity(total_coords);
-        let mut dense_cursor = 0usize;
-        let mut operator_cursor = n_dense_total;
-        for &has_operator in &coord_has_operator {
-            if has_operator {
-                original_to_raw.push(operator_cursor);
-                operator_cursor += 1;
-            } else {
-                original_to_raw.push(dense_cursor);
-                dense_cursor += 1;
-            }
-        }
-
-        let mut mapped = Array2::zeros((total_coords, total_coords));
-        for i in 0..total_coords {
-            for j in 0..total_coords {
-                mapped[[i, j]] = raw_cross[[original_to_raw[i], original_to_raw[j]]];
-            }
-        }
-
-        Some(mapped)
+        Some(stochastic_trace_hinv_crosses(
+            hop,
+            &dense_mats,
+            &coord_has_operator,
+            &generic_ops,
+            &impl_ops,
+        ))
     } else {
         None
     };
@@ -3260,12 +3305,10 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
 
     // ── ρ coordinates ──
     for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
+        let coord = &solution.penalty_coords[idx];
 
         // a_k = ½ β̂ᵀ A_k β̂ = ½ λ_k β̂ᵀ S_k β̂
-        let r_beta = r_k.dot(&solution.beta);
-        let s_k_beta_sq = r_beta.dot(&r_beta); // β̂ᵀ S_k β̂ = |R_k β̂|²
-        let a_k = 0.5 * lambdas[idx] * s_k_beta_sq;
+        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
 
         // Rescale a_k for profiled Gaussian: effective a = a_k / φ̂
         let a_k_eff = if is_profiled {
@@ -3274,21 +3317,24 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
             a_k
         };
 
-        // B_k = A_k = λ_k R_k^T R_k
-        let a_k_matrix = {
-            let mut m = r_k.t().dot(r_k);
-            m *= lambdas[idx];
-            m
-        };
-
         // Numerator: 2·a_k - tr(H⁻¹ B_k)
         // We drop the C[β_k] correction for EFS (pass None).
-        let trace_term = hop.trace_hinv_h_k(&a_k_matrix, None);
+        let trace_term = if coord.uses_operator_fast_path() {
+            let op = coord.scaled_operator(lambdas[idx], None);
+            hop.trace_hinv_operator(&op)
+        } else {
+            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            hop.trace_hinv_h_k(&a_k_matrix, None)
+        };
         let numerator = 2.0 * a_k_eff - trace_term;
 
-        // Denominator: tr(H⁻¹ B_k H⁻¹ B_k) = ||H⁻¹ B_k||²_F
-        let y_k = hop.solve_multi(&a_k_matrix);
-        let denominator = (&y_k * &y_k).sum();
+        // Denominator: tr(H⁻¹ B_k H⁻¹ B_k)
+        let denominator = if coord.uses_operator_fast_path() {
+            trace_hinv_penalty_cross(hop, coord, lambdas[idx], coord, lambdas[idx])
+        } else {
+            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
+        };
 
         let step = if denominator.abs() > 1e-30 {
             (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -3336,17 +3382,16 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         };
         let numerator = 2.0 * a_i_eff - trace_term;
 
-        // Denominator: tr(H⁻¹ B_i H⁻¹ B_i) = ||Y_i||²_F where Y_i = H⁻¹ B_i
+        // Denominator: tr(H⁻¹ B_i H⁻¹ B_i)
         let denominator = if let Some(op) = coord
             .drift
             .operator_ref()
             .filter(|_| coord.drift.uses_operator_fast_path())
         {
-            hop.hinv_operator_frobenius_sq(op)
+            hop.trace_hinv_operator_cross(op, op)
         } else {
             let h_i = coord.drift.materialize();
-            let y_i = hop.solve_multi(&h_i);
-            (&y_i * &y_i).sum()
+            hop.trace_hinv_product_cross(&h_i, &h_i)
         };
 
         let step = if denominator.abs() > 1e-30 {
@@ -3470,26 +3515,28 @@ pub fn compute_hybrid_efs_update(
 
     // ── ρ coordinates: standard EFS (identical to compute_efs_update) ──
     for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
-        let r_beta = r_k.dot(&solution.beta);
-        let s_k_beta_sq = r_beta.dot(&r_beta);
-        let a_k = 0.5 * lambdas[idx] * s_k_beta_sq;
+        let coord = &solution.penalty_coords[idx];
+        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
         let a_k_eff = if is_profiled {
             a_k / profiled_scale
         } else {
             a_k
         };
 
-        let a_k_matrix = {
-            let mut m = r_k.t().dot(r_k);
-            m *= lambdas[idx];
-            m
+        let trace_term = if coord.uses_operator_fast_path() {
+            let op = coord.scaled_operator(lambdas[idx], None);
+            hop.trace_hinv_operator(&op)
+        } else {
+            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            hop.trace_hinv_h_k(&a_k_matrix, None)
         };
-
-        let trace_term = hop.trace_hinv_h_k(&a_k_matrix, None);
         let numerator = 2.0 * a_k_eff - trace_term;
-        let y_k = hop.solve_multi(&a_k_matrix);
-        let denominator = (&y_k * &y_k).sum();
+        let denominator = if coord.uses_operator_fast_path() {
+            trace_hinv_penalty_cross(hop, coord, lambdas[idx], coord, lambdas[idx])
+        } else {
+            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
+        };
 
         let step = if denominator.abs() > 1e-30 {
             (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -3533,11 +3580,10 @@ pub fn compute_hybrid_efs_update(
                 .operator_ref()
                 .filter(|_| coord.drift.uses_operator_fast_path())
             {
-                hop.hinv_operator_frobenius_sq(op)
+                hop.trace_hinv_operator_cross(op, op)
             } else {
                 let h_i = coord.drift.materialize();
-                let y_i = hop.solve_multi(&h_i);
-                (&y_i * &y_i).sum()
+                hop.trace_hinv_product_cross(&h_i, &h_i)
             };
 
             let step = if denominator.abs() > 1e-30 {
@@ -3571,39 +3617,70 @@ pub fn compute_hybrid_efs_update(
     // the invalid assumption that the Gram norm bounds the true curvature.
     let n_psi = psi_local_indices.len();
     if n_psi > 0 {
-        // Step 1: Compute H⁻¹ B_d for each ψ coordinate.
-        // These are the same solves that EFS would use for its denominator.
-        let mut y_psi: Vec<ndarray::Array2<f64>> = Vec::with_capacity(n_psi);
-        for &li in &psi_local_indices {
-            let coord = &solution.ext_coords[li];
-            if let Some(op) = coord
-                .drift
+        let total_p = hop.dim();
+        let any_psi_operator = psi_local_indices.iter().any(|&li| {
+            let drift = &solution.ext_coords[li].drift;
+            drift
                 .operator_ref()
-                .filter(|_| coord.drift.uses_operator_fast_path())
-            {
-                y_psi.push(hop.solve_operator_columns(op));
-            } else {
-                let h_i = coord.drift.materialize();
-                y_psi.push(hop.solve_multi(&h_i));
-            }
-        }
+                .is_some_and(|_| drift.uses_operator_fast_path())
+        });
+        let use_stochastic_psi_gram =
+            any_psi_operator && total_p > 500 && hop.prefers_stochastic_trace_estimation();
 
-        // Step 2: Build the trace Gram matrix G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)
-        //       = tr(Y_d^T Y_e) where Y_d = H⁻¹ B_d.
+        // Step 1: Build the trace Gram matrix
+        //   G_{de} = tr(H⁻¹ B_d H⁻¹ B_e).
         //
-        // G is symmetric and generally PSD (it is a Gram matrix of the
-        // operators {H^{-1/2} B_d} in Frobenius norm), but may be
-        // near-singular when B_d are nearly linearly dependent in H⁻¹-norm.
-        let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
-        for d in 0..n_psi {
-            for e in d..n_psi {
-                let val = (&y_psi[d] * &y_psi[e]).sum();
-                gram[[d, e]] = val;
-                gram[[e, d]] = val;
-            }
-        }
+        // Large matrix-free/operator-backed problems batch this through the
+        // shared stochastic second-order trace estimator. Smaller or fully
+        // dense problems use exact pairwise cross traces.
+        let gram = if use_stochastic_psi_gram {
+            let mut dense_mats = Vec::new();
+            let mut coord_has_operator = Vec::with_capacity(n_psi);
+            let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
+            let mut impl_ops: Vec<&ImplicitHyperOperator> = Vec::new();
 
-        // Step 3: Pseudoinverse G⁺ via eigendecomposition.
+            for &li in &psi_local_indices {
+                let coord = &solution.ext_coords[li];
+                if let Some(op) = coord
+                    .drift
+                    .operator_ref()
+                    .filter(|_| coord.drift.uses_operator_fast_path())
+                {
+                    coord_has_operator.push(true);
+                    if let Some(imp) = op.as_implicit() {
+                        impl_ops.push(imp);
+                    }
+                    generic_ops.push(op);
+                } else {
+                    coord_has_operator.push(false);
+                    dense_mats.push(coord.drift.materialize());
+                }
+            }
+
+            stochastic_trace_hinv_crosses(
+                hop,
+                &dense_mats,
+                &coord_has_operator,
+                &generic_ops,
+                &impl_ops,
+            )
+        } else {
+            let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
+            for d in 0..n_psi {
+                for e in d..n_psi {
+                    let val = trace_hinv_drift_cross(
+                        hop,
+                        &solution.ext_coords[psi_local_indices[d]].drift,
+                        &solution.ext_coords[psi_local_indices[e]].drift,
+                    );
+                    gram[[d, e]] = val;
+                    gram[[e, d]] = val;
+                }
+            }
+            gram
+        };
+
+        // Step 2: Pseudoinverse G⁺ via eigendecomposition.
         //
         // For small n_psi (typically 2-10 anisotropic axes), this is cheap.
         // We truncate eigenvalues below PSI_GRAM_PINV_TOL * λ_max to form
@@ -3613,7 +3690,7 @@ pub fn compute_hybrid_efs_update(
         let g_psi = ndarray::Array1::from_vec(psi_gradient.clone());
         let delta_psi = pseudoinverse_times_vec(&gram, &g_psi, PSI_GRAM_PINV_TOL);
 
-        // Step 4: Apply damping and capping.
+        // Step 3: Apply damping and capping.
         //
         // Δψ = -α × G⁺ g_ψ, capped to ||Δψ||_∞ ≤ EFS_MAX_STEP.
         // The negative sign is because we are descending on V(θ) (minimizing).
@@ -4399,43 +4476,48 @@ impl SparseCholeskyOperator {
         Ok(solved_all)
     }
 
-    fn hinv_operator_frobenius_sq_exact(&self, op: &dyn HyperOperator) -> f64 {
-        let chunk = 32usize;
-        let mut norm_sq = 0.0_f64;
-        let mut basis = Array1::<f64>::zeros(self.n_dim);
-        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
-        let mut start = 0usize;
-
-        while start < self.n_dim {
-            let end = (start + chunk).min(self.n_dim);
-            let cols = end - start;
-            rhs_block.slice_mut(ndarray::s![.., ..cols]).fill(0.0);
-            for local_col in 0..cols {
-                let global_col = start + local_col;
-                basis[global_col] = 1.0;
-                let col = op.mul_vec(&basis);
-                rhs_block.slice_mut(ndarray::s![.., local_col]).assign(&col);
-                basis[global_col] = 0.0;
+    fn trace_hinv_matrix_operator_cross_exact(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
+        let solved_matrix = self.solve_multi(matrix);
+        let solved_op = match self.solve_operator_columns_exact(op) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!(
+                    "SparseCholeskyOperator::trace_hinv_matrix_operator_cross_exact failed: {e}"
+                );
+                return f64::NAN;
             }
+        };
+        (&solved_matrix.t() * &solved_op).sum()
+    }
 
-            let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
-            let solved = match crate::linalg::sparse_exact::solve_sparse_spdmulti(
-                &self.factor,
-                &rhs_view,
-            ) {
-                Ok(sol) => sol,
-                Err(e) => {
-                    log::warn!(
-                        "SparseCholeskyOperator::hinv_operator_frobenius_sq_exact multi-solve failed: {e}"
-                    );
-                    return f64::NAN;
-                }
-            };
-            norm_sq += (&solved * &solved).sum();
-            start = end;
-        }
-
-        norm_sq
+    fn trace_hinv_operator_cross_exact(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
+        let solved_left = match self.solve_operator_columns_exact(left) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!(
+                    "SparseCholeskyOperator::trace_hinv_operator_cross_exact failed on left operator: {e}"
+                );
+                return f64::NAN;
+            }
+        };
+        let solved_right = match self.solve_operator_columns_exact(right) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!(
+                    "SparseCholeskyOperator::trace_hinv_operator_cross_exact failed on right operator: {e}"
+                );
+                return f64::NAN;
+            }
+        };
+        (&solved_left.t() * &solved_right).sum()
     }
 }
 
@@ -4487,18 +4569,12 @@ impl HessianOperator for SparseCholeskyOperator {
         }
     }
 
-    fn solve_operator_columns(&self, op: &dyn HyperOperator) -> Array2<f64> {
-        match self.solve_operator_columns_exact(op) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!("{e}");
-                Array2::zeros((self.n_dim, self.n_dim))
-            }
-        }
+    fn trace_hinv_matrix_operator_cross(&self, matrix: &Array2<f64>, op: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_matrix_operator_cross_exact(matrix, op)
     }
 
-    fn hinv_operator_frobenius_sq(&self, op: &dyn HyperOperator) -> f64 {
-        self.hinv_operator_frobenius_sq_exact(op)
+    fn trace_hinv_operator_cross(&self, left: &dyn HyperOperator, right: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_operator_cross_exact(left, right)
     }
 
     fn active_rank(&self) -> usize {
@@ -4757,6 +4833,29 @@ impl HessianOperator for MatrixFreeSpdOperator {
         let estimator = StochasticTraceEstimator::with_defaults();
         let no_dense: [&Array2<f64>; 0] = [];
         estimator.estimate_traces_with_operators(self, &no_dense, &[op])[0]
+    }
+
+    fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let estimator = StochasticTraceEstimator::with_defaults();
+        let no_ops: [&dyn HyperOperator; 0] = [];
+        let mats = [a, b];
+        let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
+        cross[[0, 1]]
+    }
+
+    fn trace_hinv_matrix_operator_cross(&self, matrix: &Array2<f64>, op: &dyn HyperOperator) -> f64 {
+        let estimator = StochasticTraceEstimator::with_defaults();
+        let matrices = [matrix];
+        let cross = estimator.estimate_second_order_traces_with_operators(self, &matrices, &[op]);
+        cross[[0, 1]]
+    }
+
+    fn trace_hinv_operator_cross(&self, left: &dyn HyperOperator, right: &dyn HyperOperator) -> f64 {
+        let estimator = StochasticTraceEstimator::with_defaults();
+        let no_dense: [&Array2<f64>; 0] = [];
+        let cross =
+            estimator.estimate_second_order_traces_with_operators(self, &no_dense, &[left, right]);
+        cross[[0, 1]]
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
@@ -5031,26 +5130,6 @@ pub fn compute_block_penalty_logdet_derivs(
         first,
         second: Some(second),
     })
-}
-
-/// Embed a per-block penalty root into the joint parameter space.
-///
-/// Given a root R of shape (rank, p_block), returns a root of shape (rank, total)
-/// with R placed at columns [start..end] and zeros elsewhere.
-pub fn embed_penalty_root(
-    root: &Array2<f64>,
-    start: usize,
-    end: usize,
-    total: usize,
-) -> Array2<f64> {
-    let rank = root.nrows();
-    let p_block = root.ncols();
-    debug_assert_eq!(end - start, p_block);
-    let mut embedded = Array2::zeros((rank, total));
-    embedded
-        .slice_mut(ndarray::s![.., start..start + p_block])
-        .assign(root);
-    embedded
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5690,6 +5769,45 @@ fn stochastic_trace_hinv_products(
     }
 }
 
+fn stochastic_trace_hinv_crosses<'a>(
+    hop: &dyn HessianOperator,
+    dense_matrices: &'a [Array2<f64>],
+    coord_has_operator: &[bool],
+    generic_ops: &[&'a dyn HyperOperator],
+    implicit_ops: &[&'a ImplicitHyperOperator],
+) -> Array2<f64> {
+    let estimator = StochasticTraceEstimator::with_defaults();
+    let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
+    let raw_cross = if generic_ops.len() == implicit_ops.len() {
+        estimator.estimate_second_order_traces(hop, &dense_refs, implicit_ops)
+    } else {
+        estimator.estimate_second_order_traces_with_operators(hop, &dense_refs, generic_ops)
+    };
+
+    let total_coords = coord_has_operator.len();
+    let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
+    let mut original_to_raw = Vec::with_capacity(total_coords);
+    let mut dense_cursor = 0usize;
+    let mut operator_cursor = n_dense_total;
+    for &has_operator in coord_has_operator {
+        if has_operator {
+            original_to_raw.push(operator_cursor);
+            operator_cursor += 1;
+        } else {
+            original_to_raw.push(dense_cursor);
+            dense_cursor += 1;
+        }
+    }
+
+    let mut mapped = Array2::zeros((total_coords, total_coords));
+    for i in 0..total_coords {
+        for j in 0..total_coords {
+            mapped[[i, j]] = raw_cross[[original_to_raw[i], original_to_raw[j]]];
+        }
+    }
+    mapped
+}
+
 // Lightweight xoshiro256ss RNG
 //
 // We use a self-contained xoshiro256ss implementation so that the stochastic
@@ -5858,9 +5976,9 @@ mod tests {
             penalty_quadratic: 2.0,
             hessian_op: Box::new(op),
             beta: array![1.0, 0.5],
-            penalty_roots: vec![
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(
                 Array2::eye(2), // S₁ = I (penalty root for param 1)
-            ],
+            )],
             penalty_logdet: PenaltyLogdetDerivs {
                 value: 0.0,
                 first: array![1.0],
@@ -5986,7 +6104,10 @@ mod tests {
             penalty_quadratic: penalty_quad,
             hessian_op: Box::new(op),
             beta,
-            penalty_roots: vec![r1, r2],
+            penalty_coords: vec![
+                PenaltyCoordinate::from_dense_root(r1),
+                PenaltyCoordinate::from_dense_root(r2),
+            ],
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
