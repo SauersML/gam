@@ -1257,10 +1257,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         link_dev_constraints: link_dev_constraints.clone(),
     };
 
-    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
-    let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
-    let all_dims = setup.log_kappa_dims_per_term();
-    let rho_dim = setup.rho_dim();
+    // This family currently only exposes the inner exact Newton system
+    // analytically. The outer [rho, psi] spatial hyper objective must therefore
+    // report finite-difference gradients through the centralized outer strategy
+    // layer instead of hiding ad hoc finite differences inside this family file.
+    let analytic_joint_gradient_available = false;
+    let analytic_joint_hessian_available = false;
 
     let solved = optimize_two_block_spatial_length_scale_exact_joint(
         data,
@@ -1268,8 +1270,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &logslopespec_boot,
         kappa_options,
         &setup,
-        true,
-        false,
+        analytic_joint_gradient_available,
+        analytic_joint_hessian_available,
         |rho, _, _, marginal_design, logslope_design| {
             let blocks = build_blocks(rho, marginal_design, logslope_design)?;
             let family = make_family();
@@ -1296,97 +1298,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
             Ok(fit)
         },
         |rho, marginal_resolved, logslope_resolved, _, _, need_hessian| {
-            let _ = need_hessian;
-            let objective = {
-                let marginal_design = build_term_collection_design(data, marginal_resolved)
-                    .map_err(|e| e.to_string())?;
-                let logslope_design = build_term_collection_design(data, logslope_resolved)
-                    .map_err(|e| e.to_string())?;
-                let blocks = build_blocks(rho, &marginal_design, &logslope_design)?;
-                let family = make_family();
-                fit_score(&inner_fit(&family, &blocks, options)?)
-            };
-            let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
-                marginal_resolved,
-                &marginal_terms,
-                kappa_options,
-            );
-            let logslope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
-                logslope_resolved,
-                &logslope_terms,
-                kappa_options,
-            );
-            let mut theta = Array1::<f64>::zeros(rho_dim + all_dims.iter().sum::<usize>());
-            theta.slice_mut(s![..rho.len()]).assign(rho);
-            let mut cursor = rho.len();
-            theta
-                .slice_mut(s![cursor..cursor + marginal_kappa.as_array().len()])
-                .assign(marginal_kappa.as_array());
-            cursor += marginal_kappa.as_array().len();
-            theta
-                .slice_mut(s![cursor..cursor + logslope_kappa.as_array().len()])
-                .assign(logslope_kappa.as_array());
-
-            let mut gradient = Array1::<f64>::zeros(theta.len());
-            for j in 0..theta.len() {
-                let h = 1e-3 * (1.0 + theta[j].abs());
-                let mut plus = theta.clone();
-                plus[j] += h;
-                let mut minus = theta.clone();
-                minus[j] -= h;
-                let plus_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                    &plus,
-                    rho_dim,
-                    all_dims.clone(),
-                );
-                let minus_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                    &minus,
-                    rho_dim,
-                    all_dims.clone(),
-                );
-                let (plus_marginal, plus_logslope) = plus_kappa.split_at(marginal_terms.len());
-                let (minus_marginal, minus_logslope) = minus_kappa.split_at(marginal_terms.len());
-                let plus_marginal_spec = plus_marginal
-                    .apply_tospec(&marginalspec_boot, &marginal_terms)
-                    .map_err(|e| e.to_string())?;
-                let plus_logslope_spec = plus_logslope
-                    .apply_tospec(&logslopespec_boot, &logslope_terms)
-                    .map_err(|e| e.to_string())?;
-                let minus_marginal_spec = minus_marginal
-                    .apply_tospec(&marginalspec_boot, &marginal_terms)
-                    .map_err(|e| e.to_string())?;
-                let minus_logslope_spec = minus_logslope
-                    .apply_tospec(&logslopespec_boot, &logslope_terms)
-                    .map_err(|e| e.to_string())?;
-                let plus_marginal_design = build_term_collection_design(data, &plus_marginal_spec)
-                    .map_err(|e| e.to_string())?;
-                let plus_logslope_design = build_term_collection_design(data, &plus_logslope_spec)
-                    .map_err(|e| e.to_string())?;
-                let minus_marginal_design =
-                    build_term_collection_design(data, &minus_marginal_spec)
-                        .map_err(|e| e.to_string())?;
-                let minus_logslope_design =
-                    build_term_collection_design(data, &minus_logslope_spec)
-                        .map_err(|e| e.to_string())?;
-                let plus_fit = {
-                    let blocks = build_blocks(
-                        &plus.slice(s![..rho_dim]).to_owned(),
-                        &plus_marginal_design,
-                        &plus_logslope_design,
-                    )?;
-                    inner_fit(&make_family(), &blocks, options)?
-                };
-                let minus_fit = {
-                    let blocks = build_blocks(
-                        &minus.slice(s![..rho_dim]).to_owned(),
-                        &minus_marginal_design,
-                        &minus_logslope_design,
-                    )?;
-                    inner_fit(&make_family(), &blocks, options)?
-                };
-                gradient[j] = (fit_score(&plus_fit) - fit_score(&minus_fit)) / (2.0 * h);
-            }
-            Ok((objective, gradient, None))
+            let _ = (rho, marginal_resolved, logslope_resolved, need_hessian);
+            Err(
+                "analytic joint [rho, psi] derivatives are unavailable for bernoulli marginal-slope; outer_strategy must use the declared centralized finite-difference path"
+                    .to_string(),
+            )
         },
     )?;
 

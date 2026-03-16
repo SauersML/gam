@@ -9000,15 +9000,6 @@ where
                 has_psi_coords: true,
                 barrier_config: None,
             }]
-        } else if !analytic_joint_gradient_available {
-            vec![OuterCapability {
-                gradient: Derivative::FiniteDifference,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                has_psi_coords: true,
-                barrier_config: None,
-            }]
         } else {
             Vec::new()
         },

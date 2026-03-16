@@ -2,6 +2,10 @@ use super::inner_strategy::{GeometryBackendKind, HessianEvalStrategyKind};
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
+const DIAGNOSTIC_HESSIAN_FD_REL_STEP: f64 = 1e-4;
+const DIAGNOSTIC_HESSIAN_FD_ABS_STEP: f64 = 1e-5;
+const DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD: f64 = 1e-8;
+
 impl<'a> RemlState<'a> {
     /// Compute first and second derivatives of the smooth δ-regularized
     /// pseudo-logdet L_δ(S) with respect to ρ.
@@ -131,7 +135,6 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
-    #[cfg(test)]
     pub(super) fn compute_lamlhessian_analytic_fallback(
         &self,
         rho: &Array1<f64>,
@@ -223,37 +226,137 @@ impl<'a> RemlState<'a> {
         Ok(h)
     }
 
+    fn diagnostic_hessian_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {
+        let base = DIAGNOSTIC_HESSIAN_FD_REL_STEP * (1.0 + rho_i.abs())
+            .max(DIAGNOSTIC_HESSIAN_FD_ABS_STEP);
+        let symmetric_room = (RHO_BOUND - DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD - rho_i.abs())
+            .max(0.0);
+        let step = base.min(0.5 * symmetric_room);
+        if !step.is_finite() || step <= 0.0 {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "diagnostic numeric Hessian has no symmetric finite-difference room at rho={rho_i:.6e}"
+            )));
+        }
+        Ok(step)
+    }
+
+    pub(super) fn compute_lamlhessian_diagnostic_numeric(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let k = rho.len();
+        let mut h = Array2::<f64>::zeros((k, k));
+        if k == 0 {
+            return Ok(h);
+        }
+
+        let f0 = self.compute_cost(rho)?;
+        let mut steps = Vec::with_capacity(k);
+        for i in 0..k {
+            steps.push(self.diagnostic_hessian_fd_step(rho[i])?);
+        }
+
+        for i in 0..k {
+            let hi = steps[i];
+
+            let mut rho_p = rho.clone();
+            rho_p[i] += hi;
+            let f_p = self.compute_cost(&rho_p)?;
+
+            let mut rho_m = rho.clone();
+            rho_m[i] -= hi;
+            let f_m = self.compute_cost(&rho_m)?;
+
+            h[[i, i]] = (f_p - 2.0 * f0 + f_m) / (hi * hi);
+
+            for j in 0..i {
+                let hj = steps[j];
+
+                let mut rho_pp = rho.clone();
+                rho_pp[i] += hi;
+                rho_pp[j] += hj;
+                let f_pp = self.compute_cost(&rho_pp)?;
+
+                let mut rho_pm = rho.clone();
+                rho_pm[i] += hi;
+                rho_pm[j] -= hj;
+                let f_pm = self.compute_cost(&rho_pm)?;
+
+                let mut rho_mp = rho.clone();
+                rho_mp[i] -= hi;
+                rho_mp[j] += hj;
+                let f_mp = self.compute_cost(&rho_mp)?;
+
+                let mut rho_mm = rho.clone();
+                rho_mm[i] -= hi;
+                rho_mm[j] -= hj;
+                let f_mm = self.compute_cost(&rho_mm)?;
+
+                let hij = (f_pp - f_pm - f_mp + f_mm) / (4.0 * hi * hj);
+                h[[i, j]] = hij;
+                h[[j, i]] = hij;
+            }
+        }
+
+        enforce_symmetry(&mut h);
+        if h.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "diagnostic numeric Hessian produced non-finite values".to_string(),
+            ));
+        }
+        Ok(h)
+    }
+
+    fn compute_lamlhessian_exact_from_bundle(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let mode = super::unified::EvalMode::ValueGradientHessian;
+        let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            self.evaluate_unified_sparse(rho, bundle, mode)?
+        } else {
+            self.evaluate_unified(rho, bundle, mode)?
+        };
+        result.hessian.ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(
+                "Unified Hessian returned None for VGH mode".into(),
+            )
+        })
+    }
+
     pub(crate) fn compute_lamlhessian_consistent(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        // All strategies now route through the unified evaluator, which handles
-        // conservative degradation internally (dropping the log|H|₊ trace-
-        // curvature block when it produces non-finite values).
-        //
-        // The policy is logged for diagnostics but no longer triggers a
-        // separate code path — the unified evaluator's internal fallback
-        // produces identical results to the former external analytic fallback.
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(rho, &bundle);
-        if decision.strategy != HessianEvalStrategyKind::SpectralExact {
-            if decision.reason == "active_subspace_unstable" {
-                let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
-                log::warn!(
-                    "Exact LAML Hessian downgraded via policy (reason={}, rel_gap={:.3e}); \
-                     unified evaluator will degrade internally if needed.",
-                    decision.reason,
-                    rel_gap
-                );
-            } else {
-                log::warn!(
-                    "Exact LAML Hessian downgraded via policy (reason={}); \
-                     unified evaluator will degrade internally if needed.",
-                    decision.reason
-                );
+        if decision.reason == "active_subspace_unstable" {
+            let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
+            log::warn!(
+                "LAML Hessian strategy selected {:?} (reason={}, rel_gap={:.3e}).",
+                decision.strategy,
+                decision.reason,
+                rel_gap
+            );
+        } else if decision.strategy != HessianEvalStrategyKind::SpectralExact {
+            log::warn!(
+                "LAML Hessian strategy selected {:?} (reason={}).",
+                decision.strategy,
+                decision.reason
+            );
+        }
+        match decision.strategy {
+            HessianEvalStrategyKind::SpectralExact => {
+                self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
+            }
+            HessianEvalStrategyKind::AnalyticFallback => {
+                self.compute_lamlhessian_analytic_fallback(rho, Some(&bundle))
+            }
+            HessianEvalStrategyKind::DiagnosticNumeric => {
+                self.compute_lamlhessian_diagnostic_numeric(rho)
             }
         }
-        self.compute_lamlhessian_exact(rho)
     }
 
     pub(crate) fn compute_lamlhessian_exact(
@@ -261,20 +364,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let mode = super::unified::EvalMode::ValueGradientHessian;
-        let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-            self.evaluate_unified_sparse(rho, &bundle, mode)?
-        } else {
-            self.evaluate_unified(rho, &bundle, mode)?
-        };
-        // The unified evaluator always returns Some(hessian) for VGH mode:
-        // either the exact Hessian or a conservative penalty-only fallback
-        // (computed internally when trace-curvature terms are non-finite).
-        result.hessian.ok_or_else(|| {
-            EstimationError::RemlOptimizationFailed(
-                "Unified Hessian returned None for VGH mode".into(),
-            )
-        })
+        self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
     }
 
     pub(crate) fn compute_smoothing_correction_auto(
