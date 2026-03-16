@@ -668,21 +668,29 @@ struct BlockSlices {
     total: usize,
 }
 
-fn block_slices(states: &[ParameterBlockState]) -> BlockSlices {
+fn block_slices(
+    states: &[ParameterBlockState],
+    has_score_warp: bool,
+    has_link_dev: bool,
+) -> BlockSlices {
     let mut cursor = 0usize;
-    let marginal = cursor..cursor + states[0].beta.len();
+    let mut block_idx = 0usize;
+    let marginal = cursor..cursor + states[block_idx].beta.len();
     cursor = marginal.end;
-    let logslope = cursor..cursor + states[1].beta.len();
+    block_idx += 1;
+    let logslope = cursor..cursor + states[block_idx].beta.len();
     cursor = logslope.end;
-    let h = if states.len() > 2 {
-        let range = cursor..cursor + states[2].beta.len();
+    block_idx += 1;
+    let h = if has_score_warp {
+        let range = cursor..cursor + states[block_idx].beta.len();
         cursor = range.end;
+        block_idx += 1;
         Some(range)
     } else {
         None
     };
-    let w = if states.len() > 3 {
-        let range = cursor..cursor + states[3].beta.len();
+    let w = if has_link_dev {
+        let range = cursor..cursor + states[block_idx].beta.len();
         cursor = range.end;
         Some(range)
     } else {
@@ -931,7 +939,7 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(block_states, self.score_warp.is_some(), self.link_dev.is_some());
         let primary = primary_slices(&slices);
         let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
         let score_warp_obs = self.score_warp_obs(block_states)?;
@@ -2038,7 +2046,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (ll, gradient, hessian) = self.joint_gradient_hessian(block_states, true)?;
         let hessian = hessian.ok_or_else(|| "joint hessian unavailable".to_string())?;
-        let slices = block_slices(block_states);
+        let slices = block_slices(block_states, self.score_warp.is_some(), self.link_dev.is_some());
         let mut blockworking_sets = vec![
             BlockWorkingSet::ExactNewton {
                 gradient: gradient.slice(s![slices.marginal.clone()]).to_owned(),
@@ -2209,7 +2217,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_idx: usize,
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(block_states, self.score_warp.is_some(), self.link_dev.is_some());
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
             return Ok(self.score_warp_constraints.clone());
         }
@@ -2542,17 +2550,25 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let family = make_family(marginal_design, logslope_design);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
-            if let Some(block) = fit.block_states.first() {
+            let mut bidx = 0usize;
+            if let Some(block) = fit.block_states.get(bidx) {
                 hints_mut.marginal_beta = Some(block.beta.clone());
             }
-            if let Some(block) = fit.block_states.get(1) {
+            bidx += 1;
+            if let Some(block) = fit.block_states.get(bidx) {
                 hints_mut.logslope_beta = Some(block.beta.clone());
             }
-            if let Some(block) = fit.block_states.get(2) {
-                hints_mut.score_warp_beta = Some(block.beta.clone());
+            bidx += 1;
+            if score_warp_prepared.is_some() {
+                if let Some(block) = fit.block_states.get(bidx) {
+                    hints_mut.score_warp_beta = Some(block.beta.clone());
+                }
+                bidx += 1;
             }
-            if let Some(block) = fit.block_states.get(3) {
-                hints_mut.link_dev_beta = Some(block.beta.clone());
+            if link_dev_prepared.is_some() {
+                if let Some(block) = fit.block_states.get(bidx) {
+                    hints_mut.link_dev_beta = Some(block.beta.clone());
+                }
             }
             Ok(fit)
         },
