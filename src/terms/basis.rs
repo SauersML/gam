@@ -14,6 +14,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Wrapper to send a raw pointer across thread boundaries.
+/// SAFETY: the caller must ensure the pointer targets disjoint memory per thread.
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f64);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
 #[cfg(test)]
 use approx::assert_abs_diff_eq;
 
@@ -1682,44 +1689,132 @@ pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
     dense_bytes > IMPLICIT_OPERATOR_MEMORY_THRESHOLD
 }
 
+/// Which radial kernel family is being used. Stored in the streaming operator
+/// so that (q, t) scalars can be recomputed on the fly without a closure.
+#[derive(Debug, Clone)]
+enum RadialScalarKind {
+    /// Matern kernel: (length_scale, nu).
+    Matern {
+        length_scale: f64,
+        nu: MaternNu,
+    },
+    /// Hybrid Duchon kernel: parameters needed for `duchon_radial_jets`.
+    Duchon {
+        length_scale: f64,
+        p_order: usize,
+        s_order: usize,
+        dim: usize,
+        coeffs: DuchonPartialFractionCoeffs,
+    },
+}
+
+impl RadialScalarKind {
+    /// Evaluate the (q, t) radial scalars for a given distance `r`.
+    fn eval(&self, r: f64) -> Result<(f64, f64), BasisError> {
+        match self {
+            RadialScalarKind::Matern {
+                length_scale,
+                nu,
+            } => {
+                let (_, q, t) = matern_aniso_radial_scalars(r, *length_scale, *nu)?;
+                Ok((q, t))
+            }
+            RadialScalarKind::Duchon {
+                length_scale,
+                p_order,
+                s_order,
+                dim,
+                ref coeffs,
+            } => {
+                let jets =
+                    duchon_radial_jets(r, *length_scale, *p_order, *s_order, *dim, coeffs)?;
+                Ok((jets.q, jets.t))
+            }
+        }
+    }
+}
+
+/// Data stored for streaming (on-the-fly) recomputation of radial jet scalars.
+/// Instead of persisting O(n*k*(d+2)) arrays, the operator stores the original
+/// data/centers/eta and recomputes q/t/s per chunk during matvec operations.
+#[derive(Debug, Clone)]
+struct StreamingRadialState {
+    /// Data matrix, shape (n, d).
+    data: Array2<f64>,
+    /// Center matrix, shape (k, d).
+    centers: Array2<f64>,
+    /// Per-axis log-scales, length d.
+    eta: Vec<f64>,
+    /// Which radial kernel family to use for recomputation.
+    radial_kind: RadialScalarKind,
+}
+
+impl StreamingRadialState {
+    /// Compute (q, t, s_a[0..d]) for a single (data_row i, center j) pair.
+    ///
+    /// Returns (q, t) and writes per-axis components into `s_buf` (length d).
+    #[inline]
+    fn compute_pair(&self, i: usize, j: usize, s_buf: &mut [f64]) -> Result<(f64, f64), BasisError> {
+        let dim = self.eta.len();
+        let mut r2 = 0.0;
+        for a in 0..dim {
+            let h = self.data[[i, a]] - self.centers[[j, a]];
+            let w = (2.0 * self.eta[a].clamp(-50.0, 50.0)).exp();
+            let s_a = w * h * h;
+            s_buf[a] = s_a;
+            r2 += s_a;
+        }
+        let r = r2.sqrt();
+        self.radial_kind.eval(r)
+    }
+}
+
 /// Implicit representation of ∂X/∂ψ_d that supports matrix-vector products
-/// without materializing the full (n × p) derivative matrices.
+/// without materializing the full (n x p) derivative matrices.
 ///
-/// For anisotropic Matérn / Duchon terms with D axes, the dense path creates
-/// D matrices of size (n × p_smooth) for ∂X/∂ψ_d. At n=400K, p=2000, D=16,
-/// that is ~100 GB. This struct stores only the compact radial jet scalars:
+/// For anisotropic Matern / Duchon terms with D axes, the dense path creates
+/// D matrices of size (n x p_smooth) for dX/dpsi_d. At n=400K, p=2000, D=16,
+/// that is ~100 GB.
 ///
-/// - `q_values[i*n_knots + j]` = φ'(r_{ij}) / r_{ij}  (R-operator first scalar)
-/// - `t_values[i*n_knots + j]` = (φ''(r_{ij}) - q_{ij}) / r_{ij}²  (R-operator second scalar)
-/// - `axis_components[i*n_knots + j, d]` = exp(2η_d) · (x_{id} - c_{jd})²
+/// Two storage modes:
 ///
-/// Memory: O(n · k · (D + 2)) instead of O(n · p · D), where k = n_knots.
+/// **Materialized** (small-to-medium problems): stores pre-computed arrays
+/// - `q_values[i*n_knots + j]` = phi'(r_{ij}) / r_{ij}
+/// - `t_values[i*n_knots + j]` = (phi''(r_{ij}) - q_{ij}) / r_{ij}^2
+/// - `axis_components[i*n_knots + j, d]` = exp(2 eta_d) * (x_{id} - c_{jd})^2
+/// Memory: O(n * k * (D + 2)).
 ///
-/// The per-axis chain rule (shared by both Matérn and Duchon):
-///   ∂φ/∂ψ_a         = q · s_a
-///   ∂²φ/(∂ψ_a²)     = 2q · s_a + t · s_a²
-///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b)
+/// **Streaming** (biobank scale): stores only data/centers/eta/kernel params
+/// and recomputes (q, t, s_a) on the fly during each matvec.
+/// Memory: O(n*d + k*d) -- no per-(data,knot) storage.
+///
+/// The per-axis chain rule (shared by both Matern and Duchon):
+///   dphi/dpsi_a         = q * s_a
+///   d2phi/(dpsi_a^2)    = 2q * s_a + t * s_a^2
+///   d2phi/(dpsi_a dpsi_b) = t * s_a * s_b   (a != b)
 #[derive(Debug, Clone)]
 pub struct ImplicitDesignPsiDerivative {
-    /// Per (data, knot) pair axis components.
+    /// Pre-computed per (data, knot) pair axis components (materialized mode).
     /// Shape: (n * n_knots, D) stored in row-major order.
-    /// `axis_components[[i * n_knots + j, d]]` = s_{d,i,j} = exp(2η_d) · h_{d,ij}².
+    /// Empty (0x0) in streaming mode.
     axis_components: Array2<f64>,
 
-    /// Per (data, knot) pair R-operator first scalar.
-    /// Shape: (n * n_knots,).
-    /// `q_values[i * n_knots + j]` = φ'(r_{ij}) / r_{ij}.
+    /// Pre-computed R-operator first scalar (materialized mode).
+    /// Shape: (n * n_knots,). Empty in streaming mode.
     q_values: Array1<f64>,
 
-    /// Per (data, knot) pair R-operator second scalar.
-    /// Shape: (n * n_knots,).
-    /// `t_values[i * n_knots + j]` = (φ''(r_{ij}) - q_{ij}) / r_{ij}².
+    /// Pre-computed R-operator second scalar (materialized mode).
+    /// Shape: (n * n_knots,). Empty in streaming mode.
     t_values: Array1<f64>,
 
-    /// Identifiability/constraint transform Z: (n_knots × p_constrained).
+    /// When set, enables streaming recomputation of q/t/s from raw inputs
+    /// instead of reading from the pre-computed arrays above.
+    streaming: Option<StreamingRadialState>,
+
+    /// Identifiability/constraint transform Z: (n_knots x p_constrained).
     /// Converts raw knot-space vectors to the identifiability-constrained
     /// basis. For Duchon this is the kernel-constraint nullspace Z_kernel;
-    /// for Matérn with identifiability constraints, it is the corresponding Z.
+    /// for Matern with identifiability constraints, it is the corresponding Z.
     /// `None` means the identity (no constraint).
     ident_transform: Option<Array2<f64>>,
 
@@ -1736,7 +1831,7 @@ pub struct ImplicitDesignPsiDerivative {
     n_knots: usize,
 
     /// Number of polynomial columns appended after the smooth part.
-    /// These have zero derivative with respect to ψ_d.
+    /// These have zero derivative with respect to psi_d.
     n_poly: usize,
 
     /// Number of axes (dimension D).
@@ -1760,6 +1855,9 @@ impl ImplicitDesignPsiDerivative {
     /// - `ident_transform`: optional (n_knots × p_constrained) constraint projection.
     /// - `full_ident_transform`: optional further projection after padding.
     /// - `n`, `n_knots`, `n_poly`, `n_axes`: dimensions.
+    /// Construct from pre-computed (materialized) radial jet scalars.
+    /// This is the original path for small-to-medium problems where
+    /// O(n*k*(d+2)) storage is acceptable.
     pub fn new(
         q_values: Array1<f64>,
         t_values: Array1<f64>,
@@ -1779,6 +1877,7 @@ impl ImplicitDesignPsiDerivative {
             axis_components,
             q_values,
             t_values,
+            streaming: None,
             ident_transform,
             full_ident_transform,
             n,
@@ -1786,6 +1885,48 @@ impl ImplicitDesignPsiDerivative {
             n_poly,
             n_axes,
         }
+    }
+
+    /// Construct a streaming operator that recomputes (q, t, s_a) on the fly
+    /// from raw data/centers/eta during each matvec. No O(n*k) arrays are stored.
+    /// This is the biobank-scale path.
+    pub fn new_streaming(
+        data: Array2<f64>,
+        centers: Array2<f64>,
+        eta: Vec<f64>,
+        radial_kind: RadialScalarKind,
+        ident_transform: Option<Array2<f64>>,
+        full_ident_transform: Option<Array2<f64>>,
+        n_poly: usize,
+    ) -> Self {
+        let n = data.nrows();
+        let n_knots = centers.nrows();
+        let n_axes = data.ncols();
+        assert_eq!(eta.len(), n_axes);
+        Self {
+            // Empty arrays -- not used in streaming mode.
+            axis_components: Array2::<f64>::zeros((0, 0)),
+            q_values: Array1::<f64>::zeros(0),
+            t_values: Array1::<f64>::zeros(0),
+            streaming: Some(StreamingRadialState {
+                data,
+                centers,
+                eta,
+                radial_kind,
+            }),
+            ident_transform,
+            full_ident_transform,
+            n,
+            n_knots,
+            n_poly,
+            n_axes,
+        }
+    }
+
+    /// Whether this operator is in streaming (recompute-on-the-fly) mode.
+    #[inline]
+    fn is_streaming(&self) -> bool {
+        self.streaming.is_some()
     }
 
     /// Number of data points.
@@ -1877,6 +2018,90 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
+    /// Streaming accumulate knot vector from on-the-fly radial scalars.
+    fn streaming_accumulate_knot_vector<G>(&self, v: &ArrayView1<f64>, deriv_fn: G) -> Array1<f64>
+    where G: Fn(f64, f64, &[f64]) -> f64 + Send + Sync {
+        let st = self.streaming.as_ref().unwrap();
+        let (n, k, dim) = (self.n, self.n_knots, self.n_axes);
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let nc = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let ps: Vec<Array1<f64>> = (0..nc).into_par_iter().map(|ci| {
+                let s = ci * IMPLICIT_MATVEC_CHUNK_SIZE;
+                let e = (s + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                let mut loc = Array1::<f64>::zeros(k);
+                let mut sb = vec![0.0; dim];
+                for i in s..e {
+                    let vi = v[i]; if vi == 0.0 { continue; }
+                    for j in 0..k { if let Ok((q,t)) = st.compute_pair(i,j,&mut sb) { loc[j] += vi * deriv_fn(q,t,&sb); } }
+                }
+                loc
+            }).collect();
+            let mut tot = Array1::<f64>::zeros(k);
+            for p in ps { tot += &p; }
+            tot
+        } else {
+            let mut tot = Array1::<f64>::zeros(k);
+            let mut sb = vec![0.0; dim];
+            for i in 0..n {
+                let vi = v[i]; if vi == 0.0 { continue; }
+                for j in 0..k { if let Ok((q,t)) = st.compute_pair(i,j,&mut sb) { tot[j] += vi * deriv_fn(q,t,&sb); } }
+            }
+            tot
+        }
+    }
+    /// Streaming forward multiply.
+    fn streaming_forward_mul<G>(&self, u_knot: &Array1<f64>, deriv_fn: G) -> Array1<f64>
+    where G: Fn(f64, f64, &[f64]) -> f64 + Send + Sync {
+        let st = self.streaming.as_ref().unwrap();
+        let (n, k, dim) = (self.n, self.n_knots, self.n_axes);
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let nc = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let cr: Vec<(usize, Vec<f64>)> = (0..nc).into_par_iter().map(|ci| {
+                let s = ci * IMPLICIT_MATVEC_CHUNK_SIZE;
+                let e = (s + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                let mut loc = vec![0.0; e - s];
+                let mut sb = vec![0.0; dim];
+                for i in s..e {
+                    let mut val = 0.0;
+                    for j in 0..k { if let Ok((q,t)) = st.compute_pair(i,j,&mut sb) { val += deriv_fn(q,t,&sb) * u_knot[j]; } }
+                    loc[i - s] = val;
+                }
+                (s, loc)
+            }).collect();
+            let mut res = Array1::<f64>::zeros(n);
+            for (s, vs) in cr { for (o, &v) in vs.iter().enumerate() { res[s+o] = v; } }
+            res
+        } else {
+            let mut res = Array1::<f64>::zeros(n);
+            let mut sb = vec![0.0; dim];
+            for i in 0..n {
+                let mut val = 0.0;
+                for j in 0..k { if let Ok((q,t)) = st.compute_pair(i,j,&mut sb) { val += deriv_fn(q,t,&sb) * u_knot[j]; } }
+                res[i] = val;
+            }
+            res
+        }
+    }
+    /// Streaming materialization: build (n x k) raw matrix then project.
+    fn streaming_materialize<G>(&self, deriv_fn: G) -> Array2<f64>
+    where G: Fn(f64, f64, &[f64]) -> f64 + Send + Sync {
+        let st = self.streaming.as_ref().unwrap();
+        let (n, k, dim) = (self.n, self.n_knots, self.n_axes);
+        let mut raw = Array2::<f64>::zeros((n, k));
+        let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
+        let nc = (n + cs - 1) / cs;
+        { let rp = SendPtr(raw.as_mut_ptr());
+          (0..nc).into_par_iter().for_each(|ci| {
+            let s = ci * cs; let e = (s + cs).min(n);
+            let mut sb = vec![0.0; dim];
+            for i in s..e { for j in 0..k {
+                if let Ok((q,t)) = st.compute_pair(i,j,&mut sb) { unsafe { *rp.0.add(i*k+j) = deriv_fn(q,t,&sb); } }
+            }}
+          });
+        }
+        self.project_matrix(raw)
+    }
+
     /// Project a raw knot-space vector through the identifiability transform
     /// and pad with zeros for polynomial columns.
     fn project_and_pad(&self, raw_knot_vec: &Array1<f64>) -> Array1<f64> {
@@ -1936,12 +2161,13 @@ impl ImplicitDesignPsiDerivative {
     pub fn transpose_mul(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
         assert!(axis < self.n_axes);
         assert_eq!(v.len(), self.n);
-
+        if self.is_streaming() {
+            let raw = self.streaming_accumulate_knot_vector(v, |q, _t, sb| q * sb[axis]);
+            return self.project_and_pad(&raw);
+        }
         let af = &self.axis_components;
         let qv = &self.q_values;
-
         let raw = self.accumulate_knot_vector(v, |idx| qv[idx] * af[[idx, axis]]);
-
         self.project_and_pad(&raw)
     }
 
@@ -1955,8 +2181,10 @@ impl ImplicitDesignPsiDerivative {
     pub fn forward_mul(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
         assert!(axis < self.n_axes);
         assert_eq!(u.len(), self.p_out());
-
         let u_knot = self.unproject(u);
+        if self.is_streaming() {
+            return self.streaming_forward_mul(&u_knot, |q, _t, sb| q * sb[axis]);
+        }
         let n = self.n;
         let k = self.n_knots;
         let af = &self.axis_components;
@@ -2010,6 +2238,10 @@ impl ImplicitDesignPsiDerivative {
     pub fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
         assert!(axis < self.n_axes);
         assert_eq!(v.len(), self.n);
+        if self.is_streaming() {
+            let raw = self.streaming_accumulate_knot_vector(v, |q, t, sb| { let s = sb[axis]; 2.0*q*s + t*s*s });
+            return self.project_and_pad(&raw);
+        }
         let af = &self.axis_components;
         let qv = &self.q_values;
         let tv = &self.t_values;
@@ -2031,6 +2263,10 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_e < self.n_axes);
         assert_ne!(axis_d, axis_e);
         assert_eq!(v.len(), self.n);
+        if self.is_streaming() {
+            let raw = self.streaming_accumulate_knot_vector(v, |_q, t, sb| t * sb[axis_d] * sb[axis_e]);
+            return self.project_and_pad(&raw);
+        }
         let af = &self.axis_components;
         let tv = &self.t_values;
         let raw =
@@ -2042,8 +2278,10 @@ impl ImplicitDesignPsiDerivative {
     pub fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
         assert!(axis < self.n_axes);
         assert_eq!(u.len(), self.p_out());
-
         let u_knot = self.unproject(u);
+        if self.is_streaming() {
+            return self.streaming_forward_mul(&u_knot, |q, t, sb| { let s = sb[axis]; 2.0*q*s + t*s*s });
+        }
         let n = self.n;
         let k = self.n_knots;
         let af = &self.axis_components;
@@ -2093,8 +2331,10 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_e < self.n_axes);
         assert_ne!(axis_d, axis_e);
         assert_eq!(u.len(), self.p_out());
-
         let u_knot = self.unproject(u);
+        if self.is_streaming() {
+            return self.streaming_forward_mul(&u_knot, |_q, t, sb| t * sb[axis_d] * sb[axis_e]);
+        }
         let n = self.n;
         let k = self.n_knots;
         let af = &self.axis_components;
@@ -2139,10 +2379,11 @@ impl ImplicitDesignPsiDerivative {
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Array2<f64> {
         assert!(axis < self.n_axes);
+        if self.is_streaming() {
+            return self.streaming_materialize(|q, _t, sb| q * sb[axis]);
+        }
         let n = self.n;
         let k = self.n_knots;
-
-        // Build raw (n × k) kernel derivative: row i, col j = q_{ij} * s_{d,ij}.
         let mut raw = Array2::<f64>::zeros((n, k));
         for i in 0..n {
             let base = i * k;
@@ -2150,16 +2391,17 @@ impl ImplicitDesignPsiDerivative {
                 raw[[i, j]] = self.q_values[base + j] * self.axis_components[[base + j, axis]];
             }
         }
-
         self.project_matrix(raw)
     }
 
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
         assert!(axis < self.n_axes);
+        if self.is_streaming() {
+            return self.streaming_materialize(|q, t, sb| { let s = sb[axis]; 2.0*q*s + t*s*s });
+        }
         let n = self.n;
         let k = self.n_knots;
-
         let mut raw = Array2::<f64>::zeros((n, k));
         for i in 0..n {
             let base = i * k;
@@ -2168,7 +2410,6 @@ impl ImplicitDesignPsiDerivative {
                 raw[[i, j]] = 2.0 * self.q_values[base + j] * s + self.t_values[base + j] * s * s;
             }
         }
-
         self.project_matrix(raw)
     }
 
@@ -2179,6 +2420,9 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_d < self.n_axes);
         assert!(axis_e < self.n_axes);
         assert_ne!(axis_d, axis_e);
+        if self.is_streaming() {
+            return self.streaming_materialize(|_q, t, sb| t * sb[axis_d] * sb[axis_e]);
+        }
         let n = self.n;
         let k = self.n_knots;
         let mut raw = Array2::<f64>::zeros((n, k));
@@ -2229,6 +2473,7 @@ fn build_aniso_design_psi_derivatives_shared<F>(
     full_ident_transform: Option<Array2<f64>>,
     n_poly: usize,
     radial_scalars: F,
+    radial_kind: RadialScalarKind,
 ) -> Result<AnisoBasisPsiDerivatives, BasisError>
 where
     F: Fn(f64) -> Result<(f64, f64), BasisError> + Send + Sync,
@@ -2243,73 +2488,80 @@ where
         )));
     }
 
+    let use_implicit = should_use_implicit_operators(n, p_final, dim);
+
+    // ── Streaming path: biobank scale ─────────────────────────────────────
+    // When dense materialization would exceed the memory threshold, build a
+    // streaming operator that stores only data/centers/eta/radial_kind and
+    // recomputes (q, t, s_a) on the fly during every matvec.
+    if use_implicit {
+        let op = ImplicitDesignPsiDerivative::new_streaming(
+            data.to_owned(), centers.to_owned(), eta.to_vec(), radial_kind,
+            ident_transform, full_ident_transform, n_poly,
+        );
+        return Ok(AnisoBasisPsiDerivatives {
+            design_first: Vec::new(),
+            design_second_diag: Vec::new(),
+            penalties_first: vec![Vec::new(); dim],
+            penalties_second_diag: vec![Vec::new(); dim],
+            penalties_cross: Vec::new(),
+            penalties_cross_pairs: Vec::new(),
+            implicit_operator: Some(op),
+        });
+    }
+
+    // ── Materialized path: small-to-medium problems ───────────────────────
+    // Allocate O(n*k) arrays up front and fill with parallel chunks that
+    // write directly into preallocated storage via raw pointers. No
+    // intermediate Vec<(i, q_row, t_row, s_row)> collection.
     let nk = n * k;
     let mut q_values = Array1::<f64>::zeros(nk);
     let mut t_values = Array1::<f64>::zeros(nk);
     let mut axis_components = Array2::<f64>::zeros((nk, dim));
 
-    let row_results: Result<Vec<_>, BasisError> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut data_row_buf = vec![0.0; dim];
-            let mut center_buf = vec![0.0; dim];
-            for a in 0..dim {
-                data_row_buf[a] = data[[i, a]];
-            }
-            let mut q_row = vec![0.0; k];
-            let mut t_row = vec![0.0; k];
-            let mut s_row = vec![vec![0.0; k]; dim];
-            for j in 0..k {
-                for a in 0..dim {
-                    center_buf[a] = centers[[j, a]];
+    let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
+    let nc = (n + cs - 1) / cs;
+    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    {
+        let qp = SendPtr(q_values.as_mut_ptr());
+        let tp = SendPtr(t_values.as_mut_ptr());
+        let ap = SendPtr(axis_components.as_mut_ptr());
+        (0..nc).into_par_iter().for_each(|ci| {
+            let start = ci * cs;
+            let end = (start + cs).min(n);
+            let mut drb = vec![0.0; dim];
+            let mut cb = vec![0.0; dim];
+            for i in start..end {
+                for a in 0..dim { drb[a] = data[[i, a]]; }
+                for j in 0..k {
+                    for a in 0..dim { cb[a] = centers[[j, a]]; }
+                    let (r, sv) = aniso_distance_and_components(&drb, &cb, eta);
+                    let (q, t) = match radial_scalars(r) {
+                        Ok(p) => p,
+                        Err(_) => { err_flag.store(true, std::sync::atomic::Ordering::Relaxed); return; }
+                    };
+                    let flat = i * k + j;
+                    unsafe {
+                        *qp.0.add(flat) = q;
+                        *tp.0.add(flat) = t;
+                        for a in 0..dim { *ap.0.add(flat * dim + a) = sv[a]; }
+                    }
                 }
-                let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                let (q, t) = radial_scalars(r)?;
-                q_row[j] = q;
-                t_row[j] = t;
-                for a in 0..dim {
-                    s_row[a][j] = s_vec[a];
-                }
             }
-            Ok((i, q_row, t_row, s_row))
-        })
-        .collect();
-
-    for (i, q_row, t_row, s_row) in row_results? {
-        let base = i * k;
-        for j in 0..k {
-            q_values[base + j] = q_row[j];
-            t_values[base + j] = t_row[j];
-            for a in 0..dim {
-                axis_components[[base + j, a]] = s_row[a][j];
-            }
-        }
+        });
+    }
+    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(BasisError::InvalidInput(
+            "radial scalar evaluation failed during aniso derivative construction".into(),
+        ));
     }
 
-    let implicit_operator = ImplicitDesignPsiDerivative::new(
-        q_values,
-        t_values,
-        axis_components,
-        ident_transform,
-        full_ident_transform,
-        n,
-        k,
-        n_poly,
-        dim,
+    let op = ImplicitDesignPsiDerivative::new(
+        q_values, t_values, axis_components,
+        ident_transform, full_ident_transform, n, k, n_poly, dim,
     );
-
-    let use_implicit_design = should_use_implicit_operators(n, p_final, dim);
-    let (design_first, design_second_diag) = if use_implicit_design {
-        (Vec::new(), Vec::new())
-    } else {
-        let design_first = (0..dim)
-            .map(|axis| implicit_operator.materialize_first(axis))
-            .collect();
-        let design_second_diag = (0..dim)
-            .map(|axis| implicit_operator.materialize_second_diag(axis))
-            .collect();
-        (design_first, design_second_diag)
-    };
+    let design_first = (0..dim).map(|a| op.materialize_first(a)).collect();
+    let design_second_diag = (0..dim).map(|a| op.materialize_second_diag(a)).collect();
 
     Ok(AnisoBasisPsiDerivatives {
         design_first,
@@ -2318,7 +2570,7 @@ where
         penalties_second_diag: vec![Vec::new(); dim],
         penalties_cross: Vec::new(),
         penalties_cross_pairs: Vec::new(),
-        implicit_operator: Some(implicit_operator),
+        implicit_operator: Some(op),
     })
 }
 
@@ -5721,6 +5973,7 @@ fn pure_duchon_block_order(p_order: usize, s_order: usize) -> usize {
     p_order + s_order
 }
 
+#[derive(Debug, Clone)]
 struct DuchonPartialFractionCoeffs {
     a: Vec<f64>,
     b: Vec<f64>,
@@ -7557,6 +7810,7 @@ fn build_matern_design_psi_aniso_derivatives(
             let (_, q, t) = matern_aniso_radial_scalars(r, length_scale, nu)?;
             Ok((q, t))
         },
+        RadialScalarKind::Matern { length_scale, nu },
     )
 }
 
@@ -7770,6 +8024,9 @@ fn build_duchon_design_psi_aniso_derivatives(
         .map(|zf| zf.ncols())
         .unwrap_or(p_padded);
 
+    let radial_kind = RadialScalarKind::Duchon {
+        length_scale, p_order, s_order, dim, coeffs: coeffs.clone(),
+    };
     build_aniso_design_psi_derivatives_shared(
         data,
         centers,
@@ -7782,6 +8039,7 @@ fn build_duchon_design_psi_aniso_derivatives(
             let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, &coeffs)?;
             Ok((jets.q, jets.t))
         },
+        radial_kind,
     )
 }
 
