@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
+    ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper, fit_custom_family,
     resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
     wrap_spatial_implicit_psi_operator,
@@ -41,8 +42,7 @@ use crate::solver::estimate::{
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const MIN_PROB: f64 = 1e-12;
 
@@ -867,6 +867,10 @@ struct SurvivalJointPsiDirection {
     z_t_entry_psi: Array1<f64>,
     z_ls_exit_psi: Array1<f64>,
     z_ls_entry_psi: Array1<f64>,
+    x_t_exit_action: Option<CustomFamilyPsiDesignAction>,
+    x_t_entry_action: Option<CustomFamilyPsiDesignAction>,
+    x_ls_exit_action: Option<CustomFamilyPsiDesignAction>,
+    x_ls_entry_action: Option<CustomFamilyPsiDesignAction>,
 }
 
 struct SurvivalExactNewtonJointPsiWorkspace {
@@ -874,18 +878,7 @@ struct SurvivalExactNewtonJointPsiWorkspace {
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     joint_quantities: SurvivalJointQuantities,
-    psi_directions: Mutex<HashMap<usize, Option<Arc<SurvivalJointPsiDirection>>>>,
-}
-
-struct SurvivalJointPsiAction {
-    x_t_exit_psi: Option<CustomFamilyPsiDesignAction>,
-    x_t_entry_psi: Option<CustomFamilyPsiDesignAction>,
-    x_ls_exit_psi: Option<CustomFamilyPsiDesignAction>,
-    x_ls_entry_psi: Option<CustomFamilyPsiDesignAction>,
-    z_t_exit_psi: Array1<f64>,
-    z_t_entry_psi: Array1<f64>,
-    z_ls_exit_psi: Array1<f64>,
-    z_ls_entry_psi: Array1<f64>,
+    psi_directions: ExactNewtonJointPsiDirectCache<SurvivalJointPsiDirection>,
 }
 
 fn split_survival_psi_design(
@@ -1252,11 +1245,16 @@ impl SurvivalLocationScaleFamily {
                     let mut x_t_entry_psi = Array2::<f64>::zeros((n, pt));
                     let mut x_ls_exit_psi = Array2::<f64>::zeros((n, pls));
                     let mut x_ls_entry_psi = Array2::<f64>::zeros((n, pls));
+                    let mut x_t_exit_action = None;
+                    let mut x_t_entry_action = None;
+                    let mut x_ls_exit_action = None;
+                    let mut x_ls_entry_action = None;
                     match block_idx {
                         Self::BLOCK_THRESHOLD => {
+                            let total_rows = if t_time_varying { 2 * n } else { n };
                             let x_psi = resolve_custom_family_x_psi(
                                 deriv,
-                                if t_time_varying { 2 * n } else { n },
+                                total_rows,
                                 pt,
                                 "SurvivalLocationScaleFamily threshold",
                             )?;
@@ -1268,11 +1266,27 @@ impl SurvivalLocationScaleFamily {
                             )?;
                             x_t_exit_psi.assign(&exit);
                             x_t_entry_psi.assign(&entry);
+                            if let Ok(action) = CustomFamilyPsiDesignAction::from_first_derivative(
+                                deriv,
+                                total_rows,
+                                pt,
+                                0..total_rows,
+                                "SurvivalLocationScaleFamily threshold",
+                            ) {
+                                if t_time_varying {
+                                    x_t_exit_action = Some(action.slice_rows(0..n)?);
+                                    x_t_entry_action = Some(action.slice_rows(n..2 * n)?);
+                                } else {
+                                    x_t_exit_action = Some(action.clone());
+                                    x_t_entry_action = Some(action);
+                                }
+                            }
                         }
                         Self::BLOCK_LOG_SIGMA => {
+                            let total_rows = if ls_time_varying { 2 * n } else { n };
                             let x_psi = resolve_custom_family_x_psi(
                                 deriv,
-                                if ls_time_varying { 2 * n } else { n },
+                                total_rows,
                                 pls,
                                 "SurvivalLocationScaleFamily log-sigma",
                             )?;
@@ -1284,6 +1298,21 @@ impl SurvivalLocationScaleFamily {
                             )?;
                             x_ls_exit_psi.assign(&exit);
                             x_ls_entry_psi.assign(&entry);
+                            if let Ok(action) = CustomFamilyPsiDesignAction::from_first_derivative(
+                                deriv,
+                                total_rows,
+                                pls,
+                                0..total_rows,
+                                "SurvivalLocationScaleFamily log-sigma",
+                            ) {
+                                if ls_time_varying {
+                                    x_ls_exit_action = Some(action.slice_rows(0..n)?);
+                                    x_ls_entry_action = Some(action.slice_rows(n..2 * n)?);
+                                } else {
+                                    x_ls_exit_action = Some(action.clone());
+                                    x_ls_entry_action = Some(action);
+                                }
+                            }
                         }
                         _ => return Ok(None),
                     }
@@ -1302,102 +1331,11 @@ impl SurvivalLocationScaleFamily {
                         z_t_entry_psi,
                         z_ls_exit_psi,
                         z_ls_entry_psi,
+                        x_t_exit_action,
+                        x_t_entry_action,
+                        x_ls_exit_action,
+                        x_ls_entry_action,
                     }));
-                }
-                global += 1;
-            }
-        }
-        Ok(None)
-    }
-
-    fn exact_newton_joint_psi_action(
-        &self,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-    ) -> Result<Option<SurvivalJointPsiAction>, String> {
-        if block_states.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(format!(
-                "SurvivalLocationScaleFamily joint psi action expects {} blocks and derivative lists, got {} and {}",
-                self.expected_blocks(),
-                block_states.len(),
-                derivative_blocks.len()
-            ));
-        }
-
-        let n = self.n;
-        let pt = self.x_threshold.ncols();
-        let pls = self.x_log_sigma.ncols();
-        let beta_t = &block_states[Self::BLOCK_THRESHOLD].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let t_time_varying = self.x_threshold_entry.is_some();
-        let ls_time_varying = self.x_log_sigma_entry.is_some();
-
-        let mut global = 0usize;
-        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for deriv in block_derivs {
-                if global == psi_index {
-                    match block_idx {
-                        Self::BLOCK_THRESHOLD => {
-                            let total_rows = if t_time_varying { 2 * n } else { n };
-                            let action = match CustomFamilyPsiDesignAction::from_first_derivative(
-                                deriv,
-                                total_rows,
-                                pt,
-                                0..total_rows,
-                                "SurvivalLocationScaleFamily threshold",
-                            ) {
-                                Ok(action) => action,
-                                Err(_) => return Ok(None),
-                            };
-                            let (exit_action, entry_action) = if t_time_varying {
-                                (action.slice_rows(0..n)?, action.slice_rows(n..2 * n)?)
-                            } else {
-                                (action.clone(), action)
-                            };
-                            return Ok(Some(SurvivalJointPsiAction {
-                                z_t_exit_psi: exit_action.forward_mul(beta_t.view()),
-                                z_t_entry_psi: entry_action.forward_mul(beta_t.view()),
-                                z_ls_exit_psi: Array1::zeros(n),
-                                z_ls_entry_psi: Array1::zeros(n),
-                                x_t_exit_psi: Some(exit_action),
-                                x_t_entry_psi: Some(entry_action),
-                                x_ls_exit_psi: None,
-                                x_ls_entry_psi: None,
-                            }));
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            let total_rows = if ls_time_varying { 2 * n } else { n };
-                            let action = match CustomFamilyPsiDesignAction::from_first_derivative(
-                                deriv,
-                                total_rows,
-                                pls,
-                                0..total_rows,
-                                "SurvivalLocationScaleFamily log-sigma",
-                            ) {
-                                Ok(action) => action,
-                                Err(_) => return Ok(None),
-                            };
-                            let (exit_action, entry_action) = if ls_time_varying {
-                                (action.slice_rows(0..n)?, action.slice_rows(n..2 * n)?)
-                            } else {
-                                (action.clone(), action)
-                            };
-                            return Ok(Some(SurvivalJointPsiAction {
-                                z_t_exit_psi: Array1::zeros(n),
-                                z_t_entry_psi: Array1::zeros(n),
-                                z_ls_exit_psi: exit_action.forward_mul(beta_ls.view()),
-                                z_ls_entry_psi: entry_action.forward_mul(beta_ls.view()),
-                                x_t_exit_psi: None,
-                                x_t_entry_psi: None,
-                                x_ls_exit_psi: Some(exit_action),
-                                x_ls_entry_psi: Some(entry_action),
-                            }));
-                        }
-                        _ => return Ok(None),
-                    }
                 }
                 global += 1;
             }
@@ -4516,12 +4454,13 @@ impl SurvivalExactNewtonJointPsiWorkspace {
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
         let joint_quantities = family.collect_joint_quantities(&block_states)?;
+        let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
             block_states,
             derivative_blocks,
             joint_quantities,
-            psi_directions: Mutex::new(HashMap::new()),
+            psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
         })
     }
 
@@ -4529,33 +4468,14 @@ impl SurvivalExactNewtonJointPsiWorkspace {
         &self,
         psi_index: usize,
     ) -> Result<Option<Arc<SurvivalJointPsiDirection>>, String> {
-        {
-            let cache = self
-                .psi_directions
-                .lock()
-                .map_err(|_| "survival joint psi direction cache poisoned".to_string())?;
-            if let Some(dir) = cache.get(&psi_index) {
-                return Ok(dir.clone());
-            }
-        }
-
-        let dir = self
-            .family
-            .exact_newton_joint_psi_direction(
-                &self.block_states,
-                &self.derivative_blocks,
-                psi_index,
-            )?
-            .map(Arc::new);
-
-        let mut cache = self
-            .psi_directions
-            .lock()
-            .map_err(|_| "survival joint psi direction cache poisoned".to_string())?;
-        Ok(cache
-            .entry(psi_index)
-            .or_insert_with(|| dir.clone())
-            .clone())
+        self.psi_directions.get_or_try_init(psi_index, || {
+            self.family
+                .exact_newton_joint_psi_direction(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    psi_index,
+                )
+        })
     }
 }
 
@@ -5543,31 +5463,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 derivative_blocks.len()
             ));
         }
-        let implicit_dir =
-            self.exact_newton_joint_psi_action(block_states, derivative_blocks, psi_index)?;
-        let dense_dir = if implicit_dir.is_none() {
+        let Some(dir) =
             self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index)?
-        } else {
-            None
+        else {
+            return Ok(None);
         };
-        let (z_t_exit_psi, z_t_entry_psi, z_ls_exit_psi, z_ls_entry_psi) =
-            if let Some(ref dir) = implicit_dir {
-                (
-                    &dir.z_t_exit_psi,
-                    &dir.z_t_entry_psi,
-                    &dir.z_ls_exit_psi,
-                    &dir.z_ls_entry_psi,
-                )
-            } else if let Some(ref dir) = dense_dir {
-                (
-                    &dir.z_t_exit_psi,
-                    &dir.z_t_entry_psi,
-                    &dir.z_ls_exit_psi,
-                    &dir.z_ls_entry_psi,
-                )
-            } else {
-                return Ok(None);
-            };
+        let z_t_exit_psi = &dir.z_t_exit_psi;
+        let z_t_entry_psi = &dir.z_t_entry_psi;
+        let z_ls_exit_psi = &dir.z_ls_exit_psi;
+        let z_ls_entry_psi = &dir.z_ls_entry_psi;
         let q = self.collect_joint_quantities(block_states)?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
@@ -5636,31 +5540,18 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d_threshold_score_row_exit = &q.d2_q1 * &q1_psi * &q.dq_t + &q.d1_q1 * &dq_t_exit_psi;
         let d_threshold_score_row_entry =
             &q.d2_q0 * &q0_psi * dq_t_entry + &q.d1_q0 * &dq_t_entry_psi;
-        let threshold_score = if let Some(ref dir) = implicit_dir {
-            dir.x_t_exit_psi
+        let threshold_score = dir
+            .x_t_exit_action
+            .as_ref()
+            .map(|action| action.transpose_mul(threshold_score_row_exit.view()))
+            .unwrap_or_else(|| dir.x_t_exit_psi.t().dot(&threshold_score_row_exit))
+            + x_threshold_exit.t().dot(&d_threshold_score_row_exit)
+            + dir
+                .x_t_entry_action
                 .as_ref()
-                .map(|action: &CustomFamilyPsiDesignAction| {
-                    action.transpose_mul(threshold_score_row_exit.view())
-                })
-                .unwrap_or_else(|| Array1::zeros(x_threshold_exit.ncols()))
-                + x_threshold_exit.t().dot(&d_threshold_score_row_exit)
-                + dir
-                    .x_t_entry_psi
-                    .as_ref()
-                    .map(|action: &CustomFamilyPsiDesignAction| {
-                        action.transpose_mul(threshold_score_row_entry.view())
-                    })
-                    .unwrap_or_else(|| Array1::zeros(x_threshold_entry.ncols()))
-                + x_threshold_entry.t().dot(&d_threshold_score_row_entry)
-        } else {
-            let dir = dense_dir
-                .as_ref()
-                .expect("dense psi direction should exist when implicit direction is absent");
-            dir.x_t_exit_psi.t().dot(&threshold_score_row_exit)
-                + x_threshold_exit.t().dot(&d_threshold_score_row_exit)
-                + dir.x_t_entry_psi.t().dot(&threshold_score_row_entry)
-                + x_threshold_entry.t().dot(&d_threshold_score_row_entry)
-        };
+                .map(|action| action.transpose_mul(threshold_score_row_entry.view()))
+                .unwrap_or_else(|| dir.x_t_entry_psi.t().dot(&threshold_score_row_entry))
+            + x_threshold_entry.t().dot(&d_threshold_score_row_entry);
         score_psi
             .slice_mut(s![offsets[1]..offsets[2]])
             .assign(&threshold_score);
@@ -5670,31 +5561,18 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d_log_sigma_score_row_exit = &q.d2_q1 * &q1_psi * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_psi;
         let d_log_sigma_score_row_entry =
             &q.d2_q0 * &q0_psi * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_psi;
-        let log_sigma_score = if let Some(ref dir) = implicit_dir {
-            dir.x_ls_exit_psi
+        let log_sigma_score = dir
+            .x_ls_exit_action
+            .as_ref()
+            .map(|action| action.transpose_mul(log_sigma_score_row_exit.view()))
+            .unwrap_or_else(|| dir.x_ls_exit_psi.t().dot(&log_sigma_score_row_exit))
+            + x_log_sigma_exit.t().dot(&d_log_sigma_score_row_exit)
+            + dir
+                .x_ls_entry_action
                 .as_ref()
-                .map(|action: &CustomFamilyPsiDesignAction| {
-                    action.transpose_mul(log_sigma_score_row_exit.view())
-                })
-                .unwrap_or_else(|| Array1::zeros(x_log_sigma_exit.ncols()))
-                + x_log_sigma_exit.t().dot(&d_log_sigma_score_row_exit)
-                + dir
-                    .x_ls_entry_psi
-                    .as_ref()
-                    .map(|action: &CustomFamilyPsiDesignAction| {
-                        action.transpose_mul(log_sigma_score_row_entry.view())
-                    })
-                    .unwrap_or_else(|| Array1::zeros(x_log_sigma_entry.ncols()))
-                + x_log_sigma_entry.t().dot(&d_log_sigma_score_row_entry)
-        } else {
-            let dir = dense_dir
-                .as_ref()
-                .expect("dense psi direction should exist when implicit direction is absent");
-            dir.x_ls_exit_psi.t().dot(&log_sigma_score_row_exit)
-                + x_log_sigma_exit.t().dot(&d_log_sigma_score_row_exit)
-                + dir.x_ls_entry_psi.t().dot(&log_sigma_score_row_entry)
-                + x_log_sigma_entry.t().dot(&d_log_sigma_score_row_entry)
-        };
+                .map(|action| action.transpose_mul(log_sigma_score_row_entry.view()))
+                .unwrap_or_else(|| dir.x_ls_entry_psi.t().dot(&log_sigma_score_row_entry))
+            + x_log_sigma_entry.t().dot(&d_log_sigma_score_row_entry);
         score_psi
             .slice_mut(s![offsets[2]..offsets[3]])
             .assign(&log_sigma_score);
@@ -5756,7 +5634,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let dh_lw_entry = -(&q.d3_q0 * &q0_psi * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_psi);
         let dh_lw_exit = -(&q.d3_q1 * &q1_psi * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_psi);
 
-        if let Some(dir) = implicit_dir {
+        if dir.x_t_exit_action.is_some()
+            || dir.x_t_entry_action.is_some()
+            || dir.x_ls_exit_action.is_some()
+            || dir.x_ls_entry_action.is_some()
+        {
             let mut channels = vec![
                 CustomFamilyJointDesignChannel::new(
                     offsets[0]..offsets[1],
@@ -5771,22 +5653,22 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 CustomFamilyJointDesignChannel::new(
                     offsets[1]..offsets[2],
                     shared_dense_arc(x_threshold_exit),
-                    dir.x_t_exit_psi,
+                    dir.x_t_exit_action.clone(),
                 ),
                 CustomFamilyJointDesignChannel::new(
                     offsets[1]..offsets[2],
                     shared_dense_arc(x_threshold_entry),
-                    dir.x_t_entry_psi,
+                    dir.x_t_entry_action.clone(),
                 ),
                 CustomFamilyJointDesignChannel::new(
                     offsets[2]..offsets[3],
                     shared_dense_arc(x_log_sigma_exit),
-                    dir.x_ls_exit_psi,
+                    dir.x_ls_exit_action.clone(),
                 ),
                 CustomFamilyJointDesignChannel::new(
                     offsets[2]..offsets[3],
                     shared_dense_arc(x_log_sigma_entry),
-                    dir.x_ls_entry_psi,
+                    dir.x_ls_entry_action.clone(),
                 ),
             ];
             let mut pairs = vec![
@@ -5975,10 +5857,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 ))),
             }));
         }
-
-        let dir = dense_dir
-            .as_ref()
-            .expect("dense psi direction should exist when implicit direction is absent");
         let mut hessian_psi = Array2::<f64>::zeros((p_total, p_total));
         assign_symmetric_block(&mut hessian_psi, offsets[0], offsets[0], &h_time_time);
         let h_threshold_threshold =
