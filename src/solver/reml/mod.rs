@@ -311,15 +311,16 @@ mod tests {
         state.clearwarm_start();
 
         let rho = array![0.1, -0.2];
+        let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
         let h_exact = state
-            .compute_lamlhessian_exact(&rho)
+            .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
             .expect("exact firth hessian");
         let h_fallback = state
             .compute_lamlhessian_analytic_fallback(&rho, None)
             .expect("analytic fallback hessian");
 
-        assert!(h_exact.iter().all(|v| v.is_finite()));
-        assert!(h_fallback.iter().all(|v| v.is_finite()));
+        assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
+        assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
         for i in 0..h_exact.nrows() {
             for j in 0..i {
                 assert!(

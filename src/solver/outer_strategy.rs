@@ -49,9 +49,10 @@ pub struct OuterCapability {
     pub n_params: usize,
     /// Whether all hyperparameter coordinates (both rho and any extended coords)
     /// are penalty-like. When true, the pure EFS (Extended Fellner-Schall)
-    /// fixed-point optimizer is eligible. When false (e.g. psi/design-moving
-    /// coordinates), the hybrid EFS strategy is used instead: EFS for
-    /// penalty-like (ρ) coords and preconditioned gradient for ψ coords.
+    /// fixed-point optimizer can be eligible when `fixed_point_available` is
+    /// also true. When false (e.g. psi/design-moving coordinates), the
+    /// fallback is not automatically hybrid EFS; that still requires
+    /// `fixed_point_available`.
     ///
     /// # Hybrid EFS strategy (when `has_psi_coords` is true)
     ///
@@ -68,14 +69,21 @@ pub struct OuterCapability {
     /// what penalty-like coords satisfy and design-moving coords do not.
     pub all_penalty_like: bool,
     /// Whether ψ (design-moving) coordinates are present among the extended
-    /// hyperparameter coordinates. When true together with `n_params > 8`,
-    /// the planner selects hybrid EFS instead of falling back to full BFGS.
+    /// hyperparameter coordinates. When true together with `n_params > 8` and
+    /// `fixed_point_available`, the planner can select hybrid EFS instead of
+    /// falling back to full BFGS.
     ///
     /// The hybrid strategy is O(1) H⁻¹ solves per iteration (same as pure
     /// EFS), compared to O(dim(θ)) for BFGS which needs finite-difference
     /// gradient evaluations. This makes the hybrid dramatically cheaper for
     /// high-dimensional smoothing parameter spaces.
     pub has_psi_coords: bool,
+    /// Whether the objective actually implements `eval_efs()` for fixed-point
+    /// plans. Structural eligibility (`all_penalty_like` / `has_psi_coords`)
+    /// is not sufficient by itself: if this is false, the planner must stay on
+    /// Newton/BFGS-style plans even when EFS or Hybrid-EFS would otherwise be
+    /// mathematically admissible.
+    pub fixed_point_available: bool,
     /// Optional log-barrier configuration for structural monotonicity constraints.
     /// When present, EFS is still eligible at plan time, but the EFS iteration
     /// loop performs a quantitative check each step: if
@@ -149,6 +157,16 @@ pub struct OuterPlan {
     pub hessian_source: HessianSource,
 }
 
+/// Whether outer_strategy should automatically derive a downgrade ladder from
+/// the primary capability, or disable retries entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackPolicy {
+    /// Centralized degradation path chosen from the declared capability.
+    Automatic,
+    /// No retries; use only the primary plan.
+    Disabled,
+}
+
 impl std::fmt::Display for OuterPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -194,14 +212,22 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // a quantitative check each step via `barrier_curvature_is_significant`
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
-        (Analytic, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
-            solver: S::Efs,
-            hessian_source: H::EfsFixedPoint,
-        },
-        (Unavailable, Unavailable) if cap.all_penalty_like && cap.n_params > 8 => OuterPlan {
-            solver: S::Efs,
-            hessian_source: H::EfsFixedPoint,
-        },
+        (Analytic, Unavailable)
+            if cap.fixed_point_available && cap.all_penalty_like && cap.n_params > 8 =>
+        {
+            OuterPlan {
+                solver: S::Efs,
+                hessian_source: H::EfsFixedPoint,
+            }
+        }
+        (Unavailable, Unavailable)
+            if cap.fixed_point_available && cap.all_penalty_like && cap.n_params > 8 =>
+        {
+            OuterPlan {
+                solver: S::Efs,
+                hessian_source: H::EfsFixedPoint,
+            }
+        }
 
         // Hybrid EFS: ψ (design-moving) coords present alongside ρ coords.
         //
@@ -215,14 +241,22 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         //
         // This stays O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS)
         // and uses the same trace Gram matrix that EFS already computes.
-        (Analytic, Unavailable) if cap.has_psi_coords && cap.n_params > 8 => OuterPlan {
-            solver: S::HybridEfs,
-            hessian_source: H::HybridEfsFixedPoint,
-        },
-        (Unavailable, Unavailable) if cap.has_psi_coords && cap.n_params > 8 => OuterPlan {
-            solver: S::HybridEfs,
-            hessian_source: H::HybridEfsFixedPoint,
-        },
+        (Analytic, Unavailable)
+            if cap.fixed_point_available && cap.has_psi_coords && cap.n_params > 8 =>
+        {
+            OuterPlan {
+                solver: S::HybridEfs,
+                hessian_source: H::HybridEfsFixedPoint,
+            }
+        }
+        (Unavailable, Unavailable)
+            if cap.fixed_point_available && cap.has_psi_coords && cap.n_params > 8 =>
+        {
+            OuterPlan {
+                solver: S::HybridEfs,
+                hessian_source: H::HybridEfsFixedPoint,
+            }
+        }
 
         // With many params, FD Hessian is too expensive; fall back to BFGS.
         (Analytic, Unavailable) => OuterPlan {
@@ -277,6 +311,36 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         cap.hessian,
         the_plan,
     );
+}
+
+fn downgrade_hessian(cap: &OuterCapability) -> Option<OuterCapability> {
+    (cap.hessian == Derivative::Analytic).then(|| {
+        let mut degraded = cap.clone();
+        degraded.hessian = Derivative::Unavailable;
+        degraded
+    })
+}
+
+fn downgrade_gradient(cap: &OuterCapability) -> Option<OuterCapability> {
+    (cap.gradient == Derivative::Analytic).then(|| {
+        let mut degraded = cap.clone();
+        degraded.gradient = Derivative::FiniteDifference;
+        degraded.hessian = Derivative::Unavailable;
+        degraded
+    })
+}
+
+fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
+    let mut attempts = Vec::new();
+    if let Some(grad_cap) = downgrade_hessian(cap) {
+        attempts.push(grad_cap.clone());
+        if let Some(fd_cap) = downgrade_gradient(&grad_cap) {
+            attempts.push(fd_cap);
+        }
+    } else if let Some(fd_cap) = downgrade_gradient(cap) {
+        attempts.push(fd_cap);
+    }
+    attempts
 }
 
 /// Result of one outer objective evaluation.
@@ -769,10 +833,8 @@ pub struct OuterConfig {
     /// If provided, use this as the sole starting point (skip seed generation
     /// and screening). Useful when the caller already has a good initial rho.
     pub initial_rho: Option<Array1<f64>>,
-    /// Ordered list of degraded capabilities to try when the primary plan
-    /// fails. Each entry triggers `plan()` with the degraded capability and
-    /// a fresh solver run. Empty by default (no fallback).
-    pub fallback_sequence: Vec<OuterCapability>,
+    /// Centralized retry policy for degraded outer plans.
+    pub fallback_policy: FallbackPolicy,
 }
 
 impl Default for OuterConfig {
@@ -786,7 +848,7 @@ impl Default for OuterConfig {
             rho_bound: 30.0,
             heuristic_lambdas: None,
             initial_rho: None,
-            fallback_sequence: Vec::new(),
+            fallback_policy: FallbackPolicy::Automatic,
         }
     }
 }
@@ -822,14 +884,13 @@ pub struct OuterResult {
 /// 3. Logs the plan (so FD is never silent).
 /// 4. Generates and screens seed candidates.
 /// 5. Runs the chosen solver on each screened seed.
-/// 6. If all seeds fail and `fallback_sequence` is non-empty, re-plans
-///    with degraded capability and retries.
+/// 6. If the configured fallback policy allows it, re-plans with degraded
+///    capabilities chosen centrally inside outer_strategy and retries.
 /// 7. Returns the best result (including which plan was actually used).
 ///
-/// All outer optimization fallbacks MUST be declared via `fallback_sequence`.
-/// Do not wrap `run_outer` calls in try/catch with ad-hoc solver recovery;
-/// instead, populate `fallback_sequence` with progressively simpler
-/// `OuterCapability` entries.
+/// Do not wrap `run_outer` calls in try/catch with ad-hoc solver recovery.
+/// Callers should declare only the primary capability and, at most, whether
+/// automatic fallback is enabled at all.
 pub fn run_outer(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -853,12 +914,14 @@ pub fn run_outer(
     }
 
     // Build the ordered list of capabilities to attempt: primary first, then
-    // each entry from fallback_sequence.
-    let mut attempts: Vec<OuterCapability> = Vec::with_capacity(1 + config.fallback_sequence.len());
+    // any centrally-derived degraded capabilities.
+    let fallback_attempts = match config.fallback_policy {
+        FallbackPolicy::Automatic => automatic_fallback_attempts(&cap),
+        FallbackPolicy::Disabled => Vec::new(),
+    };
+    let mut attempts: Vec<OuterCapability> = Vec::with_capacity(1 + fallback_attempts.len());
     attempts.push(cap.clone());
-    for fb in &config.fallback_sequence {
-        let mut degraded = fb.clone();
-        degraded.n_params = cap.n_params;
+    for degraded in fallback_attempts {
         attempts.push(degraded);
     }
 
@@ -1162,6 +1225,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1177,6 +1241,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1192,6 +1257,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1207,6 +1273,7 @@ mod tests {
             n_params: 12,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1223,6 +1290,7 @@ mod tests {
                 n_params: n,
                 all_penalty_like: false,
                 has_psi_coords: false,
+                fixed_point_available: false,
                 barrier_config: None,
             };
             let p = plan(&cap);
@@ -1239,6 +1307,7 @@ mod tests {
             n_params: 3,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1253,6 +1322,7 @@ mod tests {
             n_params: 8,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1267,6 +1337,7 @@ mod tests {
             n_params: 9,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1281,11 +1352,28 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
         assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_penalty_like_without_fixed_point_stays_bfgs() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: true,
+            has_psi_coords: false,
+            fixed_point_available: false,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1296,6 +1384,7 @@ mod tests {
             n_params: 5,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1311,6 +1400,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1328,6 +1418,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1351,6 +1442,7 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: Some(barrier),
         };
         let p = plan(&cap);
@@ -1373,6 +1465,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: Some(barrier),
         };
         let p = plan(&cap);
@@ -1422,6 +1515,7 @@ mod tests {
             n_params: 0,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1449,6 +1543,7 @@ mod tests {
                 n_params: 1,
                 all_penalty_like: false,
                 has_psi_coords: false,
+                fixed_point_available: false,
                 barrier_config: None,
             },
             cost_fn: |st: &mut i32, rho: &Array1<f64>| {
@@ -1490,11 +1585,28 @@ mod tests {
             n_params: 15,
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::HybridEfs);
         assert_eq!(p.hessian_source, HessianSource::HybridEfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_psi_without_fixed_point_stays_bfgs() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            all_penalty_like: false,
+            has_psi_coords: true,
+            fixed_point_available: false,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1507,6 +1619,7 @@ mod tests {
             n_params: 15,
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1523,6 +1636,7 @@ mod tests {
             n_params: 5,
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1540,6 +1654,7 @@ mod tests {
             n_params: 20,
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
@@ -1556,10 +1671,30 @@ mod tests {
             n_params: 15,
             all_penalty_like: true,
             has_psi_coords: false,
+            fixed_point_available: true,
             barrier_config: None,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
         assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+    }
+
+    #[test]
+    fn automatic_fallbacks_degrade_hessian_then_gradient() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 12,
+            all_penalty_like: false,
+            has_psi_coords: false,
+            fixed_point_available: false,
+            barrier_config: None,
+        };
+        let attempts = automatic_fallback_attempts(&cap);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].gradient, Derivative::Analytic);
+        assert_eq!(attempts[0].hessian, Derivative::Unavailable);
+        assert_eq!(attempts[1].gradient, Derivative::FiniteDifference);
+        assert_eq!(attempts[1].hessian, Derivative::Unavailable);
     }
 }

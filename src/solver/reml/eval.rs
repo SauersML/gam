@@ -227,10 +227,9 @@ impl<'a> RemlState<'a> {
     }
 
     fn diagnostic_hessian_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {
-        let base = DIAGNOSTIC_HESSIAN_FD_REL_STEP * (1.0 + rho_i.abs())
+        let base = (DIAGNOSTIC_HESSIAN_FD_REL_STEP * (1.0 + rho_i.abs()))
             .max(DIAGNOSTIC_HESSIAN_FD_ABS_STEP);
-        let symmetric_room = (RHO_BOUND - DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD - rho_i.abs())
-            .max(0.0);
+        let symmetric_room = (RHO_BOUND - DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD - rho_i.abs()).max(0.0);
         let step = base.min(0.5 * symmetric_room);
         if !step.is_finite() || step <= 0.0 {
             return Err(EstimationError::RemlOptimizationFailed(format!(
@@ -307,7 +306,7 @@ impl<'a> RemlState<'a> {
         Ok(h)
     }
 
-    fn compute_lamlhessian_exact_from_bundle(
+    pub(super) fn compute_lamlhessian_exact_from_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -357,14 +356,6 @@ impl<'a> RemlState<'a> {
                 self.compute_lamlhessian_diagnostic_numeric(rho)
             }
         }
-    }
-
-    pub(crate) fn compute_lamlhessian_exact(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        let bundle = self.obtain_eval_bundle(rho)?;
-        self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
     }
 
     pub(crate) fn compute_smoothing_correction_auto(

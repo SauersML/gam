@@ -4476,7 +4476,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
 
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
     };
 
     struct SpatialAdaptiveOuterState {
@@ -4540,7 +4541,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         rho_bound: 30.0,
         heuristic_lambdas: None,
         initial_rho: Some(initial_theta.clone()),
-        fallback_sequence: Vec::new(),
+        fallback_policy: FallbackPolicy::Automatic,
     };
 
     let mut obj = ClosureObjective {
@@ -4554,6 +4555,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             n_params: n_theta,
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: false,
             barrier_config: None,
         },
         cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
@@ -7942,8 +7944,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
         // Isotropic analytic path: use the unified REML evaluator with
         // ext_coords for joint [ρ, κ] optimization via BFGS, analogous to
         // the anisotropic path but with a single κ per spatial term.
-        // The fallback_sequence inside run_outer handles degradation to
-        // BFGS (gradient-only) when the analytic Hessian is unavailable.
+        // outer_strategy handles the centralized degradation path when the
+        // analytic Hessian is unavailable.
         try_exact_joint_spatial_isotropic_optimization(
             data,
             y,
@@ -8023,8 +8025,8 @@ fn try_exact_joint_spatial_aniso_optimization(
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
+        OuterConfig, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8156,14 +8158,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![OuterCapability {
-            gradient: Derivative::FiniteDifference,
-            hessian: Derivative::Unavailable,
-            n_params: theta_dim,
-            all_penalty_like: false,
-            has_psi_coords: true,
-            barrier_config: None,
-        }],
+        fallback_policy: FallbackPolicy::Automatic,
     };
 
     let mut obj = ClosureObjective {
@@ -8176,6 +8171,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             // so EFS is not appropriate.
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: false,
             barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
@@ -8480,8 +8476,8 @@ fn try_exact_joint_spatial_isotropic_optimization(
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
+        OuterConfig, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8612,14 +8608,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: vec![OuterCapability {
-            gradient: Derivative::FiniteDifference,
-            hessian: Derivative::Unavailable,
-            n_params: theta_dim,
-            all_penalty_like: false,
-            has_psi_coords: true,
-            barrier_config: None,
-        }],
+        fallback_policy: FallbackPolicy::Automatic,
     };
 
     let mut obj = ClosureObjective {
@@ -8632,6 +8621,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             // not appropriate.
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: false,
             barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
@@ -8945,8 +8935,8 @@ where
     })?;
 
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
+        OuterConfig, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8991,18 +8981,7 @@ where
         rho_bound: 12.0,
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
-        fallback_sequence: if analytic_joint_hessian_available {
-            vec![OuterCapability {
-                gradient: Derivative::Analytic,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                has_psi_coords: true,
-                barrier_config: None,
-            }]
-        } else {
-            Vec::new()
-        },
+        fallback_policy: FallbackPolicy::Automatic,
     };
 
     let mut obj = ClosureObjective {
@@ -9021,6 +9000,7 @@ where
             n_params: theta_dim,
             all_penalty_like: false,
             has_psi_coords: true,
+            fixed_point_available: false,
             barrier_config: None,
         },
         cost_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {

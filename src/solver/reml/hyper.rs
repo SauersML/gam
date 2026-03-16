@@ -169,11 +169,11 @@ impl<'a> RemlState<'a> {
             );
             Ok((cost, grad, hess))
         } else {
-            // Rho-only path: no directional hyperparameters, use standard
-            // rho-only evaluators directly.
+            // Rho-only path: no directional hyperparameters, use the standard
+            // rho-only evaluators and let inner_strategy pick the Hessian path.
             let cost = self.compute_cost(&rho)?;
             let grad = self.compute_gradient(&rho)?;
-            let hess = self.compute_lamlhessian_exact(&rho)?;
+            let hess = self.compute_lamlhessian_consistent(&rho)?;
             Ok((cost, grad, hess))
         }
     }

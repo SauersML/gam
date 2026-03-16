@@ -4624,8 +4624,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     g_local += &s_ij_beta_local;
                 }
                 {
-                    let mut b_local = b_mat
-                        .slice_mut(s![cache_i.start..cache_i.end, cache_i.start..cache_i.end]);
+                    let mut b_local =
+                        b_mat.slice_mut(s![cache_i.start..cache_i.end, cache_i.start..cache_i.end]);
                     b_local += &s_local;
                 }
 
@@ -5631,7 +5631,8 @@ pub fn fit_custom_family<F: CustomFamily>(
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
     };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
@@ -5662,27 +5663,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         // Custom families enforce constraints via active-set QP in the inner
         // loop, not via log-barrier in the outer evaluator.
         barrier_config: None,
-    };
-    let gradient_fallback = OuterCapability {
-        gradient: Derivative::Analytic,
-        hessian: Derivative::Unavailable,
-        n_params: n_rho,
-        all_penalty_like: false,
-        has_psi_coords: false,
-        barrier_config: None,
-    };
-    let fd_gradient_fallback = OuterCapability {
-        gradient: Derivative::FiniteDifference,
-        hessian: Derivative::Unavailable,
-        n_params: n_rho,
-        all_penalty_like: false,
-        has_psi_coords: false,
-        barrier_config: None,
-    };
-    let fallback_sequence = if has_exact_hess {
-        vec![gradient_fallback, fd_gradient_fallback]
-    } else {
-        vec![fd_gradient_fallback]
+        fixed_point_available: false,
     };
     let outer_config = OuterConfig {
         tolerance: options.outer_tol,
@@ -5693,7 +5674,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         rho_bound: 30.0,
         heuristic_lambdas: None,
         initial_rho: Some(rho0.clone()),
-        fallback_sequence,
+        fallback_policy: FallbackPolicy::Automatic,
     };
 
     let mut obj = ClosureObjective {

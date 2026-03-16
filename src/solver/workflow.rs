@@ -1,32 +1,31 @@
 use crate::custom_family::BlockwiseFitOptions;
 use crate::estimate::{EstimationError, FitOptions, FittedLinkState, UnifiedFitResult};
 use crate::families::bernoulli_marginal_slope::{
-    fit_bernoulli_marginal_slope_terms, BernoulliMarginalSlopeFitResult,
-    BernoulliMarginalSlopeTermSpec,
+    BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec,
+    fit_bernoulli_marginal_slope_terms,
 };
 use crate::families::gamlss::{
-    fit_binomial_location_scale_terms, fit_binomial_location_scale_terms_with_selected_wiggle,
+    BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
+    BlockwiseTermFitResultParts, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
+    WiggleBlockConfig, fit_binomial_location_scale_terms,
+    fit_binomial_location_scale_terms_with_selected_wiggle,
     fit_binomial_mean_wiggle_terms_with_selected_basis, fit_gaussian_location_scale_terms,
     fit_gaussian_location_scale_terms_with_selected_wiggle,
     select_binomial_location_scale_link_wiggle_basis_from_pilot,
     select_binomial_mean_link_wiggle_basis_from_pilot,
-    select_gaussian_location_scale_link_wiggle_basis_from_pilot, BinomialLocationScaleFitResult,
-    BinomialLocationScaleTermSpec, BlockwiseTermFitResult, BlockwiseTermFitResultParts,
-    GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec, WiggleBlockConfig,
+    select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 use crate::families::survival_location_scale::{
+    SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
     fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
-    select_survival_link_wiggle_basis_from_pilot, SurvivalLocationScaleTermFitResult,
-    SurvivalLocationScaleTermSpec,
+    select_survival_link_wiggle_basis_from_pilot,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
-    fit_term_collectionwith_spatial_length_scale_optimization, AdaptiveRegularizationDiagnostics,
-    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
+    AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
+    TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use crate::solver::outer_strategy::{
-    ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval,
-};
+use crate::solver::optimize::{CostOnlyOptimizationRequest, optimize_cost_only};
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, ArrayView2};
 
@@ -414,51 +413,13 @@ fn fit_survival_location_scale_model(
             seed_config.max_seeds = 8;
             seed_config.screening_budget = 3;
             seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
-            let outer_config = OuterConfig {
-                tolerance: 1e-4,
-                max_iter: 30,
-                fd_step: 1e-3,
-                bounds: None,
-                seed_config,
-                rho_bound: 30.0,
-                heuristic_lambdas: Some(init.to_vec()),
-                initial_rho: None,
-                fallback_sequence: Vec::new(),
-            };
-            let mut obj = ClosureObjective {
-                state: (),
-                cap: OuterCapability {
-                    gradient: Derivative::FiniteDifference,
-                    hessian: Derivative::Unavailable,
-                    n_params: dim,
-                    all_penalty_like: false,
-                    has_psi_coords: false,
-                    barrier_config: None,
-                },
-                cost_fn: |state: &mut (), rho: &Array1<f64>| {
-                    let _ = state;
-                    objective(rho)
-                },
-                eval_fn: |state: &mut (),
-                          rho: &Array1<f64>|
-                 -> Result<OuterEval, EstimationError> {
-                    let _ = state;
-                    let _ = rho;
-                    Err(EstimationError::InvalidInput(
-                        "strategy should use finite-difference gradients for survival link optimization"
-                            .to_string(),
-                    ))
-                },
-                reset_fn: None::<fn(&mut ())>,
-                efs_fn: None::<
-                    fn(
-                        &mut (),
-                        &Array1<f64>,
-                    )
-                        -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
-                >,
-            };
-            match crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, name) {
+            let mut outer_request = CostOnlyOptimizationRequest::new(init.clone());
+            outer_request.tolerance = 1e-4;
+            outer_request.max_iter = 30;
+            outer_request.fd_step = 1e-3;
+            outer_request.seed_config = seed_config;
+            let context = format!("survival inverse-link optimization ({name}, dim={dim})");
+            match optimize_cost_only(outer_request, &context, |rho| objective(rho)) {
                 Ok(result) => {
                     if let Some(link) = recover(&result.rho) {
                         eprintln!(

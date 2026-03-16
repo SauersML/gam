@@ -5182,9 +5182,7 @@ fn integrated_inverse_link_from_family(
     match family {
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog => {
-            Ok(InverseLink::Standard(family.link_function()))
-        }
+        | GlmLikelihoodFamily::BinomialCLogLog => Ok(InverseLink::Standard(family.link_function())),
         GlmLikelihoodFamily::BinomialSas => {
             let state = sas_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
