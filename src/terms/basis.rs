@@ -21,6 +21,13 @@ struct SendPtr(*mut f64);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
+impl SendPtr {
+    #[inline(always)]
+    fn add(self, offset: usize) -> *mut f64 {
+        unsafe { self.0.add(offset) }
+    }
+}
+
 #[cfg(test)]
 use approx::assert_abs_diff_eq;
 
@@ -1692,7 +1699,7 @@ pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
 /// Which radial kernel family is being used. Stored in the streaming operator
 /// so that (q, t) scalars can be recomputed on the fly without a closure.
 #[derive(Debug, Clone)]
-enum RadialScalarKind {
+pub(crate) enum RadialScalarKind {
     /// Matern kernel: (length_scale, nu).
     Matern {
         length_scale: f64,
@@ -1890,7 +1897,7 @@ impl ImplicitDesignPsiDerivative {
     /// Construct a streaming operator that recomputes (q, t, s_a) on the fly
     /// from raw data/centers/eta during each matvec. No O(n*k) arrays are stored.
     /// This is the biobank-scale path.
-    pub fn new_streaming(
+    pub(crate) fn new_streaming(
         data: Array2<f64>,
         centers: Array2<f64>,
         eta: Vec<f64>,
@@ -2130,7 +2137,7 @@ impl ImplicitDesignPsiDerivative {
             let mut sb = vec![0.0; dim];
             for i in s..e { for j in 0..k {
                 match st.compute_pair(i,j,&mut sb) {
-                    Ok((q,t)) => { unsafe { *rp.0.add(i*k+j) = deriv_fn(q,t,&sb); } }
+                    Ok((q,t)) => { unsafe { *rp.add(i*k+j) = deriv_fn(q,t,&sb); } }
                     Err(_) => { ef.store(true, std::sync::atomic::Ordering::Relaxed); return; }
                 }
             }}
@@ -2585,9 +2592,9 @@ where
                     };
                     let flat = i * k + j;
                     unsafe {
-                        *qp.0.add(flat) = q;
-                        *tp.0.add(flat) = t;
-                        for a in 0..dim { *ap.0.add(flat * dim + a) = sv[a]; }
+                        *qp.add(flat) = q;
+                        *tp.add(flat) = t;
+                        for a in 0..dim { *ap.add(flat * dim + a) = sv[a]; }
                     }
                 }
             }
@@ -6017,7 +6024,7 @@ fn pure_duchon_block_order(p_order: usize, s_order: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
-struct DuchonPartialFractionCoeffs {
+pub(crate) struct DuchonPartialFractionCoeffs {
     a: Vec<f64>,
     b: Vec<f64>,
 }
