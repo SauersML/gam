@@ -2596,7 +2596,10 @@ impl<'a> RemlState<'a> {
             beta,
             n_observations,
             hessian_op,
-            penalty_roots,
+            penalty_roots
+                .into_iter()
+                .map(super::unified::PenaltyCoordinate::from_dense_root)
+                .collect(),
             penalty_logdet,
             dispersion,
         )
@@ -2824,7 +2827,10 @@ impl<'a> RemlState<'a> {
             beta,
             n_observations,
             hessian_op,
-            penalty_roots,
+            penalty_roots
+                .into_iter()
+                .map(super::unified::PenaltyCoordinate::from_dense_root)
+                .collect(),
             penalty_logdet,
             dispersion,
         )
@@ -3027,7 +3033,10 @@ impl<'a> RemlState<'a> {
             beta,
             n_observations,
             hessian_op,
-            penalty_roots,
+            penalty_roots
+                .into_iter()
+                .map(super::unified::PenaltyCoordinate::from_dense_root)
+                .collect(),
             penalty_logdet,
             dispersion,
         )
@@ -3112,7 +3121,10 @@ impl<'a> RemlState<'a> {
             beta,
             n_observations,
             hessian_op,
-            penalty_roots,
+            penalty_roots
+                .into_iter()
+                .map(super::unified::PenaltyCoordinate::from_dense_root)
+                .collect(),
             penalty_logdet,
             dispersion,
         )
