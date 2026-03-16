@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use super::*;
 use crate::faer_ndarray::FaerLblt;
 use crate::linalg::utils::{
@@ -6,6 +5,7 @@ use crate::linalg::utils::{
 };
 use crate::pirls::PirlsWorkspace;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
+use std::sync::Arc;
 
 impl<'a> RemlState<'a> {
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -679,7 +679,6 @@ impl<'a> RemlState<'a> {
         let bundle = self.obtain_eval_bundle(rho)?;
         Ok(bundle.h_total.as_ref().clone())
     }
-
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;

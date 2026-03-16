@@ -1204,7 +1204,8 @@ impl BernoulliMarginalSlopePredictor {
         let backend = PredictionCovarianceBackend::from_dense(covariance.view());
         linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
-            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
+            let (_, grad) = self
+                .final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
                 .map_err(|e| e.to_string())?;
             let grad = grad.ok_or_else(|| {
                 "bernoulli marginal-slope analytic predictor gradient was not produced".to_string()
@@ -1230,7 +1231,8 @@ impl BernoulliMarginalSlopePredictor {
         };
         linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
-            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
+            let (_, grad) = self
+                .final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
                 .map_err(|e| e.to_string())?;
             let grad = grad.ok_or_else(|| {
                 "bernoulli marginal-slope analytic predictor gradient was not produced".to_string()
@@ -2992,7 +2994,10 @@ mod tests {
             expected_eta.mapv(|eta: f64| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
         // Approximate comparison: delta-regularization bias can introduce ~1e-15 drift
         for i in 0..out.eta.len() {
-            assert!((out.eta[i] - expected_eta[i]).abs() <= 1e-14, "eta[{i}] mismatch");
+            assert!(
+                (out.eta[i] - expected_eta[i]).abs() <= 1e-14,
+                "eta[{i}] mismatch"
+            );
         }
         for i in 0..out.mean.len() {
             assert!((out.mean[i] - expected_mean[i]).abs() <= 1e-12);

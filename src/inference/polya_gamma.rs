@@ -118,12 +118,7 @@ impl PolyaGamma {
         }
     }
 
-    fn sample_trunc_inv_gauss<R: Rng + ?Sized>(
-        &self,
-        rng: &mut R,
-        z: f64,
-        trunc: f64,
-    ) -> f64 {
+    fn sample_trunc_inv_gauss<R: Rng + ?Sized>(&self, rng: &mut R, z: f64, trunc: f64) -> f64 {
         let z = z.abs();
         if FRAC_2_PI > z {
             self.sample_small_z(rng, z, trunc)

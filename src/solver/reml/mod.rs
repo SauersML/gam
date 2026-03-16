@@ -666,18 +666,12 @@ mod tests {
             state_minus.clearwarm_start();
 
             for i in 0..hyper_dirs.len() {
-                let g_plus = single_directional_tau_gradient(
-                    &state_plus,
-                    &rho,
-                    hyper_dirs[i].clone(),
-                )
-                .expect("g+ for FD");
-                let g_minus = single_directional_tau_gradient(
-                    &state_minus,
-                    &rho,
-                    hyper_dirs[i].clone(),
-                )
-                .expect("g- for FD");
+                let g_plus =
+                    single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
+                        .expect("g+ for FD");
+                let g_minus =
+                    single_directional_tau_gradient(&state_minus, &rho, hyper_dirs[i].clone())
+                        .expect("g- for FD");
                 h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
             }
         }
@@ -815,18 +809,12 @@ mod tests {
             state_minus.clearwarm_start();
 
             for i in 0..hyper_dirs.len() {
-                let g_plus = single_directional_tau_gradient(
-                    &state_plus,
-                    &rho,
-                    hyper_dirs[i].clone(),
-                )
-                .expect("g+ for FD");
-                let g_minus = single_directional_tau_gradient(
-                    &state_minus,
-                    &rho,
-                    hyper_dirs[i].clone(),
-                )
-                .expect("g- for FD");
+                let g_plus =
+                    single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
+                        .expect("g+ for FD");
+                let g_minus =
+                    single_directional_tau_gradient(&state_minus, &rho, hyper_dirs[i].clone())
+                        .expect("g- for FD");
                 h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
             }
         }

@@ -112,7 +112,11 @@ pub trait HessianOperator: Send + Sync {
     /// Default implementation materializes the operator and dispatches to the
     /// dense cross-trace path. Matrix-free and sparse backends should override
     /// this to avoid dense operator materialization.
-    fn trace_hinv_matrix_operator_cross(&self, matrix: &Array2<f64>, op: &dyn HyperOperator) -> f64 {
+    fn trace_hinv_matrix_operator_cross(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
         self.trace_hinv_product_cross(matrix, &op.to_dense())
     }
 
@@ -120,7 +124,11 @@ pub trait HessianOperator: Send + Sync {
     ///
     /// Default implementation materializes both operators densely. Backends
     /// with native operator-aware cross traces should override this.
-    fn trace_hinv_operator_cross(&self, left: &dyn HyperOperator, right: &dyn HyperOperator) -> f64 {
+    fn trace_hinv_operator_cross(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
         self.trace_hinv_product_cross(&left.to_dense(), &right.to_dense())
     }
 
@@ -1727,7 +1735,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
             let total_p = self.beta.len();
-            let penalty_rank: usize = self.penalty_coords.iter().map(PenaltyCoordinate::rank).sum();
+            let penalty_rank: usize = self
+                .penalty_coords
+                .iter()
+                .map(PenaltyCoordinate::rank)
+                .sum();
             total_p.saturating_sub(penalty_rank) as f64
         });
 
@@ -1833,8 +1845,12 @@ fn trace_hinv_drift_cross(
     left: &HyperCoordDrift,
     right: &HyperCoordDrift,
 ) -> f64 {
-    let left_op = left.operator_ref().filter(|_| left.uses_operator_fast_path());
-    let right_op = right.operator_ref().filter(|_| right.uses_operator_fast_path());
+    let left_op = left
+        .operator_ref()
+        .filter(|_| left.uses_operator_fast_path());
+    let right_op = right
+        .operator_ref()
+        .filter(|_| right.uses_operator_fast_path());
 
     match (left_op, right_op) {
         (Some(op_left), Some(op_right)) => hop.trace_hinv_operator_cross(op_left, op_right),
@@ -2034,7 +2050,12 @@ pub fn reml_laml_evaluate(
         .collect();
     let need_rho_v = effective_deriv.has_corrections() || solution.firth_op.is_some();
     let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
-        Some(rho_a_k_betas.iter().map(|a_k_beta| hop.solve(a_k_beta)).collect())
+        Some(
+            rho_a_k_betas
+                .iter()
+                .map(|a_k_beta| hop.solve(a_k_beta))
+                .collect(),
+        )
     } else {
         None
     };
@@ -2077,9 +2098,9 @@ pub fn reml_laml_evaluate(
             .iter()
             .any(PenaltyCoordinate::uses_operator_fast_path)
             || solution
-            .ext_coords
-            .iter()
-            .any(|c| c.drift.uses_operator_fast_path());
+                .ext_coords
+                .iter()
+                .any(|c| c.drift.uses_operator_fast_path());
 
         if any_operator {
             let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
@@ -2089,7 +2110,8 @@ pub fn reml_laml_evaluate(
             for idx in 0..k {
                 let coord = &solution.penalty_coords[idx];
                 if coord.uses_operator_fast_path() {
-                    rho_ops.push(coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref()));
+                    rho_ops
+                        .push(coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref()));
                     coord_has_operator.push(true);
                 } else {
                     let mut a_k = coord.scaled_dense_matrix(lambdas[idx]);
@@ -4569,11 +4591,19 @@ impl HessianOperator for SparseCholeskyOperator {
         }
     }
 
-    fn trace_hinv_matrix_operator_cross(&self, matrix: &Array2<f64>, op: &dyn HyperOperator) -> f64 {
+    fn trace_hinv_matrix_operator_cross(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
         self.trace_hinv_matrix_operator_cross_exact(matrix, op)
     }
 
-    fn trace_hinv_operator_cross(&self, left: &dyn HyperOperator, right: &dyn HyperOperator) -> f64 {
+    fn trace_hinv_operator_cross(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
         self.trace_hinv_operator_cross_exact(left, right)
     }
 
@@ -4623,15 +4653,11 @@ impl BlockCoupledOperator {
     /// `joint_hessian` is the full `p_total x p_total` penalized Hessian.
     ///
     /// Internally performs a single eigendecomposition of `joint_hessian`.
-    pub fn from_joint_hessian(
-        joint_hessian: &Array2<f64>,
-    ) -> Result<Self, String> {
+    pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String> {
         let inner = DenseSpectralOperator::from_symmetric(joint_hessian)
             .map_err(|e| format!("BlockCoupledOperator eigendecomposition: {e}"))?;
 
-        Ok(Self {
-            inner,
-        })
+        Ok(Self { inner })
     }
 }
 
@@ -4818,14 +4844,22 @@ impl HessianOperator for MatrixFreeSpdOperator {
         cross[[0, 1]]
     }
 
-    fn trace_hinv_matrix_operator_cross(&self, matrix: &Array2<f64>, op: &dyn HyperOperator) -> f64 {
+    fn trace_hinv_matrix_operator_cross(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
         let estimator = StochasticTraceEstimator::with_defaults();
         let matrices = [matrix];
         let cross = estimator.estimate_second_order_traces_with_operators(self, &matrices, &[op]);
         cross[[0, 1]]
     }
 
-    fn trace_hinv_operator_cross(&self, left: &dyn HyperOperator, right: &dyn HyperOperator) -> f64 {
+    fn trace_hinv_operator_cross(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
         let estimator = StochasticTraceEstimator::with_defaults();
         let no_dense: [&Array2<f64>; 0] = [];
         let cross =

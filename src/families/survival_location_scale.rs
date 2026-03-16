@@ -1,14 +1,13 @@
-use std::collections::HashMap;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_rowwise_kronecker_psi_operator,
-    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
-    shared_dense_arc, should_materialize_custom_family_psi_dense,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper, first_psi_linear_map,
+    fit_custom_family, resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
+    second_psi_linear_map, shared_dense_arc, should_materialize_custom_family_psi_dense,
     weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
@@ -36,9 +35,8 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
-    try_build_spatial_log_kappa_derivativeinfo_list,
+    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
@@ -47,6 +45,7 @@ use crate::solver::estimate::{
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const MIN_PROB: f64 = 1e-12;
@@ -1485,27 +1484,15 @@ impl SurvivalLocationScaleFamily {
             }
         }
 
-        let z_t_exit_ab = second_psi_linear_map(
-            x_t_exit_ab_action.as_ref(),
-            x_t_exit_ab.as_ref(),
-            n,
-            pt,
-        )
-        .forward_mul(beta_t.view());
-        let z_t_entry_ab = second_psi_linear_map(
-            x_t_entry_ab_action.as_ref(),
-            x_t_entry_ab.as_ref(),
-            n,
-            pt,
-        )
-        .forward_mul(beta_t.view());
-        let z_ls_exit_ab = second_psi_linear_map(
-            x_ls_exit_ab_action.as_ref(),
-            x_ls_exit_ab.as_ref(),
-            n,
-            pls,
-        )
-        .forward_mul(beta_ls.view());
+        let z_t_exit_ab =
+            second_psi_linear_map(x_t_exit_ab_action.as_ref(), x_t_exit_ab.as_ref(), n, pt)
+                .forward_mul(beta_t.view());
+        let z_t_entry_ab =
+            second_psi_linear_map(x_t_entry_ab_action.as_ref(), x_t_entry_ab.as_ref(), n, pt)
+                .forward_mul(beta_t.view());
+        let z_ls_exit_ab =
+            second_psi_linear_map(x_ls_exit_ab_action.as_ref(), x_ls_exit_ab.as_ref(), n, pls)
+                .forward_mul(beta_ls.view());
         let z_ls_entry_ab = second_psi_linear_map(
             x_ls_entry_ab_action.as_ref(),
             x_ls_entry_ab.as_ref(),
@@ -3976,61 +3963,63 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
             h_tt_exit.view(),
             x_t_exit_ab_map,
-        )?
-            + &weighted_crossprod_psi_maps(x_t_exit_i_map, h_tt_exit.view(), x_t_exit_j_map)?
-            + &weighted_crossprod_psi_maps(x_t_exit_j_map, h_tt_exit.view(), x_t_exit_i_map)?
-            + &weighted_crossprod_psi_maps(
-                x_t_exit_i_map,
-                dh_tt_exit_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
-                dh_tt_exit_j.view(),
-                x_t_exit_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_exit_j_map,
-                dh_tt_exit_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
-                dh_tt_exit_i.view(),
-                x_t_exit_j_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_ab_map,
-                h_tt_entry.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                h_tt_entry.view(),
-                x_t_entry_ab_map,
-            )?
-            + &weighted_crossprod_psi_maps(x_t_entry_i_map, h_tt_entry.view(), x_t_entry_j_map)?
-            + &weighted_crossprod_psi_maps(x_t_entry_j_map, h_tt_entry.view(), x_t_entry_i_map)?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_i_map,
-                dh_tt_entry_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                dh_tt_entry_j.view(),
-                x_t_entry_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_j_map,
-                dh_tt_entry_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                dh_tt_entry_i.view(),
-                x_t_entry_j_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_i_map,
+            h_tt_exit.view(),
+            x_t_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_j_map,
+            h_tt_exit.view(),
+            x_t_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_i_map,
+            dh_tt_exit_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
+            dh_tt_exit_j.view(),
+            x_t_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_j_map,
+            dh_tt_exit_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
+            dh_tt_exit_i.view(),
+            x_t_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_ab_map,
+            h_tt_entry.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            h_tt_entry.view(),
+            x_t_entry_ab_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_i_map,
+            h_tt_entry.view(),
+            x_t_entry_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_j_map,
+            h_tt_entry.view(),
+            x_t_entry_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_i_map,
+            dh_tt_entry_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            dh_tt_entry_j.view(),
+            x_t_entry_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_j_map,
+            dh_tt_entry_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            dh_tt_entry_i.view(),
+            x_t_entry_j_map,
+        )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
             offsets[1],
@@ -4064,61 +4053,63 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
             h_ll_exit.view(),
             x_ls_exit_ab_map,
-        )?
-            + &weighted_crossprod_psi_maps(x_ls_exit_i_map, h_ll_exit.view(), x_ls_exit_j_map)?
-            + &weighted_crossprod_psi_maps(x_ls_exit_j_map, h_ll_exit.view(), x_ls_exit_i_map)?
-            + &weighted_crossprod_psi_maps(
-                x_ls_exit_i_map,
-                dh_ll_exit_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
-                dh_ll_exit_j.view(),
-                x_ls_exit_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_ls_exit_j_map,
-                dh_ll_exit_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
-                dh_ll_exit_i.view(),
-                x_ls_exit_j_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_ls_entry_ab_map,
-                h_ll_entry.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-                h_ll_entry.view(),
-                x_ls_entry_ab_map,
-            )?
-            + &weighted_crossprod_psi_maps(x_ls_entry_i_map, h_ll_entry.view(), x_ls_entry_j_map)?
-            + &weighted_crossprod_psi_maps(x_ls_entry_j_map, h_ll_entry.view(), x_ls_entry_i_map)?
-            + &weighted_crossprod_psi_maps(
-                x_ls_entry_i_map,
-                dh_ll_entry_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-                dh_ll_entry_j.view(),
-                x_ls_entry_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_ls_entry_j_map,
-                dh_ll_entry_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-                dh_ll_entry_i.view(),
-                x_ls_entry_j_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_exit_i_map,
+            h_ll_exit.view(),
+            x_ls_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_exit_j_map,
+            h_ll_exit.view(),
+            x_ls_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_exit_i_map,
+            dh_ll_exit_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
+            dh_ll_exit_j.view(),
+            x_ls_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_exit_j_map,
+            dh_ll_exit_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
+            dh_ll_exit_i.view(),
+            x_ls_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_entry_ab_map,
+            h_ll_entry.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+            h_ll_entry.view(),
+            x_ls_entry_ab_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_entry_i_map,
+            h_ll_entry.view(),
+            x_ls_entry_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_entry_j_map,
+            h_ll_entry.view(),
+            x_ls_entry_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_entry_i_map,
+            dh_ll_entry_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+            dh_ll_entry_j.view(),
+            x_ls_entry_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_entry_j_map,
+            dh_ll_entry_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+            dh_ll_entry_i.view(),
+            x_ls_entry_j_map,
+        )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
             offsets[2],
@@ -4152,61 +4143,63 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
             h_tl_exit.view(),
             x_ls_exit_ab_map,
-        )?
-            + &weighted_crossprod_psi_maps(x_t_exit_i_map, h_tl_exit.view(), x_ls_exit_j_map)?
-            + &weighted_crossprod_psi_maps(x_t_exit_j_map, h_tl_exit.view(), x_ls_exit_i_map)?
-            + &weighted_crossprod_psi_maps(
-                x_t_exit_i_map,
-                dh_tl_exit_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
-                dh_tl_exit_j.view(),
-                x_ls_exit_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_exit_j_map,
-                dh_tl_exit_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
-                dh_tl_exit_i.view(),
-                x_ls_exit_j_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_ab_map,
-                h_tl_entry.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                h_tl_entry.view(),
-                x_ls_entry_ab_map,
-            )?
-            + &weighted_crossprod_psi_maps(x_t_entry_i_map, h_tl_entry.view(), x_ls_entry_j_map)?
-            + &weighted_crossprod_psi_maps(x_t_entry_j_map, h_tl_entry.view(), x_ls_entry_i_map)?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_i_map,
-                dh_tl_entry_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                dh_tl_entry_j.view(),
-                x_ls_entry_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_j_map,
-                dh_tl_entry_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                dh_tl_entry_i.view(),
-                x_ls_entry_j_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_i_map,
+            h_tl_exit.view(),
+            x_ls_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_j_map,
+            h_tl_exit.view(),
+            x_ls_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_i_map,
+            dh_tl_exit_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
+            dh_tl_exit_j.view(),
+            x_ls_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_exit_j_map,
+            dh_tl_exit_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
+            dh_tl_exit_i.view(),
+            x_ls_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_ab_map,
+            h_tl_entry.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            h_tl_entry.view(),
+            x_ls_entry_ab_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_i_map,
+            h_tl_entry.view(),
+            x_ls_entry_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_j_map,
+            h_tl_entry.view(),
+            x_ls_entry_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_i_map,
+            dh_tl_entry_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            dh_tl_entry_j.view(),
+            x_ls_entry_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_j_map,
+            dh_tl_entry_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            dh_tl_entry_i.view(),
+            x_ls_entry_j_map,
+        )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
             offsets[1],
@@ -4228,27 +4221,23 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
             dh_h0_t_i.view(),
             x_t_entry_j_map,
-        )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
-                h_h0_t.view(),
-                x_t_entry_ab_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                dh_h1_t_j.view(),
-                x_t_exit_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                dh_h1_t_i.view(),
-                x_t_exit_j_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                h_h1_t.view(),
-                x_t_exit_ab_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
+            h_h0_t.view(),
+            x_t_entry_ab_map,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+            dh_h1_t_j.view(),
+            x_t_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+            dh_h1_t_i.view(),
+            x_t_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+            h_h1_t.view(),
+            x_t_exit_ab_map,
+        )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
             offsets[0],
@@ -4270,27 +4259,23 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
             dh_h0_ls_i.view(),
             x_ls_entry_j_map,
-        )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
-                h_h0_ls.view(),
-                x_ls_entry_ab_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                dh_h1_ls_j.view(),
-                x_ls_exit_i_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                dh_h1_ls_i.view(),
-                x_ls_exit_j_map,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                h_h1_ls.view(),
-                x_ls_exit_ab_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
+            h_h0_ls.view(),
+            x_ls_entry_ab_map,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+            dh_h1_ls_j.view(),
+            x_ls_exit_i_map,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+            dh_h1_ls_i.view(),
+            x_ls_exit_j_map,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+            h_h1_ls.view(),
+            x_ls_exit_ab_map,
+        )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
             offsets[0],
@@ -4317,27 +4302,23 @@ impl SurvivalLocationScaleFamily {
                 x_t_exit_j_map,
                 dh_tw_exit_i.view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-            )?
-                + &weighted_crossprod_psi_maps(
-                    x_t_exit_ab_map,
-                    h_tw_exit.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?
-                + &weighted_crossprod_psi_maps(
-                    x_t_entry_i_map,
-                    dh_tw_entry_j.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?
-                + &weighted_crossprod_psi_maps(
-                    x_t_entry_j_map,
-                    dh_tw_entry_i.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?
-                + &weighted_crossprod_psi_maps(
-                    x_t_entry_ab_map,
-                    h_tw_entry.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?;
+            )? + &weighted_crossprod_psi_maps(
+                x_t_exit_ab_map,
+                h_tw_exit.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )? + &weighted_crossprod_psi_maps(
+                x_t_entry_i_map,
+                dh_tw_entry_j.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )? + &weighted_crossprod_psi_maps(
+                x_t_entry_j_map,
+                dh_tw_entry_i.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )? + &weighted_crossprod_psi_maps(
+                x_t_entry_ab_map,
+                h_tw_entry.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )?;
             assign_symmetric_block(
                 &mut hessian_psi_psi,
                 offsets[1],
@@ -4359,27 +4340,23 @@ impl SurvivalLocationScaleFamily {
                 x_ls_exit_j_map,
                 dh_lw_exit_i.view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-            )?
-                + &weighted_crossprod_psi_maps(
-                    x_ls_exit_ab_map,
-                    h_lw_exit.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?
-                + &weighted_crossprod_psi_maps(
-                    x_ls_entry_i_map,
-                    dh_lw_entry_j.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?
-                + &weighted_crossprod_psi_maps(
-                    x_ls_entry_j_map,
-                    dh_lw_entry_i.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?
-                + &weighted_crossprod_psi_maps(
-                    x_ls_entry_ab_map,
-                    h_lw_entry.view(),
-                    CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )?;
+            )? + &weighted_crossprod_psi_maps(
+                x_ls_exit_ab_map,
+                h_lw_exit.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )? + &weighted_crossprod_psi_maps(
+                x_ls_entry_i_map,
+                dh_lw_entry_j.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )? + &weighted_crossprod_psi_maps(
+                x_ls_entry_j_map,
+                dh_lw_entry_i.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )? + &weighted_crossprod_psi_maps(
+                x_ls_entry_ab_map,
+                h_lw_entry.view(),
+                CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+            )?;
             assign_symmetric_block(
                 &mut hessian_psi_psi,
                 offsets[2],
@@ -4573,17 +4550,15 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
             h_tt_exit_u.view(),
             x_t_exit_map,
-        )?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_map,
-                h_tt_entry_u.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                h_tt_entry_u.view(),
-                x_t_entry_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_map,
+            h_tt_entry_u.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            h_tt_entry_u.view(),
+            x_t_entry_map,
+        )?;
         assign_symmetric_block(&mut out, offsets[1], offsets[1], &threshold_threshold);
 
         let h_ll_entry_u = -(&entry_deltas.d_d2_q * &dq_ls_entry.mapv(|v| v * v)
@@ -4603,17 +4578,15 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&x_log_sigma_exit),
             h_ll_exit_u.view(),
             x_ls_exit_map,
-        )?
-            + &weighted_crossprod_psi_maps(
-                x_ls_entry_map,
-                h_ll_entry_u.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-                h_ll_entry_u.view(),
-                x_ls_entry_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_entry_map,
+            h_ll_entry_u.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+            h_ll_entry_u.view(),
+            x_ls_entry_map,
+        )?;
         assign_symmetric_block(&mut out, offsets[2], offsets[2], &log_sigma_log_sigma);
 
         let h_tl_entry_u = -(&entry_deltas.d_d2_q * &(dq_t_entry * dq_ls_entry)
@@ -4635,17 +4608,15 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&x_threshold_exit),
             h_tl_exit_u.view(),
             x_ls_exit_map,
-        )?
-            + &weighted_crossprod_psi_maps(
-                x_t_entry_map,
-                h_tl_entry_u.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
-                h_tl_entry_u.view(),
-                x_ls_entry_map,
-            )?;
+        )? + &weighted_crossprod_psi_maps(
+            x_t_entry_map,
+            h_tl_entry_u.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+            h_tl_entry_u.view(),
+            x_ls_entry_map,
+        )?;
         assign_symmetric_block(&mut out, offsets[1], offsets[2], &threshold_log_sigma);
 
         let h_h0_t_u = &entry_deltas.d_d1_q * dq_t_entry + &q.d2_q0 * &entry_deltas.delta_q_t;
@@ -4740,12 +4711,11 @@ impl SurvivalExactNewtonJointPsiWorkspace {
         psi_index: usize,
     ) -> Result<Option<Arc<SurvivalJointPsiDirection>>, String> {
         self.psi_directions.get_or_try_init(psi_index, || {
-            self.family
-                .exact_newton_joint_psi_direction(
-                    &self.block_states,
-                    &self.derivative_blocks,
-                    psi_index,
-                )
+            self.family.exact_newton_joint_psi_direction(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_index,
+            )
         })
     }
 }
@@ -7191,9 +7161,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         &joint_setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign]| {
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let fit = fit_survival_location_scale(build_spec(
                 rho,
                 &specs[0],
@@ -7207,9 +7175,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 fit.penalized_objective
             })
         },
-        |rho,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign]| {
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let fit = fit_survival_location_scale(build_spec(
                 rho,
                 &specs[0],
@@ -7223,23 +7189,14 @@ pub(crate) fn fit_survival_location_scale_terms(
             wiggle_beta_hint.replace(fit.beta_link_wiggle());
             Ok(fit)
         },
-        |rho,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign],
-         need_hessian| {
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             if !analytic_joint_gradient_available {
                 return Err(
                     "analytic spatial psi derivatives are unavailable for survival exact two-block path"
                         .to_string(),
                 );
             }
-            let assembled = build_spec(
-                rho,
-                &specs[0],
-                &specs[1],
-                &designs[0],
-                &designs[1],
-            )?;
+            let assembled = build_spec(rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
@@ -7359,10 +7316,9 @@ fn rowwise_survival_latent_covariances(
         components.push(ls);
 
         if p_w > 0 {
-            let xw = input
-                .x_link_wiggle
-                .as_ref()
-                .ok_or_else(|| "rowwise_survival_latent_covariances missing wiggle design".to_string())?;
+            let xw = input.x_link_wiggle.as_ref().ok_or_else(|| {
+                "rowwise_survival_latent_covariances missing wiggle design".to_string()
+            })?;
             let wiggle_chunk = design_row_chunk(xw, rows)?;
             let mut w = Array2::<f64>::zeros((rows_in_chunk, p_total));
             w.slice_mut(s![.., p_time + p_t + p_ls..p_total])

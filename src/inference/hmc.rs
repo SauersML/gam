@@ -23,6 +23,7 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
+use super::polya_gamma::PolyaGamma;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::estimate::reml::unified::compute_block_penalty_logdet_derivs;
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
@@ -32,7 +33,6 @@ use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatrixConfig};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
-use super::polya_gamma::PolyaGamma;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
