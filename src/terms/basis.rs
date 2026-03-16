@@ -7909,13 +7909,32 @@ fn duchon_polyharmonic_q_l_r_triplets(
     ((q0, q1, q2), (l0, l1, l2))
 }
 
+#[derive(Clone, Copy)]
+struct DuchonMaternDerivativeTerm {
+    coeff: f64,
+    kappa_power: usize,
+    r_power: f64,
+    bessel_order: f64,
+}
+
 #[inline(always)]
-fn duchon_matern_block_r3(
+fn duchon_matern_block_radial_derivative(
     r: f64,
     kappa: f64,
     n_order: usize,
     k_dim: usize,
+    derivative_order: usize,
 ) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-block distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !kappa.is_finite() || kappa <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-block kappa must be finite and positive".to_string(),
+        ));
+    }
     if r <= 0.0 {
         return Ok(0.0);
     }
@@ -7925,10 +7944,64 @@ fn duchon_matern_block_r3(
     let c = kappa.powf(k_half - n)
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
     let z = (kappa * r).max(1e-300);
-    let k_nu_m2 = bessel_k_real_half_integer_or_integer((nu - 2.0).abs(), z)?;
-    let k_num3 = bessel_k_real_half_integer_or_integer((nu - 3.0).abs(), z)?;
-    Ok(-c * kappa.powi(3) * r.powf(nu) * k_num3
-        + 3.0 * c * kappa.powi(2) * r.powf(nu - 1.0) * k_nu_m2)
+
+    // Differentiate terms of the form
+    //   coeff * c * kappa^a * r^b * K_mu(kappa r)
+    // exactly using
+    //   d/dr [r^b K_mu(kappa r)]
+    //   = (b - mu) r^(b-1) K_mu(kappa r) - kappa r^b K_{mu-1}(kappa r).
+    //
+    // Repeatedly applying this recurrence keeps the Duchon Matérn block in a
+    // closed Bessel family, so higher radial derivatives are exact sums of the
+    // same shifted K-orders with no finite-difference origin stencil.
+    let mut terms = vec![DuchonMaternDerivativeTerm {
+        coeff: 1.0,
+        kappa_power: 0,
+        r_power: nu,
+        bessel_order: nu.abs(),
+    }];
+
+    for _ in 0..derivative_order {
+        let mut next_terms = Vec::with_capacity(terms.len() * 2);
+        for term in terms {
+            let stay_coeff = term.coeff * (term.r_power - term.bessel_order);
+            if stay_coeff != 0.0 {
+                next_terms.push(DuchonMaternDerivativeTerm {
+                    coeff: stay_coeff,
+                    kappa_power: term.kappa_power,
+                    r_power: term.r_power - 1.0,
+                    bessel_order: term.bessel_order,
+                });
+            }
+            next_terms.push(DuchonMaternDerivativeTerm {
+                coeff: -term.coeff,
+                kappa_power: term.kappa_power + 1,
+                r_power: term.r_power,
+                bessel_order: term.bessel_order - 1.0,
+            });
+        }
+        terms = next_terms;
+    }
+
+    let mut value = 0.0;
+    for term in terms {
+        if term.coeff == 0.0 {
+            continue;
+        }
+        let k_term = bessel_k_real_half_integer_or_integer(term.bessel_order.abs(), z)?;
+        value += term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term;
+    }
+    Ok(c * value)
+}
+
+#[inline(always)]
+fn duchon_matern_block_r3(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<f64, BasisError> {
+    duchon_matern_block_radial_derivative(r, kappa, n_order, k_dim, 3)
 }
 
 #[inline(always)]
@@ -8294,11 +8367,11 @@ fn duchon_radial_jets(
         //
         // The fourth- and sixth-order collision derivatives are assembled from
         // the Duchon partial-fraction blocks at the standard small-r floor.
-        out.t = duchon_phi_rrrr_collision(length_scale, k_dim, coeffs) / 3.0;
+        out.t = duchon_phi_rrrr_collision(length_scale, k_dim, coeffs)? / 3.0;
         out.q_rr = out.t;
         out.lap_rr = (k_dim as f64 + 2.0) * out.t;
         out.t_r = 0.0;
-        out.t_rr = duchon_phi_rrrrrr_collision(length_scale, k_dim, coeffs) / 15.0;
+        out.t_rr = duchon_phi_rrrrrr_collision(length_scale, k_dim, coeffs)? / 15.0;
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()
@@ -8541,13 +8614,13 @@ fn duchon_polyharmonic_radial_derivative_at_r(
 /// t(0) = φ''''(0) / 3, where t = R²φ = (φ'' - q) / r².
 ///
 /// Implementation: each polyharmonic block contributes its fourth derivative
-/// evaluated at r_eff analytically; each Matérn-Bessel block uses a
-/// finite-difference stencil on the already-available second-derivative code.
+/// evaluated at r_eff analytically; each Matérn-Bessel block uses the exact
+/// closed-form fourth radial derivative of the shifted Matérn block.
 fn duchon_phi_rrrr_collision(
     length_scale: f64,
     k_dim: usize,
     coeffs: &DuchonPartialFractionCoeffs,
-) -> f64 {
+) -> Result<f64, BasisError> {
     let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
     let kappa = 1.0 / length_scale.max(1e-300);
 
@@ -8561,27 +8634,14 @@ fn duchon_phi_rrrr_collision(
         phi_rrrr += a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, 4);
     }
 
-    // Matérn-Bessel blocks: use central finite-difference on the second
-    // derivative to approximate the fourth derivative.
-    //   φ''''(r) ≈ (φ''(r+h) - 2φ''(r) + φ''(r-h)) / h²
-    let h = 1e-5 * r_eff.max(1e-12);
     for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
         if b_n == 0.0 {
             continue;
         }
-        let r_plus = r_eff + h;
-        let r_minus = (r_eff - h).max(1e-300);
-        let (_, _, d2_center) =
-            duchon_matern_block_triplet(r_eff, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let (_, _, d2_plus) =
-            duchon_matern_block_triplet(r_plus, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let (_, _, d2_minus) =
-            duchon_matern_block_triplet(r_minus, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let fourth_fd = (d2_plus - 2.0 * d2_center + d2_minus) / (h * h);
-        phi_rrrr += b_n * fourth_fd;
+        phi_rrrr += b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, 4)?;
     }
 
-    phi_rrrr
+    Ok(phi_rrrr)
 }
 
 /// Assemble φ⁽⁶⁾(0) from the partial-fraction blocks by evaluating the sixth
@@ -8593,13 +8653,13 @@ fn duchon_phi_rrrr_collision(
 /// for t = R²φ.
 ///
 /// As with [`duchon_phi_rrrr_collision`], polyharmonic pieces are differentiated
-/// analytically, while Matérn-Bessel pieces use a finite-difference stencil on
-/// the already-available second radial derivative.
+/// analytically, while Matérn-Bessel pieces use the exact closed-form sixth
+/// radial derivative of the shifted Matérn block.
 fn duchon_phi_rrrrrr_collision(
     length_scale: f64,
     k_dim: usize,
     coeffs: &DuchonPartialFractionCoeffs,
-) -> f64 {
+) -> Result<f64, BasisError> {
     let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
     let kappa = 1.0 / length_scale.max(1e-300);
 
@@ -8612,29 +8672,13 @@ fn duchon_phi_rrrrrr_collision(
         phi_rrrrrr += a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, 6);
     }
 
-    let h = 1e-4 * r_eff.max(1e-12);
     for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
         if b_n == 0.0 {
             continue;
         }
-        let r_m2 = (r_eff - 2.0 * h).max(1e-300);
-        let r_m1 = (r_eff - h).max(1e-300);
-        let r_p1 = r_eff + h;
-        let r_p2 = r_eff + 2.0 * h;
-        let (_, _, d2_m2) =
-            duchon_matern_block_triplet(r_m2, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let (_, _, d2_m1) =
-            duchon_matern_block_triplet(r_m1, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let (_, _, d2_0) =
-            duchon_matern_block_triplet(r_eff, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let (_, _, d2_p1) =
-            duchon_matern_block_triplet(r_p1, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let (_, _, d2_p2) =
-            duchon_matern_block_triplet(r_p2, kappa, n, k_dim).unwrap_or((0.0, 0.0, 0.0));
-        let sixth_fd = (d2_m2 - 4.0 * d2_m1 + 6.0 * d2_0 - 4.0 * d2_p1 + d2_p2) / h.powi(4);
-        phi_rrrrrr += b_n * sixth_fd;
+        phi_rrrrrr += b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, 6)?;
     }
-    phi_rrrrrr
+    Ok(phi_rrrrrr)
 }
 
 fn build_duchon_design_psi_derivativeswithworkspace(
@@ -9010,7 +9054,8 @@ fn build_duchon_basis_designwithworkspace(
 
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
-    let chunk_size = 256.min(n);
+    // Use larger chunks (1024) for better cache utilization at biobank scale.
+    let chunk_size = 1024.min(n);
     let basis_result: Result<(), BasisError> = basis
         .axis_chunks_iter_mut(Axis(0), chunk_size)
         .into_par_iter()
@@ -9062,13 +9107,21 @@ fn build_duchon_basis_designwithworkspace(
                         )?
                     };
                 }
+                // Write basis row = kernel_row^T × Z using scatter-accumulate
+                // pattern: for each knot j with nonzero kernel, add its
+                // contribution to all columns at once. This is more cache-
+                // friendly than the column-by-column gather pattern since
+                // Z rows are contiguous in memory.
                 let mut row = chunk.row_mut(local_i);
-                for col in 0..kernel_cols {
-                    let mut acc = 0.0;
-                    for j in 0..k {
-                        acc += kernel_row[j] * z[[j, col]];
+                row.slice_mut(s![..kernel_cols]).fill(0.0);
+                for j in 0..k {
+                    let kv = kernel_row[j];
+                    if kv != 0.0 {
+                        let z_row = z.row(j);
+                        for col in 0..kernel_cols {
+                            row[col] += kv * z_row[col];
+                        }
                     }
-                    row[col] = acc;
                 }
             }
             Ok(())
@@ -14698,7 +14751,9 @@ mod tests {
         let (phi_rr, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
-        let t_collision = duchon_phi_rrrr_collision(length_scale, k_dim, &coeffs) / 3.0;
+        let t_collision = duchon_phi_rrrr_collision(length_scale, k_dim, &coeffs)
+            .expect("collision phi''''")
+            / 3.0;
 
         assert!(jets.phi_r.abs() < 1e-12);
         assert!((jets.q - phi_rr).abs() < 1e-12);
@@ -14856,7 +14911,9 @@ mod tests {
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let t_rr_collision = duchon_phi_rrrrrr_collision(length_scale, k_dim, &coeffs) / 15.0;
+        let t_rr_collision = duchon_phi_rrrrrr_collision(length_scale, k_dim, &coeffs)
+            .expect("collision phi''''''")
+            / 15.0;
 
         let jets_0 = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
