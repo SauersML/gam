@@ -2051,15 +2051,18 @@ fn compute_q_chain_derivs(
     d4s: &Array1<f64>,
 ) -> QChainDerivs {
     let n = eta_t.len();
-    let mut r = QChainDerivs {
-        dq_t: Array1::zeros(n),
-        dq_ls: Array1::zeros(n),
-        d2q_tls: Array1::zeros(n),
-        d2q_ls: Array1::zeros(n),
-        d3q_tls_ls: Array1::zeros(n),
-        d3q_ls: Array1::zeros(n),
-        d4q_tls_ls_ls: Array1::zeros(n),
-        d4q_ls: Array1::zeros(n),
+    // Use uninit — every element is written in the loop below.
+    let mut r = unsafe {
+        QChainDerivs {
+            dq_t: Array1::uninit(n).assume_init(),
+            dq_ls: Array1::uninit(n).assume_init(),
+            d2q_tls: Array1::uninit(n).assume_init(),
+            d2q_ls: Array1::uninit(n).assume_init(),
+            d3q_tls_ls: Array1::uninit(n).assume_init(),
+            d3q_ls: Array1::uninit(n).assume_init(),
+            d4q_tls_ls_ls: Array1::uninit(n).assume_init(),
+            d4q_ls: Array1::uninit(n).assume_init(),
+        }
     };
     for i in 0..n {
         let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
@@ -2089,15 +2092,18 @@ fn compute_q_chain_derivs_third(
     d3s: &Array1<f64>,
 ) -> QChainDerivs {
     let n = eta_t.len();
-    let mut r = QChainDerivs {
-        dq_t: Array1::zeros(n),
-        dq_ls: Array1::zeros(n),
-        d2q_tls: Array1::zeros(n),
-        d2q_ls: Array1::zeros(n),
-        d3q_tls_ls: Array1::zeros(n),
-        d3q_ls: Array1::zeros(n),
-        d4q_tls_ls_ls: Array1::zeros(n),
-        d4q_ls: Array1::zeros(n),
+    // Use uninit for fields written in the loop; zeros for unused 4th-order fields.
+    let mut r = unsafe {
+        QChainDerivs {
+            dq_t: Array1::uninit(n).assume_init(),
+            dq_ls: Array1::uninit(n).assume_init(),
+            d2q_tls: Array1::uninit(n).assume_init(),
+            d2q_ls: Array1::uninit(n).assume_init(),
+            d3q_tls_ls: Array1::uninit(n).assume_init(),
+            d3q_ls: Array1::uninit(n).assume_init(),
+            d4q_tls_ls_ls: Array1::zeros(n),
+            d4q_ls: Array1::zeros(n),
+        }
     };
     for i in 0..n {
         let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =

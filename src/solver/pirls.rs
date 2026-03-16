@@ -3338,6 +3338,9 @@ where
         .map(|_| Vec::new());
     let mut consecutive_fisher_fallbacks = 0usize;
     let mut force_fisher_for_rest = false;
+    // Pre-allocated buffer for the regularized hessian to avoid O(p²) clone
+    // per PIRLS iteration. Reused across iterations when dimensions match.
+    let mut regularized_buf: Option<crate::linalg::matrix::SymmetricMatrix> = None;
 
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
@@ -3417,8 +3420,16 @@ where
         let mut loop_lambda = lambda;
         let mut attempts = 0;
 
-        // Clone the hessian once before the LM loop; adjust diagonal in-place.
-        let mut regularized = state.hessian.clone();
+        // Copy the hessian into the reusable buffer (avoids allocation after first iteration).
+        let mut regularized = match (regularized_buf.take(), state.hessian.as_dense()) {
+            (Some(crate::linalg::matrix::SymmetricMatrix::Dense(mut buf)), Some(src))
+                if buf.nrows() == src.nrows() && buf.ncols() == src.ncols() =>
+            {
+                buf.assign(src);
+                crate::linalg::matrix::SymmetricMatrix::Dense(buf)
+            }
+            _ => state.hessian.clone(),
+        };
         let mut applied_lambda = 0.0_f64;
         // Cache for sparse regularized hessian (reuse for predicted reduction).
         let mut cached_sparse_regularized: Option<SparseColMat<usize, f64>> = None;
@@ -3754,6 +3765,8 @@ where
                 }
             }
         } // end loop (lambda search)
+        // Recycle the regularized hessian buffer for the next iteration.
+        regularized_buf = Some(regularized);
     }
 
     let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
