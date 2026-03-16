@@ -5,6 +5,7 @@ pub mod formula_dsl;
 pub mod generative;
 pub mod hmc;
 pub mod model;
+pub mod polya_gamma;
 pub mod predict;
 pub mod probability;
 pub mod quadrature;

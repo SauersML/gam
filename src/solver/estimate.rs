@@ -798,11 +798,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
-#[cfg(test)]
+/// Small ridge added to the LAML Hessian before inversion, for numerical stability
+/// when smoothing parameters are weakly identified.
 const LAML_RIDGE: f64 = 1e-8;
-#[cfg(test)]
-const DP_FLOOR: f64 = 1e-12;
-#[cfg(test)]
+/// Minimum penalized deviance floor.
+pub(crate) const DP_FLOOR: f64 = 1e-12;
+/// Width of the smooth transition region for the deviance floor.
 const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 const MAX_PIRLS_CACHE_ENTRIES: usize = 128;
 // Unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
@@ -821,8 +822,7 @@ const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
 /// Smooth approximation of `max(dp, DP_FLOOR)` that is differentiable.
 ///
 /// Returns the smoothed value and its derivative with respect to `dp`.
-#[cfg(test)]
-fn smooth_floor_dp(dp: f64) -> (f64, f64) {
+pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
     let scaled = (dp - DP_FLOOR) / tau;
 
@@ -1002,7 +1002,7 @@ fn compute_smoothing_correction(
 
     // Step 3: Invert Hessian to get V_rho.
     // Add a small ridge before factorization to regularize weakly identified ρ directions.
-    add_relative_diag_ridge(&mut hessian_rho, 1e-8, 1e-8);
+    add_relative_diag_ridge(&mut hessian_rho, LAML_RIDGE, LAML_RIDGE);
 
     let v_rho = match hessian_rho.cholesky(faer::Side::Lower) {
         Ok(chol) => {

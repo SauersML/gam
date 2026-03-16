@@ -1526,29 +1526,8 @@ pub struct RemlLamlResult {
 //  Soft floor for penalized deviance (Gaussian profiled scale)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Minimum penalized deviance floor.
-const DP_FLOOR: f64 = 1e-12;
-/// Width of the smooth transition region.
-const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
-
-/// Smooth approximation of max(dp, DP_FLOOR).
-/// Returns (smoothed_value, derivative_wrt_dp).
-pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64) {
-    let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
-    let scaled = (dp - DP_FLOOR) / tau;
-
-    let softplus = if scaled > 20.0 {
-        scaled + (-scaled).exp()
-    } else if scaled < -20.0 {
-        scaled.exp()
-    } else {
-        (1.0 + scaled.exp()).ln()
-    };
-
-    let value = DP_FLOOR + tau * softplus;
-    let grad = 1.0 / (1.0 + (-scaled).exp());
-    (value, grad)
-}
+// Canonical definitions live in estimate.rs; re-use them here.
+use crate::solver::estimate::{DP_FLOOR, smooth_floor_dp};
 
 /// Ridge floor for denominator safety.
 const DENOM_RIDGE: f64 = 1e-8;

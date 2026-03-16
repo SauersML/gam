@@ -32,7 +32,7 @@ use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatrixConfig};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
-use polya_gamma::PolyaGamma;
+use super::polya_gamma::PolyaGamma;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1761,7 +1761,7 @@ pub fn run_logit_polya_gamma_gibbs(
         let mut pg_rng = StdRng::seed_from_u64(
             config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
         );
-        let pg = PolyaGamma::new(1.0);
+        let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         // Small jitter so chains are not perfectly coupled.
         for j in 0..p {
@@ -1917,7 +1917,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
         let mut pg_rng = StdRng::seed_from_u64(
             config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
         );
-        let pg = PolyaGamma::new(1.0);
+        let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         for j in 0..p {
             beta[j] += 0.05 * sample_standard_normal(&mut rng);
