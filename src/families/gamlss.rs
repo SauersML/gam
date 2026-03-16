@@ -869,6 +869,71 @@ fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectio
         .push(identity_penalty(design.design.ncols()));
 }
 
+fn binomial_location_scalewarm_start(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    link_kind: &InverseLink,
+    threshold_block: &ParameterBlockSpec,
+    log_sigma_block: &ParameterBlockSpec,
+    mean_beta_hint: Option<&Array1<f64>>,
+    noise_beta_hint: Option<&Array1<f64>>,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    if let (Some(mean_beta), Some(noise_beta)) = (mean_beta_hint, noise_beta_hint) {
+        return Ok((mean_beta.clone(), noise_beta.clone()));
+    }
+
+    let warm_family = BinomialLocationScaleFamily {
+        y: y.clone(),
+        weights: weights.clone(),
+        link_kind: link_kind.clone(),
+        threshold_design: Some(threshold_block.design.clone()),
+        log_sigma_design: Some(log_sigma_block.design.clone()),
+    };
+    let warm_blocks = vec![
+        ParameterBlockSpec {
+            name: threshold_block.name.clone(),
+            design: threshold_block.design.clone(),
+            offset: threshold_block.offset.clone(),
+            penalties: threshold_block.penalties.clone(),
+            initial_log_lambdas: threshold_block.initial_log_lambdas.clone(),
+            initial_beta: mean_beta_hint.cloned(),
+        },
+        ParameterBlockSpec {
+            name: log_sigma_block.name.clone(),
+            design: log_sigma_block.design.clone(),
+            offset: log_sigma_block.offset.clone(),
+            penalties: log_sigma_block.penalties.clone(),
+            initial_log_lambdas: log_sigma_block.initial_log_lambdas.clone(),
+            initial_beta: noise_beta_hint.cloned(),
+        },
+    ];
+    let warm_options = BlockwiseFitOptions {
+        inner_max_cycles: 20,
+        inner_tol: 1e-6,
+        outer_max_iter: 8,
+        outer_tol: 1e-6,
+        minweight: MIN_WEIGHT,
+        ridge_floor: 1e-10,
+        ridge_policy: BlockwiseFitOptions::default().ridge_policy,
+        use_remlobjective: false,
+        compute_covariance: false,
+    };
+    let warm_fit = fit_custom_family(&warm_family, &warm_blocks, &warm_options)?;
+    let beta_threshold = warm_fit
+        .block_states
+        .get(BinomialLocationScaleFamily::BLOCK_T)
+        .ok_or_else(|| "binomial location-scale warm start is missing threshold block".to_string())?
+        .beta
+        .clone();
+    let beta_log_sigma = warm_fit
+        .block_states
+        .get(BinomialLocationScaleFamily::BLOCK_LOG_SIGMA)
+        .ok_or_else(|| "binomial location-scale warm start is missing log_sigma block".to_string())?
+        .beta
+        .clone();
+    Ok((beta_threshold, beta_log_sigma))
+}
+
 #[derive(Clone)]
 struct BinomialMeanWiggleSpec {
     pub y: Array1<f64>,
@@ -1829,7 +1894,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
         let mut log_sigma_penalties = noise_design.penalties.clone();
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
-        let log_sigmaspec = ParameterBlockSpec {
+        let mut thresholdspec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: DesignMatrix::Dense(mean_design.design.clone()),
+            offset: Array1::zeros(self.y.len()),
+            penalties: mean_design.penalties.clone(),
+            initial_log_lambdas: layout.mean_from(theta),
+            initial_beta: mean_beta_hint,
+        };
+        let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(identifiednoise_design),
             offset: Array1::zeros(self.y.len()),
@@ -1837,17 +1910,24 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
-        Ok(vec![
-            ParameterBlockSpec {
-                name: "threshold".to_string(),
-                design: DesignMatrix::Dense(mean_design.design.clone()),
-                offset: Array1::zeros(self.y.len()),
-                penalties: mean_design.penalties.clone(),
-                initial_log_lambdas: layout.mean_from(theta),
-                initial_beta: mean_beta_hint,
-            },
-            log_sigmaspec,
-        ])
+        if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
+            let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
+                &self.y,
+                &self.weights,
+                &self.link_kind,
+                &thresholdspec,
+                &log_sigmaspec,
+                thresholdspec.initial_beta.as_ref(),
+                log_sigmaspec.initial_beta.as_ref(),
+            )?;
+            if thresholdspec.initial_beta.is_none() {
+                thresholdspec.initial_beta = Some(beta_t0);
+            }
+            if log_sigmaspec.initial_beta.is_none() {
+                log_sigmaspec.initial_beta = Some(beta_ls0);
+            }
+        }
+        Ok(vec![thresholdspec, log_sigmaspec])
     }
 
     fn build_family(
@@ -1951,7 +2031,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
         let mut log_sigma_penalties = noise_design.penalties.clone();
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
-        let log_sigmaspec = ParameterBlockSpec {
+        let mut thresholdspec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: DesignMatrix::Dense(mean_design.design.clone()),
+            offset: Array1::zeros(self.y.len()),
+            penalties: mean_design.penalties.clone(),
+            initial_log_lambdas: layout.mean_from(theta),
+            initial_beta: mean_beta_hint,
+        };
+        let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(identifiednoise_design),
             offset: Array1::zeros(self.y.len()),
@@ -1959,15 +2047,25 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
+        if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
+            let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
+                &self.y,
+                &self.weights,
+                &self.link_kind,
+                &thresholdspec,
+                &log_sigmaspec,
+                thresholdspec.initial_beta.as_ref(),
+                log_sigmaspec.initial_beta.as_ref(),
+            )?;
+            if thresholdspec.initial_beta.is_none() {
+                thresholdspec.initial_beta = Some(beta_t0);
+            }
+            if log_sigmaspec.initial_beta.is_none() {
+                log_sigmaspec.initial_beta = Some(beta_ls0);
+            }
+        }
         Ok(vec![
-            ParameterBlockSpec {
-                name: "threshold".to_string(),
-                design: DesignMatrix::Dense(mean_design.design.clone()),
-                offset: Array1::zeros(self.y.len()),
-                penalties: mean_design.penalties.clone(),
-                initial_log_lambdas: layout.mean_from(theta),
-                initial_beta: mean_beta_hint,
-            },
+            thresholdspec,
             log_sigmaspec,
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -15008,6 +15106,92 @@ mod tests {
         let family = builder.build_family(&mean_design, &noise_design);
         assert!(family.exact_joint_supported());
         assert!(family.requires_joint_outer_hyper_path());
+    }
+
+    #[test]
+    fn binomial_location_scale_builder_populateswarm_start_betas() {
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+        }
+        let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let builder = BinomialLocationScaleTermBuilder {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            meanspec: simple_matern_term_collection(&[0, 1], 0.45),
+            noisespec: simple_matern_term_collection(&[0, 1], 0.8),
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), builder.meanspec()).expect("mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), builder.noisespec()).expect("noise design");
+        let rho = compose_theta_from_hints_test(
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
+            &None,
+            &None,
+            &Array1::zeros(0),
+        );
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].initial_beta.is_some());
+        assert!(blocks[1].initial_beta.is_some());
+    }
+
+    #[test]
+    fn binomial_location_scalewiggle_builder_populateswarm_start_betas() {
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).cos();
+        }
+        let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let q_seed = Array1::linspace(-1.25, 1.25, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let builder = BinomialLocationScaleWiggleTermBuilder {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            meanspec: simple_matern_term_collection(&[0, 1], 0.45),
+            noisespec: simple_matern_term_collection(&[0, 1], 0.8),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            wiggle_block,
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), builder.meanspec()).expect("mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), builder.noisespec()).expect("noise design");
+        let rho = compose_theta_from_hints_test(
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
+            &None,
+            &None,
+            &builder.extra_rho0().expect("extra rho0"),
+        );
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        assert_eq!(blocks.len(), 3);
+        assert!(blocks[0].initial_beta.is_some());
+        assert!(blocks[1].initial_beta.is_some());
     }
 
     #[test]
