@@ -1,6 +1,6 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
-use crate::inference::model::SavedLinkWiggleRuntime;
+use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
@@ -308,6 +308,8 @@ pub struct PredictInput {
     pub design_noise: Option<DesignMatrix>,
     /// Optional offset vector for the noise/scale block.
     pub offset_noise: Option<Array1<f64>>,
+    /// Optional auxiliary scalar covariate used by specialized predictors.
+    pub auxiliary_scalar: Option<Array1<f64>>,
 }
 
 /// Point prediction with optional standard errors on the linear predictor.
@@ -644,6 +646,420 @@ impl PredictableModel for StandardPredictor {
         } else {
             vec![BlockRole::Mean]
         }
+    }
+}
+
+pub struct BernoulliMarginalSlopePredictor {
+    pub beta_marginal: Array1<f64>,
+    pub beta_logslope: Array1<f64>,
+    pub beta_score_warp: Option<Array1<f64>>,
+    pub beta_link_dev: Option<Array1<f64>>,
+    pub z_column: String,
+    pub baseline_marginal: f64,
+    pub baseline_logslope: f64,
+    pub covariance: Option<Array2<f64>>,
+    pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
+    pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+}
+
+impl BernoulliMarginalSlopePredictor {
+    pub fn from_unified(
+        unified: &UnifiedFitResult,
+        z_column: String,
+        baseline_marginal: f64,
+        baseline_logslope: f64,
+        score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
+        link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+    ) -> Result<Self, String> {
+        let blocks = &unified.blocks;
+        if blocks.len() < 2 {
+            return Err(format!(
+                "bernoulli marginal-slope predictor requires at least 2 blocks, got {}",
+                blocks.len()
+            ));
+        }
+        let mut cursor = 2usize;
+        let beta_score_warp = if score_warp_runtime.is_some() {
+            let beta = blocks
+                .get(cursor)
+                .ok_or_else(|| "missing score-warp coefficient block".to_string())?
+                .beta
+                .clone();
+            cursor += 1;
+            Some(beta)
+        } else {
+            None
+        };
+        let beta_link_dev = if link_deviation_runtime.is_some() {
+            Some(
+                blocks
+                    .get(cursor)
+                    .ok_or_else(|| "missing link-deviation coefficient block".to_string())?
+                    .beta
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            beta_marginal: blocks[0].beta.clone(),
+            beta_logslope: blocks[1].beta.clone(),
+            beta_score_warp,
+            beta_link_dev,
+            z_column,
+            baseline_marginal,
+            baseline_logslope,
+            covariance: unified.beta_covariance().cloned(),
+            score_warp_runtime,
+            link_deviation_runtime,
+        })
+    }
+
+    fn theta(&self) -> Array1<f64> {
+        let total = self.beta_marginal.len()
+            + self.beta_logslope.len()
+            + self.beta_score_warp.as_ref().map_or(0, |b| b.len())
+            + self.beta_link_dev.as_ref().map_or(0, |b| b.len());
+        let mut theta = Array1::<f64>::zeros(total);
+        let mut cursor = 0usize;
+        theta
+            .slice_mut(ndarray::s![cursor..cursor + self.beta_marginal.len()])
+            .assign(&self.beta_marginal);
+        cursor += self.beta_marginal.len();
+        theta
+            .slice_mut(ndarray::s![cursor..cursor + self.beta_logslope.len()])
+            .assign(&self.beta_logslope);
+        cursor += self.beta_logslope.len();
+        if let Some(beta) = self.beta_score_warp.as_ref() {
+            theta
+                .slice_mut(ndarray::s![cursor..cursor + beta.len()])
+                .assign(beta);
+            cursor += beta.len();
+        }
+        if let Some(beta) = self.beta_link_dev.as_ref() {
+            theta
+                .slice_mut(ndarray::s![cursor..cursor + beta.len()])
+                .assign(beta);
+        }
+        theta
+    }
+
+    fn split_theta<'a>(
+        &'a self,
+        theta: &'a Array1<f64>,
+    ) -> Result<
+        (
+            ArrayView1<'a, f64>,
+            ArrayView1<'a, f64>,
+            Option<ArrayView1<'a, f64>>,
+            Option<ArrayView1<'a, f64>>,
+        ),
+        EstimationError,
+    > {
+        let expected = self.theta().len();
+        if theta.len() != expected {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope theta length mismatch: expected {expected}, got {}",
+                theta.len()
+            )));
+        }
+        let mut cursor = 0usize;
+        let marginal = theta.slice(ndarray::s![cursor..cursor + self.beta_marginal.len()]);
+        cursor += self.beta_marginal.len();
+        let logslope = theta.slice(ndarray::s![cursor..cursor + self.beta_logslope.len()]);
+        cursor += self.beta_logslope.len();
+        let score_warp = self.beta_score_warp.as_ref().map(|beta| {
+            let view = theta.slice(ndarray::s![cursor..cursor + beta.len()]);
+            cursor += beta.len();
+            view
+        });
+        let link_dev = self
+            .beta_link_dev
+            .as_ref()
+            .map(|beta| theta.slice(ndarray::s![cursor..cursor + beta.len()]));
+        Ok((marginal, logslope, score_warp, link_dev))
+    }
+
+    fn normal_expectation_nodes(n: usize) -> (Vec<f64>, Vec<f64>) {
+        let gh = crate::quadrature::compute_gauss_hermite_n(n);
+        let scale = 2.0_f64.sqrt();
+        let norm = std::f64::consts::PI.sqrt();
+        (
+            gh.nodes.into_iter().map(|x| scale * x).collect(),
+            gh.weights.into_iter().map(|w| w / norm).collect(),
+        )
+    }
+
+    fn warp_values(
+        runtime: Option<&SavedAnchoredDeviationRuntime>,
+        beta: Option<ArrayView1<'_, f64>>,
+        z: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if let (Some(runtime), Some(beta)) = (runtime, beta) {
+            let design = runtime.design(z).map_err(EstimationError::InvalidInput)?;
+            Ok(z + &design.dot(&beta.to_owned()))
+        } else {
+            Ok(z.clone())
+        }
+    }
+
+    fn link_values(
+        runtime: Option<&SavedAnchoredDeviationRuntime>,
+        beta: Option<ArrayView1<'_, f64>>,
+        eta: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if let (Some(runtime), Some(beta)) = (runtime, beta) {
+            let design = runtime.design(eta).map_err(EstimationError::InvalidInput)?;
+            Ok(eta + &design.dot(&beta.to_owned()))
+        } else {
+            Ok(eta.clone())
+        }
+    }
+
+    fn link_derivative(
+        runtime: Option<&SavedAnchoredDeviationRuntime>,
+        beta: Option<ArrayView1<'_, f64>>,
+        eta: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if let (Some(runtime), Some(beta)) = (runtime, beta) {
+            let design = runtime
+                .first_derivative_design(eta)
+                .map_err(EstimationError::InvalidInput)?;
+            Ok(design.dot(&beta.to_owned()) + 1.0)
+        } else {
+            Ok(Array1::ones(eta.len()))
+        }
+    }
+
+    fn solve_intercept_scalar(
+        &self,
+        marginal_eta: f64,
+        slope: f64,
+        score_warp_beta: Option<ArrayView1<'_, f64>>,
+        link_dev_beta: Option<ArrayView1<'_, f64>>,
+    ) -> Result<f64, EstimationError> {
+        if self.score_warp_runtime.is_none() && self.link_deviation_runtime.is_none() {
+            return Ok(marginal_eta * (1.0 + slope * slope).sqrt());
+        }
+        let target = crate::probability::normal_cdf(marginal_eta).clamp(1e-12, 1.0 - 1e-12);
+        let (nodes, weights) = Self::normal_expectation_nodes(20);
+        let node_arr = Array1::from_vec(nodes);
+        let warped_nodes = Self::warp_values(
+            self.score_warp_runtime.as_ref(),
+            score_warp_beta,
+            &node_arr,
+        )?;
+        let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
+        for _ in 0..20 {
+            let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
+            let linked = Self::link_values(
+                self.link_deviation_runtime.as_ref(),
+                link_dev_beta,
+                &eta_nodes,
+            )?;
+            let linked_d1 = Self::link_derivative(
+                self.link_deviation_runtime.as_ref(),
+                link_dev_beta,
+                &eta_nodes,
+            )?;
+            let f = weights
+                .iter()
+                .zip(linked.iter())
+                .map(|(&w, &q)| w * crate::probability::normal_cdf(q))
+                .sum::<f64>()
+                - target;
+            if f.abs() < 1e-10 {
+                break;
+            }
+            let df = weights
+                .iter()
+                .zip(linked.iter().zip(linked_d1.iter()))
+                .map(|(&w, (&q, &dq))| w * crate::probability::normal_pdf(q) * dq)
+                .sum::<f64>()
+                .max(1e-10);
+            intercept -= f / df;
+        }
+        Ok(intercept)
+    }
+
+    fn final_eta_from_theta(
+        &self,
+        input: &PredictInput,
+        theta: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let z = input.auxiliary_scalar.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                format!("bernoulli marginal-slope prediction requires auxiliary z column '{}'", self.z_column),
+            )
+        })?;
+        let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "bernoulli marginal-slope prediction requires logslope design".to_string(),
+            )
+        })?;
+        let (beta_marginal, beta_logslope, beta_score_warp, beta_link_dev) =
+            self.split_theta(theta)?;
+        let marginal_eta = input.design.dot(&beta_marginal.to_owned()) + self.baseline_marginal;
+        let logslope_eta =
+            design_logslope.dot(&beta_logslope.to_owned()) + self.baseline_logslope;
+        let warped_z = Self::warp_values(self.score_warp_runtime.as_ref(), beta_score_warp, z)?;
+        let mut eta_base = Array1::<f64>::zeros(z.len());
+        for i in 0..z.len() {
+            let slope = logslope_eta[i].exp();
+            let intercept =
+                self.solve_intercept_scalar(marginal_eta[i], slope, beta_score_warp, beta_link_dev)?;
+            eta_base[i] = intercept + slope * warped_z[i];
+        }
+        Self::link_values(self.link_deviation_runtime.as_ref(), beta_link_dev, &eta_base)
+    }
+
+    fn eta_standard_error_from_covariance(
+        &self,
+        input: &PredictInput,
+        covariance: &Array2<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let theta = self.theta();
+        let eta0 = self.final_eta_from_theta(input, &theta)?;
+        let mut grad = Array2::<f64>::zeros((eta0.len(), theta.len()));
+        for j in 0..theta.len() {
+            let h = 1e-4 * (1.0 + theta[j].abs());
+            let mut plus = theta.clone();
+            plus[j] += h;
+            let mut minus = theta.clone();
+            minus[j] -= h;
+            let eta_plus = self.final_eta_from_theta(input, &plus)?;
+            let eta_minus = self.final_eta_from_theta(input, &minus)?;
+            let diff = (&eta_plus - &eta_minus) / (2.0 * h);
+            grad.column_mut(j).assign(&diff);
+        }
+        Ok(linear_predictor_se_from_grad(&grad, covariance))
+    }
+
+    fn eta_standard_error(
+        &self,
+        input: &PredictInput,
+        fit: &UnifiedFitResult,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let theta = self.theta();
+        let covariance = posterior_mean_covariance_or_warn(
+            fit,
+            self.covariance.as_ref(),
+            theta.len(),
+            "bernoulli marginal-slope posterior mean",
+        );
+        let Some(covariance) = covariance else {
+            return Ok(Array1::zeros(input.design.nrows()));
+        };
+        self.eta_standard_error_from_covariance(input, covariance)
+    }
+}
+
+impl PredictableModel for BernoulliMarginalSlopePredictor {
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError> {
+        let eta = self.final_eta_from_theta(input, &self.theta())?;
+        let mean = eta.mapv(|v| crate::probability::normal_cdf(v).clamp(0.0, 1.0));
+        Ok(PredictResult { eta, mean })
+    }
+
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError> {
+        let plugin = self.predict_plugin_response(input)?;
+        let (eta_se, mean_se) = if let Some(covariance) = self.covariance.as_ref() {
+            let theta = self.theta();
+            if covariance.nrows() != theta.len() || covariance.ncols() != theta.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "bernoulli marginal-slope covariance dimension mismatch: expected {}x{}, got {}x{}",
+                    theta.len(),
+                    theta.len(),
+                    covariance.nrows(),
+                    covariance.ncols()
+                )));
+            }
+            let eta_se = self.eta_standard_error_from_covariance(input, covariance)?;
+            let mean_se =
+                eta_se.clone() * plugin.eta.mapv(crate::probability::normal_pdf);
+            (Some(eta_se), Some(mean_se))
+        } else {
+            (None, None)
+        };
+        Ok(PredictionWithSE {
+            eta: plugin.eta,
+            mean: plugin.mean,
+            eta_se,
+            mean_se,
+        })
+    }
+
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
+        fit: &UnifiedFitResult,
+        options: &PredictUncertaintyOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError> {
+        let plugin = self.predict_plugin_response(input)?;
+        let eta_se = self.eta_standard_error(input, fit)?;
+        let zcrit = standard_normal_quantile(0.5 + options.confidence_level * 0.5)
+            .map_err(EstimationError::InvalidInput)?;
+        let eta_lower = &plugin.eta - &eta_se.mapv(|s| zcrit * s);
+        let eta_upper = &plugin.eta + &eta_se.mapv(|s| zcrit * s);
+        let mean_lower = eta_lower.mapv(|v| crate::probability::normal_cdf(v).clamp(0.0, 1.0));
+        let mean_upper = eta_upper.mapv(|v| crate::probability::normal_cdf(v).clamp(0.0, 1.0));
+        let mean_se = eta_se.clone() * plugin.eta.mapv(crate::probability::normal_pdf);
+        Ok(PredictUncertaintyResult {
+            eta: plugin.eta,
+            mean: plugin.mean,
+            eta_standard_error: eta_se.clone(),
+            mean_standard_error: mean_se,
+            eta_lower,
+            eta_upper,
+            mean_lower,
+            mean_upper,
+            observation_lower: None,
+            observation_upper: None,
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: false,
+        })
+    }
+
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        fit: &UnifiedFitResult,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        let plugin = self.predict_plugin_response(input)?;
+        let eta_se = self.eta_standard_error(input, fit)?;
+        let mean = Array1::from_iter(
+            plugin
+                .eta
+                .iter()
+                .zip(eta_se.iter())
+                .map(|(&m, &s)| crate::probability::normal_cdf(m / (1.0 + s * s).sqrt())),
+        );
+        Ok(PredictPosteriorMeanResult {
+            eta: plugin.eta,
+            eta_standard_error: eta_se,
+            mean,
+        })
+    }
+
+    fn n_blocks(&self) -> usize {
+        2 + usize::from(self.beta_score_warp.is_some()) + usize::from(self.beta_link_dev.is_some())
+    }
+
+    fn block_roles(&self) -> Vec<BlockRole> {
+        let mut roles = vec![BlockRole::Location, BlockRole::Scale];
+        if self.beta_score_warp.is_some() {
+            roles.push(BlockRole::Mean);
+        }
+        if self.beta_link_dev.is_some() {
+            roles.push(BlockRole::LinkWiggle);
+        }
+        roles
     }
 }
 

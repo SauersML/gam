@@ -23,6 +23,9 @@ use gam::estimate::{
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
 };
+use gam::families::bernoulli_marginal_slope::{
+    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime,
+};
 use gam::families::scale_design::{
     ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
     infer_non_intercept_start,
@@ -46,7 +49,7 @@ use gam::inference::formula_dsl::{
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
-    ModelKind, PredictModelClass,
+    ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
 };
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{
@@ -71,8 +74,9 @@ use gam::types::{
     SasLinkSpec, SasLinkState,
 };
 use gam::{
-    BinomialLocationScaleFitRequest, FitRequest, FitResult, GaussianLocationScaleFitRequest,
-    LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
+    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
+    GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
+    StandardFitRequest,
     SurvivalLocationScaleFitRequest, fit_model,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
@@ -213,6 +217,18 @@ struct FitArgs {
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
     #[arg(long = "predict-noise", alias = "predict-variance")]
     predict_noise: Option<String>,
+    /// Secondary formula for the ancestry-varying log-slope surface in the
+    /// Bernoulli marginal-slope family.
+    #[arg(long = "logslope-formula")]
+    logslope_formula: Option<String>,
+    /// Column containing the already-standardized score z for the Bernoulli
+    /// marginal-slope family.
+    #[arg(long = "z-column")]
+    z_column: Option<String>,
+    #[arg(long = "disable-score-warp", default_value_t = false)]
+    disable_score_warp: bool,
+    #[arg(long = "disable-link-dev", default_value_t = false)]
+    disable_link_dev: bool,
     #[arg(long = "firth", default_value_t = false)]
     firth: bool,
     /// Survival likelihood mode for Surv(...) formulas.
@@ -576,6 +592,7 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), S
 
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
 const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
+const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
 
 fn main() {
     if let Err(e) = run() {
@@ -700,6 +717,25 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .get(&parsed.response)
         .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
     let y = ds.values.column(y_col).to_owned();
+
+    if args.logslope_formula.is_some() || args.z_column.is_some() {
+        if args.logslope_formula.is_none() || args.z_column.is_none() {
+            return Err(
+                "--logslope-formula and --z-column must be provided together".to_string(),
+            );
+        }
+        return run_fit_bernoulli_marginal_slope(
+            &args,
+            &mut progress,
+            fit_total_steps,
+            &ds,
+            &col_map,
+            &parsed,
+            &formula_text,
+            &y,
+            &mut inference_notes,
+        );
+    }
 
     let link_choice = parse_link_choice(effective_link_arg.as_deref(), false)?;
     let mixture_linkspec = if let Some(choice) = link_choice.as_ref() {
@@ -1549,7 +1585,9 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
         PredictModelClass::Survival => true,
         // Binomial location-scale with link wiggles needs the hand-rolled path.
         PredictModelClass::BinomialLocationScale => model.has_link_wiggle(),
-        PredictModelClass::Standard | PredictModelClass::GaussianLocationScale => false,
+        PredictModelClass::Standard
+        | PredictModelClass::GaussianLocationScale
+        | PredictModelClass::BernoulliMarginalSlope => false,
     }
 }
 
@@ -1608,6 +1646,7 @@ fn build_predict_input_for_model(
                 offset,
                 design_noise: None,
                 offset_noise: None,
+                auxiliary_scalar: None,
             })
         }
         PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
@@ -1643,6 +1682,32 @@ fn build_predict_input_for_model(
                 offset,
                 design_noise: Some(DesignMatrix::Dense(prepared_noise_design)),
                 offset_noise: Some(Array1::zeros(n)),
+                auxiliary_scalar: None,
+            })
+        }
+        PredictModelClass::BernoulliMarginalSlope => {
+            let z_name = model
+                .z_column
+                .as_ref()
+                .ok_or_else(|| "marginal-slope model is missing z_column".to_string())?;
+            let &z_col = col_map
+                .get(z_name)
+                .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
+            let z = data.column(z_col).to_owned();
+            let spec_logslope = resolve_termspec_for_prediction(
+                &model.resolved_termspec_noise,
+                training_headers,
+                col_map,
+                "resolved_termspec_noise",
+            )?;
+            let design_logslope = build_term_collection_design(data, &spec_logslope)
+                .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
+            Ok(PredictInput {
+                design: DesignMatrix::Dense(design.design),
+                offset,
+                design_noise: Some(DesignMatrix::Dense(design_logslope.design)),
+                offset_noise: Some(Array1::zeros(n)),
+                auxiliary_scalar: Some(z),
             })
         }
         PredictModelClass::Survival => Err(
@@ -1883,6 +1948,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_sas.as_ref(),
             saved_mixture_param_cov.as_ref(),
             saved_sas_param_cov.as_ref(),
+        ),
+        PredictModelClass::BernoulliMarginalSlope => Err(
+            "bernoulli marginal-slope model unexpectedly bypassed the unified prediction path"
+                .to_string(),
         ),
         PredictModelClass::Standard => run_predict_standard(
             &mut progress,
@@ -2817,6 +2886,7 @@ fn run_predict_standard(
         offset: offset.clone(),
         design_noise: None,
         offset_noise: None,
+        auxiliary_scalar: None,
     };
     let nonlinear = matches!(
         family,
@@ -5141,6 +5211,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                     .to_string(),
             )
         }
+        PredictModelClass::BernoulliMarginalSlope => {
+            return Err(
+                "sample for bernoulli marginal-slope models is not available yet".to_string(),
+            )
+        }
         PredictModelClass::Standard => run_sample_standard(
             &mut progress,
             &model,
@@ -5847,6 +5922,12 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 &col_map,
                 training_headers,
             )?,
+            PredictModelClass::BernoulliMarginalSlope => {
+                return Err(
+                    "generate is not available for bernoulli marginal-slope models yet"
+                        .to_string(),
+                );
+            }
             PredictModelClass::Survival => {
                 return Err(
                     "generate is not available for survival models in this command; \
@@ -6175,6 +6256,7 @@ fn run_generate_standard(
         offset,
         design_noise: None,
         offset_noise: None,
+        auxiliary_scalar: None,
     };
     let pred = predictor
         .predict_plugin_response(&pred_input)

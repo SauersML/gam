@@ -919,14 +919,240 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub x_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
-    pub implicit_operator: Option<Arc<crate::terms::basis::ImplicitDesignPsiDerivative>>,
+    pub implicit_operator: Option<Arc<dyn CustomFamilyPsiDerivativeOperator>>,
     pub implicit_axis: usize,
     pub implicit_group_id: Option<usize>,
 }
 
+pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
+    fn n_data(&self) -> usize;
+    fn p_out(&self) -> usize;
+    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64>;
+    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64>;
+    fn materialize_first(&self, axis: usize) -> Array2<f64>;
+    fn materialize_second_diag(&self, axis: usize) -> Array2<f64>;
+    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64>;
+}
+
+impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
+    fn n_data(&self) -> usize {
+        crate::terms::basis::ImplicitDesignPsiDerivative::n_data(self)
+    }
+
+    fn p_out(&self) -> usize {
+        crate::terms::basis::ImplicitDesignPsiDerivative::p_out(self)
+    }
+
+    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul(self, axis, v)
+    }
+
+    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul(self, axis, u)
+    }
+
+    fn materialize_first(&self, axis: usize) -> Array2<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::materialize_first(self, axis)
+    }
+
+    fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_diag(self, axis)
+    }
+
+    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_cross(
+            self, axis_d, axis_e,
+        )
+    }
+}
+
+fn rowwise_kronecker_dense(base: &Array2<f64>, time_basis: &Array2<f64>) -> Array2<f64> {
+    assert_eq!(base.nrows(), time_basis.nrows());
+    let n = base.nrows();
+    let p_base = base.ncols();
+    let p_time = time_basis.ncols();
+    let mut out = Array2::<f64>::zeros((n, p_base * p_time));
+    for i in 0..n {
+        for j in 0..p_base {
+            let base_ij = base[[i, j]];
+            if base_ij == 0.0 {
+                continue;
+            }
+            for t in 0..p_time {
+                out[[i, j * p_time + t]] = base_ij * time_basis[[i, t]];
+            }
+        }
+    }
+    out
+}
+
+fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
+    let total_rows = blocks.iter().map(Array2::nrows).sum();
+    let p = blocks.first().map(Array2::ncols).unwrap_or(0);
+    let mut stacked = Array2::<f64>::zeros((total_rows, p));
+    let mut row_start = 0usize;
+    for block in blocks {
+        assert_eq!(block.ncols(), p);
+        let row_end = row_start + block.nrows();
+        stacked
+            .slice_mut(ndarray::s![row_start..row_end, ..])
+            .assign(block);
+        row_start = row_end;
+    }
+    stacked
+}
+
+struct RowwiseKroneckerPsiDerivativeOperator {
+    base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    time_bases: Vec<Arc<Array2<f64>>>,
+    n_per_block: usize,
+    p_time: usize,
+    p_out: usize,
+}
+
+impl RowwiseKroneckerPsiDerivativeOperator {
+    fn new(
+        base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+        time_bases: Vec<Arc<Array2<f64>>>,
+    ) -> Result<Self, String> {
+        let first = time_bases.first().ok_or_else(|| {
+            "rowwise kronecker psi operator needs at least one time basis".to_string()
+        })?;
+        let n_per_block = first.nrows();
+        let p_time = first.ncols();
+        for (idx, basis) in time_bases.iter().enumerate() {
+            if basis.nrows() != n_per_block || basis.ncols() != p_time {
+                return Err(format!(
+                    "rowwise kronecker psi operator time basis {idx} shape mismatch: got {}x{}, expected {}x{}",
+                    basis.nrows(),
+                    basis.ncols(),
+                    n_per_block,
+                    p_time
+                ));
+            }
+        }
+        if base.n_data() != n_per_block {
+            return Err(format!(
+                "rowwise kronecker psi operator base row mismatch: got {}, expected {n_per_block}",
+                base.n_data()
+            ));
+        }
+        Ok(Self {
+            p_out: base.p_out() * p_time,
+            base,
+            time_bases,
+            n_per_block,
+            p_time,
+        })
+    }
+
+    fn split_time_columns(&self, u: &ArrayView1<'_, f64>) -> Vec<Array1<f64>> {
+        let p_base = self.base.p_out();
+        assert_eq!(u.len(), self.p_out);
+        let mut cols = vec![Array1::<f64>::zeros(p_base); self.p_time];
+        for j in 0..p_base {
+            for t in 0..self.p_time {
+                cols[t][j] = u[j * self.p_time + t];
+            }
+        }
+        cols
+    }
+}
+
+impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
+    fn n_data(&self) -> usize {
+        self.n_per_block * self.time_bases.len()
+    }
+
+    fn p_out(&self) -> usize {
+        self.p_out
+    }
+
+    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(v.len(), self.n_data());
+        let p_base = self.base.p_out();
+        let mut out = Array1::<f64>::zeros(self.p_out);
+        for t in 0..self.p_time {
+            let mut accum = Array1::<f64>::zeros(p_base);
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
+                    * &time_basis.column(t).to_owned();
+                accum += &self.base.transpose_mul(axis, &weighted.view());
+            }
+            for j in 0..p_base {
+                out[j * self.p_time + t] = accum[j];
+            }
+        }
+        out
+    }
+
+    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+        let time_cols = self.split_time_columns(u);
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        for (t, coeffs) in time_cols.iter().enumerate() {
+            let base_eval = self.base.forward_mul(axis, &coeffs.view());
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let contrib = &base_eval * &time_basis.column(t).to_owned();
+                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
+                out_block += &contrib;
+            }
+        }
+        out
+    }
+
+    fn materialize_first(&self, axis: usize) -> Array2<f64> {
+        let base = self.base.materialize_first(axis);
+        let blocks: Vec<Array2<f64>> = self
+            .time_bases
+            .iter()
+            .map(|basis| rowwise_kronecker_dense(&base, basis))
+            .collect();
+        stack_dense_row_blocks(&blocks)
+    }
+
+    fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
+        let base = self.base.materialize_second_diag(axis);
+        let blocks: Vec<Array2<f64>> = self
+            .time_bases
+            .iter()
+            .map(|basis| rowwise_kronecker_dense(&base, basis))
+            .collect();
+        stack_dense_row_blocks(&blocks)
+    }
+
+    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
+        let base = self.base.materialize_second_cross(axis_d, axis_e);
+        let blocks: Vec<Array2<f64>> = self
+            .time_bases
+            .iter()
+            .map(|basis| rowwise_kronecker_dense(&base, basis))
+            .collect();
+        stack_dense_row_blocks(&blocks)
+    }
+}
+
+pub(crate) fn build_rowwise_kronecker_psi_operator(
+    base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    time_bases: Vec<Arc<Array2<f64>>>,
+) -> Result<Arc<dyn CustomFamilyPsiDerivativeOperator>, String> {
+    Ok(Arc::new(RowwiseKroneckerPsiDerivativeOperator::new(
+        base, time_bases,
+    )?))
+}
+
+pub(crate) fn wrap_spatial_implicit_psi_operator(
+    op: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+) -> Arc<dyn CustomFamilyPsiDerivativeOperator> {
+    op
+}
+
 #[derive(Clone)]
 pub(crate) struct CustomFamilyPsiDesignAction {
-    operator: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
     row_range: Range<usize>,
     p: usize,

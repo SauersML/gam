@@ -11,9 +11,12 @@ use crate::custom_family::{
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
     resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
+    wrap_spatial_implicit_psi_operator,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
+use crate::faer_ndarray::{
+    fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
+};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
@@ -644,7 +647,10 @@ fn build_block_spatial_psi_derivatives(
                             .collect();
                         rows
                     }),
-                    implicit_operator: info.implicit_operator.clone(),
+                    implicit_operator: info
+                        .implicit_operator
+                        .as_ref()
+                        .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op))),
                     implicit_axis: info.implicit_axis,
                     implicit_group_id: info.aniso_group_id,
                 }
@@ -2436,10 +2442,12 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             last_eval: None,
         },
         // Exact first-order AND second-order [rho, psi] calculus is available
-        // for all inverse links via the shared jet formulas and the five-term
-        // second-order Hessian correction in LinkWiggleDerivProvider. This
-        // enables exact Newton for the outer REML optimization, eliminating
-        // the BFGS fallback that was previously required.
+        // for all inverse links via the shared jet formulas plus the generic
+        // exact-Newton D_βH / D²_βH closures routed through
+        // evaluate_custom_family_joint_hyper -> joint_outer_evaluate ->
+        // BorrowedJointDerivProvider. This enables exact Newton for the outer
+        // REML optimization, eliminating the BFGS fallback that was previously
+        // required.
         cap: OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
@@ -2475,10 +2483,11 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         .unwrap_or(HessianResult::Unavailable),
                 });
             }
-            // Request Hessian from the unified evaluator. The five-term
-            // second-order correction in LinkWiggleDerivProvider (or the
-            // BorrowedJointDerivProvider fallback) provides exact ∂²H/∂ρ_k∂ρ_l,
-            // enabling the outer Newton step.
+            // Request Hessian from the unified evaluator. Exact ∂²H/∂ρ_k∂ρ_l
+            // now comes from the generic exact-Newton closure path
+            // (exact_newton_dh_closure / exact_newton_d2h_closure ->
+            // joint_outer_evaluate -> BorrowedJointDerivProvider), enabling
+            // the outer Newton step.
             let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), true)
                 .map_err(EstimationError::InvalidInput)?;
             let hessian_result = eval
@@ -10114,8 +10123,7 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
-        )?
-        else {
+        )? else {
             return Ok(None);
         };
         let n = self.y.len();

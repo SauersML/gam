@@ -2756,13 +2756,15 @@ impl<'a> RemlState<'a> {
     /// 1. Obtains the PIRLS bundle at the current ρ (with the design already
     ///    rebuilt for the current ψ).
     /// 2. Builds `HyperCoord` ext_coords from the supplied `DirectionalHyperParam`
-    ///    list via `build_tau_unified_objects`.
+    ///    list via the dense/transformed or sparse/native τ builders, depending
+    ///    on the active backend.
     /// 3. Builds the full `InnerSolution` (mirroring `evaluate_unified`), injects
     ///    the ext_coords, and calls `reml_laml_evaluate`.
     ///
     /// The caller is responsible for rebuilding the `RemlState` with the design
     /// X(ψ) and penalties S(ψ) corresponding to the current ψ values before
-    /// calling this method.
+    /// calling this method. The unified evaluator then preserves the backend:
+    /// dense spectral paths stay dense, and sparse exact paths stay sparse.
     pub fn evaluate_unified_with_psi_ext(
         &self,
         rho: &Array1<f64>,
@@ -2771,25 +2773,47 @@ impl<'a> RemlState<'a> {
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
 
-        // Build ext_coords from the hyper_dirs using the same machinery as τ.
         let (ext_coords, ext_pair_fn, rho_ext_pair_fn) = if !hyper_dirs.is_empty() {
-            let (coords, epf, repf) = self.build_tau_unified_objects(rho, hyper_dirs)?;
-            (coords, Some(epf), Some(repf))
+            if mode == super::unified::EvalMode::ValueGradientHessian {
+                let (coords, epf, repf) =
+                    self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
+                (coords, Some(epf), Some(repf))
+            } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                (
+                    self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
+                    None,
+                    None,
+                )
+            }
         } else {
             (Vec::new(), None, None)
         };
 
-        // Now delegate to the standard evaluate_unified path but inject ext_coords.
-        // We replicate the assembly from evaluate_unified here to be able to pass
-        // ext_coords into the InnerSolution.
-        self.evaluate_unified_with_ext_from_bundle(
-            rho,
-            &bundle,
-            mode,
-            ext_coords,
-            ext_pair_fn,
-            rho_ext_pair_fn,
-        )
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            self.evaluate_unified_sparse_with_ext_from_bundle(
+                rho,
+                &bundle,
+                mode,
+                ext_coords,
+                ext_pair_fn,
+                rho_ext_pair_fn,
+            )
+        } else {
+            self.evaluate_unified_with_ext_from_bundle(
+                rho,
+                &bundle,
+                mode,
+                ext_coords,
+                ext_pair_fn,
+                rho_ext_pair_fn,
+            )
+        }
     }
 
     /// Assemble the full `InnerSolution` from a pre-obtained PIRLS bundle
@@ -2936,6 +2960,208 @@ impl<'a> RemlState<'a> {
         let inner_solution = builder.build();
 
         // Prior (ρ-only; ψ coordinates are unconstrained soft-prior-free).
+        let prior = if mode == super::unified::EvalMode::ValueOnly {
+            let pc = self.compute_soft_priorcost(rho);
+            if pc.abs() > 0.0 {
+                Some((pc, Array1::zeros(rho.len()), None))
+            } else {
+                None
+            }
+        } else {
+            let pc = self.compute_soft_priorcost(rho);
+            let pg = self.compute_soft_priorgrad(rho);
+            let ph = if mode == super::unified::EvalMode::ValueGradientHessian {
+                self.compute_soft_priorhess(rho)
+            } else {
+                None
+            };
+            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
+                Some((pc, pg, ph))
+            } else {
+                None
+            }
+        };
+
+        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))
+    }
+
+    /// Sparse-exact bridge for unified evaluation with extended τ/ψ coordinates.
+    ///
+    /// This mirrors `evaluate_unified_sparse` but injects ext-coordinates into
+    /// the `InnerSolution` so the unified evaluator can compute joint [ρ, τ/ψ]
+    /// value/gradient/Hessian while still using the sparse Cholesky operator.
+    fn evaluate_unified_sparse_with_ext_from_bundle(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        ext_coords: Vec<super::unified::HyperCoord>,
+        ext_coord_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+        rho_ext_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{
+            HessianOperator, InnerSolutionBuilder, PenaltyLogdetDerivs, SparseCholeskyOperator,
+            penalty_matrix_root, reml_laml_evaluate,
+        };
+
+        let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
+        })?;
+        let pirls_result = bundle.pirls_result.as_ref();
+
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let p_dim = beta.len();
+        let hessian_op: Box<dyn HessianOperator> = Box::new(SparseCholeskyOperator::new(
+            sparse.factor.clone(),
+            sparse.logdet_h,
+            p_dim,
+        ));
+
+        let penalty_roots: Vec<Array2<f64>> = self
+            .s_full_list
+            .iter()
+            .enumerate()
+            .map(|(idx, s_k)| {
+                penalty_matrix_root(s_k).map_err(|e| {
+                    EstimationError::RemlOptimizationFailed(format!(
+                        "penalty root for S_{idx} failed: {e}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+        let structural_rank = (p_dim as f64 - mp) as usize;
+        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+            let lambdas = rho.mapv(f64::exp);
+            let (_, det2) = self.structural_penalty_logdet_derivatives(
+                &penalty_roots,
+                &lambdas,
+                structural_rank,
+                bundle.ridge_passport.penalty_logdet_ridge(),
+            )?;
+            Some(det2)
+        } else {
+            None
+        };
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: sparse.logdet_s_pos,
+            first: sparse.det1_values.as_ref().clone(),
+            second: det2,
+        };
+
+        let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
+            self.build_sparse_derivative_context(pirls_result, bundle)?;
+
+        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
+            let mut d_vec = pirls_result.solve_c_array.clone();
+            for val in &mut d_vec {
+                if !val.is_finite() {
+                    *val = 0.0;
+                }
+            }
+            let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
+            let compute_grad = mode != super::unified::EvalMode::ValueOnly;
+            let n_obs = d_vec.len();
+
+            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
+            let hat_leverages = if compute_grad {
+                crate::linalg::sparse_exact::leverages_from_factor(&sparse.factor, self.x())?
+            } else {
+                Array1::<f64>::zeros(0)
+            };
+
+            for j in 0..p_dim {
+                let mut e_j = Array1::<f64>::zeros(p_dim);
+                e_j[j] = 1.0;
+                if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
+                {
+                    h_inv_diag[j] = f_j[j];
+                }
+            }
+
+            let correction = -h_inv_diag
+                .iter()
+                .zip(third_deriv.iter())
+                .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
+                .sum::<f64>()
+                / 6.0;
+            let correction = if correction.is_finite() {
+                correction
+            } else {
+                0.0
+            };
+
+            let gradient = if compute_grad {
+                let k = penalty_roots.len();
+                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+                let mut tk_grad = Array1::<f64>::zeros(k);
+                for kidx in 0..k {
+                    let r_beta = penalty_roots[kidx].dot(&beta);
+                    let s_k_beta = fast_atv(&penalty_roots[kidx], &r_beta);
+                    let a_k_beta = &s_k_beta * lambdas[kidx];
+                    let v_k = match crate::linalg::sparse_exact::solve_sparse_spd(
+                        &sparse.factor,
+                        &a_k_beta,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let x_v_k: Array1<f64> = self.x().matrixvectormultiply(&v_k);
+                    let mut acc = 0.0;
+                    for i in 0..n_obs {
+                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
+                    }
+                    tk_grad[kidx] = 0.5 * acc;
+                }
+                for v in tk_grad.iter_mut() {
+                    if !v.is_finite() {
+                        *v = 0.0;
+                    }
+                }
+                Some(tk_grad)
+            } else {
+                None
+            };
+
+            (correction, gradient)
+        } else {
+            (0.0, None)
+        };
+
+        let n_observations = self.y.len();
+        let mut builder = InnerSolutionBuilder::new(
+            log_likelihood,
+            pirls_result.stable_penalty_term,
+            beta,
+            n_observations,
+            hessian_op,
+            penalty_roots,
+            penalty_logdet,
+            dispersion,
+        )
+        .deriv_provider(deriv_provider)
+        .tk(tk_correction, tk_gradient)
+        .firth(firth_logdet, firth_op)
+        .nullspace_dim_override(mp)
+        .barrier_config(barrier_config)
+        .ext_coords(ext_coords);
+
+        if let Some(f) = ext_coord_pair_fn {
+            builder = builder.ext_coord_pair_fn(f);
+        }
+        if let Some(f) = rho_ext_pair_fn {
+            builder = builder.rho_ext_pair_fn(f);
+        }
+
+        let inner_solution = builder.build();
+
         let prior = if mode == super::unified::EvalMode::ValueOnly {
             let pc = self.compute_soft_priorcost(rho);
             if pc.abs() > 0.0 {

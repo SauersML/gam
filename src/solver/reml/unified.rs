@@ -58,6 +58,14 @@ pub trait HessianOperator: Send + Sync {
     /// Uses the SAME decomposition as `logdet`.
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64;
 
+    /// tr(H₊⁻¹ B) for an operator-backed Hessian drift.
+    ///
+    /// Default implementation materializes `B` densely. Backends with
+    /// native operator traces (notably sparse Cholesky) should override it.
+    fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_product(&op.to_dense())
+    }
+
     /// Efficient computation of tr(H₊⁻¹ Hₖ) for the third-derivative contraction.
     ///
     /// For non-Gaussian families, Hₖ = Aₖ + Xᵀ diag(c ⊙ Xvₖ) X where
@@ -83,6 +91,26 @@ pub trait HessianOperator: Send + Sync {
     /// H⁻¹ M — multi-column solve.
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64>;
 
+    /// H⁻¹ B for an operator-backed Hessian drift.
+    ///
+    /// Default implementation materializes `B` densely and dispatches to
+    /// `solve_multi`. Backends with native operator-column solves should
+    /// override this to avoid unnecessary dense materialization.
+    fn solve_operator_columns(&self, op: &dyn HyperOperator) -> Array2<f64> {
+        self.solve_multi(&op.to_dense())
+    }
+
+    /// ||H⁻¹ B||²_F for an operator-backed Hessian drift.
+    ///
+    /// This is the EFS denominator for penalty-like extended coordinates.
+    /// Default implementation reuses `solve_operator_columns`, but sparse
+    /// backends should override it to accumulate the Frobenius norm without
+    /// forcing a full dense `B` materialization.
+    fn hinv_operator_frobenius_sq(&self, op: &dyn HyperOperator) -> f64 {
+        let solved = self.solve_operator_columns(op);
+        (&solved * &solved).sum()
+    }
+
     /// tr(G_ε(H) A) — trace for the logdet gradient ∂_i log|R_ε(H)|.
     ///
     /// For non-spectral backends (Cholesky), G_ε = H⁻¹ and this reduces to
@@ -90,6 +118,14 @@ pub trait HessianOperator: Send + Sync {
     /// `φ'(σ_a) = 1/√(σ_a² + 4ε²)` instead of `1/r_ε(σ_a)`.
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
         self.trace_hinv_product(a)
+    }
+
+    /// tr(G_ε(H) B) for an operator-backed Hessian drift.
+    ///
+    /// Default implementation materializes `B` densely. For Cholesky-based
+    /// backends this equals `trace_hinv_operator`.
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.trace_logdet_gradient(&op.to_dense())
     }
 
     /// Efficient computation of tr(G_ε(H) Hₖ) for the logdet gradient,
@@ -102,6 +138,20 @@ pub trait HessianOperator: Send + Sync {
         third_deriv_correction: Option<&Array2<f64>>,
     ) -> f64 {
         let base = self.trace_logdet_gradient(a_k);
+        match third_deriv_correction {
+            Some(c) => base + self.trace_logdet_gradient(c),
+            None => base,
+        }
+    }
+
+    /// Efficient computation of tr(G_ε(H) B_k) for an operator-backed Hessian drift,
+    /// optionally plus the dense third-derivative correction.
+    fn trace_logdet_h_k_operator(
+        &self,
+        b_k: &dyn HyperOperator,
+        third_deriv_correction: Option<&Array2<f64>>,
+    ) -> f64 {
+        let base = self.trace_logdet_operator(b_k);
         match third_deriv_correction {
             Some(c) => base + self.trace_logdet_gradient(c),
             None => base,
@@ -978,6 +1028,87 @@ impl ImplicitHyperOperator {
     }
 }
 
+/// Operator-backed fixed-β Hessian drift for sparse-exact τ coordinates.
+///
+/// This stays in the original sparse/native coefficient basis and computes the
+/// exact first-order τ Hessian drift
+///   B_τ = X_τᵀ W X + Xᵀ W X_τ + Xᵀ diag(c ⊙ X_τ β̂) X + S_τ − (H_φ)_{τ}|_β
+/// without materializing the full dense matrix up front.
+pub struct SparseDirectionalHyperOperator {
+    /// Original-basis design derivative X_τ.
+    pub x_tau: super::HyperDesignDerivative,
+    /// Design matrix X in the sparse-native basis.
+    pub x_design: DesignMatrix,
+    /// Working weights W (diagonal).
+    pub w_diag: std::sync::Arc<Array1<f64>>,
+    /// Penalty derivative S_τ.
+    pub s_tau: Array2<f64>,
+    /// Fixed-β non-Gaussian curvature term c ⊙ (X_τ β̂), if applicable.
+    pub c_x_tau_beta: Option<Array1<f64>>,
+    /// Fixed-β Firth partial Hessian drift (H_φ)_{τ}|_β, if applicable.
+    pub firth_hphi_tau_partial: Option<Array2<f64>>,
+    /// Total coefficient dimension.
+    pub p: usize,
+}
+
+impl HyperOperator for SparseDirectionalHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+
+        // X v
+        let x_v = self.x_design.matrixvectormultiply(v);
+
+        // X_tauᵀ (W (X v))
+        let w_x_v = &*self.w_diag * &x_v;
+        let term1 = self
+            .x_tau
+            .transpose_mul_original(&w_x_v)
+            .expect("SparseDirectionalHyperOperator transpose product should be shape-consistent");
+
+        // Xᵀ (W (X_tau v))
+        let x_tau_v = self
+            .x_tau
+            .forward_mul_original(v)
+            .expect("SparseDirectionalHyperOperator forward product should be shape-consistent");
+        let w_x_tau_v = &*self.w_diag * &x_tau_v;
+        let term2 = self.x_design.transpose_vector_multiply(&w_x_tau_v);
+
+        // S_tau v
+        let term3 = self.s_tau.dot(v);
+
+        let mut out = term1 + term2 + term3;
+
+        // Non-Gaussian fixed-beta curvature: Xᵀ diag(c ⊙ X_tau β̂) X v
+        if let Some(c_x_tau_beta) = self.c_x_tau_beta.as_ref() {
+            let weighted = c_x_tau_beta * &x_v;
+            out += &self.x_design.transpose_vector_multiply(&weighted);
+        }
+
+        // Firth fixed-beta partial: subtract (H_φ)_{τ}|_β v
+        if let Some(hphi_tau_partial) = self.firth_hphi_tau_partial.as_ref() {
+            out -= &hphi_tau_partial.dot(v);
+        }
+
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.p, self.p));
+        let mut basis = Array1::<f64>::zeros(self.p);
+        for j in 0..self.p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1829,17 +1960,11 @@ pub fn reml_laml_evaluate(
             } else {
                 None
             };
-            // When an implicit operator is present, materialize the dense B_i
-            // for the exact trace computation. This fallback path only triggers
-            // when stochastic traces are disabled (p <= 500 or sparse), where
-            // the problem is small enough for materialization.
-            let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
-                let materialized = coord.b_operator.as_ref().unwrap().to_dense();
-                0.5 * hop.trace_logdet_h_k(&materialized, correction.as_ref())
+            if let Some(ref op) = coord.b_operator {
+                0.5 * hop.trace_logdet_h_k_operator(op.as_ref(), correction.as_ref())
             } else {
                 0.5 * hop.trace_logdet_h_k(&coord.b_mat, correction.as_ref())
-            };
-            b_ref
+            }
         };
 
         // Penalty term: a_i (with profiled Gaussian rescaling if applicable)
@@ -2954,20 +3079,22 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         // Rationale: EFS is already an approximate Newton scheme; the C[β_i]
         // term is small for well-conditioned models and its omission keeps the
         // update stable and cheap.
-        // Get the dense B_i matrix, materializing from implicit operator if needed.
-        let b_mat_dense;
-        let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
-            b_mat_dense = coord.b_operator.as_ref().unwrap().to_dense();
-            &b_mat_dense
+        // Operator-backed coordinates stay operator-backed here; dense
+        // materialization is only the backend default, not the canonical path.
+        let trace_term = if let Some(ref op) = coord.b_operator {
+            hop.trace_hinv_operator(op.as_ref())
         } else {
-            &coord.b_mat
+            hop.trace_hinv_h_k(&coord.b_mat, None)
         };
-        let trace_term = hop.trace_hinv_h_k(b_ref, None);
         let numerator = 2.0 * a_i_eff - trace_term;
 
         // Denominator: tr(H⁻¹ B_i H⁻¹ B_i) = ||Y_i||²_F where Y_i = H⁻¹ B_i
-        let y_i = hop.solve_multi(b_ref);
-        let denominator = (&y_i * &y_i).sum();
+        let denominator = if let Some(ref op) = coord.b_operator {
+            hop.hinv_operator_frobenius_sq(op.as_ref())
+        } else {
+            let y_i = hop.solve_multi(&coord.b_mat);
+            (&y_i * &y_i).sum()
+        };
 
         let step = if denominator.abs() > 1e-30 {
             (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -3137,17 +3264,18 @@ pub fn compute_hybrid_efs_update(
                 coord.a
             };
 
-            let b_mat_dense;
-            let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
-                b_mat_dense = coord.b_operator.as_ref().unwrap().to_dense();
-                &b_mat_dense
+            let trace_term = if let Some(ref op) = coord.b_operator {
+                hop.trace_hinv_operator(op.as_ref())
             } else {
-                &coord.b_mat
+                hop.trace_hinv_h_k(&coord.b_mat, None)
             };
-            let trace_term = hop.trace_hinv_h_k(b_ref, None);
             let numerator = 2.0 * a_i_eff - trace_term;
-            let y_i = hop.solve_multi(b_ref);
-            let denominator = (&y_i * &y_i).sum();
+            let denominator = if let Some(ref op) = coord.b_operator {
+                hop.hinv_operator_frobenius_sq(op.as_ref())
+            } else {
+                let y_i = hop.solve_multi(&coord.b_mat);
+                (&y_i * &y_i).sum()
+            };
 
             let step = if denominator.abs() > 1e-30 {
                 (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -3185,18 +3313,11 @@ pub fn compute_hybrid_efs_update(
         let mut y_psi: Vec<ndarray::Array2<f64>> = Vec::with_capacity(n_psi);
         for &li in &psi_local_indices {
             let coord = &solution.ext_coords[li];
-            let b_mat_dense;
-            let b_ref = if coord.b_operator.is_some() && coord.b_mat.nrows() == 0 {
-                b_mat_dense = coord.b_operator.as_ref().unwrap().to_dense();
-                // Need to clone into y_psi since b_mat_dense is temporary.
-                let y = hop.solve_multi(&b_mat_dense);
-                y_psi.push(y);
-                continue;
+            if let Some(ref op) = coord.b_operator {
+                y_psi.push(hop.solve_operator_columns(op.as_ref()));
             } else {
-                &coord.b_mat
-            };
-            let y = hop.solve_multi(b_ref);
-            y_psi.push(y);
+                y_psi.push(hop.solve_multi(&coord.b_mat));
+            }
         }
 
         // Step 2: Build the trace Gram matrix G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)
@@ -3930,6 +4051,124 @@ impl SparseCholeskyOperator {
             n_dim: dim,
         }
     }
+
+    fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {
+        let chunk = 32usize;
+        let mut trace = 0.0_f64;
+        let mut basis = Array1::<f64>::zeros(self.n_dim);
+        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut start = 0usize;
+
+        while start < self.n_dim {
+            let end = (start + chunk).min(self.n_dim);
+            let cols = end - start;
+            rhs_block.slice_mut(ndarray::s![.., ..cols]).fill(0.0);
+            for local_col in 0..cols {
+                let global_col = start + local_col;
+                basis[global_col] = 1.0;
+                let col = op.mul_vec(&basis);
+                rhs_block.slice_mut(ndarray::s![.., local_col]).assign(&col);
+                basis[global_col] = 0.0;
+            }
+
+            let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
+            let solved = match crate::linalg::sparse_exact::solve_sparse_spdmulti(
+                &self.factor,
+                &rhs_view,
+            ) {
+                Ok(sol) => sol,
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::trace_hinv_operator_exact multi-solve failed: {e}"
+                    );
+                    return f64::NAN;
+                }
+            };
+            for local_col in 0..cols {
+                trace += solved[[start + local_col, local_col]];
+            }
+            start = end;
+        }
+
+        trace
+    }
+
+    fn solve_operator_columns_exact(&self, op: &dyn HyperOperator) -> Result<Array2<f64>, String> {
+        let chunk = 32usize;
+        let mut solved_all = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+        let mut basis = Array1::<f64>::zeros(self.n_dim);
+        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut start = 0usize;
+
+        while start < self.n_dim {
+            let end = (start + chunk).min(self.n_dim);
+            let cols = end - start;
+            rhs_block.slice_mut(ndarray::s![.., ..cols]).fill(0.0);
+            for local_col in 0..cols {
+                let global_col = start + local_col;
+                basis[global_col] = 1.0;
+                let col = op.mul_vec(&basis);
+                rhs_block.slice_mut(ndarray::s![.., local_col]).assign(&col);
+                basis[global_col] = 0.0;
+            }
+
+            let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
+            let solved = crate::linalg::sparse_exact::solve_sparse_spdmulti(
+                &self.factor,
+                &rhs_view,
+            )
+            .map_err(|e| {
+                format!(
+                    "SparseCholeskyOperator::solve_operator_columns_exact multi-solve failed: {e}"
+                )
+            })?;
+            solved_all
+                .slice_mut(ndarray::s![.., start..end])
+                .assign(&solved);
+            start = end;
+        }
+
+        Ok(solved_all)
+    }
+
+    fn hinv_operator_frobenius_sq_exact(&self, op: &dyn HyperOperator) -> f64 {
+        let chunk = 32usize;
+        let mut norm_sq = 0.0_f64;
+        let mut basis = Array1::<f64>::zeros(self.n_dim);
+        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut start = 0usize;
+
+        while start < self.n_dim {
+            let end = (start + chunk).min(self.n_dim);
+            let cols = end - start;
+            rhs_block.slice_mut(ndarray::s![.., ..cols]).fill(0.0);
+            for local_col in 0..cols {
+                let global_col = start + local_col;
+                basis[global_col] = 1.0;
+                let col = op.mul_vec(&basis);
+                rhs_block.slice_mut(ndarray::s![.., local_col]).assign(&col);
+                basis[global_col] = 0.0;
+            }
+
+            let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
+            let solved = match crate::linalg::sparse_exact::solve_sparse_spdmulti(
+                &self.factor,
+                &rhs_view,
+            ) {
+                Ok(sol) => sol,
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::hinv_operator_frobenius_sq_exact multi-solve failed: {e}"
+                    );
+                    return f64::NAN;
+                }
+            };
+            norm_sq += (&solved * &solved).sum();
+            start = end;
+        }
+
+        norm_sq
+    }
 }
 
 impl HessianOperator for SparseCholeskyOperator {
@@ -3952,6 +4191,14 @@ impl HessianOperator for SparseCholeskyOperator {
         trace
     }
 
+    fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_operator_exact(op)
+    }
+
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_operator_exact(op)
+    }
+
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs) {
             Ok(sol) => sol,
@@ -3970,6 +4217,20 @@ impl HessianOperator for SparseCholeskyOperator {
                 Array2::zeros((self.n_dim, rhs.ncols()))
             }
         }
+    }
+
+    fn solve_operator_columns(&self, op: &dyn HyperOperator) -> Array2<f64> {
+        match self.solve_operator_columns_exact(op) {
+            Ok(sol) => sol,
+            Err(e) => {
+                log::warn!("{e}");
+                Array2::zeros((self.n_dim, self.n_dim))
+            }
+        }
+    }
+
+    fn hinv_operator_frobenius_sq(&self, op: &dyn HyperOperator) -> f64 {
+        self.hinv_operator_frobenius_sq_exact(op)
     }
 
     fn active_rank(&self) -> usize {
