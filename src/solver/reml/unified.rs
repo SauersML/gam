@@ -238,7 +238,10 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// such that Hₖ = Aₖ + correction.
     ///
     /// Returns `None` for Gaussian (c=d=0, no correction needed).
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>>;
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String>;
 
     /// Compute the second-order correction to H_{k,l} for the outer Hessian.
     ///
@@ -248,9 +251,9 @@ pub trait HessianDerivativeProvider: Send + Sync {
         v_k: &Array1<f64>,
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let _ = (v_k, v_l, u_kl);
-        None
+        Ok(None)
     }
 
     /// Whether this provider has non-trivial corrections.
@@ -293,9 +296,12 @@ pub struct ScalarGlmIngredients<'a> {
 pub struct GaussianDerivatives;
 
 impl HessianDerivativeProvider for GaussianDerivatives {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         let _ = v_k;
-        None
+        Ok(None)
     }
     fn has_corrections(&self) -> bool {
         false
@@ -338,7 +344,10 @@ pub struct SinglePredictorGlmDerivatives {
 }
 
 impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         // The Hessian derivative is dH/dρₖ = Aₖ + D_β(X'W_HX)[−vₖ].
         // Since vₖ = H⁻¹(Aₖβ̂) = −dβ̂/dρₖ, the β-direction is −vₖ, giving:
         //   D_β(X'W_HX)[−vₖ] = X' diag(c · X(−vₖ)) X
@@ -377,7 +386,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
             }
         }
 
-        Some(result)
+        Ok(Some(result))
     }
 
     fn hessian_second_derivative_correction(
@@ -385,7 +394,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         v_k: &Array1<f64>,
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
+    ) -> Result<Option<Array2<f64>>, String> {
         // Second-order correction for the outer Hessian.
         // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
         //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
@@ -433,7 +442,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
             }
         }
 
-        Some(result)
+        Ok(Some(result))
     }
 
     fn has_corrections(&self) -> bool {
@@ -462,9 +471,12 @@ pub struct FirthAwareGlmDerivatives {
 }
 
 impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         // Base GLM correction: −Xᵀ diag(c ⊙ X vₖ) X
-        let base_corr = self.base.hessian_derivative_correction(v_k);
+        let base_corr = self.base.hessian_derivative_correction(v_k)?;
 
         // Firth correction: −D(Hφ)[B_k] where B_k = −v_k, δη_k = X·(−v_k).
         let deta_k: Array1<f64> = self.firth_op.x_dense.dot(v_k).mapv(|v| -v);
@@ -474,9 +486,9 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         match base_corr {
             Some(mut bc) => {
                 bc -= &firth_corr;
-                Some(bc)
+                Ok(Some(bc))
             }
-            None => Some(-firth_corr),
+            None => Ok(Some(-firth_corr)),
         }
     }
 
@@ -485,11 +497,11 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         v_k: &Array1<f64>,
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
+    ) -> Result<Option<Array2<f64>>, String> {
         // Base GLM second correction: Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ)(X vₗ)) X
         let base_corr = self
             .base
-            .hessian_second_derivative_correction(v_k, v_l, u_kl);
+            .hessian_second_derivative_correction(v_k, v_l, u_kl)?;
 
         // Firth D(Hφ)[B_{kl}]: B_{kl} direction is u_kl in β-space.
         let deta_kl: Array1<f64> = self.firth_op.x_dense.dot(u_kl);
@@ -513,7 +525,7 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         };
         result -= &firth_first;
         result -= &firth_second;
-        Some(result)
+        Ok(Some(result))
     }
 
     fn has_corrections(&self) -> bool {
@@ -701,7 +713,10 @@ impl<'a> BarrierDerivativeProvider<'a> {
 }
 
 impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         // The trait convention passes vₖ = H⁻¹(Aₖβ̂), but the barrier
         // third-derivative should be evaluated at the mode sensitivity
         // direction β̂_ρk = −vₖ.  barrier_correction(u) computes
@@ -709,12 +724,12 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
         //   D_β(B_ββ)[−vₖ] = +2τ vₖ_j/gap³.
         let neg_v_k = v_k.mapv(|x| -x);
         let barrier_corr = self.barrier_correction(&neg_v_k);
-        match self.inner.hessian_derivative_correction(v_k) {
+        match self.inner.hessian_derivative_correction(v_k)? {
             Some(mut ic) => {
                 ic += &barrier_corr;
-                Some(ic)
+                Ok(Some(ic))
             }
-            None => Some(barrier_corr),
+            None => Ok(Some(barrier_corr)),
         }
     }
 
@@ -723,18 +738,18 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
         v_k: &Array1<f64>,
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let barrier_total =
             &self.barrier_correction(u_kl) + &self.barrier_second_correction(v_k, v_l);
         match self
             .inner
-            .hessian_second_derivative_correction(v_k, v_l, u_kl)
+            .hessian_second_derivative_correction(v_k, v_l, u_kl)?
         {
             Some(mut ic) => {
                 ic += &barrier_total;
-                Some(ic)
+                Ok(Some(ic))
             }
-            None => Some(barrier_total),
+            None => Ok(Some(barrier_total)),
         }
     }
 
@@ -2065,7 +2080,7 @@ pub fn reml_laml_evaluate(
             .expect("rho mode responses required for Hessian corrections")
             .iter()
             .map(|v_k| effective_deriv.hessian_derivative_correction(v_k))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         vec![None; k]
     };
@@ -2144,7 +2159,7 @@ pub fn reml_laml_evaluate(
                     let mut h_i = coord.drift.materialize();
                     if effective_deriv.has_corrections() {
                         let v_i = hop.solve(&coord.g);
-                        if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                        if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
                             h_i += &corr;
                         }
                     }
@@ -2204,7 +2219,7 @@ pub fn reml_laml_evaluate(
                 let mut h_i = coord.drift.materialize();
                 if effective_deriv.has_corrections() {
                     let v_i = hop.solve(&coord.g);
-                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
                         h_i += &corr;
                     }
                 }
@@ -2288,7 +2303,7 @@ pub fn reml_laml_evaluate(
         } else {
             // Exact path.
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction(&v_i)
+                effective_deriv.hessian_derivative_correction(&v_i)?
             } else {
                 None
             };
@@ -2646,7 +2661,7 @@ fn compute_outer_hessian(
         a_k_matrices.push(a_k.clone());
 
         let correction = if effective_deriv.has_corrections() {
-            effective_deriv.hessian_derivative_correction(&v_ks[idx])
+            effective_deriv.hessian_derivative_correction(&v_ks[idx])?
         } else {
             None
         };
@@ -2729,7 +2744,7 @@ fn compute_outer_hessian(
         // operator-only fast path.
         let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i) {
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
                 h_i += &corr;
             }
         }
@@ -2864,7 +2879,7 @@ fn compute_outer_hessian(
                     } else {
                         let u_kk = hop.solve(&rhs);
                         if let Some(correction) = effective_deriv
-                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[kk], &u_kk)
+                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[kk], &u_kk)?
                         {
                             base + hop.trace_logdet_gradient(&correction)
                         } else {
@@ -2892,7 +2907,7 @@ fn compute_outer_hessian(
                     } else {
                         let u_kl = hop.solve(&rhs);
                         if let Some(correction) = effective_deriv
-                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)
+                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)?
                         {
                             hop.trace_logdet_gradient(&correction)
                         } else {
@@ -3011,7 +3026,7 @@ fn compute_outer_hessian(
                                     &v_ks[rho_idx],
                                     &ext_v[ext_idx],
                                     &u_re,
-                                )
+                                )?
                             {
                                 h2_trace += hop.trace_logdet_gradient(&correction);
                             }
@@ -3114,7 +3129,9 @@ fn compute_outer_hessian(
                         } else {
                             let u_ij = hop.solve(&rhs);
                             if let Some(correction) = effective_deriv
-                                .hessian_second_derivative_correction(&ext_v[ii], &ext_v[jj], &u_ij)
+                                .hessian_second_derivative_correction(
+                                    &ext_v[ii], &ext_v[jj], &u_ij,
+                                )?
                             {
                                 h2_trace += hop.trace_logdet_gradient(&correction);
                             }
@@ -3157,83 +3174,10 @@ fn compute_outer_hessian(
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
-        // ── Conservative fallback: recompute with L_{kl} = 0 ──
-        //
-        // The trace-curvature block (log|H|₊ second derivatives) produced
-        // non-finite values — likely due to active-subspace instability or
-        // near-singular Hessian solves. Fall back to a conservative Hessian
-        // that keeps only the well-conditioned penalty terms:
-        //   Q_{kl}: penalty-envelope quadratic curvature
-        //   P_{kl}: structural penalty logdet curvature
-        //
-        // This is the same information that the former external
-        // `compute_lamlhessian_analytic_fallback` provided, but computed
-        // inline so that callers never see a failure from VGH mode.
-        log::warn!(
-            "Outer Hessian contains non-finite entries; \
-             falling back to conservative penalty-only Hessian (L_{{kl}} = 0)."
+        return Err(
+            "Outer Hessian contains non-finite entries; exact higher-order derivatives are invalid"
+                .to_string(),
         );
-
-        let mut hess_conservative = Array2::zeros((total, total));
-
-        // ── Q_{kl} (penalty quadratic curvature) ──
-        for kk in 0..k {
-            for ll in kk..k {
-                let q_kl_raw =
-                    -a_k_betas[ll].dot(&v_ks[kk]) + if kk == ll { rho_a_vals[kk] } else { 0.0 };
-                let q_kl = if is_profiled {
-                    q_kl_raw / profiled_phi
-                        - 2.0 * rho_a_vals[kk] * rho_a_vals[ll]
-                            / (profiled_nu * profiled_phi * profiled_phi)
-                } else {
-                    q_kl_raw
-                };
-                hess_conservative[[kk, ll]] = q_kl;
-                if kk != ll {
-                    hess_conservative[[ll, kk]] = q_kl;
-                }
-            }
-        }
-
-        // ── P_{kl} (penalty logdet curvature) ──
-        if incl_logdet_s {
-            for kk in 0..k {
-                for ll in kk..k {
-                    let p_kl = -0.5 * det2[[kk, ll]];
-                    hess_conservative[[kk, ll]] += p_kl;
-                    if kk != ll {
-                        hess_conservative[[ll, kk]] += p_kl;
-                    }
-                }
-            }
-        }
-
-        // ── Enforce PD with jitter + symmetry ──
-        let scale = hess_conservative
-            .diag()
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        let jitter = 1e-8 * scale;
-        for i in 0..total {
-            hess_conservative[[i, i]] += jitter;
-        }
-        for i in 0..total {
-            for j in 0..i {
-                let avg = 0.5 * (hess_conservative[[i, j]] + hess_conservative[[j, i]]);
-                hess_conservative[[i, j]] = avg;
-                hess_conservative[[j, i]] = avg;
-            }
-        }
-
-        if hess_conservative.iter().any(|v| !v.is_finite()) {
-            return Err(
-                "Conservative fallback Hessian (penalty-only) still contains non-finite entries"
-                    .to_string(),
-            );
-        }
-        return Ok(hess_conservative);
     }
 
     Ok(hess)
@@ -5971,7 +5915,11 @@ mod tests {
     fn test_gaussian_derivatives_has_no_corrections() {
         let g = GaussianDerivatives;
         assert!(!g.has_corrections());
-        assert!(g.hessian_derivative_correction(&array![1.0, 2.0]).is_none());
+        assert!(
+            g.hessian_derivative_correction(&array![1.0, 2.0])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

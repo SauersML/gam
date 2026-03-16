@@ -337,8 +337,8 @@ def _fit_survival_model(
 
     if likelihood != "location-scale":
         raise RuntimeError(f"unsupported likelihood mode: {likelihood}")
-    # The dedicated `gam survival` subcommand was removed; fitting via
-    # `gam fit` + `Surv(...)` currently routes through transformation survival.
+    # The dedicated `gam survival` subcommand was removed; fitting now goes
+    # through `gam fit` + `Surv(...)`, including survival location-scale.
     _run_cmd(fit_args, cwd=ROOT)
 
 

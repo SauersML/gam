@@ -2238,9 +2238,7 @@ impl ImplicitDesignPsiDerivative {
         assert_eq!(v.len(), self.n);
 
         if self.is_streaming() {
-            let raw = self.streaming_accumulate_knot_vector(v, |q, _t, s_buf| {
-                q * s_buf[axis]
-            });
+            let raw = self.streaming_accumulate_knot_vector(v, |q, _t, s_buf| q * s_buf[axis]);
             return self.project_and_pad(&raw);
         }
 
@@ -2266,9 +2264,7 @@ impl ImplicitDesignPsiDerivative {
         let u_knot = self.unproject(u);
 
         if self.is_streaming() {
-            return self.streaming_forward_mul(&u_knot, |q, _t, s_buf| {
-                q * s_buf[axis]
-            });
+            return self.streaming_forward_mul(&u_knot, |q, _t, s_buf| q * s_buf[axis]);
         }
 
         let n = self.n;
@@ -2436,9 +2432,8 @@ impl ImplicitDesignPsiDerivative {
         let u_knot = self.unproject(u);
 
         if self.is_streaming() {
-            return self.streaming_forward_mul(&u_knot, |_q, t, s_buf| {
-                t * s_buf[axis_d] * s_buf[axis_e]
-            });
+            return self
+                .streaming_forward_mul(&u_knot, |_q, t, s_buf| t * s_buf[axis_d] * s_buf[axis_e]);
         }
 
         let n = self.n;
@@ -2540,9 +2535,7 @@ impl ImplicitDesignPsiDerivative {
         assert_ne!(axis_d, axis_e);
 
         if self.is_streaming() {
-            return self.streaming_materialize(|_q, t, s_buf| {
-                t * s_buf[axis_d] * s_buf[axis_e]
-            });
+            return self.streaming_materialize(|_q, t, s_buf| t * s_buf[axis_d] * s_buf[axis_e]);
         }
 
         let n = self.n;
@@ -2653,12 +2646,7 @@ where
     // Get raw pointers for parallel disjoint-range writes.
     let q_ptr = SendPtr(q_values.as_slice_mut().unwrap().as_mut_ptr());
     let t_ptr = SendPtr(t_values.as_slice_mut().unwrap().as_mut_ptr());
-    let ac_ptr = SendPtr(
-        axis_components
-            .as_slice_mut()
-            .unwrap()
-            .as_mut_ptr(),
-    );
+    let ac_ptr = SendPtr(axis_components.as_slice_mut().unwrap().as_mut_ptr());
 
     let chunk_size = IMPLICIT_MATVEC_CHUNK_SIZE;
     let n_chunks = (n + chunk_size - 1) / chunk_size;
@@ -2666,8 +2654,7 @@ where
     // Each chunk processes a disjoint range of data rows [start..end).
     // Within a chunk, row i writes to flat indices [i*k .. (i+1)*k) which
     // are unique per row and thus per chunk.
-    let err_flag: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    let err_flag: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
         let start = chunk_idx * chunk_size;
@@ -2682,8 +2669,7 @@ where
                 for a in 0..dim {
                     center_buf[a] = centers[[j, a]];
                 }
-                let (r, s_vec) =
-                    aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                let (r, s_vec) = aniso_distance_and_components(&data_row_buf, &center_buf, eta);
                 let (q, t) = match radial_scalars(r) {
                     Ok(pair) => pair,
                     Err(_) => {

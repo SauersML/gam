@@ -1,31 +1,31 @@
 use crate::basis::{
-    create_basis, create_difference_penalty_matrix, evaluate_bspline_fourth_derivative_scalar,
-    evaluate_bsplinethird_derivative_scalar, BasisOptions, Dense, KnotSource,
+    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinethird_derivative_scalar,
 };
 use crate::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyPsiDesignAction,
+    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_block_spatial_psi_derivatives, custom_family_outer_capability,
     evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    second_psi_linear_map,
 };
-use crate::estimate::{fit_gam, FitOptions, UnifiedFitResult};
+use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
-use crate::families::gamlss::{initializewiggle_knots_from_seed, ParameterBlockInput};
+use crate::families::gamlss::{ParameterBlockInput, initializewiggle_knots_from_seed};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::quadrature::compute_gauss_hermite_n;
 use crate::smooth::{
-    build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::types::LikelihoodFamily;
-use ndarray::{s, Array1, Array2, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
@@ -255,6 +255,8 @@ fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
+    // Keep the zero anchor inside the spline domain even when the observed seed
+    // lives entirely on one side of zero.
     let knot_seed = Array1::from_iter(seed.iter().copied().chain(std::iter::once(0.0)));
     let knots =
         initializewiggle_knots_from_seed(knot_seed.view(), cfg.degree, cfg.num_internal_knots)?;
