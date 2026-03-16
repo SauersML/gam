@@ -6571,6 +6571,12 @@ fn maternvalue_psi_triplet(
         ),
     };
     let a = s * r;
+    // When a > 700, exp(-a) underflows to 0 while p(a) can overflow to Inf,
+    // producing 0 * Inf = NaN.  All terms carry exp(-a) as a factor, so the
+    // triplet is exactly zero for large a.
+    if a > 700.0 {
+        return Ok((0.0, 0.0, 0.0));
+    }
     let e = (-a).exp();
     let (p0, p1, p2) = eval_polywith_derivatives(p, a);
     let value = e * p0;
@@ -6595,6 +6601,11 @@ fn exp_poly_scaled_s2_psi_triplet(s: f64, a: f64, coeffs: &[f64], scalar: f64) -
     // - phi''(r) pieces
     // - phi'(r)/r closed forms for nu>=3/2
     // under psi-derivatives.
+    // When a > 700, exp(-a) underflows to 0 while the polynomial can overflow,
+    // giving 0 * Inf = NaN.  All terms carry exp(-a), so the result is exactly 0.
+    if a > 700.0 {
+        return (0.0, 0.0, 0.0);
+    }
     let e = (-a).exp();
     let (p0, p1, p2) = eval_polywith_derivatives(coeffs, a);
     let d = p1 - p0;
@@ -7958,7 +7969,7 @@ fn duchon_matern_block_radial_derivative(
         coeff: 1.0,
         kappa_power: 0,
         r_power: nu,
-        bessel_order: nu.abs(),
+        bessel_order: nu,
     }];
 
     for _ in 0..derivative_order {
@@ -15817,8 +15828,8 @@ mod tests {
         );
         // Sum should be zero
         assert_abs_diff_eq!(eta[0] + eta[1], 0.0, epsilon = 1e-12);
-        // |η| should be ln(10) ≈ 2.3026
-        assert_abs_diff_eq!(eta[0].abs(), 10.0_f64.ln(), epsilon = 1e-12);
+        // |η| should be ln(10)/2 for d=2 zero-sum contrasts
+        assert_abs_diff_eq!(eta[0].abs(), 10.0_f64.ln() / 2.0, epsilon = 1e-12);
     }
 
     // ── maybe_initialize_aniso_contrasts tests ──────────────────────────

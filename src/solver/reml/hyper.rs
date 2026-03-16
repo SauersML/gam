@@ -1014,14 +1014,20 @@ impl<'a> RemlState<'a> {
                 );
                 components
                     .iter()
-                    .fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
+                    .try_fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
+                        if c.penalty_index >= rho.len() {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "penalty_index {} out of bounds for rho dimension {} in build_tau_pair_callbacks (first-order)",
+                                c.penalty_index,
+                                rho.len()
+                            )));
+                        }
                         c.matrix
-                            .scaled_add_to(&mut acc, rho[c.penalty_index].exp())
-                            .expect("valid penalty component in build_tau_pair_callbacks");
-                        acc
+                            .scaled_add_to(&mut acc, rho[c.penalty_index].exp())?;
+                        Ok(acc)
                     })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Pre-compute second-order penalty matrices S_{τ_i τ_j} for all pairs.
         let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
@@ -1040,12 +1046,18 @@ impl<'a> RemlState<'a> {
                 let total =
                     transformed
                         .iter()
-                        .fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
+                        .try_fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
+                            if c.penalty_index >= rho.len() {
+                                return Err(EstimationError::InvalidInput(format!(
+                                    "penalty_index {} out of bounds for rho dimension {} in build_tau_pair_callbacks (second-order)",
+                                    c.penalty_index,
+                                    rho.len()
+                                )));
+                            }
                             c.matrix
-                                .scaled_add_to(&mut acc, rho[c.penalty_index].exp())
-                                .expect("valid second penalty component");
-                            acc
-                        });
+                                .scaled_add_to(&mut acc, rho[c.penalty_index].exp())?;
+                            Ok(acc)
+                        })?;
                 s_tau_tau[i][j] = Some(total);
             }
         }

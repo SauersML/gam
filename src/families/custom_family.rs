@@ -834,6 +834,7 @@ fn validate_lambda_pair_consistency(
 /// Build a `UnifiedFitResult` from blockwise-specific fields.
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
+    specs: &[ParameterBlockSpec],
 ) -> Result<crate::solver::estimate::UnifiedFitResult, String> {
     let BlockwiseFitResultParts {
         block_states,
@@ -864,6 +865,13 @@ pub fn blockwise_fit_from_parts(
     ensure_finite_scalar_estimation("blockwise_fit.outer_gradient_norm", outer_gradient_norm)
         .map_err(|e| e.to_string())?;
 
+    if block_states.len() != specs.len() {
+        return Err(format!(
+            "blockwise_fit.block_states length ({}) does not match specs length ({})",
+            block_states.len(),
+            specs.len()
+        ));
+    }
     let n = block_states[0].eta.len();
     let total_p = block_states
         .iter()
@@ -874,10 +882,12 @@ pub fn blockwise_fit_from_parts(
             &format!("blockwise_fit.block_states[{idx}]"),
             state,
         )?;
-        if state.eta.len() != n {
+        let expected_rows = specs[idx].design.nrows();
+        if state.eta.len() != expected_rows {
             return Err(format!(
-                "blockwise_fit.block_states[{idx}] eta length mismatch: got {}, expected {n}",
-                state.eta.len()
+                "blockwise_fit.block_states[{idx}] eta length mismatch: got {}, expected {} (design rows)",
+                state.eta.len(),
+                expected_rows
             ));
         }
     }
@@ -6990,7 +7000,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             inner_cycles: inner.cycles,
             outer_converged: true,
             geometry,
-        })
+        }, specs)
         .map_err(CustomFamilyError::Optimization);
     }
 
@@ -7205,7 +7215,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         inner_cycles: inner.cycles,
         outer_converged: outer_result.converged,
         geometry,
-    })
+    }, specs)
     .map_err(CustomFamilyError::Optimization)
 }
 

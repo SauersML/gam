@@ -264,11 +264,15 @@ mod tests {
     #[test]
     fn rowwise_local_covariances_match_factorized_precision() {
         let precision = array![[4.0, 1.0, 0.0], [1.0, 3.5, 0.2], [0.0, 0.2, 2.5]];
-        let covariance = crate::linalg::utils::matrix_inversewith_regularization(
-            &precision,
-            "prediction linalg test covariance",
-        )
-        .expect("invert SPD precision");
+        // Compute the reference covariance via the same Cholesky factorization
+        // path that the backend uses, so both sides agree without ridge bias.
+        let p = precision.nrows();
+        let factor = SymmetricMatrix::Dense(precision.clone())
+            .factorize()
+            .expect("factorize SPD precision for reference covariance");
+        let covariance = factor
+            .solvemulti(&Array2::eye(p))
+            .expect("invert SPD precision via Cholesky");
         let backend =
             PredictionCovarianceBackend::from_factorized_hessian(&precision).expect("factorize");
         let grads = array![[1.0, 0.0, 2.0], [0.5, -1.0, 0.0], [0.0, 1.0, 1.0]];
