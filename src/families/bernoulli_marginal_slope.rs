@@ -4,9 +4,10 @@ use crate::basis::{
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    evaluate_custom_family_joint_hyper, fit_custom_family,
+    custom_family_outer_capability, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
@@ -335,9 +336,7 @@ fn validate_spec(
         return Err("bernoulli-marginal-slope requires binary y in {0,1}".to_string());
     }
     if spec.weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return Err(
-            "bernoulli-marginal-slope requires finite non-negative weights".to_string(),
-        );
+        return Err("bernoulli-marginal-slope requires finite non-negative weights".to_string());
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite z values".to_string());
@@ -345,7 +344,11 @@ fn validate_spec(
     Ok(())
 }
 
-fn pooled_probit_baseline(y: &Array1<f64>, z: &Array1<f64>, weights: &Array1<f64>) -> Result<(f64, f64), String> {
+fn pooled_probit_baseline(
+    y: &Array1<f64>,
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+) -> Result<(f64, f64), String> {
     let n = y.len();
     let mut x = Array2::<f64>::zeros((n, 2));
     x.column_mut(0).fill(1.0);
@@ -793,6 +796,33 @@ struct BernoulliMarginalSlopeExactEvalCache {
     row_primary_base: Vec<BernoulliMarginalSlopeRowPrimaryBase>,
 }
 
+const EXACT_OUTER_HESSIAN_MAX_ROW_PAIR_WORK: usize = 2_000_000;
+
+fn bernoulli_exact_outer_derivative_order(
+    n_rows: usize,
+    score_warp_dim: usize,
+    link_dev_dim: usize,
+) -> ExactOuterDerivativeOrder {
+    // The exact outer Hessian repeatedly executes row-local primary×primary
+    // contractions, so `n * primary_total^2` is the right first-order scale
+    // signal for when second-order exact calculus stops being practical.
+    let primary_total = 2usize
+        .saturating_add(score_warp_dim)
+        .saturating_add(link_dev_dim);
+    let row_pair_work = n_rows.saturating_mul(primary_total.saturating_mul(primary_total));
+    if row_pair_work > EXACT_OUTER_HESSIAN_MAX_ROW_PAIR_WORK {
+        ExactOuterDerivativeOrder::First
+    } else {
+        ExactOuterDerivativeOrder::Second
+    }
+}
+
+struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
+    family: BernoulliMarginalSlopeFamily,
+    block_states: Vec<ParameterBlockState>,
+    cache: BernoulliMarginalSlopeExactEvalCache,
+}
+
 struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
@@ -960,7 +990,11 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
-        let slices = block_slices(block_states, self.score_warp.is_some(), self.link_dev.is_some());
+        let slices = block_slices(
+            block_states,
+            self.score_warp.is_some(),
+            self.link_dev.is_some(),
+        );
         let primary = primary_slices(&slices);
         let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
         let score_warp_obs = self.score_warp_obs(block_states)?;
@@ -2053,11 +2087,69 @@ impl BernoulliMarginalSlopeFamily {
         }
         Ok(Some(out))
     }
+
+    fn exact_newton_joint_hessian_directional_derivative_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row in 0..self.y.len() {
+            let row_dir =
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
+            let third = self.row_primary_third_contracted(row, block_states, cache, &row_dir)?;
+            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &third);
+        }
+        Ok(Some(out))
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row in 0..self.y.len() {
+            let row_u =
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
+            let row_v =
+                self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
+            let fourth =
+                self.row_primary_fourth_contracted(row, block_states, cache, &row_u, &row_v)?;
+            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &fourth);
+        }
+        Ok(Some(out))
+    }
 }
 
 impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
+    }
+
+    fn exact_outer_derivative_order(
+        &self,
+        _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
+    ) -> ExactOuterDerivativeOrder {
+        bernoulli_exact_outer_derivative_order(
+            self.y.len(),
+            self.score_warp
+                .as_ref()
+                .map(|runtime| runtime.transform.ncols())
+                .unwrap_or(0),
+            self.link_dev
+                .as_ref()
+                .map(|runtime| runtime.transform.ncols())
+                .unwrap_or(0),
+        )
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
@@ -2067,7 +2159,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (ll, gradient, hessian) = self.joint_gradient_hessian(block_states, true)?;
         let hessian = hessian.ok_or_else(|| "joint hessian unavailable".to_string())?;
-        let slices = block_slices(block_states, self.score_warp.is_some(), self.link_dev.is_some());
+        let slices = block_slices(
+            block_states,
+            self.score_warp.is_some(),
+            self.link_dev.is_some(),
+        );
         let mut blockworking_sets = vec![
             BlockWorkingSet::ExactNewton {
                 gradient: gradient.slice(s![slices.marginal.clone()]).to_owned(),
@@ -2125,22 +2221,30 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        Ok(Some(Arc::new(
+            BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+            )?,
+        )))
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let cache = self.build_exact_eval_cache(block_states)?;
-        let slices = &cache.slices;
-        let primary = &cache.primary;
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
-        for row in 0..self.y.len() {
-            let row_dir =
-                self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
-            let third = self.row_primary_third_contracted(row, block_states, &cache, &row_dir)?;
-            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &third);
-        }
-        Ok(Some(out))
+        self.exact_newton_joint_hessian_directional_derivative_from_cache(
+            block_states,
+            d_beta_flat,
+            &cache,
+        )
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
@@ -2150,19 +2254,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let cache = self.build_exact_eval_cache(block_states)?;
-        let slices = &cache.slices;
-        let primary = &cache.primary;
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
-        for row in 0..self.y.len() {
-            let row_u =
-                self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
-            let row_v =
-                self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
-            let fourth =
-                self.row_primary_fourth_contracted(row, block_states, &cache, &row_u, &row_v)?;
-            self.add_pullback_primary_hessian(&mut out, row, slices, primary, &fourth);
-        }
-        Ok(Some(out))
+        self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+            &cache,
+        )
     }
 
     fn exact_newton_joint_psi_terms(
@@ -2238,7 +2335,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_idx: usize,
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        let slices = block_slices(block_states, self.score_warp.is_some(), self.link_dev.is_some());
+        let slices = block_slices(
+            block_states,
+            self.score_warp.is_some(),
+            self.link_dev.is_some(),
+        );
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
             return Ok(self.score_warp_constraints.clone());
         }
@@ -2251,6 +2352,48 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             return Ok(self.link_dev_constraints.clone());
         }
         Ok(None)
+    }
+}
+
+impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn new(
+        family: BernoulliMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Result<Self, String> {
+        let cache = family.build_exact_eval_cache(&block_states)?;
+        Ok(Self {
+            family,
+            block_states,
+            cache,
+        })
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_from_cache(
+                &self.block_states,
+                d_beta_flat,
+                &self.cache,
+            )
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_cache(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.cache,
+            )
     }
 }
 
@@ -2448,7 +2591,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_obs_design = score_warp_prepared
         .as_ref()
         .and_then(|p| match &p.block.design {
-            DesignMatrix::Dense(x) => Some(x.clone()),
+            DesignMatrix::Dense(x) => Some((**x).clone()),
             DesignMatrix::Sparse(_) => None,
         });
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
@@ -2551,6 +2694,26 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 .to_string(),
         );
     }
+    let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
+    let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
+    let initial_family = make_family(&marginal_design, &logslope_design);
+    let joint_cap = custom_family_outer_capability(
+        &initial_family,
+        &initial_blocks,
+        options,
+        setup.theta0().len(),
+        setup.log_kappa_dim() > 0,
+    );
+    let analytic_joint_gradient_available = analytic_joint_derivatives_available
+        && matches!(
+            joint_cap.gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+    let analytic_joint_hessian_available = analytic_joint_derivatives_available
+        && matches!(
+            joint_cap.hessian,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
 
     let solved = optimize_two_block_spatial_length_scale_exact_joint(
         data,
@@ -2558,8 +2721,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &logslopespec_boot,
         kappa_options,
         &setup,
-        analytic_joint_derivatives_available,
-        analytic_joint_derivatives_available,
+        analytic_joint_gradient_available,
+        analytic_joint_hessian_available,
         |rho, _, _, marginal_design, logslope_design| {
             let blocks = build_blocks(rho, marginal_design, logslope_design)?;
             let family = make_family(marginal_design, logslope_design);
@@ -2648,4 +2811,294 @@ pub fn fit_bernoulli_marginal_slope_terms(
         score_warp_runtime,
         link_dev_runtime,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::custom_family::CustomFamily;
+    use ndarray::array;
+
+    fn empty_termspec() -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        }
+    }
+
+    fn dummy_blockspec(p: usize, n_rows: usize) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: "dummy".to_string(),
+            design: DesignMatrix::Dense(Arc::new(Array2::<f64>::zeros((n_rows, p)))),
+            offset: Array1::zeros(n_rows),
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::zeros(p)),
+        }
+    }
+
+    fn dummy_block_state(beta: Array1<f64>, n_rows: usize) -> ParameterBlockState {
+        ParameterBlockState {
+            beta,
+            eta: Array1::zeros(n_rows),
+        }
+    }
+
+    fn base_spec(
+        y: Array1<f64>,
+        weights: Array1<f64>,
+        z: Array1<f64>,
+    ) -> BernoulliMarginalSlopeTermSpec {
+        BernoulliMarginalSlopeTermSpec {
+            y,
+            weights,
+            z,
+            marginalspec: empty_termspec(),
+            logslopespec: empty_termspec(),
+            score_warp: None,
+            link_dev: None,
+            quadrature_points: 7,
+        }
+    }
+
+    fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {
+        (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
+    }
+
+    fn max_abs(matrix: &Array2<f64>) -> f64 {
+        matrix.iter().fold(0.0, |acc, value| acc.max(value.abs()))
+    }
+
+    fn expand_integer_weight_rows(
+        y: &Array1<f64>,
+        z: &Array1<f64>,
+        weights: &Array1<f64>,
+    ) -> (Array1<f64>, Array1<f64>) {
+        let mut y_expanded = Vec::new();
+        let mut z_expanded = Vec::new();
+        for i in 0..y.len() {
+            let reps = weights[i] as usize;
+            assert!(
+                (weights[i] - reps as f64).abs() < 1e-12,
+                "test helper expects integer weights, got {}",
+                weights[i]
+            );
+            for _ in 0..reps {
+                y_expanded.push(y[i]);
+                z_expanded.push(z[i]);
+            }
+        }
+        (Array1::from_vec(y_expanded), Array1::from_vec(z_expanded))
+    }
+
+    #[test]
+    fn link_dev_without_score_warp_uses_w_block_and_constraints() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                derivative_grid_size: 16,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link block initial beta")
+            .len();
+        let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.1 * (idx as f64 + 1.0)));
+        let family = BernoulliMarginalSlopeFamily {
+            y: Array1::zeros(seed.len()),
+            weights: Array1::ones(seed.len()),
+            z: seed.clone(),
+            marginal_design: Array2::zeros((seed.len(), 0)),
+            logslope_design: Array2::zeros((seed.len(), 0)),
+            quadrature_nodes: array![0.0],
+            quadrature_weights: array![1.0],
+            score_warp: None,
+            score_warp_obs_design: None,
+            link_dev: Some(prepared.runtime.clone()),
+            score_warp_constraints: None,
+            link_dev_constraints: Some(prepared.constraints.clone()),
+        };
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_link.clone(), seed.len()),
+        ];
+
+        let slices = block_slices(&block_states, false, true);
+        assert!(slices.h.is_none(), "score-warp slice should be absent");
+        let link_slice = slices.w.as_ref().expect("link slice");
+        assert_eq!(link_slice.start, 2, "link-only block should occupy block 2");
+        assert_eq!(link_slice.len(), link_dim);
+
+        let primary = primary_slices(&slices);
+        assert!(primary.h.is_none(), "primary h slice should be absent");
+        let primary_w = primary.w.as_ref().expect("primary link slice");
+        assert_eq!(primary_w.start, 2, "primary link slice should start at 2");
+        assert_eq!(primary.total, 2 + link_dim);
+
+        let dirs = (0..primary.total)
+            .map(|idx| unit_primary_direction(&primary, idx))
+            .collect::<Vec<_>>();
+        let gamma_jets = family.build_gamma_jets(&primary, Some(&beta_link), &dirs);
+        assert_eq!(
+            gamma_jets.len(),
+            link_dim,
+            "link-only layout must produce one gamma jet per link coefficient"
+        );
+
+        let basis_row = prepared
+            .runtime
+            .design(&array![0.25])
+            .expect("link basis row")
+            .row(0)
+            .to_vec();
+        let zeros = vec![0.0; link_dim];
+        let eta_jet = MultiDirJet::constant(dirs.len(), 0.2);
+        let link_jet = family.apply_link_jet_from_rows(
+            &eta_jet,
+            &gamma_jets,
+            &basis_row,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+        );
+        assert!(
+            link_jet.coeff(0).is_finite(),
+            "link jet evaluation should remain finite with link_dev only"
+        );
+
+        let dummy_spec = dummy_blockspec(link_dim, seed.len());
+        let constraints = family
+            .block_linear_constraints(&block_states, 2, &dummy_spec)
+            .expect("constraint lookup")
+            .expect("link block constraints");
+        assert_eq!(constraints.a.ncols(), link_dim);
+        assert_eq!(constraints.a.nrows(), prepared.constraints.a.nrows());
+        assert!(
+            family
+                .block_linear_constraints(&block_states, 1, &dummy_spec)
+                .expect("non-link constraint lookup")
+                .is_none(),
+            "only block 2 should expose link constraints when score_warp is absent"
+        );
+    }
+
+    #[test]
+    fn pooled_probit_baseline_matches_expanded_integer_weight_fit() {
+        let y = array![0.0, 1.0, 0.0, 1.0];
+        let z = array![-1.5, -0.2, 0.4, 1.4];
+        let weights = array![25.0, 2.0, 1.0, 20.0];
+        let weighted = pooled_probit_baseline(&y, &z, &weights).expect("weighted baseline");
+        let unweighted =
+            pooled_probit_baseline(&y, &z, &Array1::ones(y.len())).expect("unweighted baseline");
+        let (y_expanded, z_expanded) = expand_integer_weight_rows(&y, &z, &weights);
+        let expanded =
+            pooled_probit_baseline(&y_expanded, &z_expanded, &Array1::ones(y_expanded.len()))
+                .expect("expanded baseline");
+
+        assert!(
+            pair_distance(expanded, unweighted) > 1e-2,
+            "test data should distinguish weighted from unweighted seeding"
+        );
+        assert!(
+            pair_distance(weighted, expanded) < 1e-8,
+            "weighted pilot baseline should match the expanded integer-weight fit"
+        );
+    }
+
+    #[test]
+    fn deviation_transform_enforces_constraints_at_seed_median_anchor() {
+        let seed = array![4.5, 5.0, 6.0, 7.5, 8.0];
+        let degree = 3usize;
+        let knots = initializewiggle_knots_from_seed(seed.view(), degree, 4)
+            .expect("initialize deviation knots");
+        let transform = deviation_transform(&knots, degree, &seed).expect("deviation transform");
+        let anchor = array![6.0];
+        let (value_basis, _) = create_basis::<Dense>(
+            anchor.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .expect("median value basis");
+        let (d1_basis, _) = create_basis::<Dense>(
+            anchor.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .expect("median derivative basis");
+
+        let anchored_value = value_basis.dot(&transform);
+        let anchored_d1 = d1_basis.dot(&transform);
+        assert!(
+            max_abs(&anchored_value) < 1e-8,
+            "value constraint should be imposed at the seed median anchor"
+        );
+        assert!(
+            max_abs(&anchored_d1) < 1e-8,
+            "derivative constraint should be imposed at the seed median anchor"
+        );
+    }
+
+    #[test]
+    fn validate_spec_rejects_nonfinite_or_negative_weights() {
+        let data = Array2::<f64>::zeros((3, 0));
+        let y = array![0.0, 1.0, 0.0];
+        let z = array![-1.0, 0.0, 1.0];
+
+        let err = validate_spec(
+            data.view(),
+            &base_spec(y.clone(), array![1.0, f64::NAN, 1.0], z.clone()),
+        )
+        .expect_err("non-finite weights should be rejected");
+        assert!(err.contains("finite non-negative weights"));
+
+        let err = validate_spec(data.view(), &base_spec(y, array![1.0, -0.5, 1.0], z))
+            .expect_err("negative weights should be rejected");
+        assert!(err.contains("finite non-negative weights"));
+    }
+
+    #[test]
+    fn validate_spec_rejects_nonfinite_z_values() {
+        let data = Array2::<f64>::zeros((3, 0));
+        let err = validate_spec(
+            data.view(),
+            &base_spec(
+                array![0.0, 1.0, 0.0],
+                array![1.0, 1.0, 1.0],
+                array![-1.0, f64::INFINITY, 1.0],
+            ),
+        )
+        .expect_err("non-finite z should be rejected");
+        assert!(err.contains("finite z values"));
+    }
+
+    #[test]
+    fn exact_outer_derivative_order_keeps_small_primary_models_second_order() {
+        assert_eq!(
+            bernoulli_exact_outer_derivative_order(100_000, 0, 0),
+            ExactOuterDerivativeOrder::Second
+        );
+        assert_eq!(
+            bernoulli_exact_outer_derivative_order(4_000, 8, 6),
+            ExactOuterDerivativeOrder::Second
+        );
+    }
+
+    #[test]
+    fn exact_outer_derivative_order_downgrades_large_rich_models_to_first_order() {
+        assert_eq!(
+            bernoulli_exact_outer_derivative_order(10_000, 8, 6),
+            ExactOuterDerivativeOrder::First
+        );
+    }
 }

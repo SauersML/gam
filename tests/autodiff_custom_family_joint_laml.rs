@@ -3,15 +3,15 @@ use ad_trait::differentiable_function::{DifferentiableFunctionTrait, ForwardAD};
 use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
+use gam::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState,
+};
 use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::pirls::LinearInequalityConstraints;
-use gam::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState,
-};
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;

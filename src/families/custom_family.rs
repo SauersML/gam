@@ -111,6 +111,25 @@ pub enum ExactNewtonOuterObjective {
     PseudoLaplace,
 }
 
+/// Highest exact outer derivative order a family wants to expose at the
+/// current realized problem scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExactOuterDerivativeOrder {
+    Zeroth,
+    First,
+    Second,
+}
+
+impl ExactOuterDerivativeOrder {
+    pub fn has_gradient(self) -> bool {
+        !matches!(self, Self::Zeroth)
+    }
+
+    pub fn has_hessian(self) -> bool {
+        matches!(self, Self::Second)
+    }
+}
+
 /// Family evaluation over all parameter blocks.
 #[derive(Clone)]
 pub struct FamilyEvaluation {
@@ -165,6 +184,20 @@ pub trait CustomFamily {
     /// joint Hessian depends on β even though outer objective is QuadraticReml.
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         self.exact_newton_outerobjective() != ExactNewtonOuterObjective::QuadraticReml
+    }
+
+    /// Declares how much exact outer calculus this family wants to expose for
+    /// the current realized problem size.
+    ///
+    /// Families can use this to preserve exact first-order profiled/Laplace
+    /// derivatives while downgrading the exact outer Hessian when the full
+    /// second-order path is too expensive at scale.
+    fn exact_outer_derivative_order(
+        &self,
+        _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
+    ) -> ExactOuterDerivativeOrder {
+        ExactOuterDerivativeOrder::Second
     }
 
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
@@ -337,6 +370,20 @@ pub trait CustomFamily {
         _: &Array1<f64>,
         _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
+    /// Optional per-evaluation workspace for exact joint Hessian directional
+    /// derivatives.
+    ///
+    /// Families with expensive cache construction can override this to build
+    /// shared state once and reuse it across the repeated `dH[v]` / `d²H[u,v]`
+    /// calls made by the unified outer evaluator.
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         Ok(None)
     }
 
@@ -993,6 +1040,20 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
     fn p_out(&self) -> usize;
     fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64>;
     fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64>;
+    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64>;
+    fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Array1<f64>;
+    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64>;
+    fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Array1<f64>;
     fn materialize_first(&self, axis: usize) -> Array2<f64>;
     fn materialize_second_diag(&self, axis: usize) -> Array2<f64>;
     fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64>;
@@ -1013,6 +1074,36 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
 
     fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul(self, axis, u)
+    }
+
+    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul_second_diag(self, axis, v)
+    }
+
+    fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul_second_cross(
+            self, axis_d, axis_e, v,
+        )
+    }
+
+    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul_second_diag(self, axis, u)
+    }
+
+    fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul_second_cross(
+            self, axis_d, axis_e, u,
+        )
     }
 
     fn materialize_first(&self, axis: usize) -> Array2<f64> {
@@ -1168,6 +1259,92 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         out
     }
 
+    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(v.len(), self.n_data());
+        let p_base = self.base.p_out();
+        let mut out = Array1::<f64>::zeros(self.p_out);
+        for t in 0..self.p_time {
+            let mut accum = Array1::<f64>::zeros(p_base);
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
+                    * &time_basis.column(t).to_owned();
+                accum += &self.base.transpose_mul_second_diag(axis, &weighted.view());
+            }
+            for j in 0..p_base {
+                out[j * self.p_time + t] = accum[j];
+            }
+        }
+        out
+    }
+
+    fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(v.len(), self.n_data());
+        let p_base = self.base.p_out();
+        let mut out = Array1::<f64>::zeros(self.p_out);
+        for t in 0..self.p_time {
+            let mut accum = Array1::<f64>::zeros(p_base);
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
+                    * &time_basis.column(t).to_owned();
+                accum += &self
+                    .base
+                    .transpose_mul_second_cross(axis_d, axis_e, &weighted.view());
+            }
+            for j in 0..p_base {
+                out[j * self.p_time + t] = accum[j];
+            }
+        }
+        out
+    }
+
+    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+        let time_cols = self.split_time_columns(u);
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        for (t, coeffs) in time_cols.iter().enumerate() {
+            let base_eval = self.base.forward_mul_second_diag(axis, &coeffs.view());
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let contrib = &base_eval * &time_basis.column(t).to_owned();
+                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
+                out_block += &contrib;
+            }
+        }
+        out
+    }
+
+    fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let time_cols = self.split_time_columns(u);
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        for (t, coeffs) in time_cols.iter().enumerate() {
+            let base_eval = self
+                .base
+                .forward_mul_second_cross(axis_d, axis_e, &coeffs.view());
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let contrib = &base_eval * &time_basis.column(t).to_owned();
+                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
+                out_block += &contrib;
+            }
+        }
+        out
+    }
+
     fn materialize_first(&self, axis: usize) -> Array2<f64> {
         let base = self.base.materialize_first(axis);
         let blocks: Vec<Array2<f64>> = self
@@ -1214,6 +1391,31 @@ pub(crate) fn wrap_spatial_implicit_psi_operator(
     op
 }
 
+const CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD: usize = 1_000_000_000; // 1 GB
+
+fn custom_family_psi_dense_payload_bytes(total_rows: usize, p: usize, psi_dim: usize) -> usize {
+    total_rows
+        .saturating_mul(p)
+        .saturating_mul(8)
+        .saturating_mul(1usize.saturating_add(psi_dim))
+}
+
+pub(crate) fn should_materialize_custom_family_psi_dense(
+    total_rows: usize,
+    p: usize,
+    psi_dim: usize,
+    implicit_available: bool,
+) -> bool {
+    !implicit_available
+        || custom_family_psi_dense_payload_bytes(total_rows, p, psi_dim)
+            <= CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD
+}
+
+fn should_resolve_custom_family_psi_dense(total_rows: usize, p: usize) -> bool {
+    total_rows.saturating_mul(p).saturating_mul(8)
+        <= CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD
+}
+
 pub(crate) fn build_block_spatial_psi_derivatives(
     data: ndarray::ArrayView2<'_, f64>,
     resolvedspec: &TermCollectionSpec,
@@ -1240,12 +1442,30 @@ pub(crate) fn build_block_spatial_psi_derivatives(
             .into_iter()
             .enumerate()
             .map(|(psi_idx, info)| {
-                let x_full = EmbeddedColumnBlock::new(
-                    &info.x_psi_local,
-                    info.global_range.clone(),
-                    info.total_p,
-                )
-                .materialize();
+                let implicit_operator = info
+                    .implicit_operator
+                    .as_ref()
+                    .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
+                let dense_row_count = implicit_operator
+                    .as_ref()
+                    .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
+                let materialize_dense_design = !info.x_psi_local.is_empty()
+                    && should_materialize_custom_family_psi_dense(
+                        dense_row_count,
+                        info.total_p,
+                        psi_dim,
+                        implicit_operator.is_some(),
+                    );
+                let x_full = if materialize_dense_design {
+                    EmbeddedColumnBlock::new(
+                        &info.x_psi_local,
+                        info.global_range.clone(),
+                        info.total_p,
+                    )
+                    .materialize()
+                } else {
+                    Array2::<f64>::zeros((0, 0))
+                };
                 let s_full = EmbeddedSquareBlock::new(
                     &info.s_psi_local,
                     info.global_range.clone(),
@@ -1254,22 +1474,20 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 .materialize();
                 let penalty_indices = info.penalty_indices.clone();
                 let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
-                    EmbeddedSquareBlock::new(
-                        local,
-                        info.global_range.clone(),
-                        info.total_p,
-                    )
-                    .materialize()
+                    EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
+                        .materialize()
                 };
                 let s_components: Vec<(usize, Array2<f64>)> = info
                     .penalty_indices
                     .into_iter()
-                    .zip(info.s_psi_components_local.into_iter().map(|local| {
-                        embed_penalty(&local)
-                    }))
+                    .zip(
+                        info.s_psi_components_local
+                            .into_iter()
+                            .map(|local| embed_penalty(&local)),
+                    )
                     .collect();
                 // Build x_psi_psi rows with cross-derivative designs
-                let x_psi_psi_rows = {
+                let x_psi_psi_rows = if materialize_dense_design {
                     let mut rows =
                         vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
                     rows[psi_idx] = EmbeddedColumnBlock::new(
@@ -1292,17 +1510,20 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                             }
                         }
                     }
-                    rows
+                    Some(rows)
+                } else {
+                    None
                 };
                 // Build s_psi_psi_components with cross-penalty terms
-                let mut s_psi_psi_comp_rows =
-                    vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+                let mut s_psi_psi_comp_rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
                 s_psi_psi_comp_rows[psi_idx] = penalty_indices
                     .iter()
                     .copied()
-                    .zip(info.s_psi_psi_components_local.iter().map(|local| {
-                        embed_penalty(local)
-                    }))
+                    .zip(
+                        info.s_psi_psi_components_local
+                            .iter()
+                            .map(|local| embed_penalty(local)),
+                    )
                     .collect();
                 if let (Some(gid), Some(cross_penalties)) =
                     (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
@@ -1312,9 +1533,7 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                             s_psi_psi_comp_rows[global_j] = penalty_indices
                                 .iter()
                                 .copied()
-                                .zip(local_components.iter().map(|local| {
-                                    embed_penalty(local)
-                                }))
+                                .zip(local_components.iter().map(|local| embed_penalty(local)))
                                 .collect();
                         }
                     }
@@ -1334,13 +1553,10 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                     x_psi: x_full.clone(),
                     s_psi: s_full,
                     s_psi_components: Some(s_components),
-                    x_psi_psi: Some(x_psi_psi_rows),
+                    x_psi_psi: x_psi_psi_rows,
                     s_psi_psi: Some(s_psi_psi_rows),
                     s_psi_psi_components: Some(s_psi_psi_comp_rows),
-                    implicit_operator: info
-                        .implicit_operator
-                        .as_ref()
-                        .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op))),
+                    implicit_operator,
                     implicit_axis: info.implicit_axis,
                     implicit_group_id: info.aniso_group_id,
                 }
@@ -1435,6 +1651,267 @@ impl CustomFamilyPsiDesignAction {
                 .assign(&v);
             self.operator.transpose_mul(self.axis, &expanded.view())
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CustomFamilyPsiSecondDesignLevel {
+    Diag(usize),
+    Cross(usize, usize),
+}
+
+#[derive(Clone)]
+pub(crate) struct CustomFamilyPsiSecondDesignAction {
+    operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    level: CustomFamilyPsiSecondDesignLevel,
+    row_range: Range<usize>,
+    p: usize,
+}
+
+impl CustomFamilyPsiSecondDesignAction {
+    pub(crate) fn from_second_derivative(
+        deriv_i: &CustomFamilyBlockPsiDerivative,
+        deriv_j: &CustomFamilyBlockPsiDerivative,
+        total_rows: usize,
+        p: usize,
+        row_range: Range<usize>,
+        label: &str,
+    ) -> Result<Option<Self>, String> {
+        if row_range.end > total_rows {
+            return Err(format!(
+                "{label} row range {}..{} exceeds total rows {total_rows}",
+                row_range.start, row_range.end
+            ));
+        }
+        let Some(op) = deriv_i.implicit_operator.as_ref() else {
+            return Ok(None);
+        };
+        if op.n_data() != total_rows || op.p_out() != p {
+            return Err(format!(
+                "{label} is missing an implicit x_psi_psi operator with shape {}x{}",
+                total_rows, p
+            ));
+        }
+        let same_group = deriv_i.implicit_group_id.is_some()
+            && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
+        if !same_group {
+            return Ok(None);
+        }
+        let level = if deriv_i.implicit_axis == deriv_j.implicit_axis {
+            CustomFamilyPsiSecondDesignLevel::Diag(deriv_i.implicit_axis)
+        } else {
+            CustomFamilyPsiSecondDesignLevel::Cross(deriv_i.implicit_axis, deriv_j.implicit_axis)
+        };
+        Ok(Some(Self {
+            operator: Arc::clone(op),
+            level,
+            row_range,
+            p,
+        }))
+    }
+
+    pub(crate) fn nrows(&self) -> usize {
+        self.row_range.end - self.row_range.start
+    }
+
+    pub(crate) fn slice_rows(&self, row_range: Range<usize>) -> Result<Self, String> {
+        if row_range.end > self.nrows() {
+            return Err(format!(
+                "psi second-design row range {}..{} exceeds available rows {}",
+                row_range.start,
+                row_range.end,
+                self.nrows()
+            ));
+        }
+        Ok(Self {
+            operator: Arc::clone(&self.operator),
+            level: self.level,
+            row_range: (self.row_range.start + row_range.start)
+                ..(self.row_range.start + row_range.end),
+            p: self.p,
+        })
+    }
+
+    pub(crate) fn forward_mul(&self, u: ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(u.len(), self.p);
+        let out = match self.level {
+            CustomFamilyPsiSecondDesignLevel::Diag(axis) => {
+                self.operator.forward_mul_second_diag(axis, &u)
+            }
+            CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => {
+                self.operator.forward_mul_second_cross(axis_d, axis_e, &u)
+            }
+        };
+        out.slice(ndarray::s![self.row_range.clone()]).to_owned()
+    }
+
+    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(v.len(), self.nrows());
+        let expanded = if self.row_range.start == 0 && self.row_range.end == self.operator.n_data()
+        {
+            None
+        } else {
+            let mut expanded = Array1::<f64>::zeros(self.operator.n_data());
+            expanded
+                .slice_mut(ndarray::s![self.row_range.clone()])
+                .assign(&v);
+            Some(expanded)
+        };
+        let full_v = expanded.as_ref().map_or(v, |arr| arr.view());
+        match self.level {
+            CustomFamilyPsiSecondDesignLevel::Diag(axis) => {
+                self.operator.transpose_mul_second_diag(axis, &full_v)
+            }
+            CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => self
+                .operator
+                .transpose_mul_second_cross(axis_d, axis_e, &full_v),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CustomFamilyPsiLinearMapRef<'a> {
+    Dense(&'a Array2<f64>),
+    First(&'a CustomFamilyPsiDesignAction),
+    Second(&'a CustomFamilyPsiSecondDesignAction),
+    Zero { nrows: usize, ncols: usize },
+}
+
+impl CustomFamilyPsiLinearMapRef<'_> {
+    pub(crate) fn nrows(&self) -> usize {
+        match self {
+            Self::Dense(mat) => mat.nrows(),
+            Self::First(action) => action.nrows(),
+            Self::Second(action) => action.nrows(),
+            Self::Zero { nrows, .. } => *nrows,
+        }
+    }
+
+    pub(crate) fn ncols(&self) -> usize {
+        match self {
+            Self::Dense(mat) => mat.ncols(),
+            Self::First(action) => action.p,
+            Self::Second(action) => action.p,
+            Self::Zero { ncols, .. } => *ncols,
+        }
+    }
+
+    pub(crate) fn forward_mul(&self, u: ArrayView1<'_, f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(mat) => mat.dot(&u),
+            Self::First(action) => action.forward_mul(u),
+            Self::Second(action) => action.forward_mul(u),
+            Self::Zero { nrows, .. } => Array1::<f64>::zeros(*nrows),
+        }
+    }
+
+    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(mat) => mat.t().dot(&v),
+            Self::First(action) => action.transpose_mul(v),
+            Self::Second(action) => action.transpose_mul(v),
+            Self::Zero { ncols, .. } => Array1::<f64>::zeros(*ncols),
+        }
+    }
+
+    pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
+        if row >= self.nrows() {
+            return Err(format!(
+                "psi linear-map row {row} out of bounds for {} rows",
+                self.nrows()
+            ));
+        }
+        Ok(match self {
+            Self::Dense(mat) => mat.row(row).to_owned(),
+            Self::First(_) | Self::Second(_) => {
+                let mut e = Array1::<f64>::zeros(self.nrows());
+                e[row] = 1.0;
+                self.transpose_mul(e.view())
+            }
+            Self::Zero { ncols, .. } => Array1::<f64>::zeros(*ncols),
+        })
+    }
+}
+
+pub(crate) fn weighted_crossprod_psi_maps(
+    left: CustomFamilyPsiLinearMapRef<'_>,
+    weights: ArrayView1<'_, f64>,
+    right: CustomFamilyPsiLinearMapRef<'_>,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != weights.len() || right.nrows() != weights.len() {
+        return Err(format!(
+            "psi weighted crossprod row mismatch: left={}, weights={}, right={}",
+            left.nrows(),
+            weights.len(),
+            right.nrows()
+        ));
+    }
+    if left.ncols() == 0 || right.ncols() == 0 {
+        return Ok(Array2::<f64>::zeros((left.ncols(), right.ncols())));
+    }
+    if matches!(left, CustomFamilyPsiLinearMapRef::Zero { .. })
+        || matches!(right, CustomFamilyPsiLinearMapRef::Zero { .. })
+    {
+        return Ok(Array2::<f64>::zeros((left.ncols(), right.ncols())));
+    }
+    if let (
+        CustomFamilyPsiLinearMapRef::Dense(left_dense),
+        CustomFamilyPsiLinearMapRef::Dense(right_dense),
+    ) = (&left, &right)
+    {
+        let mut weighted = Array2::<f64>::zeros((right_dense.nrows(), right_dense.ncols()));
+        for i in 0..right_dense.nrows() {
+            let wi = weights[i];
+            for j in 0..right_dense.ncols() {
+                weighted[[i, j]] = wi * right_dense[[i, j]];
+            }
+        }
+        return Ok(left_dense.t().dot(&weighted));
+    }
+
+    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+    let mut basis = Array1::<f64>::zeros(right.ncols());
+    for j in 0..right.ncols() {
+        basis[j] = 1.0;
+        let right_col = right.forward_mul(basis.view());
+        basis[j] = 0.0;
+        let weighted_col = &right_col * &weights;
+        let left_col = left.transpose_mul(weighted_col.view());
+        out.column_mut(j).assign(&left_col);
+    }
+    Ok(out)
+}
+
+pub(crate) fn first_psi_linear_map<'a>(
+    action: Option<&'a CustomFamilyPsiDesignAction>,
+    dense: &'a Array2<f64>,
+    nrows: usize,
+    ncols: usize,
+) -> CustomFamilyPsiLinearMapRef<'a> {
+    if let Some(action) = action {
+        CustomFamilyPsiLinearMapRef::First(action)
+    } else if dense.nrows() == nrows && dense.ncols() == ncols {
+        CustomFamilyPsiLinearMapRef::Dense(dense)
+    } else {
+        CustomFamilyPsiLinearMapRef::Zero { nrows, ncols }
+    }
+}
+
+pub(crate) fn second_psi_linear_map<'a>(
+    action: Option<&'a CustomFamilyPsiSecondDesignAction>,
+    dense: Option<&'a Array2<f64>>,
+    nrows: usize,
+    ncols: usize,
+) -> CustomFamilyPsiLinearMapRef<'a> {
+    if let Some(action) = action {
+        CustomFamilyPsiLinearMapRef::Second(action)
+    } else if let Some(dense) = dense
+        && dense.nrows() == nrows
+        && dense.ncols() == ncols
+    {
+        CustomFamilyPsiLinearMapRef::Dense(dense)
+    } else {
+        CustomFamilyPsiLinearMapRef::Zero { nrows, ncols }
     }
 }
 
@@ -1661,6 +2138,12 @@ pub(crate) fn resolve_custom_family_x_psi(
         return Ok(deriv.x_psi.clone());
     }
     if let Some(op) = deriv.implicit_operator.as_ref() {
+        if !should_resolve_custom_family_psi_dense(n, p) {
+            return Err(format!(
+                "{label} would materialize implicit x_psi densely at {}x{}; use the operator-aware exact-joint path instead",
+                n, p
+            ));
+        }
         let x = op.materialize_first(deriv.implicit_axis);
         if x.nrows() != n || x.ncols() != p {
             return Err(format!(
@@ -1691,6 +2174,12 @@ pub(crate) fn resolve_custom_family_x_psi_psi(
     label: &str,
 ) -> Result<Array2<f64>, String> {
     if let Some(op) = deriv_i.implicit_operator.as_ref() {
+        if !should_resolve_custom_family_psi_dense(n, p) {
+            return Err(format!(
+                "{label} would materialize implicit x_psi_psi densely at {}x{}; use the operator-aware exact-joint path instead",
+                n, p
+            ));
+        }
         let same_group = deriv_i.implicit_group_id.is_some()
             && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
         let x = if same_group {
@@ -1758,6 +2247,21 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
     pub hessian_psi_psi: Array2<f64>,
+}
+
+pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String>;
+
+    fn second_directional_derivative(
+        &self,
+        _: &Array1<f64>,
+        _: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
 }
 
 pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
@@ -2930,49 +3434,22 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
             block_states,
             &beta_flat,
         )?);
-
-        let synced_dh = Arc::clone(&synced);
-        let compute_dh = Box::new(
-            move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-                let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                    &synced_dh, specs, v_k,
-                )?;
-                match h_rho {
-                    Some(h) => {
-                        if h.iter().all(|v| v.is_finite()) {
-                            Ok(Some(symmetrized_square_matrix(
-                                h,
-                                total,
-                                "joint exact-newton dH shape mismatch",
-                            )?))
-                        } else {
-                            Ok(Some(Array2::<f64>::zeros((total, total))))
-                        }
-                    }
-                    None => Err(
-                        "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
-                    ),
-                }
-            },
-        );
-        let synced_d2h = Arc::clone(&synced);
-        let compute_d2h = Box::new(
-            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
-                match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                    &synced_d2h,
-                    specs,
-                    u,
-                    v,
-                )? {
-                    Some(m) => Ok(Some(symmetrized_square_matrix(
-                        m,
-                        total,
-                        "joint exact-newton d2H shape mismatch",
-                    )?)),
-                    None => Ok(None),
-                }
-            },
-        );
+        let hessian_workspace =
+            family.exact_newton_joint_hessian_workspace(synced.as_ref(), specs)?;
+        let compute_dh = Box::new(exact_newton_dh_closure(
+            family,
+            synced.as_ref(),
+            specs,
+            total,
+            hessian_workspace.clone(),
+        ));
+        let compute_d2h = Box::new(exact_newton_d2h_closure(
+            family,
+            synced.as_ref(),
+            specs,
+            total,
+            hessian_workspace,
+        ));
         return Ok(Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)));
     }
 
@@ -3041,13 +3518,18 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
     synced_states: &'a [ParameterBlockState],
     specs: &'a [ParameterBlockSpec],
     total: usize,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 ) -> impl Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
     move |v_k: &Array1<f64>| {
-        let h_rho = family.exact_newton_joint_hessian_directional_derivative_with_specs(
-            synced_states,
-            specs,
-            v_k,
-        )?;
+        let h_rho = if let Some(workspace) = workspace.as_ref() {
+            workspace.directional_derivative(v_k)?
+        } else {
+            family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                synced_states,
+                specs,
+                v_k,
+            )?
+        };
         match h_rho {
             Some(h) => {
                 if h.iter().all(|v| v.is_finite()) {
@@ -3073,14 +3555,18 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     synced_states: &'a [ParameterBlockState],
     specs: &'a [ParameterBlockSpec],
     total: usize,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 ) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
-    move |u: &Array1<f64>, v: &Array1<f64>| match family
-        .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+    move |u: &Array1<f64>, v: &Array1<f64>| match if let Some(workspace) = workspace.as_ref() {
+        workspace.second_directional_derivative(u, v)?
+    } else {
+        family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
             synced_states,
             specs,
             u,
             v,
-        )? {
+        )?
+    } {
         Some(m) => Ok(Some(symmetrized_square_matrix(
             m,
             total,
@@ -3223,6 +3709,38 @@ fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
             family.exact_newton_outerobjective(),
             ExactNewtonOuterObjective::QuadraticReml | ExactNewtonOuterObjective::PseudoLaplace
         )
+}
+
+pub(crate) fn custom_family_outer_capability<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    n_params: usize,
+    has_psi_coords: bool,
+) -> crate::solver::outer_strategy::OuterCapability {
+    use crate::solver::outer_strategy::{Derivative, OuterCapability};
+
+    let order = family.exact_outer_derivative_order(specs, options);
+    let gradient = if order.has_gradient() {
+        Derivative::Analytic
+    } else {
+        Derivative::FiniteDifference
+    };
+    let hessian = if include_exact_newton_logdet_h(family, options) && order.has_hessian() {
+        Derivative::Analytic
+    } else {
+        Derivative::Unavailable
+    };
+
+    OuterCapability {
+        gradient,
+        hessian,
+        n_params,
+        all_penalty_like: false,
+        has_psi_coords,
+        barrier_config: None,
+        fixed_point_available: false,
+    }
 }
 
 fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
@@ -3497,12 +4015,12 @@ fn inner_blockwise_fit<F: CustomFamily>(
         };
         let total_p: usize = ranges.last().map_or(0, |r| r.1);
 
-        let joint_mode_diagonal_ridge = if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty
-        {
-            ridge
-        } else {
-            0.0
-        };
+        let joint_mode_diagonal_ridge =
+            if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
+                ridge
+            } else {
+                0.0
+            };
 
         for cycle in 0..inner_max_cycles {
             // Get joint Hessian and block gradients from the current evaluation.
@@ -3529,30 +4047,27 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
 
             // Stationarity residual: r = S*beta - gradient (for penalized NLL)
-            let penalty_beta =
-                apply_joint_block_penalty(&ranges, &s_lambdas, &beta_joint, joint_mode_diagonal_ridge);
+            let penalty_beta = apply_joint_block_penalty(
+                &ranges,
+                &s_lambdas,
+                &beta_joint,
+                joint_mode_diagonal_ridge,
+            );
             let rhs = &grad_joint - &penalty_beta;
 
             let Some(mut delta) = (if use_joint_matrix_free_path(total_p, false) {
-                let apply_ranges = ranges.clone();
-                let apply_penalties = s_lambdas.clone();
-                let apply_h = h_joint.clone();
                 let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
                 let preconditioner_diag = joint_penalty_preconditioner_diag(
-                    &apply_h,
-                    &apply_ranges,
-                    &apply_penalties,
+                    &h_joint,
+                    &ranges,
+                    &s_lambdas,
                     trace_diagonal_ridge,
                 );
                 crate::linalg::utils::solve_spd_pcg(
-                    move |v| {
-                        let mut out = apply_h.dot(v);
-                        let penalty = apply_joint_block_penalty(
-                            &apply_ranges,
-                            &apply_penalties,
-                            v,
-                            trace_diagonal_ridge,
-                        );
+                    |v| {
+                        let mut out = h_joint.dot(v);
+                        let penalty =
+                            apply_joint_block_penalty(&ranges, &s_lambdas, v, trace_diagonal_ridge);
                         out += &penalty;
                         out
                     },
@@ -3610,7 +4125,9 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 for b in 0..specs.len() {
                     let (start, end) = ranges[b];
                     states[b].beta.assign(&old_beta[b]);
-                    states[b].beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
+                    states[b]
+                        .beta
+                        .scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_ll = family.log_likelihood_only(&states)?;
@@ -4134,12 +4651,7 @@ fn joint_outer_evaluate(
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<OuterObjectiveEvalResult, String> {
-    let joint_trace_diagonal_ridge = moderidge
-        + if !strict_spd {
-            extra_logdet_ridge
-        } else {
-            0.0
-        };
+    let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
 
     // Build derivative provider from the caller-supplied closures.
     let compute_d2h_ref: Option<
@@ -5411,9 +5923,24 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             drift_fn,
         };
 
+        let hessian_workspace =
+            family.exact_newton_joint_hessian_workspace(&synced_joint_states, specs)?;
+
         // Build derivative provider for the ρ coordinates (D_β H[v]).
-        let compute_dh = exact_newton_dh_closure(family, &synced_joint_states, specs, total);
-        let compute_d2h = exact_newton_d2h_closure(family, &synced_joint_states, specs, total);
+        let compute_dh = exact_newton_dh_closure(
+            family,
+            &synced_joint_states,
+            specs,
+            total,
+            hessian_workspace.clone(),
+        );
+        let compute_d2h = exact_newton_d2h_closure(
+            family,
+            &synced_joint_states,
+            specs,
+            total,
+            hessian_workspace,
+        );
 
         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
         let eval_result = joint_outer_evaluate(
@@ -5703,7 +6230,7 @@ fn apply_joint_block_penalty(
     let mut out = Array1::<f64>::zeros(vector.len());
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
-        let block = vector.slice(s![start..end]).to_owned();
+        let block = vector.slice(s![start..end]);
         out.slice_mut(s![start..end]).assign(&s_lambda.dot(&block));
     }
     if diagonal_ridge > 0.0 {
@@ -5726,7 +6253,9 @@ fn joint_penalty_preconditioner_diag(
         }
     }
     if diagonal_ridge > 0.0 {
-        diag += diagonal_ridge;
+        for value in &mut diag {
+            *value += diagonal_ridge;
+        }
     }
     diag.mapv(|v| v.abs().max(1e-10))
 }
@@ -6139,8 +6668,7 @@ pub fn fit_custom_family<F: CustomFamily>(
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterConfig, OuterEval,
     };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
@@ -6151,33 +6679,15 @@ pub fn fit_custom_family<F: CustomFamily>(
         last_error: Option<String>,
     }
 
-    let has_exact_hess = include_exact_newton_logdet_h(family, options);
     let n_rho = rho0.len();
     let total_joint_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-
-    let hessian_deriv = if has_exact_hess {
-        if joint_exact_analytic_outer_hessian_available(total_joint_p) {
-            Derivative::Analytic
-        } else {
-            Derivative::Unavailable
-        }
-    } else {
-        Derivative::Unavailable
-    };
-
-    let primary_cap = OuterCapability {
-        gradient: Derivative::Analytic,
-        hessian: hessian_deriv,
-        n_params: n_rho,
-        // Custom-family outer objectives do not currently provide `eval_efs`,
-        // so strategy should remain within Newton/BFGS-style plans here.
-        all_penalty_like: false,
-        has_psi_coords: false,
-        // Custom families enforce constraints via active-set QP in the inner
-        // loop, not via log-barrier in the outer evaluator.
-        barrier_config: None,
-        fixed_point_available: false,
-    };
+    let mut primary_cap = custom_family_outer_capability(family, specs, options, n_rho, false);
+    if matches!(primary_cap.hessian, Derivative::Analytic)
+        && !joint_exact_analytic_outer_hessian_available(total_joint_p)
+    {
+        primary_cap.hessian = Derivative::Unavailable;
+    }
+    let need_outer_hessian = matches!(primary_cap.hessian, Derivative::Analytic);
     let outer_config = OuterConfig {
         tolerance: options.outer_tol,
         max_iter: options.outer_max_iter,
@@ -6229,7 +6739,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                 &penalty_counts,
                 rho,
                 warm_ref,
-                true,
+                need_outer_hessian,
             ) {
                 Ok((cost, grad, hess_opt, warm))
                     if cost.is_finite()
@@ -6369,8 +6879,14 @@ pub fn fit_custom_family<F: CustomFamily>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::families::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
     use crate::matrix::DesignMatrix;
+    use crate::smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+        build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
+        spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
+    };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
@@ -6385,6 +6901,274 @@ mod tests {
         assert_eq!(floored[0], 0.0);
         assert_eq!(floored[1], 1.0e-6);
         assert_eq!(floored[2], 0.25);
+    }
+
+    #[test]
+    fn custom_family_outer_capability_respects_first_order_downgrade() {
+        #[derive(Clone)]
+        struct OneBlockFirstOrderOnlyFamily;
+
+        impl CustomFamily for OneBlockFirstOrderOnlyFamily {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                let n = block_states[0].eta.len();
+                Ok(FamilyEvaluation {
+                    log_likelihood: 0.0,
+                    blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                        working_response: Array1::zeros(n),
+                        working_weights: Array1::ones(n),
+                    }],
+                })
+            }
+
+            fn exact_outer_derivative_order(
+                &self,
+                _: &[ParameterBlockSpec],
+                _: &BlockwiseFitOptions,
+            ) -> ExactOuterDerivativeOrder {
+                ExactOuterDerivativeOrder::First
+            }
+        }
+
+        let specs = vec![ParameterBlockSpec {
+            name: "x".to_string(),
+            design: DesignMatrix::Dense(array![[1.0]]),
+            offset: array![0.0],
+            penalties: vec![array![[1.0]]],
+            initial_log_lambdas: array![0.0],
+            initial_beta: None,
+        }];
+        let cap = custom_family_outer_capability(
+            &OneBlockFirstOrderOnlyFamily,
+            &specs,
+            &BlockwiseFitOptions::default(),
+            1,
+            false,
+        );
+        assert_eq!(
+            cap.gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            cap.hessian,
+            crate::solver::outer_strategy::Derivative::Unavailable
+        );
+    }
+
+    #[test]
+    fn build_block_spatial_psi_derivatives_populates_aniso_cross_rows() {
+        let n = 10usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.37 * i as f64).sin() + 0.2 * x0;
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "spatial".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                        length_scale: 0.8,
+                        nu: MaternNu::ThreeHalves,
+                        include_intercept: false,
+                        double_penalty: false,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let base_design =
+            build_term_collection_design(data.view(), &spec).expect("build base spatial design");
+        let resolvedspec = freeze_spatial_length_scale_terms_from_design(&spec, &base_design)
+            .expect("freeze spatial term spec");
+        let resolved_design = build_term_collection_design(data.view(), &resolvedspec)
+            .expect("rebuild frozen spatial design");
+        let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
+        let info_list = try_build_spatial_log_kappa_derivativeinfo_list(
+            data.view(),
+            &resolvedspec,
+            &resolved_design,
+            &spatial_terms,
+        )
+        .expect("build spatial derivative info list")
+        .expect("anisotropic derivative info");
+        let derivs =
+            build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &resolved_design)
+                .expect("build custom-family spatial psi derivatives")
+                .expect("anisotropic spatial derivative rows");
+
+        assert_eq!(
+            derivs.len(),
+            2,
+            "2D anisotropic term should expose two psi rows"
+        );
+        assert_eq!(info_list.len(), 2, "info list should expose the same two psi rows");
+
+        let x_cross_01 = derivs[0]
+            .x_psi_psi
+            .as_ref()
+            .expect("psi0 second-derivative rows")[1]
+            .clone();
+        let x_cross_10 = derivs[1]
+            .x_psi_psi
+            .as_ref()
+            .expect("psi1 second-derivative rows")[0]
+            .clone();
+        assert_eq!(
+            x_cross_01.dim(),
+            (
+                resolved_design.design.nrows(),
+                resolved_design.design.ncols()
+            )
+        );
+        assert_eq!(
+            x_cross_10.dim(),
+            (
+                resolved_design.design.nrows(),
+                resolved_design.design.ncols()
+            )
+        );
+        let cross_designs_01 = info_list[0]
+            .aniso_cross_designs
+            .as_ref()
+            .expect("psi0 cross designs");
+        let cross_designs_10 = info_list[1]
+            .aniso_cross_designs
+            .as_ref()
+            .expect("psi1 cross designs");
+        assert_eq!(cross_designs_01[0].0, 1, "psi0 should point at psi1 cross design");
+        assert_eq!(cross_designs_10[0].0, 0, "psi1 should point at psi0 cross design");
+        let expected_x_cross_01 = EmbeddedColumnBlock::new(
+            &cross_designs_01[0].1,
+            info_list[0].global_range.clone(),
+            info_list[0].total_p,
+        )
+        .materialize();
+        let expected_x_cross_10 = EmbeddedColumnBlock::new(
+            &cross_designs_10[0].1,
+            info_list[1].global_range.clone(),
+            info_list[1].total_p,
+        )
+        .materialize();
+        assert!(
+            x_cross_01
+                .iter()
+                .zip(expected_x_cross_01.iter())
+                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+            "generic psi builder should embed the psi0->psi1 cross design into the off-diagonal row"
+        );
+        assert!(
+            x_cross_10
+                .iter()
+                .zip(expected_x_cross_10.iter())
+                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+            "generic psi builder should embed the psi1->psi0 cross design into the symmetric off-diagonal row"
+        );
+
+        let s_cross_01 = derivs[0]
+            .s_psi_psi
+            .as_ref()
+            .expect("psi0 penalty second-derivative rows")[1]
+            .clone();
+        let s_cross_10 = derivs[1]
+            .s_psi_psi
+            .as_ref()
+            .expect("psi1 penalty second-derivative rows")[0]
+            .clone();
+        assert_eq!(
+            s_cross_01.dim(),
+            (
+                resolved_design.design.ncols(),
+                resolved_design.design.ncols()
+            )
+        );
+        assert_eq!(
+            s_cross_10.dim(),
+            (
+                resolved_design.design.ncols(),
+                resolved_design.design.ncols()
+            )
+        );
+        let cross_penalties_01 = info_list[0]
+            .aniso_cross_penalties
+            .as_ref()
+            .expect("psi0 cross penalties");
+        let cross_penalties_10 = info_list[1]
+            .aniso_cross_penalties
+            .as_ref()
+            .expect("psi1 cross penalties");
+        assert_eq!(
+            cross_penalties_01[0].0,
+            1,
+            "psi0 should point at psi1 cross penalties"
+        );
+        assert_eq!(
+            cross_penalties_10[0].0,
+            0,
+            "psi1 should point at psi0 cross penalties"
+        );
+        let expected_s_cross_01 = cross_penalties_01[0]
+            .1
+            .iter()
+            .map(|local| {
+                EmbeddedSquareBlock::new(
+                    local,
+                    info_list[0].global_range.clone(),
+                    info_list[0].total_p,
+                )
+                .materialize()
+            })
+            .fold(
+                Array2::<f64>::zeros((
+                    resolved_design.design.ncols(),
+                    resolved_design.design.ncols(),
+                )),
+                |acc, matrix| acc + matrix,
+            );
+        let expected_s_cross_10 = cross_penalties_10[0]
+            .1
+            .iter()
+            .map(|local| {
+                EmbeddedSquareBlock::new(
+                    local,
+                    info_list[1].global_range.clone(),
+                    info_list[1].total_p,
+                )
+                .materialize()
+            })
+            .fold(
+                Array2::<f64>::zeros((
+                    resolved_design.design.ncols(),
+                    resolved_design.design.ncols(),
+                )),
+                |acc, matrix| acc + matrix,
+            );
+        assert!(
+            s_cross_01
+                .iter()
+                .zip(expected_s_cross_01.iter())
+                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+            "generic psi builder should embed the psi0->psi1 cross penalties into the off-diagonal row"
+        );
+        assert!(
+            s_cross_10
+                .iter()
+                .zip(expected_s_cross_10.iter())
+                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+            "generic psi builder should embed the psi1->psi0 cross penalties into the symmetric off-diagonal row"
+        );
     }
 
     impl CustomFamily for OneBlockIdentityFamily {
@@ -8244,22 +9028,21 @@ mod tests {
         }
     }
 
-    // ---------- eta_backup mem::swap shape-mismatch tests ----------
+    // ---------- eta_backup heterogeneous-shape regression tests ----------
     //
-    // Root cause: inner_blockwise_fit (line ~2241) allocates a single
-    // `eta_backup` buffer to `max(eta.len())` across blocks.  It then
-    // uses `mem::swap` to exchange each block's eta with this buffer.
-    // When blocks have DIFFERENT eta lengths (e.g. survival time block
-    // = 3n, threshold/log-sigma = n), the swap after the first large
-    // block leaves eta_backup at the smaller length.  The subsequent
-    // `states[b].eta.assign(&eta_backup)` tries to write a short
-    // array into a long slot, triggering an ndarray broadcast panic:
+    // Regression note: a previous `inner_blockwise_fit` implementation
+    // reused a single `eta_backup` buffer across blocks during line search.
+    // With heterogeneous eta lengths (e.g. survival time block = 3n,
+    // threshold/log-sigma = n), that buffer could be left at the wrong
+    // shape for the next block update and trigger an ndarray broadcast
+    // panic:
     //   "could not broadcast array from shape: [n] to: [3n]"
 
     /// Minimal two-block family where block 0 has design nrows=3n and
-    /// block 1 has design nrows=n.  Both use ExactNewton.  Block 0's
-    /// gradient is nonzero so the Newton step exceeds tol and triggers
-    /// the line-search path (which contains the faulty mem::swap).
+    /// block 1 has design nrows=n. Both use ExactNewton. Block 0's
+    /// gradient is nonzero so the Newton step exceeds tol and exercises
+    /// the line-search path that previously mishandled heterogeneous
+    /// eta buffer shapes.
     #[derive(Clone)]
     struct HeterogeneousEtaLengthFamily {
         n: usize,
@@ -8323,8 +9106,8 @@ mod tests {
         ]
     }
 
-    /// NECESSITY: blocks with identical eta lengths do NOT trigger the
-    /// panic — the bug requires heterogeneous eta lengths across blocks.
+    /// Regression guard: blocks with identical eta lengths never exercised
+    /// the old heterogeneous-shape failure mode.
     #[test]
     fn uniform_eta_lengths_do_not_panic() {
         let n = 10;
@@ -8389,10 +9172,10 @@ mod tests {
         );
     }
 
-    /// SUFFICIENCY: heterogeneous eta lengths (3n vs n) must NOT prevent
-    /// the inner fit from completing.  Currently panics with
+    /// Regression guard: heterogeneous eta lengths (3n vs n) must not
+    /// prevent the inner fit from completing. Older code could panic with
     /// "could not broadcast array from shape: [n] to: [3n]" due to the
-    /// eta_backup mem::swap bug.
+    /// eta_backup swap bug.
     #[test]
     fn heterogeneous_eta_lengths_inner_fit_completes() {
         let n = 10;
@@ -8430,10 +9213,9 @@ mod tests {
         );
     }
 
-    /// NECESSITY: when ALL blocks have step <= tol (already converged),
-    /// the line-search path is skipped for every block and the swap
-    /// never executes — so no panic even with heterogeneous eta lengths.
-    /// This proves that reaching the swap is necessary to trigger the bug.
+    /// Regression guard: when all blocks have step <= tol, the line-search
+    /// path is skipped for every block, so this case should remain safe
+    /// even with heterogeneous eta lengths.
     #[test]
     fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
         let n = 10;
@@ -8488,10 +9270,9 @@ mod tests {
         );
     }
 
-    /// SUFFICIENCY: even when only the SECOND (smaller) block takes a
-    /// step, the fit must complete.  Currently panics because the
-    /// oversized eta_backup buffer (3n) gets swapped into block 1's
-    /// eta slot (n), then assign fails.
+    /// Regression guard: even when only the second (smaller) block takes
+    /// a step, the fit must complete. Earlier code could still panic here
+    /// after reusing an oversized eta_backup buffer across blocks.
     #[test]
     fn heterogeneous_eta_completes_when_only_small_block_steps() {
         let n = 10;

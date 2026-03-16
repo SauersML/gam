@@ -7,7 +7,7 @@ use crate::custom_family::{
     ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper, fit_custom_family,
     resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
-    wrap_spatial_implicit_psi_operator,
+    should_materialize_custom_family_psi_dense, wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::gamlss::{
@@ -19,6 +19,9 @@ use crate::families::scale_design::{
 use crate::families::sigma_link::{
     exp_sigma_derivs_up_to_fourth, exp_sigma_derivs_up_to_third,
     exp_sigma_derivs_up_to_third_scalar,
+};
+use crate::inference::prediction_linalg::{
+    PredictionCovarianceBackend, dense_row_chunk, design_row_chunk, rowwise_local_covariances,
 };
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, SymmetricMatrix, xt_diag_x_symmetric,
@@ -2506,7 +2509,17 @@ fn build_survival_covariate_block_psi_derivatives(
                                 .implicit_operator
                                 .as_ref()
                                 .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
-                            let x_full = if implicit_operator.is_some() {
+                            let total_rows = implicit_operator
+                                .as_ref()
+                                .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
+                            let materialize_dense_design = !info.x_psi_local.is_empty()
+                                && should_materialize_custom_family_psi_dense(
+                                    total_rows,
+                                    info.total_p,
+                                    psi_dim,
+                                    implicit_operator.is_some(),
+                                );
+                            let x_full = if !materialize_dense_design {
                                 Array2::<f64>::zeros((0, 0))
                             } else {
                                 embed_design(&info.x_psi_local)
@@ -2518,7 +2531,7 @@ fn build_survival_covariate_block_psi_derivatives(
                                 .copied()
                                 .zip(info.s_psi_components_local.iter().map(embed_penalty))
                                 .collect();
-                            let x_psi_psi = if implicit_operator.is_some() {
+                            let x_psi_psi = if !materialize_dense_design {
                                 None
                             } else {
                                 let mut rows =
@@ -2619,12 +2632,22 @@ fn build_survival_covariate_block_psi_derivatives(
                                     )
                                 })
                                 .transpose()?;
-                            let x_psi = if implicit_operator.is_some() {
+                            let p_total = info.total_p * time_basis_exit.ncols();
+                            let total_rows = implicit_operator
+                                .as_ref()
+                                .map_or_else(|| 2 * info.x_psi_local.nrows(), |op| op.n_data());
+                            let materialize_dense_design = !info.x_psi_local.is_empty()
+                                && should_materialize_custom_family_psi_dense(
+                                    total_rows,
+                                    p_total,
+                                    psi_dim,
+                                    implicit_operator.is_some(),
+                                );
+                            let x_psi = if !materialize_dense_design {
                                 Array2::<f64>::zeros((0, 0))
                             } else {
                                 tensorize_design(&embed_design(&info.x_psi_local))
                             };
-                            let p_total = info.total_p * time_basis_exit.ncols();
                             let s_components: Vec<(usize, Array2<f64>)> = info
                                 .penalty_indices
                                 .iter()
@@ -2636,7 +2659,7 @@ fn build_survival_covariate_block_psi_derivatives(
                                         .map(|full| tensorize_penalty(&full)),
                                 )
                                 .collect();
-                            let x_psi_psi = if implicit_operator.is_some() {
+                            let x_psi_psi = if !materialize_dense_design {
                                 None
                             } else {
                                 let mut rows =
@@ -3375,158 +3398,6 @@ fn select_anchorrow(age_entry: &Array1<f64>, time_anchor: Option<f64>) -> Result
                 .ok_or_else(|| "select_anchorrow: failed to select nearest entry".to_string())
         }
     }
-}
-
-fn design_times_dense(design: &DesignMatrix, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
-    if design.ncols() != rhs.nrows() {
-        return Err(format!(
-            "design_times_dense shape mismatch: design is {}x{}, rhs is {}x{}",
-            design.nrows(),
-            design.ncols(),
-            rhs.nrows(),
-            rhs.ncols()
-        ));
-    }
-    match design {
-        DesignMatrix::Dense(x) => Ok(x.dot(rhs)),
-        DesignMatrix::Sparse(_) => {
-            let n = design.nrows();
-            let q = rhs.ncols();
-            let mut out = Array2::<f64>::zeros((n, q));
-            for j in 0..q {
-                let col = rhs.column(j).to_owned();
-                out.column_mut(j).assign(&design.matrixvectormultiply(&col));
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn rowwise_dot_designwith_dense(
-    design: &DesignMatrix,
-    rowvalues: &Array2<f64>,
-) -> Result<Array1<f64>, String> {
-    if design.nrows() != rowvalues.nrows() || design.ncols() != rowvalues.ncols() {
-        return Err(format!(
-            "rowwise_dot_designwith_dense shape mismatch: design is {}x{}, rowvalues is {}x{}",
-            design.nrows(),
-            design.ncols(),
-            rowvalues.nrows(),
-            rowvalues.ncols()
-        ));
-    }
-    match design {
-        DesignMatrix::Dense(x) => Ok(Array1::from_iter(
-            (0..x.nrows()).map(|i| x.row(i).dot(&rowvalues.row(i))),
-        )),
-        DesignMatrix::Sparse(xs) => {
-            let csr = xs.to_csr_arc().ok_or_else(|| {
-                "rowwise_dot_designwith_dense: failed to obtain CSR view".to_string()
-            })?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-            let mut out = Array1::<f64>::zeros(xs.nrows());
-            for i in 0..xs.nrows() {
-                let start = row_ptr[i];
-                let end = row_ptr[i + 1];
-                let mut acc = 0.0_f64;
-                for ptr in start..end {
-                    let j = col_idx[ptr];
-                    acc += vals[ptr] * rowvalues[[i, j]];
-                }
-                out[i] = acc;
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn rowwise_cross_quadratic_dense_design(
-    left_dense: &Array2<f64>,
-    middle: &Array2<f64>,
-    right: &DesignMatrix,
-) -> Result<Array1<f64>, String> {
-    if left_dense.ncols() != middle.nrows() || middle.ncols() != right.ncols() {
-        return Err(format!(
-            "rowwise_cross_quadratic_dense_design shape mismatch: left is {}x{}, middle is {}x{}, right is {}x{}",
-            left_dense.nrows(),
-            left_dense.ncols(),
-            middle.nrows(),
-            middle.ncols(),
-            right.nrows(),
-            right.ncols()
-        ));
-    }
-    if left_dense.nrows() != right.nrows() {
-        return Err(format!(
-            "rowwise_cross_quadratic_dense_design row mismatch: left has {} rows, right has {} rows",
-            left_dense.nrows(),
-            right.nrows()
-        ));
-    }
-
-    let mut out = Array1::<f64>::zeros(left_dense.nrows());
-    let mut row_scratch = vec![0.0_f64; middle.ncols()];
-    match right {
-        DesignMatrix::Dense(x_right) => {
-            for i in 0..left_dense.nrows() {
-                row_scratch.fill(0.0);
-                for j in 0..left_dense.ncols() {
-                    let left_ij = left_dense[[i, j]];
-                    if left_ij == 0.0 {
-                        continue;
-                    }
-                    for k in 0..middle.ncols() {
-                        row_scratch[k] += left_ij * middle[[j, k]];
-                    }
-                }
-                let mut acc = 0.0_f64;
-                for k in 0..x_right.ncols() {
-                    acc += row_scratch[k] * x_right[[i, k]];
-                }
-                out[i] = acc;
-            }
-        }
-        DesignMatrix::Sparse(xs) => {
-            let csr = xs.to_csr_arc().ok_or_else(|| {
-                "rowwise_cross_quadratic_dense_design: failed to obtain CSR view".to_string()
-            })?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-            for i in 0..left_dense.nrows() {
-                row_scratch.fill(0.0);
-                for j in 0..left_dense.ncols() {
-                    let left_ij = left_dense[[i, j]];
-                    if left_ij == 0.0 {
-                        continue;
-                    }
-                    for k in 0..middle.ncols() {
-                        row_scratch[k] += left_ij * middle[[j, k]];
-                    }
-                }
-                let mut acc = 0.0_f64;
-                for ptr in row_ptr[i]..row_ptr[i + 1] {
-                    let k = col_idx[ptr];
-                    acc += vals[ptr] * row_scratch[k];
-                }
-                out[i] = acc;
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn rowwise_cross_quadratic_design(
-    left: &DesignMatrix,
-    middle: &Array2<f64>,
-    right: &DesignMatrix,
-) -> Result<Array1<f64>, String> {
-    let left_middle = design_times_dense(left, middle)?;
-    rowwise_dot_designwith_dense(right, &left_middle)
 }
 
 fn weighted_crossprod_dense(
@@ -7051,6 +6922,79 @@ pub fn predict_survival_location_scale(
     Ok(SurvivalLocationScalePredictResult { eta, survival_prob })
 }
 
+struct SurvivalLatentRowCovariances {
+    var_h: Array1<f64>,
+    var_t: Array1<f64>,
+    var_ls: Array1<f64>,
+    cov_ht: Array1<f64>,
+    cov_hl: Array1<f64>,
+    cov_tl: Array1<f64>,
+    var_w: Option<Array1<f64>>,
+    cov_hw: Option<Array1<f64>>,
+    cov_tw: Option<Array1<f64>>,
+    cov_lw: Option<Array1<f64>>,
+}
+
+fn rowwise_survival_latent_covariances(
+    input: &SurvivalLocationScalePredictInput,
+    p_time: usize,
+    p_t: usize,
+    p_ls: usize,
+    p_w: usize,
+    backend: &PredictionCovarianceBackend<'_>,
+) -> Result<SurvivalLatentRowCovariances, String> {
+    let p_total = p_time + p_t + p_ls + p_w;
+    let local_dim = if p_w > 0 { 4 } else { 3 };
+    let local = rowwise_local_covariances(backend, input.x_time_exit.nrows(), local_dim, |rows| {
+        let rows_in_chunk = rows.end - rows.start;
+        let time_chunk = dense_row_chunk(&input.x_time_exit, rows.clone());
+        let threshold_chunk = design_row_chunk(&input.x_threshold, rows.clone())?;
+        let log_sigma_chunk = design_row_chunk(&input.x_log_sigma, rows.clone())?;
+        let mut components = Vec::with_capacity(local_dim);
+
+        let mut h = Array2::<f64>::zeros((rows_in_chunk, p_total));
+        h.slice_mut(s![.., 0..p_time]).assign(&time_chunk);
+        components.push(h);
+
+        let mut t = Array2::<f64>::zeros((rows_in_chunk, p_total));
+        t.slice_mut(s![.., p_time..p_time + p_t])
+            .assign(&threshold_chunk);
+        components.push(t);
+
+        let mut ls = Array2::<f64>::zeros((rows_in_chunk, p_total));
+        ls.slice_mut(s![.., p_time + p_t..p_time + p_t + p_ls])
+            .assign(&log_sigma_chunk);
+        components.push(ls);
+
+        if p_w > 0 {
+            let xw = input
+                .x_link_wiggle
+                .as_ref()
+                .ok_or_else(|| "rowwise_survival_latent_covariances missing wiggle design".to_string())?;
+            let wiggle_chunk = design_row_chunk(xw, rows)?;
+            let mut w = Array2::<f64>::zeros((rows_in_chunk, p_total));
+            w.slice_mut(s![.., p_time + p_t + p_ls..p_total])
+                .assign(&wiggle_chunk);
+            components.push(w);
+        }
+
+        Ok(components)
+    })?;
+
+    Ok(SurvivalLatentRowCovariances {
+        var_h: local[0][0].mapv(|v| v.max(0.0)),
+        var_t: local[1][1].mapv(|v| v.max(0.0)),
+        var_ls: local[2][2].mapv(|v| v.max(0.0)),
+        cov_ht: local[0][1].clone(),
+        cov_hl: local[0][2].clone(),
+        cov_tl: local[1][2].clone(),
+        var_w: (p_w > 0).then(|| local[3][3].mapv(|v| v.max(0.0))),
+        cov_hw: (p_w > 0).then(|| local[0][3].clone()),
+        cov_tw: (p_w > 0).then(|| local[1][3].clone()),
+        cov_lw: (p_w > 0).then(|| local[2][3].clone()),
+    })
+}
+
 pub fn predict_survival_location_scale_posterior_mean(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
@@ -7118,77 +7062,8 @@ pub fn predict_survival_location_scale_posterior_mean(
                 .to_string(),
         );
     }
-
-    let cov_hh = covariance.slice(s![0..p_time, 0..p_time]).to_owned();
-    let cov_tt = covariance
-        .slice(s![p_time..p_time + p_t, p_time..p_time + p_t])
-        .to_owned();
-    let cov_ll = covariance
-        .slice(s![
-            p_time + p_t..p_time + p_t + p_ls,
-            p_time + p_t..p_time + p_t + p_ls
-        ])
-        .to_owned();
-    let cov_ht = covariance
-        .slice(s![0..p_time, p_time..p_time + p_t])
-        .to_owned();
-    let cov_hl = covariance
-        .slice(s![0..p_time, p_time + p_t..p_time + p_t + p_ls])
-        .to_owned();
-    let cov_tl = covariance
-        .slice(s![p_time..p_time + p_t, p_time + p_t..p_time + p_t + p_ls])
-        .to_owned();
-    let (varwrows, cov_hwrows, cov_twrows, cov_lwrows) =
-        if let Some(xw) = input.x_link_wiggle.as_ref() {
-            let covww = covariance
-                .slice(s![
-                    p_time + p_t + p_ls..p_total,
-                    p_time + p_t + p_ls..p_total
-                ])
-                .to_owned();
-            let cov_hw = covariance
-                .slice(s![0..p_time, p_time + p_t + p_ls..p_total])
-                .to_owned();
-            let cov_tw = covariance
-                .slice(s![p_time..p_time + p_t, p_time + p_t + p_ls..p_total])
-                .to_owned();
-            let cov_lw = covariance
-                .slice(s![
-                    p_time + p_t..p_time + p_t + p_ls,
-                    p_time + p_t + p_ls..p_total
-                ])
-                .to_owned();
-            (
-                Some(xw.quadratic_form_diag(&covww)?),
-                Some(rowwise_cross_quadratic_dense_design(
-                    &input.x_time_exit,
-                    &cov_hw,
-                    xw,
-                )?),
-                Some(rowwise_cross_quadratic_design(
-                    &input.x_threshold,
-                    &cov_tw,
-                    xw,
-                )?),
-                Some(rowwise_cross_quadratic_design(
-                    &input.x_log_sigma,
-                    &cov_lw,
-                    xw,
-                )?),
-            )
-        } else {
-            (None, None, None, None)
-        };
-
-    let xh_hh = input.x_time_exit.dot(&cov_hh);
-    let var_trows = input.x_threshold.quadratic_form_diag(&cov_tt)?;
-    let var_lsrows = input.x_log_sigma.quadratic_form_diag(&cov_ll)?;
-    let cov_htrows =
-        rowwise_cross_quadratic_dense_design(&input.x_time_exit, &cov_ht, &input.x_threshold)?;
-    let cov_hlrows =
-        rowwise_cross_quadratic_dense_design(&input.x_time_exit, &cov_hl, &input.x_log_sigma)?;
-    let cov_tlrows =
-        rowwise_cross_quadratic_design(&input.x_threshold, &cov_tl, &input.x_log_sigma)?;
+    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+    let row_cov = rowwise_survival_latent_covariances(input, p_time, p_t, p_ls, pw, &backend)?;
 
     let mu_h = predictors.h;
     let mu_t = predictors.eta_t;
@@ -7243,28 +7118,28 @@ pub fn predict_survival_location_scale_posterior_mean(
                 [mu_h[i], mu_t[i], mu_ls[i], muw[i]],
                 [
                     [
-                        var_hrow(i, input, &xh_hh),
-                        cov_htrows[i],
-                        cov_hlrows[i],
-                        cov_hwrows.as_ref().expect("wiggle cov_hw rows")[i],
+                        row_cov.var_h[i],
+                        row_cov.cov_ht[i],
+                        row_cov.cov_hl[i],
+                        row_cov.cov_hw.as_ref().expect("wiggle cov_hw rows")[i],
                     ],
                     [
-                        cov_htrows[i],
-                        var_trows[i],
-                        cov_tlrows[i],
-                        cov_twrows.as_ref().expect("wiggle cov_tw rows")[i],
+                        row_cov.cov_ht[i],
+                        row_cov.var_t[i],
+                        row_cov.cov_tl[i],
+                        row_cov.cov_tw.as_ref().expect("wiggle cov_tw rows")[i],
                     ],
                     [
-                        cov_hlrows[i],
-                        cov_tlrows[i],
-                        var_lsrows[i],
-                        cov_lwrows.as_ref().expect("wiggle cov_lw rows")[i],
+                        row_cov.cov_hl[i],
+                        row_cov.cov_tl[i],
+                        row_cov.var_ls[i],
+                        row_cov.cov_lw.as_ref().expect("wiggle cov_lw rows")[i],
                     ],
                     [
-                        cov_hwrows.as_ref().expect("wiggle cov_hw rows")[i],
-                        cov_twrows.as_ref().expect("wiggle cov_tw rows")[i],
-                        cov_lwrows.as_ref().expect("wiggle cov_lw rows")[i],
-                        varwrows.as_ref().expect("wiggle var rows")[i],
+                        row_cov.cov_hw.as_ref().expect("wiggle cov_hw rows")[i],
+                        row_cov.cov_tw.as_ref().expect("wiggle cov_tw rows")[i],
+                        row_cov.cov_lw.as_ref().expect("wiggle cov_lw rows")[i],
+                        row_cov.var_w.as_ref().expect("wiggle var rows")[i],
                     ],
                 ],
                 11,
@@ -7282,9 +7157,9 @@ pub fn predict_survival_location_scale_posterior_mean(
                 &quadctx,
                 [mu_h[i], mu_t[i], mu_ls[i]],
                 [
-                    [var_hrow(i, input, &xh_hh), cov_htrows[i], cov_hlrows[i]],
-                    [cov_htrows[i], var_trows[i], cov_tlrows[i]],
-                    [cov_hlrows[i], cov_tlrows[i], var_lsrows[i]],
+                    [row_cov.var_h[i], row_cov.cov_ht[i], row_cov.cov_hl[i]],
+                    [row_cov.cov_ht[i], row_cov.var_t[i], row_cov.cov_tl[i]],
+                    [row_cov.cov_hl[i], row_cov.cov_tl[i], row_cov.var_ls[i]],
                 ],
                 |h, t, ls| {
                     let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
@@ -7296,17 +7171,17 @@ pub fn predict_survival_location_scale_posterior_mean(
     };
 
     let survival_prob = Array1::from_iter((0..n).map(|i| {
-        let var_h = var_hrow(i, input, &xh_hh);
-        let var_t = var_trows[i];
-        let var_ls = var_lsrows[i];
-        let cov_ht_i = cov_htrows[i];
-        let cov_hl_i = cov_hlrows[i];
-        let cov_tl_i = cov_tlrows[i];
+        let var_h = row_cov.var_h[i];
+        let var_t = row_cov.var_t[i];
+        let var_ls = row_cov.var_ls[i];
+        let cov_ht_i = row_cov.cov_ht[i];
+        let cov_hl_i = row_cov.cov_hl[i];
+        let cov_tl_i = row_cov.cov_tl[i];
         let muw_i = muw.as_ref().map_or(0.0, |vals| vals[i]);
-        let varw_i = varwrows.as_ref().map_or(0.0, |vals| vals[i]);
-        let cov_hw_i = cov_hwrows.as_ref().map_or(0.0, |vals| vals[i]);
-        let cov_tw_i = cov_twrows.as_ref().map_or(0.0, |vals| vals[i]);
-        let cov_lw_i = cov_lwrows.as_ref().map_or(0.0, |vals| vals[i]);
+        let varw_i = row_cov.var_w.as_ref().map_or(0.0, |vals| vals[i]);
+        let cov_hw_i = row_cov.cov_hw.as_ref().map_or(0.0, |vals| vals[i]);
+        let cov_tw_i = row_cov.cov_tw.as_ref().map_or(0.0, |vals| vals[i]);
+        let cov_lw_i = row_cov.cov_lw.as_ref().map_or(0.0, |vals| vals[i]);
         let mu_l_i = mu_ls[i];
 
         if !(var_h.is_finite()
@@ -7425,99 +7300,29 @@ pub fn predict_survival_location_scalewith_uncertainty(
     }
 
     let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
-
-    let cov_hh = covariance.slice(s![0..p_time, 0..p_time]).to_owned();
-    let cov_tt = covariance
-        .slice(s![p_time..p_time + p_t, p_time..p_time + p_t])
-        .to_owned();
-    let cov_ll = covariance
-        .slice(s![
-            p_time + p_t..p_time + p_t + p_ls,
-            p_time + p_t..p_time + p_t + p_ls
-        ])
-        .to_owned();
-    let cov_ht = covariance
-        .slice(s![0..p_time, p_time..p_time + p_t])
-        .to_owned();
-    let cov_hl = covariance
-        .slice(s![0..p_time, p_time + p_t..p_time + p_t + p_ls])
-        .to_owned();
-    let cov_tl = covariance
-        .slice(s![p_time..p_time + p_t, p_time + p_t..p_time + p_t + p_ls])
-        .to_owned();
-    let xh_hh = input.x_time_exit.dot(&cov_hh);
-    let var_hrows =
-        Array1::from_iter((0..n).map(|i| input.x_time_exit.row(i).dot(&xh_hh.row(i)).max(0.0)));
-    let var_trows = input.x_threshold.quadratic_form_diag(&cov_tt)?;
-    let var_lsrows = input.x_log_sigma.quadratic_form_diag(&cov_ll)?;
-    let cov_htrows =
-        rowwise_cross_quadratic_dense_design(&input.x_time_exit, &cov_ht, &input.x_threshold)?;
-    let cov_hlrows =
-        rowwise_cross_quadratic_dense_design(&input.x_time_exit, &cov_hl, &input.x_log_sigma)?;
-    let cov_tlrows =
-        rowwise_cross_quadratic_design(&input.x_threshold, &cov_tl, &input.x_log_sigma)?;
-    let (varwrows, cov_hwrows, cov_twrows, cov_lwrows) =
-        if let Some(xw) = input.x_link_wiggle.as_ref() {
-            let covww = covariance
-                .slice(s![
-                    p_time + p_t + p_ls..p_total,
-                    p_time + p_t + p_ls..p_total
-                ])
-                .to_owned();
-            let cov_hw = covariance
-                .slice(s![0..p_time, p_time + p_t + p_ls..p_total])
-                .to_owned();
-            let cov_tw = covariance
-                .slice(s![p_time..p_time + p_t, p_time + p_t + p_ls..p_total])
-                .to_owned();
-            let cov_lw = covariance
-                .slice(s![
-                    p_time + p_t..p_time + p_t + p_ls,
-                    p_time + p_t + p_ls..p_total
-                ])
-                .to_owned();
-            (
-                Some(xw.quadratic_form_diag(&covww)?),
-                Some(rowwise_cross_quadratic_dense_design(
-                    &input.x_time_exit,
-                    &cov_hw,
-                    xw,
-                )?),
-                Some(rowwise_cross_quadratic_design(
-                    &input.x_threshold,
-                    &cov_tw,
-                    xw,
-                )?),
-                Some(rowwise_cross_quadratic_design(
-                    &input.x_log_sigma,
-                    &cov_lw,
-                    xw,
-                )?),
-            )
-        } else {
-            (None, None, None, None)
-        };
+    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+    let row_cov = rowwise_survival_latent_covariances(input, p_time, p_t, p_ls, pw, &backend)?;
 
     let mut etavar = Array1::<f64>::zeros(n);
     for i in 0..n {
         let inv_sigma = 1.0 / sigma[i].max(1e-12);
         let coeff_ls = predictors.eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
-        let mut acc = var_hrows[i]
-            + inv_sigma * inv_sigma * var_trows[i]
-            + coeff_ls * coeff_ls * var_lsrows[i]
-            + 2.0 * inv_sigma * cov_htrows[i]
-            - 2.0 * coeff_ls * cov_hlrows[i]
-            - 2.0 * inv_sigma * coeff_ls * cov_tlrows[i];
-        if let Some(varw) = varwrows.as_ref() {
+        let mut acc = row_cov.var_h[i]
+            + inv_sigma * inv_sigma * row_cov.var_t[i]
+            + coeff_ls * coeff_ls * row_cov.var_ls[i]
+            + 2.0 * inv_sigma * row_cov.cov_ht[i]
+            - 2.0 * coeff_ls * row_cov.cov_hl[i]
+            - 2.0 * inv_sigma * coeff_ls * row_cov.cov_tl[i];
+        if let Some(varw) = row_cov.var_w.as_ref() {
             acc += varw[i];
         }
-        if let Some(cov_hw) = cov_hwrows.as_ref() {
+        if let Some(cov_hw) = row_cov.cov_hw.as_ref() {
             acc -= 2.0 * cov_hw[i];
         }
-        if let Some(cov_tw) = cov_twrows.as_ref() {
+        if let Some(cov_tw) = row_cov.cov_tw.as_ref() {
             acc -= 2.0 * inv_sigma * cov_tw[i];
         }
-        if let Some(cov_lw) = cov_lwrows.as_ref() {
+        if let Some(cov_lw) = row_cov.cov_lw.as_ref() {
             acc += 2.0 * coeff_ls * cov_lw[i];
         }
         etavar[i] = acc.max(0.0);
@@ -7557,10 +7362,6 @@ pub fn predict_survival_location_scalewith_uncertainty(
 }
 
 #[inline]
-fn var_hrow(i: usize, input: &SurvivalLocationScalePredictInput, xh_hh: &Array2<f64>) -> f64 {
-    input.x_time_exit.row(i).dot(&xh_hh.row(i)).max(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

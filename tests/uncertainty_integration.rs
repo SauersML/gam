@@ -1,13 +1,13 @@
 use gam::estimate::FittedLinkState;
-use gam::mixture_link::state_fromspec;
-use gam::probability::try_inverse_link_array;
-use gam::types::LinkComponent;
 use gam::estimate::{FitOptions, fit_gam};
+use gam::mixture_link::state_fromspec;
 use gam::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     coefficient_uncertainty, predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
+use gam::probability::try_inverse_link_array;
 use gam::types::LikelihoodFamily;
+use gam::types::LinkComponent;
 use ndarray::{Array1, Array2};
 
 #[test]
@@ -154,7 +154,11 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         pred.mean_lower
             .iter()
             .zip(pred.mean_upper.iter())
-            .all(|(&l, &u): (&f64, &f64)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite()
+                && u.is_finite()
+                && l <= u
+                && l >= 0.0
+                && u <= 1.0)
     );
     assert!(pred.observation_lower.is_none());
     assert!(pred.observation_upper.is_none());
@@ -375,6 +379,10 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         pred.mean_lower
             .iter()
             .zip(pred.mean_upper.iter())
-            .all(|(&l, &u): (&f64, &f64)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite()
+                && u.is_finite()
+                && l <= u
+                && l >= 0.0
+                && u <= 1.0)
     );
 }

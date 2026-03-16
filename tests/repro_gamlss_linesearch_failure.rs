@@ -48,10 +48,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         },
         reset_fn: None::<fn(&mut i32)>,
         efs_fn: None::<
-            fn(
-                &mut i32,
-                &Array1<f64>,
-            ) -> Result<EfsEval, gam::solver::estimate::EstimationError>,
+            fn(&mut i32, &Array1<f64>) -> Result<EfsEval, gam::solver::estimate::EstimationError>,
         >,
     };
 
