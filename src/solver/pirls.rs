@@ -757,42 +757,61 @@ impl PirlsWorkspace {
         let use_parallel = num_chunks >= 4 && (n as u64) * (p as u64) >= 200_000;
 
         if use_parallel {
-            // Parallel: each rayon task owns a chunk buffer + p×p accumulator.
-            // Individual matmuls use Par::Seq since parallelism is at the chunk level.
-            let partial_sums: Vec<Array2<f64>> = (0..num_chunks)
+            // Parallel: use fold/reduce so each thread reuses one chunk buffer
+            // and one p×p accumulator. This reduces allocations from num_chunks×p²
+            // to num_threads×p² (e.g., 8 instead of 400 at biobank scale).
+            let combined = (0..num_chunks)
                 .into_par_iter()
-                .map(|ci| {
-                    let start = ci * chunkrows;
-                    let rows = (n - start).min(chunkrows);
-                    let mut chunk_buf = Array2::<f64>::zeros((rows, p).f());
-                    let x_slice = x.slice(s![start..start + rows, ..]);
-                    let w_slice = sqrtw.slice(s![start..start + rows]);
-                    Zip::from(chunk_buf.rows_mut())
-                        .and(x_slice.rows())
-                        .and(&w_slice)
-                        .for_each(|mut dst, src, &w| {
-                            Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
-                        });
-                    let mut acc = Array2::<f64>::zeros((p, p).f());
-                    let mut accview = array2_to_matmut(&mut acc);
-                    let chunk_view = chunk_buf.view();
-                    let chunkview = FaerArrayView::new(&chunk_view);
-                    matmul(
-                        accview.as_mut(),
-                        Accum::Add,
-                        chunkview.as_ref().transpose(),
-                        chunkview.as_ref(),
-                        1.0,
-                        Par::Seq,
-                    );
-                    acc
-                })
-                .collect();
-            for partial in &partial_sums {
-                Zip::from(&mut *out)
-                    .and(partial)
-                    .for_each(|o, &p_val| *o += p_val);
-            }
+                .fold(
+                    || {
+                        (
+                            Array2::<f64>::zeros((chunkrows, p).f()),
+                            Array2::<f64>::zeros((p, p).f()),
+                        )
+                    },
+                    |(mut chunk_buf, mut acc), ci| {
+                        let start = ci * chunkrows;
+                        let rows = (n - start).min(chunkrows);
+                        {
+                            let mut chunk = chunk_buf.slice_mut(s![0..rows, ..]);
+                            let x_slice = x.slice(s![start..start + rows, ..]);
+                            let w_slice = sqrtw.slice(s![start..start + rows]);
+                            Zip::from(chunk.rows_mut())
+                                .and(x_slice.rows())
+                                .and(&w_slice)
+                                .for_each(|mut dst, src, &w| {
+                                    Zip::from(&mut dst)
+                                        .and(&src)
+                                        .for_each(|d, &s| *d = s * w);
+                                });
+                        }
+                        let chunkrowsview = chunk_buf.slice(s![0..rows, ..]);
+                        let chunkview = FaerArrayView::new(&chunkrowsview);
+                        let mut accview = array2_to_matmut(&mut acc);
+                        matmul(
+                            accview.as_mut(),
+                            Accum::Add,
+                            chunkview.as_ref().transpose(),
+                            chunkview.as_ref(),
+                            1.0,
+                            Par::Seq,
+                        );
+                        (chunk_buf, acc)
+                    },
+                )
+                .reduce(
+                    || {
+                        (
+                            Array2::<f64>::zeros((0, 0)),
+                            Array2::<f64>::zeros((p, p).f()),
+                        )
+                    },
+                    |(_, mut a), (_, b)| {
+                        a += &b;
+                        (Array2::zeros((0, 0)), a)
+                    },
+                );
+            *out += &combined.1;
         } else {
             // Sequential: reuse workspace chunk buffer
             if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
