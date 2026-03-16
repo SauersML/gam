@@ -5296,6 +5296,15 @@ impl CustomFamily for GaussianLocationScaleFamily {
             w_ls.as_slice_memory_order_mut(),
         ) {
             for i in 0..n {
+                let weight_i = w_s[i];
+                // Fast path: skip expensive sigma computation for zero-weight observations.
+                if weight_i == 0.0 {
+                    wmu_s[i] = 0.0;
+                    zmu_s[i] = mu_s[i];
+                    wls_s[i] = 0.0;
+                    zls_s[i] = ls_s[i];
+                    continue;
+                }
                 let eta_ls_i = ls_s[i];
                 let SigmaJet1 {
                     sigma: raw_sigma,
@@ -5309,16 +5318,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let log_sigma_i = sigma_i.ln();
                 let r = y_s[i] - mu_s[i];
-                let weight_i = w_s[i];
                 ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * log_sigma_i));
 
-                if weight_i == 0.0 {
-                    wmu_s[i] = 0.0;
-                    zmu_s[i] = mu_s[i];
-                } else {
-                    wmu_s[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
-                    zmu_s[i] = mu_s[i] + r;
-                }
+                wmu_s[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
+                zmu_s[i] = mu_s[i] + r;
 
                 let dlogsigma_du = if d_sigma_i == 0.0 {
                     0.0
@@ -5338,6 +5341,15 @@ impl CustomFamily for GaussianLocationScaleFamily {
             }
         } else {
             for i in 0..n {
+                let weight_i = self.weights[i];
+                // Fast path: skip expensive sigma computation for zero-weight observations.
+                if weight_i == 0.0 {
+                    wmu[i] = 0.0;
+                    zmu[i] = etamu[i];
+                    w_ls[i] = 0.0;
+                    z_ls[i] = eta_log_sigma[i];
+                    continue;
+                }
                 let eta_ls_i = eta_log_sigma[i];
                 let SigmaJet1 {
                     sigma: raw_sigma,
@@ -5351,15 +5363,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
                 let log_sigma_i = sigma_i.ln();
                 let r = self.y[i] - etamu[i];
-                let weight_i = self.weights[i];
                 ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * log_sigma_i));
-                if weight_i == 0.0 {
-                    wmu[i] = 0.0;
-                    zmu[i] = etamu[i];
-                } else {
-                    wmu[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
-                    zmu[i] = etamu[i] + r;
-                }
+                wmu[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
+                zmu[i] = etamu[i] + r;
                 let dlogsigma_du = if d_sigma_i == 0.0 {
                     0.0
                 } else {
