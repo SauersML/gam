@@ -2955,7 +2955,7 @@ fn build_blockspec(
         name: name.to_string(),
         design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: Array1::from_elem(design.design.nrows(), baseline),
-        penalties: design.penalties.clone(),
+        penalties: design.global_penalties(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }

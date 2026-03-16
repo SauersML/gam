@@ -28,10 +28,10 @@ use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::normal_pdf;
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
@@ -762,9 +762,10 @@ fn identity_penalty(dim: usize) -> Array2<f64> {
 }
 
 fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
+    let p = design.design.ncols();
     design
         .penalties
-        .push(identity_penalty(design.design.ncols()));
+        .push(BlockwisePenalty::new(0..p, identity_penalty(p)));
 }
 
 // Honest warm start for the binomial location-scale model: run a short fit on
@@ -947,17 +948,16 @@ fn validate_term_collection_design(
             design.penalties.len()
         ));
     }
-    for (idx, penalty) in design.penalties.iter().enumerate() {
+    for (idx, bp) in design.penalties.iter().enumerate() {
         validate_all_finite_estimation(
             &format!("{label}.penalties[{idx}]"),
-            penalty.iter().copied(),
+            bp.local.iter().copied(),
         )
         .map_err(|e| e.to_string())?;
-        let (rows, cols) = penalty.dim();
-        if rows != p || cols != p {
+        if bp.col_range.end > p {
             return Err(format!(
-                "{label}.penalties[{idx}] must be {}x{}, got {}x{}",
-                p, p, rows, cols
+                "{label}.penalties[{idx}] col_range {}..{} exceeds design width {}",
+                bp.col_range.start, bp.col_range.end, p
             ));
         }
     }
@@ -1452,7 +1452,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut solved = run_exact_joint_spatial!()
         .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
 
-    builder.augment_result_designs(&mut solved.designs[0], &mut solved.designs[1]);
+    builder.augment_result_designs(
+        &mut solved.designs[0],
+        &mut solved.designs[1],
+    );
 
     BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit: solved.fit,
@@ -1504,7 +1507,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             name: "mu".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
         };
@@ -1520,7 +1523,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                     .min(noise_design.design.ncols()),
             )?)),
             offset: Array1::zeros(self.y.len()),
-            penalties: noise_design.penalties.clone(),
+            penalties: noise_design.global_penalties(),
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
         };
@@ -1656,7 +1659,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             name: "mu".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1672,7 +1675,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                     .min(noise_design.design.ncols()),
             )?)),
             offset: Array1::zeros(self.y.len()),
-            penalties: noise_design.penalties.clone(),
+            penalties: noise_design.global_penalties(),
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
@@ -1827,13 +1830,13 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let mut log_sigma_penalties = noise_design.penalties.clone();
+        let mut log_sigma_penalties = noise_design.global_penalties();
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1981,13 +1984,13 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let mut log_sigma_penalties = noise_design.penalties.clone();
+        let mut log_sigma_penalties = noise_design.global_penalties();
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -2353,7 +2356,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 eta_block: ParameterBlockInput {
                     design: DesignMatrix::Dense(Arc::new(pilot_design.design.clone())),
                     offset: Array1::zeros(y.len()),
-                    penalties: pilot_design.penalties.clone(),
+                    penalties: pilot_design.global_penalties(),
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
                 },
@@ -2453,7 +2456,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 name: "eta".to_string(),
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y_cloned.len()),
-                penalties: design.penalties.clone(),
+                penalties: design.global_penalties(),
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
             },
@@ -2617,7 +2620,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             eta_block: ParameterBlockInput {
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y.len()),
-                penalties: design.penalties.clone(),
+                penalties: design.global_penalties(),
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),
             },
@@ -3691,8 +3694,7 @@ pub struct GaussianLocationScaleFamily {
     /// Cached per-observation row scalars keyed by 6-element fingerprint
     /// (first, mid, last elements of both eta vectors).
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
-    cached_row_scalars:
-        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleFamily {
@@ -4376,7 +4378,8 @@ fn gaussian_joint_psi_mixedhessian_drift_fromweights(
         CustomFamilyPsiLinearMapRef::Dense(xmu),
         mixedweights.dhmu_ls_u.view(),
         x_ls_psi,
-    )? + &xt_diag_y_dense(xmu, &mixedweights.d2hmu_ls, x_ls)?;
+    )?
+        + &xt_diag_y_dense(xmu, &mixedweights.d2hmu_ls, x_ls)?;
     let a_ls = weighted_crossprod_psi_maps(
         x_ls_psi,
         mixedweights.dh_ls_ls_u.view(),
@@ -4471,15 +4474,8 @@ impl GaussianLocationScaleFamily {
         *self
             .cached_row_scalars
             .write()
-            .expect("cached_row_scalars lock poisoned") = Some((
-            key.0,
-            key.1,
-            key.2,
-            key.3,
-            key.4,
-            key.5,
-            Arc::clone(&scalars),
-        ));
+            .expect("cached_row_scalars lock poisoned") =
+            Some((key.0, key.1, key.2, key.3, key.4, key.5, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
@@ -5125,12 +5121,10 @@ impl GaussianLocationScaleFamily {
             x_ls,
         )?;
         let n = self.y.len();
-        let xmu_i_map =
-            first_psi_linear_map(dir_i.xmu_action.as_ref(), &dir_i.xmu_psi, n, xmu.ncols());
+        let xmu_i_map = first_psi_linear_map(dir_i.xmu_action.as_ref(), &dir_i.xmu_psi, n, xmu.ncols());
         let x_ls_i_map =
             first_psi_linear_map(dir_i.x_ls_action.as_ref(), &dir_i.x_ls_psi, n, x_ls.ncols());
-        let xmu_j_map =
-            first_psi_linear_map(dir_j.xmu_action.as_ref(), &dir_j.xmu_psi, n, xmu.ncols());
+        let xmu_j_map = first_psi_linear_map(dir_j.xmu_action.as_ref(), &dir_j.xmu_psi, n, xmu.ncols());
         let x_ls_j_map =
             first_psi_linear_map(dir_j.x_ls_action.as_ref(), &dir_j.x_ls_psi, n, x_ls.ncols());
         let xmu_ab_map = second_psi_linear_map(
@@ -5257,14 +5251,9 @@ impl GaussianLocationScaleFamily {
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
-        let xmu_map =
-            first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, xmu.nrows(), pmu);
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            &dir_a.x_ls_psi,
-            x_ls.nrows(),
-            p_ls,
-        );
+        let xmu_map = first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, xmu.nrows(), pmu);
+        let x_ls_map =
+            first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, x_ls.nrows(), p_ls);
         let total = pmu + p_ls;
         if d_beta_flat.len() != total {
             return Err(format!(
@@ -5976,8 +5965,7 @@ pub struct GaussianLocationScaleWiggleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
-    cached_row_scalars:
-        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleWiggleFamily {
@@ -6272,15 +6260,8 @@ impl GaussianLocationScaleWiggleFamily {
         *self
             .cached_row_scalars
             .write()
-            .expect("cached_row_scalars lock poisoned") = Some((
-            key.0,
-            key.1,
-            key.2,
-            key.3,
-            key.4,
-            key.5,
-            Arc::clone(&scalars),
-        ));
+            .expect("cached_row_scalars lock poisoned") =
+            Some((key.0, key.1, key.2, key.3, key.4, key.5, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
@@ -6841,18 +6822,9 @@ impl GaussianLocationScaleWiggleFamily {
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
-        let xmu_map = first_psi_linear_map(
-            dir_a.xmu_action.as_ref(),
-            &dir_a.xmu_psi,
-            xmu.nrows(),
-            xmu.ncols(),
-        );
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            &dir_a.x_ls_psi,
-            x_ls.nrows(),
-            x_ls.ncols(),
-        );
+        let xmu_map = first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, xmu.nrows(), xmu.ncols());
+        let x_ls_map =
+            first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, x_ls.nrows(), x_ls.ncols());
 
         let q_a = &geom.dq_dq0 * &dir_a.zmu_psi;
         let s1_a = &geom.d2q_dq02 * &dir_a.zmu_psi;
@@ -6906,7 +6878,8 @@ impl GaussianLocationScaleWiggleFamily {
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             coeff_ml.view(),
             x_ls_map,
-        )? + &xt_diag_y_dense(xmu, &coeff_ml_a, x_ls)?;
+        )?
+            + &xt_diag_y_dense(xmu, &coeff_ml_a, x_ls)?;
         let h_ll_a1 = weighted_crossprod_psi_maps(
             x_ls_map,
             coeff_ll.view(),
@@ -6917,7 +6890,8 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_map,
             a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-        )? + &xt_diag_y_dense(xmu, &a_a, &geom.basis)?
+        )?
+            + &xt_diag_y_dense(xmu, &a_a, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a, &basis_a)?
             + &weighted_crossprod_psi_maps(
                 xmu_map,
@@ -6930,7 +6904,8 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls_map,
             l.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-        )? + &xt_diag_y_dense(x_ls, &l_a, &geom.basis)?
+        )?
+            + &xt_diag_y_dense(x_ls, &l_a, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l, &basis_a)?;
         let h_ww_a1 = xt_diag_y_dense(&basis_a, &rows.w, &geom.basis)?;
         let h_ww = &h_ww_a1 + &h_ww_a1.t() + &xt_diag_x_dense(&geom.basis, &dw_a)?;
@@ -7004,12 +6979,10 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls,
         )?;
         let n = self.y.len();
-        let xmu_a_map =
-            first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, n, xmu.ncols());
+        let xmu_a_map = first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, n, xmu.ncols());
         let x_ls_a_map =
             first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, n, x_ls.ncols());
-        let xmu_b_map =
-            first_psi_linear_map(dir_b.xmu_action.as_ref(), &dir_b.xmu_psi, n, xmu.ncols());
+        let xmu_b_map = first_psi_linear_map(dir_b.xmu_action.as_ref(), &dir_b.xmu_psi, n, xmu.ncols());
         let x_ls_b_map =
             first_psi_linear_map(dir_b.x_ls_action.as_ref(), &dir_b.x_ls_psi, n, x_ls.ncols());
         let xmu_ab_map = second_psi_linear_map(
@@ -7034,16 +7007,19 @@ impl GaussianLocationScaleWiggleFamily {
 
         let q_a = &geom.dq_dq0 * &dir_a.zmu_psi;
         let q_b = &geom.dq_dq0 * &dir_b.zmu_psi;
-        let q_ab = &(&geom.dq_dq0 * &second_drifts.zmu_ab)
-            + &(&geom.d2q_dq02 * &(&dir_a.zmu_psi * &dir_b.zmu_psi));
+        let q_ab =
+            &(&geom.dq_dq0 * &second_drifts.zmu_ab)
+                + &(&geom.d2q_dq02 * &(&dir_a.zmu_psi * &dir_b.zmu_psi));
         let s1_a = &geom.d2q_dq02 * &dir_a.zmu_psi;
         let s1_b = &geom.d2q_dq02 * &dir_b.zmu_psi;
-        let s1_ab = &(&geom.d3q_dq03 * &(&dir_a.zmu_psi * &dir_b.zmu_psi))
-            + &(&geom.d2q_dq02 * &second_drifts.zmu_ab);
+        let s1_ab =
+            &(&geom.d3q_dq03 * &(&dir_a.zmu_psi * &dir_b.zmu_psi))
+                + &(&geom.d2q_dq02 * &second_drifts.zmu_ab);
         let g2_a = &geom.d3q_dq03 * &dir_a.zmu_psi;
         let g2_b = &geom.d3q_dq03 * &dir_b.zmu_psi;
-        let g2_ab = &(&geom.d4q_dq04 * &(&dir_a.zmu_psi * &dir_b.zmu_psi))
-            + &(&geom.d3q_dq03 * &second_drifts.zmu_ab);
+        let g2_ab =
+            &(&geom.d4q_dq04 * &(&dir_a.zmu_psi * &dir_b.zmu_psi))
+                + &(&geom.d3q_dq03 * &second_drifts.zmu_ab);
         let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.zmu_psi)?;
         let basis_b = scale_matrix_rows(&geom.basis_d1, &dir_b.zmu_psi)?;
         let basis_ab = scale_matrix_rows(&geom.basis_d1, &second_drifts.zmu_ab)?
@@ -7055,8 +7031,9 @@ impl GaussianLocationScaleWiggleFamily {
 
         let dw_a = -2.0 * &rows.w * &dir_a.z_ls_psi;
         let dw_b = -2.0 * &rows.w * &dir_b.z_ls_psi;
-        let dw_ab = 4.0 * &rows.w * &(&dir_a.z_ls_psi * &dir_b.z_ls_psi)
-            - &(2.0 * &rows.w * &second_drifts.z_ls_ab);
+        let dw_ab =
+            4.0 * &rows.w * &(&dir_a.z_ls_psi * &dir_b.z_ls_psi)
+                - &(2.0 * &rows.w * &second_drifts.z_ls_ab);
         let dm_a = -(&rows.w * &q_a) - &(2.0 * &rows.m * &dir_a.z_ls_psi);
         let dm_b = -(&rows.w * &q_b) - &(2.0 * &rows.m * &dir_b.z_ls_psi);
         let dm_ab = &(2.0 * &rows.w * &(&q_a * &dir_b.z_ls_psi + &q_b * &dir_a.z_ls_psi))
@@ -7237,15 +7214,18 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_a_map,
             a_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-        )? + &weighted_crossprod_psi_maps(
-            xmu_a_map,
-            a.view(),
-            CustomFamilyPsiLinearMapRef::Dense(&basis_b),
-        )? + &weighted_crossprod_psi_maps(
-            xmu_b_map,
-            a_a.view(),
-            CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-        )? + &xt_diag_y_dense(xmu, &a_ab, &geom.basis)?
+        )?
+            + &weighted_crossprod_psi_maps(
+                xmu_a_map,
+                a.view(),
+                CustomFamilyPsiLinearMapRef::Dense(&basis_b),
+            )?
+            + &weighted_crossprod_psi_maps(
+                xmu_b_map,
+                a_a.view(),
+                CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
+            )?
+            + &xt_diag_y_dense(xmu, &a_ab, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a_a, &basis_b)?
             + &weighted_crossprod_psi_maps(
                 xmu_b_map,
@@ -7291,15 +7271,18 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls_a_map,
             l_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-        )? + &weighted_crossprod_psi_maps(
-            x_ls_a_map,
-            l.view(),
-            CustomFamilyPsiLinearMapRef::Dense(&basis_b),
-        )? + &weighted_crossprod_psi_maps(
-            x_ls_b_map,
-            l_a.view(),
-            CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-        )? + &xt_diag_y_dense(x_ls, &l_ab, &geom.basis)?
+        )?
+            + &weighted_crossprod_psi_maps(
+                x_ls_a_map,
+                l.view(),
+                CustomFamilyPsiLinearMapRef::Dense(&basis_b),
+            )?
+            + &weighted_crossprod_psi_maps(
+                x_ls_b_map,
+                l_a.view(),
+                CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
+            )?
+            + &xt_diag_y_dense(x_ls, &l_ab, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_a, &basis_b)?
             + &weighted_crossprod_psi_maps(
                 x_ls_b_map,
@@ -7371,14 +7354,9 @@ impl GaussianLocationScaleWiggleFamily {
     ) -> Result<Array2<f64>, String> {
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
-        let xmu_map =
-            first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, xmu.nrows(), pmu);
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            &dir_a.x_ls_psi,
-            x_ls.nrows(),
-            p_ls,
-        );
+        let xmu_map = first_psi_linear_map(dir_a.xmu_action.as_ref(), &dir_a.xmu_psi, xmu.nrows(), pmu);
+        let x_ls_map =
+            first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, x_ls.nrows(), p_ls);
         let q0 = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -7483,7 +7461,8 @@ impl GaussianLocationScaleWiggleFamily {
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             coeff_ml_u.view(),
             x_ls_map,
-        )? + &xt_diag_y_dense(xmu, &coeff_ml_a_u, x_ls)?;
+        )?
+            + &xt_diag_y_dense(xmu, &coeff_ml_a_u, x_ls)?;
         let hll_a1 = weighted_crossprod_psi_maps(
             x_ls_map,
             coeff_ll_u.view(),
@@ -7498,7 +7477,8 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_map,
             a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&basis_u),
-        )? + &xt_diag_y_dense(xmu, &a_a_u, &geom.basis)?
+        )?
+            + &xt_diag_y_dense(xmu, &a_a_u, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a_a, &basis_u)?
             + &xt_diag_y_dense(xmu, &a_u, &basis_a)?
             + &xt_diag_y_dense(xmu, &a, &basis_a_u)?
@@ -7524,7 +7504,8 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls_map,
             l.view(),
             CustomFamilyPsiLinearMapRef::Dense(&basis_u),
-        )? + &xt_diag_y_dense(x_ls, &l_a_u, &geom.basis)?
+        )?
+            + &xt_diag_y_dense(x_ls, &l_a_u, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_a, &basis_u)?
             + &xt_diag_y_dense(x_ls, &l_u, &basis_a)?
             + &xt_diag_y_dense(x_ls, &l, &basis_a_u)?;
@@ -10846,8 +10827,10 @@ impl BinomialLocationScaleFamily {
         let total = pt + pls;
         let x_t_i_map = first_psi_linear_map(dir_i.x_t_action.as_ref(), &dir_i.x_t_psi, n, pt);
         let x_t_j_map = first_psi_linear_map(dir_j.x_t_action.as_ref(), &dir_j.x_t_psi, n, pt);
-        let x_ls_i_map = first_psi_linear_map(dir_i.x_ls_action.as_ref(), &dir_i.x_ls_psi, n, pls);
-        let x_ls_j_map = first_psi_linear_map(dir_j.x_ls_action.as_ref(), &dir_j.x_ls_psi, n, pls);
+        let x_ls_i_map =
+            first_psi_linear_map(dir_i.x_ls_action.as_ref(), &dir_i.x_ls_psi, n, pls);
+        let x_ls_j_map =
+            first_psi_linear_map(dir_j.x_ls_action.as_ref(), &dir_j.x_ls_psi, n, pls);
         let x_t_ab_map = second_psi_linear_map(
             second_drifts.x_t_ab_action.as_ref(),
             second_drifts.x_t_ab.as_ref(),
@@ -11053,7 +11036,9 @@ impl BinomialLocationScaleFamily {
             d2h_tl[row] = r
                 * (((3.0 * c + q * d) * q_j) * q_i + (2.0 * b + q * c) * q_ij
                     - (2.0 * b + q * c) * (q_j * dir_i.z_ls_psi[row] + q_i * dir_j.z_ls_psi[row])
-                    + u * (dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row] - second_drifts.z_ls_ab[row]));
+                    + u
+                        * (dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row]
+                            - second_drifts.z_ls_ab[row]));
             d2h_ll[row] = (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j
                 + (a + 3.0 * q * b + q * q * c) * q_ij;
 
@@ -11355,7 +11340,8 @@ impl BinomialLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             h_tt_u.view(),
             x_t_map,
-        )? + &xt_diag_x_dense(x_t, &dh_tt_u)?;
+        )?
+            + &xt_diag_x_dense(x_t, &dh_tt_u)?;
         let tl_block = weighted_crossprod_psi_maps(
             x_t_map,
             h_tl_u.view(),
@@ -11364,7 +11350,8 @@ impl BinomialLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             h_tl_u.view(),
             x_ls_map,
-        )? + &xt_diag_y_dense(x_t, &dh_tl_u, x_ls)?;
+        )?
+            + &xt_diag_y_dense(x_t, &dh_tl_u, x_ls)?;
         let ll_block = weighted_crossprod_psi_maps(
             x_ls_map,
             h_ll_u.view(),
@@ -11373,7 +11360,8 @@ impl BinomialLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             h_ll_u.view(),
             x_ls_map,
-        )? + &xt_diag_x_dense(x_ls, &dh_ll_u)?;
+        )?
+            + &xt_diag_x_dense(x_ls, &dh_ll_u)?;
         let mut out = Array2::<f64>::zeros((total, total));
         out.slice_mut(s![0..pt, 0..pt]).assign(&tt_block);
         out.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_block);
@@ -12974,8 +12962,10 @@ impl BinomialLocationScaleWiggleFamily {
         let total = pt + pls + pw;
         let x_t_a_map = first_psi_linear_map(dir_a.x_t_action.as_ref(), &dir_a.x_t_psi, n, pt);
         let x_t_b_map = first_psi_linear_map(dir_b.x_t_action.as_ref(), &dir_b.x_t_psi, n, pt);
-        let x_ls_a_map = first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, n, pls);
-        let x_ls_b_map = first_psi_linear_map(dir_b.x_ls_action.as_ref(), &dir_b.x_ls_psi, n, pls);
+        let x_ls_a_map =
+            first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, n, pls);
+        let x_ls_b_map =
+            first_psi_linear_map(dir_b.x_ls_action.as_ref(), &dir_b.x_ls_psi, n, pls);
         let x_t_ab_map = second_psi_linear_map(
             second_drifts.x_t_ab_action.as_ref(),
             second_drifts.x_t_ab.as_ref(),
@@ -13060,7 +13050,8 @@ impl BinomialLocationScaleWiggleFamily {
                 + r_sigma
                     * (dir_a.z_t_psi[row] * dir_b.z_ls_psi[row]
                         + dir_b.z_t_psi[row] * dir_a.z_ls_psi[row])
-                + q0 * (dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row] - second_drifts.z_ls_ab[row]);
+                + q0
+                    * (dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row] - second_drifts.z_ls_ab[row]);
 
             let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
             let q0_t_b = q0_geom.q_tl * dir_b.z_ls_psi[row];
@@ -19141,24 +19132,22 @@ mod tests {
         let n = 6usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design =
-            DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
-                let t = i as f64 / (n as f64 - 1.0);
-                match j {
-                    0 => 1.0,
-                    1 => t - 0.5,
-                    _ => unreachable!(),
-                }
-            })));
-        let log_sigma_design =
-            DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
-                let t = i as f64 / (n as f64 - 1.0);
-                match j {
-                    0 => 1.0,
-                    1 => (2.0 * std::f64::consts::PI * t).cos(),
-                    _ => unreachable!(),
-                }
-            })));
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => t - 0.5,
+                _ => unreachable!(),
+            }
+        })));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).cos(),
+                _ => unreachable!(),
+            }
+        })));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -19209,24 +19198,22 @@ mod tests {
         let n = 8usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design =
-            DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
-                let t = i as f64 / (n as f64 - 1.0);
-                match j {
-                    0 => 1.0,
-                    1 => (2.0 * std::f64::consts::PI * t).sin(),
-                    _ => unreachable!(),
-                }
-            })));
-        let log_sigma_design =
-            DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
-                let t = i as f64 / (n as f64 - 1.0);
-                match j {
-                    0 => 1.0,
-                    1 => t - 0.5,
-                    _ => unreachable!(),
-                }
-            })));
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).sin(),
+                _ => unreachable!(),
+            }
+        })));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => t - 0.5,
+                _ => unreachable!(),
+            }
+        })));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -19280,24 +19267,22 @@ mod tests {
         let n = 8usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design =
-            DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
-                let t = i as f64 / (n as f64 - 1.0);
-                match j {
-                    0 => 1.0,
-                    1 => (2.0 * std::f64::consts::PI * t).sin(),
-                    _ => unreachable!(),
-                }
-            })));
-        let log_sigma_design =
-            DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
-                let t = i as f64 / (n as f64 - 1.0);
-                match j {
-                    0 => 1.0,
-                    1 => t - 0.5,
-                    _ => unreachable!(),
-                }
-            })));
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).sin(),
+                _ => unreachable!(),
+            }
+        })));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => t - 0.5,
+                _ => unreachable!(),
+            }
+        })));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),

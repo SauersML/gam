@@ -1079,7 +1079,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             weights.view(),
             design.design.view(),
             offset.view(),
-            design.penalties.clone(),
+            design.global_penalties(),
             &ExternalOptimOptions {
                 family,
                 mixture_link: None,
@@ -3345,12 +3345,13 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
     } else {
         progress.set_stage("diagnose", "refitting model for alo");
+        let global_penalties = design.global_penalties();
         let fit = fit_gam(
             design.design.view(),
             y.view(),
             weights.view(),
             offset.view(),
-            &design.penalties,
+            &global_penalties,
             family,
             &FitOptions {
                 mixture_link: None,
@@ -5960,12 +5961,13 @@ fn run_sample_standard(
     let weights = Array1::ones(data.nrows());
     let offset = Array1::zeros(data.nrows());
     progress.set_stage("sample", "refitting mode for hmc");
+    let global_penalties = design.global_penalties();
     let fit = fit_gam(
         design.design.view(),
         y.view(),
         weights.view(),
         offset.view(),
-        &design.penalties,
+        &global_penalties,
         family,
         &FitOptions {
             mixture_link: None,
@@ -5983,7 +5985,7 @@ fn run_sample_standard(
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
     progress.advance_workflow(3);
-    let penalty = weighted_penalty_matrix(&design.penalties, fit.lambdas.view())?;
+    let penalty = weighted_penalty_matrix(&global_penalties, fit.lambdas.view())?;
 
     run_nuts_sampling_flattened_family(
         family,
@@ -6109,7 +6111,8 @@ fn run_sample_standard_link_wiggle(
     }
 
     // Base penalty: Σ λ_k S_k (p_main × p_main)
-    let penalty_base = weighted_penalty_matrix(&design.penalties, base_lambdas)?;
+    let global_penalties_base = design.global_penalties();
+    let penalty_base = weighted_penalty_matrix(&global_penalties_base, base_lambdas)?;
 
     // Wiggle penalty: rebuild constrained difference penalties for the saved
     // wiggle basis and weight them by the saved LinkWiggle lambdas.

@@ -2519,7 +2519,7 @@ fn build_survival_covariate_block_from_design(
             Ok(CovariateBlockKind::Static(CovariateBlockInput {
                 design: DesignMatrix::Dense(Arc::new(cov_design.design.clone())),
                 offset: Array1::zeros(cov_design.design.nrows()),
-                penalties: cov_design.penalties.clone(),
+                penalties: cov_design.global_penalties(),
                 initial_log_lambdas,
                 initial_beta,
             }))
@@ -2534,9 +2534,10 @@ fn build_survival_covariate_block_from_design(
             let design_covariates = DesignMatrix::Dense(Arc::new(cov_design.design.clone()));
             let i_cov = Array2::<f64>::eye(p_cov);
             let i_time = Array2::<f64>::eye(p_time);
+            let cov_global_penalties = cov_design.global_penalties();
             let mut penalties =
-                Vec::with_capacity(cov_design.penalties.len() + time_penalties.len());
-            for s_cov in &cov_design.penalties {
+                Vec::with_capacity(cov_global_penalties.len() + time_penalties.len());
+            for s_cov in &cov_global_penalties {
                 penalties.push(kronecker_product(s_cov, &i_time));
             }
             for s_time in time_penalties {
