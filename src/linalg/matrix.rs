@@ -1391,10 +1391,12 @@ fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Ar
         return;
     }
 
-    // Target ~2MB working set per chunk
-    const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    // Target ~8MB working set per chunk (matches faer_ndarray streaming path).
+    // Previous 2MB / MAX_ROWS=2048 was 64x smaller than needed and caused
+    // excessive loop overhead on large n.
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
-    const MAX_ROWS: usize = 2048;
+    const MAX_ROWS: usize = 131_072;
     let chunk_rows = (TARGET_BYTES / (p * 8)).max(MIN_ROWS).min(MAX_ROWS).min(n);
 
     let par = faer::get_global_parallelism();
