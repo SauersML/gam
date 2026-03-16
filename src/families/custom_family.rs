@@ -6050,11 +6050,11 @@ pub fn fit_custom_family<F: CustomFamily>(
         },
         cap: primary_cap,
         cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
-            let warm_ref = if has_exact_hess {
-                None
-            } else {
-                outer.warm_cache.as_ref()
-            };
+            // Always use warm cache when available — the previous inner solution
+            // gives a much better starting point. This was previously disabled for
+            // exact-Hessian families, forcing every inner solve to start from
+            // scratch (5-10 Newton steps instead of 1-2 with warm start).
+            let warm_ref = outer.warm_cache.as_ref();
             match outerobjectivegradienthessian(
                 family,
                 specs,
@@ -6072,14 +6072,9 @@ pub fn fit_custom_family<F: CustomFamily>(
             }
         },
         eval_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
-            // Use a reference to the warm cache instead of cloning it.
-            // The clone was O(Σp_i) per outer evaluation — unnecessary since
-            // we only need read access for the proximity check.
-            let warm_ref = if has_exact_hess {
-                None
-            } else {
-                outer.warm_cache.as_ref()
-            };
+            // Always use warm cache — previous inner solution is an excellent
+            // starting point, especially when rho hasn't moved far.
+            let warm_ref = outer.warm_cache.as_ref();
             let (cost, grad, hess_opt) = match outerobjectivegradienthessian(
                 family,
                 specs,
