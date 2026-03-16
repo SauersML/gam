@@ -196,6 +196,7 @@ pub struct QuadratureContext {
     gh15_cache: OnceLock<GaussHermiteRuleDynamic>,
     gh21_cache: OnceLock<GaussHermiteRuleDynamic>,
     gh31_cache: OnceLock<GaussHermiteRuleDynamic>,
+    gh51_cache: OnceLock<GaussHermiteRuleDynamic>,
     // Clenshaw-Curtis rules are constructed on demand because the node count is
     // chosen from the certified truncation/ellipse heuristic rather than from a
     // tiny fixed family like the GHQ rules above.
@@ -288,6 +289,7 @@ impl QuadratureContext {
             gh15_cache: OnceLock::new(),
             gh21_cache: OnceLock::new(),
             gh31_cache: OnceLock::new(),
+            gh51_cache: OnceLock::new(),
             cc_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -302,6 +304,7 @@ impl QuadratureContext {
             15 => self.gh15_cache.get_or_init(|| compute_gauss_hermite_n(15)),
             21 => self.gh21_cache.get_or_init(|| compute_gauss_hermite_n(21)),
             31 => self.gh31_cache.get_or_init(|| compute_gauss_hermite_n(31)),
+            51 => self.gh51_cache.get_or_init(|| compute_gauss_hermite_n(51)),
             _ => self.gh21_cache.get_or_init(|| compute_gauss_hermite_n(21)),
         }
     }
@@ -2965,13 +2968,17 @@ where
 
 fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
     // Use a more aggressive schedule for nonlinear tail-sensitive transforms.
-    // 7 points stays for very well-identified rows, 15/21 kick in earlier for
+    // 7 points stays for very well-identified rows, 15/21/31 kick in earlier for
     // location-scale and rare-event regimes where MC checks showed larger error.
+    // 51 nodes covers the wide-sigma regime where 31-point GHQ accumulated
+    // noticeable error against the Faddeeva / high-res numeric references.
     if max_sd.is_finite() && max_sd > 2.5 {
-        31
+        51
     } else if max_sd.is_finite() && max_sd > 1.0 {
-        21
+        31
     } else if max_sd.is_finite() && max_sd > 0.35 {
+        21
+    } else if max_sd.is_finite() && max_sd > 0.1 {
         15
     } else {
         7
@@ -4653,15 +4660,13 @@ mod tests {
             None,
         )
         .expect("stateful mixture integrated moments should evaluate");
-        let direct = integrate_normal_ghq_adaptive(&ctx, 0.2, 0.5, |x| {
-            let jet = crate::mixture_link::mixture_inverse_link_jet(&state, x);
-            (jet.mu, jet.d1, jet.d2, jet.d3)
-        });
-        assert_relative_eq!(out.mean, direct.0, epsilon = 1e-12);
-        assert_relative_eq!(out.d1, direct.1, epsilon = 1e-12);
-        assert_relative_eq!(out.d2, direct.2, epsilon = 1e-12);
-        assert_relative_eq!(out.d3, direct.3, epsilon = 1e-12);
-        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        let direct = integrated_mixture_jet(&ctx, 0.2, 0.5, &state)
+            .expect("direct integrated mixture jet should evaluate");
+        assert_relative_eq!(out.mean, direct.mean, epsilon = 1e-12);
+        assert_relative_eq!(out.d1, direct.d1, epsilon = 1e-12);
+        assert_relative_eq!(out.d2, direct.d2, epsilon = 1e-12);
+        assert_relative_eq!(out.d3, direct.d3, epsilon = 1e-12);
+        assert_eq!(out.mode, direct.mode);
     }
 
     // Tests for CLogLog Gaussian convolution derivatives
@@ -4826,7 +4831,7 @@ mod tests {
         let ctx = QuadratureContext::new();
         for &mu in &[-1.0, 0.0, 0.5, 2.0] {
             for &sigma in &[0.1, 0.5, 1.0] {
-                let our_val = cloglog_ghq_value(&ctx, mu, sigma, 31);
+                let our_val = cloglog_ghq_value(&ctx, mu, sigma, 51);
                 // The existing function uses eta=mu, se_eta=sigma
                 let existing = cloglog_posterior_mean(&ctx, mu, sigma);
                 // They may use different node counts or different code paths

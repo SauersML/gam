@@ -1307,8 +1307,10 @@ pub fn stable_reparameterization_engine(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     dims: EngineDims,
+    penalty_shrinkage_floor: Option<f64>,
 ) -> Result<ReparamResult, EstimationError> {
-    stable_reparameterization(rs_list, lambdas, dims.p)
+    let invariant = precompute_reparam_invariant(rs_list, dims.p)?;
+    stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, &invariant, penalty_shrinkage_floor)
 }
 
 /// Engine-facing stable reparameterization API with precomputed invariant using only `(p, k)`.
