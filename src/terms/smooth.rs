@@ -563,15 +563,6 @@ pub(crate) struct SpatialLogKappaCoords {
 }
 
 impl SpatialLogKappaCoords {
-    /// Backward-compatible constructor: assumes 1 ψ value per term (all isotropic).
-    pub(crate) fn new(values: Array1<f64>) -> Self {
-        let n = values.len();
-        Self {
-            values,
-            dims_per_term: vec![1; n],
-        }
-    }
-
     /// Construct from an explicit dims layout plus values.
     pub(crate) fn new_with_dims(values: Array1<f64>, dims_per_term: Vec<usize>) -> Self {
         debug_assert_eq!(
@@ -728,16 +719,6 @@ impl SpatialLogKappaCoords {
         self.values.len()
     }
 
-    /// Total number of ψ values (sum of dims_per_term). Alias for `len()`.
-    fn total_dim(&self) -> usize {
-        self.values.len()
-    }
-
-    /// Number of logical terms.
-    fn num_terms(&self) -> usize {
-        self.dims_per_term.len()
-    }
-
     /// Dimensionality layout: how many ψ values each term contributes.
     pub(crate) fn dims_per_term(&self) -> &[usize] {
         &self.dims_per_term
@@ -773,10 +754,6 @@ impl SpatialLogKappaCoords {
                 dims_per_term: self.dims_per_term[mid..].to_vec(),
             },
         )
-    }
-
-    fn to_log_length_scales(&self) -> Array1<f64> {
-        self.values.mapv(|v| -v)
     }
 
     /// Apply optimized ψ values back to the spec.
@@ -3293,38 +3270,6 @@ impl CharbonnierScalarBlockState {
         self.radius.mapv(|r| eps3 / (r * r * r))
     }
 
-    fn epsilongradient_terms(&self) -> Array1<f64> {
-        // Root-cause fix: the exact adaptive production model uses the scaled
-        // Charbonnier / pseudo-Huber block
-        //
-        //   psi(t; eps) = eps * (sqrt(t^2 + eps^2) - eps),
-        //
-        // not the raw Charbonnier block sqrt(t^2 + eps^2) - eps.
-        //
-        // The raw form makes lambda and eps nearly confounded:
-        //
-        //   lambda * (sqrt(t^2 + eps^2) - eps)
-        //   = (lambda / (2 eps)) t^2 + O(t^4),
-        //
-        // so the outer optimizer can move along flat valleys by shrinking
-        // lambda toward zero while inflating eps. That is exactly the
-        // pathological adaptive behavior seen in the 2D production traces.
-        //
-        // The scaled pseudo-Huber form removes that local scale confounding:
-        //
-        //   psi(t; eps) = 0.5 t^2 + O(t^4 / eps^2)
-        //
-        // near t = 0, so lambda controls local quadratic shrinkage while eps
-        // controls where the penalty transitions toward the linear tail.
-        //
-        // This method returns d/deps psi(t; eps), not d/deta.
-        //
-        //   d/deps [eps * (sqrt(t^2 + eps^2) - eps)]
-        //   = sqrt(t^2 + eps^2) + eps^2 / sqrt(t^2 + eps^2) - 2 eps.
-        self.radius
-            .mapv(|r| r + (self.epsilon * self.epsilon) / r - 2.0 * self.epsilon)
-    }
-
     fn log_epsilon_gradient_terms(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         let eps2 = epsilon * epsilon;
@@ -3335,23 +3280,6 @@ impl CharbonnierScalarBlockState {
         self.radius.mapv(|r| epsilon * r + eps3 / r - 2.0 * eps2)
     }
 
-    fn beta_epsilon_mixed_coeff(&self) -> Array1<f64> {
-        // Mixed derivative with respect to beta and the raw epsilon coordinate:
-        //
-        //   d/dt psi(t; eps)        = eps * t / s
-        //   d/(dt deps) psi(t; eps) = t / s - eps^2 t / s^3
-        //                           = t^3 / s^3,
-        //   s = sqrt(t^2 + eps^2).
-        //
-        // For log-epsilon eta = log eps, multiply this coefficient by eps.
-        Array1::from_iter(
-            self.signal
-                .iter()
-                .zip(self.radius.iter())
-                .map(|(t, r)| (t * t * t) / (r * r * r)),
-        )
-    }
-
     fn log_epsilon_betagradient_coeff(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         Array1::from_iter(
@@ -3360,12 +3288,6 @@ impl CharbonnierScalarBlockState {
                 .zip(self.radius.iter())
                 .map(|(t, r)| epsilon * t.powi(3) / r.powi(3)),
         )
-    }
-
-    fn epsilonhessian_terms(&self) -> Array1<f64> {
-        Array1::from_iter(self.signal.iter().zip(self.radius.iter()).map(|(t, r)| {
-            (3.0 * self.epsilon * t * t + 2.0 * self.epsilon.powi(3)) / (r * r * r) - 2.0
-        }))
     }
 
     fn log_epsilon_hessian_terms(&self) -> Array1<f64> {
@@ -3562,38 +3484,11 @@ impl CharbonnierGroupedBlockState {
         out
     }
 
-    fn epsilongradient_terms(&self) -> Array1<f64> {
-        // Raw-epsilon derivative for one grouped scaled-Charbonnier block:
-        //
-        //   psi(g; eps) = eps * (sqrt(g^2 + eps^2) - eps),
-        //   d/deps psi   = sqrt(g^2 + eps^2) + eps^2 / sqrt(g^2 + eps^2) - 2 eps,
-        //
-        // with g = ||v||_2. For eta = log eps, multiply this by eps.
-        self.radius
-            .mapv(|r| r + (self.epsilon * self.epsilon) / r - 2.0 * self.epsilon)
-    }
-
     fn log_epsilon_gradient_terms(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         let eps2 = epsilon * epsilon;
         let eps3 = eps2 * epsilon;
         self.radius.mapv(|r| epsilon * r + eps3 / r - 2.0 * eps2)
-    }
-
-    fn beta_epsilon_mixed_blocks(&self) -> Array2<f64> {
-        // Raw-epsilon mixed block:
-        //
-        //   d/d beta psi(||v||; eps) = G^T (eps * v / s),
-        //   d/(d beta deps) psi      = G^T (((||v||^2) / s^3) v),
-        //   s = sqrt(||v||^2 + eps^2).
-        //
-        // For log-epsilon eta = log eps, multiply the inner vector by eps.
-        let mut out = self.signal_blocks.clone();
-        for (k, mut row) in out.rows_mut().into_iter().enumerate() {
-            let scale = (self.norm[k] * self.norm[k]) / self.radius[k].powi(3);
-            row.mapv_inplace(|v| v * scale);
-        }
-        out
     }
 
     fn log_epsilon_betagradient_blocks(&self) -> Array2<f64> {
@@ -3604,12 +3499,6 @@ impl CharbonnierGroupedBlockState {
             row.mapv_inplace(|v| v * scale);
         }
         out
-    }
-
-    fn epsilonhessian_terms(&self) -> Array1<f64> {
-        Array1::from_iter(self.norm.iter().zip(self.radius.iter()).map(|(g, r)| {
-            (3.0 * self.epsilon * g * g + 2.0 * self.epsilon.powi(3)) / (r * r * r) - 2.0
-        }))
     }
 
     fn log_epsilon_hessian_terms(&self) -> Array1<f64> {
@@ -4586,7 +4475,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use crate::solver::strategy::{
+    use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
     };
 
@@ -4774,11 +4663,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             fn(
                 &mut SpatialAdaptiveOuterState,
                 &Array1<f64>,
-            ) -> Result<crate::solver::strategy::EfsEval, EstimationError>,
+            ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
     };
 
-    let outer_result = crate::solver::strategy::run_outer(
+    let outer_result = crate::solver::outer_strategy::run_outer(
         &mut obj,
         &outer_config,
         "exact spatial adaptive regularization",
@@ -6439,6 +6328,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
             objective_psi: direct,
             score_psi: beta_mixed,
             hessian_psi: betahessian_explicit,
+            hessian_psi_operator: None,
         }))
     }
 
@@ -8132,7 +8022,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::strategy::{
+    use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
         OuterEval,
     };
@@ -8334,16 +8224,13 @@ fn try_exact_joint_spatial_aniso_optimization(
         >,
     };
 
-    let result = crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "aniso-psi joint REML",
-    )
-    .map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-        ))
-    })?;
+    let result =
+        crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "aniso-psi joint REML")
+            .map_err(|e| {
+            EstimationError::InvalidInput(format!(
+                "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+            ))
+        })?;
     log::trace!(
         "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
         result.iterations,
@@ -8433,56 +8320,6 @@ fn enforce_psi_sum_to_zero(
         }
         offset += d;
     }
-}
-
-/// Helmert contrast matrix: an orthonormal basis for the subspace 1⊥ ⊂ ℝ^D.
-///
-/// Returns a D×(D−1) matrix C satisfying:
-///   C^T C = I_{D−1}   (columns are orthonormal)
-///   C^T 1 = 0          (columns are orthogonal to the all-ones vector)
-///
-/// The standard normalized Helmert contrast construction:
-///
-///   C[i, j] = -1/√((j+1)(j+2))           if i <= j
-///   C[j+1, j] = (j+1)/√((j+1)(j+2))     if i = j+1
-///   C[i, j] = 0                            if i > j+1
-///
-/// for j = 0, ..., D−2 (column index), i = 0, ..., D−1 (row index).
-///
-/// This is the standard construction used for reparameterizing constrained
-/// parameters. Writing ψ = C ψ̃ automatically enforces Σψ_d = 0, and the
-/// reduced derivatives are (response.md §4d):
-///
-///   g̃ = C^T g_ψ       (projected gradient in reduced coordinates)
-///   H̃ = C^T H_ψψ C    (projected Hessian in reduced coordinates)
-///
-/// Properties (easily verified):
-///   C^T 1 = 0: column j sums to (j+1)·(-1/norm) + (j+1)/norm = 0.
-///   ||col_j||^2 = (j+1)/norm^2 + (j+1)^2/norm^2
-///     = ((j+1) + (j+1)^2)/((j+1)(j+2)) = (j+1)(j+2)/((j+1)(j+2)) = 1.
-///   C^T C = I_{D-1} (orthonormality follows from the Helmert structure).
-///
-/// # Panics
-///
-/// Panics if `d < 2` (the constraint is trivial or impossible for d < 2).
-pub(crate) fn helmert_contrast_matrix(d: usize) -> Array2<f64> {
-    assert!(d >= 2, "helmert_contrast_matrix requires d >= 2, got d={d}");
-    let mut c = Array2::<f64>::zeros((d, d - 1));
-    for j in 0..(d - 1) {
-        let jp1 = (j + 1) as f64;
-        let jp2 = (j + 2) as f64;
-        let norm = (jp1 * jp2).sqrt();
-        // Rows i = 0, ..., j: C[i, j] = -1/norm
-        for i in 0..=j {
-            c[[i, j]] = -1.0 / norm;
-        }
-        // Row i = j+1: C[j+1, j] = (j+1)/norm
-        if j + 1 < d {
-            c[[j + 1, j]] = jp1 / norm;
-        }
-        // Rows i > j+1: already zero.
-    }
-    c
 }
 
 /// Project the ψ-block gradient onto the tangent space of the sum-to-zero
@@ -8664,7 +8501,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::strategy::{
+    use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
         OuterEval,
     };
@@ -8853,16 +8690,13 @@ fn try_exact_joint_spatial_isotropic_optimization(
         >,
     };
 
-    let result = crate::solver::strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "iso-kappa joint REML",
-    )
-    .map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-        ))
-    })?;
+    let result =
+        crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "iso-kappa joint REML")
+            .map_err(|e| {
+            EstimationError::InvalidInput(format!(
+                "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+            ))
+        })?;
     log::trace!(
         "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
         result.iterations,
@@ -9132,7 +8966,7 @@ where
         format!("failed to freeze noise spatial basis centers during exact joint κ bootstrap: {e}")
     })?;
 
-    use crate::solver::strategy::{
+    use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
         OuterEval,
     };
@@ -9316,7 +9150,7 @@ where
         >,
     };
 
-    let result = crate::solver::strategy::run_outer(
+    let result = crate::solver::outer_strategy::run_outer(
         &mut obj,
         &outer_config,
         "two-block exact-joint spatial",
@@ -11905,6 +11739,9 @@ mod tests {
             x_psi_psi: None,
             s_psi_psi: None,
             s_psi_psi_components: None,
+            implicit_operator: None,
+            implicit_axis: 0,
+            implicit_group_id: None,
         };
         let state = vec![ParameterBlockState {
             beta: array![0.0, 0.0],
@@ -12308,6 +12145,9 @@ mod tests {
                     x_psi_psi: None,
                     s_psi_psi: None,
                     s_psi_psi_components: None,
+                    implicit_operator: None,
+                    implicit_axis: 0,
+                    implicit_group_id: None,
                 })
                 .collect::<Vec<_>>(),
         ];
@@ -12496,6 +12336,9 @@ mod tests {
                     x_psi_psi: None,
                     s_psi_psi: None,
                     s_psi_psi_components: None,
+                    implicit_operator: None,
+                    implicit_axis: 0,
+                    implicit_group_id: None,
                 })
                 .collect::<Vec<_>>(),
         ];
@@ -12724,9 +12567,9 @@ mod tests {
             array![f64::NEG_INFINITY, 0.25, f64::INFINITY],
             array![-12.0, -12.0, -12.0],
             array![12.0, 12.0, 12.0],
-            SpatialLogKappaCoords::new(array![0.5]),
-            SpatialLogKappaCoords::new(array![-2.0]),
-            SpatialLogKappaCoords::new(array![2.0]),
+            SpatialLogKappaCoords::new_with_dims(array![0.5], vec![1]),
+            SpatialLogKappaCoords::new_with_dims(array![-2.0], vec![1]),
+            SpatialLogKappaCoords::new_with_dims(array![2.0], vec![1]),
         );
 
         let theta0 = setup.theta0();
@@ -13006,31 +12849,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_charbonnier_epsilon_derivatives_match_finite_difference() {
-        let signal = array![0.4, -0.9];
-        let epsilon = 0.35;
-        let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
-        let h = 1e-5;
-        let value = |eps: f64| {
-            CharbonnierScalarBlockState::from_signal(signal.clone(), eps).penalty_value()
-        };
-        let gradfd = (value(epsilon + h) - value(epsilon - h)) / (2.0 * h);
-        let hessfd = (value(epsilon + h) - 2.0 * value(epsilon) + value(epsilon - h)) / (h * h);
-        assert!((state.epsilongradient_terms().sum() - gradfd).abs() < 1e-6);
-        assert!((state.epsilonhessian_terms().sum() - hessfd).abs() < 1e-4);
-
-        let mixed = state.beta_epsilon_mixed_coeff();
-        for i in 0..signal.len() {
-            let eval_grad = |eps: f64| {
-                CharbonnierScalarBlockState::from_signal(signal.clone(), eps).betagradient_coeff()
-                    [i]
-            };
-            let mixedfd = (eval_grad(epsilon + h) - eval_grad(epsilon - h)) / (2.0 * h);
-            assert!((mixed[i] - mixedfd).abs() < 1e-6);
-        }
-    }
-
-    #[test]
     fn scalar_charbonnier_log_epsilon_derivatives_match_finite_difference() {
         let signal = array![0.4, -0.9];
         let epsilon = 0.35_f64;
@@ -13121,51 +12939,6 @@ mod tests {
         let fd = (&evalhess(h) - &evalhess(-h)) / (2.0 * h);
         for i in 0..signal.len() {
             assert!((analytic[i] - fd[i]).abs() < 1e-4);
-        }
-    }
-
-    #[test]
-    fn grouped_charbonnierhessian_and_epsilon_derivatives_match_finite_difference() {
-        let blocks = array![[0.7, -0.2], [0.1, 0.8]];
-        let epsilon = 0.3;
-        let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
-        let h = 1e-5;
-        let hess_blocks = state.betahessian_blocks();
-        for k in 0..blocks.nrows() {
-            for axis in 0..blocks.ncols() {
-                let eval_grad = |step: f64| {
-                    let mut shifted = blocks.clone();
-                    shifted[[k, axis]] += step;
-                    CharbonnierGroupedBlockState::from_signal_blocks(shifted, epsilon)
-                        .betagradient_blocks()
-                        .row(k)
-                        .to_owned()
-                };
-                let gradfd = (&eval_grad(h) - &eval_grad(-h)) / (2.0 * h);
-                for j in 0..blocks.ncols() {
-                    assert!((hess_blocks[k][[j, axis]] - gradfd[j]).abs() < 1e-5);
-                }
-            }
-        }
-
-        let value = |eps: f64| {
-            CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eps).penalty_value()
-        };
-        let gradfd = (value(epsilon + h) - value(epsilon - h)) / (2.0 * h);
-        let hessfd = (value(epsilon + h) - 2.0 * value(epsilon) + value(epsilon - h)) / (h * h);
-        assert!((state.epsilongradient_terms().sum() - gradfd).abs() < 1e-6);
-        assert!((state.epsilonhessian_terms().sum() - hessfd).abs() < 1e-4);
-
-        let mixed_blocks = state.beta_epsilon_mixed_blocks();
-        for k in 0..blocks.nrows() {
-            for axis in 0..blocks.ncols() {
-                let eval_grad = |eps: f64| {
-                    CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eps)
-                        .betagradient_blocks()[[k, axis]]
-                };
-                let mixedfd = (eval_grad(epsilon + h) - eval_grad(epsilon - h)) / (2.0 * h);
-                assert!((mixed_blocks[[k, axis]] - mixedfd).abs() < 1e-6);
-            }
         }
     }
 
@@ -13353,33 +13126,6 @@ mod tests {
                 "large-epsilon grouped curvature should equal identity"
             );
         }
-    }
-
-    #[test]
-    fn scalar_charbonnierzero_signal_haszero_epsilongradient() {
-        let state = CharbonnierScalarBlockState::from_signal(array![0.0, 0.0, 0.0], 0.37);
-        assert!(
-            state.epsilongradient_terms().mapv(f64::abs).sum() < 1e-12,
-            "scaled Charbonnier should have zero epsilon gradient at zero signal"
-        );
-        assert!(
-            state.beta_epsilon_mixed_coeff().mapv(f64::abs).sum() < 1e-12,
-            "scaled Charbonnier should have zero beta/epsilon mixed derivative at zero signal"
-        );
-    }
-
-    #[test]
-    fn grouped_charbonnierzero_signal_haszero_epsilongradient() {
-        let state =
-            CharbonnierGroupedBlockState::from_signal_blocks(array![[0.0, 0.0], [0.0, 0.0]], 0.37);
-        assert!(
-            state.epsilongradient_terms().mapv(f64::abs).sum() < 1e-12,
-            "scaled grouped Charbonnier should have zero epsilon gradient at zero signal"
-        );
-        assert!(
-            state.beta_epsilon_mixed_blocks().mapv(f64::abs).sum() < 1e-12,
-            "scaled grouped Charbonnier should have zero beta/epsilon mixed derivative at zero signal"
-        );
     }
 
     #[test]

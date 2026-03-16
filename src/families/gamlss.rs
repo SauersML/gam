@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
@@ -7,8 +8,10 @@ use crate::basis::{
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper,
-    fit_custom_family, resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
+    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
+    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, FamilyEvaluation,
+    ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
+    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -24,7 +27,7 @@ use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, SymmetricMatrix, xt_diag_x_symmetric,
 };
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
-use crate::probability::{normal_cdf, normal_pdf};
+use crate::probability::normal_pdf;
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
@@ -38,9 +41,6 @@ use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
-const BETA_RANGE_WARN_THRESHOLD: f64 = 1.10;
-const BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD: f64 = 25.0;
-const BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT: f64 = 0.0;
 
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
@@ -128,10 +128,6 @@ impl GamlssLambdaLayout {
 
     fn wiggle_end(self) -> usize {
         self.k_mean + self.k_noise + self.kwiggle
-    }
-
-    fn haswiggle(self) -> bool {
-        self.kwiggle > 0
     }
 
     fn validate_theta_len(self, theta_len: usize, context: &str) -> Result<(), String> {
@@ -705,32 +701,6 @@ fn build_two_block_exact_joint_setup(
     )
 }
 
-fn solveweighted_projection(
-    design: &DesignMatrix,
-    offset: &Array1<f64>,
-    target_eta: &Array1<f64>,
-    weights: &Array1<f64>,
-    ridge_floor: f64,
-) -> Result<Array1<f64>, String> {
-    let n = design.nrows();
-    let p = design.ncols();
-    if offset.len() != n || target_eta.len() != n || weights.len() != n {
-        return Err("solveweighted_projection dimension mismatch".to_string());
-    }
-
-    let y_star = target_eta - offset;
-    let xtwy = design.compute_xtwy(weights, &y_star)?;
-    let ridge = ridge_floor.max(1e-12);
-    let penalty = Array2::from_diag(&Array1::from_elem(p, ridge));
-    let beta = design
-        .solve_system(weights, &xtwy, Some(&penalty))
-        .map_err(|_| "solveweighted_projection produced non-finite coefficients".to_string())?;
-    if beta.iter().any(|v| !v.is_finite()) {
-        return Err("solveweighted_projection produced non-finite coefficients".to_string());
-    }
-    Ok(beta)
-}
-
 fn solve_penalizedweighted_projection(
     design: &DesignMatrix,
     offset: &Array1<f64>,
@@ -840,15 +810,6 @@ fn gaussian_location_scalewarm_start(
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
 
-fn weighted_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
-    let w_sum: f64 = weights.iter().copied().sum();
-    if w_sum <= 0.0 {
-        return 0.5;
-    }
-    let yw_sum: f64 = y.iter().zip(weights.iter()).map(|(&yi, &wi)| yi * wi).sum();
-    (yw_sum / w_sum).clamp(0.0, 1.0)
-}
-
 fn prepared_scale_design(
     primary_design: &Array2<f64>,
     noise_design: &Array2<f64>,
@@ -897,270 +858,10 @@ fn identity_penalty(dim: usize) -> Array2<f64> {
     penalty
 }
 
-fn append_log_lambdavalue(log_lambdas: &Array1<f64>, value: f64) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(log_lambdas.len() + 1);
-    if !log_lambdas.is_empty() {
-        out.slice_mut(s![0..log_lambdas.len()]).assign(log_lambdas);
-    }
-    out[log_lambdas.len()] = value;
-    out
-}
-
-fn append_binomial_log_sigma_shrinkage_penalty_input(block: &mut ParameterBlockInput) {
-    let p = block.design.ncols();
-    block.penalties.push(identity_penalty(p));
-    block.initial_log_lambdas = Some(match block.initial_log_lambdas.take() {
-        Some(log_lambdas) => {
-            append_log_lambdavalue(&log_lambdas, BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT)
-        }
-        None => Array1::from_vec(vec![BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT]),
-    });
-}
-
 fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
     design
         .penalties
         .push(identity_penalty(design.design.ncols()));
-}
-
-fn emit_binomial_alpha_betawarnings(
-    context: &str,
-    betavalues: &Array1<f64>,
-    y: &Array1<f64>,
-    weights: &Array1<f64>,
-) {
-    if betavalues.is_empty() {
-        return;
-    }
-    let beta_min = betavalues.iter().copied().fold(f64::INFINITY, f64::min);
-    let beta_max = betavalues.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-
-    if !beta_min.is_finite() || !beta_max.is_finite() || beta_min <= 0.0 {
-        log::warn!(
-            "[GAMLSS][{}] non-positive or non-finite beta encountered (min={}, max={})",
-            context,
-            beta_min,
-            beta_max
-        );
-    } else {
-        let ratio = beta_max / beta_min;
-        if ratio > BETA_RANGE_WARN_THRESHOLD {
-            log::warn!(
-                "[GAMLSS][{}] beta range ratio {:.3} exceeds {:.3}; transformed-penalty distortion risk is elevated",
-                context,
-                ratio,
-                BETA_RANGE_WARN_THRESHOLD
-            );
-        }
-    }
-
-    let pi = weighted_prevalence(y, weights);
-    let w_sum: f64 = weights.iter().copied().sum();
-    let n_eff = w_sum * pi * (1.0 - pi);
-    if n_eff < BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD {
-        log::warn!(
-            "[GAMLSS][{}] low effective sample size N_eff={:.3} (sumw={:.3}, prevalence={:.3}); location-scale separation artifacts are more likely",
-            context,
-            n_eff,
-            w_sum,
-            pi
-        );
-    }
-}
-
-#[derive(Clone)]
-struct BinomialAlphaBetaWarmStartFamily {
-    y: Array1<f64>,
-    weights: Array1<f64>,
-}
-
-impl BinomialAlphaBetaWarmStartFamily {
-    const BLOCK_ALPHA: usize = 0;
-    const BLOCK_BETA: usize = 1;
-}
-
-impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
-    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
-        true
-    }
-
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 2 {
-            return Err(format!(
-                "BinomialAlphaBetaWarmStartFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_alpha = &block_states[Self::BLOCK_ALPHA].eta;
-        let eta_beta = &block_states[Self::BLOCK_BETA].eta;
-        if eta_alpha.len() != n || eta_beta.len() != n || self.weights.len() != n {
-            return Err("BinomialAlphaBetaWarmStartFamily input size mismatch".to_string());
-        }
-
-        let mut z_alpha = Array1::<f64>::zeros(n);
-        let mut w_alpha = Array1::<f64>::zeros(n);
-        let mut z_beta = Array1::<f64>::zeros(n);
-        let mut w_beta = Array1::<f64>::zeros(n);
-        let mut ll = 0.0_f64;
-
-        for i in 0..n {
-            let q = eta_alpha[i];
-            // Mathematical status of this warm-start family:
-            //
-            //   ell_i(alpha_i, beta_i)
-            //   = w_i [ y_i log Phi(q_i) + (1-y_i) log(1-Phi(q_i)) ],
-            //   q_i = eta_alpha,i.
-            //
-            // As coded, q_i does not depend on eta_beta,i at all. Therefore the
-            // literal per-row objective satisfies
-            //
-            //   d ell_i / d eta_beta,i    = 0,
-            //   d²ell_i / d eta_beta,i²   = 0,
-            //   d²ell_i / d eta_alpha,i d eta_beta,i = 0.
-            //
-            // Earlier versions fabricated a beta working derivative by pushing a
-            // bounded-beta chain rule through an alpha-only likelihood. That was
-            // mathematically false. The current implementation keeps the beta
-            // block neutral:
-            //
-            //   w_beta,i = 0,
-            //   z_beta,i = eta_beta,i,
-            //
-            // so the warm-start IRLS step is an honest derivative of the coded
-            // objective. If this family is ever meant to inform beta, the model
-            // itself must change so q_i or ell_i actually depends on beta.
-            let mu = normal_cdf(q);
-            let dmu_dq = normal_pdf(q).max(MIN_DERIV);
-            let var = (mu * (1.0 - mu)).max(MIN_PROB);
-
-            ll += self.weights[i] * (self.y[i] * mu.ln() + (1.0 - self.y[i]) * (1.0 - mu).ln());
-
-            // Clamp-consistent derivative:
-            //
-            //   mu_bar(q) = clamp(Phi(q), eps, 1-eps).
-            //
-            // On an active clamp branch mu_bar is locally constant, so the
-            // exact derivative of the reported log-likelihood is zero. In that
-            // region the IRLS surrogate must also be locally flat:
-            //
-            //   w_alpha,i = 0,
-            //   z_alpha,i = eta_alpha,i.
-            let dmu_alpha = dmu_dq;
-            if dmu_alpha == 0.0 {
-                w_alpha[i] = 0.0;
-                z_alpha[i] = eta_alpha[i];
-            } else {
-                w_alpha[i] = floor_positiveweight(
-                    self.weights[i] * (dmu_alpha * dmu_alpha / var),
-                    MIN_WEIGHT,
-                );
-                z_alpha[i] =
-                    eta_alpha[i] + (self.y[i] - mu) / signedwith_floor(dmu_alpha, MIN_DERIV);
-            }
-
-            w_beta[i] = 0.0;
-            z_beta[i] = eta_beta[i];
-        }
-
-        Ok(FamilyEvaluation {
-            log_likelihood: ll,
-            blockworking_sets: vec![
-                BlockWorkingSet::Diagonal {
-                    working_response: z_alpha,
-                    working_weights: w_alpha,
-                },
-                BlockWorkingSet::Diagonal {
-                    working_response: z_beta,
-                    working_weights: w_beta,
-                },
-            ],
-        })
-    }
-}
-
-fn try_binomial_alpha_betawarm_start(
-    y: &Array1<f64>,
-    weights: &Array1<f64>,
-    threshold_block: &ParameterBlockInput,
-    log_sigma_block: &ParameterBlockInput,
-    options: &BlockwiseFitOptions,
-) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-    let warm_family = BinomialAlphaBetaWarmStartFamily {
-        y: y.clone(),
-        weights: weights.clone(),
-    };
-
-    let alphaspec = ParameterBlockSpec {
-        name: "alphawarm".to_string(),
-        design: threshold_block.design.clone(),
-        offset: threshold_block.offset.clone(),
-        penalties: threshold_block.penalties.clone(),
-        initial_log_lambdas: initial_log_lambdas_orzeros(threshold_block)?,
-        initial_beta: None,
-    };
-    let betaspec = ParameterBlockSpec {
-        name: "betawarm".to_string(),
-        design: log_sigma_block.design.clone(),
-        offset: log_sigma_block.offset.clone(),
-        penalties: log_sigma_block.penalties.clone(),
-        initial_log_lambdas: initial_log_lambdas_orzeros(log_sigma_block)?,
-        initial_beta: None,
-    };
-
-    let warm_options = BlockwiseFitOptions {
-        inner_max_cycles: options.inner_max_cycles.clamp(5, 40),
-        inner_tol: options.inner_tol,
-        outer_max_iter: options.outer_max_iter.clamp(3, 20),
-        outer_tol: options.outer_tol.max(1e-6),
-        minweight: options.minweight,
-        ridge_floor: options.ridge_floor.max(1e-10),
-        ridge_policy: options.ridge_policy,
-        // Warm start optimization focuses on robust initialization, not REML correction.
-        use_remlobjective: false,
-        // Warm-start covariance is unused.
-        compute_covariance: false,
-    };
-    let warm_fit = fit_custom_family(&warm_family, &[alphaspec, betaspec], &warm_options)?;
-    let eta_alpha = &warm_fit.block_states[BinomialAlphaBetaWarmStartFamily::BLOCK_ALPHA].eta;
-    if eta_alpha.len() != y.len() {
-        return Err("warm start eta length mismatch".to_string());
-    }
-
-    // This warm-start family currently identifies alpha only. Seed the
-    // log-sigma block from a deterministic midpoint sigma instead of reusing
-    // the beta block's penalty-only iterate.
-    let sigma_target: f64 = 1.0;
-    let eta_ls_target = 0.0;
-    let betaobs = Array1::from_elem(y.len(), 1.0 / sigma_target.max(1e-12));
-    let t_target = Array1::from_iter(
-        eta_alpha
-            .iter()
-            .zip(betaobs.iter())
-            .map(|(&a, &b)| -a / b.max(1e-12)),
-    );
-    let log_sigma_target = Array1::from_elem(y.len(), eta_ls_target);
-    // T = -alpha/beta is noisy when beta is small (large sigma). Weight the
-    // projection by beta^2 (inverse variance of T under fixed alpha noise).
-    let t_projectionw =
-        Array1::from_iter(weights.iter().zip(betaobs.iter()).map(|(&w, &b)| w * b * b));
-
-    let beta_t = solveweighted_projection(
-        &threshold_block.design,
-        &threshold_block.offset,
-        &t_target,
-        &t_projectionw,
-        options.ridge_floor.max(1e-10),
-    )?;
-    let beta_log_sigma = solveweighted_projection(
-        &log_sigma_block.design,
-        &log_sigma_block.offset,
-        &log_sigma_target,
-        weights,
-        options.ridge_floor.max(1e-10),
-    )?;
-
-    Ok((beta_t, beta_log_sigma, betaobs))
 }
 
 #[derive(Clone)]
@@ -1491,24 +1192,6 @@ pub struct GaussianLocationScaleFitResult {
     pub beta_link_wiggle: Option<Vec<f64>>,
 }
 
-fn slice_log_lambda_block(
-    log_lambdas: &Array1<f64>,
-    start: usize,
-    len: usize,
-    blockname: &str,
-) -> Result<Array1<f64>, String> {
-    let end = start + len;
-    if end > log_lambdas.len() {
-        return Err(format!(
-            "log lambda slice for block '{blockname}' is out of bounds: {}..{} with total {}",
-            start,
-            end,
-            log_lambdas.len()
-        ));
-    }
-    Ok(log_lambdas.slice(s![start..end]).to_owned())
-}
-
 fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
     options: &BlockwiseFitOptions,
@@ -1557,36 +1240,6 @@ fn fit_binomial_mean_wiggle(
         spec.wiggle_block.intospec("wiggle")?,
     ];
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
-}
-
-fn compose_theta_from_hints(
-    mean_penalty_count: usize,
-    noise_penalty_count: usize,
-    mean_log_lambda_hint: &Option<Array1<f64>>,
-    noise_log_lambda_hint: &Option<Array1<f64>>,
-    extra_rho0: &Array1<f64>,
-) -> Array1<f64> {
-    let layout =
-        GamlssLambdaLayout::withwiggle(mean_penalty_count, noise_penalty_count, extra_rho0.len());
-    let mut theta = Array1::<f64>::zeros(layout.total());
-    if let Some(v) = mean_log_lambda_hint
-        && v.len() == layout.k_mean
-    {
-        theta.slice_mut(s![0..layout.mean_end()]).assign(v);
-    }
-    if let Some(v) = noise_log_lambda_hint
-        && v.len() == layout.k_noise
-    {
-        theta
-            .slice_mut(s![layout.noise_start()..layout.noise_end()])
-            .assign(v);
-    }
-    if layout.haswiggle() {
-        theta
-            .slice_mut(s![layout.wiggle_start()..layout.wiggle_end()])
-            .assign(extra_rho0);
-    }
-    theta
 }
 
 fn gamlss_fit_score(fit: &UnifiedFitResult) -> f64 {
@@ -2774,7 +2427,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     };
 
     use crate::estimate::EstimationError;
-    use crate::solver::strategy::{
+    use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
     };
 
@@ -2853,7 +2506,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             fn(
                 &mut MeanWiggleOuterState,
                 &Array1<f64>,
-            ) -> Result<crate::solver::strategy::EfsEval, EstimationError>,
+            ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
     };
 
@@ -2888,7 +2541,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         ],
     };
 
-    let outer = crate::solver::strategy::run_outer(
+    let outer = crate::solver::outer_strategy::run_outer(
         &mut obj,
         &outer_config,
         "binomial mean wiggle exact spatial hyper",
@@ -4370,6 +4023,109 @@ fn gaussian_joint_psihessian_fromweights(
     ))
 }
 
+fn build_two_block_custom_family_joint_psi_operator(
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    moving_block_idx: usize,
+    moving_local_idx: usize,
+    left_block_idx: usize,
+    right_block_idx: usize,
+    left_label: &str,
+    right_label: &str,
+    left_design: &Array2<f64>,
+    right_design: &Array2<f64>,
+    left_weights: &Array1<f64>,
+    cross_weights: &Array1<f64>,
+    right_weights: &Array1<f64>,
+    left_drift_weights: &Array1<f64>,
+    cross_drift_weights: &Array1<f64>,
+    right_drift_weights: &Array1<f64>,
+) -> Result<Option<Box<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String> {
+    let Some(moving_deriv) = derivative_blocks
+        .get(moving_block_idx)
+        .and_then(|block| block.get(moving_local_idx))
+    else {
+        return Ok(None);
+    };
+    if moving_deriv.implicit_operator.is_none() {
+        return Ok(None);
+    }
+
+    let n = left_design.nrows();
+    let p_left = left_design.ncols();
+    let p_right = right_design.ncols();
+    let total = p_left + p_right;
+    let left_range = 0..p_left;
+    let right_range = p_left..total;
+
+    let left_action = if moving_block_idx == left_block_idx {
+        Some(CustomFamilyPsiDesignAction::from_first_derivative(
+            moving_deriv,
+            n,
+            p_left,
+            0..n,
+            left_label,
+        )?)
+    } else {
+        None
+    };
+    let right_action = if moving_block_idx == right_block_idx {
+        Some(CustomFamilyPsiDesignAction::from_first_derivative(
+            moving_deriv,
+            n,
+            p_right,
+            0..n,
+            right_label,
+        )?)
+    } else {
+        None
+    };
+
+    let channels = vec![
+        CustomFamilyJointDesignChannel::new(
+            left_range.clone(),
+            Arc::new(left_design.clone()),
+            left_action,
+        ),
+        CustomFamilyJointDesignChannel::new(
+            right_range.clone(),
+            Arc::new(right_design.clone()),
+            right_action,
+        ),
+    ];
+    let pair_contributions = vec![
+        CustomFamilyJointDesignPairContribution::new(
+            0,
+            0,
+            left_weights.clone(),
+            left_drift_weights.clone(),
+        ),
+        CustomFamilyJointDesignPairContribution::new(
+            0,
+            1,
+            cross_weights.clone(),
+            cross_drift_weights.clone(),
+        ),
+        CustomFamilyJointDesignPairContribution::new(
+            1,
+            0,
+            cross_weights.clone(),
+            cross_drift_weights.clone(),
+        ),
+        CustomFamilyJointDesignPairContribution::new(
+            1,
+            1,
+            right_weights.clone(),
+            right_drift_weights.clone(),
+        ),
+    ];
+
+    Ok(Some(Box::new(CustomFamilyJointPsiOperator::new(
+        total,
+        channels,
+        pair_contributions,
+    ))))
+}
+
 fn gaussian_joint_psisecondhessian_fromweights(
     xmu: &Array2<f64>,
     x_ls: &Array2<f64>,
@@ -4984,18 +4740,40 @@ impl GaussianLocationScaleFamily {
             &(dir_a.xmu_psi.t().dot(&weights_a.scoremu) + xmu.t().dot(&weights_a.dscoremu)),
             &(dir_a.x_ls_psi.t().dot(&weights_a.score_ls) + x_ls.t().dot(&weights_a.dscore_ls)),
         );
-        let hessian_psi = gaussian_joint_psihessian_fromweights(
+        let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator(
+            derivative_blocks,
+            dir_a.block_idx,
+            dir_a.local_idx,
+            Self::BLOCK_MU,
+            Self::BLOCK_LOG_SIGMA,
+            "GaussianLocationScaleFamily mu",
+            "GaussianLocationScaleFamily log-sigma",
             xmu,
             x_ls,
-            &dir_a.xmu_psi,
-            &dir_a.x_ls_psi,
-            &weights_a,
+            &weights_a.hmumu,
+            &weights_a.hmu_ls,
+            &weights_a.h_ls_ls,
+            &weights_a.dhmumu,
+            &weights_a.dhmu_ls,
+            &weights_a.dh_ls_ls,
         )?;
+        let hessian_psi = if hessian_psi_operator.is_some() {
+            Array2::<f64>::zeros((0, 0))
+        } else {
+            gaussian_joint_psihessian_fromweights(
+                xmu,
+                x_ls,
+                &dir_a.xmu_psi,
+                &dir_a.x_ls_psi,
+                &weights_a,
+            )?
+        };
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi,
+            hessian_psi_operator,
         }))
     }
 
@@ -6543,6 +6321,7 @@ impl GaussianLocationScaleWiggleFamily {
             hessian_psi: gaussian_pack_wiggle_joint_symmetrichessian(
                 &h_mm, &h_ml, &h_mw, &h_ll, &h_lw, &h_ww,
             ),
+            hessian_psi_operator: None,
         }))
     }
 
@@ -7379,7 +7158,6 @@ struct BinomialMeanWiggleGeometry {
 }
 
 struct BinomialMeanWiggleJointPsiDirection {
-    local_idx: usize,
     x_eta_psi: Array2<f64>,
     z_eta_psi: Array1<f64>,
 }
@@ -7688,7 +7466,7 @@ impl BinomialMeanWiggleFamily {
         let beta_eta = &block_states[Self::BLOCK_ETA].beta;
         let mut global = 0usize;
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            for deriv in block_derivs {
                 if global == psi_index {
                     if block_idx != Self::BLOCK_ETA {
                         return Ok(None);
@@ -7701,7 +7479,6 @@ impl BinomialMeanWiggleFamily {
                     )?;
                     let z_eta_psi = x_eta_psi.dot(beta_eta);
                     return Ok(Some(BinomialMeanWiggleJointPsiDirection {
-                        local_idx,
                         x_eta_psi,
                         z_eta_psi,
                     }));
@@ -8358,6 +8135,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             hessian_psi: binomial_pack_mean_wiggle_joint_symmetrichessian(
                 &h_eta_eta, &h_eta_w, &h_ww,
             ),
+            hessian_psi_operator: None,
         }))
     }
 }
@@ -9670,30 +9448,53 @@ impl BinomialLocationScaleFamily {
             .slice_mut(s![pt..pt + pls])
             .assign(&(x_ls_psi.t().dot(&r_ls) + x_ls.t().dot(&dr_ls)));
 
-        let h_tt_block = xt_diag_y_dense(&x_t_psi, &h_tt, x_t)?
-            + &xt_diag_y_dense(x_t, &h_tt, &x_t_psi)?
-            + &xt_diag_x_dense(x_t, &dh_tt)?;
-        let h_tl_block = xt_diag_y_dense(&x_t_psi, &h_tl, x_ls)?
-            + &xt_diag_y_dense(x_t, &h_tl, &x_ls_psi)?
-            + &xt_diag_y_dense(x_t, &dh_tl, x_ls)?;
-        let h_ll_block = xt_diag_y_dense(&x_ls_psi, &h_ll, x_ls)?
-            + &xt_diag_y_dense(x_ls, &h_ll, &x_ls_psi)?
-            + &xt_diag_x_dense(x_ls, &dh_ll)?;
+        let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator(
+            derivative_blocks,
+            psi_dir.block_idx,
+            psi_dir.local_idx,
+            Self::BLOCK_T,
+            Self::BLOCK_LOG_SIGMA,
+            "BinomialLocationScaleFamily threshold",
+            "BinomialLocationScaleFamily log-sigma",
+            x_t,
+            x_ls,
+            &h_tt,
+            &h_tl,
+            &h_ll,
+            &dh_tt,
+            &dh_tl,
+            &dh_ll,
+        )?;
+        let hessian_psi = if hessian_psi_operator.is_some() {
+            Array2::<f64>::zeros((0, 0))
+        } else {
+            let h_tt_block = xt_diag_y_dense(&x_t_psi, &h_tt, x_t)?
+                + &xt_diag_y_dense(x_t, &h_tt, &x_t_psi)?
+                + &xt_diag_x_dense(x_t, &dh_tt)?;
+            let h_tl_block = xt_diag_y_dense(&x_t_psi, &h_tl, x_ls)?
+                + &xt_diag_y_dense(x_t, &h_tl, &x_ls_psi)?
+                + &xt_diag_y_dense(x_t, &dh_tl, x_ls)?;
+            let h_ll_block = xt_diag_y_dense(&x_ls_psi, &h_ll, x_ls)?
+                + &xt_diag_y_dense(x_ls, &h_ll, &x_ls_psi)?
+                + &xt_diag_x_dense(x_ls, &dh_ll)?;
 
-        let mut hessian_psi = Array2::<f64>::zeros((total, total));
-        hessian_psi.slice_mut(s![0..pt, 0..pt]).assign(&h_tt_block);
-        hessian_psi
-            .slice_mut(s![0..pt, pt..pt + pls])
-            .assign(&h_tl_block);
-        hessian_psi
-            .slice_mut(s![pt..pt + pls, pt..pt + pls])
-            .assign(&h_ll_block);
-        mirror_upper_to_lower(&mut hessian_psi);
+            let mut hessian_psi = Array2::<f64>::zeros((total, total));
+            hessian_psi.slice_mut(s![0..pt, 0..pt]).assign(&h_tt_block);
+            hessian_psi
+                .slice_mut(s![0..pt, pt..pt + pls])
+                .assign(&h_tl_block);
+            hessian_psi
+                .slice_mut(s![pt..pt + pls, pt..pt + pls])
+                .assign(&h_ll_block);
+            mirror_upper_to_lower(&mut hessian_psi);
+            hessian_psi
+        };
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi,
+            hessian_psi_operator,
         }))
     }
 
@@ -11408,6 +11209,7 @@ impl BinomialLocationScaleWiggleFamily {
             objective_psi,
             score_psi,
             hessian_psi,
+            hessian_psi_operator: None,
         }))
     }
 
@@ -13816,6 +13618,39 @@ mod tests {
         }
     }
 
+    fn compose_theta_from_hints_test(
+        mean_penalty_count: usize,
+        noise_penalty_count: usize,
+        mean_log_lambda_hint: &Option<Array1<f64>>,
+        noise_log_lambda_hint: &Option<Array1<f64>>,
+        extra_rho0: &Array1<f64>,
+    ) -> Array1<f64> {
+        let layout = GamlssLambdaLayout::withwiggle(
+            mean_penalty_count,
+            noise_penalty_count,
+            extra_rho0.len(),
+        );
+        let mut theta = Array1::<f64>::zeros(layout.total());
+        if let Some(v) = mean_log_lambda_hint
+            && v.len() == layout.k_mean
+        {
+            theta.slice_mut(s![0..layout.mean_end()]).assign(v);
+        }
+        if let Some(v) = noise_log_lambda_hint
+            && v.len() == layout.k_noise
+        {
+            theta
+                .slice_mut(s![layout.noise_start()..layout.noise_end()])
+                .assign(v);
+        }
+        if layout.kwiggle > 0 {
+            theta
+                .slice_mut(s![layout.wiggle_start()..layout.wiggle_end()])
+                .assign(extra_rho0);
+        }
+        theta
+    }
+
     fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
         D::one() / (D::one() + (-x).exp())
     }
@@ -14090,46 +13925,6 @@ mod tests {
             secondweights.objective_psi_psirow[0],
             expected_objective_psi_psi
         );
-    }
-
-    #[test]
-    fn weighted_projection_returns_finite_coefficients() {
-        let n = 8usize;
-        let design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
-        let offset = Array1::zeros(n);
-        let target_eta = Array1::from_vec(vec![0.2; n]);
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let beta =
-            solveweighted_projection(&design, &offset, &target_eta, &weights, 1e-10).unwrap();
-        assert_eq!(beta.len(), 1);
-        assert!(beta[0].is_finite());
-        assert!((beta[0] - 0.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn alpha_betawarm_start_produces_finite_targets() {
-        let n = 16usize;
-        let y = Array1::from_vec((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect());
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold = intercept_block(n);
-        let log_sigma = intercept_block(n);
-
-        let (beta_t, beta_ls, betaobs) = try_binomial_alpha_betawarm_start(
-            &y,
-            &weights,
-            &threshold,
-            &log_sigma,
-            &BlockwiseFitOptions::default(),
-        )
-        .unwrap();
-
-        assert_eq!(beta_t.len(), 1);
-        assert_eq!(beta_ls.len(), 1);
-        assert!(beta_t[0].is_finite());
-        assert!(beta_ls[0].is_finite());
-        assert!(betaobs.iter().all(|v| v.is_finite() && *v > 0.0));
-        let expected_beta = 1.0;
-        assert!(betaobs.iter().all(|v| (*v - expected_beta).abs() < 1e-12));
     }
 
     #[test]
@@ -14903,7 +14698,7 @@ mod tests {
         let noisespec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
                 .expect("freeze noise spec");
-        let rho = compose_theta_from_hints(
+        let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
             &None,
@@ -14990,7 +14785,7 @@ mod tests {
         let noisespec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
                 .expect("freeze noise spec");
-        let rho = compose_theta_from_hints(
+        let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
             &None,
@@ -15068,7 +14863,7 @@ mod tests {
         let noisespec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
                 .expect("freeze noise spec");
-        let rho = compose_theta_from_hints(
+        let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
             &None,
@@ -15156,7 +14951,7 @@ mod tests {
         let noisespec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
                 .expect("freeze noise spec");
-        let rho = compose_theta_from_hints(
+        let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
             &None,
@@ -15265,7 +15060,7 @@ mod tests {
         let noisespec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
                 .expect("freeze noise spec");
-        let rho = compose_theta_from_hints(
+        let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
             &None,

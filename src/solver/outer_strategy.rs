@@ -15,14 +15,14 @@
 
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
-use ndarray::{Array1, Array2};
-use opt::{
+use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FiniteDiffGradient,
     FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
     FixedPointSample, FixedPointStatus, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError,
     ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution, Tolerance,
     ZerothOrderObjective,
 };
+use ndarray::{Array1, Array2};
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

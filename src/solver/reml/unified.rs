@@ -724,419 +724,6 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 /// - Differentiating W (weight drift, terms 3-5)
 /// - Cross terms between the two differentiations (terms 2, 3, 4)
 /// - The curvature of W itself through w'' (term 5)
-pub struct LinkWiggleDerivProvider {
-    /// Joint Jacobian J (n × p_total) at the converged mode.
-    /// Columns [0..p_base] correspond to the base predictor block,
-    /// columns [p_base..p_total] to the link wiggle block.
-    j_mat: Array2<f64>,
-
-    /// Pre-weighted Jacobian: diag(√W) · J (n × p_total).
-    /// Used for the √W factorization trick in symmetric products.
-    jweighted: Array2<f64>,
-
-    /// √W per observation (n-vector). Square root of the working weights
-    /// from the converged Gauss-Newton Hessian.
-    sqrtw: Array1<f64>,
-
-    /// dW/dη per observation (n-vector). Third derivative of the negative
-    /// log-likelihood w.r.t. the predictor η. Controls how the working
-    /// weights shift as β changes along a direction.
-    w_prime: Array1<f64>,
-
-    /// d²W/dη² per observation (n-vector). Fourth derivative of the negative
-    /// log-likelihood w.r.t. η. Needed for term 5 of the second-order
-    /// correction, where the curvature of W itself contributes.
-    w_double_prime: Array1<f64>,
-
-    /// Base design matrix X (n × p_base) in the transformed coefficient space.
-    x_base: Array2<f64>,
-
-    /// g''(η) per observation (n-vector). Second derivative of the link
-    /// function at the converged η values. Controls how the Jacobian's
-    /// base block changes as η shifts.
-    gsecond: Array1<f64>,
-
-    /// B'(z) · Z (n × p_link). Product of the B-spline basis first
-    /// derivative (evaluated at the normalized predictor z) with the
-    /// geometric constraint transform Z.
-    b_prime_u: Array2<f64>,
-
-    /// 1/range_width for z-coordinate scaling. When the base predictor η
-    /// shifts by dη, the normalized coordinate z shifts by dη · invrw.
-    invrw: f64,
-
-    /// Number of base predictor coefficients.
-    p_base: usize,
-
-    /// Number of link wiggle coefficients (after constraint transform).
-    p_link: usize,
-
-    /// Total number of joint coefficients: p_base + p_link.
-    p_total: usize,
-
-    /// Number of observations.
-    n: usize,
-}
-
-impl LinkWiggleDerivProvider {
-    /// Create a new provider from pre-computed ingredients at the converged mode.
-    pub fn new(
-        j_mat: Array2<f64>,
-        sqrtw: Array1<f64>,
-        w_prime: Array1<f64>,
-        w_double_prime: Array1<f64>,
-        x_base: Array2<f64>,
-        gsecond: Array1<f64>,
-        b_prime_u: Array2<f64>,
-        invrw: f64,
-    ) -> Self {
-        let n = j_mat.nrows();
-        let p_total = j_mat.ncols();
-        let p_base = x_base.ncols();
-        let p_link = p_total - p_base;
-
-        // Pre-compute √W · J once (used in multiple places).
-        let mut jweighted = j_mat.clone();
-        for i in 0..n {
-            let w = sqrtw[i];
-            for j in 0..p_total {
-                jweighted[[i, j]] *= w;
-            }
-        }
-
-        Self {
-            j_mat,
-            jweighted,
-            sqrtw,
-            w_prime,
-            w_double_prime,
-            x_base,
-            gsecond,
-            b_prime_u,
-            invrw,
-            p_base,
-            p_link,
-            p_total,
-            n,
-        }
-    }
-
-    /// Compute first-order quantities for a given direction δ in the joint
-    /// parameter space.
-    ///
-    /// Returns:
-    /// - `dot_eta`: J · δ  (n-vector, predictor change)
-    /// - `dot_j`:   ∂J/∂β[δ]  (n × p_total, Jacobian directional derivative)
-    ///
-    /// The Jacobian derivative ∂J/∂β[δ] captures how J changes when β moves
-    /// along direction δ:
-    ///
-    ///   dot_J[:, 0..p_base] = diag(dot_g_prime) · X_base
-    ///   dot_J[:, p_base..]  = B'(z) · Z · diag(dot_u · invrw)
-    ///
-    /// where dot_g_prime = g'' · dot_u + B'Z · δ_theta is the change in the
-    /// link function's first derivative.
-    fn compute_first_order(&self, delta: &Array1<f64>) -> (Array1<f64>, Array2<f64>) {
-        let delta_beta = delta.slice(ndarray::s![0..self.p_base]);
-        let delta_theta = delta.slice(ndarray::s![self.p_base..self.p_total]);
-
-        // dot_eta = J · delta: how the predictor changes along direction delta.
-        let dot_eta = self.j_mat.dot(delta);
-
-        // dot_u = X_base · delta_beta: base predictor change.
-        let dot_u = self.x_base.dot(&delta_beta);
-
-        // dot_g_prime = g'' · dot_u + B'Z · delta_theta:
-        // Change in the link function's first derivative g'(η).
-        // - g'' · dot_u: curvature of the link function times base predictor shift
-        // - B'Z · delta_theta: direct change from link coefficients
-        let b_prime_z_delta_theta = self.b_prime_u.dot(&delta_theta);
-        let mut dot_g_prime = Array1::<f64>::zeros(self.n);
-        Zip::from(&mut dot_g_prime)
-            .and(&self.gsecond)
-            .and(&dot_u)
-            .and(&b_prime_z_delta_theta)
-            .for_each(|dgp, &gs, &du, &bpzdt| {
-                *dgp = gs * du + bpzdt;
-            });
-
-        // Assemble dot_J: the directional derivative of the joint Jacobian.
-        let mut dot_j = Array2::<f64>::zeros((self.n, self.p_total));
-
-        // Base block: dot_J[:, 0..p_base] = diag(dot_g_prime) · X_base
-        for i in 0..self.n {
-            let dgp = dot_g_prime[i];
-            if dgp.abs() > 0.0 {
-                for j in 0..self.p_base {
-                    dot_j[[i, j]] = dgp * self.x_base[[i, j]];
-                }
-            }
-        }
-
-        // Link block: dot_J[:, p_base..] = B'(z) · Z · (dot_u · invrw)
-        // The z-coordinate shifts by dz = dot_u · invrw when the base
-        // predictor changes, causing the B-spline basis to shift.
-        //
-        // dot_J_link[i, :] = dot_u[i] * invrw * (B'[i,:] · Z)
-        //                   = dot_u[i] * invrw * b_prime_u[i,:]
-        //
-        // Note: This uses the pre-computed b_prime_u = B' · Z to avoid
-        // the intermediate B' · Z product.
-        for i in 0..self.n {
-            let scale = dot_u[i] * self.invrw;
-            if scale.abs() > 0.0 {
-                for j in 0..self.p_link {
-                    dot_j[[i, self.p_base + j]] = scale * self.b_prime_u[[i, j]];
-                }
-            }
-        }
-
-        (dot_eta, dot_j)
-    }
-
-    /// Build the first-order Hessian correction matrix from dot_eta and dot_J.
-    ///
-    /// The correction is:
-    ///
-    ///   C = dot_J' W J + J' W dot_J + J' diag(w' · dot_eta) J
-    ///
-    /// This decomposes into:
-    /// - Jacobian symmetry term: (√W · dot_J)' (√W · J) + transpose
-    /// - Weight drift term: J' diag(w' · dot_eta) J
-    ///
-    /// The Jacobian symmetry term uses the √W factorization trick for
-    /// numerical stability: dot_J'WJ = (√W · dot_J)' (√W · J).
-    fn build_first_order_correction(
-        &self,
-        dot_eta: &Array1<f64>,
-        dot_j: &Array2<f64>,
-    ) -> Array2<f64> {
-        let p = self.p_total;
-
-        // Jacobian symmetry term: dot_J'WJ + J'W·dot_J
-        // = (√W·dot_J)'(√W·J) + ((√W·dot_J)'(√W·J))'
-        let mut w_dot_j = dot_j.clone();
-        for i in 0..self.n {
-            let w = self.sqrtw[i];
-            for j in 0..p {
-                w_dot_j[[i, j]] *= w;
-            }
-        }
-        let atb = w_dot_j.t().dot(&self.jweighted);
-        let mut result = &atb + &atb.t();
-
-        // Weight drift term: J' diag(w' · dot_eta) J
-        // w_dot[i] = w'[i] · dot_eta[i] is the weight change due to
-        // the predictor shift. This term captures how the working weights
-        // themselves move as β changes, contributing the third-derivative
-        // (w') curvature to the Hessian correction.
-        //
-        // Uses direct outer product accumulation (O(n·p²)) since w_dot
-        // can be negative and the √W factorization trick requires
-        // non-negative weights.
-        for i in 0..self.n {
-            let w_dot = self.w_prime[i] * dot_eta[i];
-            if w_dot.abs() > 0.0 {
-                let ji = self.j_mat.row(i);
-                for a in 0..p {
-                    let wa = w_dot * ji[a];
-                    for b in a..p {
-                        let val = wa * ji[b];
-                        result[[a, b]] += val;
-                        if a != b {
-                            result[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        result
-    }
-}
-
-impl HessianDerivativeProvider for LinkWiggleDerivProvider {
-    /// First-order Hessian derivative correction: ∂H/∂ρ_k − A_k.
-    ///
-    /// Given the mode response v_k = H⁻¹(A_k β̂), the IFT direction is
-    /// δ = -v_k (since dβ̂/dρ_k = -v_k). This method computes:
-    ///
-    ///   D_β(J'WJ)[-v_k] = dot_J'WJ + J'W·dot_J + J'diag(w'·dot_eta)J
-    ///
-    /// where dot_eta = J·(-v_k) and dot_J = ∂J/∂β[-v_k].
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
-        let delta = -v_k;
-        let (dot_eta, dot_j) = self.compute_first_order(&delta);
-        Some(self.build_first_order_correction(&dot_eta, &dot_j))
-    }
-
-    /// Second-order Hessian derivative correction for the outer Hessian.
-    ///
-    /// Computes ∂²H/∂ρ_k∂ρ_l via the FIVE-TERM decomposition that arises
-    /// from differentiating J'WJ twice through the implicit function theorem.
-    ///
-    /// # The five terms (response.md Section 6)
-    ///
-    /// **Term 1: D_β H[u_kl]** — First-order correction structure applied to
-    /// the second-order IFT mode response u_kl = H⁻¹(−g_kl + Ḣ_l v_k + Ḣ_k v_l).
-    /// This captures how H changes when β moves along the compound direction u_kl.
-    ///
-    /// **Term 2: Cross-Jacobian** — (∂J/∂β[δ_k])' W (∂J/∂β[δ_l]) + transpose.
-    /// The Jacobian derivatives from directions k and l interact through the
-    /// working weights W. Uses the √W factorization trick since W ≥ 0.
-    ///
-    /// **Term 3: Weight-drift × Jacobian_k** — The weight derivative w' couples
-    /// with the predictor change from direction l, acting on the Jacobian
-    /// derivative from direction k:
-    ///   dot_J_k' diag(w' · dot_η_l) J + J' diag(w' · dot_η_l) dot_J_k
-    ///
-    /// **Term 4: Weight-drift × Jacobian_l** — Same as term 3 with k↔l swapped:
-    ///   dot_J_l' diag(w' · dot_η_k) J + J' diag(w' · dot_η_k) dot_J_l
-    ///
-    /// **Term 5: Second-order weight + mixed predictor** — Two sub-contributions:
-    ///   J' diag(w'' · dot_η_k · dot_η_l + w' · dot_η_kl) J
-    ///
-    /// where w'' = d²W/dη² is the fourth derivative of the neg-log-likelihood.
-    /// - w'' · dot_η_k · dot_η_l: captures the curvature of W itself (how the
-    ///   rate of weight change varies with the predictor). This is the fourth
-    ///   derivative entering through the Faà di Bruno chain rule.
-    /// - w' · dot_η_kl: captures the mixed predictor acceleration, where
-    ///   dot_η_kl = dot_J_k · δ_l + J · u_kl accounts for how the predictor
-    ///   change in direction k is itself modified by moving in direction l.
-    ///
-    /// **Why the √W trick cannot be used for term 5:** The combined weight
-    /// w_ddot[i] = w''[i] · dot_η_k[i] · dot_η_l[i] + w'[i] · dot_η_kl[i]
-    /// can be negative (w'' is the fourth derivative which has no sign
-    /// constraint), so we cannot factor it as (√w_ddot)² and must use
-    /// direct outer product accumulation O(n·p²).
-    ///
-    /// # Restoring exact Newton
-    ///
-    /// Together, these five terms give the exact Q[v_k, v_l] correction that
-    /// the unified REML evaluator needs for the outer Hessian. With this,
-    /// the evaluator can compute the exact outer Hessian ∂²V/∂ρ_k∂ρ_l,
-    /// enabling Newton's method for the outer optimization and eliminating
-    /// the BFGS fallback.
-    fn hessian_second_derivative_correction(
-        &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        let delta_k = -v_k;
-        let delta_l = -v_l;
-        let p = self.p_total;
-
-        // Compute first-order quantities for both directions.
-        let (dot_eta_k, dot_j_k) = self.compute_first_order(&delta_k);
-        let (dot_eta_l, dot_j_l) = self.compute_first_order(&delta_l);
-
-        // ── Term 1: D_β H[u_kl] ──────────────────────────────────────────
-        // Same structure as first-order correction, applied to the compound
-        // IFT direction u_kl.
-        let (dot_eta_ukl, dot_j_ukl) = self.compute_first_order(u_kl);
-        let term1 = self.build_first_order_correction(&dot_eta_ukl, &dot_j_ukl);
-
-        // ── Term 2: Cross-Jacobian ────────────────────────────────────────
-        // (∂J/∂β[δ_k])' W (∂J/∂β[δ_l]) + transpose
-        // = (√W·dot_J_k)' (√W·dot_J_l) + ((√W·dot_J_k)' (√W·dot_J_l))'
-        //
-        // Uses √W factorization since W ≥ 0.
-        let mut w_dot_j_k = dot_j_k.clone();
-        let mut w_dot_j_l = dot_j_l.clone();
-        for i in 0..self.n {
-            let w = self.sqrtw[i];
-            for j in 0..p {
-                w_dot_j_k[[i, j]] *= w;
-                w_dot_j_l[[i, j]] *= w;
-            }
-        }
-        let atb2 = w_dot_j_k.t().dot(&w_dot_j_l);
-        let term2 = &atb2 + &atb2.t();
-
-        // ── Term 3: Weight-drift × Jacobian_k ────────────────────────────
-        // dot_J_k' diag(w' · dot_η_l) J + J' diag(w' · dot_η_l) dot_J_k
-        //
-        // = (diag(w' · dot_η_l) · dot_J_k)' · J + transpose
-        let mut wl_dot_j_k = dot_j_k.clone();
-        for i in 0..self.n {
-            let wl = self.w_prime[i] * dot_eta_l[i];
-            for j in 0..p {
-                wl_dot_j_k[[i, j]] *= wl;
-            }
-        }
-        let atb3 = wl_dot_j_k.t().dot(&self.j_mat);
-        let term3 = &atb3 + &atb3.t();
-
-        // ── Term 4: Weight-drift × Jacobian_l ────────────────────────────
-        // Same as term 3 with k↔l swapped.
-        let mut wk_dot_j_l = dot_j_l.clone();
-        for i in 0..self.n {
-            let wk = self.w_prime[i] * dot_eta_k[i];
-            for j in 0..p {
-                wk_dot_j_l[[i, j]] *= wk;
-            }
-        }
-        let atb4 = wk_dot_j_l.t().dot(&self.j_mat);
-        let term4 = &atb4 + &atb4.t();
-
-        // ── Term 5: Second-order weight + mixed predictor ─────────────────
-        // J' diag(w_ddot) J  where
-        //   w_ddot[i] = w''[i] · dot_η_k[i] · dot_η_l[i] + w'[i] · dot_η_kl[i]
-        //
-        // dot_η_kl = dot_J_k · δ_l + J · u_kl
-        // This is the mixed predictor acceleration: how the predictor change
-        // from direction k is itself modified by moving in direction l.
-        //
-        // w'' (the fourth derivative of -log L w.r.t. η) is needed here because
-        // differentiating the third-derivative weight w' once more w.r.t. η gives
-        // w''. This is the deepest derivative layer in the chain — the Faà di
-        // Bruno formula for (ℓ ∘ g)'''' effectively produces this term.
-        //
-        // IMPORTANT: w_ddot can be negative (w'' has no sign constraint), so
-        // we CANNOT use the √W factorization trick here. Instead we accumulate
-        // the J'diag(w_ddot)J product directly via an O(n·p²) outer product loop.
-        let dot_eta_kl_full = dot_j_k.dot(&delta_l) + self.j_mat.dot(u_kl);
-        let mut term5 = Array2::<f64>::zeros((p, p));
-        for i in 0..self.n {
-            let w_ddot = self.w_double_prime[i] * dot_eta_k[i] * dot_eta_l[i]
-                + self.w_prime[i] * dot_eta_kl_full[i];
-            if w_ddot.abs() > 0.0 {
-                let ji = self.j_mat.row(i);
-                for a in 0..p {
-                    let wa = w_ddot * ji[a];
-                    for b in a..p {
-                        let val = wa * ji[b];
-                        term5[[a, b]] += val;
-                        if a != b {
-                            term5[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sum all five terms.
-        Some(term1 + &term2 + &term3 + &term4 + &term5)
-    }
-
-    fn has_corrections(&self) -> bool {
-        true
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Extended hyperparameter coordinate types
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Fixed-β objects for a single outer hyperparameter coordinate.
-///
-/// For ρ_k:  a = ½β̂ᵀAₖβ̂,  g = Aₖβ̂,  b_mat = Aₖ,  ld_s = (log|S|₊)'_k
-/// For ψ_j:  family provides likelihood-side objects, penalty adds S_j terms.
-///
-/// The unified evaluator uses these to compute gradient and Hessian entries
-/// for any outer coordinate, whether it moves the penalty only (ρ) or also
-/// moves the design/likelihood (ψ).
 pub struct HyperCoord {
     /// ∂_i F|_β — fixed-β cost derivative (scalar).
     pub a: f64,
@@ -1241,29 +828,6 @@ pub trait HyperOperator: Send + Sync {
     /// structure (A_d = X^T C_d X + P_d), `None` for dense wrappers.
     fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
         None
-    }
-}
-
-/// Dense wrapper: wraps an existing (p × p) matrix as a `HyperOperator`.
-pub struct DenseHyperOperator {
-    pub mat: Array2<f64>,
-}
-
-impl HyperOperator for DenseHyperOperator {
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.mat.dot(v)
-    }
-
-    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
-        v.dot(&self.mat.dot(u))
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        self.mat.clone()
-    }
-
-    fn is_implicit(&self) -> bool {
-        false
     }
 }
 
@@ -1855,8 +1419,6 @@ pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     (value, grad)
 }
 
-pub(crate) const LAML_RIDGE: f64 = 1e-8;
-
 /// Ridge floor for denominator safety.
 const DENOM_RIDGE: f64 = 1e-8;
 
@@ -2119,9 +1681,14 @@ pub fn reml_laml_evaluate(
                 }
             }
 
-            let estimator = StochasticTraceEstimator::with_defaults();
             let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
-            let raw_traces = estimator.estimate_traces_structural(hop, &dense_refs, &implicit_ops);
+            let raw_traces = stochastic_trace_hinv_products(
+                hop,
+                StochasticTraceTargets::Structural {
+                    dense_matrices: &dense_refs,
+                    implicit_ops: &implicit_ops,
+                },
+            );
 
             // Re-map traces back to the [rho_0..rho_k, ext_0..ext_N] layout.
             let mut result = Vec::with_capacity(k + ext_dim);
@@ -2179,9 +1746,11 @@ pub fn reml_laml_evaluate(
                 all_h_k_matrices.push(h_i);
             }
 
-            let estimator = StochasticTraceEstimator::with_defaults();
             let refs: Vec<&Array2<f64>> = all_h_k_matrices.iter().collect();
-            Some(estimator.estimate_traces(hop, &refs))
+            Some(stochastic_trace_hinv_products(
+                hop,
+                StochasticTraceTargets::Dense(&refs),
+            ))
         }
     } else {
         None
@@ -3431,13 +3000,6 @@ const PSI_GRAM_PINV_TOL: f64 = 1e-8;
 /// early iterations when the quadratic model may be inaccurate.
 const PSI_INITIAL_ALPHA: f64 = 1.0;
 
-/// Maximum number of backtracking halvings for the ψ step.
-///
-/// If after this many halvings the combined (ρ-EFS, ψ-gradient) step
-/// still doesn't decrease V(θ), the ψ step is zeroed out for this
-/// iteration and only the ρ-EFS step is applied.
-const MAX_PSI_BACKTRACK: usize = 8;
-
 /// Result of the hybrid EFS update, containing both the step vector and
 /// metadata needed for backtracking on the ψ block.
 pub struct HybridEfsResult {
@@ -4125,13 +3687,6 @@ fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
 fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
     let four_eps_sq = 4.0 * epsilon * epsilon;
     0.5 * (sigma + (sigma * sigma + four_eps_sq).sqrt())
-}
-
-/// Derivative of the smooth spectral regularizer: `r'_ε(σ) = ½(1 + σ/√(σ² + 4ε²))`.
-#[inline]
-fn spectral_regularize_deriv(sigma: f64, epsilon: f64) -> f64 {
-    let four_eps_sq = 4.0 * epsilon * epsilon;
-    0.5 * (1.0 + sigma / (sigma * sigma + four_eps_sq).sqrt())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4882,6 +4437,34 @@ pub struct StochasticTraceEstimator {
     config: StochasticTraceConfig,
 }
 
+enum StochasticTraceTargets<'a> {
+    Dense(&'a [&'a Array2<f64>]),
+    Mixed {
+        dense_matrices: &'a [&'a Array2<f64>],
+        operators: &'a [&'a dyn HyperOperator],
+    },
+    Structural {
+        dense_matrices: &'a [&'a Array2<f64>],
+        implicit_ops: &'a [&'a ImplicitHyperOperator],
+    },
+}
+
+impl StochasticTraceTargets<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(matrices) => matrices.len(),
+            Self::Mixed {
+                dense_matrices,
+                operators,
+            } => dense_matrices.len() + operators.len(),
+            Self::Structural {
+                dense_matrices,
+                implicit_ops,
+            } => dense_matrices.len() + implicit_ops.len(),
+        }
+    }
+}
+
 impl StochasticTraceEstimator {
     /// Create a new estimator with the given configuration.
     pub fn new(config: StochasticTraceConfig) -> Self {
@@ -4890,9 +4473,133 @@ impl StochasticTraceEstimator {
 
     /// Create with default configuration.
     pub fn with_defaults() -> Self {
-        Self {
-            config: StochasticTraceConfig::default(),
+        Self::new(StochasticTraceConfig::default())
+    }
+
+    fn estimate_from_probe_batch<F>(
+        &self,
+        hop: &dyn HessianOperator,
+        n_coords: usize,
+        mut evaluate_probe: F,
+    ) -> Vec<f64>
+    where
+        F: FnMut(&Array1<f64>, &Array1<f64>, &mut [f64]),
+    {
+        if n_coords == 0 {
+            return Vec::new();
         }
+
+        let p = hop.dim();
+        if p == 0 {
+            return vec![0.0; n_coords];
+        }
+
+        let mut means = vec![0.0_f64; n_coords];
+        let mut m2s = vec![0.0_f64; n_coords];
+        let mut probe_values = vec![0.0_f64; n_coords];
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let check_interval = 4;
+
+        for m in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+            let w = hop.solve(&z);
+            evaluate_probe(&z, &w, &mut probe_values);
+
+            for k in 0..n_coords {
+                let q_k = probe_values[k];
+                let count = (m + 1) as f64;
+                let delta = q_k - means[k];
+                means[k] += delta / count;
+                let delta2 = q_k - means[k];
+                m2s[k] += delta * delta2;
+            }
+
+            let n_done = m + 1;
+            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+                if self.check_convergence(n_done, &means, &m2s) {
+                    break;
+                }
+            }
+        }
+
+        means
+    }
+
+    fn estimate_hinv_traces(
+        &self,
+        hop: &dyn HessianOperator,
+        targets: StochasticTraceTargets<'_>,
+    ) -> Vec<f64> {
+        let n_coords = targets.len();
+        if n_coords == 0 {
+            return Vec::new();
+        }
+
+        match targets {
+            StochasticTraceTargets::Dense(matrices) => {
+                self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+                    for k in 0..matrices.len() {
+                        let a_w = matrices[k].dot(w);
+                        probe_values[k] = z.dot(&a_w);
+                    }
+                })
+            }
+            StochasticTraceTargets::Mixed {
+                dense_matrices,
+                operators,
+            } => self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+                for k in 0..dense_matrices.len() {
+                    let a_w = dense_matrices[k].dot(w);
+                    probe_values[k] = z.dot(&a_w);
+                }
+
+                let dense_count = dense_matrices.len();
+                for (oi, op) in operators.iter().enumerate() {
+                    let k = dense_count + oi;
+                    let a_w = op.mul_vec(w);
+                    probe_values[k] = z.dot(&a_w);
+                }
+            }),
+            StochasticTraceTargets::Structural {
+                dense_matrices,
+                implicit_ops,
+            } => {
+                if implicit_ops.is_empty() {
+                    let no_ops: [&dyn HyperOperator; 0] = [];
+                    return self.estimate_hinv_traces(
+                        hop,
+                        StochasticTraceTargets::Mixed {
+                            dense_matrices,
+                            operators: &no_ops,
+                        },
+                    );
+                }
+
+                let x_dense = implicit_ops[0].x_dense.clone();
+                self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+                    let x_vec = x_dense.dot(z);
+                    let y_vec = x_dense.dot(w);
+
+                    for k in 0..dense_matrices.len() {
+                        let a_w = dense_matrices[k].dot(w);
+                        probe_values[k] = z.dot(&a_w);
+                    }
+
+                    let dense_count = dense_matrices.len();
+                    for (oi, op) in implicit_ops.iter().enumerate() {
+                        let k = dense_count + oi;
+                        probe_values[k] = op.bilinear_with_shared_x(&x_vec, &y_vec, z, w);
+                    }
+                })
+            }
+        }
+    }
+
+    /// Estimate a single trace `tr(H⁻¹ A)` using the same batched Hutchinson
+    /// core as the multi-coordinate path.
+    pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, matrix: &Array2<f64>) -> f64 {
+        let matrices = [matrix];
+        self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(&matrices))[0]
     }
 
     /// Estimate `tr(H⁻¹ A_k)` for multiple matrices `A_k` simultaneously.
@@ -4912,66 +4619,7 @@ impl StochasticTraceEstimator {
         hop: &dyn HessianOperator,
         matrices: &[&Array2<f64>],
     ) -> Vec<f64> {
-        let n_coords = matrices.len();
-        if n_coords == 0 {
-            return Vec::new();
-        }
-
-        let p = hop.dim();
-        if p == 0 {
-            return vec![0.0; n_coords];
-        }
-
-        // Welford online accumulators: per-coordinate running mean and M2.
-        let mut means = vec![0.0_f64; n_coords];
-        let mut m2s = vec![0.0_f64; n_coords]; // sum of squared deviations
-
-        // Simple splitmix64-seeded Rademacher generator for reproducibility.
-        // We use a lightweight xoshiro256ss state derived from the config seed.
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-
-        let check_interval = 4; // check stopping every this many probes
-
-        for m in 0..self.config.n_probes_max {
-            // Generate Rademacher probe z ∈ {±1}^p.
-            let z = rademacher_probe(p, &mut rng_state);
-
-            // ONE shared solve: w = H⁻¹ z.
-            let w = hop.solve(&z);
-
-            // For each coordinate k: q_k = zᵀ (A_k w).
-            for k in 0..n_coords {
-                let a_w = matrices[k].dot(&w); // A_k w: p-vector
-                let q_k = z.dot(&a_w); // zᵀ (A_k w): scalar
-
-                // Welford update for online mean and variance.
-                let count = (m + 1) as f64;
-                let delta = q_k - means[k];
-                means[k] += delta / count;
-                let delta2 = q_k - means[k];
-                m2s[k] += delta * delta2;
-            }
-
-            let n_done = m + 1;
-
-            // Check adaptive stopping criterion (after minimum probes reached).
-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
-                if self.check_convergence(n_done, &means, &m2s) {
-                    break;
-                }
-            }
-        }
-
-        means
-    }
-
-    /// Estimate `tr(H⁻¹ A)` for a single matrix A.
-    ///
-    /// Convenience wrapper around [`estimate_traces`](Self::estimate_traces).
-    pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, a: &Array2<f64>) -> f64 {
-        let matrices = [a];
-        let refs: Vec<&Array2<f64>> = matrices.iter().copied().collect();
-        self.estimate_traces(hop, &refs)[0]
+        self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(matrices))
     }
 
     /// Estimate `tr(H⁻¹ A_k)` for a mix of dense matrices and implicit operators.
@@ -4994,59 +4642,13 @@ impl StochasticTraceEstimator {
         dense_matrices: &[&Array2<f64>],
         operators: &[&dyn HyperOperator],
     ) -> Vec<f64> {
-        let n_dense = dense_matrices.len();
-        let n_ops = operators.len();
-        let n_coords = n_dense + n_ops;
-        if n_coords == 0 {
-            return Vec::new();
-        }
-
-        let p = hop.dim();
-        if p == 0 {
-            return vec![0.0; n_coords];
-        }
-
-        let mut means = vec![0.0_f64; n_coords];
-        let mut m2s = vec![0.0_f64; n_coords];
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-        let check_interval = 4;
-
-        for m in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
-            let w = hop.solve(&z);
-
-            // Dense matrices.
-            for k in 0..n_dense {
-                let a_w = dense_matrices[k].dot(&w);
-                let q_k = z.dot(&a_w);
-                let count = (m + 1) as f64;
-                let delta = q_k - means[k];
-                means[k] += delta / count;
-                let delta2 = q_k - means[k];
-                m2s[k] += delta * delta2;
-            }
-
-            // Implicit operators.
-            for (oi, op) in operators.iter().enumerate() {
-                let k = n_dense + oi;
-                let a_w = op.mul_vec(&w);
-                let q_k = z.dot(&a_w);
-                let count = (m + 1) as f64;
-                let delta = q_k - means[k];
-                means[k] += delta / count;
-                let delta2 = q_k - means[k];
-                m2s[k] += delta * delta2;
-            }
-
-            let n_done = m + 1;
-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
-                if self.check_convergence(n_done, &means, &m2s) {
-                    break;
-                }
-            }
-        }
-
-        means
+        self.estimate_hinv_traces(
+            hop,
+            StochasticTraceTargets::Mixed {
+                dense_matrices,
+                operators,
+            },
+        )
     }
 
     /// Estimate first-order traces `tr(H⁻¹ A_d)` for implicit operators using the
@@ -5071,78 +4673,13 @@ impl StochasticTraceEstimator {
         dense_matrices: &[&Array2<f64>],
         implicit_ops: &[&ImplicitHyperOperator],
     ) -> Vec<f64> {
-        let n_dense = dense_matrices.len();
-        let n_ops = implicit_ops.len();
-        let n_coords = n_dense + n_ops;
-        if n_coords == 0 {
-            return Vec::new();
-        }
-
-        // When there are no implicit operators, delegate to the generic
-        // operator-aware estimator which shares the same Hutchinson loop but
-        // avoids the unnecessary shared-X machinery.
-        if n_ops == 0 {
-            let no_ops: &[&dyn HyperOperator] = &[];
-            return self.estimate_traces_with_operators(hop, dense_matrices, no_ops);
-        }
-
-        let p = hop.dim();
-        if p == 0 {
-            return vec![0.0; n_coords];
-        }
-
-        let mut means = vec![0.0_f64; n_coords];
-        let mut m2s = vec![0.0_f64; n_coords];
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-        let check_interval = 4;
-
-        // Get the shared X reference from the first implicit operator (all share the same X).
-        let x_dense = Some(implicit_ops[0].x_dense.clone());
-
-        for m in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
-
-            // ONE shared solve: u = H⁻¹ z
-            let u = hop.solve(&z);
-
-            // Shared X multiplies (only needed when implicit operators present).
-            let (x_vec, y_vec) = if let Some(ref x) = x_dense {
-                (x.dot(&z), x.dot(&u))
-            } else {
-                (Array1::zeros(0), Array1::zeros(0))
-            };
-
-            // Dense matrices: standard estimator.
-            for k in 0..n_dense {
-                let a_w = dense_matrices[k].dot(&u);
-                let q_k = z.dot(&a_w);
-                let count = (m + 1) as f64;
-                let delta = q_k - means[k];
-                means[k] += delta / count;
-                let delta2 = q_k - means[k];
-                m2s[k] += delta * delta2;
-            }
-
-            // Implicit operators: exploit shared X multiplies.
-            for (oi, op) in implicit_ops.iter().enumerate() {
-                let k = n_dense + oi;
-                let q_k = op.bilinear_with_shared_x(&x_vec, &y_vec, &z, &u);
-                let count = (m + 1) as f64;
-                let delta = q_k - means[k];
-                means[k] += delta / count;
-                let delta2 = q_k - means[k];
-                m2s[k] += delta * delta2;
-            }
-
-            let n_done = m + 1;
-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
-                if self.check_convergence(n_done, &means, &m2s) {
-                    break;
-                }
-            }
-        }
-
-        means
+        self.estimate_hinv_traces(
+            hop,
+            StochasticTraceTargets::Structural {
+                dense_matrices,
+                implicit_ops,
+            },
+        )
     }
 
     /// Estimate the full D×D matrix of second-order traces `tr(H⁻¹ A_d H⁻¹ A_e)`
@@ -5366,18 +4903,25 @@ impl StochasticTraceEstimator {
     }
 }
 
-/// Convenience method on `HessianOperator` for stochastic trace estimation.
-///
-/// This is a free function rather than a default trait method to avoid
-/// making the trait object-unsafe with the additional import requirements.
-///
-/// Estimates `tr(H⁻¹ A)` for a single matrix using Rademacher probes.
-pub fn stochastic_trace_hinv_product(
+fn stochastic_trace_hinv_products(
     hop: &dyn HessianOperator,
-    a: &Array2<f64>,
-    config: &StochasticTraceConfig,
-) -> f64 {
-    StochasticTraceEstimator::new(config.clone()).estimate_single_trace(hop, a)
+    targets: StochasticTraceTargets<'_>,
+) -> Vec<f64> {
+    let estimator = StochasticTraceEstimator::with_defaults();
+    match targets {
+        StochasticTraceTargets::Dense(matrices) if matrices.len() == 1 => {
+            vec![estimator.estimate_single_trace(hop, matrices[0])]
+        }
+        StochasticTraceTargets::Dense(matrices) => estimator.estimate_traces(hop, matrices),
+        StochasticTraceTargets::Mixed {
+            dense_matrices,
+            operators,
+        } => estimator.estimate_traces_with_operators(hop, dense_matrices, operators),
+        StochasticTraceTargets::Structural {
+            dense_matrices,
+            implicit_ops,
+        } => estimator.estimate_traces_structural(hop, dense_matrices, implicit_ops),
+    }
 }
 
 // Lightweight xoshiro256ss RNG
@@ -5509,19 +5053,6 @@ mod tests {
         assert!((op.logdet() - expected_logdet).abs() < 1e-10);
         let trace = op.trace_hinv_product(&Array2::eye(2));
         assert!(trace.is_finite());
-
-        // Verify spectral_regularize_deriv via finite differences
-        let fd_h = 1e-7;
-        for &sigma in &[0.0, 2.0, -0.5, 1.0] {
-            let analytic = spectral_regularize_deriv(sigma, epsilon);
-            let fd = (spectral_regularize(sigma + fd_h, epsilon)
-                - spectral_regularize(sigma - fd_h, epsilon))
-                / (2.0 * fd_h);
-            assert!(
-                (analytic - fd).abs() < 1e-5,
-                "spectral_regularize_deriv mismatch at sigma={sigma}: analytic={analytic}, fd={fd}"
-            );
-        }
     }
 
     #[test]
@@ -5803,32 +5334,6 @@ mod tests {
             estimates[1],
             exact2,
             rel_err2,
-        );
-    }
-
-    #[test]
-    fn test_stochastic_trace_single_convenience() {
-        let h = array![[5.0, 1.0], [1.0, 3.0],];
-        let a = array![[1.0, 0.0], [0.0, 1.0],];
-        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
-        let exact = op.trace_hinv_product(&a);
-
-        let config = StochasticTraceConfig {
-            n_probes_min: 30,
-            n_probes_max: 100,
-            relative_tol: 0.01,
-            tau_rel: 1e-10,
-            seed: 123,
-        };
-        let stochastic = stochastic_trace_hinv_product(&op, &a, &config);
-
-        let rel_err = (stochastic - exact).abs() / exact.abs().max(1e-10);
-        assert!(
-            rel_err < 0.05,
-            "Single trace: est={:.6}, exact={:.6}, rel_err={:.4}",
-            stochastic,
-            exact,
-            rel_err,
         );
     }
 

@@ -405,7 +405,7 @@ impl FdGradientState<EstimationError> for RemlState<'_> {
     }
 
     fn last_ridge_used(&self) -> Option<f64> {
-        RemlState::lastridge_used(self)
+        RemlState::last_ridge_used(self)
     }
 }
 
@@ -1565,7 +1565,7 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        use crate::solver::strategy::{
+        use crate::solver::outer_strategy::{
             ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
         };
 
@@ -1619,7 +1619,7 @@ where
         };
 
         let strategy_result =
-            crate::solver::strategy::run_outer(&mut obj, &outer_config, "standard REML")?;
+            crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "standard REML")?;
         let outer_result = strategy_result.into_smoothing_result();
         (
             outer_result.rho.clone(),
@@ -1672,7 +1672,7 @@ where
         smoothing_options_mix.fdhessian_max_dim = 0;
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         smoothing_options_mix.seed_config.num_auxiliary_trailing = aux_dim_outer;
-        use crate::solver::strategy::{
+        use crate::solver::outer_strategy::{
             ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
             OuterEval,
         };
@@ -1908,7 +1908,7 @@ where
                 ) -> Result<EfsEval, EstimationError>,
             >,
         };
-        let strategy_result = crate::solver::strategy::run_outer(
+        let strategy_result = crate::solver::outer_strategy::run_outer(
             &mut obj,
             &outer_config,
             "mixture/SAS flexible link",
@@ -4596,7 +4596,7 @@ where
     );
 
     let cost = reml_state.compute_cost(rho)?;
-    let ridge = reml_state.lastridge_used().unwrap_or(0.0);
+    let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
     Ok((cost, ridge))
 }
 

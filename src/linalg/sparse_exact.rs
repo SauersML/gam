@@ -134,13 +134,6 @@ impl SparseTraceWorkspace {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct SparseOperatorBlockSupport {
-    pub p_start: usize,
-    pub p_end: usize,
-    pub strict: bool,
-}
-
 pub fn dense_to_sparse(
     matrix: &Array2<f64>,
     tol: f64,

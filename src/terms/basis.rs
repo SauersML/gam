@@ -2003,6 +2003,134 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
+    /// Compute (∂²X/∂ψ_d²)^T v — diagonal second derivative, same axis.
+    ///
+    /// Matrix-free variant of `materialize_second_diag`: avoids forming the
+    /// full (n × p_out) matrix when only a single adjoint matvec is needed.
+    pub fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
+        assert!(axis < self.n_axes);
+        assert_eq!(v.len(), self.n);
+        let af = &self.axis_components;
+        let qv = &self.q_values;
+        let tv = &self.t_values;
+        let raw = self.accumulate_knot_vector(v, |idx| {
+            let s = af[[idx, axis]];
+            2.0 * qv[idx] * s + tv[idx] * s * s
+        });
+        self.project_and_pad(&raw)
+    }
+
+    /// Compute (∂²X/∂ψ_d∂ψ_e)^T v — cross second derivative (d ≠ e).
+    pub fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<f64>,
+    ) -> Array1<f64> {
+        assert!(axis_d < self.n_axes);
+        assert!(axis_e < self.n_axes);
+        assert_ne!(axis_d, axis_e);
+        assert_eq!(v.len(), self.n);
+        let af = &self.axis_components;
+        let tv = &self.t_values;
+        let raw =
+            self.accumulate_knot_vector(v, |idx| tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]);
+        self.project_and_pad(&raw)
+    }
+
+    /// Compute (∂²X/∂ψ_d²) u — forward diagonal second derivative.
+    pub fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
+        assert!(axis < self.n_axes);
+        assert_eq!(u.len(), self.p_out());
+
+        let u_knot = self.unproject(u);
+        let n = self.n;
+        let k = self.n_knots;
+        let af = &self.axis_components;
+        let qv = &self.q_values;
+        let tv = &self.t_values;
+        let compute_row = |i: usize| -> f64 {
+            let base = i * k;
+            let mut val = 0.0;
+            for j in 0..k {
+                let s = af[[base + j, axis]];
+                val += (2.0 * qv[base + j] * s + tv[base + j] * s * s) * u_knot[j];
+            }
+            val
+        };
+
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
+            let mut result = Array1::<f64>::zeros(n);
+            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                    let local: Vec<f64> = (start..end).map(compute_row).collect();
+                    (start, local)
+                })
+                .collect();
+            for (start, vals) in chunk_results {
+                for (offset, &value) in vals.iter().enumerate() {
+                    result[start + offset] = value;
+                }
+            }
+            result
+        } else {
+            Array1::from_vec((0..n).map(compute_row).collect())
+        }
+    }
+
+    /// Compute (∂²X/∂ψ_d∂ψ_e) u — forward cross second derivative.
+    pub fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<f64>,
+    ) -> Array1<f64> {
+        assert!(axis_d < self.n_axes);
+        assert!(axis_e < self.n_axes);
+        assert_ne!(axis_d, axis_e);
+        assert_eq!(u.len(), self.p_out());
+
+        let u_knot = self.unproject(u);
+        let n = self.n;
+        let k = self.n_knots;
+        let af = &self.axis_components;
+        let tv = &self.t_values;
+        let compute_row = |i: usize| -> f64 {
+            let base = i * k;
+            let mut val = 0.0;
+            for j in 0..k {
+                val += tv[base + j] * af[[base + j, axis_d]] * af[[base + j, axis_e]] * u_knot[j];
+            }
+            val
+        };
+
+        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+            let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
+            let mut result = Array1::<f64>::zeros(n);
+            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                    let local: Vec<f64> = (start..end).map(compute_row).collect();
+                    (start, local)
+                })
+                .collect();
+            for (start, vals) in chunk_results {
+                for (offset, &value) in vals.iter().enumerate() {
+                    result[start + offset] = value;
+                }
+            }
+            result
+        } else {
+            Array1::from_vec((0..n).map(compute_row).collect())
+        }
+    }
+
     /// Materialize the full (n × p_out) first-derivative matrix for axis d.
     ///
     /// Efficient O(n * k) construction: builds the raw (n × k) kernel derivative
@@ -2044,144 +2172,9 @@ impl ImplicitDesignPsiDerivative {
         self.project_matrix(raw)
     }
 
-    /// Compute (∂²X/∂ψ_d²)^T v — diagonal second derivative, same axis.
-    ///
-    /// Matrix-free variant of `materialize_second_diag`: avoids forming the
-    /// full (n × p) matrix when only a single matvec product is needed.
-    /// Formula in raw knot space:
-    ///   [raw]_j = Σ_i v_i · [2 · q_{ij} · s_{d,ij} + t_{ij} · s_{d,ij}²]
-    pub fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<f64>) -> Array1<f64> {
-        assert!(axis < self.n_axes);
-        assert_eq!(v.len(), self.n);
-        let af = &self.axis_components;
-        let qv = &self.q_values;
-        let tv = &self.t_values;
-        let raw = self.accumulate_knot_vector(v, |idx| {
-            let s = af[[idx, axis]];
-            2.0 * qv[idx] * s + tv[idx] * s * s
-        });
-        self.project_and_pad(&raw)
-    }
-
-    /// Compute (∂²X/∂ψ_d∂ψ_e)^T v — cross second derivative (d ≠ e).
-    ///
-    /// Matrix-free cross-axis variant: captures the rank-1 coupling
-    /// t · s_d · s_e between different anisotropy axes.
-    pub fn transpose_mul_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        v: &ArrayView1<f64>,
-    ) -> Array1<f64> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
-        assert_ne!(axis_d, axis_e);
-        assert_eq!(v.len(), self.n);
-        let af = &self.axis_components;
-        let tv = &self.t_values;
-        let raw =
-            self.accumulate_knot_vector(v, |idx| tv[idx] * af[[idx, axis_d]] * af[[idx, axis_e]]);
-        self.project_and_pad(&raw)
-    }
-
-    /// Compute (∂²X/∂ψ_d²) u — forward diagonal second derivative.
-    ///
-    /// Parallel-chunked forward product for scaling to large n.
-    pub fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<f64>) -> Array1<f64> {
-        assert!(axis < self.n_axes);
-        assert_eq!(u.len(), self.p_out());
-        let u_knot = self.unproject(u);
-        let n = self.n;
-        let k = self.n_knots;
-        let af = &self.axis_components;
-        let qv = &self.q_values;
-        let tv = &self.t_values;
-        let compute_row = |i: usize| -> f64 {
-            let base = i * k;
-            let mut val = 0.0;
-            for j in 0..k {
-                let s = af[[base + j, axis]];
-                val += (2.0 * qv[base + j] * s + tv[base + j] * s * s) * u_knot[j];
-            }
-            val
-        };
-        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
-            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
-            let mut result = Array1::<f64>::zeros(n);
-            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
-                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
-                    let local: Vec<f64> = (start..end).map(|i| compute_row(i)).collect();
-                    (start, local)
-                })
-                .collect();
-            for (start, vals) in chunk_results {
-                for (offset, &v) in vals.iter().enumerate() {
-                    result[start + offset] = v;
-                }
-            }
-            result
-        } else {
-            Array1::from_vec((0..n).map(compute_row).collect())
-        }
-    }
-
-    /// Compute (∂²X/∂ψ_d∂ψ_e) u — forward cross second derivative.
-    ///
-    /// Parallel-chunked forward product for cross-axis coupling.
-    pub fn forward_mul_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        u: &ArrayView1<f64>,
-    ) -> Array1<f64> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
-        assert_ne!(axis_d, axis_e);
-        assert_eq!(u.len(), self.p_out());
-        let u_knot = self.unproject(u);
-        let n = self.n;
-        let k = self.n_knots;
-        let af = &self.axis_components;
-        let tv = &self.t_values;
-        let compute_row = |i: usize| -> f64 {
-            let base = i * k;
-            let mut val = 0.0;
-            for j in 0..k {
-                val += tv[base + j] * af[[base + j, axis_d]] * af[[base + j, axis_e]] * u_knot[j];
-            }
-            val
-        };
-        if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
-            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
-            let mut result = Array1::<f64>::zeros(n);
-            let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
-                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
-                    let local: Vec<f64> = (start..end).map(|i| compute_row(i)).collect();
-                    (start, local)
-                })
-                .collect();
-            for (start, vals) in chunk_results {
-                for (offset, &v) in vals.iter().enumerate() {
-                    result[start + offset] = v;
-                }
-            }
-            result
-        } else {
-            Array1::from_vec((0..n).map(compute_row).collect())
-        }
-    }
-
     /// Materialize the full (n × p_out) cross second derivative matrix for axes (d, e).
     ///
     /// Dense materialization of the t · s_d · s_e cross coupling.
-    /// Use the matrix-free `transpose_mul_second_cross` / `forward_mul_second_cross`
-    /// variants when only matvec products are needed.
     pub fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
         assert!(axis_d < self.n_axes);
         assert!(axis_e < self.n_axes);
@@ -15191,7 +15184,7 @@ mod tests {
         ] {
             for &r in &[0.05, 0.2, 0.7, 1.5, 3.0] {
                 let (_, phi_r, phi_rr) = matern_kernel_radial_triplet(r, ls, nu).expect("triplet");
-                let (_, q, t) = matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
+                let (_, _, t) = matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
                 let q_check = phi_r / r;
                 let t_ref = (phi_rr - q_check) / (r * r);
                 assert!(

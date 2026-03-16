@@ -7,7 +7,8 @@ use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HyperCoord, HyperCoordPair, InnerSolutionBuilder,
+    HessianDerivativeProvider, HyperCoord, HyperCoordPair, HyperOperator,
+    InnerSolutionBuilder,
     compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
     reml_laml_evaluate,
 };
@@ -18,8 +19,10 @@ use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
-use ndarray::{Array1, Array2};
-use std::sync::Arc;
+use ndarray::{Array1, Array2, ArrayView1};
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
 
 /// Static specification for one parameter block in a custom family.
@@ -921,6 +924,326 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub implicit_group_id: Option<usize>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CustomFamilyPsiDesignAction {
+    operator: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    axis: usize,
+    row_range: Range<usize>,
+    p: usize,
+}
+
+impl CustomFamilyPsiDesignAction {
+    pub(crate) fn from_first_derivative(
+        deriv: &CustomFamilyBlockPsiDerivative,
+        total_rows: usize,
+        p: usize,
+        row_range: Range<usize>,
+        label: &str,
+    ) -> Result<Self, String> {
+        if row_range.end > total_rows {
+            return Err(format!(
+                "{label} row range {}..{} exceeds total rows {total_rows}",
+                row_range.start, row_range.end
+            ));
+        }
+        if let Some(op) = deriv.implicit_operator.as_ref() {
+            if op.n_data() == total_rows && op.p_out() == p {
+                return Ok(Self {
+                    operator: Arc::clone(op),
+                    axis: deriv.implicit_axis,
+                    row_range,
+                    p,
+                });
+            }
+        }
+        Err(format!(
+            "{label} is missing an implicit x_psi operator with shape {}x{}; got dense payload {}x{} instead",
+            total_rows,
+            p,
+            deriv.x_psi.nrows(),
+            deriv.x_psi.ncols(),
+        ))
+    }
+
+    pub(crate) fn is_implicit(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn nrows(&self) -> usize {
+        self.row_range.end - self.row_range.start
+    }
+
+    pub(crate) fn slice_rows(&self, row_range: Range<usize>) -> Result<Self, String> {
+        if row_range.end > self.nrows() {
+            return Err(format!(
+                "psi design row range {}..{} exceeds available rows {}",
+                row_range.start,
+                row_range.end,
+                self.nrows()
+            ));
+        }
+        Ok(Self {
+            operator: Arc::clone(&self.operator),
+            axis: self.axis,
+            row_range: (self.row_range.start + row_range.start)..(self.row_range.start + row_range.end),
+            p: self.p,
+        })
+    }
+
+    pub(crate) fn forward_mul(&self, u: ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(u.len(), self.p);
+        self.operator
+            .forward_mul(self.axis, &u)
+            .slice(ndarray::s![self.row_range.clone()])
+            .to_owned()
+    }
+
+    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(v.len(), self.row_range.end - self.row_range.start);
+        if self.row_range.start == 0 && self.row_range.end == self.operator.n_data() {
+            self.operator.transpose_mul(self.axis, &v)
+        } else {
+            let mut expanded = Array1::<f64>::zeros(self.operator.n_data());
+            expanded
+                .slice_mut(ndarray::s![self.row_range.clone()])
+                .assign(&v);
+            self.operator.transpose_mul(self.axis, &expanded.view())
+        }
+    }
+}
+
+pub(crate) struct CustomFamilyJointDesignChannel {
+    range: Range<usize>,
+    design: Arc<Array2<f64>>,
+    psi_derivative: Option<CustomFamilyPsiDesignAction>,
+}
+
+impl CustomFamilyJointDesignChannel {
+    pub(crate) fn new(
+        range: Range<usize>,
+        design: Arc<Array2<f64>>,
+        psi_derivative: Option<CustomFamilyPsiDesignAction>,
+    ) -> Self {
+        Self {
+            range,
+            design,
+            psi_derivative,
+        }
+    }
+}
+
+pub(crate) struct CustomFamilyJointDesignPairContribution {
+    left_channel: usize,
+    right_channel: usize,
+    weights: Array1<f64>,
+    drift_weights: Array1<f64>,
+}
+
+impl CustomFamilyJointDesignPairContribution {
+    pub(crate) fn new(
+        left_channel: usize,
+        right_channel: usize,
+        weights: Array1<f64>,
+        drift_weights: Array1<f64>,
+    ) -> Self {
+        Self {
+            left_channel,
+            right_channel,
+            weights,
+            drift_weights,
+        }
+    }
+}
+
+pub(crate) struct CustomFamilyJointPsiOperator {
+    total_dim: usize,
+    channels: Vec<CustomFamilyJointDesignChannel>,
+    pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
+}
+
+impl CustomFamilyJointPsiOperator {
+    pub(crate) fn new(
+        total_dim: usize,
+        channels: Vec<CustomFamilyJointDesignChannel>,
+        pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
+    ) -> Self {
+        Self {
+            total_dim,
+            channels,
+            pair_contributions,
+        }
+    }
+}
+
+impl HyperOperator for CustomFamilyJointPsiOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(v.len(), self.total_dim);
+        let base_vals: Vec<Array1<f64>> = self
+            .channels
+            .iter()
+            .map(|channel| channel.design.dot(&v.slice(ndarray::s![channel.range.clone()])))
+            .collect();
+        let deriv_vals: Vec<Option<Array1<f64>>> = self
+            .channels
+            .iter()
+            .map(|channel| {
+                channel.psi_derivative.as_ref().map(|deriv| {
+                    deriv.forward_mul(v.slice(ndarray::s![channel.range.clone()]))
+                })
+            })
+            .collect();
+
+        let mut out = Array1::<f64>::zeros(self.total_dim);
+        for pair in &self.pair_contributions {
+            let left = &self.channels[pair.left_channel];
+            let right_base = &base_vals[pair.right_channel];
+            let weighted_drift = &pair.drift_weights * right_base;
+            let mut contrib = left.design.t().dot(&weighted_drift);
+
+            if let Some(left_deriv) = left.psi_derivative.as_ref() {
+                let weighted_right = &pair.weights * right_base;
+                contrib += &left_deriv.transpose_mul(weighted_right.view());
+            }
+
+            if let Some(right_deriv) = deriv_vals[pair.right_channel].as_ref() {
+                let weighted_right = &pair.weights * right_deriv;
+                contrib += &left.design.t().dot(&weighted_right);
+            }
+
+            let mut out_slice = out.slice_mut(ndarray::s![left.range.clone()]);
+            out_slice += &contrib;
+        }
+
+        out
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        assert_eq!(v.len(), self.total_dim);
+        assert_eq!(u.len(), self.total_dim);
+        let base_v: Vec<Array1<f64>> = self
+            .channels
+            .iter()
+            .map(|channel| channel.design.dot(&v.slice(ndarray::s![channel.range.clone()])))
+            .collect();
+        let base_u: Vec<Array1<f64>> = self
+            .channels
+            .iter()
+            .map(|channel| channel.design.dot(&u.slice(ndarray::s![channel.range.clone()])))
+            .collect();
+        let deriv_v: Vec<Option<Array1<f64>>> = self
+            .channels
+            .iter()
+            .map(|channel| {
+                channel.psi_derivative.as_ref().map(|deriv| {
+                    deriv.forward_mul(v.slice(ndarray::s![channel.range.clone()]))
+                })
+            })
+            .collect();
+        let deriv_u: Vec<Option<Array1<f64>>> = self
+            .channels
+            .iter()
+            .map(|channel| {
+                channel.psi_derivative.as_ref().map(|deriv| {
+                    deriv.forward_mul(u.slice(ndarray::s![channel.range.clone()]))
+                })
+            })
+            .collect();
+
+        let mut total = 0.0;
+        for pair in &self.pair_contributions {
+            let left_base_u = &base_u[pair.left_channel];
+            let right_base_v = &base_v[pair.right_channel];
+            total += left_base_u.dot(&(&pair.drift_weights * right_base_v));
+
+            if let Some(left_deriv_u) = deriv_u[pair.left_channel].as_ref() {
+                total += left_deriv_u.dot(&(&pair.weights * right_base_v));
+            }
+            if let Some(right_deriv_v) = deriv_v[pair.right_channel].as_ref() {
+                total += left_base_u.dot(&(&pair.weights * right_deriv_v));
+            }
+        }
+
+        total
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.total_dim, self.total_dim));
+        let mut basis = Array1::<f64>::zeros(self.total_dim);
+        for j in 0..self.total_dim {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        self.channels
+            .iter()
+            .any(|channel| channel.psi_derivative.as_ref().is_some_and(|d| d.is_implicit()))
+    }
+}
+
+struct DenseAddedHyperOperator {
+    base: Box<dyn HyperOperator>,
+    dense_addition: Array2<f64>,
+}
+
+impl HyperOperator for DenseAddedHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.base.mul_vec(v) + self.dense_addition.dot(v)
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        self.base.bilinear(v, u) + u.dot(&self.dense_addition.dot(v))
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.base.to_dense() + &self.dense_addition
+    }
+
+    fn is_implicit(&self) -> bool {
+        self.base.is_implicit()
+    }
+}
+
+fn maybe_add_dense_to_operator(
+    base: Option<Box<dyn HyperOperator>>,
+    dense_addition: Array2<f64>,
+) -> Option<Box<dyn HyperOperator>> {
+    if dense_addition.iter().all(|v| *v == 0.0) {
+        return base;
+    }
+    base.map(|op| {
+        Box::new(DenseAddedHyperOperator {
+            base: op,
+            dense_addition,
+        }) as Box<dyn HyperOperator>
+    })
+}
+
+fn shared_dense_design_cache() -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn shared_dense_arc(x: &Array2<f64>) -> Arc<Array2<f64>> {
+    let key = (x.as_ptr() as usize, x.nrows(), x.ncols());
+    let cache = shared_dense_design_cache();
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(shared) = guard.get(&key).and_then(Weak::upgrade) {
+            return shared;
+        }
+        let shared = Arc::new(x.clone());
+        guard.insert(key, Arc::downgrade(&shared));
+        shared
+    } else {
+        Arc::new(x.clone())
+    }
+}
+
 pub(crate) fn resolve_custom_family_x_psi(
     deriv: &CustomFamilyBlockPsiDerivative,
     n: usize,
@@ -1005,11 +1328,22 @@ pub(crate) fn resolve_custom_family_x_psi_psi(
     Ok(Array2::<f64>::zeros((n, p)))
 }
 
-#[derive(Clone)]
 pub struct ExactNewtonJointPsiTerms {
     pub objective_psi: f64,
     pub score_psi: Array1<f64>,
     pub hessian_psi: Array2<f64>,
+    pub hessian_psi_operator: Option<Box<dyn HyperOperator>>,
+}
+
+impl ExactNewtonJointPsiTerms {
+    fn zeros(total: usize) -> Self {
+        Self {
+            objective_psi: 0.0,
+            score_psi: Array1::zeros(total),
+            hessian_psi: Array2::zeros((total, total)),
+            hessian_psi_operator: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2321,70 +2655,27 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
     Ok(2.0 * chol.diag().mapv(f64::ln).sum())
 }
 
-struct PsdPositivePartGeometry {
-    pinv: Array2<f64>,
-    logdet: f64,
-}
-
-fn strict_psd_positive_part_geometry(
-    matrix: &Array2<f64>,
-) -> Result<PsdPositivePartGeometry, String> {
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower)
-        .map_err(|e| format!("strict pseudo-laplace PSD eigendecomposition failed: {e}"))?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let tol = (max_abs_eval * 1e-12).max(1e-14);
-    if evals.iter().any(|&ev| ev < -tol) {
-        return Err("strict pseudo-laplace SPD solve failed".to_string());
-    }
-    let p = matrix.nrows();
-    let mut pinv = Array2::<f64>::zeros((p, p));
-    let mut logdet = 0.0;
-    for k in 0..p {
-        let ev = evals[k];
-        if ev > tol {
-            logdet += ev.ln();
-            let inv_ev = 1.0 / ev;
-            for i in 0..p {
-                let uik = evecs[(i, k)];
-                for j in 0..p {
-                    pinv[[i, j]] += inv_ev * uik * evecs[(j, k)];
-                }
-            }
-        }
-    }
-    Ok(PsdPositivePartGeometry { pinv, logdet })
-}
-
-#[cfg(test)]
-fn strict_solve_spdwith_semidefinite_option(
-    matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-    allow_semidefinite: bool,
-) -> Result<Array1<f64>, String> {
-    if allow_semidefinite {
-        return Ok(strict_psd_positive_part_geometry(matrix)?.pinv.dot(rhs));
-    }
-    strict_solve_spd(matrix, rhs)
-}
-
-fn strict_inverse_spdwith_semidefinite_option(
-    matrix: &Array2<f64>,
-    allow_semidefinite: bool,
-) -> Result<Array2<f64>, String> {
-    if allow_semidefinite {
-        return Ok(strict_psd_positive_part_geometry(matrix)?.pinv);
-    }
-    strict_inverse_spd(matrix)
-}
-
 fn strict_logdet_spd_with_semidefinite_option(
     matrix: &Array2<f64>,
     allow_semidefinite: bool,
 ) -> Result<f64, String> {
     if allow_semidefinite {
-        return Ok(strict_psd_positive_part_geometry(matrix)?.logdet);
+        let mut sym = matrix.clone();
+        symmetrize_dense_in_place(&mut sym);
+        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower)
+            .map_err(|e| format!("strict pseudo-laplace PSD eigendecomposition failed: {e}"))?;
+        let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+        let tol = (max_abs_eval * 1e-12).max(1e-14);
+        if evals.iter().any(|&ev| ev < -tol) {
+            return Err("strict pseudo-laplace SPD solve failed".to_string());
+        }
+        let logdet = evals
+            .iter()
+            .copied()
+            .filter(|&ev| ev > tol)
+            .map(f64::ln)
+            .sum();
+        return Ok(logdet);
     }
     strict_logdet_spd(matrix)
 }
@@ -3812,11 +4103,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             // 1. Get family-provided likelihood objects (joint flattened space).
             let psi_terms = family
                 .exact_newton_joint_psi_terms(synced_states, specs, derivative_blocks, psi_global)?
-                .unwrap_or_else(|| ExactNewtonJointPsiTerms {
-                    objective_psi: 0.0,
-                    score_psi: Array1::zeros(total),
-                    hessian_psi: Array2::zeros((total, total)),
-                });
+                .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total));
 
             // 2. Assemble S_ψ from penalty derivatives, embed into joint space.
             let s_psi_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
@@ -3826,7 +4113,18 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             let s_psi_beta = s_psi.dot(beta_flat);
             let a = psi_terms.objective_psi + 0.5 * beta_flat.dot(&s_psi_beta);
             let g = &psi_terms.score_psi + &s_psi_beta;
-            let b_mat = &psi_terms.hessian_psi + &s_psi;
+            let dense_b = if psi_terms.hessian_psi.nrows() == 0 {
+                s_psi.clone()
+            } else {
+                &psi_terms.hessian_psi + &s_psi
+            };
+            let b_operator =
+                maybe_add_dense_to_operator(psi_terms.hessian_psi_operator, dense_b.clone());
+            let b_mat = if b_operator.is_some() {
+                Array2::<f64>::zeros((0, 0))
+            } else {
+                dense_b
+            };
             let ld_s = if let Some(sp) = s_pinv {
                 trace_product(sp, &s_psi)
             } else {
@@ -3836,8 +4134,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             coords.push(HyperCoord {
                 a,
                 g,
-                b_mat: b_mat.to_owned(),
-                b_operator: None,
+                b_mat,
+                b_operator,
                 ld_s,
                 b_depends_on_beta: !hessian_beta_independent,
                 // ψ coordinates move the design/likelihood, so b_mat need not
@@ -4998,7 +5296,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
-    use crate::solver::strategy::{
+    use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
     };
 
@@ -5168,11 +5466,12 @@ pub fn fit_custom_family<F: CustomFamily>(
                 &mut CustomOuterState,
                 &Array1<f64>,
             )
-                -> Result<crate::solver::strategy::EfsEval, crate::estimate::EstimationError>,
+                -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
         >,
     };
 
-    let outer_result = crate::solver::strategy::run_outer(&mut obj, &outer_config, "custom family");
+    let outer_result =
+        crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "custom family");
 
     let last_error_detail = obj
         .state
@@ -5610,6 +5909,7 @@ mod tests {
                 objective_psi: 3.5,
                 score_psi: array![0.0],
                 hessian_psi: array![[0.0]],
+                hessian_psi_operator: None,
             }))
         }
     }
@@ -6053,34 +6353,6 @@ mod tests {
             msg.contains("strict pseudo-laplace SPD")
                 || msg.contains("strict pseudo-laplace SPD logdet"),
             "unexpected error message: {msg}"
-        );
-    }
-
-    #[test]
-    fn strict_psd_positive_part_geometry_accepts_semidefinite_boundary() {
-        let h = array![[4.0, 0.0], [0.0, 0.0]];
-        let rhs = array![8.0, 3.0];
-        let sol = strict_solve_spdwith_semidefinite_option(&h, &rhs, true)
-            .expect("semidefinite positive-part solve");
-        let inv = strict_inverse_spdwith_semidefinite_option(&h, true)
-            .expect("semidefinite positive-part inverse");
-        let logdet = strict_logdet_spd_with_semidefinite_option(&h, true)
-            .expect("semidefinite positive-part logdet");
-        assert!((sol[0] - 2.0).abs() < 1e-12);
-        assert!(sol[1].abs() < 1e-12);
-        assert!((inv[[0, 0]] - 0.25).abs() < 1e-12);
-        assert!(inv[[1, 1]].abs() < 1e-12);
-        assert!((logdet - 4.0_f64.ln()).abs() < 1e-12);
-    }
-
-    #[test]
-    fn strict_psd_positive_part_geometry_still_rejects_indefinite_matrix() {
-        let h = array![[1.0, 0.0], [0.0, -1e-3]];
-        let err = strict_solve_spdwith_semidefinite_option(&h, &array![1.0, 0.0], true)
-            .expect_err("indefinite matrix must still be rejected");
-        assert!(
-            err.contains("strict pseudo-laplace SPD solve failed"),
-            "unexpected error: {err}"
         );
     }
 
