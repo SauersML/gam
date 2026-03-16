@@ -3374,13 +3374,21 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut states = buildblock_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
     let has_joint_exacthessian = family.exact_newton_joint_hessian(&states)?.is_some();
+    // For exact Newton families (GAMLSS), tighten tolerance but don't go
+    // below 1e-8 — blockwise coordinate descent converges linearly, so
+    // 1e-10 wastes many cycles for marginal improvement. The outer REML
+    // only needs the inner solve accurate to ~1e-6 of the smoothing
+    // parameter gradient, so 1e-8 is more than sufficient.
     let inner_tol = if has_joint_exacthessian {
-        options.inner_tol.min(1e-10)
+        options.inner_tol.min(1e-8)
     } else {
         options.inner_tol
     };
+    // Cap at 500 cycles instead of 4000. Well-conditioned GAMLSS
+    // converges in 20-100 cycles. If 500 isn't enough, the problem
+    // is pathologically ill-conditioned and more cycles won't help.
     let inner_max_cycles = if has_joint_exacthessian {
-        options.inner_max_cycles.max(4000)
+        options.inner_max_cycles.max(500)
     } else {
         options.inner_max_cycles
     };
