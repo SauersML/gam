@@ -45,7 +45,7 @@ impl<'a> PredictionCovarianceBackend<'a> {
     pub(crate) fn nrows(&self) -> usize {
         match self {
             Self::Dense(covariance) => covariance.nrows(),
-            Self::Factorized(_) => self.parameter_dim(),
+            Self::Factorized { .. } => self.parameter_dim(),
         }
     }
 
@@ -237,11 +237,7 @@ mod tests {
 
     #[test]
     fn rowwise_local_covariances_match_dense_direct_formula() {
-        let covariance = array![
-            [2.0, 0.3, 0.1],
-            [0.3, 1.5, -0.2],
-            [0.1, -0.2, 1.1]
-        ];
+        let covariance = array![[2.0, 0.3, 0.1], [0.3, 1.5, -0.2], [0.1, -0.2, 1.1]];
         let backend = PredictionCovarianceBackend::from_dense(covariance.view());
         let grads0 = array![[1.0, 0.0, 2.0], [0.5, -1.0, 0.0], [0.0, 1.0, 1.0]];
         let grads1 = array![[0.0, 1.0, 1.0], [1.0, 0.5, -0.5], [2.0, 0.0, 0.5]];
@@ -267,11 +263,7 @@ mod tests {
 
     #[test]
     fn rowwise_local_covariances_match_factorized_precision() {
-        let precision = array![
-            [4.0, 1.0, 0.0],
-            [1.0, 3.5, 0.2],
-            [0.0, 0.2, 2.5]
-        ];
+        let precision = array![[4.0, 1.0, 0.0], [1.0, 3.5, 0.2], [0.0, 0.2, 2.5]];
         let covariance = crate::linalg::utils::matrix_inversewith_regularization(
             &precision,
             "prediction linalg test covariance",

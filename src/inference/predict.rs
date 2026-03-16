@@ -2,8 +2,7 @@ use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitRes
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
 use crate::inference::prediction_linalg::{
-    PredictionCovarianceBackend, dense_row_chunk, design_row_chunk, prediction_chunk_rows,
-    rowwise_local_covariances,
+    PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows, rowwise_local_covariances,
 };
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
@@ -14,15 +13,6 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::InverseLink;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-
-pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
-    let p = cov.nrows().min(cov.ncols());
-    let mut se = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        se[i] = cov[[i, i]].max(0.0).sqrt();
-    }
-    se
-}
 
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
@@ -106,18 +96,16 @@ fn selected_uncertainty_backend<'a>(
     label: &str,
 ) -> Result<(PredictionCovarianceBackend<'a>, bool), EstimationError> {
     match requested_mode {
-        InferenceCovarianceMode::Conditional => conditional_prediction_backend(
-            fit,
-            expected_dim,
-            label,
-        )
-        .map(|backend| (backend, false))
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(
+        InferenceCovarianceMode::Conditional => {
+            conditional_prediction_backend(fit, expected_dim, label)
+                .map(|backend| (backend, false))
+                .ok_or_else(|| {
+                    EstimationError::InvalidInput(
                 "fit result does not contain conditional covariance or a usable penalized Hessian"
                     .to_string(),
             )
-        }),
+                })
+        }
         InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
             if let Some(covariance) = fit.beta_covariance_corrected() {
                 if covariance.nrows() != expected_dim || covariance.ncols() != expected_dim {
@@ -218,14 +206,6 @@ fn linear_predictorvariance_from_backend(
     Ok(local[0][0].mapv(|v| v.max(0.0)))
 }
 
-fn linear_predictorvariance(
-    x: &DesignMatrix,
-    cov: &Array2<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    let backend = PredictionCovarianceBackend::from_dense(cov.view());
-    linear_predictorvariance_from_backend(x, &backend)
-}
-
 const POSTERIOR_MEAN_VARIANCE_TOL: f64 = 1e-10;
 const POSTERIOR_MEAN_CROSS_TOL: f64 = 1e-10;
 
@@ -293,7 +273,9 @@ fn project_two_block_linear_predictor_covariance(
         let rows_in_chunk = rows.end - rows.start;
         let mut first = Array2::<f64>::zeros((rows_in_chunk, p_total));
         let mut second = Array2::<f64>::zeros((rows_in_chunk, p_total));
-        first.slice_mut(ndarray::s![.., 0..p_first]).assign(&x_first);
+        first
+            .slice_mut(ndarray::s![.., 0..p_first])
+            .assign(&x_first);
         second
             .slice_mut(ndarray::s![.., p_first..p_total])
             .assign(&x_second);
@@ -1210,8 +1192,7 @@ impl BernoulliMarginalSlopePredictor {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
             let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)?;
             let grad = grad.ok_or_else(|| {
-                "bernoulli marginal-slope analytic predictor gradient was not produced"
-                    .to_string()
+                "bernoulli marginal-slope analytic predictor gradient was not produced".to_string()
             })?;
             Ok(vec![grad])
         })
@@ -1236,8 +1217,7 @@ impl BernoulliMarginalSlopePredictor {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
             let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)?;
             let grad = grad.ok_or_else(|| {
-                "bernoulli marginal-slope analytic predictor gradient was not produced"
-                    .to_string()
+                "bernoulli marginal-slope analytic predictor gradient was not produced".to_string()
             })?;
             Ok(vec![grad])
         })
@@ -1890,35 +1870,26 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 for local_row in 0..rows_in_chunk {
                     let i = start + local_row;
                     let solved_t = solved.slice(ndarray::s![.., local_row]).to_owned();
-                    let solved_ls =
-                        solved.slice(ndarray::s![.., rows_in_chunk + local_row]).to_owned();
-                    let var_t = x_t.row(local_row).dot(
-                        &solved_t
-                            .slice(ndarray::s![0..p_t])
-                            .to_owned(),
-                    )
-                    .max(0.0);
-                    let var_ls = x_ls.row(local_row).dot(
-                        &solved_ls
-                            .slice(ndarray::s![p_t..p_t + p_s])
-                            .to_owned(),
-                    )
-                    .max(0.0);
-                    let cov_tls_t = x_t.row(local_row).dot(
-                        &solved_ls
-                            .slice(ndarray::s![0..p_t])
-                            .to_owned(),
-                    );
-                    let cov_tls_ls = x_ls.row(local_row).dot(
-                        &solved_t
-                            .slice(ndarray::s![p_t..p_t + p_s])
-                            .to_owned(),
-                    );
+                    let solved_ls = solved
+                        .slice(ndarray::s![.., rows_in_chunk + local_row])
+                        .to_owned();
+                    let var_t = x_t
+                        .row(local_row)
+                        .dot(&solved_t.slice(ndarray::s![0..p_t]).to_owned())
+                        .max(0.0);
+                    let var_ls = x_ls
+                        .row(local_row)
+                        .dot(&solved_ls.slice(ndarray::s![p_t..p_t + p_s]).to_owned())
+                        .max(0.0);
+                    let cov_tls_t = x_t
+                        .row(local_row)
+                        .dot(&solved_ls.slice(ndarray::s![0..p_t]).to_owned());
+                    let cov_tls_ls = x_ls
+                        .row(local_row)
+                        .dot(&solved_t.slice(ndarray::s![p_t..p_t + p_s]).to_owned());
                     let cov_tls = 0.5 * (cov_tls_t + cov_tls_ls);
                     let suv_t = solved_t.slice(ndarray::s![p_t + p_s..p_total]).to_owned();
-                    let suv_ls = solved_ls
-                        .slice(ndarray::s![p_t + p_s..p_total])
-                        .to_owned();
+                    let suv_ls = solved_ls.slice(ndarray::s![p_t + p_s..p_total]).to_owned();
                     let det = (var_t * var_ls - cov_tls * cov_tls).max(1e-12);
                     let inv_uu = [
                         [var_ls / det, -cov_tls / det],
@@ -1948,8 +1919,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                                 .map_err(EstimationError::InvalidInput)?;
                             let dt = t - eta_t[i];
                             let dls = ls - eta_s[i];
-                            let meanw =
-                                q0 + xw.dot(&betaw) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
+                            let meanw = q0 + xw.dot(&betaw) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
                             let mut varw = 0.0;
                             for r in 0..p_w {
                                 let xr = xw[r];
@@ -2131,9 +2101,7 @@ impl PredictableModel for SurvivalPredictor {
                 for i in 0..rows_in_chunk {
                     let sigma = eta_ls_chunk[i].exp();
                     let q0 = -eta_t_chunk[i] / sigma;
-                    let jet = strategy
-                        .inverse_link_jet(-q0)
-                        .map_err(|e| e.to_string())?;
+                    let jet = strategy.inverse_link_jet(-q0).map_err(|e| e.to_string())?;
                     let phi_neg_q0 = jet.d1;
                     let dsurv_deta_t = phi_neg_q0 / sigma;
                     let dsurv_deta_s = -phi_neg_q0 * eta_t_chunk[i] / sigma;
