@@ -85,6 +85,12 @@ struct MeaninglessConditionalCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for `const _: fn() = func_name;` dead-code anchor patterns
+struct DeadCodeAnchorCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 // A custom collector for #[allow(clippy::no_effect)] with no-op variable access
 struct NoEffectCollector {
     violations: Vec<String>,
@@ -687,6 +693,57 @@ impl MeaninglessConditionalCollector {
         );
 
         Some(error_msg)
+    }
+}
+
+impl DeadCodeAnchorCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let filename = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} dead-code anchor pattern(s) in {}:\n",
+            self.violations.len(),
+            filename
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ `const _: fn() = func_name;` is a dead-code preservation hack.\n",
+        );
+        error_msg.push_str(
+            "   This pattern forces the compiler to keep otherwise-unused functions alive.\n",
+        );
+        error_msg.push_str(
+            "   Either wire the code into a real call site or delete it.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl Sink for DeadCodeAnchorCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
     }
 }
 
@@ -1709,6 +1766,16 @@ fn main() {
     emit_stage_detail(&degenerate_boolean_report);
     allviolations.extend(degenerate_booleanviolations);
 
+    // Scan for `const _: fn() = func;` dead-code anchor hacks
+    update_stage("scan dead-code anchor patterns");
+    let dead_code_anchorviolations = scan_for_dead_code_anchors();
+    let dead_code_anchor_report = format!(
+        "dead-code anchor scan identified {} violation groups",
+        dead_code_anchorviolations.len()
+    );
+    emit_stage_detail(&dead_code_anchor_report);
+    allviolations.extend(dead_code_anchorviolations);
+
     // Scan for #[allow(clippy::no_effect)] attributes
     update_stage("scan #[allow(clippy::no_effect)] attributes");
     let no_effectviolations = scan_for_no_effect_allow();
@@ -2724,6 +2791,56 @@ fn scan_for_meaningless_conditionals() -> Vec<String> {
         Err(e) => {
             allviolations.push(format!(
                 "Error creating meaningless conditional regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    allviolations
+}
+
+fn scan_for_dead_code_anchors() -> Vec<String> {
+    // Catches `const _: fn() = some_func_name;` — the pattern used to keep
+    // otherwise-dead preserve_* functions alive at compile time.
+    let pattern = r"const\s+_\s*:\s*fn\s*\(\s*\)\s*=\s*\w+\s*;";
+    let mut allviolations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let stripped = strip_comments_and_strings_for_content(&content);
+
+                let mut collector = DeadCodeAnchorCollector::new(path);
+
+                if searcher
+                    .search_reader(&matcher, Cursor::new(&stripped), &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    allviolations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            allviolations.push(format!(
+                "Error creating dead-code anchor regex matcher: {}",
                 e
             ));
         }
