@@ -3422,6 +3422,180 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut eta_backups: Vec<Array1<f64>> =
         states.iter().map(|s| Array1::zeros(s.eta.len())).collect();
 
+    // ── Joint Newton fast path ──
+    //
+    // When the family provides an exact joint Hessian (GAMLSS location-scale),
+    // solve the full (p_mu + p_ls) × (p_mu + p_ls) system in one Newton step
+    // per cycle instead of iterating between blocks. This converges quadratically
+    // (5-10 steps) instead of linearly (20-100+ blockwise cycles).
+    //
+    // Falls back to blockwise iteration if the joint Hessian is unavailable,
+    // the joint solve fails, or constraints are present.
+    let has_constraints = specs.iter().any(|s| {
+        family
+            .block_linear_constraints(&states, 0, s)
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let use_joint_newton = has_joint_exacthessian && !has_constraints && specs.len() >= 2;
+
+    if use_joint_newton {
+        // Build block ranges for the joint system.
+        let ranges: Vec<(usize, usize)> = {
+            let mut offset = 0;
+            specs
+                .iter()
+                .map(|s| {
+                    let start = offset;
+                    offset += s.design.ncols();
+                    (start, offset)
+                })
+                .collect()
+        };
+        let total_p: usize = ranges.last().map_or(0, |r| r.1);
+
+        // Assemble joint block-diagonal penalty.
+        let mut s_joint = Array2::<f64>::zeros((total_p, total_p));
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            s_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(s_lambda);
+        }
+        if ridge > 0.0 && options.ridge_policy.include_stabilization_in_objective {
+            for d in 0..total_p {
+                s_joint[[d, d]] += ridge;
+            }
+        }
+
+        for cycle in 0..inner_max_cycles {
+            // Get joint Hessian and block gradients from the current evaluation.
+            let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
+            let Some(h_joint) = h_joint_opt else {
+                break; // Fall back to blockwise if joint Hessian unavailable
+            };
+
+            // Assemble joint penalized system: (H + S) delta = -(S*beta - grad)
+            let mut lhs = h_joint + &s_joint;
+            // Add small ridge for numerical stability
+            for d in 0..total_p {
+                lhs[[d, d]] += 1e-10;
+            }
+
+            // Concatenate block gradients and betas.
+            let mut grad_joint = Array1::<f64>::zeros(total_p);
+            let mut beta_joint = Array1::<f64>::zeros(total_p);
+            for (b, ws) in cached_eval.blockworking_sets.iter().enumerate() {
+                let (start, end) = ranges[b];
+                if let BlockWorkingSet::ExactNewton { gradient, .. } = ws {
+                    grad_joint
+                        .slice_mut(ndarray::s![start..end])
+                        .assign(gradient);
+                } else {
+                    break; // Not all blocks are ExactNewton
+                }
+                beta_joint
+                    .slice_mut(ndarray::s![start..end])
+                    .assign(&states[b].beta);
+            }
+
+            // Stationarity residual: r = S*beta - gradient (for penalized NLL)
+            let rhs = &grad_joint - &s_joint.dot(&beta_joint);
+
+            // Solve the joint system with ridge retries for robustness
+            let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
+            let Some(delta) = solver.solvevectorwithridge_retries(&lhs, &rhs, 1e-10) else {
+                break; // Fall back to blockwise
+            };
+
+            // Trust region: cap step size
+            let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            const MAX_JOINT_STEP: f64 = 20.0;
+            if step_inf > MAX_JOINT_STEP {
+                delta.mapv_inplace(|v| v * (MAX_JOINT_STEP / step_inf));
+            }
+
+            if step_inf <= inner_tol {
+                converged = true;
+                cycles_done = cycle + 1;
+                break;
+            }
+
+            // Line search: try full step, then halve
+            let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
+            let mut accepted = false;
+            for bt in 0..8 {
+                let alpha = 0.5f64.powi(bt);
+                for (b, spec) in specs.iter().enumerate() {
+                    let (start, end) = ranges[b];
+                    states[b].beta.assign(&old_beta[b]);
+                    states[b].beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
+                }
+                refresh_all_block_etas(family, specs, &mut states)?;
+                let trial_ll = family.log_likelihood_only(&states)?;
+                let trial_penalty =
+                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                let trialobjective = -trial_ll + trial_penalty;
+                if trialobjective.is_finite() && trialobjective <= lastobjective + 1e-10 {
+                    lastobjective = trialobjective;
+                    current_penalty = trial_penalty;
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted {
+                // Restore original betas
+                for (b, old) in old_beta.iter().enumerate() {
+                    states[b].beta.assign(old);
+                }
+                refresh_all_block_etas(family, specs, &mut states)?;
+                break; // Fall back to blockwise
+            }
+
+            // Re-evaluate for next iteration and convergence check
+            cached_eval = family.evaluate(&states)?;
+            current_penalty =
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+            lastobjective = -cached_eval.log_likelihood + current_penalty;
+            cycles_done = cycle + 1;
+
+            // Check convergence via joint stationarity
+            if let Some(residual) = exact_newton_joint_stationarity_inf_norm(
+                &cached_eval,
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+            )? {
+                if residual <= inner_tol && step_inf <= inner_tol {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+
+        // If joint Newton converged, skip the blockwise loop entirely.
+        if converged {
+            let penalty_value =
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+            let (block_logdet_h, block_logdet_s) =
+                blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
+            return Ok(BlockwiseInnerResult {
+                block_states: states,
+                active_sets: cached_active_sets,
+                log_likelihood: cached_eval.log_likelihood,
+                penalty_value,
+                cycles: cycles_done,
+                converged,
+                block_logdet_h,
+                block_logdet_s,
+                s_lambdas,
+            });
+        }
+        // Otherwise fall through to blockwise iteration below.
+    }
+
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
         let mut max_beta_step = 0.0_f64;
