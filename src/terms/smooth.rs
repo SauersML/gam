@@ -3140,32 +3140,63 @@ fn fit_term_collection_forspecwith_heuristic_lambdas(
     family: LikelihoodFamily,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
+    let base_design = build_term_collection_design(data, spec)?;
+    fit_term_collection_on_realized_design(
+        y,
+        weights,
+        offset,
+        spec,
+        &base_design,
+        heuristic_lambdas,
+        family,
+        options,
+    )
+}
+
+fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
+    spec.linear_terms.iter().any(|term| {
+        matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Bounded { .. }
+        )
+    })
+}
+
+fn fit_term_collection_on_realized_design(
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+    heuristic_lambdas: Option<&[f64]>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
     if has_bounded_linear_terms(spec) {
-        return fit_bounded_term_collection_forspec(
-            data,
+        return fit_bounded_term_collection_with_design(
             y,
             weights,
             offset,
             spec,
+            design,
             heuristic_lambdas,
             family,
             options,
         );
     }
-    let base_design = build_term_collection_design(data, spec)?;
-    let base_fit_opts = adaptive_fit_options_base(options, &base_design);
+    let base_fit_opts = adaptive_fit_options_base(options, design);
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
-            base_design.design.view(),
+            design.design.view(),
             y,
             weights,
             offset,
-            &base_design.penalties,
+            &design.penalties,
             heuristic_lambdas,
             family,
             &base_fit_opts,
         )?,
-        design: base_design,
+        design: design.clone(),
         adaptive_diagnostics: None,
     };
     enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
@@ -3187,15 +3218,6 @@ fn fit_term_collection_forspecwith_heuristic_lambdas(
         options,
         &runtime_caches,
     )
-}
-
-fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
-    spec.linear_terms.iter().any(|term| {
-        matches!(
-            term.coefficient_geometry,
-            LinearCoefficientGeometry::Bounded { .. }
-        )
-    })
 }
 
 #[derive(Clone)]
@@ -6862,6 +6884,28 @@ fn fit_bounded_term_collection_forspec(
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     let design = build_term_collection_design(data, spec)?;
+    fit_bounded_term_collection_with_design(
+        y,
+        weights,
+        offset,
+        spec,
+        &design,
+        heuristic_lambdas,
+        family,
+        options,
+    )
+}
+
+fn fit_bounded_term_collection_with_design(
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+    heuristic_lambdas: Option<&[f64]>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
     let conditioning_cols: Vec<usize> = spec
         .linear_terms
         .iter()
@@ -7097,7 +7141,7 @@ fn fit_bounded_term_collection_forspec(
                 inner_cycles: 0,
             })?
         },
-        design,
+        design: design.clone(),
         adaptive_diagnostics: None,
     })
 }
@@ -7856,6 +7900,103 @@ fn has_aniso_terms(dims_per_term: &[usize]) -> bool {
     dims_per_term.iter().any(|&d| d > 1)
 }
 
+#[derive(Debug, Clone)]
+struct SingleBlockExactJointDesignCache<'d> {
+    realizer: FrozenTermCollectionIncrementalRealizer<'d>,
+    current_theta: Option<Array1<f64>>,
+    last_cost: Option<f64>,
+    last_eval: Option<(f64, Array1<f64>, Array2<f64>)>,
+    spatial_terms: Vec<usize>,
+    rho_dim: usize,
+    dims_per_term: Vec<usize>,
+}
+
+impl<'d> SingleBlockExactJointDesignCache<'d> {
+    fn new(
+        data: ArrayView2<'d, f64>,
+        spec: TermCollectionSpec,
+        design: TermCollectionDesign,
+        spatial_terms: Vec<usize>,
+        rho_dim: usize,
+        dims_per_term: Vec<usize>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            realizer: FrozenTermCollectionIncrementalRealizer::new(data, spec, design)?,
+            current_theta: None,
+            last_cost: None,
+            last_eval: None,
+            spatial_terms,
+            rho_dim,
+            dims_per_term,
+        })
+    }
+
+    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            return Ok(());
+        }
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            theta,
+            self.rho_dim,
+            self.dims_per_term.clone(),
+        );
+        self.realizer
+            .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
+        self.current_theta = Some(theta.clone());
+        self.last_cost = None;
+        self.last_eval = None;
+        Ok(())
+    }
+
+    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval
+                .as_ref()
+                .map(|cached| cached.0)
+                .or(self.last_cost)
+        } else {
+            None
+        }
+    }
+
+    fn memoized_eval(&self, theta: &Array1<f64>) -> Option<(f64, Array1<f64>, Array2<f64>)> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval.clone()
+        } else {
+            None
+        }
+    }
+
+    fn store_cost(&mut self, cost: f64) {
+        self.last_cost = Some(cost);
+    }
+
+    fn store_eval(&mut self, eval: (f64, Array1<f64>, Array2<f64>)) {
+        self.last_cost = Some(eval.0);
+        self.last_eval = Some(eval);
+    }
+
+    fn spec(&self) -> &TermCollectionSpec {
+        self.realizer.spec()
+    }
+
+    fn design(&self) -> &TermCollectionDesign {
+        self.realizer.design()
+    }
+}
+
 fn try_exact_joint_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -8045,34 +8186,31 @@ fn try_exact_joint_spatial_aniso_optimization(
         y: ArrayView1<'d, f64>,
         weights: ArrayView1<'d, f64>,
         offset: ArrayView1<'d, f64>,
-        resolvedspec: &'d TermCollectionSpec,
         family: LikelihoodFamily,
         options: &'d FitOptions,
-        spatial_terms: &'d [usize],
         dims_per_term: &'d [usize],
         rho_dim: usize,
         best_cost: f64,
+        cache: SingleBlockExactJointDesignCache<'d>,
     }
 
     impl<'d> AnisoJointContext<'d> {
-        /// Full evaluation: rebuild design + hyper_dirs, compute cost + gradient + Hessian.
+        /// Full evaluation on the current realized design + hyper_dirs.
         fn eval_full(
-            &self,
+            &mut self,
             theta: &Array1<f64>,
         ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                self.rho_dim,
-                self.dims_per_term.to_vec(),
-            );
-            let spec_at_psi = log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms)?;
-            let design_at_psi = build_term_collection_design(self.data, &spec_at_psi)?;
-
+            if let Some(eval) = self.cache.memoized_eval(theta) {
+                return Ok(eval);
+            }
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
             let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
                 self.data,
-                &spec_at_psi,
-                &design_at_psi,
-                self.spatial_terms,
+                self.cache.spec(),
+                self.cache.design(),
+                &self.cache.spatial_terms,
             )?
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -8084,7 +8222,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 self.y,
                 self.weights,
                 self.offset,
-                &design_at_psi,
+                self.cache.design(),
                 theta,
                 self.rho_dim,
                 hyper_dirs,
@@ -8092,31 +8230,33 @@ fn try_exact_joint_spatial_aniso_optimization(
                 self.family,
                 self.options,
             )
+            .inspect(|eval| self.cache.store_eval(eval.clone()))
         }
 
-        /// Cost-only evaluation (cheaper: no hyper_dirs or gradient).
-        fn eval_cost(&self, theta: &Array1<f64>) -> f64 {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                self.rho_dim,
-                self.dims_per_term.to_vec(),
-            );
-            let spec_at_psi = match log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms) {
-                Ok(s) => s,
-                Err(_) => return f64::INFINITY,
-            };
+        /// Cost-only evaluation on the current realized design.
+        fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
+            if let Some(cost) = self.cache.memoized_cost(theta) {
+                return cost;
+            }
+            if self.cache.ensure_theta(theta).is_err() {
+                return f64::INFINITY;
+            }
             let rho_vec = theta.slice(s![..self.rho_dim]).mapv(f64::exp);
-            match fit_term_collection_forspecwith_heuristic_lambdas(
-                self.data,
+            match fit_term_collection_on_realized_design(
                 self.y,
                 self.weights,
                 self.offset,
-                &spec_at_psi,
+                self.cache.spec(),
+                self.cache.design(),
                 rho_vec.as_slice(),
                 self.family,
                 self.options,
             ) {
-                Ok(fit) => fit_score(&fit.fit),
+                Ok(fit) => {
+                    let cost = fit_score(&fit.fit);
+                    self.cache.store_cost(cost);
+                    cost
+                }
                 Err(_) => f64::INFINITY,
             }
         }
@@ -8134,13 +8274,20 @@ fn try_exact_joint_spatial_aniso_optimization(
         y,
         weights,
         offset,
-        resolvedspec,
         family,
         options,
-        spatial_terms,
         dims_per_term,
         rho_dim,
         best_cost: f64::INFINITY,
+        cache: SingleBlockExactJointDesignCache::new(
+            data,
+            resolvedspec.clone(),
+            baseline_design.clone(),
+            spatial_terms.to_vec(),
+            rho_dim,
+            dims_per_term.to_vec(),
+        )
+        .map_err(EstimationError::InvalidInput)?,
     };
 
     let outer_config = OuterConfig {

@@ -7,5 +7,6 @@ pub mod hmc;
 pub mod model;
 pub mod polya_gamma;
 pub mod predict;
+pub mod prediction_linalg;
 pub mod probability;
 pub mod quadrature;
