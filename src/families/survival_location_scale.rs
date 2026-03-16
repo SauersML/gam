@@ -6131,6 +6131,31 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         ))
     }
 
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if block_states.len() != self.expected_blocks()
+            || specs.len() != self.expected_blocks()
+            || derivative_blocks.len() != self.expected_blocks()
+        {
+            return Err(format!(
+                "SurvivalLocationScaleFamily joint psi workspace expects {} states, specs, and derivative blocks, got {} / {} / {}",
+                self.expected_blocks(),
+                block_states.len(),
+                specs.len(),
+                derivative_blocks.len()
+            ));
+        }
+        Ok(Some(Arc::new(SurvivalExactNewtonJointPsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            derivative_blocks.to_vec(),
+        )?)))
+    }
+
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -6155,242 +6180,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             return Ok(None);
         };
         let q = self.collect_joint_quantities(block_states)?;
-        let offsets = self.joint_block_offsets();
-        let p_total = *offsets
-            .last()
-            .ok_or_else(|| "missing joint block offsets".to_string())?;
-        if d_beta_flat.len() != p_total {
-            return Err(format!(
-                "joint psi hessian directional derivative length mismatch: got {}, expected {p_total}",
-                d_beta_flat.len()
-            ));
-        }
-
-        let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
-        let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
-        let log_sigma_dir = d_beta_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
-        let wiggle_dir = if self.x_link_wiggle.is_some() {
-            Some(d_beta_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
-        } else {
-            None
-        };
-
-        let delta_h0 = self.x_time_entry.dot(&time_dir);
-        let delta_h1 = self.x_time_exit.dot(&time_dir);
-        let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
-        let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
-        let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
-            (Some(xw), Some(dir_w)) => xw.matrixvectormultiply(dir_w),
-            _ => Array1::zeros(self.n),
-        };
-
-        let delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit + &deltaw;
-        let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
-        let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
-        let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
-        let delta_q_ls_ls_exit = &q.d3q_tls_ls * &delta_t_exit + &q.d3q_ls * &delta_ls_exit;
-
-        struct EntryDeltas {
-            delta_q: Array1<f64>,
-            delta_q_t: Array1<f64>,
-            delta_q_ls: Array1<f64>,
-            delta_q_tls: Array1<f64>,
-            delta_q_ls_ls: Array1<f64>,
-            d_d1_q: Array1<f64>,
-            d_d2_q: Array1<f64>,
-        }
-        let entry_deltas = if self.x_threshold_entry.is_some() || self.x_log_sigma_entry.is_some() {
-            let dt_en = self
-                .x_threshold_entry
-                .as_ref()
-                .map(|x| x.matrixvectormultiply(&threshold_dir))
-                .unwrap_or_else(|| delta_t_exit.clone());
-            let dls_en = self
-                .x_log_sigma_entry
-                .as_ref()
-                .map(|x| x.matrixvectormultiply(&log_sigma_dir))
-                .unwrap_or_else(|| delta_ls_exit.clone());
-            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-            let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
-            let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
-            let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
-            let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-            let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + &deltaw;
-            EntryDeltas {
-                delta_q_t: d2q_tls_en * &dls_en,
-                delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
-                delta_q_tls: d3q_tls_ls_en * &dls_en,
-                delta_q_ls_ls: d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en,
-                d_d1_q: &q.d2_q0 * &dq_en + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &dq_en - &q.d_h_h0 * &delta_h0,
-                delta_q: dq_en,
-            }
-        } else {
-            EntryDeltas {
-                delta_q: delta_q_exit.clone(),
-                delta_q_t: delta_q_t_exit.clone(),
-                delta_q_ls: delta_q_ls_exit.clone(),
-                delta_q_tls: delta_q_tls_exit.clone(),
-                delta_q_ls_ls: delta_q_ls_ls_exit.clone(),
-                d_d1_q: &q.d2_q0 * &delta_q_exit + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &delta_q_exit - &q.d_h_h0 * &delta_h0,
-            }
-        };
-
-        let x_threshold_exit = self.x_threshold.to_dense();
-        let x_threshold_entry_owned = self.x_threshold_entry.as_ref().map(DesignMatrix::to_dense);
-        let x_threshold_entry = x_threshold_entry_owned
-            .as_ref()
-            .unwrap_or(&x_threshold_exit);
-        let x_log_sigma_exit = self.x_log_sigma.to_dense();
-        let x_log_sigma_entry_owned = self.x_log_sigma_entry.as_ref().map(DesignMatrix::to_dense);
-        let x_log_sigma_entry = x_log_sigma_entry_owned
-            .as_ref()
-            .unwrap_or(&x_log_sigma_exit);
-        let xw = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense);
-
-        let dq_t_entry = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-        let dq_ls_entry = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-        let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-
-        let q0_psi = &(dq_t_entry * &dir.z_t_entry_psi) + &(dq_ls_entry * &dir.z_ls_entry_psi);
-        let q1_psi = &(&q.dq_t * &dir.z_t_exit_psi) + &(&q.dq_ls * &dir.z_ls_exit_psi);
-        let z_t_entry_psi_u = dir.x_t_entry_psi.dot(&threshold_dir);
-        let z_t_exit_psi_u = dir.x_t_exit_psi.dot(&threshold_dir);
-        let z_ls_entry_psi_u = dir.x_ls_entry_psi.dot(&log_sigma_dir);
-        let z_ls_exit_psi_u = dir.x_ls_exit_psi.dot(&log_sigma_dir);
-        let q0_psi_u = &(&entry_deltas.delta_q_t * &dir.z_t_entry_psi)
-            + &(dq_t_entry * &z_t_entry_psi_u)
-            + &(&entry_deltas.delta_q_ls * &dir.z_ls_entry_psi)
-            + &(dq_ls_entry * &z_ls_entry_psi_u);
-        let q1_psi_u = &(&delta_q_t_exit * &dir.z_t_exit_psi)
-            + &(&q.dq_t * &z_t_exit_psi_u)
-            + &(&delta_q_ls_exit * &dir.z_ls_exit_psi)
-            + &(&q.dq_ls * &z_ls_exit_psi_u);
-        let mut out = Array2::<f64>::zeros((p_total, p_total));
-
-        let time_time = fast_xt_diag_x(
-            &self.x_time_entry,
-            &(-(&q.d_h_h0 * &entry_deltas.delta_q * q0_psi) - &(&q.d3_q0 * &q0_psi_u)),
-        ) + fast_xt_diag_x(
-            &self.x_time_exit,
-            &(-(&q.d_h_h1 * &delta_q_exit * q1_psi) - &(&q.d3_q1 * &q1_psi_u)),
-        );
-        assign_symmetric_block(&mut out, offsets[0], offsets[0], &time_time);
-
-        let h_tt_entry = -(&q.d2_q0 * &dq_t_entry.mapv(|v| v * v));
-        let h_tt_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| v * v));
-        let h_tt_entry_u = -(&entry_deltas.d_d2_q * &dq_t_entry.mapv(|v| v * v)
-            + &(2.0 * &q.d2_q0 * dq_t_entry * &entry_deltas.delta_q_t));
-        let h_tt_exit_u = -(&(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1)
-            * &q.dq_t.mapv(|v| v * v)
-            + &(2.0 * &q.d2_q1 * &q.dq_t * &delta_q_t_exit));
-        let threshold_threshold =
-            weighted_crossprod_dense(&dir.x_t_exit_psi, &h_tt_exit_u, &x_threshold_exit)?
-                + weighted_crossprod_dense(&x_threshold_exit, &h_tt_exit_u, &dir.x_t_exit_psi)?
-                + weighted_crossprod_dense(&dir.x_t_entry_psi, &h_tt_entry_u, x_threshold_entry)?
-                + weighted_crossprod_dense(x_threshold_entry, &h_tt_entry_u, &dir.x_t_entry_psi)?;
-        let _ = h_tt_entry;
-        let _ = h_tt_exit;
-        assign_symmetric_block(&mut out, offsets[1], offsets[1], &threshold_threshold);
-
-        let h_ll_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| v * v) + &(&q.d1_q0 * d2q_ls_entry));
-        let h_ll_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| v * v) + &(&q.d1_q1 * &q.d2q_ls));
-        let h_ll_entry_u = -(&entry_deltas.d_d2_q * &dq_ls_entry.mapv(|v| v * v)
-            + &(2.0 * &q.d2_q0 * dq_ls_entry * &entry_deltas.delta_q_ls)
-            + &(&entry_deltas.d_d1_q * d2q_ls_entry)
-            + &(&q.d1_q0 * &entry_deltas.delta_q_ls_ls));
-        let h_ll_exit_u = -(&(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1)
-            * &q.dq_ls.mapv(|v| v * v)
-            + &(2.0 * &q.d2_q1 * &q.dq_ls * &delta_q_ls_exit)
-            + &((&q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1) * &q.d2q_ls)
-            + &(&q.d1_q1 * &delta_q_ls_ls_exit));
-        let log_sigma_log_sigma =
-            weighted_crossprod_dense(&dir.x_ls_exit_psi, &h_ll_exit_u, &x_log_sigma_exit)?
-                + weighted_crossprod_dense(&x_log_sigma_exit, &h_ll_exit_u, &dir.x_ls_exit_psi)?
-                + weighted_crossprod_dense(&dir.x_ls_entry_psi, &h_ll_entry_u, x_log_sigma_entry)?
-                + weighted_crossprod_dense(x_log_sigma_entry, &h_ll_entry_u, &dir.x_ls_entry_psi)?;
-        let _ = h_ll_entry;
-        let _ = h_ll_exit;
-        assign_symmetric_block(&mut out, offsets[2], offsets[2], &log_sigma_log_sigma);
-
-        let h_tl_entry = -(&q.d2_q0 * &(dq_t_entry * dq_ls_entry)
-            + &(&q.d1_q0 * q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls)));
-        let h_tl_exit = -(&q.d2_q1 * &(&q.dq_t * &q.dq_ls) + &(&q.d1_q1 * &q.d2q_tls));
-        let h_tl_entry_u = -(&entry_deltas.d_d2_q * &(dq_t_entry * dq_ls_entry)
-            + &(&q.d2_q0
-                * &(&entry_deltas.delta_q_t * dq_ls_entry
-                    + dq_t_entry * &entry_deltas.delta_q_ls))
-            + &(&entry_deltas.d_d1_q * q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls))
-            + &(&q.d1_q0 * &entry_deltas.delta_q_tls));
-        let h_tl_exit_u = -(&(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1)
-            * &(&q.dq_t * &q.dq_ls)
-            + &(&q.d2_q1 * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
-            + &((&q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1) * &q.d2q_tls)
-            + &(&q.d1_q1 * &delta_q_tls_exit));
-        let threshold_log_sigma =
-            weighted_crossprod_dense(&dir.x_t_exit_psi, &h_tl_exit_u, &x_log_sigma_exit)?
-                + weighted_crossprod_dense(&x_threshold_exit, &h_tl_exit_u, &dir.x_ls_exit_psi)?
-                + weighted_crossprod_dense(&dir.x_t_entry_psi, &h_tl_entry_u, x_log_sigma_entry)?
-                + weighted_crossprod_dense(x_threshold_entry, &h_tl_entry_u, &dir.x_ls_entry_psi)?;
-        let _ = h_tl_entry;
-        let _ = h_tl_exit;
-        assign_symmetric_block(&mut out, offsets[1], offsets[2], &threshold_log_sigma);
-
-        let h_h0_t_u = &entry_deltas.d_d1_q * dq_t_entry + &q.d2_q0 * &entry_deltas.delta_q_t;
-        let h_h1_t_u = &(&q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1) * &q.dq_t
-            + &q.d2_q1 * &delta_q_t_exit;
-        let h_h0_ls_u = &entry_deltas.d_d1_q * dq_ls_entry + &q.d2_q0 * &entry_deltas.delta_q_ls;
-        let h_h1_ls_u = &(&q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1) * &q.dq_ls
-            + &q.d2_q1 * &delta_q_ls_exit;
-        let time_threshold =
-            weighted_crossprod_dense(&self.x_time_entry, &h_h0_t_u, &dir.x_t_entry_psi)?
-                + weighted_crossprod_dense(&self.x_time_exit, &h_h1_t_u, &dir.x_t_exit_psi)?;
-        let time_log_sigma =
-            weighted_crossprod_dense(&self.x_time_entry, &h_h0_ls_u, &dir.x_ls_entry_psi)?
-                + weighted_crossprod_dense(&self.x_time_exit, &h_h1_ls_u, &dir.x_ls_exit_psi)?;
-        assign_symmetric_block(&mut out, offsets[0], offsets[1], &time_threshold);
-        assign_symmetric_block(&mut out, offsets[0], offsets[2], &time_log_sigma);
-
-        if let (Some(xw_dense), Some(w_offset)) = (xw.as_ref(), offsets.get(3).copied()) {
-            let d_d2_q_combined =
-                if self.x_threshold_entry.is_some() || self.x_log_sigma_entry.is_some() {
-                    &(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1) + &entry_deltas.d_d2_q
-                } else {
-                    &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1
-                };
-            let threshold_wiggle = weighted_crossprod_dense(
-                &dir.x_t_exit_psi,
-                &(-(&d_d2_q_combined * &q.dq_t)),
-                xw_dense,
-            )? + weighted_crossprod_dense(
-                &dir.x_t_entry_psi,
-                &(-(&d_d2_q_combined * dq_t_entry)),
-                xw_dense,
-            )?;
-            let log_sigma_wiggle = weighted_crossprod_dense(
-                &dir.x_ls_exit_psi,
-                &(-(&d_d2_q_combined * &q.dq_ls)),
-                xw_dense,
-            )? + weighted_crossprod_dense(
-                &dir.x_ls_entry_psi,
-                &(-(&d_d2_q_combined * dq_ls_entry)),
-                xw_dense,
-            )?;
-            let time_wiggle =
-                weighted_crossprod_dense(&self.x_time_entry, &(&q.d3_q0 * &q0_psi_u), xw_dense)?
-                    + weighted_crossprod_dense(
-                        &self.x_time_exit,
-                        &(&q.d3_q1 * &q1_psi_u),
-                        xw_dense,
-                    )?;
-            assign_symmetric_block(&mut out, offsets[1], w_offset, &threshold_wiggle);
-            assign_symmetric_block(&mut out, offsets[2], w_offset, &log_sigma_wiggle);
-            assign_symmetric_block(&mut out, offsets[0], w_offset, &time_wiggle);
-        }
-
-        Ok(Some(out))
+        Ok(Some(
+            self.exact_newton_joint_psihessian_directional_derivative_from_parts(
+                &q,
+                &dir,
+                d_beta_flat,
+            )?,
+        ))
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
