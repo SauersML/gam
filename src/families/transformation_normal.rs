@@ -314,13 +314,18 @@ impl TransformationNormalFamily {
             build_tensor_penalties_kronecker(&response_penalties, covariate_penalties, p_resp, p_cov, config)?;
 
         // Monotonicity constraints.
-        // We need the original response values to build the boundary grid, but
-        // from_prebuilt only has the basis. Use the derivative design rows directly.
-        // For biobank scale, subsample the training rows for constraints.
+        // Extract response values from column 1 of the value basis (which stores y)
+        // to build the boundary grid.  For biobank scale, subsample training rows.
+        let response_approx_for_grid = response_val_basis.column(1).to_owned();
         let monotonicity_constraints = build_subsampled_monotonicity_constraints(
             &x_deriv_kron,
+            &response_approx_for_grid,
+            &response_knots,
+            response_degree,
+            &response_transform,
+            covariate_design,
             config,
-        );
+        )?;
 
         // Warm start: need response values for location-scale init.
         // Extract response from column 1 of response_val_basis (which stores y).
@@ -1040,9 +1045,11 @@ impl KroneckerDesign {
         match self {
             KroneckerDesign::Dense(m) => fast_atb(m, m),
             KroneckerDesign::Factored { .. } => {
-                // Fall back to materialization for the Gram matrix, which is
-                // needed for the inner Newton step.  A fully operator-form
-                // Gram would require PCG, which is future work.
+                // For row-wise Kronecker X where row i = l_i kron r_i, the Gram
+                // matrix X'X = sum_i (l_i kron r_i)(l_i kron r_i)' = sum_i (l_i l_i') kron (r_i r_i').
+                // This is a sum of Kronecker products, NOT a single Kronecker product,
+                // so it does not factor as (L'L) kron (R'R).  Materialization is therefore
+                // the correct approach (short of PCG with operator-form matvec).
                 let dense = self.to_dense();
                 fast_atb(&dense, &dense)
             }
@@ -1057,6 +1064,8 @@ impl KroneckerDesign {
                 fast_atb(&wm, m)
             }
             KroneckerDesign::Factored { .. } => {
+                // Same reasoning as gram(): X'diag(w)X for row-wise Kronecker is
+                // sum_i w_i (l_i kron r_i)(l_i kron r_i)', which is not separable.
                 let dense = self.to_dense();
                 let wm = weight_rows(&dense, w);
                 fast_atb(&wm, &dense)
@@ -1318,50 +1327,118 @@ fn subsample_covariate_rows(design: &Array2<f64>, max_rows: usize) -> Array2<f64
     out
 }
 
-/// Maximum number of constraint rows for biobank-scale monotonicity.
+/// Maximum number of training-point constraint rows for biobank-scale monotonicity.
 ///
 /// When the training set is large (e.g. 400K), using all n derivative rows as
-/// hard constraints is prohibitively expensive.  This cap limits the constraint
-/// matrix to a manageable size while still covering the design space.
-const MAX_MONOTONICITY_CONSTRAINT_ROWS: usize = 4096;
+/// hard constraints is prohibitively expensive.  This cap limits the training-point
+/// portion of the constraint matrix.  Boundary grid rows are added on top of this.
+const MAX_MONOTONICITY_TRAINING_ROWS: usize = 8192;
 
 /// Build monotonicity constraints from a KroneckerDesign, subsampling for
 /// large problems.
 ///
-/// For small problems (n <= MAX_MONOTONICITY_CONSTRAINT_ROWS), all derivative
-/// rows are used.  For large problems, a uniform subsample is taken.
+/// This mirrors what `build_monotonicity_constraints` does for the non-prebuilt
+/// path: it includes BOTH training-point derivative rows (subsampled if n is
+/// large) AND boundary grid rows that evaluate h'(y|x) on a fine grid of
+/// response values crossed with subsampled covariate rows.  The boundary grid
+/// is critical for preventing B-spline derivatives from going negative between
+/// observed response values, especially near domain boundaries.
 fn build_subsampled_monotonicity_constraints(
     x_deriv_kron: &KroneckerDesign,
+    response_values: &Array1<f64>,
+    response_knots: &Array1<f64>,
+    response_degree: usize,
+    response_transform: &Array2<f64>,
+    covariate_design: &Array2<f64>,
     config: &TransformationNormalConfig,
-) -> LinearInequalityConstraints {
+) -> Result<LinearInequalityConstraints, String> {
     let n = x_deriv_kron.nrows();
     let p = x_deriv_kron.ncols();
     let eps = config.monotonicity_eps;
 
     let dense = x_deriv_kron.to_dense();
 
-    if n <= MAX_MONOTONICITY_CONSTRAINT_ROWS {
+    // --- Part 1: training-point derivative rows (subsampled if large) ---
+    let mut constraint_rows: Vec<Array1<f64>> = Vec::new();
+
+    if n <= MAX_MONOTONICITY_TRAINING_ROWS {
         // Use all training-point rows.
-        LinearInequalityConstraints {
-            a: dense.into_owned(),
-            b: Array1::from_elem(n, eps),
+        for i in 0..n {
+            let row = dense.row(i).to_owned();
+            let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if norm > 1e-12 {
+                constraint_rows.push(row);
+            }
         }
     } else {
         // Subsample uniformly.
-        let step = n as f64 / MAX_MONOTONICITY_CONSTRAINT_ROWS as f64;
-        let indices: Vec<usize> = (0..MAX_MONOTONICITY_CONSTRAINT_ROWS)
+        let step = n as f64 / MAX_MONOTONICITY_TRAINING_ROWS as f64;
+        let indices: Vec<usize> = (0..MAX_MONOTONICITY_TRAINING_ROWS)
             .map(|i| ((i as f64 * step) as usize).min(n - 1))
             .collect();
-        let n_sub = indices.len();
-        let mut a = Array2::zeros((n_sub, p));
-        for (r, &idx) in indices.iter().enumerate() {
-            a.row_mut(r).assign(&dense.row(idx));
-        }
-        LinearInequalityConstraints {
-            a,
-            b: Array1::from_elem(n_sub, eps),
+        for &idx in &indices {
+            let row = dense.row(idx).to_owned();
+            let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if norm > 1e-12 {
+                constraint_rows.push(row);
+            }
         }
     }
+
+    // --- Part 2: boundary grid rows ---
+    // Evaluate the response derivative basis on a fine grid of response values,
+    // crossed with a subsample of covariate rows.  This catches negativity
+    // between observed response values and near domain boundaries.
+    let grid = response_derivative_grid(response_values, config)?;
+    let p_cov = covariate_design.ncols();
+    if !grid.is_empty() && p_cov > 0 {
+        let (raw_d1, _) = create_basis::<Dense>(
+            grid.view(),
+            KnotSource::Provided(response_knots.view()),
+            response_degree,
+            BasisOptions::first_derivative(),
+        )
+        .map_err(|e| e.to_string())?;
+        let dev_d1 = raw_d1.as_ref().dot(response_transform);
+        let p_resp = 2 + dev_d1.ncols();
+        let g = grid.len();
+        let mut grid_resp_deriv = Array2::<f64>::zeros((g, p_resp));
+        grid_resp_deriv.column_mut(1).fill(1.0); // derivative of y is 1
+        grid_resp_deriv.slice_mut(s![.., 2..]).assign(&dev_d1);
+
+        // Use a subsample of covariate rows for the boundary constraint.
+        let cov_subsample = subsample_covariate_rows(covariate_design, 50);
+        for gi in 0..g {
+            for ci in 0..cov_subsample.nrows() {
+                let mut row = Array1::<f64>::zeros(p);
+                for j in 0..p_resp {
+                    let r = grid_resp_deriv[[gi, j]];
+                    if r == 0.0 {
+                        continue;
+                    }
+                    for k in 0..p_cov {
+                        row[j * p_cov + k] = r * cov_subsample[[ci, k]];
+                    }
+                }
+                let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if norm > 1e-12 {
+                    constraint_rows.push(row);
+                }
+            }
+        }
+    }
+
+    let n_constraints = constraint_rows.len();
+    if n_constraints == 0 {
+        return Err("no valid constraint rows for monotonicity".to_string());
+    }
+    let mut a = Array2::<f64>::zeros((n_constraints, p));
+    for (i, row) in constraint_rows.into_iter().enumerate() {
+        a.row_mut(i).assign(&row);
+    }
+    let b = Array1::from_elem(n_constraints, eps);
+
+    Ok(LinearInequalityConstraints { a, b })
 }
 
 // ---------------------------------------------------------------------------
