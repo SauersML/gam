@@ -26,5 +26,5 @@ pub use solver::workflow::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
     StandardFitRequest, StandardFitResult, SurvivalLocationScaleFitRequest,
-    SurvivalLocationScaleFitResult, fit_model,
+    SurvivalLocationScaleFitResult, TransformationNormalFitRequest, fit_model,
 };

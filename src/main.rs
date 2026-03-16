@@ -74,11 +74,11 @@ use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
     SasLinkSpec, SasLinkState,
 };
+use gam::transformation_normal::TransformationNormalConfig;
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
-    StandardFitRequest,
-    SurvivalLocationScaleFitRequest, fit_model,
+    StandardFitRequest, SurvivalLocationScaleFitRequest, TransformationNormalFitRequest, fit_model,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -230,6 +230,11 @@ struct FitArgs {
     disable_score_warp: bool,
     #[arg(long = "disable-link-dev", default_value_t = false)]
     disable_link_dev: bool,
+    /// Fit a conditional transformation-normal model: h(Y|x) ~ N(0,1).
+    /// Uses the main formula for the covariate-side smooth terms and
+    /// automatically builds the response-direction monotone basis.
+    #[arg(long = "transformation-normal", default_value_t = false)]
+    transformation_normal: bool,
     #[arg(long = "firth", default_value_t = false)]
     firth: bool,
     /// Survival likelihood mode for Surv(...) formulas.
@@ -398,6 +403,7 @@ enum FamilyArg {
     PoissonLog,
     GammaLog,
     RoystonParmar,
+    TransformationNormal,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -594,6 +600,7 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), S
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
 const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
 const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
+const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
 
 fn main() {
     if let Err(e) = run() {
@@ -719,6 +726,20 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
     let y = ds.values.column(y_col).to_owned();
     let mut inference_notes: Vec<String> = Vec::new();
+
+    if args.transformation_normal {
+        return run_fit_transformation_normal(
+            &args,
+            &mut progress,
+            fit_total_steps,
+            &ds,
+            &col_map,
+            &parsed,
+            &formula_text,
+            &y,
+            &mut inference_notes,
+        );
+    }
 
     if args.logslope_formula.is_some() || args.z_column.is_some() {
         if args.logslope_formula.is_none() || args.z_column.is_none() {
@@ -1392,6 +1413,106 @@ fn run_fit_bernoulli_marginal_slope(
     Ok(())
 }
 
+fn run_fit_transformation_normal(
+    args: &FitArgs,
+    progress: &mut gam::visualizer::VisualizerSession,
+    fit_total_steps: usize,
+    ds: &Dataset,
+    col_map: &HashMap<String, usize>,
+    parsed: &ParsedFormula,
+    formula_text: &str,
+    y: &Array1<f64>,
+    inference_notes: &mut Vec<String>,
+) -> Result<(), String> {
+    if args.firth {
+        return Err("--firth is not supported for the transformation-normal family".to_string());
+    }
+    if parsed.linkspec.is_some() {
+        return Err(
+            "link(...) is not supported for the transformation-normal family".to_string(),
+        );
+    }
+    if parsed.linkwiggle.is_some() {
+        return Err(
+            "linkwiggle(...) is not supported for the transformation-normal family".to_string(),
+        );
+    }
+    if args.predict_noise.is_some() {
+        return Err(
+            "--predict-noise cannot be combined with --transformation-normal".to_string(),
+        );
+    }
+
+    progress.set_stage("fit", "building transformation-normal covariate specification");
+    let mut covariate_spec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    if args.scale_dimensions {
+        enable_scale_dimensions(&mut covariate_spec);
+    }
+
+    let spatial_usagewarnings =
+        collect_spatial_smooth_usagewarnings(&covariate_spec, &ds.headers, "transformation-normal");
+    emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
+    print_inference_summary(inference_notes);
+
+    let options = blockwise_options_from_fit_args(args)?;
+    let config = TransformationNormalConfig::default();
+
+    progress.set_stage("fit", "optimizing transformation-normal model");
+    let solved = match fit_model(FitRequest::TransformationNormal(
+        TransformationNormalFitRequest {
+            data: ds.values.view(),
+            response: y.clone(),
+            covariate_spec: covariate_spec.clone(),
+            config,
+            options,
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            warm_start: None,
+        },
+    )) {
+        Ok(FitResult::TransformationNormal(result)) => result,
+        Ok(_) => {
+            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            return Err(
+                "internal transformation-normal workflow returned the wrong result variant"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            return Err(format!("transformation-normal fit failed: {e}"));
+        }
+    };
+    progress.advance_workflow(3);
+
+    let frozen_covariate =
+        freeze_term_collectionspec(&solved.covariate_spec_resolved, &solved.covariate_design)?;
+    progress.advance_workflow(4);
+    println!(
+        "model fit complete | family={} | outer_iter={} | converged={}",
+        FAMILY_TRANSFORMATION_NORMAL,
+        solved.fit.outer_iterations,
+        solved.fit.outer_converged
+    );
+    print_spatial_aniso_scales(&solved.covariate_spec_resolved);
+
+    if let Some(out) = args.out.as_ref() {
+        progress.set_stage("fit", "writing transformation-normal model");
+        let model = build_transformation_normal_saved_model(
+            formula_text.to_string(),
+            ds.schema.clone(),
+            ds.headers.clone(),
+            frozen_covariate,
+            solved.fit,
+        );
+        write_model_json(out, &model)?;
+        progress.advance_workflow(fit_total_steps);
+    }
+
+    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    progress.finish_progress("transformation-normal fit complete");
+    Ok(())
+}
+
 fn run_fitwith_predict_noise(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &FitArgs,
@@ -1769,7 +1890,8 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
         PredictModelClass::BinomialLocationScale => model.has_link_wiggle(),
         PredictModelClass::Standard
         | PredictModelClass::GaussianLocationScale
-        | PredictModelClass::BernoulliMarginalSlope => false,
+        | PredictModelClass::BernoulliMarginalSlope
+        | PredictModelClass::TransformationNormal => false,
     }
 }
 
@@ -1894,6 +2016,9 @@ fn build_predict_input_for_model(
         }
         PredictModelClass::Survival => Err(
             "build_predict_input_for_model should not be called for survival models".to_string(),
+        ),
+        PredictModelClass::TransformationNormal => Err(
+            "prediction for transformation-normal models is not yet supported".to_string(),
         ),
     }
 }
@@ -2134,6 +2259,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         PredictModelClass::BernoulliMarginalSlope => Err(
             "bernoulli marginal-slope model unexpectedly bypassed the unified prediction path"
                 .to_string(),
+        ),
+        PredictModelClass::TransformationNormal => Err(
+            "prediction for transformation-normal models is not yet supported".to_string(),
         ),
         PredictModelClass::Standard => run_predict_standard(
             &mut progress,
@@ -5398,6 +5526,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 "sample for bernoulli marginal-slope models is not available yet".to_string(),
             )
         }
+        PredictModelClass::TransformationNormal => {
+            return Err(
+                "sample for transformation-normal models is not available yet".to_string(),
+            )
+        }
         PredictModelClass::Standard => run_sample_standard(
             &mut progress,
             &model,
@@ -6115,6 +6248,11 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                     "generate is not available for survival models in this command; \
                      use survival-specific simulation APIs"
                         .to_string(),
+                );
+            }
+            PredictModelClass::TransformationNormal => {
+                return Err(
+                    "generate is not available for transformation-normal models yet".to_string(),
                 );
             }
             PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
@@ -7419,6 +7557,30 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.resolved_termspec_noise = Some(resolved_logslopespec);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
     payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
+    SavedModel::from_payload(payload)
+}
+
+fn build_transformation_normal_saved_model(
+    formula: String,
+    data_schema: DataSchema,
+    training_headers: Vec<String>,
+    resolved_covariate_spec: TermCollectionSpec,
+    fit_result: UnifiedFitResult,
+) -> SavedModel {
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::TransformationNormal,
+        FittedFamily::TransformationNormal {
+            likelihood: LikelihoodFamily::GaussianIdentity,
+        },
+        FAMILY_TRANSFORMATION_NORMAL.to_string(),
+    );
+    payload.unified = Some(fit_result.clone());
+    payload.fit_result = Some(fit_result);
+    payload.data_schema = Some(data_schema);
+    payload.training_headers = Some(training_headers);
+    payload.resolved_termspec = Some(resolved_covariate_spec);
     SavedModel::from_payload(payload)
 }
 
@@ -9211,6 +9373,7 @@ fn resolve_family(
         FamilyArg::PoissonLog => LikelihoodFamily::PoissonLog,
         FamilyArg::GammaLog => LikelihoodFamily::GammaLog,
         FamilyArg::RoystonParmar => LikelihoodFamily::RoystonParmar,
+        FamilyArg::TransformationNormal => LikelihoodFamily::GaussianIdentity,
         FamilyArg::Auto => {
             if is_binary_response(y) {
                 LikelihoodFamily::BinomialLogit
@@ -9231,6 +9394,7 @@ fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
         FamilyArg::PoissonLog => Some(LikelihoodFamily::PoissonLog),
         FamilyArg::GammaLog => Some(LikelihoodFamily::GammaLog),
         FamilyArg::RoystonParmar => Some(LikelihoodFamily::RoystonParmar),
+        FamilyArg::TransformationNormal => Some(LikelihoodFamily::GaussianIdentity),
     }
 }
 
@@ -10749,6 +10913,7 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
+            transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
@@ -10823,6 +10988,7 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
+            transformation_normal: false,
             firth: true,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,

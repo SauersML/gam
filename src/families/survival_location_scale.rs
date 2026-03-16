@@ -34,10 +34,10 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
-    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design,
-    optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::estimate::UnifiedFitResult;
@@ -2860,7 +2860,7 @@ fn build_survival_two_block_exact_joint_setup(
     log_sigmaspec: &TermCollectionSpec,
     rho0: Array1<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> TwoBlockExactJointHyperSetup {
+) -> ExactJointHyperSetup {
     let threshold_terms = spatial_length_scale_term_indices(thresholdspec);
     let log_sigma_terms = spatial_length_scale_term_indices(log_sigmaspec);
     let rho_lower = Array1::<f64>::from_elem(rho0.len(), -12.0);
@@ -2885,7 +2885,7 @@ fn build_survival_two_block_exact_joint_setup(
     let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&all_dims, kappa_options);
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&all_dims, kappa_options);
 
-    TwoBlockExactJointHyperSetup::new(
+    ExactJointHyperSetup::new(
         rho0,
         rho_lower,
         rho_upper,
@@ -7181,25 +7181,25 @@ pub(crate) fn fit_survival_location_scale_terms(
         })
     };
 
-    let solved = optimize_two_block_spatial_length_scale_exact_joint(
+    let threshold_terms = spatial_length_scale_term_indices(&spec.thresholdspec);
+    let log_sigma_terms = spatial_length_scale_term_indices(&spec.log_sigmaspec);
+    let solved = optimize_spatial_length_scale_exact_joint(
         data,
-        &spec.thresholdspec,
-        &spec.log_sigmaspec,
+        &[spec.thresholdspec.clone(), spec.log_sigmaspec.clone()],
+        &[threshold_terms, log_sigma_terms],
         kappa_options,
         &joint_setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         |rho,
-         thresholdspec_resolved,
-         log_sigmaspec_resolved,
-         threshold_design,
-         log_sigma_design| {
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign]| {
             let fit = fit_survival_location_scale(build_spec(
                 rho,
-                thresholdspec_resolved,
-                log_sigmaspec_resolved,
-                threshold_design,
-                log_sigma_design,
+                &specs[0],
+                &specs[1],
+                &designs[0],
+                &designs[1],
             )?)?;
             Ok(if fit.reml_score.is_finite() {
                 fit.reml_score
@@ -7208,16 +7208,14 @@ pub(crate) fn fit_survival_location_scale_terms(
             })
         },
         |rho,
-         thresholdspec_resolved,
-         log_sigmaspec_resolved,
-         threshold_design,
-         log_sigma_design| {
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign]| {
             let fit = fit_survival_location_scale(build_spec(
                 rho,
-                thresholdspec_resolved,
-                log_sigmaspec_resolved,
-                threshold_design,
-                log_sigma_design,
+                &specs[0],
+                &specs[1],
+                &designs[0],
+                &designs[1],
             )?)?;
             time_beta_hint.replace(Some(fit.beta_time()));
             threshold_beta_hint.replace(Some(fit.beta_threshold()));
@@ -7226,10 +7224,8 @@ pub(crate) fn fit_survival_location_scale_terms(
             Ok(fit)
         },
         |rho,
-         thresholdspec_resolved,
-         log_sigmaspec_resolved,
-         threshold_design,
-         log_sigma_design,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
          need_hessian| {
             if !analytic_joint_gradient_available {
                 return Err(
@@ -7239,23 +7235,23 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             let assembled = build_spec(
                 rho,
-                thresholdspec_resolved,
-                log_sigmaspec_resolved,
-                threshold_design,
-                log_sigma_design,
+                &specs[0],
+                &specs[1],
+                &designs[0],
+                &designs[1],
             )?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
-                thresholdspec_resolved,
-                threshold_design,
+                &specs[0],
+                &designs[0],
                 &spec.threshold_template,
             )?
             .ok_or_else(|| "missing survival threshold spatial psi derivatives".to_string())?;
             let log_sigma_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
-                log_sigmaspec_resolved,
-                log_sigma_design,
+                &specs[1],
+                &designs[1],
                 &spec.log_sigma_template,
             )?
             .ok_or_else(|| "missing survival log-sigma spatial psi derivatives".to_string())?;
@@ -7278,12 +7274,14 @@ pub(crate) fn fit_survival_location_scale_terms(
         },
     )?;
 
+    let mut resolved_specs = solved.resolved_specs;
+    let mut designs = solved.designs;
     Ok(SurvivalLocationScaleTermFitResult {
         fit: solved.fit,
-        resolved_thresholdspec: solved.resolved_meanspec,
-        resolved_log_sigmaspec: solved.resolved_noisespec,
-        threshold_design: solved.mean_design,
-        log_sigma_design: solved.noise_design,
+        resolved_thresholdspec: resolved_specs.remove(0),
+        resolved_log_sigmaspec: resolved_specs.remove(0),
+        threshold_design: designs.remove(0),
+        log_sigma_design: designs.remove(0),
     })
 }
 

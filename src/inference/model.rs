@@ -237,6 +237,7 @@ pub enum FittedModel {
     LocationScale { payload: FittedModelPayload },
     MarginalSlope { payload: FittedModelPayload },
     Survival { payload: FittedModelPayload },
+    TransformationNormal { payload: FittedModelPayload },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -246,6 +247,7 @@ pub enum ModelKind {
     LocationScale,
     MarginalSlope,
     Survival,
+    TransformationNormal,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -274,6 +276,9 @@ pub enum FittedFamily {
         #[serde(default)]
         survival_distribution: Option<String>,
     },
+    TransformationNormal {
+        likelihood: LikelihoodFamily,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -283,6 +288,7 @@ pub enum PredictModelClass {
     BinomialLocationScale,
     BernoulliMarginalSlope,
     Survival,
+    TransformationNormal,
 }
 
 #[derive(Clone, Debug)]
@@ -474,7 +480,8 @@ impl FittedFamily {
             Self::Standard { likelihood, .. }
             | Self::LocationScale { likelihood, .. }
             | Self::MarginalSlope { likelihood, .. }
-            | Self::Survival { likelihood, .. } => *likelihood,
+            | Self::Survival { likelihood, .. }
+            | Self::TransformationNormal { likelihood, .. } => *likelihood,
         }
     }
 }
@@ -485,6 +492,7 @@ impl FittedModel {
         let class = match payload.model_kind {
             ModelKind::Survival => PredictModelClass::Survival,
             ModelKind::MarginalSlope => PredictModelClass::BernoulliMarginalSlope,
+            ModelKind::TransformationNormal => PredictModelClass::TransformationNormal,
             ModelKind::LocationScale => {
                 if likelihood == LikelihoodFamily::GaussianIdentity {
                     PredictModelClass::GaussianLocationScale
@@ -502,6 +510,10 @@ impl FittedModel {
             PredictModelClass::BernoulliMarginalSlope => {
                 payload.model_kind = ModelKind::MarginalSlope;
                 Self::MarginalSlope { payload }
+            }
+            PredictModelClass::TransformationNormal => {
+                payload.model_kind = ModelKind::TransformationNormal;
+                Self::TransformationNormal { payload }
             }
             PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
                 payload.model_kind = ModelKind::LocationScale;
@@ -521,7 +533,8 @@ impl FittedModel {
             Self::Standard { payload }
             | Self::LocationScale { payload }
             | Self::MarginalSlope { payload }
-            | Self::Survival { payload } => payload,
+            | Self::Survival { payload }
+            | Self::TransformationNormal { payload } => payload,
         }
     }
 
@@ -531,7 +544,8 @@ impl FittedModel {
             Self::Standard { payload }
             | Self::LocationScale { payload }
             | Self::MarginalSlope { payload }
-            | Self::Survival { payload } => payload,
+            | Self::Survival { payload }
+            | Self::TransformationNormal { payload } => payload,
         }
     }
 
@@ -594,6 +608,7 @@ impl FittedModel {
         match self.payload().family_state {
             FittedFamily::Survival { .. } => PredictModelClass::Survival,
             FittedFamily::MarginalSlope { .. } => PredictModelClass::BernoulliMarginalSlope,
+            FittedFamily::TransformationNormal { .. } => PredictModelClass::TransformationNormal,
             FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::GaussianIdentity,
                 ..
@@ -841,6 +856,7 @@ impl FittedModel {
             }
             FittedFamily::MarginalSlope { .. } => Ok(None),
             FittedFamily::Survival { .. } => Ok(None),
+            FittedFamily::TransformationNormal { .. } => Ok(None),
         }
     }
 
@@ -930,6 +946,10 @@ impl FittedModel {
                 )
                 .ok()?;
                 Some(Box::new(predictor) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::TransformationNormal => {
+                // Prediction for transformation-normal models is not yet wired.
+                None
             }
         }
     }
