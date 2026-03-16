@@ -851,7 +851,10 @@ impl PirlsWorkspace {
         S: Data<Elem = f64>,
     {
         if self.sqrtw.len() != weights.len() {
-            self.sqrtw = Array1::zeros(weights.len());
+            // Use uninit — every element is written by the Zip below.
+            unsafe {
+                self.sqrtw = Array1::uninit(weights.len()).assume_init();
+            }
         }
         Zip::from(&mut self.sqrtw)
             .and(weights)
@@ -2288,7 +2291,10 @@ fn solve_subsystem_direction(
 ) -> Result<(), EstimationError> {
     let n = g_sub.len();
     if out.len() != n {
-        *out = Array1::zeros(n);
+        // Use uninit — immediately overwritten by assign below.
+        unsafe {
+            *out = Array1::uninit(n).assume_init();
+        }
     }
     // Try direct factorization first.
     if let Ok(factor) = StableSolver::new("pirls bounded subsystem").factorize(h_sub) {
@@ -2345,7 +2351,10 @@ fn solve_symmetric_system(
     out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
     if out.len() != rhs.len() {
-        *out = Array1::zeros(rhs.len());
+        // Use uninit — immediately overwritten by assign below.
+        unsafe {
+            *out = Array1::uninit(rhs.len()).assume_init();
+        }
     }
     out.assign(rhs);
     let factor = StableSolver::new("pirls symmetric system")
