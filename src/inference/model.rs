@@ -1,3 +1,6 @@
+use crate::basis::{
+    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
+};
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::inference::predict::{
     BinomialLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
@@ -8,6 +11,7 @@ use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::types::{
     InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec, SasLinkState,
 };
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -264,12 +268,108 @@ pub struct SavedLinkWiggleRuntime {
     pub beta: Vec<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SavedBaselineTimeWiggleRuntime {
+    pub knots: Vec<f64>,
+    pub degree: usize,
+    pub penalty_orders: Vec<usize>,
+    pub double_penalty: bool,
+    pub beta: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SavedPredictionRuntime {
+    pub model_class: PredictModelClass,
+    pub likelihood: LikelihoodFamily,
+    pub inverse_link: Option<InverseLink>,
+    pub link_wiggle: Option<SavedLinkWiggleRuntime>,
+    pub baseline_time_wiggle: Option<SavedBaselineTimeWiggleRuntime>,
+}
+
+impl SavedLinkWiggleRuntime {
+    fn constrained_basis(
+        &self,
+        q0: &Array1<f64>,
+        basis_options: BasisOptions,
+    ) -> Result<Array2<f64>, String> {
+        let knot_arr = Array1::from_vec(self.knots.clone());
+        let (basis, _) = create_basis::<Dense>(
+            q0.view(),
+            KnotSource::Provided(knot_arr.view()),
+            self.degree,
+            basis_options,
+        )
+        .map_err(|e| format!("failed to evaluate saved link-wiggle basis: {e}"))?;
+        let full = basis.as_ref().clone();
+        if full.ncols() < 3 {
+            return Err("saved link-wiggle basis has fewer than three columns".to_string());
+        }
+        let (z, _) = compute_geometric_constraint_transform(&knot_arr, self.degree, 2)
+            .map_err(|e| format!("failed to build saved link-wiggle constraint transform: {e}"))?;
+        if full.ncols() != z.nrows() {
+            return Err(format!(
+                "saved link-wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
+                full.ncols(),
+                z.nrows()
+            ));
+        }
+        let constrained = full.dot(&z);
+        if constrained.ncols() != self.beta.len() {
+            return Err(format!(
+                "saved link-wiggle dimension mismatch: coefficients have {} entries but basis has {} columns",
+                self.beta.len(),
+                constrained.ncols()
+            ));
+        }
+        Ok(constrained)
+    }
+
+    pub fn design(&self, q0: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.constrained_basis(q0, BasisOptions::value())
+    }
+
+    pub fn basis_row_scalar(&self, q0: f64) -> Result<Array1<f64>, String> {
+        let q = Array1::from_vec(vec![q0]);
+        let x = self.design(&q)?;
+        if x.nrows() != 1 {
+            return Err(format!(
+                "saved link-wiggle scalar evaluation expected 1 row, got {}",
+                x.nrows()
+            ));
+        }
+        Ok(x.row(0).to_owned())
+    }
+
+    pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let xwiggle = self.design(q0)?;
+        let beta_link_wiggle = Array1::from_vec(self.beta.clone());
+        Ok(q0 + &xwiggle.dot(&beta_link_wiggle))
+    }
+
+    pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let d_constrained = self.constrained_basis(q0, BasisOptions::first_derivative())?;
+        let beta_link_wiggle = Array1::from_vec(self.beta.clone());
+        Ok((d_constrained.dot(&beta_link_wiggle) + 1.0).mapv(|v| v.clamp(-1e6, 1e6)))
+    }
+}
+
 fn saved_link_name_disallows_wiggle(link_name: &str) -> bool {
     let link_name = link_name.trim().to_ascii_lowercase();
     link_name == "sas"
         || link_name == "beta-logistic"
         || link_name.starts_with("blended(")
         || link_name.starts_with("mixture(")
+}
+
+fn inverse_link_disallows_wiggle(link: &InverseLink) -> bool {
+    matches!(
+        link,
+        InverseLink::Standard(LinkFunction::Sas)
+            | InverseLink::Standard(LinkFunction::BetaLogistic)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
+    )
 }
 
 impl FittedFamily {
@@ -419,9 +519,15 @@ impl FittedModel {
                 )
             }
         };
-        if let Some(link_name) = payload.link.as_deref()
-            && saved_link_name_disallows_wiggle(link_name)
-        {
+        let resolved_link = self.resolved_inverse_link()?;
+        let saved_link_disallows_wiggle = resolved_link
+            .as_ref()
+            .is_some_and(inverse_link_disallows_wiggle)
+            || payload
+                .link
+                .as_deref()
+                .is_some_and(saved_link_name_disallows_wiggle);
+        if saved_link_disallows_wiggle {
             return Err(
                 "link wiggle does not support SAS/BetaLogistic/Mixture links; refit without wiggle or with a jointly fitted standard link"
                     .to_string(),
@@ -467,10 +573,46 @@ impl FittedModel {
         }))
     }
 
+    pub fn saved_baseline_time_wiggle(
+        &self,
+    ) -> Result<Option<SavedBaselineTimeWiggleRuntime>, String> {
+        let payload = self.payload();
+        match (
+            payload.baseline_timewiggle_knots.as_ref(),
+            payload.baseline_timewiggle_degree,
+            payload.baseline_timewiggle_penalty_orders.as_ref(),
+            payload.baseline_timewiggle_double_penalty,
+            payload.beta_baseline_timewiggle.as_ref(),
+        ) {
+            (None, None, None, None, None) => Ok(None),
+            (Some(knots), Some(degree), Some(penalty_orders), Some(double_penalty), Some(beta)) => {
+                Ok(Some(SavedBaselineTimeWiggleRuntime {
+                    knots: knots.clone(),
+                    degree,
+                    penalty_orders: penalty_orders.clone(),
+                    double_penalty,
+                    beta: beta.clone(),
+                }))
+            }
+            _ => Err(
+                "saved model has partial baseline-timewiggle metadata; expected knots+degree+penalty_order+double_penalty+beta_baseline_timewiggle together"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Whether this model has a link wiggle component with complete metadata.
     #[inline]
     pub fn has_link_wiggle(&self) -> bool {
         self.saved_link_wiggle()
+            .map(|runtime| runtime.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Whether this model has a baseline-time wiggle component with complete metadata.
+    #[inline]
+    pub fn has_baseline_time_wiggle(&self) -> bool {
+        self.saved_baseline_time_wiggle()
             .map(|runtime| runtime.is_some())
             .unwrap_or(false)
     }
@@ -482,6 +624,16 @@ impl FittedModel {
             .ok()
             .flatten()
             .map_or(0, |runtime| runtime.beta.len())
+    }
+
+    pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
+        Ok(SavedPredictionRuntime {
+            model_class: self.predict_model_class(),
+            likelihood: self.likelihood(),
+            inverse_link: self.resolved_inverse_link()?,
+            link_wiggle: self.saved_link_wiggle()?,
+            baseline_time_wiggle: self.saved_baseline_time_wiggle()?,
+        })
     }
 
     pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, String> {
@@ -594,46 +746,47 @@ impl FittedModel {
         }
     }
 
-    /// Build a `PredictableModel` for the standard (single-block) case.
+    /// Build a validated predictor for the saved model shape and runtime.
     ///
-    /// Returns `None` for location-scale or survival models which require
-    /// specialised predictors not yet wired through this trait.
-    ///
-    /// When a `UnifiedFitResult` is available, the predictor is built from
-    /// the unified representation (extracting beta from the first block and
-    /// covariance from the unified result). Otherwise falls back to the
-    /// legacy `UnifiedFitResult` path.
+    /// Survival models still go through specialised top-level prediction
+    /// assembly because they need time-basis construction from saved metadata.
     pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
+        let runtime = self.saved_prediction_runtime().ok()?;
         match self.predict_model_class() {
             PredictModelClass::GaussianLocationScale => {
-                let unified = self.unified()?;
+                let fit = self.fit_result.as_ref()?;
+                let beta_mu = fit.beta.clone();
+                let beta_noise = Array1::from_vec(self.payload().beta_noise.clone()?);
                 let response_scale = self.gaussian_response_scale.unwrap_or(1.0);
-                GaussianLocationScalePredictor::from_unified(unified, response_scale)
-                    .ok()
-                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+                Some(Box::new(GaussianLocationScalePredictor {
+                    beta_mu,
+                    beta_noise,
+                    response_scale,
+                    covariance: fit.beta_covariance().cloned(),
+                    link_wiggle: runtime.link_wiggle,
+                }) as Box<dyn PredictableModel>)
             }
             PredictModelClass::Standard => {
-                if self.has_link_wiggle() {
-                    return None;
-                }
                 let family = self.family_state.likelihood();
                 let link_kind = self.resolved_inverse_link().ok().flatten();
-
-                // Prefer unified path when available.
-                if let Some(unified) = self.unified() {
-                    return StandardPredictor::from_unified(unified, family, link_kind)
-                        .ok()
-                        .map(|p| Box::new(p) as Box<dyn PredictableModel>);
-                }
-
-                // Legacy path: extract from UnifiedFitResult.
                 let fit = self.fit_result.as_ref()?;
+                let beta = if runtime.link_wiggle.is_some() {
+                    fit.block_by_role(BlockRole::Mean)?.beta.clone()
+                } else if let Some(unified) = self.unified() {
+                    StandardPredictor::from_unified(unified, family, link_kind.clone(), None)
+                        .ok()
+                        .map(|p| p.beta)
+                        .unwrap_or_else(|| fit.beta.clone())
+                } else {
+                    fit.beta.clone()
+                };
                 let covariance = fit.beta_covariance().cloned();
                 Some(Box::new(StandardPredictor {
-                    beta: fit.beta.clone(),
+                    beta,
                     family,
                     link_kind,
                     covariance,
+                    link_wiggle: runtime.link_wiggle,
                 }))
             }
             PredictModelClass::Survival => {
@@ -649,15 +802,21 @@ impl FittedModel {
                     .map(|p| Box::new(p) as Box<dyn PredictableModel>)
             }
             PredictModelClass::BinomialLocationScale => {
-                let unified = self.unified()?;
                 let inverse_link = self
                     .resolved_inverse_link()
                     .ok()
                     .flatten()
                     .unwrap_or(InverseLink::Standard(LinkFunction::Probit));
-                BinomialLocationScalePredictor::from_unified(unified, inverse_link)
-                    .ok()
-                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+                let fit = self.fit_result.as_ref()?;
+                let beta_threshold = fit.beta.clone();
+                let beta_noise = Array1::from_vec(self.payload().beta_noise.clone()?);
+                Some(Box::new(BinomialLocationScalePredictor {
+                    beta_threshold,
+                    beta_noise,
+                    covariance: fit.beta_covariance().cloned(),
+                    inverse_link,
+                    link_wiggle: runtime.link_wiggle,
+                }) as Box<dyn PredictableModel>)
             }
         }
     }
@@ -805,6 +964,17 @@ impl FittedModel {
         if has_any_saved_link_wiggle && self.saved_link_wiggle()?.is_none() {
             return Err(
                 "saved model has incomplete link-wiggle state; expected metadata and coefficients"
+                    .to_string(),
+            );
+        }
+        let has_any_saved_baseline_time_wiggle = self.baseline_timewiggle_knots.is_some()
+            || self.baseline_timewiggle_degree.is_some()
+            || self.baseline_timewiggle_penalty_orders.is_some()
+            || self.baseline_timewiggle_double_penalty.is_some()
+            || self.beta_baseline_timewiggle.is_some();
+        if has_any_saved_baseline_time_wiggle && self.saved_baseline_time_wiggle()?.is_none() {
+            return Err(
+                "saved model has incomplete baseline-timewiggle state; expected metadata and coefficients"
                     .to_string(),
             );
         }

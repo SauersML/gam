@@ -1,5 +1,6 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
+use crate::inference::model::SavedLinkWiggleRuntime;
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
@@ -241,6 +242,15 @@ fn project_two_block_linear_predictor_covariance(
     Ok((var_first, var_second, cov_cross))
 }
 
+fn linear_predictor_se_from_grad(grad: &Array2<f64>, cov: &Array2<f64>) -> Array1<f64> {
+    let xc = grad.dot(cov);
+    let mut out = Array1::<f64>::zeros(grad.nrows());
+    for i in 0..grad.nrows() {
+        out[i] = grad.row(i).dot(&xc.row(i)).max(0.0).sqrt();
+    }
+    out
+}
+
 fn projected_bivariate_posterior_mean_result<F>(
     quadctx: &crate::quadrature::QuadratureContext,
     mu: [f64; 2],
@@ -320,8 +330,19 @@ pub struct PredictionWithSE {
 /// a uniform prediction interface. Eliminates the match-dispatch pattern in
 /// main.rs for predict, NUTS, and summary commands.
 pub trait PredictableModel {
-    /// Point prediction on the response scale.
-    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError>;
+    /// Response-scale plug-in prediction at the fitted parameter value.
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError>;
+
+    /// Primary linear-predictor output.
+    fn predict_linear_predictor(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Array1<f64>, EstimationError> {
+        self.predict_plugin_response(input).map(|pred| pred.eta)
+    }
 
     /// Prediction with uncertainty quantification (SE on eta and mean scales).
     fn predict_with_uncertainty(
@@ -343,7 +364,8 @@ pub trait PredictableModel {
 
     /// Posterior-mean prediction with coefficient uncertainty propagation.
     ///
-    /// For nonlinear links, returns E[g^{-1}(eta_tilde)] where eta_tilde ~ N(eta_hat, se^2).
+    /// This is the canonical response-scale prediction path for nonlinear
+    /// models and the default semantics exposed by the CLI.
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
@@ -363,6 +385,7 @@ pub struct StandardPredictor {
     pub family: crate::types::LikelihoodFamily,
     pub link_kind: Option<InverseLink>,
     pub covariance: Option<Array2<f64>>,
+    pub link_wiggle: Option<SavedLinkWiggleRuntime>,
 }
 
 impl StandardPredictor {
@@ -372,47 +395,102 @@ impl StandardPredictor {
         unified: &UnifiedFitResult,
         family: crate::types::LikelihoodFamily,
         link_kind: Option<InverseLink>,
+        link_wiggle: Option<SavedLinkWiggleRuntime>,
     ) -> Result<Self, String> {
-        if unified.n_blocks() != 1 || unified.block_by_role(BlockRole::LinkWiggle).is_some() {
+        let expected_linkwiggle = link_wiggle.is_some();
+        if !expected_linkwiggle
+            && (unified.n_blocks() != 1 || unified.block_by_role(BlockRole::LinkWiggle).is_some())
+        {
             return Err(
                 "StandardPredictor only supports single-block standard fits without link wiggles"
                     .to_string(),
             );
         }
-        let beta = unified
-            .blocks
-            .first()
-            .map(|b| b.beta.clone())
-            .ok_or_else(|| {
-                "standard unified fit is missing its sole coefficient block".to_string()
-            })?;
+        let beta = if expected_linkwiggle {
+            unified
+                .block_by_role(BlockRole::Mean)
+                .map(|b| b.beta.clone())
+                .ok_or_else(|| {
+                    "standard link-wiggle unified fit is missing Mean coefficient block".to_string()
+                })?
+        } else {
+            unified
+                .blocks
+                .first()
+                .map(|b| b.beta.clone())
+                .ok_or_else(|| {
+                    "standard unified fit is missing its sole coefficient block".to_string()
+                })?
+        };
         let covariance = unified.covariance_conditional.clone();
         Ok(Self {
             beta,
             family,
             link_kind,
             covariance,
+            link_wiggle,
         })
     }
 }
 
 impl PredictableModel for StandardPredictor {
-    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
-        predict_gam(
-            input.design.clone(),
-            self.beta.view(),
-            input.offset.view(),
-            self.family,
-        )
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError> {
+        let eta_base = input.design.dot(&self.beta) + &input.offset;
+        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
+            runtime
+                .apply(&eta_base)
+                .map_err(EstimationError::InvalidInput)?
+        } else {
+            eta_base
+        };
+        let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+        let mean = strategy.inverse_link_array(eta.view())?;
+        Ok(PredictResult { eta, mean })
     }
 
     fn predict_with_uncertainty(
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        let result = self.predict_response(input)?;
+        let result = self.predict_plugin_response(input)?;
+        let eta_base = input.design.dot(&self.beta) + &input.offset;
         let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
-            let se = eta_standard_errors_from_design(&input.design, cov)?;
+            let se = if let Some(runtime) = self.link_wiggle.as_ref() {
+                let wiggle_design = runtime
+                    .design(&eta_base)
+                    .map_err(EstimationError::InvalidInput)?;
+                let dq_dq0 = runtime
+                    .derivative_q0(&eta_base)
+                    .map_err(EstimationError::InvalidInput)?;
+                let p_main = self.beta.len();
+                let p_w = runtime.beta.len();
+                let p_total = p_main + p_w;
+                if cov.nrows() != p_total || cov.ncols() != p_total {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "standard link-wiggle covariance dimension mismatch: expected {}x{}, got {}x{}",
+                        p_total,
+                        p_total,
+                        cov.nrows(),
+                        cov.ncols()
+                    )));
+                }
+                let x_main = input.design.to_dense();
+                let mut grad = Array2::<f64>::zeros((result.eta.len(), p_total));
+                for i in 0..result.eta.len() {
+                    for j in 0..p_main {
+                        grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+                    }
+                    for j in 0..p_w {
+                        grad[[i, p_main + j]] = wiggle_design[[i, j]];
+                    }
+                }
+                linear_predictor_se_from_grad(&grad, cov)
+            } else {
+                eta_standard_errors_from_design(&input.design, cov)?
+            };
             let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
             let mean_se = delta_method_mean_se(&result.eta, &se, &strategy)?;
             (Some(se), Some(mean_se))
@@ -433,14 +511,55 @@ impl PredictableModel for StandardPredictor {
         fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        predict_gamwith_uncertainty(
-            input.design.clone(),
-            self.beta.view(),
-            input.offset.view(),
-            self.family,
-            fit,
-            options,
-        )
+        if self.link_wiggle.is_none() {
+            return predict_gamwith_uncertainty(
+                input.design.clone(),
+                self.beta.view(),
+                input.offset.view(),
+                self.family,
+                fit,
+                options,
+            );
+        }
+        let pred = self.predict_with_uncertainty(input)?;
+        let eta_se = pred.eta_se.clone().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "standard link-wiggle uncertainty requires covariance".to_string(),
+            )
+        })?;
+        let mean_se = pred.mean_se.clone().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "standard link-wiggle uncertainty requires covariance".to_string(),
+            )
+        })?;
+        let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
+            .map_err(EstimationError::InvalidInput)?;
+        let eta_lower = &pred.eta - &eta_se.mapv(|s| z * s);
+        let eta_upper = &pred.eta + &eta_se.mapv(|s| z * s);
+        let mut mean_lower = &pred.mean - &mean_se.mapv(|s| z * s);
+        let mut mean_upper = &pred.mean + &mean_se.mapv(|s| z * s);
+        let (lo, hi) = match self.family {
+            crate::types::LikelihoodFamily::GaussianIdentity => (f64::NEG_INFINITY, f64::INFINITY),
+            crate::types::LikelihoodFamily::PoissonLog
+            | crate::types::LikelihoodFamily::GammaLog => (0.0, f64::INFINITY),
+            _ => (1e-10, 1.0 - 1e-10),
+        };
+        mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
+        mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
+        Ok(PredictUncertaintyResult {
+            eta: pred.eta,
+            mean: pred.mean,
+            eta_standard_error: eta_se,
+            mean_standard_error: mean_se,
+            eta_lower,
+            eta_upper,
+            mean_lower,
+            mean_upper,
+            observation_lower: None,
+            observation_upper: None,
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: false,
+        })
     }
 
     fn predict_posterior_mean(
@@ -448,27 +567,85 @@ impl PredictableModel for StandardPredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        if self.link_wiggle.is_none() {
+            let cov = fit.beta_covariance().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "posterior-mean prediction requires beta covariance in fit result".to_string(),
+                )
+            })?;
+            return predict_gam_posterior_meanwith_fit(
+                input.design.clone(),
+                self.beta.view(),
+                input.offset.view(),
+                self.family,
+                cov.view(),
+                fit,
+            );
+        }
+        let runtime = self.link_wiggle.as_ref().expect("checked above");
+        let plugin = self.predict_plugin_response(input)?;
+        let eta_base = input.design.dot(&self.beta) + &input.offset;
         let cov = fit.beta_covariance().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "posterior-mean prediction requires beta covariance in fit result".to_string(),
             )
         })?;
-        predict_gam_posterior_meanwith_fit(
-            input.design.clone(),
-            self.beta.view(),
-            input.offset.view(),
-            self.family,
-            cov.view(),
-            fit,
-        )
+        let p_main = self.beta.len();
+        let p_w = runtime.beta.len();
+        let p_total = p_main + p_w;
+        if cov.nrows() != p_total || cov.ncols() != p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "standard link-wiggle posterior mean covariance mismatch: expected {}x{}, got {}x{}",
+                p_total,
+                p_total,
+                cov.nrows(),
+                cov.ncols()
+            )));
+        }
+        let x_main = input.design.to_dense();
+        let wiggle_design = runtime
+            .design(&eta_base)
+            .map_err(EstimationError::InvalidInput)?;
+        let dq_dq0 = runtime
+            .derivative_q0(&eta_base)
+            .map_err(EstimationError::InvalidInput)?;
+        let mut grad = Array2::<f64>::zeros((plugin.eta.len(), p_total));
+        for i in 0..plugin.eta.len() {
+            for j in 0..p_main {
+                grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+            }
+            for j in 0..p_w {
+                grad[[i, p_main + j]] = wiggle_design[[i, j]];
+            }
+        }
+        let eta_se = linear_predictor_se_from_grad(&grad, cov);
+        let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+        let quadctx = crate::quadrature::QuadratureContext::new();
+        let mean = Array1::from_iter((0..plugin.eta.len()).map(|i| {
+            crate::quadrature::normal_expectation_1d_adaptive(
+                &quadctx,
+                plugin.eta[i],
+                eta_se[i],
+                |x| strategy.inverse_link(x).unwrap_or(plugin.mean[i]),
+            )
+        }));
+        Ok(PredictPosteriorMeanResult {
+            eta: plugin.eta,
+            eta_standard_error: eta_se,
+            mean,
+        })
     }
 
     fn n_blocks(&self) -> usize {
-        1
+        if self.link_wiggle.is_some() { 2 } else { 1 }
     }
 
     fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Mean]
+        if self.link_wiggle.is_some() {
+            vec![BlockRole::Mean, BlockRole::LinkWiggle]
+        } else {
+            vec![BlockRole::Mean]
+        }
     }
 }
 
@@ -481,49 +658,89 @@ pub struct GaussianLocationScalePredictor {
     pub beta_noise: Array1<f64>,
     pub response_scale: f64,
     pub covariance: Option<Array2<f64>>,
+    pub link_wiggle: Option<SavedLinkWiggleRuntime>,
 }
 
 impl GaussianLocationScalePredictor {
-    pub(crate) fn from_unified(
-        unified: &UnifiedFitResult,
-        response_scale: f64,
-    ) -> Result<Self, EstimationError> {
-        let beta_mu = unified
-            .block_by_role(BlockRole::Location)
-            .or_else(|| unified.block_by_role(BlockRole::Mean))
-            .map(|b| b.beta.clone())
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Gaussian location-scale model missing location/mean block".to_string(),
-                )
-            })?;
-        let beta_noise = unified
-            .block_by_role(BlockRole::Scale)
-            .map(|b| b.beta.clone())
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Gaussian location-scale model missing scale block".to_string(),
-                )
-            })?;
-        Ok(Self {
-            beta_mu,
-            beta_noise,
-            response_scale,
-            covariance: unified.covariance_conditional.clone(),
-        })
-    }
-
     /// Compute sigma = exp(eta_noise) * response_scale for each observation.
     /// Clamps eta_noise to [-500, 500] to prevent overflow/underflow in exp().
     fn compute_sigma(&self, design_noise: &DesignMatrix) -> Array1<f64> {
         let eta_noise = design_noise.dot(&self.beta_noise);
         eta_noise.mapv(|eta| eta.clamp(-500.0, 500.0).exp() * self.response_scale)
     }
+
+    fn eta_standard_error(
+        &self,
+        input: &PredictInput,
+        fit: &UnifiedFitResult,
+        eta_len: usize,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let covariance = posterior_mean_covariance_or_warn(
+            fit,
+            self.covariance.as_ref(),
+            self.beta_mu.len()
+                + self.beta_noise.len()
+                + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len()),
+            "gaussian location-scale posterior mean",
+        );
+        let Some(covariance) = covariance else {
+            return Ok(Array1::zeros(eta_len));
+        };
+        let p_mu = self.beta_mu.len();
+        let p_sigma = self.beta_noise.len();
+        let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+        let p_total = p_mu + p_sigma + p_w;
+        if covariance.nrows() != p_total || covariance.ncols() != p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "gaussian location-scale covariance mismatch: expected {}x{}, got {}x{}",
+                p_total,
+                p_total,
+                covariance.nrows(),
+                covariance.ncols()
+            )));
+        }
+        let x_mu = input.design.to_dense();
+        let mut grad = Array2::<f64>::zeros((eta_len, p_total));
+        if let Some(runtime) = self.link_wiggle.as_ref() {
+            let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
+            let wiggle_design = runtime
+                .design(&eta_base)
+                .map_err(EstimationError::InvalidInput)?;
+            let dq_dq0 = runtime
+                .derivative_q0(&eta_base)
+                .map_err(EstimationError::InvalidInput)?;
+            for i in 0..eta_len {
+                for j in 0..p_mu {
+                    grad[[i, j]] = dq_dq0[i] * x_mu[[i, j]];
+                }
+                for j in 0..p_w {
+                    grad[[i, p_mu + p_sigma + j]] = wiggle_design[[i, j]];
+                }
+            }
+        } else {
+            for i in 0..eta_len {
+                for j in 0..p_mu {
+                    grad[[i, j]] = x_mu[[i, j]];
+                }
+            }
+        }
+        Ok(linear_predictor_se_from_grad(&grad, covariance))
+    }
 }
 
 impl PredictableModel for GaussianLocationScalePredictor {
-    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
-        let eta = input.design.dot(&self.beta_mu) + &input.offset;
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError> {
+        let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
+        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
+            runtime
+                .apply(&eta_base)
+                .map_err(EstimationError::InvalidInput)?
+        } else {
+            eta_base
+        };
         // Gaussian identity link: mean = eta.
         let mean = eta.clone();
         Ok(PredictResult { eta, mean })
@@ -533,7 +750,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        let result = self.predict_response(input)?;
+        let result = self.predict_plugin_response(input)?;
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "Gaussian location-scale prediction requires noise design matrix".to_string(),
@@ -556,26 +773,33 @@ impl PredictableModel for GaussianLocationScalePredictor {
         fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        let _ = fit; // not needed for Gaussian LS intervals
-        let pred = self.predict_with_uncertainty(input)?;
-        let sigma = pred.mean_se.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput("missing sigma for Gaussian LS intervals".to_string())
+        let pred = self.predict_plugin_response(input)?;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian location-scale prediction requires noise design matrix".to_string(),
+            )
         })?;
+        let sigma = self.compute_sigma(design_noise);
+        let eta_se = self.eta_standard_error(input, fit, pred.eta.len())?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(|e| EstimationError::InvalidInput(e))?;
-        let eta_lower = &pred.eta - &sigma.mapv(|s| z * s);
-        let eta_upper = &pred.eta + &sigma.mapv(|s| z * s);
+        let eta_lower = &pred.eta - &eta_se.mapv(|s| z * s);
+        let eta_upper = &pred.eta + &eta_se.mapv(|s| z * s);
         Ok(PredictUncertaintyResult {
             eta: pred.eta.clone(),
             mean: pred.mean.clone(),
-            eta_standard_error: sigma.clone(),
-            mean_standard_error: sigma.clone(),
+            eta_standard_error: eta_se.clone(),
+            mean_standard_error: eta_se.clone(),
             eta_lower: eta_lower.clone(),
             eta_upper: eta_upper.clone(),
             mean_lower: eta_lower,
             mean_upper: eta_upper,
-            observation_lower: None,
-            observation_upper: None,
+            observation_lower: options
+                .includeobservation_interval
+                .then(|| &pred.mean - &sigma.mapv(|s| z * s)),
+            observation_upper: options
+                .includeobservation_interval
+                .then(|| &pred.mean + &sigma.mapv(|s| z * s)),
             covariance_mode_requested: options.covariance_mode,
             covariance_corrected_used: false,
         })
@@ -586,28 +810,25 @@ impl PredictableModel for GaussianLocationScalePredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        // Gaussian identity link: posterior mean = point estimate (no nonlinearity).
-        let _ = fit;
-        let result = self.predict_response(input)?;
-        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "Gaussian location-scale posterior mean requires noise design matrix".to_string(),
-            )
-        })?;
-        let sigma = self.compute_sigma(design_noise);
+        let result = self.predict_plugin_response(input)?;
+        let eta_se = self.eta_standard_error(input, fit, result.eta.len())?;
         Ok(PredictPosteriorMeanResult {
             eta: result.eta,
-            eta_standard_error: sigma,
+            eta_standard_error: eta_se,
             mean: result.mean,
         })
     }
 
     fn n_blocks(&self) -> usize {
-        2
+        if self.link_wiggle.is_some() { 3 } else { 2 }
     }
 
     fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Location, BlockRole::Scale]
+        if self.link_wiggle.is_some() {
+            vec![BlockRole::Location, BlockRole::Scale, BlockRole::LinkWiggle]
+        } else {
+            vec![BlockRole::Location, BlockRole::Scale]
+        }
     }
 }
 
@@ -627,42 +848,14 @@ pub struct BinomialLocationScalePredictor {
     pub beta_noise: Array1<f64>,
     pub covariance: Option<Array2<f64>>,
     pub inverse_link: InverseLink,
+    pub link_wiggle: Option<SavedLinkWiggleRuntime>,
 }
 
 impl BinomialLocationScalePredictor {
-    pub(crate) fn from_unified(
-        unified: &UnifiedFitResult,
-        inverse_link: InverseLink,
-    ) -> Result<Self, EstimationError> {
-        let beta_threshold = unified
-            .block_by_role(BlockRole::Location)
-            .or_else(|| unified.block_by_role(BlockRole::Mean))
-            .map(|b| b.beta.clone())
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Binomial location-scale model missing location/mean block".to_string(),
-                )
-            })?;
-        let beta_noise = unified
-            .block_by_role(BlockRole::Scale)
-            .map(|b| b.beta.clone())
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Binomial location-scale model missing scale block".to_string(),
-                )
-            })?;
-        Ok(Self {
-            beta_threshold,
-            beta_noise,
-            covariance: unified.covariance_conditional.clone(),
-            inverse_link,
-        })
-    }
-
     /// Compute q0 = -eta_t / sigma for each observation, where
     /// eta_t is the threshold linear predictor and sigma = exp(eta_s).
     ///
-    /// Returns (q0, sigma, eta_t).
+    /// Returns (q0_base, sigma, eta_t).
     fn compute_q0_and_sigma(
         &self,
         input: &PredictInput,
@@ -683,42 +876,48 @@ impl BinomialLocationScalePredictor {
         Ok((q0, sigma, eta_t))
     }
 
-    /// Apply the inverse link to q0 to get probabilities.
-    fn apply_link(&self, q0: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+    /// Apply the saved wiggle (if present) and then the inverse link to q0.
+    fn apply_link(&self, q0: &Array1<f64>) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
+            runtime.apply(q0).map_err(EstimationError::InvalidInput)?
+        } else {
+            q0.clone()
+        };
         let mut prob = Array1::zeros(q0.len());
-        for i in 0..q0.len() {
+        for i in 0..eta.len() {
             let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
                 &self.inverse_link,
-                q0[i],
+                eta[i],
             )?;
             prob[i] = jet.mu.clamp(0.0, 1.0);
         }
-        Ok(prob)
+        Ok((eta, prob))
     }
 }
 
 impl PredictableModel for BinomialLocationScalePredictor {
-    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
-        let (q0, _, eta_t) = self.compute_q0_and_sigma(input)?;
-        let prob = self.apply_link(&q0)?;
-        Ok(PredictResult {
-            eta: eta_t,
-            mean: prob,
-        })
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError> {
+        let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
+        let (eta, prob) = self.apply_link(&q0_base)?;
+        Ok(PredictResult { eta, mean: prob })
     }
 
     fn predict_with_uncertainty(
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        let (q0, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
-        let prob = self.apply_link(&q0)?;
+        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let (eta, prob) = self.apply_link(&q0_base)?;
 
         let mean_se = if let Some(ref cov) = self.covariance {
             let n = eta_t.len();
             let p_t = self.beta_threshold.len();
             let p_s = self.beta_noise.len();
-            let p_total = p_t + p_s;
+            let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+            let p_total = p_t + p_s + p_w;
 
             if cov.nrows() != p_total || cov.ncols() != p_total {
                 return Err(EstimationError::InvalidInput(format!(
@@ -735,13 +934,29 @@ impl PredictableModel for BinomialLocationScalePredictor {
                     "binomial location-scale uncertainty requires noise design matrix".to_string(),
                 )
             })?;
+            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
+                Some(
+                    runtime
+                        .design(&q0_base)
+                        .map_err(EstimationError::InvalidInput)?,
+                )
+            } else {
+                None
+            };
+            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
+                runtime
+                    .derivative_q0(&q0_base)
+                    .map_err(EstimationError::InvalidInput)?
+            } else {
+                Array1::ones(q0_base.len())
+            };
             let mut se = Array1::zeros(n);
 
             for i in 0..n {
                 // Derivative of inverse link at q0: d(prob)/d(q0) = jet.d1
                 let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
                     &self.inverse_link,
-                    q0[i],
+                    eta[i],
                 )?;
                 let dphi = jet.d1;
 
@@ -749,10 +964,11 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 // d(q0)/d(eta_t) = -1 / sigma
                 // d(q0)/d(eta_s) = d(q0)/d(sigma) * d(sigma)/d(eta_s)
                 //                = (eta_t / sigma^2) * sigma = eta_t / sigma
-                // d(prob)/d(eta_t) = dphi * (-1 / sigma)
-                // d(prob)/d(eta_s) = dphi * (eta_t / sigma)
-                let dprob_deta_t = dphi * (-1.0 / sigma[i]);
-                let dprob_deta_s = dphi * (eta_t[i] / sigma[i]);
+                // d(prob)/d(eta_t) = dphi * d(wiggle)/d(q0) * (-1 / sigma)
+                // d(prob)/d(eta_s) = dphi * d(wiggle)/d(q0) * (eta_t / sigma)
+                let scale = dq_dq0[i];
+                let dprob_deta_t = dphi * scale * (-1.0 / sigma[i]);
+                let dprob_deta_s = dphi * scale * (eta_t[i] / sigma[i]);
 
                 // Build gradient: [dprob/d(beta_t), dprob/d(beta_s)]
                 let mut grad = Vec::with_capacity(p_total);
@@ -761,6 +977,11 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 }
                 for j in 0..p_s {
                     grad.push(dprob_deta_s * design_noise.get(i, j));
+                }
+                if let Some(wd) = wiggle_design.as_ref() {
+                    for j in 0..p_w {
+                        grad.push(dphi * wd[[i, j]]);
+                    }
                 }
 
                 let var = quadratic_form(cov, &grad)?;
@@ -772,7 +993,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         };
 
         Ok(PredictionWithSE {
-            eta: eta_t,
+            eta,
             mean: prob,
             eta_se: None,
             mean_se,
@@ -831,7 +1052,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         // posterior correlation and require agreement within ~0.01; as
         // covariance -> 0, the integrated mean must converge to the plug-in
         // point prediction row-wise.
-        let (q0, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "Binomial location-scale posterior mean requires noise design matrix".to_string(),
@@ -842,10 +1063,11 @@ impl PredictableModel for BinomialLocationScalePredictor {
             .as_ref()
             .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
         let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
-        let point_prob = self.apply_link(&q0)?;
+        let (eta, point_prob) = self.apply_link(&q0_base)?;
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_noise.len();
-        let p_total = p_t + p_s;
+        let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+        let p_total = p_t + p_s + p_w;
         let covariance = posterior_mean_covariance_or_warn(
             fit,
             self.covariance.as_ref(),
@@ -855,21 +1077,43 @@ impl PredictableModel for BinomialLocationScalePredictor {
 
         let eta_se = if let Some(cov) = covariance {
             let n = eta_t.len();
+            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
+                Some(
+                    runtime
+                        .design(&q0_base)
+                        .map_err(EstimationError::InvalidInput)?,
+                )
+            } else {
+                None
+            };
+            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
+                runtime
+                    .derivative_q0(&q0_base)
+                    .map_err(EstimationError::InvalidInput)?
+            } else {
+                Array1::ones(q0_base.len())
+            };
             let mut se = Array1::zeros(n);
             for i in 0..n {
                 let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
                     &self.inverse_link,
-                    q0[i],
+                    eta[i],
                 )?;
                 let dphi = jet.d1;
-                let dprob_deta_t = dphi * (-1.0 / sigma[i]);
-                let dprob_deta_s = dphi * (eta_t[i] / sigma[i]);
+                let scale = dq_dq0[i];
+                let dprob_deta_t = dphi * scale * (-1.0 / sigma[i]);
+                let dprob_deta_s = dphi * scale * (eta_t[i] / sigma[i]);
                 let mut grad = Vec::with_capacity(p_total);
                 for j in 0..p_t {
                     grad.push(dprob_deta_t * input.design.get(i, j));
                 }
                 for j in 0..p_s {
                     grad.push(dprob_deta_s * design_noise.get(i, j));
+                }
+                if let Some(wd) = wiggle_design.as_ref() {
+                    for j in 0..p_w {
+                        grad.push(dphi * wd[[i, j]]);
+                    }
                 }
                 let var = quadratic_form(cov, &grad)?;
                 se[i] = var.sqrt();
@@ -879,18 +1123,19 @@ impl PredictableModel for BinomialLocationScalePredictor {
             Array1::zeros(eta_t.len())
         };
 
-        let mean = if let Some(covariance) = covariance {
-            match project_two_block_linear_predictor_covariance(
-                &input.design,
-                design_noise,
-                covariance,
-                p_t,
-                p_s,
-                "binomial location-scale posterior mean",
-            ) {
-                Ok((var_t, var_s, cov_ts)) => {
-                    let quadctx = crate::quadrature::QuadratureContext::new();
-                    Array1::from_vec(
+        let mean = if self.link_wiggle.is_none() {
+            if let Some(covariance) = covariance {
+                match project_two_block_linear_predictor_covariance(
+                    &input.design,
+                    design_noise,
+                    covariance,
+                    p_t,
+                    p_s,
+                    "binomial location-scale posterior mean",
+                ) {
+                    Ok((var_t, var_s, cov_ts)) => {
+                        let quadctx = crate::quadrature::QuadratureContext::new();
+                        Array1::from_vec(
                         (0..eta_t.len())
                             .map(|i| {
                                 projected_bivariate_posterior_mean_result(
@@ -914,30 +1159,126 @@ impl PredictableModel for BinomialLocationScalePredictor {
                             })
                             .collect::<Result<Vec<_>, _>>()?,
                     )
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "binomial location-scale posterior mean: failed to project covariance into (eta_threshold, eta_log_sigma): {err}; falling back to plug-in point prediction"
+                        );
+                        point_prob.clone()
+                    }
                 }
-                Err(err) => {
-                    log::warn!(
-                        "binomial location-scale posterior mean: failed to project covariance into (eta_threshold, eta_log_sigma): {err}; falling back to plug-in point prediction"
-                    );
-                    point_prob.clone()
-                }
+            } else {
+                point_prob.clone()
             }
+        } else if let Some(cov_mat) = covariance {
+            let runtime = self.link_wiggle.as_ref().expect("checked above");
+            let cov_tt = cov_mat.slice(ndarray::s![0..p_t, 0..p_t]).to_owned();
+            let cov_ll = cov_mat
+                .slice(ndarray::s![p_t..p_t + p_s, p_t..p_t + p_s])
+                .to_owned();
+            let cov_tl = cov_mat
+                .slice(ndarray::s![0..p_t, p_t..p_t + p_s])
+                .to_owned();
+            let cov_tw = cov_mat
+                .slice(ndarray::s![0..p_t, p_t + p_s..p_t + p_s + p_w])
+                .to_owned();
+            let cov_lw = cov_mat
+                .slice(ndarray::s![p_t..p_t + p_s, p_t + p_s..p_t + p_s + p_w])
+                .to_owned();
+            let covww = cov_mat
+                .slice(ndarray::s![
+                    p_t + p_s..p_t + p_s + p_w,
+                    p_t + p_s..p_t + p_s + p_w
+                ])
+                .to_owned();
+            let xd_t_covtt = design_times_dense(&input.design, &cov_tt)?;
+            let xd_l_covll = design_times_dense(design_noise, &cov_ll)?;
+            let xd_t_covtl = design_times_dense(&input.design, &cov_tl)?;
+            let xd_t_covtw = design_times_dense(&input.design, &cov_tw)?;
+            let xd_l_covlw = design_times_dense(design_noise, &cov_lw)?;
+            let x_t_dense = input.design.to_dense();
+            let x_l_dense = design_noise.to_dense();
+            let betaw = Array1::from_vec(runtime.beta.clone());
+            let quadctx = crate::quadrature::QuadratureContext::new();
+            let mut out = Array1::<f64>::zeros(eta.len());
+            for i in 0..eta.len() {
+                let var_t = x_t_dense.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
+                let var_ls = x_l_dense.row(i).dot(&xd_l_covll.row(i)).max(0.0);
+                let cov_tls = x_l_dense.row(i).dot(&xd_t_covtl.row(i));
+                let suv_t = xd_t_covtw.row(i).to_owned();
+                let suv_ls = xd_l_covlw.row(i).to_owned();
+                let inv_uu = [
+                    [
+                        var_ls / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
+                        -cov_tls / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
+                    ],
+                    [
+                        -cov_tls / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
+                        var_t / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
+                    ],
+                ];
+                let mut k0 = Array1::<f64>::zeros(p_w);
+                let mut k1 = Array1::<f64>::zeros(p_w);
+                for j in 0..p_w {
+                    k0[j] = suv_t[j] * inv_uu[0][0] + suv_ls[j] * inv_uu[1][0];
+                    k1[j] = suv_t[j] * inv_uu[0][1] + suv_ls[j] * inv_uu[1][1];
+                }
+                let mut covw_cond = covww.clone();
+                for r in 0..p_w {
+                    for c in 0..p_w {
+                        covw_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
+                    }
+                }
+                out[i] = crate::quadrature::normal_expectation_2d_adaptive_result(
+                    &quadctx,
+                    [eta_t[i], eta_s[i]],
+                    [[var_t, cov_tls], [cov_tls, var_ls]],
+                    |t, ls| {
+                        let sigma = ls.exp().max(1e-12);
+                        let q0 = (-t / sigma).clamp(-30.0, 30.0);
+                        let xw = runtime
+                            .basis_row_scalar(q0)
+                            .map_err(EstimationError::InvalidInput)?;
+                        let dt = t - eta_t[i];
+                        let dls = ls - eta_s[i];
+                        let meanw = q0 + xw.dot(&betaw) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
+                        let mut varw = 0.0;
+                        for r in 0..p_w {
+                            let xr = xw[r];
+                            for c in 0..p_w {
+                                varw += xr * covw_cond[[r, c]] * xw[c];
+                            }
+                        }
+                        let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
+                            &self.inverse_link,
+                            meanw,
+                            varw.max(0.0).sqrt(),
+                        )?;
+                        Ok(jet.mu.clamp(0.0, 1.0))
+                    },
+                )?;
+            }
+            out
         } else {
             point_prob.clone()
         };
         Ok(PredictPosteriorMeanResult {
-            eta: eta_t,
+            eta,
             eta_standard_error: eta_se,
             mean,
         })
     }
 
     fn n_blocks(&self) -> usize {
-        2
+        if self.link_wiggle.is_some() { 3 } else { 2 }
     }
 
     fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Location, BlockRole::Scale]
+        if self.link_wiggle.is_some() {
+            vec![BlockRole::Location, BlockRole::Scale, BlockRole::LinkWiggle]
+        } else {
+            vec![BlockRole::Location, BlockRole::Scale]
+        }
     }
 }
 
@@ -1013,7 +1354,10 @@ impl SurvivalPredictor {
 }
 
 impl PredictableModel for SurvivalPredictor {
-    fn predict_response(&self, input: &PredictInput) -> Result<PredictResult, EstimationError> {
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError> {
         let eta_threshold = input.design.dot(&self.beta_threshold) + &input.offset;
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
