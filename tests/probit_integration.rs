@@ -1,8 +1,8 @@
+use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::update_glmvectors_by_family;
+use gam::predict::predict_gam;
 use gam::probability::normal_cdf;
 use gam::types::GlmLikelihoodFamily;
-use gam::estimate::{FitOptions, fit_gam};
-use gam::predict::predict_gam;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;

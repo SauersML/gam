@@ -1,9 +1,12 @@
 use gam::{
+    FitRequest, FitResult, StandardFitRequest,
     basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu},
     estimate::FitOptions,
-    smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec},
+    smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+        TermCollectionSpec,
+    },
     types::LikelihoodFamily,
-    FitRequest, FitResult, StandardFitRequest,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;

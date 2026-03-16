@@ -1,12 +1,12 @@
+use gam::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState,
+};
 use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, ExactNewtonJointPsiTerms, ExactNewtonOuterObjective,
     evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::SymmetricMatrix;
-use gam::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState,
-};
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 

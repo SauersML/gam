@@ -4550,7 +4550,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         },
         cap: OuterCapability {
             gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
+            hessian: if crate::custom_family::joint_exact_analytic_outer_hessian_available(
+                blockspec.design.ncols(),
+            ) {
+                Derivative::Analytic
+            } else {
+                Derivative::Unavailable
+            },
             n_params: n_theta,
             all_penalty_like: false,
             has_psi_coords: true,
@@ -8802,6 +8808,714 @@ pub(crate) fn freeze_spatial_length_scale_terms_from_design(
     Ok(frozen)
 }
 
+#[derive(Debug, Clone)]
+struct SingleSmoothTermRealization {
+    design_local: Array2<f64>,
+    term: SmoothTerm,
+    dropped_penaltyinfo: Vec<DroppedPenaltyBlockInfo>,
+}
+
+impl SingleSmoothTermRealization {
+    fn active_penaltyinfo(&self) -> Vec<PenaltyInfo> {
+        self.term
+            .penaltyinfo_local
+            .iter()
+            .filter(|info| info.active)
+            .cloned()
+            .collect()
+    }
+}
+
+fn build_single_smooth_term_realization(
+    data: ArrayView2<'_, f64>,
+    termspec: &SmoothTermSpec,
+) -> Result<SingleSmoothTermRealization, BasisError> {
+    let raw = build_smooth_design(data, std::slice::from_ref(termspec))?;
+    let RawSmoothDesign {
+        design,
+        dropped_penaltyinfo,
+        terms,
+        ..
+    } = raw;
+    let term = terms.into_iter().next().ok_or_else(|| {
+        BasisError::InvalidInput("single-term smooth build returned no term".to_string())
+    })?;
+    Ok(SingleSmoothTermRealization {
+        design_local: design,
+        term,
+        dropped_penaltyinfo,
+    })
+}
+
+fn rebuild_smooth_auxiliary_state(
+    smooth: &mut SmoothDesign,
+    dropped_penaltyinfo_by_term: &[Vec<DroppedPenaltyBlockInfo>],
+) -> Result<(), String> {
+    if dropped_penaltyinfo_by_term.len() != smooth.terms.len() {
+        return Err(format!(
+            "smooth dropped-penalty cache mismatch: terms={}, dropped_sets={}",
+            smooth.terms.len(),
+            dropped_penaltyinfo_by_term.len()
+        ));
+    }
+
+    let total_p = smooth.design.ncols();
+    let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
+    let mut any_bounds = false;
+    let mut linear_constraintrows: Vec<Array1<f64>> = Vec::new();
+    let mut linear_constraint_b: Vec<f64> = Vec::new();
+
+    for term in &smooth.terms {
+        let range = term.coeff_range.clone();
+        if let Some(lb_local) = term.lower_bounds_local.as_ref() {
+            if lb_local.len() != range.len() {
+                return Err(format!(
+                    "smooth lower-bound cache mismatch for term '{}': bounds={}, coeffs={}",
+                    term.name,
+                    lb_local.len(),
+                    range.len()
+                ));
+            }
+            coefficient_lower_bounds
+                .slice_mut(s![range.clone()])
+                .assign(lb_local);
+            any_bounds = true;
+        }
+        if let Some(lin_local) = term.linear_constraints_local.as_ref() {
+            if lin_local.a.ncols() != range.len() {
+                return Err(format!(
+                    "smooth linear-constraint cache mismatch for term '{}': cols={}, coeffs={}",
+                    term.name,
+                    lin_local.a.ncols(),
+                    range.len()
+                ));
+            }
+            for r in 0..lin_local.a.nrows() {
+                let mut row = Array1::<f64>::zeros(total_p);
+                row.slice_mut(s![range.clone()]).assign(&lin_local.a.row(r));
+                linear_constraintrows.push(row);
+                linear_constraint_b.push(lin_local.b[r]);
+            }
+        }
+    }
+
+    smooth.coefficient_lower_bounds = if any_bounds {
+        Some(coefficient_lower_bounds)
+    } else {
+        None
+    };
+    smooth.linear_constraints = if linear_constraintrows.is_empty() {
+        None
+    } else {
+        let mut a = Array2::<f64>::zeros((linear_constraintrows.len(), total_p));
+        for (i, row) in linear_constraintrows.iter().enumerate() {
+            a.row_mut(i).assign(row);
+        }
+        Some(LinearInequalityConstraints {
+            a,
+            b: Array1::from_vec(linear_constraint_b),
+        })
+    };
+    smooth.dropped_penaltyinfo = dropped_penaltyinfo_by_term
+        .iter()
+        .flat_map(|infos| infos.iter().cloned())
+        .collect();
+    Ok(())
+}
+
+fn rebuild_term_collection_auxiliary_state(
+    spec: &TermCollectionSpec,
+    design: &mut TermCollectionDesign,
+) -> Result<(), String> {
+    if spec.linear_terms.len() != design.linear_ranges.len() {
+        return Err(format!(
+            "term-collection linear bookkeeping mismatch: spec_terms={}, design_ranges={}",
+            spec.linear_terms.len(),
+            design.linear_ranges.len()
+        ));
+    }
+
+    let p_total = design.design.ncols();
+    let smooth_start = p_total.saturating_sub(design.smooth.design.ncols());
+    let mut coefficient_lower_bounds = Array1::<f64>::from_elem(p_total, f64::NEG_INFINITY);
+    let mut any_bounds = false;
+    let mut linear_constraintrows: Vec<Array1<f64>> = Vec::new();
+    let mut linear_constraint_b: Vec<f64> = Vec::new();
+
+    for (linear, (_, range)) in spec.linear_terms.iter().zip(design.linear_ranges.iter()) {
+        if range.len() != 1 {
+            return Err(format!(
+                "linear term '{}' expected one coefficient column, found {}",
+                linear.name,
+                range.len()
+            ));
+        }
+        let col = range.start;
+        if let Some(lb) = linear.coefficient_min {
+            let mut row = Array1::<f64>::zeros(p_total);
+            row[col] = 1.0;
+            linear_constraintrows.push(row);
+            linear_constraint_b.push(lb);
+        }
+        if let Some(ub) = linear.coefficient_max {
+            let mut row = Array1::<f64>::zeros(p_total);
+            row[col] = -1.0;
+            linear_constraintrows.push(row);
+            linear_constraint_b.push(-ub);
+        }
+    }
+
+    if let Some(lb_smooth) = design.smooth.coefficient_lower_bounds.as_ref() {
+        if lb_smooth.len() != design.smooth.design.ncols() {
+            return Err(format!(
+                "smooth lower-bound width mismatch: bounds={}, smooth_cols={}",
+                lb_smooth.len(),
+                design.smooth.design.ncols()
+            ));
+        }
+        coefficient_lower_bounds
+            .slice_mut(s![
+                smooth_start..(smooth_start + design.smooth.design.ncols())
+            ])
+            .assign(lb_smooth);
+        any_bounds = true;
+    }
+    if let Some(lin_smooth) = design.smooth.linear_constraints.as_ref() {
+        if lin_smooth.a.ncols() != design.smooth.design.ncols() {
+            return Err(format!(
+                "smooth linear-constraint width mismatch: cols={}, smooth_cols={}",
+                lin_smooth.a.ncols(),
+                design.smooth.design.ncols()
+            ));
+        }
+        let mut a_global = Array2::<f64>::zeros((lin_smooth.a.nrows(), p_total));
+        a_global
+            .slice_mut(s![
+                ..,
+                smooth_start..(smooth_start + design.smooth.design.ncols())
+            ])
+            .assign(&lin_smooth.a);
+        for r in 0..a_global.nrows() {
+            linear_constraintrows.push(a_global.row(r).to_owned());
+            linear_constraint_b.push(lin_smooth.b[r]);
+        }
+    }
+
+    let lower_bound_constraints = if any_bounds {
+        linear_constraints_from_lower_bounds_global(&coefficient_lower_bounds)
+    } else {
+        None
+    };
+    let explicit_linear_constraints = if linear_constraintrows.is_empty() {
+        None
+    } else {
+        let mut a = Array2::<f64>::zeros((linear_constraintrows.len(), p_total));
+        for (i, row) in linear_constraintrows.iter().enumerate() {
+            a.row_mut(i).assign(row);
+        }
+        Some(LinearInequalityConstraints {
+            a,
+            b: Array1::from_vec(linear_constraint_b),
+        })
+    };
+
+    design.coefficient_lower_bounds = if any_bounds {
+        Some(coefficient_lower_bounds)
+    } else {
+        None
+    };
+    design.linear_constraints =
+        merge_linear_constraints_global(explicit_linear_constraints, lower_bound_constraints);
+    design.dropped_penaltyinfo = design.smooth.dropped_penaltyinfo.clone();
+    Ok(())
+}
+
+fn theta_values_match(left: &Array1<f64>, right: &Array1<f64>) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(&l, &r)| l.to_bits() == r.to_bits())
+}
+
+fn spatial_psi_to_length_scale_and_aniso(psi: &[f64]) -> (f64, Option<Vec<f64>>) {
+    if psi.len() <= 1 {
+        ((-psi.first().copied().unwrap_or(0.0)).exp(), None)
+    } else {
+        let psi_bar = psi.iter().sum::<f64>() / psi.len() as f64;
+        (
+            (-psi_bar).exp(),
+            Some(psi.iter().map(|&value| value - psi_bar).collect()),
+        )
+    }
+}
+
+fn spatial_aniso_matches(left: Option<&[f64]>, right: Option<&[f64]>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(&x, &y)| x.to_bits() == y.to_bits())
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FrozenTermCollectionIncrementalRealizer<'d> {
+    data: ArrayView2<'d, f64>,
+    spec: TermCollectionSpec,
+    design: TermCollectionDesign,
+    dropped_penaltyinfo_by_term: Vec<Vec<DroppedPenaltyBlockInfo>>,
+    smooth_penalty_ranges: Vec<Range<usize>>,
+    full_penalty_ranges: Vec<Range<usize>>,
+    full_smooth_start: usize,
+}
+
+impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
+    fn new(
+        data: ArrayView2<'d, f64>,
+        spec: TermCollectionSpec,
+        design: TermCollectionDesign,
+    ) -> Result<Self, String> {
+        if spec.smooth_terms.len() != design.smooth.terms.len() {
+            return Err(format!(
+                "incremental realizer smooth term mismatch: spec_terms={}, design_terms={}",
+                spec.smooth_terms.len(),
+                design.smooth.terms.len()
+            ));
+        }
+
+        let mut smooth_cursor = 0usize;
+        let mut smooth_penalty_ranges = Vec::with_capacity(design.smooth.terms.len());
+        for term in &design.smooth.terms {
+            let next = smooth_cursor + term.penalties_local.len();
+            smooth_penalty_ranges.push(smooth_cursor..next);
+            smooth_cursor = next;
+        }
+        if smooth_cursor != design.smooth.penalties.len() {
+            return Err(format!(
+                "incremental realizer smooth penalty mismatch: ranged={}, actual={}",
+                smooth_cursor,
+                design.smooth.penalties.len()
+            ));
+        }
+
+        let fixed_penalty_offset = design
+            .penalties
+            .len()
+            .checked_sub(design.smooth.penalties.len())
+            .ok_or_else(|| {
+                "incremental realizer encountered invalid penalty bookkeeping".to_string()
+            })?;
+        let full_penalty_ranges = smooth_penalty_ranges
+            .iter()
+            .map(|range| (fixed_penalty_offset + range.start)..(fixed_penalty_offset + range.end))
+            .collect::<Vec<_>>();
+
+        let mut dropped_penaltyinfo_by_term = Vec::with_capacity(spec.smooth_terms.len());
+        for (term_idx, termspec) in spec.smooth_terms.iter().enumerate() {
+            let realization =
+                build_single_smooth_term_realization(data, termspec).map_err(|e| {
+                    format!(
+                        "failed to build cached realization for smooth term '{}' (index {}): {e}",
+                        termspec.name, term_idx
+                    )
+                })?;
+            let expected_cols = design.smooth.terms[term_idx].coeff_range.len();
+            if realization.design_local.ncols() != expected_cols {
+                return Err(format!(
+                    "cached realization width mismatch for term '{}': cached_cols={}, design_cols={}",
+                    termspec.name,
+                    realization.design_local.ncols(),
+                    expected_cols
+                ));
+            }
+            if realization.active_penaltyinfo().len()
+                != design.smooth.terms[term_idx].penalties_local.len()
+            {
+                return Err(format!(
+                    "cached realization penalty mismatch for term '{}': cached_penalties={}, design_penalties={}",
+                    termspec.name,
+                    realization.active_penaltyinfo().len(),
+                    design.smooth.terms[term_idx].penalties_local.len()
+                ));
+            }
+            dropped_penaltyinfo_by_term.push(realization.dropped_penaltyinfo);
+        }
+
+        let full_smooth_start = design
+            .design
+            .ncols()
+            .saturating_sub(design.smooth.design.ncols());
+        Ok(Self {
+            data,
+            spec,
+            design,
+            dropped_penaltyinfo_by_term,
+            smooth_penalty_ranges,
+            full_penalty_ranges,
+            full_smooth_start,
+        })
+    }
+
+    fn spec(&self) -> &TermCollectionSpec {
+        &self.spec
+    }
+
+    fn design(&self) -> &TermCollectionDesign {
+        &self.design
+    }
+
+    fn apply_log_kappa(
+        &mut self,
+        log_kappa: &SpatialLogKappaCoords,
+        term_indices: &[usize],
+    ) -> Result<(), String> {
+        if term_indices.len() != log_kappa.dims_per_term().len() {
+            return Err(format!(
+                "incremental realizer log-kappa term mismatch: term_indices={}, dims_per_term={}",
+                term_indices.len(),
+                log_kappa.dims_per_term().len()
+            ));
+        }
+
+        let mut any_changed = false;
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            any_changed |= self.apply_log_kappa_to_term(term_idx, log_kappa.term_slice(slot))?;
+        }
+
+        if any_changed {
+            rebuild_smooth_auxiliary_state(
+                &mut self.design.smooth,
+                &self.dropped_penaltyinfo_by_term,
+            )?;
+            rebuild_term_collection_auxiliary_state(&self.spec, &mut self.design)?;
+        }
+        Ok(())
+    }
+
+    fn apply_log_kappa_to_term(&mut self, term_idx: usize, psi: &[f64]) -> Result<bool, String> {
+        let current_length_scale =
+            get_spatial_length_scale(&self.spec, term_idx).ok_or_else(|| {
+                format!(
+                    "incremental realizer term {term_idx} does not expose a spatial length scale"
+                )
+            })?;
+        let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
+        let (next_length_scale, next_aniso) = spatial_psi_to_length_scale_and_aniso(psi);
+        let same_length = current_length_scale.to_bits() == next_length_scale.to_bits();
+        let same_aniso = spatial_aniso_matches(current_aniso.as_deref(), next_aniso.as_deref());
+        if same_length && same_aniso {
+            return Ok(false);
+        }
+
+        set_spatial_length_scale(&mut self.spec, term_idx, next_length_scale)
+            .map_err(|e| e.to_string())?;
+        if let Some(eta) = next_aniso {
+            set_spatial_aniso_log_scales(&mut self.spec, term_idx, eta)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let termspec = self
+            .spec
+            .smooth_terms
+            .get(term_idx)
+            .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
+            .clone();
+        let realization =
+            build_single_smooth_term_realization(self.data, &termspec).map_err(|e| {
+                format!(
+                    "failed to rebuild smooth term '{}' during incremental κ realization: {e}",
+                    termspec.name
+                )
+            })?;
+        self.replace_term_realization(term_idx, realization)?;
+        Ok(true)
+    }
+
+    fn replace_term_realization(
+        &mut self,
+        term_idx: usize,
+        realization: SingleSmoothTermRealization,
+    ) -> Result<(), String> {
+        let SingleSmoothTermRealization {
+            design_local,
+            term,
+            dropped_penaltyinfo,
+        } = realization;
+        let SmoothTerm {
+            name,
+            penalties_local,
+            nullspace_dims,
+            penaltyinfo_local,
+            metadata,
+            lower_bounds_local,
+            linear_constraints_local,
+            ..
+        } = term;
+        let coeff_range = self
+            .design
+            .smooth
+            .terms
+            .get(term_idx)
+            .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
+            .coeff_range
+            .clone();
+        let full_range = (self.full_smooth_start + coeff_range.start)
+            ..(self.full_smooth_start + coeff_range.end);
+        if design_local.ncols() != coeff_range.len() {
+            return Err(format!(
+                "incremental realizer width mismatch for term {}: rebuilt_cols={}, cached_cols={}",
+                term_idx,
+                design_local.ncols(),
+                coeff_range.len()
+            ));
+        }
+        if design_local.nrows() != self.design.design.nrows() {
+            return Err(format!(
+                "incremental realizer row mismatch for term {}: rebuilt_rows={}, design_rows={}",
+                term_idx,
+                design_local.nrows(),
+                self.design.design.nrows()
+            ));
+        }
+
+        let active_penaltyinfo = penaltyinfo_local
+            .iter()
+            .filter(|info| info.active)
+            .cloned()
+            .collect::<Vec<_>>();
+        let smooth_penalty_range = self
+            .smooth_penalty_ranges
+            .get(term_idx)
+            .ok_or_else(|| {
+                format!("incremental realizer missing smooth penalty range for term {term_idx}")
+            })?
+            .clone();
+        let full_penalty_range = self
+            .full_penalty_ranges
+            .get(term_idx)
+            .ok_or_else(|| {
+                format!("incremental realizer missing full penalty range for term {term_idx}")
+            })?
+            .clone();
+        if active_penaltyinfo.len() != smooth_penalty_range.len()
+            || penalties_local.len() != smooth_penalty_range.len()
+            || nullspace_dims.len() != smooth_penalty_range.len()
+        {
+            return Err(format!(
+                "incremental realizer topology changed for term '{}': penalties={}, infos={}, nullspaces={}, cached_penalties={}",
+                name,
+                penalties_local.len(),
+                active_penaltyinfo.len(),
+                nullspace_dims.len(),
+                smooth_penalty_range.len()
+            ));
+        }
+
+        self.design
+            .smooth
+            .design
+            .slice_mut(s![.., coeff_range.clone()])
+            .assign(&design_local);
+        self.design
+            .design
+            .slice_mut(s![.., full_range.clone()])
+            .assign(&design_local);
+
+        for (offset, penalty_local) in penalties_local.iter().enumerate() {
+            let smooth_penalty_idx = smooth_penalty_range.start + offset;
+            let full_penalty_idx = full_penalty_range.start + offset;
+            let nullspace_dim = nullspace_dims[offset];
+            let penalty_info = active_penaltyinfo[offset].clone();
+
+            let smooth_penalty = self
+                .design
+                .smooth
+                .penalties
+                .get_mut(smooth_penalty_idx)
+                .ok_or_else(|| {
+                    format!(
+                        "incremental realizer smooth penalty {} out of range for term {}",
+                        smooth_penalty_idx, term_idx
+                    )
+                })?;
+            smooth_penalty.fill(0.0);
+            smooth_penalty
+                .slice_mut(s![coeff_range.clone(), coeff_range.clone()])
+                .assign(penalty_local);
+
+            let full_penalty =
+                self.design
+                    .penalties
+                    .get_mut(full_penalty_idx)
+                    .ok_or_else(|| {
+                        format!(
+                            "incremental realizer full penalty {} out of range for term {}",
+                            full_penalty_idx, term_idx
+                        )
+                    })?;
+            full_penalty.fill(0.0);
+            full_penalty
+                .slice_mut(s![full_range.clone(), full_range.clone()])
+                .assign(penalty_local);
+
+            self.design.smooth.nullspace_dims[smooth_penalty_idx] = nullspace_dim;
+            self.design.nullspace_dims[full_penalty_idx] = nullspace_dim;
+
+            self.design.smooth.penaltyinfo[smooth_penalty_idx].global_index = smooth_penalty_idx;
+            self.design.smooth.penaltyinfo[smooth_penalty_idx].termname = Some(name.clone());
+            self.design.smooth.penaltyinfo[smooth_penalty_idx].penalty = penalty_info.clone();
+
+            self.design.penaltyinfo[full_penalty_idx].global_index = full_penalty_idx;
+            self.design.penaltyinfo[full_penalty_idx].termname = Some(name.clone());
+            self.design.penaltyinfo[full_penalty_idx].penalty = penalty_info;
+        }
+
+        let target_term = self.design.smooth.terms.get_mut(term_idx).ok_or_else(|| {
+            format!("incremental realizer smooth term {term_idx} disappeared during replacement")
+        })?;
+        target_term.penalties_local = penalties_local;
+        target_term.nullspace_dims = nullspace_dims;
+        target_term.penaltyinfo_local = penaltyinfo_local;
+        target_term.metadata = metadata;
+        target_term.lower_bounds_local = lower_bounds_local;
+        target_term.linear_constraints_local = linear_constraints_local;
+        self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TwoBlockExactJointDesignCache<'d> {
+    mean_realizer: FrozenTermCollectionIncrementalRealizer<'d>,
+    noise_realizer: FrozenTermCollectionIncrementalRealizer<'d>,
+    current_theta: Option<Array1<f64>>,
+    last_cost: Option<f64>,
+    last_eval: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
+    mean_terms: Vec<usize>,
+    noise_terms: Vec<usize>,
+    rho_dim: usize,
+    all_dims: Vec<usize>,
+}
+
+impl<'d> TwoBlockExactJointDesignCache<'d> {
+    fn new(
+        data: ArrayView2<'d, f64>,
+        meanspec: TermCollectionSpec,
+        mean_design: TermCollectionDesign,
+        mean_terms: Vec<usize>,
+        noisespec: TermCollectionSpec,
+        noise_design: TermCollectionDesign,
+        noise_terms: Vec<usize>,
+        rho_dim: usize,
+        all_dims: Vec<usize>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            mean_realizer: FrozenTermCollectionIncrementalRealizer::new(
+                data,
+                meanspec,
+                mean_design,
+            )?,
+            noise_realizer: FrozenTermCollectionIncrementalRealizer::new(
+                data,
+                noisespec,
+                noise_design,
+            )?,
+            current_theta: None,
+            last_cost: None,
+            last_eval: None,
+            mean_terms,
+            noise_terms,
+            rho_dim,
+            all_dims,
+        })
+    }
+
+    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            return Ok(());
+        }
+
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            theta,
+            self.rho_dim,
+            self.all_dims.clone(),
+        );
+        let (mean_lk, noise_lk) = log_kappa.split_at(self.mean_terms.len());
+        self.mean_realizer
+            .apply_log_kappa(&mean_lk, &self.mean_terms)?;
+        self.noise_realizer
+            .apply_log_kappa(&noise_lk, &self.noise_terms)?;
+        self.current_theta = Some(theta.clone());
+        self.last_cost = None;
+        self.last_eval = None;
+        Ok(())
+    }
+
+    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval
+                .as_ref()
+                .map(|cached| cached.0)
+                .or(self.last_cost)
+        } else {
+            None
+        }
+    }
+
+    fn memoized_eval(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval.clone()
+        } else {
+            None
+        }
+    }
+
+    fn store_cost(&mut self, cost: f64) {
+        self.last_cost = Some(cost);
+    }
+
+    fn store_eval(&mut self, eval: (f64, Array1<f64>, Option<Array2<f64>>)) {
+        self.last_cost = Some(eval.0);
+        self.last_eval = Some(eval);
+    }
+
+    fn mean_spec(&self) -> &TermCollectionSpec {
+        self.mean_realizer.spec()
+    }
+
+    fn noise_spec(&self) -> &TermCollectionSpec {
+        self.noise_realizer.spec()
+    }
+
+    fn mean_design(&self) -> &TermCollectionDesign {
+        self.mean_realizer.design()
+    }
+
+    fn noise_design(&self) -> &TermCollectionDesign {
+        self.noise_realizer.design()
+    }
+}
+
 pub fn optimize_two_block_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn, ExactFn>(
     data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
@@ -8901,20 +9615,16 @@ where
     }
     let rho_dim = joint_setup.rho_dim();
     let all_dims = joint_setup.log_kappa_dims_per_term();
-
-    let build_pair = |ms: &TermCollectionSpec,
-                      ns: &TermCollectionSpec|
-     -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
-        let d_mean = build_term_collection_design(data, ms).map_err(|e| {
-            format!("failed to build mean design during exact joint κ optimization: {e}")
-        })?;
-        let d_noise = build_term_collection_design(data, ns).map_err(|e| {
-            format!("failed to build noise design during exact joint κ optimization: {e}")
-        })?;
-        Ok((d_mean, d_noise))
-    };
-
-    let (bootmean_design, bootnoise_design) = build_pair(meanspec, noisespec)?;
+    let bootmean_design = build_term_collection_design(data, meanspec).map_err(|e| {
+        format!("failed to build mean design during exact joint κ optimization: {e}")
+    })?;
+    let bootnoise_design = build_term_collection_design(data, noisespec).map_err(|e| {
+        format!("failed to build noise design during exact joint κ optimization: {e}")
+    })?;
+    let analytic_outer_hessian_available = analytic_joint_hessian_available
+        && crate::custom_family::joint_exact_analytic_outer_hessian_available(
+            bootmean_design.design.ncols() + bootnoise_design.design.ncols(),
+        );
     let best_meanspec = freeze_spatial_length_scale_terms_from_design(meanspec, &bootmean_design)
         .map_err(|e| {
         format!("failed to freeze mean spatial basis centers during exact joint κ bootstrap: {e}")
@@ -8935,11 +9645,12 @@ where
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
 
-    struct TwoBlockExactJointState {
+    struct TwoBlockExactJointState<'d> {
         best_cost: f64,
+        cache: TwoBlockExactJointDesignCache<'d>,
     }
 
-    impl TwoBlockExactJointState {
+    impl<'d> TwoBlockExactJointState<'d> {
         fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
             let _ = theta;
             if cost < self.best_cost {
@@ -8950,14 +9661,20 @@ where
 
     let mut state = TwoBlockExactJointState {
         best_cost: f64::INFINITY,
+        cache: TwoBlockExactJointDesignCache::new(
+            data,
+            best_meanspec.clone(),
+            bootmean_design.clone(),
+            mean_terms.clone(),
+            best_noisespec.clone(),
+            bootnoise_design.clone(),
+            noise_terms.clone(),
+            rho_dim,
+            all_dims.clone(),
+        )?,
     };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
-    let build_pair_ref = &build_pair;
-    let best_meanspec_ref = &best_meanspec;
-    let best_noisespec_ref = &best_noisespec;
-    let mean_terms_ref = &mean_terms;
-    let noise_terms_ref = &noise_terms;
     let all_dims_ref = &all_dims;
 
     let outer_config = OuterConfig {
@@ -8985,7 +9702,7 @@ where
             } else {
                 Derivative::FiniteDifference
             },
-            hessian: if analytic_joint_hessian_available {
+            hessian: if analytic_outer_hessian_available {
                 Derivative::Analytic
             } else {
                 Derivative::Unavailable
@@ -8996,61 +9713,71 @@ where
             fixed_point_available: false,
             barrier_config: None,
         },
-        cost_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                rho_dim,
-                all_dims_ref.clone(),
-            );
-            let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
-            let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
-                Ok(v) => v,
-                Err(_) => return Ok(f64::INFINITY),
-            };
-            let ns = match noise_lk.apply_tospec(best_noisespec_ref, noise_terms_ref) {
-                Ok(v) => v,
-                Err(_) => return Ok(f64::INFINITY),
-            };
-            let (md, nd) = match build_pair_ref(&ms, &ns) {
-                Ok(v) => v,
-                Err(_) => return Ok(f64::INFINITY),
-            };
-            match cost_fn(&theta.slice(s![..rho_dim]).to_owned(), &ms, &ns, &md, &nd) {
+        cost_fn: |ctx: &mut &mut TwoBlockExactJointState<'_>, theta: &Array1<f64>| {
+            if let Some(cost) = ctx.cache.memoized_cost(theta) {
+                ctx.track_best(theta, cost);
+                return Ok(cost);
+            }
+            if ctx.cache.ensure_theta(theta).is_err() {
+                return Ok(f64::INFINITY);
+            }
+            match cost_fn(
+                &theta.slice(s![..rho_dim]).to_owned(),
+                ctx.cache.mean_spec(),
+                ctx.cache.noise_spec(),
+                ctx.cache.mean_design(),
+                ctx.cache.noise_design(),
+            ) {
                 Ok(cost) => {
+                    ctx.cache.store_cost(cost);
                     ctx.track_best(theta, cost);
                     Ok(cost)
                 }
                 Err(_) => Ok(f64::INFINITY),
             }
         },
-        eval_fn: |ctx: &mut &mut TwoBlockExactJointState, theta: &Array1<f64>| {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                rho_dim,
-                all_dims_ref.clone(),
-            );
-            let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms_ref.len());
-            let ms = match mean_lk.apply_tospec(best_meanspec_ref, mean_terms_ref) {
-                Ok(v) => v,
-                Err(_) => return Ok(OuterEval::infeasible(theta.len())),
-            };
-            let ns = match noise_lk.apply_tospec(best_noisespec_ref, noise_terms_ref) {
-                Ok(v) => v,
-                Err(_) => return Ok(OuterEval::infeasible(theta.len())),
-            };
-            let (md, nd) = match build_pair_ref(&ms, &ns) {
-                Ok(v) => v,
-                Err(_) => return Ok(OuterEval::infeasible(theta.len())),
-            };
+        eval_fn: |ctx: &mut &mut TwoBlockExactJointState<'_>, theta: &Array1<f64>| {
+            if let Some((cost, mut grad, hess)) = ctx.cache.memoized_eval(theta) {
+                ctx.track_best(theta, cost);
+                if !cost.is_finite() {
+                    return Ok(OuterEval::infeasible(theta.len()));
+                }
+                if grad.iter().any(|v| !v.is_finite()) {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "two-block exact-joint gradient contained non-finite values".to_string(),
+                    ));
+                }
+                project_psi_gradient(&mut grad, rho_dim, all_dims_ref);
+                let hessian_result = match hess {
+                    Some(mut h)
+                        if h.nrows() == theta.len()
+                            && h.ncols() == theta.len()
+                            && h.iter().all(|v| v.is_finite()) =>
+                    {
+                        project_psi_hessian(&mut h, rho_dim, all_dims_ref);
+                        HessianResult::Analytic(h)
+                    }
+                    _ => HessianResult::Unavailable,
+                };
+                return Ok(OuterEval {
+                    cost,
+                    gradient: grad,
+                    hessian: hessian_result,
+                });
+            }
+            if ctx.cache.ensure_theta(theta).is_err() {
+                return Ok(OuterEval::infeasible(theta.len()));
+            }
             match (&mut *exact_fn_cell.borrow_mut())(
                 &theta.slice(s![..rho_dim]).to_owned(),
-                &ms,
-                &ns,
-                &md,
-                &nd,
-                true,
+                ctx.cache.mean_spec(),
+                ctx.cache.noise_spec(),
+                ctx.cache.mean_design(),
+                ctx.cache.noise_design(),
+                analytic_outer_hessian_available,
             ) {
                 Ok((cost, mut grad, hess)) => {
+                    ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
                     ctx.track_best(theta, cost);
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
@@ -9086,9 +9813,12 @@ where
                 ))),
             }
         },
-        reset_fn: None::<fn(&mut &mut TwoBlockExactJointState)>,
+        reset_fn: None::<fn(&mut &mut TwoBlockExactJointState<'_>)>,
         efs_fn: None::<
-            fn(&mut &mut TwoBlockExactJointState, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+            fn(
+                &mut &mut TwoBlockExactJointState<'_>,
+                &Array1<f64>,
+            ) -> Result<EfsEval, EstimationError>,
         >,
     };
 
@@ -9106,12 +9836,7 @@ where
     // bootstrap designs. The combined ρ vector lays out mean penalties first,
     // then noise penalties, matching the order of smooth_term_penalty_index
     // within each block.
-    let noise_penalty_offset: usize = bootmean_design
-        .smooth
-        .terms
-        .iter()
-        .map(|t| t.penalties_local.len())
-        .sum();
+    let noise_penalty_offset = bootmean_design.penalties.len();
     let mean_rho_indices: Vec<usize> = mean_terms
         .iter()
         .map(|&ti| smooth_term_penalty_index(&best_meanspec, &bootmean_design, ti).unwrap_or(0))
@@ -9135,16 +9860,11 @@ where
         &all_dims,
         Some(&combined_rho_indices),
     );
-    let log_kappa_star =
-        SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, all_dims);
-    let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
-    let resolved_meanspec = mean_log_kappa
-        .apply_tospec(&best_meanspec, &mean_terms)
-        .map_err(|e| e.to_string())?;
-    let resolved_noisespec = noise_log_kappa
-        .apply_tospec(&best_noisespec, &noise_terms)
-        .map_err(|e| e.to_string())?;
-    let (mean_design, noise_design) = build_pair(&resolved_meanspec, &resolved_noisespec)?;
+    state.cache.ensure_theta(&theta_star)?;
+    let resolved_meanspec = state.cache.mean_spec().clone();
+    let resolved_noisespec = state.cache.noise_spec().clone();
+    let mean_design = state.cache.mean_design().clone();
+    let noise_design = state.cache.noise_design().clone();
     let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
     let fit = fit_fn(
         &rho_star,
@@ -9303,7 +10023,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
+        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
         DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
         SpatialIdentifiability, ThinPlateBasisSpec,
     };
@@ -9371,6 +10091,122 @@ mod tests {
             SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options),
             SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options),
         )
+    }
+
+    fn max_abs_diff_matrix(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        assert_eq!(a.dim(), b.dim());
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn max_abs_diff_vector(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn assert_term_collection_designs_match(
+        left: &TermCollectionDesign,
+        right: &TermCollectionDesign,
+        label: &str,
+    ) {
+        let design_diff = max_abs_diff_matrix(&left.design, &right.design);
+        assert!(
+            design_diff <= 1e-10,
+            "{label} design mismatch max_abs={design_diff}"
+        );
+        assert_eq!(
+            left.penalties.len(),
+            right.penalties.len(),
+            "{label} penalty count mismatch"
+        );
+        for (idx, (lp, rp)) in left
+            .penalties
+            .iter()
+            .zip(right.penalties.iter())
+            .enumerate()
+        {
+            let penalty_diff = max_abs_diff_matrix(lp, rp);
+            assert!(
+                penalty_diff <= 1e-10,
+                "{label} penalty {idx} mismatch max_abs={penalty_diff}"
+            );
+        }
+        assert_eq!(
+            left.nullspace_dims, right.nullspace_dims,
+            "{label} nullspace dims mismatch"
+        );
+        assert_eq!(
+            left.penaltyinfo.len(),
+            right.penaltyinfo.len(),
+            "{label} penaltyinfo length mismatch"
+        );
+        for (idx, (linfo, rinfo)) in left
+            .penaltyinfo
+            .iter()
+            .zip(right.penaltyinfo.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                linfo.termname, rinfo.termname,
+                "{label} penaltyinfo termname mismatch at {idx}"
+            );
+            assert_eq!(
+                linfo.penalty.source, rinfo.penalty.source,
+                "{label} penalty source mismatch at {idx}"
+            );
+            assert_eq!(
+                linfo.penalty.active, rinfo.penalty.active,
+                "{label} penalty active mismatch at {idx}"
+            );
+            assert_eq!(
+                linfo.penalty.effective_rank, rinfo.penalty.effective_rank,
+                "{label} penalty rank mismatch at {idx}"
+            );
+            assert_eq!(
+                linfo.penalty.nullspace_dim_hint, rinfo.penalty.nullspace_dim_hint,
+                "{label} penalty nullspace hint mismatch at {idx}"
+            );
+            assert!(
+                (linfo.penalty.normalization_scale - rinfo.penalty.normalization_scale).abs()
+                    <= 1e-10,
+                "{label} penalty normalization mismatch at {idx}"
+            );
+        }
+        match (
+            left.coefficient_lower_bounds.as_ref(),
+            right.coefficient_lower_bounds.as_ref(),
+        ) {
+            (Some(lb_left), Some(lb_right)) => {
+                let diff = max_abs_diff_vector(lb_left, lb_right);
+                assert!(diff <= 1e-10, "{label} lower-bound mismatch max_abs={diff}");
+            }
+            (None, None) => {}
+            _ => panic!("{label} lower-bound presence mismatch"),
+        }
+        match (
+            left.linear_constraints.as_ref(),
+            right.linear_constraints.as_ref(),
+        ) {
+            (Some(c_left), Some(c_right)) => {
+                let a_diff = max_abs_diff_matrix(&c_left.a, &c_right.a);
+                let b_diff = max_abs_diff_vector(&c_left.b, &c_right.b);
+                assert!(
+                    a_diff <= 1e-10,
+                    "{label} linear-constraint A mismatch max_abs={a_diff}"
+                );
+                assert!(
+                    b_diff <= 1e-10,
+                    "{label} linear-constraint b mismatch max_abs={b_diff}"
+                );
+            }
+            (None, None) => {}
+            _ => panic!("{label} linear-constraint presence mismatch"),
+        }
     }
 
     #[test]
@@ -10694,6 +11530,265 @@ mod tests {
                 _ => panic!("expected Matérn term"),
             }
         }
+    }
+
+    #[test]
+    fn incremental_frozen_realizer_matches_unified_full_rebuild() {
+        let n = 24usize;
+        let mut data = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (0.35 * i as f64).sin();
+            data[[i, 2]] = (i % 3) as f64;
+            data[[i, 3]] = t * t;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "lin".to_string(),
+                feature_col: 1,
+                double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: Some(-0.5),
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "grp".to_string(),
+                feature_col: 2,
+                drop_first_level: false,
+                frozen_levels: None,
+            }],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "spatial".to_string(),
+                    basis: SmoothBasisSpec::Matern {
+                        feature_cols: vec![0, 1],
+                        spec: MaternBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                            length_scale: 0.8,
+                            nu: MaternNu::FiveHalves,
+                            include_intercept: false,
+                            double_penalty: true,
+                            identifiability: MaternIdentifiability::CenterSumToZero,
+                            aniso_log_scales: Some(vec![0.15, -0.15]),
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "mono".to_string(),
+                    basis: SmoothBasisSpec::BSpline1D {
+                        feature_col: 3,
+                        spec: BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knotspec: BSplineKnotSpec::Generate {
+                                data_range: (0.0, 1.0),
+                                num_internal_knots: 3,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::None,
+                        },
+                    },
+                    shape: ShapeConstraint::MonotoneIncreasing,
+                },
+            ],
+        };
+
+        let base_design = build_term_collection_design(data.view(), &spec).expect("base design");
+        let frozen =
+            freeze_spatial_length_scale_terms_from_design(&spec, &base_design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        assert_eq!(spatial_terms, vec![0]);
+
+        let smooth_start = frozen_design.design.ncols() - frozen_design.smooth.design.ncols();
+        let fixed_before = frozen_design.design.clone();
+        let nonspatial_range = frozen_design.smooth.terms[1].coeff_range.clone();
+        let full_nonspatial_range =
+            (smooth_start + nonspatial_range.start)..(smooth_start + nonspatial_range.end);
+        let mut realizer = FrozenTermCollectionIncrementalRealizer::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+        )
+        .expect("incremental realizer");
+
+        let updated_log_kappa = SpatialLogKappaCoords::new_with_dims(array![0.30, -0.20], vec![2]);
+        let updated_spec = updated_log_kappa
+            .apply_tospec(&frozen, &spatial_terms)
+            .expect("updated spec");
+        realizer
+            .apply_log_kappa(&updated_log_kappa, &spatial_terms)
+            .expect("incremental update");
+        let rebuilt =
+            build_term_collection_design(data.view(), &updated_spec).expect("rebuilt design");
+
+        assert_term_collection_designs_match(realizer.design(), &rebuilt, "incremental realizer");
+
+        let linear_range = frozen_design.linear_ranges[0].1.clone();
+        let random_range = frozen_design.random_effect_ranges[0].1.clone();
+        let updated_full = &realizer.design().design;
+        let linear_diff = max_abs_diff_matrix(
+            &fixed_before.slice(s![.., linear_range.clone()]).to_owned(),
+            &updated_full.slice(s![.., linear_range]).to_owned(),
+        );
+        let random_diff = max_abs_diff_matrix(
+            &fixed_before.slice(s![.., random_range.clone()]).to_owned(),
+            &updated_full.slice(s![.., random_range]).to_owned(),
+        );
+        let nonspatial_diff = max_abs_diff_matrix(
+            &fixed_before
+                .slice(s![.., full_nonspatial_range.clone()])
+                .to_owned(),
+            &updated_full
+                .slice(s![.., full_nonspatial_range.clone()])
+                .to_owned(),
+        );
+        let spatial_range = frozen_design.smooth.terms[0].coeff_range.clone();
+        let full_spatial_range =
+            (smooth_start + spatial_range.start)..(smooth_start + spatial_range.end);
+        let spatial_change = max_abs_diff_matrix(
+            &fixed_before
+                .slice(s![.., full_spatial_range.clone()])
+                .to_owned(),
+            &updated_full.slice(s![.., full_spatial_range]).to_owned(),
+        );
+        assert!(
+            linear_diff <= 1e-12,
+            "linear block changed max_abs={linear_diff}"
+        );
+        assert!(
+            random_diff <= 1e-12,
+            "random-effect block changed max_abs={random_diff}"
+        );
+        assert!(
+            nonspatial_diff <= 1e-12,
+            "unchanged smooth block changed max_abs={nonspatial_diff}"
+        );
+        assert!(
+            spatial_change > 1e-8,
+            "spatial block did not update max_abs={spatial_change}"
+        );
+    }
+
+    #[test]
+    fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
+        let n = 20usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.19 * i as f64).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let matern_term = |name: &str, length_scale: f64| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+                    length_scale,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let meanspec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("mean", 0.7)],
+        };
+        let noisespec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("noise", 1.1)],
+        };
+        let kappa_options = SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 1,
+            rel_tol: 1e-6,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-3,
+            max_length_scale: 1e3,
+        };
+        let joint_setup =
+            isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
+        let theta0 = joint_setup.theta0();
+
+        let mean_design = build_term_collection_design(data.view(), &meanspec).expect("mean");
+        let noise_design = build_term_collection_design(data.view(), &noisespec).expect("noise");
+        let mean_frozen = freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
+            .expect("freeze mean");
+        let noise_frozen = freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
+            .expect("freeze noise");
+
+        let mut cache = TwoBlockExactJointDesignCache::new(
+            data.view(),
+            mean_frozen.clone(),
+            mean_design.clone(),
+            spatial_length_scale_term_indices(&mean_frozen),
+            noise_frozen.clone(),
+            noise_design.clone(),
+            spatial_length_scale_term_indices(&noise_frozen),
+            joint_setup.rho_dim(),
+            joint_setup.log_kappa_dims_per_term(),
+        )
+        .expect("two-block cache");
+
+        cache.ensure_theta(&theta0).expect("initial theta");
+        assert!(cache.memoized_cost(&theta0).is_none());
+        assert!(cache.memoized_eval(&theta0).is_none());
+
+        cache.store_cost(3.5);
+        assert_eq!(cache.memoized_cost(&theta0), Some(3.5));
+        let eval = (
+            2.25,
+            Array1::<f64>::ones(theta0.len()),
+            Some(Array2::<f64>::eye(theta0.len())),
+        );
+        cache.store_eval(eval.clone());
+        let cached_eval = cache.memoized_eval(&theta0).expect("cached eval");
+        assert!((cached_eval.0 - eval.0).abs() <= 1e-12);
+        assert_eq!(cached_eval.1, eval.1);
+        assert_eq!(cached_eval.2, eval.2);
+
+        let mut theta1 = theta0.clone();
+        theta1[joint_setup.rho_dim()] += 0.25;
+        cache.ensure_theta(&theta1).expect("updated theta");
+        assert!(cache.memoized_cost(&theta1).is_none());
+        assert!(cache.memoized_eval(&theta1).is_none());
+
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            &theta1,
+            joint_setup.rho_dim(),
+            joint_setup.log_kappa_dims_per_term(),
+        );
+        let mean_terms = spatial_length_scale_term_indices(&mean_frozen);
+        let noise_terms = spatial_length_scale_term_indices(&noise_frozen);
+        let (mean_lk, noise_lk) = log_kappa.split_at(mean_terms.len());
+        let mean_updated = mean_lk
+            .apply_tospec(&mean_frozen, &mean_terms)
+            .expect("mean updated spec");
+        let noise_updated = noise_lk
+            .apply_tospec(&noise_frozen, &noise_terms)
+            .expect("noise updated spec");
+        let mean_rebuilt =
+            build_term_collection_design(data.view(), &mean_updated).expect("mean rebuilt");
+        let noise_rebuilt =
+            build_term_collection_design(data.view(), &noise_updated).expect("noise rebuilt");
+        assert_term_collection_designs_match(cache.mean_design(), &mean_rebuilt, "mean cache");
+        assert_term_collection_designs_match(cache.noise_design(), &noise_rebuilt, "noise cache");
     }
 
     #[test]

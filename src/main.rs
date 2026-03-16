@@ -4261,14 +4261,14 @@ fn build_survival_timewiggle_from_baseline(
         match buildwiggle_block_input_from_knots(eta_entry.view(), &knots, cfg.degree, 2, false)?
             .design
         {
-            DesignMatrix::Dense(m) => m,
+            DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
             _ => return Err("baseline-timewiggle entry design must be dense".to_string()),
         };
     let design_exit =
         match buildwiggle_block_input_from_knots(eta_exit.view(), &knots, cfg.degree, 2, false)?
             .design
         {
-            DesignMatrix::Dense(m) => m,
+            DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
             _ => return Err("baseline-timewiggle exit design must be dense".to_string()),
         };
     let knot_arr = knots.clone();
@@ -4470,7 +4470,7 @@ fn saved_baseline_timewiggle_components(
             )?
             .design
             {
-                DesignMatrix::Dense(m) => m,
+                DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
                 _ => return Err("saved baseline-timewiggle entry design must be dense".to_string()),
             };
             let exit = match buildwiggle_block_input_from_knots(
@@ -4482,7 +4482,7 @@ fn saved_baseline_timewiggle_components(
             )?
             .design
             {
-                DesignMatrix::Dense(m) => m,
+                DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
                 _ => return Err("saved baseline-timewiggle exit design must be dense".to_string()),
             };
             let betaw = runtime.beta;

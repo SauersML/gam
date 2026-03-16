@@ -1,6 +1,10 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
+use crate::inference::prediction_linalg::{
+    PredictionCovarianceBackend, dense_row_chunk, design_row_chunk, prediction_chunk_rows,
+    rowwise_local_covariances,
+};
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
@@ -26,6 +30,139 @@ fn apply_family_inverse_link(
     link_kind: Option<&InverseLink>,
 ) -> Result<Array1<f64>, EstimationError> {
     strategy_for_family(family, link_kind).inverse_link_array(eta.view())
+}
+
+fn local_covariances_with_backend<F>(
+    backend: &PredictionCovarianceBackend<'_>,
+    n_rows: usize,
+    local_dim: usize,
+    build_chunk: F,
+) -> Result<Vec<Vec<Array1<f64>>>, EstimationError>
+where
+    F: FnMut(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String>,
+{
+    rowwise_local_covariances(backend, n_rows, local_dim, build_chunk)
+        .map_err(EstimationError::InvalidInput)
+}
+
+fn usable_penalized_hessian<'a>(
+    fit: &'a UnifiedFitResult,
+    expected_dim: usize,
+    label: &str,
+) -> Option<&'a Array2<f64>> {
+    let hessian = fit.penalized_hessian()?;
+    if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
+        log::warn!(
+            "{label}: ignoring penalized Hessian with shape {}x{}; expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            expected_dim,
+            expected_dim
+        );
+        return None;
+    }
+    if !hessian.iter().any(|value| value.abs() > 0.0) {
+        log::warn!("{label}: ignoring zero penalized Hessian placeholder");
+        return None;
+    }
+    Some(hessian)
+}
+
+fn conditional_prediction_backend<'a>(
+    fit: &'a UnifiedFitResult,
+    expected_dim: usize,
+    label: &str,
+) -> Option<PredictionCovarianceBackend<'a>> {
+    if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
+        match PredictionCovarianceBackend::from_factorized_hessian(hessian) {
+            Ok(backend) => return Some(backend),
+            Err(err) => {
+                log::warn!(
+                    "{label}: failed to build factorized prediction precision backend: {err}"
+                );
+            }
+        }
+    }
+    fit.beta_covariance().and_then(|covariance| {
+        if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
+            Some(PredictionCovarianceBackend::from_dense(covariance.view()))
+        } else {
+            log::warn!(
+                "{label}: ignoring conditional covariance with shape {}x{}; expected {}x{}",
+                covariance.nrows(),
+                covariance.ncols(),
+                expected_dim,
+                expected_dim
+            );
+            None
+        }
+    })
+}
+
+fn selected_uncertainty_backend<'a>(
+    fit: &'a UnifiedFitResult,
+    expected_dim: usize,
+    requested_mode: InferenceCovarianceMode,
+    label: &str,
+) -> Result<(PredictionCovarianceBackend<'a>, bool), EstimationError> {
+    match requested_mode {
+        InferenceCovarianceMode::Conditional => conditional_prediction_backend(
+            fit,
+            expected_dim,
+            label,
+        )
+        .map(|backend| (backend, false))
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "fit result does not contain conditional covariance or a usable penalized Hessian"
+                    .to_string(),
+            )
+        }),
+        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
+            if let Some(covariance) = fit.beta_covariance_corrected() {
+                if covariance.nrows() != expected_dim || covariance.ncols() != expected_dim {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{label}: corrected covariance dimension mismatch: expected {}x{}, got {}x{}",
+                        expected_dim,
+                        expected_dim,
+                        covariance.nrows(),
+                        covariance.ncols()
+                    )));
+                }
+                Ok((
+                    PredictionCovarianceBackend::from_dense(covariance.view()),
+                    true,
+                ))
+            } else {
+                selected_uncertainty_backend(
+                    fit,
+                    expected_dim,
+                    InferenceCovarianceMode::Conditional,
+                    label,
+                )
+            }
+        }
+        InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
+            let covariance = fit.beta_covariance_corrected().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "fit result does not contain smoothing-corrected covariance".to_string(),
+                )
+            })?;
+            if covariance.nrows() != expected_dim || covariance.ncols() != expected_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{label}: corrected covariance dimension mismatch: expected {}x{}, got {}x{}",
+                    expected_dim,
+                    expected_dim,
+                    covariance.nrows(),
+                    covariance.ncols()
+                )));
+            }
+            Ok((
+                PredictionCovarianceBackend::from_dense(covariance.view()),
+                true,
+            ))
+        }
+    }
 }
 
 #[inline]
@@ -71,104 +208,33 @@ fn quadratic_form_from_jetmu(
     Ok(acc.max(0.0))
 }
 
+fn linear_predictorvariance_from_backend(
+    x: &DesignMatrix,
+    backend: &PredictionCovarianceBackend<'_>,
+) -> Result<Array1<f64>, EstimationError> {
+    let local = local_covariances_with_backend(backend, x.nrows(), 1, |rows| {
+        Ok(vec![design_row_chunk(x, rows)?])
+    })?;
+    Ok(local[0][0].mapv(|v| v.max(0.0)))
+}
+
 fn linear_predictorvariance(
     x: &DesignMatrix,
     cov: &Array2<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    x.quadratic_form_diag(cov).map_err(|e| {
-        EstimationError::InvalidInput(format!("failed to compute linear predictor variance: {e}"))
-    })
-}
-
-fn design_times_dense(
-    design: &DesignMatrix,
-    rhs: &Array2<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    if design.ncols() != rhs.nrows() {
-        return Err(EstimationError::InvalidInput(format!(
-            "design_times_dense shape mismatch: design is {}x{}, rhs is {}x{}",
-            design.nrows(),
-            design.ncols(),
-            rhs.nrows(),
-            rhs.ncols()
-        )));
-    }
-    match design {
-        DesignMatrix::Dense(x) => Ok(x.dot(rhs)),
-        DesignMatrix::Sparse(_) => {
-            let n = design.nrows();
-            let q = rhs.ncols();
-            let mut out = Array2::<f64>::zeros((n, q));
-            for j in 0..q {
-                let col = rhs.column(j).to_owned();
-                out.column_mut(j).assign(&design.matrixvectormultiply(&col));
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn rowwise_dot_designwith_dense(
-    design: &DesignMatrix,
-    rowvalues: &Array2<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    if design.nrows() != rowvalues.nrows() || design.ncols() != rowvalues.ncols() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rowwise_dot_designwith_dense shape mismatch: design is {}x{}, rowvalues is {}x{}",
-            design.nrows(),
-            design.ncols(),
-            rowvalues.nrows(),
-            rowvalues.ncols()
-        )));
-    }
-    match design {
-        DesignMatrix::Dense(x) => Ok(Array1::from_iter(
-            (0..x.nrows()).map(|i| x.row(i).dot(&rowvalues.row(i))),
-        )),
-        DesignMatrix::Sparse(xs) => {
-            let csr = xs.to_csr_arc().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "rowwise_dot_designwith_dense: failed to obtain CSR view".to_string(),
-                )
-            })?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-            let mut out = Array1::<f64>::zeros(xs.nrows());
-            for i in 0..xs.nrows() {
-                let start = row_ptr[i];
-                let end = row_ptr[i + 1];
-                let mut acc = 0.0_f64;
-                for ptr in start..end {
-                    let j = col_idx[ptr];
-                    acc += vals[ptr] * rowvalues[[i, j]];
-                }
-                out[i] = acc;
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn rowwise_cross_quadratic_design(
-    left: &DesignMatrix,
-    middle: &Array2<f64>,
-    right: &DesignMatrix,
-) -> Result<Array1<f64>, EstimationError> {
-    let left_middle = design_times_dense(left, middle)?;
-    rowwise_dot_designwith_dense(right, &left_middle)
+    let backend = PredictionCovarianceBackend::from_dense(cov.view());
+    linear_predictorvariance_from_backend(x, &backend)
 }
 
 const POSTERIOR_MEAN_VARIANCE_TOL: f64 = 1e-10;
 const POSTERIOR_MEAN_CROSS_TOL: f64 = 1e-10;
 
-fn posterior_mean_covariance_or_warn<'a>(
+fn posterior_mean_backend_or_warn<'a>(
     fit: &'a UnifiedFitResult,
     fallback: Option<&'a Array2<f64>>,
     expected_dim: usize,
     label: &str,
-) -> Option<&'a Array2<f64>> {
+) -> Option<PredictionCovarianceBackend<'a>> {
     for (source, covariance) in [
         ("fit result", fit.beta_covariance()),
         ("predictor state", fallback),
@@ -177,7 +243,7 @@ fn posterior_mean_covariance_or_warn<'a>(
             continue;
         };
         if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
-            return Some(covariance);
+            return Some(PredictionCovarianceBackend::from_dense(covariance.view()));
         }
         log::warn!(
             "{label}: ignoring {source} covariance with shape {}x{}; expected {}x{}",
@@ -187,26 +253,29 @@ fn posterior_mean_covariance_or_warn<'a>(
             expected_dim
         );
     }
-    log::warn!("{label}: covariance unavailable; falling back to plug-in point prediction");
+    if let Some(backend) = conditional_prediction_backend(fit, expected_dim, label) {
+        return Some(backend);
+    }
+    log::warn!(
+        "{label}: covariance/precision unavailable; falling back to plug-in point prediction"
+    );
     None
 }
 
 fn project_two_block_linear_predictor_covariance(
     design_first: &DesignMatrix,
     design_second: &DesignMatrix,
-    covariance: &Array2<f64>,
+    backend: &PredictionCovarianceBackend<'_>,
     p_first: usize,
     p_second: usize,
     label: &str,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
     let p_total = p_first + p_second;
-    if covariance.nrows() != p_total || covariance.ncols() != p_total {
+    if backend.nrows() != p_total {
         return Err(EstimationError::InvalidInput(format!(
-            "{label} covariance dimension mismatch: expected {}x{}, got {}x{}",
+            "{label} covariance dimension mismatch: expected parameter dimension {}, got {}",
             p_total,
-            p_total,
-            covariance.nrows(),
-            covariance.ncols()
+            backend.nrows()
         )));
     }
     if design_first.ncols() != p_first || design_second.ncols() != p_second {
@@ -218,37 +287,35 @@ fn project_two_block_linear_predictor_covariance(
             p_second
         )));
     }
-
-    let cov_ff = covariance
-        .slice(ndarray::s![0..p_first, 0..p_first])
-        .to_owned();
-    let cov_ss = covariance
-        .slice(ndarray::s![p_first..p_total, p_first..p_total])
-        .to_owned();
-    let cov_fs = covariance
-        .slice(ndarray::s![0..p_first, p_first..p_total])
-        .to_owned();
-    let var_first = design_first.quadratic_form_diag(&cov_ff).map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "{label} failed to compute first-block predictor variance: {e}"
-        ))
+    let local = local_covariances_with_backend(backend, design_first.nrows(), 2, |rows| {
+        let x_first = design_row_chunk(design_first, rows.clone())?;
+        let x_second = design_row_chunk(design_second, rows.clone())?;
+        let rows_in_chunk = rows.end - rows.start;
+        let mut first = Array2::<f64>::zeros((rows_in_chunk, p_total));
+        let mut second = Array2::<f64>::zeros((rows_in_chunk, p_total));
+        first.slice_mut(ndarray::s![.., 0..p_first]).assign(&x_first);
+        second
+            .slice_mut(ndarray::s![.., p_first..p_total])
+            .assign(&x_second);
+        Ok(vec![first, second])
     })?;
-    let var_second = design_second.quadratic_form_diag(&cov_ss).map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "{label} failed to compute second-block predictor variance: {e}"
-        ))
-    })?;
-    let cov_cross = rowwise_cross_quadratic_design(design_first, &cov_fs, design_second)?;
-    Ok((var_first, var_second, cov_cross))
+    Ok((
+        local[0][0].mapv(|v| v.max(0.0)),
+        local[1][1].mapv(|v| v.max(0.0)),
+        local[0][1].clone(),
+    ))
 }
 
-fn linear_predictor_se_from_grad(grad: &Array2<f64>, cov: &Array2<f64>) -> Array1<f64> {
-    let xc = grad.dot(cov);
-    let mut out = Array1::<f64>::zeros(grad.nrows());
-    for i in 0..grad.nrows() {
-        out[i] = grad.row(i).dot(&xc.row(i)).max(0.0).sqrt();
-    }
-    out
+fn linear_predictor_se_from_backend<F>(
+    backend: &PredictionCovarianceBackend<'_>,
+    n_rows: usize,
+    build_chunk: F,
+) -> Result<Array1<f64>, EstimationError>
+where
+    F: FnMut(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String>,
+{
+    let local = local_covariances_with_backend(backend, n_rows, 1, build_chunk)?;
+    Ok(local[0][0].mapv(|v| v.max(0.0).sqrt()))
 }
 
 fn projected_bivariate_posterior_mean_result<F>(
@@ -310,6 +377,35 @@ pub struct PredictInput {
     pub offset_noise: Option<Array1<f64>>,
     /// Optional auxiliary scalar covariate used by specialized predictors.
     pub auxiliary_scalar: Option<Array1<f64>>,
+}
+
+fn slice_predict_input(
+    input: &PredictInput,
+    rows: std::ops::Range<usize>,
+) -> Result<PredictInput, EstimationError> {
+    Ok(PredictInput {
+        design: DesignMatrix::Dense(
+            design_row_chunk(&input.design, rows.clone()).map_err(EstimationError::InvalidInput)?,
+        ),
+        offset: input.offset.slice(ndarray::s![rows.clone()]).to_owned(),
+        design_noise: input
+            .design_noise
+            .as_ref()
+            .map(|design| {
+                design_row_chunk(design, rows.clone())
+                    .map(DesignMatrix::Dense)
+                    .map_err(EstimationError::InvalidInput)
+            })
+            .transpose()?,
+        offset_noise: input
+            .offset_noise
+            .as_ref()
+            .map(|offset| offset.slice(ndarray::s![rows.clone()]).to_owned()),
+        auxiliary_scalar: input
+            .auxiliary_scalar
+            .as_ref()
+            .map(|values| values.slice(ndarray::s![rows]).to_owned()),
+    })
 }
 
 /// Point prediction with optional standard errors on the linear predictor.
@@ -458,38 +554,36 @@ impl PredictableModel for StandardPredictor {
         let result = self.predict_plugin_response(input)?;
         let eta_base = input.design.dot(&self.beta) + &input.offset;
         let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
+            let backend = PredictionCovarianceBackend::from_dense(cov.view());
             let se = if let Some(runtime) = self.link_wiggle.as_ref() {
-                let wiggle_design = runtime
-                    .design(&eta_base)
-                    .map_err(EstimationError::InvalidInput)?;
-                let dq_dq0 = runtime
-                    .derivative_q0(&eta_base)
-                    .map_err(EstimationError::InvalidInput)?;
                 let p_main = self.beta.len();
                 let p_w = runtime.beta.len();
                 let p_total = p_main + p_w;
-                if cov.nrows() != p_total || cov.ncols() != p_total {
+                if backend.nrows() != p_total {
                     return Err(EstimationError::InvalidInput(format!(
-                        "standard link-wiggle covariance dimension mismatch: expected {}x{}, got {}x{}",
+                        "standard link-wiggle covariance dimension mismatch: expected parameter dimension {}, got {}",
                         p_total,
-                        p_total,
-                        cov.nrows(),
-                        cov.ncols()
+                        backend.nrows()
                     )));
                 }
-                let x_main = input.design.to_dense();
-                let mut grad = Array2::<f64>::zeros((result.eta.len(), p_total));
-                for i in 0..result.eta.len() {
-                    for j in 0..p_main {
-                        grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+                linear_predictor_se_from_backend(&backend, result.eta.len(), |rows| {
+                    let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
+                    let x_main = design_row_chunk(&input.design, rows.clone())?;
+                    let wiggle_design = runtime.design(&q0_chunk)?;
+                    let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
+                    let rows_in_chunk = q0_chunk.len();
+                    let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+                    for i in 0..rows_in_chunk {
+                        for j in 0..p_main {
+                            grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+                        }
                     }
-                    for j in 0..p_w {
-                        grad[[i, p_main + j]] = wiggle_design[[i, j]];
-                    }
-                }
-                linear_predictor_se_from_grad(&grad, cov)
+                    grad.slice_mut(ndarray::s![.., p_main..p_total])
+                        .assign(&wiggle_design);
+                    Ok(vec![grad])
+                })?
             } else {
-                eta_standard_errors_from_design(&input.design, cov)?
+                eta_standard_errors_from_backend(&input.design, &backend)?
             };
             let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
             let mean_se = delta_method_mean_se(&result.eta, &se, &strategy)?;
@@ -585,40 +679,44 @@ impl PredictableModel for StandardPredictor {
         let runtime = self.link_wiggle.as_ref().expect("checked above");
         let plugin = self.predict_plugin_response(input)?;
         let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let cov = fit.beta_covariance().ok_or_else(|| {
+        let backend = posterior_mean_backend_or_warn(
+            fit,
+            self.covariance.as_ref(),
+            self.beta.len() + runtime.beta.len(),
+            "standard link-wiggle posterior mean",
+        )
+        .ok_or_else(|| {
             EstimationError::InvalidInput(
-                "posterior-mean prediction requires beta covariance in fit result".to_string(),
+                "posterior-mean prediction requires beta covariance or penalized Hessian"
+                    .to_string(),
             )
         })?;
         let p_main = self.beta.len();
         let p_w = runtime.beta.len();
         let p_total = p_main + p_w;
-        if cov.nrows() != p_total || cov.ncols() != p_total {
+        if backend.nrows() != p_total {
             return Err(EstimationError::InvalidInput(format!(
-                "standard link-wiggle posterior mean covariance mismatch: expected {}x{}, got {}x{}",
+                "standard link-wiggle posterior mean covariance mismatch: expected parameter dimension {}, got {}",
                 p_total,
-                p_total,
-                cov.nrows(),
-                cov.ncols()
+                backend.nrows()
             )));
         }
-        let x_main = input.design.to_dense();
-        let wiggle_design = runtime
-            .design(&eta_base)
-            .map_err(EstimationError::InvalidInput)?;
-        let dq_dq0 = runtime
-            .derivative_q0(&eta_base)
-            .map_err(EstimationError::InvalidInput)?;
-        let mut grad = Array2::<f64>::zeros((plugin.eta.len(), p_total));
-        for i in 0..plugin.eta.len() {
-            for j in 0..p_main {
-                grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+        let eta_se = linear_predictor_se_from_backend(&backend, plugin.eta.len(), |rows| {
+            let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
+            let x_main = design_row_chunk(&input.design, rows.clone())?;
+            let wiggle_design = runtime.design(&q0_chunk)?;
+            let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
+            let rows_in_chunk = q0_chunk.len();
+            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+            for i in 0..rows_in_chunk {
+                for j in 0..p_main {
+                    grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+                }
             }
-            for j in 0..p_w {
-                grad[[i, p_main + j]] = wiggle_design[[i, j]];
-            }
-        }
-        let eta_se = linear_predictor_se_from_grad(&grad, cov);
+            grad.slice_mut(ndarray::s![.., p_main..p_total])
+                .assign(&wiggle_design);
+            Ok(vec![grad])
+        })?;
         let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
         let quadctx = crate::quadrature::QuadratureContext::new();
         let mean = Array1::from_iter((0..plugin.eta.len()).map(|i| {
@@ -1107,13 +1205,16 @@ impl BernoulliMarginalSlopePredictor {
         covariance: &Array2<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let theta = self.theta();
-        let (_, grad) = self.final_eta_and_gradient_from_theta(input, &theta, true)?;
-        let grad = grad.ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "bernoulli marginal-slope analytic predictor gradient was not produced".to_string(),
-            )
-        })?;
-        Ok(linear_predictor_se_from_grad(&grad, covariance))
+        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+        linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
+            let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
+            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)?;
+            let grad = grad.ok_or_else(|| {
+                "bernoulli marginal-slope analytic predictor gradient was not produced"
+                    .to_string()
+            })?;
+            Ok(vec![grad])
+        })
     }
 
     fn eta_standard_error(
@@ -1122,16 +1223,24 @@ impl BernoulliMarginalSlopePredictor {
         fit: &UnifiedFitResult,
     ) -> Result<Array1<f64>, EstimationError> {
         let theta = self.theta();
-        let covariance = posterior_mean_covariance_or_warn(
+        let backend = posterior_mean_backend_or_warn(
             fit,
             self.covariance.as_ref(),
             theta.len(),
             "bernoulli marginal-slope posterior mean",
         );
-        let Some(covariance) = covariance else {
+        let Some(backend) = backend else {
             return Ok(Array1::zeros(input.design.nrows()));
         };
-        self.eta_standard_error_from_covariance(input, covariance)
+        linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
+            let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
+            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)?;
+            let grad = grad.ok_or_else(|| {
+                "bernoulli marginal-slope analytic predictor gradient was not produced"
+                    .to_string()
+            })?;
+            Ok(vec![grad])
+        })
     }
 }
 
@@ -1269,7 +1378,7 @@ impl GaussianLocationScalePredictor {
         fit: &UnifiedFitResult,
         eta_len: usize,
     ) -> Result<Array1<f64>, EstimationError> {
-        let covariance = posterior_mean_covariance_or_warn(
+        let backend = posterior_mean_backend_or_warn(
             fit,
             self.covariance.as_ref(),
             self.beta_mu.len()
@@ -1277,48 +1386,41 @@ impl GaussianLocationScalePredictor {
                 + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len()),
             "gaussian location-scale posterior mean",
         );
-        let Some(covariance) = covariance else {
+        let Some(backend) = backend else {
             return Ok(Array1::zeros(eta_len));
         };
         let p_mu = self.beta_mu.len();
         let p_sigma = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
         let p_total = p_mu + p_sigma + p_w;
-        if covariance.nrows() != p_total || covariance.ncols() != p_total {
+        if backend.nrows() != p_total {
             return Err(EstimationError::InvalidInput(format!(
-                "gaussian location-scale covariance mismatch: expected {}x{}, got {}x{}",
+                "gaussian location-scale covariance mismatch: expected parameter dimension {}, got {}",
                 p_total,
-                p_total,
-                covariance.nrows(),
-                covariance.ncols()
+                backend.nrows()
             )));
         }
-        let x_mu = input.design.to_dense();
-        let mut grad = Array2::<f64>::zeros((eta_len, p_total));
         if let Some(runtime) = self.link_wiggle.as_ref() {
             let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
-            let wiggle_design = runtime
-                .design(&eta_base)
-                .map_err(EstimationError::InvalidInput)?;
-            let dq_dq0 = runtime
-                .derivative_q0(&eta_base)
-                .map_err(EstimationError::InvalidInput)?;
-            for i in 0..eta_len {
-                for j in 0..p_mu {
-                    grad[[i, j]] = dq_dq0[i] * x_mu[[i, j]];
+            linear_predictor_se_from_backend(&backend, eta_len, |rows| {
+                let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
+                let x_mu = design_row_chunk(&input.design, rows.clone())?;
+                let wiggle_design = runtime.design(&q0_chunk)?;
+                let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
+                let rows_in_chunk = q0_chunk.len();
+                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+                for i in 0..rows_in_chunk {
+                    for j in 0..p_mu {
+                        grad[[i, j]] = dq_dq0[i] * x_mu[[i, j]];
+                    }
                 }
-                for j in 0..p_w {
-                    grad[[i, p_mu + p_sigma + j]] = wiggle_design[[i, j]];
-                }
-            }
+                grad.slice_mut(ndarray::s![.., p_mu + p_sigma..p_total])
+                    .assign(&wiggle_design);
+                Ok(vec![grad])
+            })
         } else {
-            for i in 0..eta_len {
-                for j in 0..p_mu {
-                    grad[[i, j]] = x_mu[[i, j]];
-                }
-            }
+            eta_standard_errors_from_backend(&input.design, &backend)
         }
-        Ok(linear_predictor_se_from_grad(&grad, covariance))
     }
 }
 
@@ -1512,14 +1614,12 @@ impl PredictableModel for BinomialLocationScalePredictor {
             let p_s = self.beta_noise.len();
             let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
             let p_total = p_t + p_s + p_w;
-
-            if cov.nrows() != p_total || cov.ncols() != p_total {
+            let backend = PredictionCovarianceBackend::from_dense(cov.view());
+            if backend.nrows() != p_total {
                 return Err(EstimationError::InvalidInput(format!(
-                    "covariance dimension mismatch for binomial LS: expected {}x{}, got {}x{}",
+                    "covariance dimension mismatch for binomial LS: expected parameter dimension {}, got {}",
                     p_total,
-                    p_total,
-                    cov.nrows(),
-                    cov.ncols()
+                    backend.nrows()
                 )));
             }
 
@@ -1528,60 +1628,49 @@ impl PredictableModel for BinomialLocationScalePredictor {
                     "binomial location-scale uncertainty requires noise design matrix".to_string(),
                 )
             })?;
-            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
-                Some(
-                    runtime
-                        .design(&q0_base)
-                        .map_err(EstimationError::InvalidInput)?,
-                )
-            } else {
-                None
-            };
-            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
-                runtime
-                    .derivative_q0(&q0_base)
-                    .map_err(EstimationError::InvalidInput)?
-            } else {
-                Array1::ones(q0_base.len())
-            };
-            let mut se = Array1::zeros(n);
-
-            for i in 0..n {
-                // Derivative of inverse link at q0: d(prob)/d(q0) = jet.d1
-                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                    &self.inverse_link,
-                    eta[i],
-                )?;
-                let dphi = jet.d1;
-
-                // q0 = -eta_t / sigma, sigma = exp(eta_s)
-                // d(q0)/d(eta_t) = -1 / sigma
-                // d(q0)/d(eta_s) = d(q0)/d(sigma) * d(sigma)/d(eta_s)
-                //                = (eta_t / sigma^2) * sigma = eta_t / sigma
-                // d(prob)/d(eta_t) = dphi * d(wiggle)/d(q0) * (-1 / sigma)
-                // d(prob)/d(eta_s) = dphi * d(wiggle)/d(q0) * (eta_t / sigma)
-                let scale = dq_dq0[i];
-                let dprob_deta_t = dphi * scale * (-1.0 / sigma[i]);
-                let dprob_deta_s = dphi * scale * (eta_t[i] / sigma[i]);
-
-                // Build gradient: [dprob/d(beta_t), dprob/d(beta_s)]
-                let mut grad = Vec::with_capacity(p_total);
-                for j in 0..p_t {
-                    grad.push(dprob_deta_t * input.design.get(i, j));
-                }
-                for j in 0..p_s {
-                    grad.push(dprob_deta_s * design_noise.get(i, j));
-                }
-                if let Some(wd) = wiggle_design.as_ref() {
-                    for j in 0..p_w {
-                        grad.push(dphi * wd[[i, j]]);
+            Some(linear_predictor_se_from_backend(&backend, n, |rows| {
+                let x_t = design_row_chunk(&input.design, rows.clone())?;
+                let x_s = design_row_chunk(design_noise, rows.clone())?;
+                let eta_chunk = eta.slice(ndarray::s![rows.clone()]).to_owned();
+                let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
+                let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]).to_owned();
+                let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]).to_owned();
+                let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
+                    Some(runtime.design(&q0_chunk)?)
+                } else {
+                    None
+                };
+                let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
+                    runtime.derivative_q0(&q0_chunk)?
+                } else {
+                    Array1::ones(q0_chunk.len())
+                };
+                let rows_in_chunk = q0_chunk.len();
+                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+                for i in 0..rows_in_chunk {
+                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                        &self.inverse_link,
+                        eta_chunk[i],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let dphi = jet.d1;
+                    let scale = dq_dq0[i];
+                    let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
+                    let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
+                    for j in 0..p_t {
+                        grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
+                    }
+                    for j in 0..p_s {
+                        grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
+                    }
+                    if let Some(wd) = wiggle_design.as_ref() {
+                        for j in 0..p_w {
+                            grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
+                        }
                     }
                 }
-
-                let var = quadratic_form(cov, &grad)?;
-                se[i] = var.sqrt();
-            }
-            Some(se)
+                Ok(vec![grad])
+            })?)
         } else {
             None
         };
@@ -1662,67 +1751,67 @@ impl PredictableModel for BinomialLocationScalePredictor {
         let p_s = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
         let p_total = p_t + p_s + p_w;
-        let covariance = posterior_mean_covariance_or_warn(
+        let backend = posterior_mean_backend_or_warn(
             fit,
             self.covariance.as_ref(),
             p_total,
             "binomial location-scale posterior mean",
         );
 
-        let eta_se = if let Some(cov) = covariance {
-            let n = eta_t.len();
-            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
-                Some(
-                    runtime
-                        .design(&q0_base)
-                        .map_err(EstimationError::InvalidInput)?,
-                )
-            } else {
-                None
-            };
-            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
-                runtime
-                    .derivative_q0(&q0_base)
-                    .map_err(EstimationError::InvalidInput)?
-            } else {
-                Array1::ones(q0_base.len())
-            };
-            let mut se = Array1::zeros(n);
-            for i in 0..n {
-                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                    &self.inverse_link,
-                    eta[i],
-                )?;
-                let dphi = jet.d1;
-                let scale = dq_dq0[i];
-                let dprob_deta_t = dphi * scale * (-1.0 / sigma[i]);
-                let dprob_deta_s = dphi * scale * (eta_t[i] / sigma[i]);
-                let mut grad = Vec::with_capacity(p_total);
-                for j in 0..p_t {
-                    grad.push(dprob_deta_t * input.design.get(i, j));
-                }
-                for j in 0..p_s {
-                    grad.push(dprob_deta_s * design_noise.get(i, j));
-                }
-                if let Some(wd) = wiggle_design.as_ref() {
-                    for j in 0..p_w {
-                        grad.push(dphi * wd[[i, j]]);
+        let eta_se = if let Some(backend_ref) = backend.as_ref() {
+            linear_predictor_se_from_backend(backend_ref, eta_t.len(), |rows| {
+                let x_t = design_row_chunk(&input.design, rows.clone())?;
+                let x_s = design_row_chunk(design_noise, rows.clone())?;
+                let eta_chunk = eta.slice(ndarray::s![rows.clone()]).to_owned();
+                let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
+                let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]).to_owned();
+                let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]).to_owned();
+                let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
+                    Some(runtime.design(&q0_chunk)?)
+                } else {
+                    None
+                };
+                let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
+                    runtime.derivative_q0(&q0_chunk)?
+                } else {
+                    Array1::ones(q0_chunk.len())
+                };
+                let rows_in_chunk = q0_chunk.len();
+                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+                for i in 0..rows_in_chunk {
+                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                        &self.inverse_link,
+                        eta_chunk[i],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let dphi = jet.d1;
+                    let scale = dq_dq0[i];
+                    let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
+                    let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
+                    for j in 0..p_t {
+                        grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
+                    }
+                    for j in 0..p_s {
+                        grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
+                    }
+                    if let Some(wd) = wiggle_design.as_ref() {
+                        for j in 0..p_w {
+                            grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
+                        }
                     }
                 }
-                let var = quadratic_form(cov, &grad)?;
-                se[i] = var.sqrt();
-            }
-            se
+                Ok(vec![grad])
+            })?
         } else {
             Array1::zeros(eta_t.len())
         };
 
         let mean = if self.link_wiggle.is_none() {
-            if let Some(covariance) = covariance {
+            if let Some(backend_ref) = backend.as_ref() {
                 match project_two_block_linear_predictor_covariance(
                     &input.design,
                     design_noise,
-                    covariance,
+                    backend_ref,
                     p_t,
                     p_s,
                     "binomial location-scale posterior mean",
@@ -1764,96 +1853,123 @@ impl PredictableModel for BinomialLocationScalePredictor {
             } else {
                 point_prob.clone()
             }
-        } else if let Some(cov_mat) = covariance {
+        } else if let Some(backend_ref) = backend.as_ref() {
             let runtime = self.link_wiggle.as_ref().expect("checked above");
-            let cov_tt = cov_mat.slice(ndarray::s![0..p_t, 0..p_t]).to_owned();
-            let cov_ll = cov_mat
-                .slice(ndarray::s![p_t..p_t + p_s, p_t..p_t + p_s])
-                .to_owned();
-            let cov_tl = cov_mat
-                .slice(ndarray::s![0..p_t, p_t..p_t + p_s])
-                .to_owned();
-            let cov_tw = cov_mat
-                .slice(ndarray::s![0..p_t, p_t + p_s..p_t + p_s + p_w])
-                .to_owned();
-            let cov_lw = cov_mat
-                .slice(ndarray::s![p_t..p_t + p_s, p_t + p_s..p_t + p_s + p_w])
-                .to_owned();
-            let covww = cov_mat
-                .slice(ndarray::s![
-                    p_t + p_s..p_t + p_s + p_w,
-                    p_t + p_s..p_t + p_s + p_w
-                ])
-                .to_owned();
-            let xd_t_covtt = design_times_dense(&input.design, &cov_tt)?;
-            let xd_l_covll = design_times_dense(design_noise, &cov_ll)?;
-            let xd_t_covtl = design_times_dense(&input.design, &cov_tl)?;
-            let xd_t_covtw = design_times_dense(&input.design, &cov_tw)?;
-            let xd_l_covlw = design_times_dense(design_noise, &cov_lw)?;
-            let x_t_dense = input.design.to_dense();
-            let x_l_dense = design_noise.to_dense();
             let betaw = Array1::from_vec(runtime.beta.clone());
+            let mut wiggle_basis_rhs = Array2::<f64>::zeros((p_total, p_w));
+            for j in 0..p_w {
+                wiggle_basis_rhs[[p_t + p_s + j, j]] = 1.0;
+            }
+            let covww = backend_ref
+                .apply_columns(&wiggle_basis_rhs)
+                .map_err(EstimationError::InvalidInput)?
+                .slice(ndarray::s![p_t + p_s..p_total, ..])
+                .to_owned();
             let quadctx = crate::quadrature::QuadratureContext::new();
             let mut out = Array1::<f64>::zeros(eta.len());
-            for i in 0..eta.len() {
-                let var_t = x_t_dense.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                let var_ls = x_l_dense.row(i).dot(&xd_l_covll.row(i)).max(0.0);
-                let cov_tls = x_l_dense.row(i).dot(&xd_t_covtl.row(i));
-                let suv_t = xd_t_covtw.row(i).to_owned();
-                let suv_ls = xd_l_covlw.row(i).to_owned();
-                let inv_uu = [
-                    [
-                        var_ls / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
-                        -cov_tls / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
-                    ],
-                    [
-                        -cov_tls / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
-                        var_t / (var_t * var_ls - cov_tls * cov_tls).max(1e-12),
-                    ],
-                ];
-                let mut k0 = Array1::<f64>::zeros(p_w);
-                let mut k1 = Array1::<f64>::zeros(p_w);
-                for j in 0..p_w {
-                    k0[j] = suv_t[j] * inv_uu[0][0] + suv_ls[j] * inv_uu[1][0];
-                    k1[j] = suv_t[j] * inv_uu[0][1] + suv_ls[j] * inv_uu[1][1];
+            let chunk_rows = prediction_chunk_rows(p_total, 2, eta.len());
+            let mut start = 0usize;
+            while start < eta.len() {
+                let end = (start + chunk_rows).min(eta.len());
+                let rows = start..end;
+                let rows_in_chunk = end - start;
+                let x_t = design_row_chunk(&input.design, rows.clone())
+                    .map_err(EstimationError::InvalidInput)?;
+                let x_ls = design_row_chunk(design_noise, rows.clone())
+                    .map_err(EstimationError::InvalidInput)?;
+                let mut rhs = Array2::<f64>::zeros((p_total, rows_in_chunk * 2));
+                for local_row in 0..rows_in_chunk {
+                    rhs.slice_mut(ndarray::s![0..p_t, local_row])
+                        .assign(&x_t.row(local_row).t());
+                    rhs.slice_mut(ndarray::s![p_t..p_t + p_s, rows_in_chunk + local_row])
+                        .assign(&x_ls.row(local_row).t());
                 }
-                let mut covw_cond = covww.clone();
-                for r in 0..p_w {
-                    for c in 0..p_w {
-                        covw_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
+                let solved = backend_ref
+                    .apply_columns(&rhs)
+                    .map_err(EstimationError::InvalidInput)?;
+                for local_row in 0..rows_in_chunk {
+                    let i = start + local_row;
+                    let solved_t = solved.slice(ndarray::s![.., local_row]).to_owned();
+                    let solved_ls =
+                        solved.slice(ndarray::s![.., rows_in_chunk + local_row]).to_owned();
+                    let var_t = x_t.row(local_row).dot(
+                        &solved_t
+                            .slice(ndarray::s![0..p_t])
+                            .to_owned(),
+                    )
+                    .max(0.0);
+                    let var_ls = x_ls.row(local_row).dot(
+                        &solved_ls
+                            .slice(ndarray::s![p_t..p_t + p_s])
+                            .to_owned(),
+                    )
+                    .max(0.0);
+                    let cov_tls_t = x_t.row(local_row).dot(
+                        &solved_ls
+                            .slice(ndarray::s![0..p_t])
+                            .to_owned(),
+                    );
+                    let cov_tls_ls = x_ls.row(local_row).dot(
+                        &solved_t
+                            .slice(ndarray::s![p_t..p_t + p_s])
+                            .to_owned(),
+                    );
+                    let cov_tls = 0.5 * (cov_tls_t + cov_tls_ls);
+                    let suv_t = solved_t.slice(ndarray::s![p_t + p_s..p_total]).to_owned();
+                    let suv_ls = solved_ls
+                        .slice(ndarray::s![p_t + p_s..p_total])
+                        .to_owned();
+                    let det = (var_t * var_ls - cov_tls * cov_tls).max(1e-12);
+                    let inv_uu = [
+                        [var_ls / det, -cov_tls / det],
+                        [-cov_tls / det, var_t / det],
+                    ];
+                    let mut k0 = Array1::<f64>::zeros(p_w);
+                    let mut k1 = Array1::<f64>::zeros(p_w);
+                    for j in 0..p_w {
+                        k0[j] = suv_t[j] * inv_uu[0][0] + suv_ls[j] * inv_uu[1][0];
+                        k1[j] = suv_t[j] * inv_uu[0][1] + suv_ls[j] * inv_uu[1][1];
                     }
-                }
-                out[i] = crate::quadrature::normal_expectation_2d_adaptive_result(
-                    &quadctx,
-                    [eta_t[i], eta_s[i]],
-                    [[var_t, cov_tls], [cov_tls, var_ls]],
-                    |t, ls| {
-                        let sigma = ls.exp().max(1e-12);
-                        let q0 = (-t / sigma).clamp(-30.0, 30.0);
-                        let xw = runtime
-                            .basis_row_scalar(q0)
-                            .map_err(EstimationError::InvalidInput)?;
-                        let dt = t - eta_t[i];
-                        let dls = ls - eta_s[i];
-                        let meanw = q0 + xw.dot(&betaw) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
-                        let mut varw = 0.0;
-                        for r in 0..p_w {
-                            let xr = xw[r];
-                            for c in 0..p_w {
-                                varw += xr * covw_cond[[r, c]] * xw[c];
-                            }
+                    let mut covw_cond = covww.clone();
+                    for r in 0..p_w {
+                        for c in 0..p_w {
+                            covw_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
                         }
-                        let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
-                            &quadctx,
-                            self.inverse_link.link_function(),
-                            meanw,
-                            varw.max(0.0).sqrt(),
-                            self.inverse_link.mixture_state(),
-                            self.inverse_link.sas_state(),
-                        )?;
-                        Ok::<f64, EstimationError>(jet.mean.clamp(0.0, 1.0))
-                    },
-                )?;
+                    }
+                    out[i] = crate::quadrature::normal_expectation_2d_adaptive_result(
+                        &quadctx,
+                        [eta_t[i], eta_s[i]],
+                        [[var_t, cov_tls], [cov_tls, var_ls]],
+                        |t, ls| {
+                            let sigma = ls.exp().max(1e-12);
+                            let q0 = (-t / sigma).clamp(-30.0, 30.0);
+                            let xw = runtime
+                                .basis_row_scalar(q0)
+                                .map_err(EstimationError::InvalidInput)?;
+                            let dt = t - eta_t[i];
+                            let dls = ls - eta_s[i];
+                            let meanw =
+                                q0 + xw.dot(&betaw) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
+                            let mut varw = 0.0;
+                            for r in 0..p_w {
+                                let xr = xw[r];
+                                for c in 0..p_w {
+                                    varw += xr * covw_cond[[r, c]] * xw[c];
+                                }
+                            }
+                            let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
+                                &quadctx,
+                                self.inverse_link.link_function(),
+                                meanw,
+                                varw.max(0.0).sqrt(),
+                                self.inverse_link.mixture_state(),
+                                self.inverse_link.sas_state(),
+                            )?;
+                            Ok::<f64, EstimationError>(jet.mean.clamp(0.0, 1.0))
+                        },
+                    )?;
+                }
+                start = end;
             }
             out
         } else {
@@ -1996,46 +2112,40 @@ impl PredictableModel for SurvivalPredictor {
             let n = eta_threshold.len();
             let p_t = self.beta_threshold.len();
             let p_s = self.beta_log_sigma.len();
+            let backend = PredictionCovarianceBackend::from_dense(cov.view());
 
-            // Eta SE for threshold linear predictor only.
-            let cov_tt = cov.slice(ndarray::s![..p_t, ..p_t]).to_owned();
-            let eta_se = eta_standard_errors_from_design(&input.design, &cov_tt)?;
+            let eta_se = eta_standard_errors_from_backend(&input.design, &backend)?;
 
             // Delta-method SE for survival probability.
-            // Convert design matrices to dense for element access.
-            let x_t_dense = input.design.to_dense();
-            let x_s_dense = design_noise.to_dense();
             let strategy = strategy_for_family(
                 crate::types::LikelihoodFamily::BinomialProbit,
                 Some(&self.inverse_link),
             );
-            let mut mean_se_vec = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let sigma = eta_log_sigma[i].exp();
-                let q0 = -eta_threshold[i] / sigma;
-                // surv = F(-q0), so d(surv)/d(q0) = -F'(-q0) = -phi(-q0)
-                let jet = strategy.inverse_link_jet(-q0)?;
-                let phi_neg_q0 = jet.d1; // F'(-q0) = phi(-q0)
-
-                // d(q0)/d(eta_t) = -1/sigma
-                // d(q0)/d(eta_s) = eta_t/sigma  (since q0 = -eta_t/sigma)
-                // d(surv)/d(eta_t) = -phi_neg_q0 * (-1/sigma) = phi_neg_q0 / sigma
-                // d(surv)/d(eta_s) = -phi_neg_q0 * (eta_t/sigma)
-                let dsurv_deta_t = phi_neg_q0 / sigma;
-                let dsurv_deta_s = -phi_neg_q0 * eta_threshold[i] / sigma;
-
-                // Build combined gradient: [dsurv/d(beta_t), dsurv/d(beta_s)]
-                let mut grad = Vec::with_capacity(p_t + p_s);
-                for j in 0..p_t {
-                    grad.push(dsurv_deta_t * x_t_dense[[i, j]]);
+            let mean_se_vec = linear_predictor_se_from_backend(&backend, n, |rows| {
+                let x_t = design_row_chunk(&input.design, rows.clone())?;
+                let x_s = design_row_chunk(design_noise, rows.clone())?;
+                let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]).to_owned();
+                let eta_ls_chunk = eta_log_sigma.slice(ndarray::s![rows.clone()]).to_owned();
+                let rows_in_chunk = eta_t_chunk.len();
+                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
+                for i in 0..rows_in_chunk {
+                    let sigma = eta_ls_chunk[i].exp();
+                    let q0 = -eta_t_chunk[i] / sigma;
+                    let jet = strategy
+                        .inverse_link_jet(-q0)
+                        .map_err(|e| e.to_string())?;
+                    let phi_neg_q0 = jet.d1;
+                    let dsurv_deta_t = phi_neg_q0 / sigma;
+                    let dsurv_deta_s = -phi_neg_q0 * eta_t_chunk[i] / sigma;
+                    for j in 0..p_t {
+                        grad[[i, j]] = dsurv_deta_t * x_t[[i, j]];
+                    }
+                    for j in 0..p_s {
+                        grad[[i, p_t + j]] = dsurv_deta_s * x_s[[i, j]];
+                    }
                 }
-                for j in 0..p_s {
-                    grad.push(dsurv_deta_s * x_s_dense[[i, j]]);
-                }
-
-                let var = quadratic_form(cov, &grad)?;
-                mean_se_vec[i] = var.sqrt();
-            }
+                Ok(vec![grad])
+            })?;
             (Some(eta_se), Some(mean_se_vec))
         } else {
             (None, None)
@@ -2121,28 +2231,24 @@ impl PredictableModel for SurvivalPredictor {
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_log_sigma.len();
         let p_total = p_t + p_s;
-        let covariance = posterior_mean_covariance_or_warn(
+        let backend = posterior_mean_backend_or_warn(
             fit,
             self.covariance.as_ref(),
             p_total,
             "survival posterior mean",
         );
 
-        let eta_se = if let Some(cov) = covariance {
-            let p_t = self.beta_threshold.len();
-            eta_standard_errors_from_design(
-                &input.design,
-                &cov.slice(ndarray::s![..p_t, ..p_t]).to_owned(),
-            )?
+        let eta_se = if let Some(backend_ref) = backend.as_ref() {
+            eta_standard_errors_from_backend(&input.design, backend_ref)?
         } else {
             Array1::zeros(eta_threshold.len())
         };
 
-        let mean = if let Some(covariance) = covariance {
+        let mean = if let Some(backend_ref) = backend.as_ref() {
             match project_two_block_linear_predictor_covariance(
                 &input.design,
                 design_noise,
-                covariance,
+                backend_ref,
                 p_t,
                 p_s,
                 "survival posterior mean",
@@ -2199,14 +2305,12 @@ impl PredictableModel for SurvivalPredictor {
     }
 }
 
-/// Compute eta standard errors from design matrix and coefficient covariance.
-fn eta_standard_errors_from_design(
+/// Compute eta standard errors from a design matrix and covariance/precision backend.
+fn eta_standard_errors_from_backend(
     x: &DesignMatrix,
-    cov: &Array2<f64>,
+    backend: &PredictionCovarianceBackend<'_>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let vars = x.quadratic_form_diag(cov).map_err(|e| {
-        EstimationError::InvalidInput(format!("failed to compute linear predictor variance: {e}"))
-    })?;
+    let vars = linear_predictorvariance_from_backend(x, backend)?;
     Ok(vars.mapv(|v| v.max(0.0).sqrt()))
 }
 
@@ -2394,7 +2498,8 @@ where
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
 
-    let etavar = linear_predictorvariance(&x, &covariance.to_owned())?;
+    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+    let etavar = linear_predictorvariance_from_backend(&x, &backend)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
     let quadctx = crate::quadrature::QuadratureContext::new();
     let strategy = strategy_for_family(family, None);
@@ -2454,7 +2559,8 @@ where
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
-    let etavar = linear_predictorvariance(&x, &covariance.to_owned())?;
+    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+    let etavar = linear_predictorvariance_from_backend(&x, &backend)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
     let quadctx = crate::quadrature::QuadratureContext::new();
     let strategy = strategy_from_fit(family, fit)?;
@@ -2551,48 +2657,12 @@ where
     }
 
     let requested_mode = options.covariance_mode;
-    // Covariance selection corresponds to approximation order:
-    // - Conditional: uses only A(mu) = Hmu^{-1}
-    // - Corrected: adds first-order Var(b(rho)) term J V_rho J^T
-    let (cov, covariance_corrected_used) = match requested_mode {
-        InferenceCovarianceMode::Conditional => (
-            fit.beta_covariance().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "fit result does not contain conditional covariance".to_string(),
-                )
-            })?,
-            false,
-        ),
-        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
-            if let Some(cov_corr) = fit.beta_covariance_corrected() {
-                (cov_corr, true)
-            } else if let Some(cov_base) = fit.beta_covariance() {
-                (cov_base, false)
-            } else {
-                return Err(EstimationError::InvalidInput(
-                    "fit result does not contain a usable posterior covariance".to_string(),
-                ));
-            }
-        }
-        InferenceCovarianceMode::ConditionalPlusSmoothingRequired => (
-            fit.beta_covariance_corrected().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "fit result does not contain smoothing-corrected covariance".to_string(),
-                )
-            })?,
-            true,
-        ),
-    };
-
-    if cov.nrows() != beta.len() || cov.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "covariance dimension mismatch: expected {}x{}, got {}x{}",
-            beta.len(),
-            beta.len(),
-            cov.nrows(),
-            cov.ncols()
-        )));
-    }
+    let (backend, covariance_corrected_used) = selected_uncertainty_backend(
+        fit,
+        beta.len(),
+        requested_mode,
+        "predict_gamwith_uncertainty",
+    )?;
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
@@ -2618,7 +2688,7 @@ where
     let strategy = strategy_for_family(family, link_kind.as_ref());
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
-    let etavar = linear_predictorvariance(&x, cov)?;
+    let etavar = linear_predictorvariance_from_backend(&x, &backend)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
     let z = standard_normal_quantile(0.5 + 0.5 * options.confidence_level)

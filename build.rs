@@ -732,15 +732,11 @@ impl DeadCodeAnchorCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str(
-            "\n⚠️ `const _: fn() = func_name;` is a dead-code preservation hack.\n",
-        );
+        error_msg.push_str("\n⚠️ `const _: fn() = func_name;` is a dead-code preservation hack.\n");
         error_msg.push_str(
             "   This pattern forces the compiler to keep otherwise-unused functions alive.\n",
         );
-        error_msg.push_str(
-            "   Either wire the code into a real call site or delete it.\n",
-        );
+        error_msg.push_str("   Either wire the code into a real call site or delete it.\n");
         error_msg.push_str(
             "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
         );
@@ -2032,24 +2028,36 @@ fn manually_check_for_unusedvariables() {
                     eprintln!(
                         "   Either use the variable or remove it completely. Underscore prefixes are NOT allowed."
                     );
-                    eprintln!("   These are the only two options: fully wire it into real use, or delete it entirely.");
-                    eprintln!("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.");
+                    eprintln!(
+                        "   These are the only two options: fully wire it into real use, or delete it entirely."
+                    );
+                    eprintln!(
+                        "   Do not suppress, hide, no-op, stub, or work around this lint in any other way."
+                    );
                     std::process::exit(1);
                 } else if stderr.contains("function is never used") {
                     eprintln!("\n❌ ERROR: Unused functions detected in build.rs!");
                     eprintln!("{stderr}");
                     eprintln!("\n⚠️ Unused functions are STRICTLY FORBIDDEN in this project.");
                     eprintln!("   Either use the function or remove it completely.");
-                    eprintln!("   These are the only two options: fully wire it into real use, or delete it entirely.");
-                    eprintln!("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.");
+                    eprintln!(
+                        "   These are the only two options: fully wire it into real use, or delete it entirely."
+                    );
+                    eprintln!(
+                        "   Do not suppress, hide, no-op, stub, or work around this lint in any other way."
+                    );
                     std::process::exit(1);
                 } else if stderr.contains("unused import") {
                     eprintln!("\n❌ ERROR: Unused imports detected in build.rs!");
                     eprintln!("{stderr}");
                     eprintln!("\n⚠️ Unused imports are STRICTLY FORBIDDEN in this project.");
                     eprintln!("   Either use the imported item or remove the import completely.");
-                    eprintln!("   These are the only two options: fully wire it into real use, or delete it entirely.");
-                    eprintln!("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.");
+                    eprintln!(
+                        "   These are the only two options: fully wire it into real use, or delete it entirely."
+                    );
+                    eprintln!(
+                        "   Do not suppress, hide, no-op, stub, or work around this lint in any other way."
+                    );
                     std::process::exit(1);
                 } else {
                     eprintln!(
