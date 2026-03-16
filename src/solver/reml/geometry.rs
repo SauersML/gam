@@ -1,5 +1,8 @@
+use super::unified::{LAML_RIDGE, smooth_floor_dp};
 use super::*;
 use crate::linalg::sparse_exact::SparseOperatorBlockSupport;
+use crate::linalg::sparse_exact::SparseTraceWorkspace;
+use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SparseExactLikelihoodStructure {

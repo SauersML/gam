@@ -1124,6 +1124,7 @@ impl WorkingModelSurvival {
             penalty_term: penalty_dev + ridge_penalty,
             firth: crate::pirls::FirthDiagnostics::Inactive,
             ridge_used,
+            hessian_curvature: crate::pirls::HessianCurvatureKind::Observed,
         })
     }
 

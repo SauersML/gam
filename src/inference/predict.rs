@@ -297,8 +297,6 @@ pub struct PredictResult {
 //  PredictableModel trait — uniform prediction interface for all model types
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::estimate::BlockRole;
-
 /// Input to the prediction trait. Contains the design matrix and metadata
 /// needed for point prediction + uncertainty quantification.
 pub struct PredictInput {
@@ -1250,11 +1248,14 @@ impl PredictableModel for BinomialLocationScalePredictor {
                             }
                         }
                         let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
-                            &self.inverse_link,
+                            &quadctx,
+                            self.inverse_link.link_function(),
                             meanw,
                             varw.max(0.0).sqrt(),
+                            self.inverse_link.mixture_state(),
+                            self.inverse_link.sas_state(),
                         )?;
-                        Ok(jet.mu.clamp(0.0, 1.0))
+                        Ok::<f64, EstimationError>(jet.mean.clamp(0.0, 1.0))
                     },
                 )?;
             }

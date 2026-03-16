@@ -13,7 +13,7 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::scale_design::{
-    apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
+    apply_scale_deviation_transform, build_scale_deviation_transform,
 };
 use crate::families::sigma_link::{
     SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar, exp_sigma_derivs_up_to_third,
@@ -1175,22 +1175,6 @@ struct BinomialMeanWiggleSpec {
 }
 
 #[derive(Clone)]
-pub struct PoissonLogSpec {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub eta_block: ParameterBlockInput,
-}
-
-#[derive(Clone)]
-pub struct GammaLogSpec {
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    /// Gamma shape parameter (k > 0).
-    pub shape: f64,
-    pub eta_block: ParameterBlockInput,
-}
-
-#[derive(Clone)]
 pub struct GaussianLocationScaleTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -1614,6 +1598,66 @@ fn gamlss_fit_score(fit: &UnifiedFitResult) -> f64 {
         score
     } else {
         f64::INFINITY
+    }
+}
+
+trait LocationScaleFamilyBuilder {
+    type Family: CustomFamily + Clone + Send + Sync + 'static;
+
+    fn meanspec(&self) -> &TermCollectionSpec;
+    fn noisespec(&self) -> &TermCollectionSpec;
+
+    fn build_blocks(
+        &self,
+        theta: &Array1<f64>,
+        mean_design: &TermCollectionDesign,
+        noise_design: &TermCollectionDesign,
+        mean_beta_hint: Option<Array1<f64>>,
+        noise_beta_hint: Option<Array1<f64>>,
+    ) -> Result<Vec<ParameterBlockSpec>, String>;
+
+    fn build_family(
+        &self,
+        mean_design: &TermCollectionDesign,
+        noise_design: &TermCollectionDesign,
+    ) -> Self::Family;
+
+    fn extract_primary_betas(
+        &self,
+        fit: &UnifiedFitResult,
+    ) -> Result<(Array1<f64>, Array1<f64>), String>;
+
+    fn mean_penalty_count(&self, mean_design: &TermCollectionDesign) -> usize {
+        mean_design.penalties.len()
+    }
+
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+        noise_design.penalties.len()
+    }
+
+    fn exact_spatial_joint_supported(&self) -> bool {
+        false
+    }
+
+    fn require_exact_spatial_joint(&self) -> bool {
+        false
+    }
+
+    fn extra_rho0(&self) -> Result<Array1<f64>, String> {
+        Ok(Array1::zeros(0))
+    }
+
+    fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
+
+    fn build_psiderivative_blocks(
+        &self,
+        _: ndarray::ArrayView2<'_, f64>,
+        _: &TermCollectionSpec,
+        _: &TermCollectionSpec,
+        _: &TermCollectionDesign,
+        _: &TermCollectionDesign,
+    ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+        Err("spatial psi derivatives are unavailable for this location-scale family".to_string())
     }
 }
 
@@ -6349,8 +6393,6 @@ impl GaussianLocationScaleWiggleFamily {
         let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &zeta_v);
         let dm_uv = &(2.0 * &rows.w * &(&q_u * &zeta_v + &q_v * &zeta_u)) - &(&rows.w * &q_uv)
             + &(4.0 * &rows.m * &(&zeta_u * &zeta_v));
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &zeta_u);
-        let dn_v = -(2.0 * &rows.m * &q_v) - &(2.0 * &rows.n * &zeta_v);
         let dn_uv = &(2.0 * &rows.w * &(&q_u * &q_v))
             + &(4.0 * &rows.m * &(&q_u * &zeta_v + &q_v * &zeta_u))
             - &(2.0 * &rows.m * &q_uv)

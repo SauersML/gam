@@ -1,10 +1,8 @@
 use crate::custom_family::{CustomFamily, ParameterBlockState};
-use crate::estimate::UnifiedFitResult;
-use crate::estimate::{EstimationError, PredictResult, predict_gam};
+use crate::estimate::{EstimationError, PredictResult};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
-use crate::matrix::DesignMatrix;
 use crate::types::LikelihoodFamily;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2};
 
 /// Observation-noise model used for generative sampling.
 #[derive(Clone, Debug)]
@@ -46,21 +44,6 @@ pub fn generativespec_from_predict(
         mean: prediction.mean,
         noise,
     })
-}
-
-/// Convenience builder: from design + coefficients directly.
-pub fn generativespec_from_gam<X>(
-    x: X,
-    beta: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    family: LikelihoodFamily,
-    gaussian_scale: Option<f64>,
-) -> Result<GenerativeSpec, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let pred = predict_gam(x, beta, offset, family)?;
-    generativespec_from_predict(pred, family, gaussian_scale)
 }
 
 /// Draw one synthetic observation vector from a generative spec.
@@ -167,12 +150,4 @@ pub trait CustomFamilyGenerative: CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String>;
-}
-
-/// Build custom-family generative spec from a fitted multi-block model.
-pub fn custom_generativespec<F: CustomFamilyGenerative>(
-    family: &F,
-    fit: &UnifiedFitResult,
-) -> Result<GenerativeSpec, String> {
-    family.generativespec(&fit.block_states)
 }

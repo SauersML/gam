@@ -617,15 +617,6 @@ impl FittedModel {
             .unwrap_or(false)
     }
 
-    /// Number of wiggle coefficients (0 if no wiggle).
-    #[inline]
-    pub fn link_wiggle_dim(&self) -> usize {
-        self.saved_link_wiggle()
-            .ok()
-            .flatten()
-            .map_or(0, |runtime| runtime.beta.len())
-    }
-
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
         Ok(SavedPredictionRuntime {
             model_class: self.predict_model_class(),

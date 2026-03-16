@@ -13,13 +13,12 @@ use gam::basis::{
     build_bspline_basis_1d, compute_geometric_constraint_transform, create_basis,
     create_difference_penalty_matrix, default_num_centers, evaluate_bspline_derivative_scalar,
 };
-use gam::construction::kronecker_product;
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
-    UnifiedFitResultParts, compute_continuous_smoothness_order, fit_gam, optimize_external_design,
-    predict_gam, predict_gam_posterior_mean, predict_gamwith_uncertainty,
+    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
+    predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
@@ -76,7 +75,7 @@ use gam::{
     LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
     SurvivalLocationScaleFitRequest, fit_model,
 };
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, HashMap};
@@ -329,6 +328,7 @@ struct SurvivalArgs {
     threshold_time_degree: usize,
     sigma_time_k: Option<usize>,
     sigma_time_degree: usize,
+    scale_dimensions: bool,
     out: Option<PathBuf>,
 }
 
@@ -675,6 +675,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             threshold_time_degree: args.threshold_time_degree,
             sigma_time_k: args.sigma_time_k,
             sigma_time_degree: args.sigma_time_degree,
+            scale_dimensions: args.scale_dimensions,
             out: args.out.clone(),
         };
         return run_survival(surv_args);
@@ -1016,7 +1017,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         TermCollectionSpec,
         Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
         FittedLinkState,
-        Option<(Vec<f64>, usize, Vec<f64>)>,
+        Option<(Vec<f64>, usize)>,
     ) = if args.firth {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -4316,7 +4317,6 @@ fn build_time_varying_survival_covariate_template(
     let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
         .map_err(|e| format!("failed to build {block_name} time-margin B-spline basis: {e}"))?;
     let time_design_exit = time_build.design;
-    let _p_time = time_design_exit.ncols();
 
     // Extract the knot vector so we can evaluate the basis at entry times too.
     let knots = match &time_build.metadata {
@@ -4650,15 +4650,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         )) {
             Ok(FitResult::SurvivalLocationScale(result)) => result,
             Ok(_) => {
-                return Err(classify_cli_error(
+                return Err(
                     "internal survival location-scale workflow returned the wrong result variant"
                         .to_string(),
-                ));
+                );
             }
             Err(e) => {
-                return Err(classify_cli_error(format!(
-                    "survival location-scale fit failed: {e}"
-                )));
+                return Err(format!("survival location-scale fit failed: {e}"));
             }
         };
         let fitted_inverse_link = fit.inverse_link.clone();
@@ -6481,7 +6479,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         iterations: fit.outer_iterations,
         edf_total: model
             .unified()
-            .map(|u| u.edf_total())
+            .and_then(|u| u.edf_total())
             .unwrap_or_else(|| fit.edf_total().unwrap_or(0.0)),
         r_squared,
         coefficients,
@@ -6580,7 +6578,7 @@ fn freeze_term_collectionspec(
             (
                 SmoothBasisSpec::ThinPlate {
                     spec: s,
-                    ref mut input_scales,
+                    input_scales,
                     ..
                 },
                 BasisMetadata::ThinPlate {
@@ -6604,7 +6602,7 @@ fn freeze_term_collectionspec(
             (
                 SmoothBasisSpec::Matern {
                     spec: s,
-                    ref mut input_scales,
+                    input_scales,
                     ..
                 },
                 BasisMetadata::Matern {
@@ -6634,7 +6632,7 @@ fn freeze_term_collectionspec(
             (
                 SmoothBasisSpec::Duchon {
                     spec: s,
-                    ref mut input_scales,
+                    input_scales,
                     ..
                 },
                 BasisMetadata::Duchon {
@@ -8808,6 +8806,15 @@ fn resolve_family(
         } else {
             match choice.link {
                 LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
+                LinkFunction::Log => {
+                    if y.iter()
+                        .all(|&yi| yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9)
+                    {
+                        LikelihoodFamily::PoissonLog
+                    } else {
+                        LikelihoodFamily::GammaLog
+                    }
+                }
                 LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
                 LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                 LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
@@ -9062,6 +9069,7 @@ fn inverse_link_to_saved_string(link: &InverseLink) -> String {
 
 fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
     match link {
+        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
         InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
         InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
         InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
@@ -10044,10 +10052,6 @@ fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), 
     Ok(())
 }
 
-fn survival_probability_from_eta(eta: ArrayView1<'_, f64>) -> Array1<f64> {
-    eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0))
-}
-
 /// Unified CSV prediction writer.  Each column is a `(name, data)` pair;
 /// the function writes a header row from the names and one data row per
 /// element, formatting every value to 12 decimal places.
@@ -10080,7 +10084,7 @@ fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> Resu
 
     // Validate all prediction values are finite before writing.
     // NaN or Inf in clinical output would be dangerous.
-    for (col_name, data) in &columns {
+    for (col_name, data) in columns {
         for (i, val) in data.iter().enumerate() {
             if !val.is_finite() {
                 return Err(format!(
@@ -10987,7 +10991,7 @@ mod tests {
     #[test]
     fn survival_probability_is_bounded_and_monotone_decreasing_in_eta() {
         let eta = array![-3.0, -1.0, 0.0, 1.0, 2.0];
-        let surv = survival_probability_from_eta(eta.view());
+        let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
         assert!(surv.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
         assert!(surv.windows(2).into_iter().all(|w| w[1] <= w[0] + 1e-12));
     }
@@ -10996,7 +11000,9 @@ mod tests {
     fn concordance_depends_on_score_semantics() {
         let time = [12.0, 10.0, 8.0, 6.0, 4.0, 2.0];
         let eta = array![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
-        let surv = survival_probability_from_eta(eta.view()).to_vec();
+        let surv = eta
+            .mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0))
+            .to_vec();
         let risk = eta.to_vec();
         let neg_risk = eta.mapv(|v| -v).to_vec();
 
@@ -11669,7 +11675,7 @@ mod tests {
         path.push(format!("gam_survival_pred_schema_{ts}.csv"));
 
         let eta = array![0.5, -0.25];
-        let surv = survival_probability_from_eta(eta.view());
+        let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
         write_survival_prediction_csv(&path, eta.view(), surv.view(), None, None, None)
             .expect("write survival prediction csv");
 
@@ -12933,7 +12939,7 @@ mod tests {
                 );
                 let beta = summary.beta.as_ref().to_owned();
                 let eta = time_build.x_exit_time.dot(&beta);
-                let surv = survival_probability_from_eta(eta.view());
+                let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
                 let state = constrained_model
                     .update_state(&beta)
                     .expect("evaluate fitted structural survival state");

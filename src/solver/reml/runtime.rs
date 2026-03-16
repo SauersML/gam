@@ -1,9 +1,12 @@
 use super::*;
 use crate::faer_ndarray::FaerLblt;
+use crate::linalg::sparse_exact::SparseTraceWorkspace;
 use crate::linalg::utils::{
     StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
 };
+use crate::pirls::PirlsWorkspace;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
+use std::sync::Mutex;
 
 impl<'a> RemlState<'a> {
     pub(crate) fn third_derivative_projection_from_design(
@@ -1222,9 +1225,6 @@ impl<'a> RemlState<'a> {
         let mut det1 = Array1::<f64>::zeros(rho.len());
         for block in blocks {
             let lambda_k = rho[block.term_index].exp();
-            let rank = block.positive_eigenvalues.len();
-            let p_block = block.p_end - block.p_start;
-            let nullity = p_block.saturating_sub(rank);
 
             // Choose δ based on the spectral scale of λ_k S_k.
             let max_ev = block
@@ -1515,7 +1515,6 @@ impl<'a> RemlState<'a> {
                 logdet_h: sparse_system.logdet_h,
                 logdet_s_pos,
                 det1_values: Arc::new(det1_values),
-                #[cfg(test)]
                 traceworkspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
             })),
             firth_dense_operator: None,
@@ -1686,6 +1685,7 @@ impl<'a> RemlState<'a> {
         }
     }
 }
+
 impl<'a> RemlState<'a> {
     /// Compute the objective function for BFGS optimization.
     ///

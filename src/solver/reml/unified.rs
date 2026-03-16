@@ -761,16 +761,6 @@ pub struct LinkWiggleDerivProvider {
     /// geometric constraint transform Z.
     b_prime_u: Array2<f64>,
 
-    /// B'(z) raw (n × n_raw). B-spline basis first derivative before
-    /// the constraint transform. Used for computing the link-block
-    /// Jacobian drift dJ[:,p_base..].
-    b_prime: Array2<f64>,
-
-    /// Z matrix (n_raw × p_link). Geometric constraint transform that
-    /// maps unconstrained link coefficients to the monotonicity-constrained
-    /// parameter space.
-    link_transform: Array2<f64>,
-
     /// 1/range_width for z-coordinate scaling. When the base predictor η
     /// shifts by dη, the normalized coordinate z shifts by dη · invrw.
     invrw: f64,
@@ -790,7 +780,6 @@ pub struct LinkWiggleDerivProvider {
 
 impl LinkWiggleDerivProvider {
     /// Create a new provider from pre-computed ingredients at the converged mode.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         j_mat: Array2<f64>,
         sqrtw: Array1<f64>,
@@ -799,8 +788,6 @@ impl LinkWiggleDerivProvider {
         x_base: Array2<f64>,
         gsecond: Array1<f64>,
         b_prime_u: Array2<f64>,
-        b_prime: Array2<f64>,
-        link_transform: Array2<f64>,
         invrw: f64,
     ) -> Self {
         let n = j_mat.nrows();
@@ -826,8 +813,6 @@ impl LinkWiggleDerivProvider {
             x_base,
             gsecond,
             b_prime_u,
-            b_prime,
-            link_transform,
             invrw,
             p_base,
             p_link,
@@ -1629,7 +1614,7 @@ pub struct InnerSolution<'dp> {
     /// contributions internally. When present, `reml_laml_evaluate` and
     /// `compute_outer_hessian` compute the Firth gradient ∂Φ/∂ρ and Hessian
     /// ∂²Φ/∂ρ² inline, eliminating the need for callers to pre-compute them.
-    pub firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    pub(crate) firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
 
     // === Model dimensions ===
     /// Number of observations.
@@ -1853,7 +1838,7 @@ const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 
 /// Smooth approximation of max(dp, DP_FLOOR).
 /// Returns (smoothed_value, derivative_wrt_dp).
-fn smooth_floor_dp(dp: f64) -> (f64, f64) {
+pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
     let scaled = (dp - DP_FLOOR) / tau;
 
@@ -1869,6 +1854,8 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     let grad = 1.0 / (1.0 + (-scaled).exp());
     (value, grad)
 }
+
+pub(crate) const LAML_RIDGE: f64 = 1e-8;
 
 /// Ridge floor for denominator safety.
 const DENOM_RIDGE: f64 = 1e-8;
@@ -3778,7 +3765,8 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
     let max_sweeps = 100;
     let tol = 1e-15;
 
-    for _sweep in 0..max_sweeps {
+    let mut sweep = 0;
+    while sweep < max_sweeps {
         // Check convergence: sum of squares of off-diagonal elements.
         let mut off_diag_sq = 0.0;
         for i in 0..n {
@@ -3840,6 +3828,7 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
                 }
             }
         }
+        sweep += 1;
     }
 
     let eigenvalues: Vec<f64> = (0..n).map(|i| work[[i, i]]).collect();

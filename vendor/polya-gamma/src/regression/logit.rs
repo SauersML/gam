@@ -210,7 +210,7 @@ impl<R: SeedableRng + Rng + Clone + Send + Sync> GibbsLogit<R> {
     /// let y = array![0.0, 0.0, 1.0];
     /// let model = GibbsLogit::from_rng(rng, x, y, 100.0, 4, 42);
     /// ```
-    pub fn from_rng(
+    fn from_rng(
         rng: R,
         x: Array2<f64>,
         y: Array1<f64>,

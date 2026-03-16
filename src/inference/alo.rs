@@ -472,15 +472,6 @@ pub fn compute_alo_diagnostics_from_fit(
     compute_alo_diagnostics_from_pirls_impl(pirls, y, link)
 }
 
-/// Compute ALO diagnostics from a fitted GAM result (primary API).
-pub fn compute_alo_diagnostics(
-    fit: &UnifiedFitResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_fit(fit, y, link)
-}
-
 /// Compute ALO diagnostics from a `UnifiedFitResult`.
 ///
 /// Extracts `FitGeometry` from `unified.geometry`, builds an `AloInput`
