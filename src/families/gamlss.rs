@@ -3389,13 +3389,17 @@ fn binomial_location_scale_core(
         return Err("binomial location-scale core wiggle size mismatch".to_string());
     }
 
-    let mut sigma = Array1::<f64>::zeros(n);
-    let mut dsigma_deta = Array1::<f64>::zeros(n);
-    let mut q0 = Array1::<f64>::zeros(n);
-    let mut mu = Array1::<f64>::zeros(n);
-    let mut dmu_dq = Array1::<f64>::zeros(n);
-    let mut d2mu_dq2 = Array1::<f64>::zeros(n);
-    let mut d3mu_dq3 = Array1::<f64>::zeros(n);
+    // Use uninit to skip wasted zero-fill — every element is written in the loop.
+    let (mut sigma, mut dsigma_deta, mut q0, mut mu, mut dmu_dq, mut d2mu_dq2, mut d3mu_dq3);
+    unsafe {
+        sigma = Array1::<f64>::uninit(n).assume_init();
+        dsigma_deta = Array1::<f64>::uninit(n).assume_init();
+        q0 = Array1::<f64>::uninit(n).assume_init();
+        mu = Array1::<f64>::uninit(n).assume_init();
+        dmu_dq = Array1::<f64>::uninit(n).assume_init();
+        d2mu_dq2 = Array1::<f64>::uninit(n).assume_init();
+        d3mu_dq3 = Array1::<f64>::uninit(n).assume_init();
+    }
     let mut ll = 0.0;
 
     for i in 0..n {
@@ -3441,12 +3445,16 @@ fn binomial_location_scale_working_sets(
 ) -> Result<(BlockWorkingSet, BlockWorkingSet, Option<BlockWorkingSet>), String> {
     let n = y.len();
     if let Some(geom) = exact_geometry {
-        let mut grad_eta_t = Array1::<f64>::zeros(n);
-        let mut h_eta_t = Array1::<f64>::zeros(n);
-        let mut grad_eta_ls = Array1::<f64>::zeros(n);
-        let mut h_eta_ls = Array1::<f64>::zeros(n);
-        let mut grad_q = etawiggle.map(|_| Array1::<f64>::zeros(n));
-        let mut h_q_psd = etawiggle.map(|_| Array1::<f64>::zeros(n));
+        // Use uninit — every element is written in the loop below.
+        let (mut grad_eta_t, mut h_eta_t, mut grad_eta_ls, mut h_eta_ls);
+        unsafe {
+            grad_eta_t = Array1::<f64>::uninit(n).assume_init();
+            h_eta_t = Array1::<f64>::uninit(n).assume_init();
+            grad_eta_ls = Array1::<f64>::uninit(n).assume_init();
+            h_eta_ls = Array1::<f64>::uninit(n).assume_init();
+        }
+        let mut grad_q = etawiggle.map(|_| unsafe { Array1::<f64>::uninit(n).assume_init() });
+        let mut h_q_psd = etawiggle.map(|_| unsafe { Array1::<f64>::uninit(n).assume_init() });
 
         for i in 0..n {
             let (score_q, curvature_q, _) = binomial_score_curvaturethird_from_jet(
@@ -3585,12 +3593,16 @@ fn binomial_location_scale_working_sets(
     // REML uses these Fisher weights in H = X'WX + S, which is a PQL-type
     // approximation for non-canonical links. This is acceptable when the
     // ExactNewton path handles the joint Hessian for the outer objective.
-    let mut z_t = Array1::<f64>::zeros(n);
-    let mut w_t = Array1::<f64>::zeros(n);
-    let mut z_ls = Array1::<f64>::zeros(n);
-    let mut w_ls = Array1::<f64>::zeros(n);
-    let mut zw = etawiggle.map(|_| Array1::<f64>::zeros(n));
-    let mut ww = etawiggle.map(|_| Array1::<f64>::zeros(n));
+    // Use uninit — every element is written in the loop below.
+    let (mut z_t, mut w_t, mut z_ls, mut w_ls);
+    unsafe {
+        z_t = Array1::<f64>::uninit(n).assume_init();
+        w_t = Array1::<f64>::uninit(n).assume_init();
+        z_ls = Array1::<f64>::uninit(n).assume_init();
+        w_ls = Array1::<f64>::uninit(n).assume_init();
+    }
+    let mut zw = etawiggle.map(|_| unsafe { Array1::<f64>::uninit(n).assume_init() });
+    let mut ww = etawiggle.map(|_| unsafe { Array1::<f64>::uninit(n).assume_init() });
 
     for i in 0..n {
         let var = (core.mu[i] * (1.0 - core.mu[i])).max(MIN_PROB);
