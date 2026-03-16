@@ -3,8 +3,9 @@ use crate::custom_family::{
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyWarmStart,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
+    ParameterBlockSpec, ParameterBlockState, build_rowwise_kronecker_psi_operator,
+    evaluate_custom_family_joint_hyper, fit_custom_family, resolve_custom_family_x_psi,
+    resolve_custom_family_x_psi_psi, shared_dense_arc, wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::gamlss::{
@@ -39,6 +40,7 @@ use crate::solver::estimate::{
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const MIN_PROB: f64 = 1e-12;
@@ -852,6 +854,8 @@ struct SurvivalJointQuantities {
     d2q_ls: Array1<f64>,
     d3q_tls_ls: Array1<f64>,
     d3q_ls: Array1<f64>,
+    d4q_tls_ls_ls: Array1<f64>,
+    d4q_ls: Array1<f64>,
     /// Entry-side dq0/d(eta_t_entry) = -1/sigma_entry (only for time-varying).
     dq_t_entry: Option<Array1<f64>>,
     /// Entry-side chain-rule derivatives for sigma at entry (only for time-varying sigma).
@@ -860,6 +864,8 @@ struct SurvivalJointQuantities {
     d2q_ls_entry: Option<Array1<f64>>,
     d3q_tls_ls_entry: Option<Array1<f64>>,
     d3q_ls_entry: Option<Array1<f64>>,
+    d4q_tls_ls_ls_entry: Option<Array1<f64>>,
+    d4q_ls_entry: Option<Array1<f64>>,
 }
 
 struct SurvivalJointPsiDirection {
@@ -1209,12 +1215,16 @@ impl SurvivalLocationScaleFamily {
             d2q_ls: exit_qd.d2q_ls,
             d3q_tls_ls: exit_qd.d3q_tls_ls,
             d3q_ls: exit_qd.d3q_ls,
+            d4q_tls_ls_ls: exit_qd.d4q_tls_ls_ls,
+            d4q_ls: exit_qd.d4q_ls,
             dq_t_entry,
             dq_ls_entry: entry_qd.as_ref().map(|q| q.dq_ls.clone()),
             d2q_tls_entry: entry_qd.as_ref().map(|q| q.d2q_tls.clone()),
             d2q_ls_entry: entry_qd.as_ref().map(|q| q.d2q_ls.clone()),
             d3q_tls_ls_entry: entry_qd.as_ref().map(|q| q.d3q_tls_ls.clone()),
             d3q_ls_entry: entry_qd.as_ref().map(|q| q.d3q_ls.clone()),
+            d4q_tls_ls_ls_entry: entry_qd.as_ref().map(|q| q.d4q_tls_ls_ls.clone()),
+            d4q_ls_entry: entry_qd.as_ref().map(|q| q.d4q_ls.clone()),
         })
     }
 
@@ -2539,164 +2549,268 @@ fn build_survival_covariate_block_psi_derivatives(
         return Ok(None);
     };
     let psi_dim = info_list.len();
+    let axis_lookup: HashMap<(usize, usize), usize> = info_list
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, info)| {
+            info.aniso_group_id
+                .map(|gid| ((gid, info.implicit_axis), idx))
+        })
+        .collect();
     Ok(Some(
         info_list
             .into_iter()
             .enumerate()
-            .map(|(psi_idx, info)| {
-                let penalty_indices = info.penalty_indices.clone();
-                match template {
-                    SurvivalCovariateTermBlockTemplate::Static => {
-                        let x_full = EmbeddedColumnBlock::new(
-                            &info.x_psi_local,
-                            info.global_range.clone(),
-                            info.total_p,
-                        )
-                        .materialize();
-                        let s_full = EmbeddedSquareBlock::new(
-                            &info.s_psi_local,
-                            info.global_range.clone(),
-                            info.total_p,
-                        )
-                        .materialize();
-                        CustomFamilyBlockPsiDerivative {
-                            penalty_index: Some(info.penalty_index),
-                            x_psi: x_full.clone(),
-                            s_psi: s_full,
-                            s_psi_components: Some(
-                                info.penalty_indices
-                                    .into_iter()
-                                    .zip(info.s_psi_components_local.into_iter().map(|local| {
-                                        EmbeddedSquareBlock::new(
-                                            &local,
-                                            info.global_range.clone(),
-                                            info.total_p,
-                                        )
-                                        .materialize()
-                                    }))
-                                    .collect(),
-                            ),
-                            x_psi_psi: Some({
+            .map(
+                |(psi_idx, info)| -> Result<CustomFamilyBlockPsiDerivative, String> {
+                    let penalty_indices = info.penalty_indices.clone();
+                    let embed_design = |local: &Array2<f64>| {
+                        EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
+                            .materialize()
+                    };
+                    let embed_penalty = |local: &Array2<f64>| {
+                        EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
+                            .materialize()
+                    };
+                    match template {
+                        SurvivalCovariateTermBlockTemplate::Static => {
+                            let implicit_operator = info
+                                .implicit_operator
+                                .as_ref()
+                                .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
+                            let x_full = if implicit_operator.is_some() {
+                                Array2::<f64>::zeros((0, 0))
+                            } else {
+                                embed_design(&info.x_psi_local)
+                            };
+                            let s_full = embed_penalty(&info.s_psi_local);
+                            let s_components: Vec<(usize, Array2<f64>)> = info
+                                .penalty_indices
+                                .iter()
+                                .copied()
+                                .zip(info.s_psi_components_local.iter().map(embed_penalty))
+                                .collect();
+                            let x_psi_psi = if implicit_operator.is_some() {
+                                None
+                            } else {
                                 let mut rows =
                                     vec![
                                         Array2::<f64>::zeros((x_full.nrows(), x_full.ncols()));
                                         psi_dim
                                     ];
-                                rows[psi_idx] = EmbeddedColumnBlock::new(
-                                    &info.x_psi_psi_local,
-                                    info.global_range.clone(),
-                                    info.total_p,
+                                rows[psi_idx] = embed_design(&info.x_psi_psi_local);
+                                if let (Some(gid), Some(cross_designs)) =
+                                    (info.aniso_group_id, info.aniso_cross_designs.as_ref())
+                                {
+                                    for (axis_j, local) in cross_designs {
+                                        if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                                            rows[global_j] = embed_design(local);
+                                        }
+                                    }
+                                }
+                                Some(rows)
+                            };
+                            let mut s_psi_psi_components =
+                                vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+                            s_psi_psi_components[psi_idx] = penalty_indices
+                                .iter()
+                                .copied()
+                                .zip(info.s_psi_psi_components_local.iter().map(embed_penalty))
+                                .collect();
+                            if let (Some(gid), Some(cross_penalties)) =
+                                (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
+                            {
+                                for (axis_j, local_components) in cross_penalties {
+                                    if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                                        s_psi_psi_components[global_j] = penalty_indices
+                                            .iter()
+                                            .copied()
+                                            .zip(local_components.iter().map(embed_penalty))
+                                            .collect();
+                                    }
+                                }
+                            }
+                            let s_psi_psi: Vec<Array2<f64>> = s_psi_psi_components
+                                .iter()
+                                .map(|components| {
+                                    components.iter().fold(
+                                        Array2::<f64>::zeros((info.total_p, info.total_p)),
+                                        |acc, (_, matrix)| acc + matrix,
+                                    )
+                                })
+                                .collect();
+                            Ok(CustomFamilyBlockPsiDerivative {
+                                penalty_index: Some(info.penalty_index),
+                                x_psi: x_full,
+                                s_psi: s_full,
+                                s_psi_components: Some(s_components),
+                                x_psi_psi,
+                                s_psi_psi: Some(s_psi_psi),
+                                s_psi_psi_components: Some(s_psi_psi_components),
+                                implicit_operator,
+                                implicit_axis: info.implicit_axis,
+                                implicit_group_id: info.aniso_group_id,
+                            })
+                        }
+                        SurvivalCovariateTermBlockTemplate::TimeVarying {
+                            time_basis_entry,
+                            time_basis_exit,
+                            ..
+                        } => {
+                            let tensorize_design = |base: &Array2<f64>| {
+                                let exit = rowwise_kronecker(
+                                    &DesignMatrix::Dense(base.clone()),
+                                    time_basis_exit,
                                 )
-                                .materialize();
-                                rows
-                            }),
-                            s_psi_psi: Some({
+                                .to_dense();
+                                let entry = rowwise_kronecker(
+                                    &DesignMatrix::Dense(base.clone()),
+                                    time_basis_entry,
+                                )
+                                .to_dense();
+                                let n = exit.nrows();
+                                let p = exit.ncols();
+                                let mut stacked = Array2::<f64>::zeros((2 * n, p));
+                                stacked.slice_mut(s![0..n, ..]).assign(&exit);
+                                stacked.slice_mut(s![n..2 * n, ..]).assign(&entry);
+                                stacked
+                            };
+                            let i_time = Array2::<f64>::eye(time_basis_exit.ncols());
+                            let tensorize_penalty =
+                                |base: &Array2<f64>| kronecker_product(base, &i_time);
+                            let implicit_operator = info
+                                .implicit_operator
+                                .as_ref()
+                                .map(|op| {
+                                    build_rowwise_kronecker_psi_operator(
+                                        wrap_spatial_implicit_psi_operator(Arc::clone(op)),
+                                        vec![
+                                            shared_dense_arc(time_basis_exit),
+                                            shared_dense_arc(time_basis_entry),
+                                        ],
+                                    )
+                                })
+                                .transpose()?;
+                            let x_psi = if implicit_operator.is_some() {
+                                Array2::<f64>::zeros((0, 0))
+                            } else {
+                                tensorize_design(&embed_design(&info.x_psi_local))
+                            };
+                            let p_total = info.total_p * time_basis_exit.ncols();
+                            let s_components: Vec<(usize, Array2<f64>)> = info
+                                .penalty_indices
+                                .iter()
+                                .copied()
+                                .zip(
+                                    info.s_psi_components_local
+                                        .iter()
+                                        .map(embed_penalty)
+                                        .map(|full| tensorize_penalty(&full)),
+                                )
+                                .collect();
+                            let x_psi_psi = if implicit_operator.is_some() {
+                                None
+                            } else {
                                 let mut rows =
                                     vec![
-                                        Array2::<f64>::zeros((info.total_p, info.total_p));
+                                        Array2::<f64>::zeros((x_psi.nrows(), x_psi.ncols()));
                                         psi_dim
                                     ];
-                                rows[psi_idx] = EmbeddedSquareBlock::new(
-                                    &info.s_psi_psi_local,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                                .materialize();
-                                rows
-                            }),
-                            s_psi_psi_components: Some({
-                                let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-                                rows[psi_idx] = penalty_indices
-                                    .into_iter()
-                                    .zip(info.s_psi_psi_components_local.into_iter().map(|local| {
-                                        EmbeddedSquareBlock::new(
-                                            &local,
-                                            info.global_range.clone(),
-                                            info.total_p,
-                                        )
-                                        .materialize()
-                                    }))
-                                    .collect();
-                                rows
-                            }),
-                            implicit_operator: info.implicit_operator.clone(),
-                            implicit_axis: info.implicit_axis,
-                            implicit_group_id: info.aniso_group_id,
-                        }
-                    }
-                    SurvivalCovariateTermBlockTemplate::TimeVarying {
-                        time_basis_entry,
-                        time_basis_exit,
-                        ..
-                    } => {
-                        let base_x_psi = if info.x_psi_local.nrows() == design.design.nrows()
-                            && info.x_psi_local.ncols() == info.global_range.len()
-                        {
-                            EmbeddedColumnBlock::new(
-                                &info.x_psi_local,
-                                info.global_range.clone(),
-                                info.total_p,
-                            )
-                            .materialize()
-                        } else if let Some(op) = info.implicit_operator.as_ref() {
-                            op.materialize_first(info.implicit_axis)
-                        } else {
-                            EmbeddedColumnBlock::new(
-                                &info.x_psi_local,
-                                info.global_range.clone(),
-                                info.total_p,
-                            )
-                            .materialize()
-                        };
-                        let exit = rowwise_kronecker(
-                            &DesignMatrix::Dense(base_x_psi.clone()),
-                            time_basis_exit,
-                        )
-                        .to_dense();
-                        let entry =
-                            rowwise_kronecker(&DesignMatrix::Dense(base_x_psi), time_basis_entry)
-                                .to_dense();
-                        let n = exit.nrows();
-                        let p = exit.ncols();
-                        let mut stacked = Array2::<f64>::zeros((2 * n, p));
-                        stacked.slice_mut(s![0..n, ..]).assign(&exit);
-                        stacked.slice_mut(s![n..2 * n, ..]).assign(&entry);
-
-                        let i_time = Array2::<f64>::eye(time_basis_exit.ncols());
-                        let mut s_components = Vec::new();
-                        for (penalty_idx, local) in
-                            info.s_psi_components_local.into_iter().enumerate()
-                        {
-                            s_components.push((
-                                penalty_indices[penalty_idx],
-                                kronecker_product(&local, &i_time),
-                            ));
-                        }
-                        let p_total = p;
-                        CustomFamilyBlockPsiDerivative {
-                            penalty_index: Some(info.penalty_index),
-                            x_psi: stacked,
-                            s_psi: s_components
+                                rows[psi_idx] =
+                                    tensorize_design(&embed_design(&info.x_psi_psi_local));
+                                if let (Some(gid), Some(cross_designs)) =
+                                    (info.aniso_group_id, info.aniso_cross_designs.as_ref())
+                                {
+                                    for (axis_j, local) in cross_designs {
+                                        if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                                            rows[global_j] = tensorize_design(&embed_design(local));
+                                        }
+                                    }
+                                }
+                                Some(rows)
+                            };
+                            let mut s_psi_psi_components =
+                                vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+                            s_psi_psi_components[psi_idx] = penalty_indices
                                 .iter()
-                                .fold(Array2::<f64>::zeros((p_total, p_total)), |acc, (_, m)| {
-                                    acc + m
-                                }),
-                            s_psi_components: Some(s_components),
-                            x_psi_psi: Some(vec![Array2::<f64>::zeros((2 * n, p_total)); psi_dim]),
-                            s_psi_psi: Some(vec![
-                                Array2::<f64>::zeros((p_total, p_total));
-                                psi_dim
-                            ]),
-                            s_psi_psi_components: Some(vec![Vec::new(); psi_dim]),
-                            implicit_operator: None,
-                            implicit_axis: info.implicit_axis,
-                            implicit_group_id: info.aniso_group_id,
+                                .copied()
+                                .zip(
+                                    info.s_psi_psi_components_local
+                                        .iter()
+                                        .map(embed_penalty)
+                                        .map(|full| tensorize_penalty(&full)),
+                                )
+                                .collect();
+                            if let (Some(gid), Some(cross_penalties)) =
+                                (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
+                            {
+                                for (axis_j, local_components) in cross_penalties {
+                                    if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                                        s_psi_psi_components[global_j] = penalty_indices
+                                            .iter()
+                                            .copied()
+                                            .zip(
+                                                local_components
+                                                    .iter()
+                                                    .map(embed_penalty)
+                                                    .map(|full| tensorize_penalty(&full)),
+                                            )
+                                            .collect();
+                                    }
+                                }
+                            }
+                            let s_psi_psi: Vec<Array2<f64>> = s_psi_psi_components
+                                .iter()
+                                .map(|components| {
+                                    components.iter().fold(
+                                        Array2::<f64>::zeros((p_total, p_total)),
+                                        |acc, (_, matrix)| acc + matrix,
+                                    )
+                                })
+                                .collect();
+                            Ok(CustomFamilyBlockPsiDerivative {
+                                penalty_index: Some(info.penalty_index),
+                                x_psi,
+                                s_psi: s_components.iter().fold(
+                                    Array2::<f64>::zeros((p_total, p_total)),
+                                    |acc, (_, m)| acc + m,
+                                ),
+                                s_psi_components: Some(s_components),
+                                x_psi_psi,
+                                s_psi_psi: Some(s_psi_psi),
+                                s_psi_psi_components: Some(s_psi_psi_components),
+                                implicit_operator,
+                                implicit_axis: info.implicit_axis,
+                                implicit_group_id: info.aniso_group_id,
+                            })
                         }
                     }
-                }
-            })
-            .collect(),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?,
     ))
+}
+
+fn survival_psi_derivatives_support_exact_joint_hessian(
+    derivs: &[CustomFamilyBlockPsiDerivative],
+) -> bool {
+    let psi_dim = derivs.len();
+    derivs.iter().all(|deriv| {
+        let design_ok = deriv.implicit_operator.is_some()
+            || deriv
+                .x_psi_psi
+                .as_ref()
+                .is_some_and(|rows| rows.len() == psi_dim);
+        let penalty_ok = deriv
+            .s_psi_psi_components
+            .as_ref()
+            .is_some_and(|rows| rows.len() == psi_dim)
+            || deriv
+                .s_psi_psi
+                .as_ref()
+                .is_some_and(|rows| rows.len() == psi_dim);
+        design_ok && penalty_ok
+    })
 }
 
 fn build_survival_two_block_exact_joint_setup(
@@ -4637,11 +4751,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         } else {
             None
         };
-        let (block_idx, local_idx, z_t_exit_psi, z_t_entry_psi, z_ls_exit_psi, z_ls_entry_psi) =
+        let (z_t_exit_psi, z_t_entry_psi, z_ls_exit_psi, z_ls_entry_psi) =
             if let Some(ref dir) = implicit_dir {
                 (
-                    dir.block_idx,
-                    dir.local_idx,
                     &dir.z_t_exit_psi,
                     &dir.z_t_entry_psi,
                     &dir.z_ls_exit_psi,
@@ -4649,8 +4761,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 )
             } else if let Some(ref dir) = dense_dir {
                 (
-                    dir.block_idx,
-                    dir.local_idx,
                     &dir.z_t_exit_psi,
                     &dir.z_t_entry_psi,
                     &dir.z_ls_exit_psi,
@@ -6030,11 +6140,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         // Perturbed curvature quantities for direction u.
         let d_d1_q_exit_u = &q.d2_q1 * &delta_q_exit_u + &q.h_time_h1 * &delta_h1_u;
-        let d_d2_q_exit_u = &q.d3_q1 * &delta_q_exit_u - &q.d_h_h1 * &delta_h1_u;
-
         // Perturbed curvature quantities for direction v.
         let d_d1_q_exit_v = &q.d2_q1 * &delta_q_exit_v + &q.h_time_h1 * &delta_h1_v;
-        let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v - &q.d_h_h1 * &delta_h1_v;
 
         let x_threshold_exit = self.x_threshold.to_dense();
         let x_threshold_entry = self.x_threshold_entry.as_ref().map(DesignMatrix::to_dense);
@@ -6045,6 +6152,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         // --- Entry-side deltas (analogous to first derivative) ---
         struct EntryDeltas2 {
+            delta_t_u: Array1<f64>,
+            delta_ls_u: Array1<f64>,
             delta_q_u: Array1<f64>,
             delta_q_t_u: Array1<f64>,
             delta_q_ls_u: Array1<f64>,
@@ -6052,6 +6161,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             delta_q_ls_ls_u: Array1<f64>,
             d_d1_q_u: Array1<f64>,
             d_d2_q_u: Array1<f64>,
+            delta_t_v: Array1<f64>,
+            delta_ls_v: Array1<f64>,
             delta_q_v: Array1<f64>,
             delta_q_t_v: Array1<f64>,
             delta_q_ls_v: Array1<f64>,
@@ -6068,6 +6179,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                                  deltaw: &Array1<f64>,
                                  delta_h0: &Array1<f64>|
              -> (
+                Array1<f64>,
+                Array1<f64>,
                 Array1<f64>,
                 Array1<f64>,
                 Array1<f64>,
@@ -6099,13 +6212,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let dq_ls_ls = d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en;
                 let d_d1_q = &q.d2_q0 * &dq_en + &q.h_time_h0 * delta_h0;
                 let d_d2_q = &q.d3_q0 * &dq_en - &q.d_h_h0 * delta_h0;
-                (dq_en, dq_t, dq_ls, dq_tls, dq_ls_ls, d_d1_q, d_d2_q)
+                (
+                    dt_en, dls_en, dq_en, dq_t, dq_ls, dq_tls, dq_ls_ls, d_d1_q, d_d2_q,
+                )
             };
-            let (dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) =
+            let (dt_u, dls_u, dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) =
                 compute_entry(&threshold_dir_u, &log_sigma_dir_u, &deltaw_u, &delta_h0_u);
-            let (dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) =
+            let (dt_v, dls_v, dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) =
                 compute_entry(&threshold_dir_v, &log_sigma_dir_v, &deltaw_v, &delta_h0_v);
             EntryDeltas2 {
+                delta_t_u: dt_u,
+                delta_ls_u: dls_u,
                 delta_q_u: dq_u,
                 delta_q_t_u: dqt_u,
                 delta_q_ls_u: dqls_u,
@@ -6113,6 +6230,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q_ls_ls_u: dqlsls_u,
                 d_d1_q_u: dd1_u,
                 d_d2_q_u: dd2_u,
+                delta_t_v: dt_v,
+                delta_ls_v: dls_v,
                 delta_q_v: dq_v,
                 delta_q_t_v: dqt_v,
                 delta_q_ls_v: dqls_v,
@@ -6124,6 +6243,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         } else {
             // Time-invariant: entry deltas = exit deltas.
             EntryDeltas2 {
+                delta_t_u: delta_t_exit_u.clone(),
+                delta_ls_u: delta_ls_exit_u.clone(),
                 delta_q_u: delta_q_exit_u.clone(),
                 delta_q_t_u: delta_q_t_exit_u.clone(),
                 delta_q_ls_u: delta_q_ls_exit_u.clone(),
@@ -6131,6 +6252,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q_ls_ls_u: delta_q_ls_ls_exit_u.clone(),
                 d_d1_q_u: &q.d2_q0 * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u,
                 d_d2_q_u: &q.d3_q0 * &delta_q_exit_u - &q.d_h_h0 * &delta_h0_u,
+                delta_t_v: delta_t_exit_v.clone(),
+                delta_ls_v: delta_ls_exit_v.clone(),
                 delta_q_v: delta_q_exit_v.clone(),
                 delta_q_t_v: delta_q_t_exit_v.clone(),
                 delta_q_ls_v: delta_q_ls_exit_v.clone(),
@@ -6172,43 +6295,61 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // for the (ϑ,s,s,s) and (s,s,s,s) blocks of the outer Hessian drift
         // Q[v_k, v_l]. See response.md Section 6.
         //
-        // For the exit contribution:
-        //   d²(d2_q1)/dβ² [u,v] uses d³ℓ/dq1³ products and would need d⁴ℓ/dq1⁴.
-        //   We use the available d3_q1 as the coefficient.
-        //
-        // The cross-term structure for the Hessian weight d2_q1 under β-perturbation:
-        //   D_u(d2_q1) = d3_q1 · δq_u + correction_from_h
-        //   D²_{u,v}(d2_q1) = d3_q1 · δq_u · δq_v (leading term, ignoring 4th deriv)
-        //     + d2_q1 contributions from cross-perturbations of δq
-        //
-        // For robustness, we use:
-        //   D²_{u,v}(d2_q) ≈ d3_q · δq_u · δq_v (fourth-deriv terms dropped)
-
         // --- Time block D²H[u,v] ---
-        // The time Hessian weight for h0 is h_time_h0[i].
-        // D_u(h_time_h0) = d_h_h0 · (δh0_u - δq_u)  (from row_derivatives: sign)
-        // D²_{u,v}(h_time_h0) involves the fourth derivative of ℓ w.r.t. q0.
-        // We approximate by products of the directional perturbation weights.
-        //
-        // The key products:
-        //   dh_h0_u = d_h_h0 * (delta_h0_u - delta_q_entry_u)
-        //   dh_h1_u = d_h_h1 * (delta_h1_u - delta_q_exit_u)
-        //   dh_d_u  = d_h_d * delta_d_u
-        //
-        // For the second derivative, the bilinear contribution is:
-        //   d²h/d(h0)² * (δh0_u - δq0_u) * (δh0_v - δq0_v)
-        // where d²h/d(h0)² is the fourth derivative of ℓ w.r.t. h0.
-        //
-        // Since d_h_h0 = d³ℓ/dh0³ and d²h/dh0² = d⁴ℓ/dh0⁴, and we lack
-        // the fourth derivative, we use the third-derivative product structure
-        // which captures the leading contribution.
-
         let xi_h0_u = &delta_h0_u - &entry_deltas.delta_q_u;
         let xi_h1_u = &delta_h1_u - &delta_q_exit_u;
         let xi_h0_v = &delta_h0_v - &entry_deltas.delta_q_v;
         let xi_h1_v = &delta_h1_v - &delta_q_exit_v;
-        let d2_d2_q_entry_exact = &q.d4_q0 * &(&xi_h0_u * &xi_h0_v);
-        let d2_d2_q_exit_exact = &q.d4_q1 * &(&xi_h1_u * &xi_h1_v);
+        let d2q_tls_entry = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
+        let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
+        let d3q_tls_ls_entry = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
+        let d3q_ls_entry = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
+        let d4q_tls_ls_ls_entry = q.d4q_tls_ls_ls_entry.as_ref().unwrap_or(&q.d4q_tls_ls_ls);
+        let d4q_ls_entry = q.d4q_ls_entry.as_ref().unwrap_or(&q.d4q_ls);
+
+        let delta_q_uv_exit = &(&q.d2q_tls
+            * &(&delta_t_exit_u * &delta_ls_exit_v + &delta_t_exit_v * &delta_ls_exit_u))
+            + &(&q.d2q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
+        let delta_q_t_uv_exit = &q.d3q_tls_ls * &(&delta_ls_exit_u * &delta_ls_exit_v);
+        let delta_q_ls_uv_exit = &(&q.d3q_tls_ls
+            * &(&delta_ls_exit_u * &delta_t_exit_v + &delta_ls_exit_v * &delta_t_exit_u))
+            + &(&q.d3q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
+        let delta_q_tls_uv_exit = &q.d4q_tls_ls_ls * &(&delta_ls_exit_u * &delta_ls_exit_v);
+        let delta_q_ls_ls_uv_exit = &(&q.d4q_tls_ls_ls
+            * &(&delta_ls_exit_u * &delta_t_exit_v + &delta_ls_exit_v * &delta_t_exit_u))
+            + &(&q.d4q_ls * &(&delta_ls_exit_u * &delta_ls_exit_v));
+
+        let delta_q_uv_entry = &(d2q_tls_entry
+            * &(&entry_deltas.delta_t_u * &entry_deltas.delta_ls_v
+                + &entry_deltas.delta_t_v * &entry_deltas.delta_ls_u))
+            + &(d2q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
+        let delta_q_t_uv_entry =
+            d3q_tls_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v);
+        let delta_q_ls_uv_entry = &(d3q_tls_ls_entry
+            * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_t_v
+                + &entry_deltas.delta_ls_v * &entry_deltas.delta_t_u))
+            + &(d3q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
+        let delta_q_tls_uv_entry =
+            d4q_tls_ls_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v);
+        let delta_q_ls_ls_uv_entry = &(d4q_tls_ls_ls_entry
+            * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_t_v
+                + &entry_deltas.delta_ls_v * &entry_deltas.delta_t_u))
+            + &(d4q_ls_entry * &(&entry_deltas.delta_ls_u * &entry_deltas.delta_ls_v));
+
+        let d_d1_q_combined_u =
+            &q.d2_q * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u + &q.h_time_h1 * &delta_h1_u;
+        let d_d1_q_combined_v =
+            &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
+        let d_d2_q_combined_u =
+            &q.d3_q * &delta_q_exit_u - &q.d_h_h0 * &delta_h0_u - &q.d_h_h1 * &delta_h1_u;
+        let d_d2_q_combined_v =
+            &q.d3_q * &delta_q_exit_v - &q.d_h_h0 * &delta_h0_v - &q.d_h_h1 * &delta_h1_v;
+
+        let d2_d1_q_entry_exact = &q.d3_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d2_q0 * &delta_q_uv_entry;
+        let d2_d1_q_exit_exact = &q.d3_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d2_q1 * &delta_q_uv_exit;
+        let d2_d1_q_combined_exact = &d2_d1_q_entry_exact + &d2_d1_q_exit_exact;
+        let d2_d2_q_entry_exact = &q.d4_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d3_q0 * &delta_q_uv_entry;
+        let d2_d2_q_exit_exact = &q.d4_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d3_q1 * &delta_q_uv_exit;
         let d2_d2_q_combined_exact = &d2_d2_q_entry_exact + &d2_d2_q_exit_exact;
 
         // Second-order time-time weight: bilinear in perturbation directions.
@@ -6230,16 +6371,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if let Some(x_t_en) = x_threshold_entry.as_ref() {
             let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
             let d2_w_exit = &d2_d2_q_exit_exact * &q.dq_t.mapv(|v| v * v)
-                + &q.d2_q1 * &(2.0 * &delta_q_t_exit_u * &delta_q_t_exit_v);
+                + &(2.0 * &d_d2_q_exit_u * &q.dq_t * &delta_q_t_exit_v)
+                + &(2.0 * &d_d2_q_exit_v * &q.dq_t * &delta_q_t_exit_u)
+                + &(2.0 * &q.d2_q1 * &delta_q_t_exit_u * &delta_q_t_exit_v)
+                + &(2.0 * &q.d2_q1 * &q.dq_t * &delta_q_t_uv_exit);
             let d2_w_entry = &d2_d2_q_entry_exact * &dq_t_en.mapv(|v| v * v)
-                + &q.d2_q0 * &(2.0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v);
+                + &(2.0 * &entry_deltas.d_d2_q_u * dq_t_en * &entry_deltas.delta_q_t_v)
+                + &(2.0 * &entry_deltas.d_d2_q_v * dq_t_en * &entry_deltas.delta_q_t_u)
+                + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v)
+                + &(2.0 * &q.d2_q0 * dq_t_en * &delta_q_t_uv_entry);
             let d2_h_tt =
                 weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_threshold_exit)?
                     + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_t_en)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
         } else {
             let d2_w = &d2_d2_q_combined_exact * &q.dq_t.mapv(|v| v * v)
-                + &q.d2_q * &(2.0 * &delta_q_t_exit_u * &delta_q_t_exit_v);
+                + &(2.0 * &d_d2_q_combined_u * &q.dq_t * &delta_q_t_exit_v)
+                + &(2.0 * &d_d2_q_combined_v * &q.dq_t * &delta_q_t_exit_u)
+                + &(2.0 * &q.d2_q * &delta_q_t_exit_u * &delta_q_t_exit_v)
+                + &(2.0 * &q.d2_q * &q.dq_t * &delta_q_t_uv_exit);
             let d2_h_tt =
                 weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w), &x_threshold_exit)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
@@ -6249,26 +6399,37 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if let Some(x_ls_en) = x_log_sigma_entry.as_ref() {
             let dq_ls_en = q.dq_ls_entry.as_ref().unwrap();
             let d2_w_exit = &d2_d2_q_exit_exact * &q.dq_ls.mapv(|v| v * v)
-                + &q.d2_q1 * &(2.0 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
+                + &(2.0 * &d_d2_q_exit_u * &q.dq_ls * &delta_q_ls_exit_v)
+                + &(2.0 * &d_d2_q_exit_v * &q.dq_ls * &delta_q_ls_exit_u)
+                + &(2.0 * &q.d2_q1 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
+                + &(2.0 * &q.d2_q1 * &q.dq_ls * &delta_q_ls_uv_exit)
+                + &d2_d1_q_exit_exact * &q.d2q_ls
                 + &d_d1_q_exit_u * &delta_q_ls_ls_exit_v
-                + &d_d1_q_exit_v * &delta_q_ls_ls_exit_u;
+                + &d_d1_q_exit_v * &delta_q_ls_ls_exit_u
+                + &(&q.d1_q1 * &delta_q_ls_ls_uv_exit);
             let d2_w_entry = &d2_d2_q_entry_exact * &dq_ls_en.mapv(|v| v * v)
-                + &q.d2_q0 * &(2.0 * &entry_deltas.delta_q_ls_u * &entry_deltas.delta_q_ls_v)
+                + &(2.0 * &entry_deltas.d_d2_q_u * dq_ls_en * &entry_deltas.delta_q_ls_v)
+                + &(2.0 * &entry_deltas.d_d2_q_v * dq_ls_en * &entry_deltas.delta_q_ls_u)
+                + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_ls_u * &entry_deltas.delta_q_ls_v)
+                + &(2.0 * &q.d2_q0 * dq_ls_en * &delta_q_ls_uv_entry)
+                + &d2_d1_q_entry_exact * d2q_ls_entry
                 + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
-                + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u;
+                + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u
+                + &(&q.d1_q0 * &delta_q_ls_ls_uv_entry);
             let d2_h_ll =
                 weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
                     + weighted_crossprod_dense(x_ls_en, &(-&d2_w_entry), x_ls_en)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
         } else {
-            let d_d1_q_u =
-                &q.d2_q * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u + &q.h_time_h1 * &delta_h1_u;
-            let d_d1_q_v =
-                &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
             let d2_w = &d2_d2_q_combined_exact * &q.dq_ls.mapv(|v| v * v)
-                + &q.d2_q * &(2.0 * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
-                + &d_d1_q_u * &delta_q_ls_ls_exit_v
-                + &d_d1_q_v * &delta_q_ls_ls_exit_u;
+                + &(2.0 * &d_d2_q_combined_u * &q.dq_ls * &delta_q_ls_exit_v)
+                + &(2.0 * &d_d2_q_combined_v * &q.dq_ls * &delta_q_ls_exit_u)
+                + &(2.0 * &q.d2_q * &delta_q_ls_exit_u * &delta_q_ls_exit_v)
+                + &(2.0 * &q.d2_q * &q.dq_ls * &delta_q_ls_uv_exit)
+                + &d2_d1_q_combined_exact * &q.d2q_ls
+                + &d_d1_q_combined_u * &delta_q_ls_ls_exit_v
+                + &d_d1_q_combined_v * &delta_q_ls_ls_exit_u
+                + &(&q.d1_q * &delta_q_ls_ls_uv_exit);
             let d2_h_ll =
                 weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
@@ -6284,34 +6445,54 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
                 let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
                 let d2_w_exit = &d2_d2_q_exit_exact * &(&q.dq_t * &q.dq_ls)
+                    + &d_d2_q_exit_u
+                        * &(&delta_q_t_exit_v * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_v)
+                    + &d_d2_q_exit_v
+                        * &(&delta_q_t_exit_u * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_u)
                     + &q.d2_q1
-                        * &(&delta_q_t_exit_u * &delta_q_ls_exit_v
-                            + &delta_q_t_exit_v * &delta_q_ls_exit_u)
+                        * &(&delta_q_t_uv_exit * &q.dq_ls
+                            + &delta_q_t_exit_u * &delta_q_ls_exit_v
+                            + &delta_q_t_exit_v * &delta_q_ls_exit_u
+                            + &q.dq_t * &delta_q_ls_uv_exit)
+                    + &d2_d1_q_exit_exact * &q.d2q_tls
                     + &d_d1_q_exit_u * &delta_q_tls_exit_v
-                    + &d_d1_q_exit_v * &delta_q_tls_exit_u;
+                    + &d_d1_q_exit_v * &delta_q_tls_exit_u
+                    + &(&q.d1_q1 * &delta_q_tls_uv_exit);
                 let d2_w_entry = &d2_d2_q_entry_exact * &(dq_t_en * dq_ls_en)
+                    + &entry_deltas.d_d2_q_u
+                        * &(&entry_deltas.delta_q_t_v * dq_ls_en
+                            + dq_t_en * &entry_deltas.delta_q_ls_v)
+                    + &entry_deltas.d_d2_q_v
+                        * &(&entry_deltas.delta_q_t_u * dq_ls_en
+                            + dq_t_en * &entry_deltas.delta_q_ls_u)
                     + &q.d2_q0
-                        * &(&entry_deltas.delta_q_t_u * &entry_deltas.delta_q_ls_v
-                            + &entry_deltas.delta_q_t_v * &entry_deltas.delta_q_ls_u)
+                        * &(&delta_q_t_uv_entry * dq_ls_en
+                            + &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_ls_v
+                            + &entry_deltas.delta_q_t_v * &entry_deltas.delta_q_ls_u
+                            + dq_t_en * &delta_q_ls_uv_entry)
+                    + &d2_d1_q_entry_exact * d2q_tls_entry
                     + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_tls_v
-                    + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_tls_u;
+                    + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_tls_u
+                    + &(&q.d1_q0 * &delta_q_tls_uv_entry);
                 let d2_h_tl =
                     weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w_exit), &x_log_sigma_exit)?
                         + weighted_crossprod_dense(x_t_en, &(-&d2_w_entry), x_ls_en)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
             } else {
-                let d_d1_q_u = &q.d2_q * &delta_q_exit_u
-                    + &q.h_time_h0 * &delta_h0_u
-                    + &q.h_time_h1 * &delta_h1_u;
-                let d_d1_q_v = &q.d2_q * &delta_q_exit_v
-                    + &q.h_time_h0 * &delta_h0_v
-                    + &q.h_time_h1 * &delta_h1_v;
                 let d2_w = &d2_d2_q_combined_exact * &(&q.dq_t * &q.dq_ls)
+                    + &d_d2_q_combined_u
+                        * &(&delta_q_t_exit_v * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_v)
+                    + &d_d2_q_combined_v
+                        * &(&delta_q_t_exit_u * &q.dq_ls + &q.dq_t * &delta_q_ls_exit_u)
                     + &q.d2_q
-                        * &(&delta_q_t_exit_u * &delta_q_ls_exit_v
-                            + &delta_q_t_exit_v * &delta_q_ls_exit_u)
-                    + &d_d1_q_u * &delta_q_tls_exit_v
-                    + &d_d1_q_v * &delta_q_tls_exit_u;
+                        * &(&delta_q_t_uv_exit * &q.dq_ls
+                            + &delta_q_t_exit_u * &delta_q_ls_exit_v
+                            + &delta_q_t_exit_v * &delta_q_ls_exit_u
+                            + &q.dq_t * &delta_q_ls_uv_exit)
+                    + &d2_d1_q_combined_exact * &q.d2q_tls
+                    + &d_d1_q_combined_u * &delta_q_tls_exit_v
+                    + &d_d1_q_combined_v * &delta_q_tls_exit_u
+                    + &(&q.d1_q * &delta_q_tls_uv_exit);
                 let d2_h_tl =
                     weighted_crossprod_dense(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
@@ -6617,7 +6798,12 @@ pub(crate) fn fit_survival_location_scale_terms(
     )?;
     let analytic_joint_gradient_available =
         threshold_boot_derivs.is_some() && log_sigma_boot_derivs.is_some();
-    let analytic_joint_hessian_available = analytic_joint_gradient_available;
+    let analytic_joint_hessian_available = threshold_boot_derivs
+        .as_ref()
+        .is_some_and(|derivs| survival_psi_derivatives_support_exact_joint_hessian(derivs))
+        && log_sigma_boot_derivs
+            .as_ref()
+            .is_some_and(|derivs| survival_psi_derivatives_support_exact_joint_hessian(derivs));
 
     let wiggle_rho0 = spec
         .linkwiggle_block

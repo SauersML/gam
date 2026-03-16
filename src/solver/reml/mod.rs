@@ -970,6 +970,89 @@ impl HyperDesignDerivative {
         }
     }
 
+    pub(crate) fn forward_mul_original(
+        &self,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => {
+                if dense.ncols() != u.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense hyper design derivative forward_mul_original width mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        u.len()
+                    )));
+                }
+                Ok(dense.dot(u))
+            }
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if embedded.total_dim != u.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded hyper design derivative forward_mul_original width mismatch: total_dim={}, vector={}",
+                        embedded.total_dim,
+                        u.len()
+                    )));
+                }
+                let u_local = u.slice(s![embedded.global_range.clone()]).to_owned();
+                Ok(embedded.local.dot(&u_local))
+            }
+            DerivativeMatrixStorage::Implicit(op) => {
+                if op.ncols() != u.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "implicit hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
+                        op.ncols(),
+                        u.len()
+                    )));
+                }
+                Ok(op.forward_mul(u))
+            }
+        }
+    }
+
+    pub(crate) fn transpose_mul_original(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => {
+                if dense.nrows() != v.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense hyper design derivative transpose_mul_original height mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        v.len()
+                    )));
+                }
+                Ok(dense.t().dot(v))
+            }
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if embedded.local.nrows() != v.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded hyper design derivative transpose_mul_original height mismatch: local_rows={}, vector={}",
+                        embedded.local.nrows(),
+                        v.len()
+                    )));
+                }
+                let mut out = Array1::<f64>::zeros(embedded.total_dim);
+                let pulled = embedded.local.t().dot(v);
+                out.slice_mut(s![embedded.global_range.clone()])
+                    .assign(&pulled);
+                Ok(out)
+            }
+            DerivativeMatrixStorage::Implicit(op) => {
+                if op.nrows() != v.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "implicit hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
+                        op.nrows(),
+                        v.len()
+                    )));
+                }
+                Ok(op.transpose_mul(v))
+            }
+        }
+    }
+
     pub(crate) fn transformed(
         &self,
         qs: &Array2<f64>,
@@ -1390,6 +1473,37 @@ impl DirectionalHyperParam {
 
     pub(crate) fn penalty_first_components(&self) -> &[PenaltyDerivativeComponent] {
         &self.penalty_first_components
+    }
+
+    pub(crate) fn penalty_total_at(
+        &self,
+        rho: &Array1<f64>,
+        p: usize,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let mut out = Array2::<f64>::zeros((p, p));
+        for component in &self.penalty_first_components {
+            if component.matrix.nrows() != p || component.matrix.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "S_tau shape mismatch for penalty {}: expected {}x{}, got {}x{}",
+                    component.penalty_index,
+                    p,
+                    p,
+                    component.matrix.nrows(),
+                    component.matrix.ncols()
+                )));
+            }
+            if component.penalty_index >= rho.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "penalty_index {} out of bounds for rho dimension {}",
+                    component.penalty_index,
+                    rho.len()
+                )));
+            }
+            component
+                .matrix
+                .scaled_add_to(&mut out, rho[component.penalty_index].exp())?;
+        }
+        Ok(out)
     }
 
     pub(crate) fn penaltysecond_components_for(

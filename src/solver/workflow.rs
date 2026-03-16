@@ -1,5 +1,9 @@
 use crate::custom_family::BlockwiseFitOptions;
 use crate::estimate::{EstimationError, FitOptions, FittedLinkState, UnifiedFitResult};
+use crate::families::bernoulli_marginal_slope::{
+    BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec,
+    fit_bernoulli_marginal_slope_terms,
+};
 use crate::families::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
     BlockwiseTermFitResultParts, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
@@ -78,11 +82,19 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub optimize_inverse_link: bool,
 }
 
+pub struct BernoulliMarginalSlopeFitRequest<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub spec: BernoulliMarginalSlopeTermSpec,
+    pub options: BlockwiseFitOptions,
+    pub kappa_options: SpatialLengthScaleOptimizationOptions,
+}
+
 pub enum FitRequest<'a> {
     Standard(StandardFitRequest<'a>),
     GaussianLocationScale(GaussianLocationScaleFitRequest<'a>),
     BinomialLocationScale(BinomialLocationScaleFitRequest<'a>),
     SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
+    BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest<'a>),
 }
 
 pub struct StandardFitResult {
@@ -107,6 +119,7 @@ pub enum FitResult {
     GaussianLocationScale(GaussianLocationScaleFitResult),
     BinomialLocationScale(BinomialLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
+    BernoulliMarginalSlope(BernoulliMarginalSlopeFitResult),
 }
 
 fn resolved_wiggle_inverse_link(
@@ -590,6 +603,17 @@ fn fit_survival_location_scale_model(
     })
 }
 
+fn fit_bernoulli_marginal_slope_model(
+    request: BernoulliMarginalSlopeFitRequest<'_>,
+) -> Result<BernoulliMarginalSlopeFitResult, String> {
+    fit_bernoulli_marginal_slope_terms(
+        request.data,
+        request.spec,
+        &request.options,
+        &request.kappa_options,
+    )
+}
+
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     match request {
         FitRequest::Standard(request) => fit_standard_model(request).map(FitResult::Standard),
@@ -601,6 +625,9 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
         }
         FitRequest::SurvivalLocationScale(request) => {
             fit_survival_location_scale_model(request).map(FitResult::SurvivalLocationScale)
+        }
+        FitRequest::BernoulliMarginalSlope(request) => {
+            fit_bernoulli_marginal_slope_model(request).map(FitResult::BernoulliMarginalSlope)
         }
     }
 }

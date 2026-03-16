@@ -179,10 +179,15 @@ impl<'a> RemlState<'a> {
     }
 
     /// Build the extended-coordinate objects for τ (directional) hyperparameters
-    /// using the unified evaluator representation. This assembles both the
-    /// first-order `HyperCoord` objects and the second-order pair callbacks,
-    /// suitable for passing to `InnerSolutionBuilder::ext_coords()` and
-    /// related pair-callback setters.
+    /// using the unified evaluator representation.
+    ///
+    /// This is the single dispatch point for directional hyperparameter objects:
+    /// - dense / transformed backends use the transformed-coordinate builders
+    /// - sparse exact backends use the original-basis sparse builders
+    ///
+    /// In both cases it assembles the first-order `HyperCoord` objects and the
+    /// second-order pair callbacks suitable for
+    /// `InnerSolutionBuilder::ext_coords()` and related pair-callback setters.
     ///
     /// Returns `(coords, ext_pair_fn, rho_ext_pair_fn)`.
     pub(crate) fn build_tau_unified_objects(
@@ -198,10 +203,33 @@ impl<'a> RemlState<'a> {
         EstimationError,
     > {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let ext_coords = self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?;
-        let (ext_pair_fn, rho_ext_pair_fn) =
-            self.build_tau_pair_callbacks(rho, &bundle, hyper_dirs)?;
-        Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+        self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)
+    }
+
+    pub(crate) fn build_tau_unified_objects_from_bundle(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<
+        (
+            Vec<super::unified::HyperCoord>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        ),
+        EstimationError,
+    > {
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            let ext_coords = self.build_tau_hyper_coords_sparse_exact(rho, bundle, hyper_dirs)?;
+            let (ext_pair_fn, rho_ext_pair_fn) =
+                self.build_tau_pair_callbacks_sparse_exact(rho, bundle, hyper_dirs)?;
+            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+        } else {
+            let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs)?;
+            let (ext_pair_fn, rho_ext_pair_fn) =
+                self.build_tau_pair_callbacks(rho, bundle, hyper_dirs)?;
+            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -480,6 +508,490 @@ impl<'a> RemlState<'a> {
         }
 
         Ok(coords)
+    }
+
+    /// Sparse-exact τ builder in the original sparse/native coefficient basis.
+    ///
+    /// Unlike the dense/transformed path, this builder keeps `β`, `X`, `X_τ`,
+    /// and `S_τ` in the original sparse-native coordinates used by the sparse
+    /// Cholesky factor. The fixed-β Hessian drift is attached as an operator,
+    /// not a dense matrix, so the unified evaluator can compute
+    /// `tr(H^{-1} B_τ)` exactly without falling back to dense spectral
+    /// materialization.
+    pub(crate) fn build_tau_hyper_coords_sparse_exact(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+        if bundle.sparse_exact.is_none() {
+            return Err(EstimationError::InvalidInput(
+                "missing sparse exact evaluation payload".to_string(),
+            ));
+        }
+
+        let psi_dim = hyper_dirs.len();
+        if psi_dim == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let beta_eval = self.sparse_exact_beta_original(pirls_result);
+        let p_dim = beta_eval.len();
+        let n_obs = self.y.len();
+        if p_dim == 0 {
+            return Ok((0..psi_dim)
+                .map(|j| super::unified::HyperCoord {
+                    a: 0.0,
+                    g: Array1::zeros(0),
+                    b_mat: Array2::zeros((0, 0)),
+                    b_operator: None,
+                    ld_s: 0.0,
+                    b_depends_on_beta: false,
+                    is_penalty_like: hyper_dirs[j].is_penalty_like,
+                })
+                .collect());
+        }
+
+        for (j, dir) in hyper_dirs.iter().enumerate() {
+            if dir.x_tau_original.nrows() != n_obs || dir.x_tau_original.ncols() != p_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "X_tau shape mismatch for sparse exact tau coord {}: expected {}x{}, got {}x{}",
+                    j,
+                    n_obs,
+                    p_dim,
+                    dir.x_tau_original.nrows(),
+                    dir.x_tau_original.ncols()
+                )));
+            }
+            Self::validate_penalty_component_shapes(
+                dir.penalty_first_components(),
+                p_dim,
+                "S_tau",
+            )?;
+        }
+
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
+        let w_diag = std::sync::Arc::new(pirls_result.finalweights.clone());
+        let x_design = self.x().clone();
+
+        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
+        let firth_logit_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let firth_op = if firth_logit_active {
+            if let Some(cached) = bundle
+                .firth_dense_operator_original
+                .as_ref()
+                .or(bundle.firth_dense_operator.as_ref())
+            {
+                Some(cached.as_ref().clone())
+            } else {
+                let x_dense_arc = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact tau coords require dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Some(Self::build_firth_dense_operator(
+                    x_dense_arc.as_ref(),
+                    &pirls_result.final_eta,
+                )?)
+            }
+        } else {
+            None
+        };
+
+        let mut coords = Vec::with_capacity(psi_dim);
+        for dir in hyper_dirs {
+            let s_tau_j = dir.penalty_total_at(rho, p_dim)?;
+            let x_tau_beta_j = dir.x_tau_original.forward_mul_original(&beta_eval)?;
+            let weighted_x_tau_beta_j = &*w_diag * &x_tau_beta_j;
+
+            let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
+            let mut g_j = dir.x_tau_original.transpose_mul_original(&u)?
+                - self.x().transpose_vector_multiply(&weighted_x_tau_beta_j)
+                - s_tau_j.dot(&beta_eval);
+
+            let mut firth_hphi_tau_partial = None;
+            if let Some(op) = firth_op.as_ref() {
+                let x_tau_dense = dir.x_tau_dense();
+                let need_kernel = dir.x_tau_original.any_nonzero();
+                let tau_bundle =
+                    Self::firth_exact_tau_kernel(op, &x_tau_dense, &beta_eval, need_kernel);
+                g_j -= &tau_bundle.gphi_tau;
+                a_j += tau_bundle.phi_tau_partial;
+                if let Some(kernel) = tau_bundle.tau_kernel.as_ref() {
+                    let eye = Array2::<f64>::eye(p_dim);
+                    firth_hphi_tau_partial = Some(Self::firth_hphi_tau_partial_apply(
+                        op,
+                        &x_tau_dense,
+                        kernel,
+                        &eye,
+                    ));
+                }
+            }
+
+            let c_x_tau_beta = if is_gaussian_identity {
+                None
+            } else {
+                Some(&pirls_result.solve_c_array * &x_tau_beta_j)
+            };
+
+            let ld_s_j = self.fixed_subspace_penalty_trace(
+                &pirls_result.reparam_result.e_transformed,
+                &s_tau_j,
+                pirls_result.ridge_passport,
+            )?;
+
+            coords.push(super::unified::HyperCoord {
+                a: a_j,
+                g: g_j,
+                b_mat: Array2::<f64>::zeros((0, 0)),
+                b_operator: Some(Box::new(super::unified::SparseDirectionalHyperOperator {
+                    x_tau: dir.x_tau_original.clone(),
+                    x_design: x_design.clone(),
+                    w_diag: w_diag.clone(),
+                    s_tau: s_tau_j,
+                    c_x_tau_beta,
+                    firth_hphi_tau_partial,
+                    p: p_dim,
+                })),
+                ld_s: ld_s_j,
+                b_depends_on_beta: !is_gaussian_identity,
+                is_penalty_like: dir.is_penalty_like,
+            });
+        }
+
+        Ok(coords)
+    }
+
+    /// Sparse-exact τ×τ and ρ×τ pair callbacks in original coordinates.
+    ///
+    /// This path prioritizes correctness and consistent basis alignment with the
+    /// sparse Cholesky operator. It densifies the design only for second-order
+    /// pair assembly, which is acceptable because pair callbacks are used only
+    /// when the caller requests the full outer Hessian.
+    pub(crate) fn build_tau_pair_callbacks_sparse_exact(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<
+        (
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        ),
+        EstimationError,
+    > {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let beta_eval = self.sparse_exact_beta_original(pirls_result);
+        let p_dim = beta_eval.len();
+        let psi_dim = hyper_dirs.len();
+        let k_count = rho.len();
+        let lambdas = rho.mapv(f64::exp);
+
+        if psi_dim == 0 || p_dim == 0 {
+            let tau_tau_pair_fn = move |i: usize, j: usize| {
+                std::hint::black_box(i);
+                std::hint::black_box(j);
+                super::unified::HyperCoordPair {
+                    a: 0.0,
+                    g: Array1::zeros(p_dim),
+                    b_mat: Array2::zeros((p_dim, p_dim)),
+                    ld_s: 0.0,
+                }
+            };
+            let rho_tau_pair_fn = move |k: usize, j: usize| {
+                std::hint::black_box(k);
+                std::hint::black_box(j);
+                super::unified::HyperCoordPair {
+                    a: 0.0,
+                    g: Array1::zeros(p_dim),
+                    b_mat: Array2::zeros((p_dim, p_dim)),
+                    ld_s: 0.0,
+                }
+            };
+            return Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)));
+        }
+
+        let s_tau_list: Vec<Array2<f64>> = hyper_dirs
+            .iter()
+            .map(|dir| dir.penalty_total_at(rho, p_dim))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
+        for i in 0..psi_dim {
+            for j in 0..psi_dim {
+                let second_components =
+                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
+                if second_components.is_empty() {
+                    continue;
+                }
+                Self::validate_penalty_component_shapes(&second_components, p_dim, "S_tau_tau")?;
+                let total = second_components.iter().try_fold(
+                    Array2::<f64>::zeros((p_dim, p_dim)),
+                    |mut acc, component| {
+                        if component.penalty_index >= rho.len() {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "penalty_index {} out of bounds for rho dimension {}",
+                                component.penalty_index,
+                                rho.len()
+                            )));
+                        }
+                        component
+                            .matrix
+                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                        Ok(acc)
+                    },
+                )?;
+                s_tau_tau[i][j] = Some(total);
+            }
+        }
+
+        let s_eval = self.s_full_list.iter().enumerate().fold(
+            Array2::<f64>::zeros((p_dim, p_dim)),
+            |acc, (idx, s_k)| {
+                if idx < lambdas.len() {
+                    acc + &s_k.mapv(|v| lambdas[idx] * v)
+                } else {
+                    acc
+                }
+            },
+        );
+        let (s_eigs, svecs) = s_eval
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let delta = super::unified::smooth_logdet_delta(s_eigs.as_slice().unwrap());
+        let mut s_reg_inv = Array2::<f64>::zeros((p_dim, p_dim));
+        for idx in 0..p_dim {
+            let inv_ev = 1.0 / (s_eigs[idx] + delta);
+            let ucol = svecs.column(idx).to_owned();
+            let outer = ucol
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&ucol.view().insert_axis(Axis(0)));
+            s_reg_inv += &outer.mapv(|v| v * inv_ev);
+        }
+        let sdag_s_tau: Vec<Array2<f64>> = s_tau_list.iter().map(|s| s_reg_inv.dot(s)).collect();
+        let a_k_mats: Vec<Array2<f64>> = self
+            .s_full_list
+            .iter()
+            .enumerate()
+            .map(|(k, s_k)| s_k.mapv(|v| lambdas[k] * v))
+            .collect();
+        let sdag_a_k: Vec<Array2<f64>> = a_k_mats.iter().map(|a| s_reg_inv.dot(a)).collect();
+
+        let x_dense = self
+            .x()
+            .try_to_dense_arc("sparse exact tau pair callbacks require dense design")
+            .map_err(EstimationError::InvalidInput)?;
+        let x_dense: Array2<f64> = x_dense.as_ref().clone();
+        let x_tau_list: Vec<Array2<f64>> = hyper_dirs.iter().map(|dir| dir.x_tau_dense()).collect();
+        let x_tau_beta_list: Vec<Array1<f64>> = x_tau_list
+            .iter()
+            .map(|x_tau| x_tau.dot(&beta_eval))
+            .collect();
+
+        let mut x_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
+        for i in 0..psi_dim {
+            for j in i..psi_dim {
+                let xij = hyper_dirs[i]
+                    .x_tau_tau_entry_at(j)
+                    .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
+                    .map(|entry| entry.materialize());
+                if xij.is_some() {
+                    x_tau_tau[j][i] = xij.clone();
+                }
+                x_tau_tau[i][j] = xij;
+            }
+        }
+
+        let u = &pirls_result.solveweights
+            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
+        let w_diag = pirls_result.finalweights.clone();
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
+        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
+
+        let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
+            .iter()
+            .map(|dir| dir.penalty_first_components().to_vec())
+            .collect();
+        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
+        for j in 0..psi_dim {
+            for component in &penalty_components_per_dir[j] {
+                let k = component.penalty_index;
+                if k < k_count {
+                    a_k_tau_j_mats[j][k] = Some(component.matrix.scaled_materialize(lambdas[k]));
+                }
+            }
+        }
+
+        let s_tau_tau = std::sync::Arc::new(s_tau_tau);
+        let s_reg_inv = std::sync::Arc::new(s_reg_inv);
+        let sdag_s_tau = std::sync::Arc::new(sdag_s_tau);
+        let sdag_a_k = std::sync::Arc::new(sdag_a_k);
+        let beta_eval = std::sync::Arc::new(beta_eval);
+        let x_dense = std::sync::Arc::new(x_dense);
+        let x_tau_list = std::sync::Arc::new(x_tau_list);
+        let x_tau_beta_list = std::sync::Arc::new(x_tau_beta_list);
+        let x_tau_tau = std::sync::Arc::new(x_tau_tau);
+        let u = std::sync::Arc::new(u);
+        let w_diag = std::sync::Arc::new(w_diag);
+        let c_array = std::sync::Arc::new(c_array);
+        let d_array = std::sync::Arc::new(d_array);
+        let a_k_tau_j_mats = std::sync::Arc::new(a_k_tau_j_mats);
+
+        let s_tau_tau_tt = std::sync::Arc::clone(&s_tau_tau);
+        let s_reg_inv_tt = std::sync::Arc::clone(&s_reg_inv);
+        let sdag_s_tau_tt = std::sync::Arc::clone(&sdag_s_tau);
+        let beta_tt = std::sync::Arc::clone(&beta_eval);
+        let x_dense_tt = std::sync::Arc::clone(&x_dense);
+        let x_tau_list_tt = std::sync::Arc::clone(&x_tau_list);
+        let x_tau_beta_tt = std::sync::Arc::clone(&x_tau_beta_list);
+        let x_tau_tau_tt = std::sync::Arc::clone(&x_tau_tau);
+        let u_tt = std::sync::Arc::clone(&u);
+        let w_tt = std::sync::Arc::clone(&w_diag);
+        let c_tt = std::sync::Arc::clone(&c_array);
+        let d_tt = std::sync::Arc::clone(&d_array);
+        let p_dim_tt = p_dim;
+        let is_gaussian_tt = is_gaussian_identity;
+
+        let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
+            let ld_s_quad = Self::trace_product(&sdag_s_tau_tt[j], &sdag_s_tau_tt[i]);
+            let ld_s_linear = s_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|s_ij| Self::trace_product(&s_reg_inv_tt, s_ij))
+                .unwrap_or(0.0);
+            let ld_s_ij = ld_s_quad - ld_s_linear;
+
+            let x_tau_i_beta = &x_tau_beta_tt[i];
+            let x_tau_j_beta = &x_tau_beta_tt[j];
+            let w_x_tau_j_beta = w_tt.as_ref() * x_tau_j_beta;
+            let a_ij_likelihood = x_tau_i_beta.dot(&w_x_tau_j_beta);
+            let x_tau_tau_beta = x_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|xij| xij.dot(beta_tt.as_ref()))
+                .unwrap_or_else(|| Array1::<f64>::zeros(u_tt.len()));
+            let a_ij_design2 = if x_tau_tau_tt[i][j].is_some() {
+                -u_tt.dot(&x_tau_tau_beta)
+            } else {
+                0.0
+            };
+            let a_ij_penalty = 0.5
+                * s_tau_tau_tt[i][j]
+                    .as_ref()
+                    .map(|s_ij| beta_tt.dot(&s_ij.dot(beta_tt.as_ref())))
+                    .unwrap_or(0.0);
+            let a_ij = a_ij_likelihood + a_ij_design2 + a_ij_penalty;
+
+            let x_tau_i = &x_tau_list_tt[i];
+            let x_tau_j = &x_tau_list_tt[j];
+            let term1 = x_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|xij| xij.t().dot(u_tt.as_ref()))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+            let term2 = x_tau_j.t().dot(&(w_tt.as_ref() * x_tau_i_beta));
+            let term3 = x_tau_i.t().dot(&w_x_tau_j_beta);
+            let c_x_tau_i_beta = c_tt.as_ref() * x_tau_i_beta;
+            let term4 = x_dense_tt.t().dot(&(&c_x_tau_i_beta * x_tau_j_beta));
+            let term5 = if x_tau_tau_tt[i][j].is_some() {
+                x_dense_tt.t().dot(&(w_tt.as_ref() * &x_tau_tau_beta))
+            } else {
+                Array1::<f64>::zeros(p_dim_tt)
+            };
+            let term6 = s_tau_tau_tt[i][j]
+                .as_ref()
+                .map(|s_ij| s_ij.dot(beta_tt.as_ref()))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+            let g_ij = term1 - &term2 - &term3 - &term4 - &term5 - &term6;
+
+            let mut b_ij = Array2::<f64>::zeros((p_dim_tt, p_dim_tt));
+            if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
+                let cross = Self::weighted_cross(xij, x_dense_tt.as_ref(), w_tt.as_ref());
+                b_ij += &cross;
+                b_ij += &cross.t().to_owned();
+            }
+            b_ij += &Self::weighted_cross(x_tau_i, x_tau_j, w_tt.as_ref());
+            b_ij += &Self::weighted_cross(x_tau_j, x_tau_i, w_tt.as_ref());
+
+            if !is_gaussian_tt {
+                b_ij += &Self::weighted_cross(x_tau_j, x_dense_tt.as_ref(), &c_x_tau_i_beta);
+                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_j, &c_x_tau_i_beta);
+
+                let c_x_tau_j_beta = c_tt.as_ref() * x_tau_j_beta;
+                b_ij += &Self::weighted_cross(x_tau_i, x_dense_tt.as_ref(), &c_x_tau_j_beta);
+                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_i, &c_x_tau_j_beta);
+
+                let d_cross = d_tt.as_ref() * &(x_tau_i_beta * x_tau_j_beta);
+                let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+                b_ij += &Self::xt_diag_x_dense_into(
+                    x_dense_tt.as_ref(),
+                    &d_cross,
+                    &mut weighted_scratch,
+                );
+
+                if x_tau_tau_tt[i][j].is_some() {
+                    let c_xij_beta = c_tt.as_ref() * &x_tau_tau_beta;
+                    b_ij += &Self::xt_diag_x_dense_into(
+                        x_dense_tt.as_ref(),
+                        &c_xij_beta,
+                        &mut weighted_scratch,
+                    );
+                }
+            }
+
+            if let Some(s_ij) = s_tau_tau_tt[i][j].as_ref() {
+                b_ij += s_ij;
+            }
+
+            super::unified::HyperCoordPair {
+                a: a_ij,
+                g: g_ij,
+                b_mat: b_ij,
+                ld_s: ld_s_ij,
+            }
+        };
+
+        let s_reg_inv_rt = std::sync::Arc::clone(&s_reg_inv);
+        let sdag_s_tau_rt = std::sync::Arc::clone(&sdag_s_tau);
+        let sdag_a_k_rt = std::sync::Arc::clone(&sdag_a_k);
+        let a_k_tau_j_rt = std::sync::Arc::clone(&a_k_tau_j_mats);
+        let beta_rt = std::sync::Arc::clone(&beta_eval);
+        let p_dim_rt = p_dim;
+
+        let rho_tau_pair_fn = move |k: usize, j: usize| -> super::unified::HyperCoordPair {
+            let ld_s_quad = Self::trace_product(&sdag_s_tau_rt[j], &sdag_a_k_rt[k]);
+            let ld_s_linear = a_k_tau_j_rt[j][k]
+                .as_ref()
+                .map(|a_kt| Self::trace_product(&s_reg_inv_rt, a_kt))
+                .unwrap_or(0.0);
+            let ld_s_kj = ld_s_linear - ld_s_quad;
+
+            let a_kj = 0.5
+                * a_k_tau_j_rt[j][k]
+                    .as_ref()
+                    .map(|a_kt| beta_rt.dot(&a_kt.dot(beta_rt.as_ref())))
+                    .unwrap_or(0.0);
+            let g_kj = a_k_tau_j_rt[j][k]
+                .as_ref()
+                .map(|a_kt| -(a_kt.dot(beta_rt.as_ref())))
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_rt));
+            let b_kj = a_k_tau_j_rt[j][k]
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Array2::<f64>::zeros((p_dim_rt, p_dim_rt)));
+
+            super::unified::HyperCoordPair {
+                a: a_kj,
+                g: g_kj,
+                b_mat: b_kj,
+                ld_s: ld_s_kj,
+            }
+        };
+
+        Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)))
     }
 
     /// Build pair callbacks for τ×τ and ρ×τ second-order [`HyperCoordPair`]

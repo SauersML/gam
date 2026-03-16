@@ -3,8 +3,8 @@ use crate::basis::{
 };
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::inference::predict::{
-    BinomialLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
-    StandardPredictor, SurvivalPredictor,
+    BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
+    GaussianLocationScalePredictor, PredictableModel, StandardPredictor, SurvivalPredictor,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
@@ -60,6 +60,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub formula_noise: Option<String>,
     #[serde(default)]
+    pub formula_logslope: Option<String>,
+    #[serde(default)]
     pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_projection: Option<Vec<Vec<f64>>>,
@@ -87,6 +89,16 @@ pub struct FittedModelPayload {
     pub baseline_timewiggle_double_penalty: Option<bool>,
     #[serde(default)]
     pub beta_baseline_timewiggle: Option<Vec<f64>>,
+    #[serde(default)]
+    pub z_column: Option<String>,
+    #[serde(default)]
+    pub marginal_baseline: Option<f64>,
+    #[serde(default)]
+    pub logslope_baseline: Option<f64>,
+    #[serde(default)]
+    pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
+    #[serde(default)]
+    pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -166,6 +178,7 @@ impl FittedModelPayload {
             mixture_link_param_covariance: None,
             sas_param_covariance: None,
             formula_noise: None,
+            formula_logslope: None,
             beta_noise: None,
             noise_projection: None,
             noise_center: None,
@@ -180,6 +193,11 @@ impl FittedModelPayload {
             baseline_timewiggle_penalty_orders: None,
             baseline_timewiggle_double_penalty: None,
             beta_baseline_timewiggle: None,
+            z_column: None,
+            marginal_baseline: None,
+            logslope_baseline: None,
+            score_warp_runtime: None,
+            link_deviation_runtime: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -217,6 +235,7 @@ impl FittedModelPayload {
 pub enum FittedModel {
     Standard { payload: FittedModelPayload },
     LocationScale { payload: FittedModelPayload },
+    MarginalSlope { payload: FittedModelPayload },
     Survival { payload: FittedModelPayload },
 }
 
@@ -225,6 +244,7 @@ pub enum FittedModel {
 pub enum ModelKind {
     Standard,
     LocationScale,
+    MarginalSlope,
     Survival,
 }
 
@@ -244,6 +264,9 @@ pub enum FittedFamily {
         #[serde(default)]
         base_link: Option<InverseLink>,
     },
+    MarginalSlope {
+        likelihood: LikelihoodFamily,
+    },
     Survival {
         likelihood: LikelihoodFamily,
         #[serde(default)]
@@ -258,6 +281,7 @@ pub enum PredictModelClass {
     Standard,
     GaussianLocationScale,
     BinomialLocationScale,
+    BernoulliMarginalSlope,
     Survival,
 }
 
@@ -277,6 +301,13 @@ pub struct SavedBaselineTimeWiggleRuntime {
     pub beta: Vec<f64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedAnchoredDeviationRuntime {
+    pub knots: Vec<f64>,
+    pub degree: usize,
+    pub transform: Vec<Vec<f64>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SavedPredictionRuntime {
     pub model_class: PredictModelClass,
@@ -284,6 +315,8 @@ pub struct SavedPredictionRuntime {
     pub inverse_link: Option<InverseLink>,
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
     pub baseline_time_wiggle: Option<SavedBaselineTimeWiggleRuntime>,
+    pub score_warp: Option<SavedAnchoredDeviationRuntime>,
+    pub link_deviation: Option<SavedAnchoredDeviationRuntime>,
 }
 
 impl SavedLinkWiggleRuntime {
@@ -353,6 +386,69 @@ impl SavedLinkWiggleRuntime {
     }
 }
 
+impl SavedAnchoredDeviationRuntime {
+    fn transform_matrix(&self) -> Result<Array2<f64>, String> {
+        if self.transform.is_empty() {
+            return Err("saved anchored deviation transform is empty".to_string());
+        }
+        let rows = self.transform.len();
+        let cols = self.transform[0].len();
+        if cols == 0 {
+            return Err("saved anchored deviation transform has zero columns".to_string());
+        }
+        let mut out = Array2::<f64>::zeros((rows, cols));
+        for (i, row) in self.transform.iter().enumerate() {
+            if row.len() != cols {
+                return Err(
+                    "saved anchored deviation transform rows have inconsistent widths"
+                        .to_string(),
+                );
+            }
+            for (j, &value) in row.iter().enumerate() {
+                out[[i, j]] = value;
+            }
+        }
+        Ok(out)
+    }
+
+    fn constrained_basis(
+        &self,
+        values: &Array1<f64>,
+        basis_options: BasisOptions,
+    ) -> Result<Array2<f64>, String> {
+        let knot_arr = Array1::from_vec(self.knots.clone());
+        let (basis, _) = create_basis::<Dense>(
+            values.view(),
+            KnotSource::Provided(knot_arr.view()),
+            self.degree,
+            basis_options,
+        )
+        .map_err(|e| format!("failed to evaluate saved anchored deviation basis: {e}"))?;
+        let full = basis.as_ref().clone();
+        let transform = self.transform_matrix()?;
+        if full.ncols() != transform.nrows() {
+            return Err(format!(
+                "saved anchored deviation basis/transform mismatch: basis has {} columns but transform has {} rows",
+                full.ncols(),
+                transform.nrows()
+            ));
+        }
+        Ok(full.dot(&transform))
+    }
+
+    pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.constrained_basis(values, BasisOptions::value())
+    }
+
+    pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.constrained_basis(values, BasisOptions::first_derivative())
+    }
+
+    pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.constrained_basis(values, BasisOptions::second_derivative())
+    }
+}
+
 fn saved_link_name_disallows_wiggle(link_name: &str) -> bool {
     let link_name = link_name.trim().to_ascii_lowercase();
     link_name == "sas"
@@ -378,6 +474,7 @@ impl FittedFamily {
         match self {
             Self::Standard { likelihood, .. }
             | Self::LocationScale { likelihood, .. }
+            | Self::MarginalSlope { likelihood, .. }
             | Self::Survival { likelihood, .. } => *likelihood,
         }
     }
@@ -388,6 +485,7 @@ impl FittedModel {
         let likelihood = payload.family_state.likelihood();
         let class = match payload.model_kind {
             ModelKind::Survival => PredictModelClass::Survival,
+            ModelKind::MarginalSlope => PredictModelClass::BernoulliMarginalSlope,
             ModelKind::LocationScale => {
                 if likelihood == LikelihoodFamily::GaussianIdentity {
                     PredictModelClass::GaussianLocationScale
@@ -401,6 +499,10 @@ impl FittedModel {
             PredictModelClass::Survival => {
                 payload.model_kind = ModelKind::Survival;
                 Self::Survival { payload }
+            }
+            PredictModelClass::BernoulliMarginalSlope => {
+                payload.model_kind = ModelKind::MarginalSlope;
+                Self::MarginalSlope { payload }
             }
             PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
                 payload.model_kind = ModelKind::LocationScale;
@@ -419,6 +521,7 @@ impl FittedModel {
         match self {
             Self::Standard { payload }
             | Self::LocationScale { payload }
+            | Self::MarginalSlope { payload }
             | Self::Survival { payload } => payload,
         }
     }
@@ -428,6 +531,7 @@ impl FittedModel {
         match self {
             Self::Standard { payload }
             | Self::LocationScale { payload }
+            | Self::MarginalSlope { payload }
             | Self::Survival { payload } => payload,
         }
     }
@@ -490,6 +594,7 @@ impl FittedModel {
     pub fn predict_model_class(&self) -> PredictModelClass {
         match self.payload().family_state {
             FittedFamily::Survival { .. } => PredictModelClass::Survival,
+            FittedFamily::MarginalSlope { .. } => PredictModelClass::BernoulliMarginalSlope,
             FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::GaussianIdentity,
                 ..
@@ -624,6 +729,8 @@ impl FittedModel {
             inverse_link: self.resolved_inverse_link()?,
             link_wiggle: self.saved_link_wiggle()?,
             baseline_time_wiggle: self.saved_baseline_time_wiggle()?,
+            score_warp: self.payload().score_warp_runtime.clone(),
+            link_deviation: self.payload().link_deviation_runtime.clone(),
         })
     }
 
@@ -733,6 +840,7 @@ impl FittedModel {
             FittedFamily::Standard { link, .. } => {
                 Ok(stateful.or_else(|| link.map(InverseLink::Standard)))
             }
+            FittedFamily::MarginalSlope { .. } => Ok(None),
             FittedFamily::Survival { .. } => Ok(None),
         }
     }
@@ -808,6 +916,21 @@ impl FittedModel {
                     inverse_link,
                     link_wiggle: runtime.link_wiggle,
                 }) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::BernoulliMarginalSlope => {
+                let unified = self.unified()?;
+                let payload = self.payload();
+                let z_column = payload.z_column.clone()?;
+                let predictor = BernoulliMarginalSlopePredictor::from_unified(
+                    unified,
+                    z_column,
+                    payload.marginal_baseline?,
+                    payload.logslope_baseline?,
+                    runtime.score_warp,
+                    runtime.link_deviation,
+                )
+                .ok()?;
+                Some(Box::new(predictor) as Box<dyn PredictableModel>)
             }
         }
     }
