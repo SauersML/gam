@@ -367,7 +367,7 @@ pub fn buildwiggle_block_input_from_knots(
         penalties.push(Array2::<f64>::eye(p));
     }
     Ok(ParameterBlockInput {
-        design: DesignMatrix::Dense(design),
+        design: DesignMatrix::Dense(Arc::new(design)),
         offset: Array1::zeros(seed.len()),
         penalties,
         initial_log_lambdas: None,
@@ -1500,7 +1500,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         let noise_log_lambdas = layout.noise_from(theta);
         let mut meanspec = ParameterBlockSpec {
             name: "mu".to_string(),
-            design: DesignMatrix::Dense(mean_design.design.clone()),
+            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.penalties.clone(),
             initial_log_lambdas: mean_log_lambdas,
@@ -1508,7 +1508,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         };
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(prepared_gaussian_log_sigma_design(
+            design: DesignMatrix::Dense(Arc::new(prepared_gaussian_log_sigma_design(
                 &mean_design.design,
                 &noise_design.design,
                 &self.weights,
@@ -1560,8 +1560,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
-            mu_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(preparednoise_design)),
+            mu_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(preparednoise_design))),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
     }
@@ -1652,7 +1652,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         layout.validate_theta_len(theta.len(), "gaussian location-scale wiggle")?;
         let mut meanspec = ParameterBlockSpec {
             name: "mu".to_string(),
-            design: DesignMatrix::Dense(mean_design.design.clone()),
+            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.penalties.clone(),
             initial_log_lambdas: layout.mean_from(theta),
@@ -1660,7 +1660,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         };
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(prepared_gaussian_log_sigma_design(
+            design: DesignMatrix::Dense(Arc::new(prepared_gaussian_log_sigma_design(
                 &mean_design.design,
                 &noise_design.design,
                 &self.weights,
@@ -1723,8 +1723,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
-            mu_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(preparednoise_design)),
+            mu_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(preparednoise_design))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             cached_row_scalars: std::sync::RwLock::new(None),
@@ -1829,7 +1829,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(mean_design.design.clone()),
+            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.penalties.clone(),
             initial_log_lambdas: layout.mean_from(theta),
@@ -1837,7 +1837,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(identifiednoise_design),
+            design: DesignMatrix::Dense(Arc::new(identifiednoise_design)),
             offset: Array1::zeros(self.y.len()),
             penalties: log_sigma_penalties,
             initial_log_lambdas: layout.noise_from(theta),
@@ -1875,8 +1875,8 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(identifiednoise_design)),
+            threshold_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(identifiednoise_design))),
         }
     }
 
@@ -1983,7 +1983,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(mean_design.design.clone()),
+            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.penalties.clone(),
             initial_log_lambdas: layout.mean_from(theta),
@@ -1991,7 +1991,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(identifiednoise_design),
+            design: DesignMatrix::Dense(Arc::new(identifiednoise_design)),
             offset: Array1::zeros(self.y.len()),
             penalties: log_sigma_penalties,
             initial_log_lambdas: layout.noise_from(theta),
@@ -2040,8 +2040,8 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(identifiednoise_design)),
+            threshold_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(identifiednoise_design))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
         }
@@ -2349,7 +2349,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 wiggle_knots: wiggle_knots.clone(),
                 wiggle_degree,
                 eta_block: ParameterBlockInput {
-                    design: DesignMatrix::Dense(pilot_design.design.clone()),
+                    design: DesignMatrix::Dense(Arc::new(pilot_design.design.clone())),
                     offset: Array1::zeros(y.len()),
                     penalties: pilot_design.penalties.clone(),
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
@@ -2445,7 +2445,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         let blocks = vec![
             ParameterBlockSpec {
                 name: "eta".to_string(),
-                design: DesignMatrix::Dense(design.design.clone()),
+                design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y_cloned.len()),
                 penalties: design.penalties.clone(),
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
@@ -2605,7 +2605,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             wiggle_knots: wiggle_knots.clone(),
             wiggle_degree,
             eta_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(design.design.clone()),
+                design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y.len()),
                 penalties: design.penalties.clone(),
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
@@ -7526,7 +7526,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             ));
         }
         let nrows = x.nrows();
-        Ok((DesignMatrix::Dense(x), Array1::zeros(nrows)))
+        Ok((DesignMatrix::Dense(Arc::new(x)), Array1::zeros(nrows)))
     }
 
     fn block_geometry_is_dynamic(&self) -> bool {
@@ -8069,7 +8069,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             ));
         }
         let nrows = x.nrows();
-        Ok((DesignMatrix::Dense(x), Array1::zeros(nrows)))
+        Ok((DesignMatrix::Dense(Arc::new(x)), Array1::zeros(nrows)))
     }
 
     fn block_geometry_is_dynamic(&self) -> bool {
@@ -11601,8 +11601,8 @@ impl BinomialLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(x_t.into_owned())),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls.into_owned())),
+            threshold_design: Some(DesignMatrix::Dense(Arc::new(x_t.into_owned()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(x_ls.into_owned()))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
         }))
@@ -14626,7 +14626,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             ));
         }
         let nrows = x.nrows();
-        Ok((DesignMatrix::Dense(x), Array1::zeros(nrows)))
+        Ok((DesignMatrix::Dense(Arc::new(x)), Array1::zeros(nrows)))
     }
 
     fn block_geometry_is_dynamic(&self) -> bool {
@@ -14683,7 +14683,7 @@ mod tests {
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
         ParameterBlockInput {
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: Vec::new(),
             initial_log_lambdas: None,
@@ -14940,7 +14940,7 @@ mod tests {
         let n = design.nrows();
         ParameterBlockSpec {
             name: name.to_string(),
-            design: DesignMatrix::Dense(design),
+            design: DesignMatrix::Dense(Arc::new(design)),
             offset: Array1::zeros(n),
             penalties: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
@@ -15630,8 +15630,8 @@ mod tests {
         let n = 6usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_elem(n, 1.0);
-        let threshold_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
-        let log_sigma_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0)));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0)));
         let family = BinomialLocationScaleFamily {
             y,
             weights,
@@ -16701,7 +16701,7 @@ mod tests {
     fn binomial_location_scale_exact_log_sigma_block_should_be_flat_on_safe_exp_plateau() {
         let y = array![1.0];
         let weights = array![1.0];
-        let design = DesignMatrix::Dense(array![[1.0]]);
+        let design = DesignMatrix::Dense(Arc::new(array![[1.0]]));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -16869,7 +16869,7 @@ mod tests {
     fn binomial_location_scale_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau() {
         let y = array![1.0];
         let weights = array![1.0];
-        let design = DesignMatrix::Dense(array![[1.0]]);
+        let design = DesignMatrix::Dense(Arc::new(array![[1.0]]));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -16930,7 +16930,7 @@ mod tests {
     {
         let y = array![1.0];
         let weights = array![1.0];
-        let design = DesignMatrix::Dense(array![[1.0]]);
+        let design = DesignMatrix::Dense(Arc::new(array![[1.0]]));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -17441,8 +17441,8 @@ mod tests {
         let family = GaussianLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            mu_design: Some(DesignMatrix::Dense(x_mu0_mat.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls0_mat.clone())),
+            mu_design: Some(DesignMatrix::Dense(Arc::new(x_mu0_mat.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(x_ls0_mat.clone()))),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let specs = vec![
@@ -17635,8 +17635,8 @@ mod tests {
         let family = GaussianLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            mu_design: Some(DesignMatrix::Dense(x_mu0_mat.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(x_ls0_mat.clone())),
+            mu_design: Some(DesignMatrix::Dense(Arc::new(x_mu0_mat.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(x_ls0_mat.clone()))),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let specs = vec![
@@ -17848,8 +17848,8 @@ mod tests {
             1 => (3.0 * std::f64::consts::PI * t_grid[i]).cos(),
             _ => unreachable!(),
         });
-        let threshold_design = DesignMatrix::Dense(threshold_x.clone());
-        let log_sigma_design = DesignMatrix::Dense(log_sigma_x.clone());
+        let threshold_design = DesignMatrix::Dense(Arc::new(threshold_x.clone()));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(log_sigma_x.clone()));
         let q_seed = Array1::linspace(-1.3, 1.1, n);
         let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
             q_seed.view(),
@@ -17981,8 +17981,8 @@ mod tests {
             1 => (3.0 * std::f64::consts::PI * t_grid[i]).cos(),
             _ => unreachable!(),
         });
-        let threshold_design = DesignMatrix::Dense(threshold_x.clone());
-        let log_sigma_design = DesignMatrix::Dense(log_sigma_x.clone());
+        let threshold_design = DesignMatrix::Dense(Arc::new(threshold_x.clone()));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(log_sigma_x.clone()));
         let q_seed = Array1::linspace(-1.3, 1.1, n);
         let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
             q_seed.view(),
@@ -18501,7 +18501,7 @@ mod tests {
         let n = 6usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
                 0 => 1.0,
@@ -18509,7 +18509,7 @@ mod tests {
                 _ => unreachable!(),
             }
         }));
-        let log_sigma_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
                 0 => 1.0,
@@ -18567,7 +18567,7 @@ mod tests {
         let n = 8usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
                 0 => 1.0,
@@ -18575,7 +18575,7 @@ mod tests {
                 _ => unreachable!(),
             }
         }));
-        let log_sigma_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
                 0 => 1.0,
@@ -18636,7 +18636,7 @@ mod tests {
         let n = 8usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
                 0 => 1.0,
@@ -18644,7 +18644,7 @@ mod tests {
                 _ => unreachable!(),
             }
         }));
-        let log_sigma_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
                 0 => 1.0,
@@ -18976,8 +18976,8 @@ mod tests {
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_design: Some(DesignMatrix::Dense(design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(design.clone())),
+            threshold_design: Some(DesignMatrix::Dense(Arc::new(design.clone()))),
+            log_sigma_design: Some(DesignMatrix::Dense(Arc::new(design.clone()))),
         };
 
         // Extreme eta values → fitted probs ≈ 0 or 1 → zero working weights

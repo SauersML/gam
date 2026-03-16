@@ -302,7 +302,7 @@ fn build_deviation_block_from_seed(
     };
     Ok(DeviationPrepared {
         block: ParameterBlockInput {
-            design: DesignMatrix::Dense(design),
+            design: DesignMatrix::Dense(Arc::new(design)),
             offset: Array1::zeros(seed.len()),
             penalties,
             initial_log_lambdas: None,
@@ -2323,7 +2323,7 @@ fn build_blockspec(
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: name.to_string(),
-        design: DesignMatrix::Dense(design.design.clone()),
+        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design.penalties.clone(),
         initial_log_lambdas: rho,

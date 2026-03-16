@@ -41,7 +41,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // Local alias used by internal tests/helpers.
 #[cfg(test)]
@@ -4078,7 +4078,7 @@ impl PirlsResult {
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
-            x_transformed: DesignMatrix::Dense(Array2::zeros((0, 0))),
+            x_transformed: DesignMatrix::Dense(Arc::new(Array2::zeros((0, 0)))),
             coordinate_frame: self.coordinate_frame.clone(),
             cache_compacted: true,
         }
@@ -6904,7 +6904,7 @@ mod tests {
 
     #[test]
     fn sparse_native_decision_rejects_dense_design() {
-        let x = DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 1.0]]);
+        let x = DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]]));
         let s = array![[1.0, 0.0], [0.0, 1.0]];
         let mut workspace = PirlsWorkspace::new(2, 2, 0, 0);
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);

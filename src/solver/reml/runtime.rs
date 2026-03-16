@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use super::*;
 use crate::faer_ndarray::FaerLblt;
 use crate::linalg::utils::{
@@ -1914,7 +1915,7 @@ impl<'a> RemlState<'a> {
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
-                    crate::linalg::matrix::DesignMatrix::Dense(x_dense.dot(z))
+                    crate::linalg::matrix::DesignMatrix::Dense(Arc::new(x_dense.dot(z)))
                 } else {
                     pirls_result.x_transformed.clone()
                 };

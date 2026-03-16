@@ -494,7 +494,7 @@ impl ParametricColumnConditioning {
             }
             dense.column_mut(j).mapv_inplace(|v| v / scale);
         }
-        DesignMatrix::Dense(dense)
+        DesignMatrix::Dense(Arc::new(dense))
     }
 
     fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
@@ -4577,10 +4577,10 @@ mod fd_policy_tests {
         let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
         assert!(effective_sas_link.is_some());
         let conditioning = ParametricColumnConditioning::infer_from_penalties(
-            &DesignMatrix::Dense(x.clone()),
+            &DesignMatrix::Dense(Arc::new(x.clone())),
             &s_list,
         );
-        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
         let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
@@ -4706,7 +4706,7 @@ mod fd_policy_tests {
         let beta_at = |raw_eps: f64| -> Array1<f64> {
             let mut state = RemlState::newwith_offset(
                 y.view(),
-                conditioning.apply_to_design(&DesignMatrix::Dense(x.clone())),
+                conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone()))),
                 w.view(),
                 offset.view(),
                 s_list.clone(),
@@ -4778,10 +4778,10 @@ mod fd_policy_tests {
         let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
         assert!(effective_sas_link.is_some());
         let conditioning = ParametricColumnConditioning::infer_from_penalties(
-            &DesignMatrix::Dense(x.clone()),
+            &DesignMatrix::Dense(Arc::new(x.clone())),
             &s_list,
         );
-        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
         let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
@@ -4811,7 +4811,7 @@ mod fd_policy_tests {
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
         let ridge = pirls_result.ridge_used;
         let x_dense = match &pirls_result.x_transformed {
-            DesignMatrix::Dense(x_dense) => x_dense.clone(),
+            DesignMatrix::Dense(x_dense) => (**x_dense).clone(),
             DesignMatrix::Sparse(_) => {
                 panic!("expected dense transformed design in seed-19 SAS test")
             }
@@ -4925,10 +4925,10 @@ mod fd_policy_tests {
         let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
         assert!(effective_sas_link.is_some());
         let conditioning = ParametricColumnConditioning::infer_from_penalties(
-            &DesignMatrix::Dense(x.clone()),
+            &DesignMatrix::Dense(Arc::new(x.clone())),
             &s_list,
         );
-        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
         let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
@@ -4958,7 +4958,7 @@ mod fd_policy_tests {
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
         let ridge = pirls_result.ridge_used;
         let x_dense = match &pirls_result.x_transformed {
-            DesignMatrix::Dense(x_dense) => x_dense.clone(),
+            DesignMatrix::Dense(x_dense) => (**x_dense).clone(),
             DesignMatrix::Sparse(_) => {
                 panic!("expected dense transformed design in seed-19 SAS test")
             }
