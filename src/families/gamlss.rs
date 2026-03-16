@@ -3678,9 +3678,10 @@ pub struct GaussianLocationScaleFamily {
     pub weights: Array1<f64>,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
-    /// Cached per-observation row scalars keyed by (eta_mu[0], eta_ls[0]) fingerprint.
+    /// Cached per-observation row scalars keyed by 6-element fingerprint
+    /// (first, mid, last elements of both eta vectors).
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
-    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, Arc<GaussianJointRowScalars>)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleFamily {
@@ -4421,17 +4422,33 @@ impl GaussianLocationScaleFamily {
         etamu: &Array1<f64>,
         eta_ls: &Array1<f64>,
     ) -> Result<Arc<GaussianJointRowScalars>, String> {
+        // Use a more robust fingerprint: first, last, and middle elements
+        // of both eta vectors. The old fingerprint only checked eta[0],
+        // which could miss changes when the first observation's eta doesn't
+        // move but others do (e.g., sparse designs or zero-weighted first row).
+        let n = etamu.len();
+        let mid = n / 2;
         let key = (
             etamu.get(0).copied().unwrap_or(f64::NAN),
             eta_ls.get(0).copied().unwrap_or(f64::NAN),
+            etamu.get(mid).copied().unwrap_or(f64::NAN),
+            eta_ls.get(mid).copied().unwrap_or(f64::NAN),
+            etamu.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
+            eta_ls.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
         );
         {
             let cache = self
                 .cached_row_scalars
                 .read()
                 .expect("cached_row_scalars lock poisoned");
-            if let Some((k0, k1, ref scalars)) = *cache {
-                if k0 == key.0 && k1 == key.1 {
+            if let Some((k0, k1, k2, k3, k4, k5, ref scalars)) = *cache {
+                if k0 == key.0
+                    && k1 == key.1
+                    && k2 == key.2
+                    && k3 == key.3
+                    && k4 == key.4
+                    && k5 == key.5
+                {
                     return Ok(Arc::clone(scalars));
                 }
             }
@@ -4446,7 +4463,7 @@ impl GaussianLocationScaleFamily {
             .cached_row_scalars
             .write()
             .expect("cached_row_scalars lock poisoned") =
-            Some((key.0, key.1, Arc::clone(&scalars)));
+            Some((key.0, key.1, key.2, key.3, key.4, key.5, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
@@ -5867,7 +5884,7 @@ pub struct GaussianLocationScaleWiggleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
-    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, Arc<GaussianJointRowScalars>)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleWiggleFamily {
@@ -6127,18 +6144,28 @@ impl GaussianLocationScaleWiggleFamily {
         q: &Array1<f64>,
         eta_ls: &Array1<f64>,
     ) -> Result<Arc<GaussianJointRowScalars>, String> {
+        let n = q.len();
+        let mid = n / 2;
         let key = (
             q.get(0).copied().unwrap_or(f64::NAN),
             eta_ls.get(0).copied().unwrap_or(f64::NAN),
+            q.get(mid).copied().unwrap_or(f64::NAN),
+            eta_ls.get(mid).copied().unwrap_or(f64::NAN),
+            q.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
+            eta_ls.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
         );
         {
             let cache = self
                 .cached_row_scalars
                 .read()
                 .expect("cached_row_scalars lock poisoned");
-            if let Some((k0, k1, ref scalars)) = *cache
+            if let Some((k0, k1, k2, k3, k4, k5, ref scalars)) = *cache
                 && k0 == key.0
                 && k1 == key.1
+                && k2 == key.2
+                && k3 == key.3
+                && k4 == key.4
+                && k5 == key.5
             {
                 return Ok(Arc::clone(scalars));
             }
@@ -6153,7 +6180,7 @@ impl GaussianLocationScaleWiggleFamily {
             .cached_row_scalars
             .write()
             .expect("cached_row_scalars lock poisoned") =
-            Some((key.0, key.1, Arc::clone(&scalars)));
+            Some((key.0, key.1, key.2, key.3, key.4, key.5, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
