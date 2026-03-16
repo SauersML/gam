@@ -13,7 +13,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift, HyperCoordPair,
+    HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair,
     HyperOperator, InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
     compute_block_penalty_logdet_derivs, penalty_matrix_root, reml_laml_evaluate,
 };
@@ -1040,25 +1040,25 @@ impl CustomFamilyBlockPsiDerivative {
 pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
     fn n_data(&self) -> usize;
     fn p_out(&self) -> usize;
-    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64>;
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64>;
-    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64>;
+    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
     fn transpose_mul_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
-    ) -> Array1<f64>;
-    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64>;
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
     fn forward_mul_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
-    ) -> Array1<f64>;
-    fn materialize_first(&self, axis: usize) -> Array2<f64>;
-    fn materialize_second_diag(&self, axis: usize) -> Array2<f64>;
-    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64>;
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+    fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
 }
 
 impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
@@ -1070,15 +1070,15 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         crate::terms::basis::ImplicitDesignPsiDerivative::p_out(self)
     }
 
-    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul(self, axis, v)
     }
 
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul(self, axis, u)
     }
 
-    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul_second_diag(self, axis, v)
     }
 
@@ -1087,13 +1087,13 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         axis_d: usize,
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul_second_cross(
             self, axis_d, axis_e, v,
         )
     }
 
-    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul_second_diag(self, axis, u)
     }
 
@@ -1102,21 +1102,21 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         axis_d: usize,
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul_second_cross(
             self, axis_d, axis_e, u,
         )
     }
 
-    fn materialize_first(&self, axis: usize) -> Array2<f64> {
+    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_first(self, axis)
     }
 
-    fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
+    fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_diag(self, axis)
     }
 
-    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
+    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_cross(
             self, axis_d, axis_e,
         )
@@ -1225,7 +1225,7 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         self.p_out
     }
 
-    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         assert_eq!(v.len(), self.n_data());
         let p_base = self.base.p_out();
         let mut out = Array1::<f64>::zeros(self.p_out);
@@ -1236,20 +1236,20 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                 let row_end = row_start + self.n_per_block;
                 let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
                     * &time_basis.column(t).to_owned();
-                accum += &self.base.transpose_mul(axis, &weighted.view());
+                accum += &self.base.transpose_mul(axis, &weighted.view())?;
             }
             for j in 0..p_base {
                 out[j * self.p_time + t] = accum[j];
             }
         }
-        out
+        Ok(out)
     }
 
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let time_cols = self.split_time_columns(u);
         let mut out = Array1::<f64>::zeros(self.n_data());
         for (t, coeffs) in time_cols.iter().enumerate() {
-            let base_eval = self.base.forward_mul(axis, &coeffs.view());
+            let base_eval = self.base.forward_mul(axis, &coeffs.view())?;
             for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
                 let row_start = block_idx * self.n_per_block;
                 let row_end = row_start + self.n_per_block;
@@ -1258,10 +1258,10 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                 out_block += &contrib;
             }
         }
-        out
+        Ok(out)
     }
 
-    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         assert_eq!(v.len(), self.n_data());
         let p_base = self.base.p_out();
         let mut out = Array1::<f64>::zeros(self.p_out);
@@ -1272,13 +1272,13 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                 let row_end = row_start + self.n_per_block;
                 let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
                     * &time_basis.column(t).to_owned();
-                accum += &self.base.transpose_mul_second_diag(axis, &weighted.view());
+                accum += &self.base.transpose_mul_second_diag(axis, &weighted.view())?;
             }
             for j in 0..p_base {
                 out[j * self.p_time + t] = accum[j];
             }
         }
-        out
+        Ok(out)
     }
 
     fn transpose_mul_second_cross(
@@ -1286,7 +1286,7 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_d: usize,
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         assert_eq!(v.len(), self.n_data());
         let p_base = self.base.p_out();
         let mut out = Array1::<f64>::zeros(self.p_out);
@@ -1299,20 +1299,20 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                     * &time_basis.column(t).to_owned();
                 accum += &self
                     .base
-                    .transpose_mul_second_cross(axis_d, axis_e, &weighted.view());
+                    .transpose_mul_second_cross(axis_d, axis_e, &weighted.view())?;
             }
             for j in 0..p_base {
                 out[j * self.p_time + t] = accum[j];
             }
         }
-        out
+        Ok(out)
     }
 
-    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let time_cols = self.split_time_columns(u);
         let mut out = Array1::<f64>::zeros(self.n_data());
         for (t, coeffs) in time_cols.iter().enumerate() {
-            let base_eval = self.base.forward_mul_second_diag(axis, &coeffs.view());
+            let base_eval = self.base.forward_mul_second_diag(axis, &coeffs.view())?;
             for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
                 let row_start = block_idx * self.n_per_block;
                 let row_end = row_start + self.n_per_block;
@@ -1321,7 +1321,7 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                 out_block += &contrib;
             }
         }
-        out
+        Ok(out)
     }
 
     fn forward_mul_second_cross(
@@ -1329,13 +1329,13 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_d: usize,
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let time_cols = self.split_time_columns(u);
         let mut out = Array1::<f64>::zeros(self.n_data());
         for (t, coeffs) in time_cols.iter().enumerate() {
             let base_eval = self
                 .base
-                .forward_mul_second_cross(axis_d, axis_e, &coeffs.view());
+                .forward_mul_second_cross(axis_d, axis_e, &coeffs.view())?;
             for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
                 let row_start = block_idx * self.n_per_block;
                 let row_end = row_start + self.n_per_block;
@@ -1344,37 +1344,37 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                 out_block += &contrib;
             }
         }
-        out
+        Ok(out)
     }
 
-    fn materialize_first(&self, axis: usize) -> Array2<f64> {
-        let base = self.base.materialize_first(axis);
+    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let base = self.base.materialize_first(axis)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
             .map(|basis| rowwise_kronecker_dense(&base, basis))
             .collect();
-        stack_dense_row_blocks(&blocks)
+        Ok(stack_dense_row_blocks(&blocks))
     }
 
-    fn materialize_second_diag(&self, axis: usize) -> Array2<f64> {
-        let base = self.base.materialize_second_diag(axis);
+    fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let base = self.base.materialize_second_diag(axis)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
             .map(|basis| rowwise_kronecker_dense(&base, basis))
             .collect();
-        stack_dense_row_blocks(&blocks)
+        Ok(stack_dense_row_blocks(&blocks))
     }
 
-    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Array2<f64> {
-        let base = self.base.materialize_second_cross(axis_d, axis_e);
+    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let base = self.base.materialize_second_cross(axis_d, axis_e)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
             .map(|basis| rowwise_kronecker_dense(&base, basis))
             .collect();
-        stack_dense_row_blocks(&blocks)
+        Ok(stack_dense_row_blocks(&blocks))
     }
 }
 
@@ -1638,6 +1638,7 @@ impl CustomFamilyPsiDesignAction {
         assert_eq!(u.len(), self.p);
         self.operator
             .forward_mul(self.axis, &u)
+            .expect("radial scalar evaluation failed during implicit psi forward_mul")
             .slice(ndarray::s![self.row_range.clone()])
             .to_owned()
     }
@@ -1646,12 +1647,14 @@ impl CustomFamilyPsiDesignAction {
         assert_eq!(v.len(), self.row_range.end - self.row_range.start);
         if self.row_range.start == 0 && self.row_range.end == self.operator.n_data() {
             self.operator.transpose_mul(self.axis, &v)
+                .expect("radial scalar evaluation failed during implicit psi transpose_mul")
         } else {
             let mut expanded = Array1::<f64>::zeros(self.operator.n_data());
             expanded
                 .slice_mut(ndarray::s![self.row_range.clone()])
                 .assign(&v);
             self.operator.transpose_mul(self.axis, &expanded.view())
+                .expect("radial scalar evaluation failed during implicit psi transpose_mul")
         }
     }
 }
@@ -1739,9 +1742,11 @@ impl CustomFamilyPsiSecondDesignAction {
         let out = match self.level {
             CustomFamilyPsiSecondDesignLevel::Diag(axis) => {
                 self.operator.forward_mul_second_diag(axis, &u)
+                    .expect("radial scalar evaluation failed during implicit psi second forward_mul")
             }
             CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => {
                 self.operator.forward_mul_second_cross(axis_d, axis_e, &u)
+                    .expect("radial scalar evaluation failed during implicit psi second forward_mul")
             }
         };
         out.slice(ndarray::s![self.row_range.clone()]).to_owned()
@@ -1763,10 +1768,12 @@ impl CustomFamilyPsiSecondDesignAction {
         match self.level {
             CustomFamilyPsiSecondDesignLevel::Diag(axis) => {
                 self.operator.transpose_mul_second_diag(axis, &full_v)
+                    .expect("radial scalar evaluation failed during implicit psi second transpose_mul")
             }
             CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => self
                 .operator
-                .transpose_mul_second_cross(axis_d, axis_e, &full_v),
+                .transpose_mul_second_cross(axis_d, axis_e, &full_v)
+                .expect("radial scalar evaluation failed during implicit psi second transpose_mul"),
         }
     }
 }
@@ -2146,7 +2153,8 @@ pub(crate) fn resolve_custom_family_x_psi(
                 n, p
             ));
         }
-        let x = op.materialize_first(deriv.implicit_axis);
+        let x = op.materialize_first(deriv.implicit_axis)
+            .map_err(|e| format!("{label} implicit materialize_first failed: {e}"))?;
         if x.nrows() != n || x.ncols() != p {
             return Err(format!(
                 "{label} implicit x_psi shape mismatch: got {}x{}, expected {}x{}",
@@ -2187,8 +2195,10 @@ pub(crate) fn resolve_custom_family_x_psi_psi(
         let x = if same_group {
             if deriv_i.implicit_axis == deriv_j.implicit_axis {
                 op.materialize_second_diag(deriv_i.implicit_axis)
+                    .map_err(|e| format!("{label} implicit materialize_second_diag failed: {e}"))?
             } else {
                 op.materialize_second_cross(deriv_i.implicit_axis, deriv_j.implicit_axis)
+                    .map_err(|e| format!("{label} implicit materialize_second_cross failed: {e}"))?
             }
         } else {
             Array2::<f64>::zeros((n, p))

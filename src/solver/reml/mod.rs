@@ -881,9 +881,12 @@ struct ImplicitDerivativeOp {
 impl ImplicitDerivativeOp {
     fn materialize_dense(&self) -> &Array2<f64> {
         self.cached_dense.get_or_init(|| match self.level {
-            ImplicitDerivLevel::First(axis) => self.operator.materialize_first(axis),
-            ImplicitDerivLevel::SecondDiag(axis) => self.operator.materialize_second_diag(axis),
-            ImplicitDerivLevel::SecondCross(d, e) => self.operator.materialize_second_cross(d, e),
+            ImplicitDerivLevel::First(axis) => self.operator.materialize_first(axis)
+                .expect("radial scalar evaluation failed during implicit derivative materialization"),
+            ImplicitDerivLevel::SecondDiag(axis) => self.operator.materialize_second_diag(axis)
+                .expect("radial scalar evaluation failed during implicit derivative materialization"),
+            ImplicitDerivLevel::SecondCross(d, e) => self.operator.materialize_second_cross(d, e)
+                .expect("radial scalar evaluation failed during implicit derivative materialization"),
         })
     }
 
@@ -897,24 +900,30 @@ impl ImplicitDerivativeOp {
 
     fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
         match self.level {
-            ImplicitDerivLevel::First(axis) => self.operator.transpose_mul(axis, &v.view()),
+            ImplicitDerivLevel::First(axis) => self.operator.transpose_mul(axis, &v.view())
+                .expect("radial scalar evaluation failed during implicit derivative transpose_mul"),
             ImplicitDerivLevel::SecondDiag(axis) => {
                 self.operator.transpose_mul_second_diag(axis, &v.view())
+                    .expect("radial scalar evaluation failed during implicit derivative transpose_mul")
             }
             ImplicitDerivLevel::SecondCross(d, e) => {
                 self.operator.transpose_mul_second_cross(d, e, &v.view())
+                    .expect("radial scalar evaluation failed during implicit derivative transpose_mul")
             }
         }
     }
 
     fn forward_mul(&self, u: &Array1<f64>) -> Array1<f64> {
         match self.level {
-            ImplicitDerivLevel::First(axis) => self.operator.forward_mul(axis, &u.view()),
+            ImplicitDerivLevel::First(axis) => self.operator.forward_mul(axis, &u.view())
+                .expect("radial scalar evaluation failed during implicit derivative forward_mul"),
             ImplicitDerivLevel::SecondDiag(axis) => {
                 self.operator.forward_mul_second_diag(axis, &u.view())
+                    .expect("radial scalar evaluation failed during implicit derivative forward_mul")
             }
             ImplicitDerivLevel::SecondCross(d, e) => {
                 self.operator.forward_mul_second_cross(d, e, &u.view())
+                    .expect("radial scalar evaluation failed during implicit derivative forward_mul")
             }
         }
     }
