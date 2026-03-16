@@ -1038,9 +1038,15 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
     {
         return Ok(out);
     }
-    let out = logit_large_sigma_probit_asymptotic(mu, sigma);
-    if out.mean.is_finite() && out.dmean_dmu.is_finite() {
-        return Ok(out);
+    // The Monahan-Stefanski probit approximation is only accurate when sigma
+    // is large enough for the logistic kernel to resemble a rescaled probit.
+    // For moderate sigma the GHQ fallback in the controlled router provides
+    // better accuracy, so we only apply the approximation above a threshold.
+    if sigma >= 3.0 {
+        let out = logit_large_sigma_probit_asymptotic(mu, sigma);
+        if out.mean.is_finite() && out.dmean_dmu.is_finite() {
+            return Ok(out);
+        }
     }
     Err(EstimationError::InvalidInput(
         "logit analytic expectation produced non-finite values".to_string(),
