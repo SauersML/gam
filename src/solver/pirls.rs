@@ -4415,7 +4415,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     use crate::construction::{
         EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
-        stable_reparameterizationwith_invariant_engine,
     };
 
     let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = penalty.balanced_penalty_root {
@@ -4429,22 +4428,13 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    let reparam_result = if let Some(invariant) = penalty.reparam_invariant {
-        stable_reparameterizationwith_invariant_engine(
-            penalty.rs_original,
-            lambdas_slice,
-            EngineDims::new(penalty.p, penalty.rs_original.len()),
-            invariant,
-            penalty.penalty_shrinkage_floor,
-        )?
-    } else {
-        stable_reparameterization_engine(
-            penalty.rs_original,
-            lambdas_slice,
-            EngineDims::new(penalty.p, penalty.rs_original.len()),
-            penalty.penalty_shrinkage_floor,
-        )?
-    };
+    let reparam_result = stable_reparameterization_engine(
+        penalty.rs_original,
+        lambdas_slice,
+        EngineDims::new(penalty.p, penalty.rs_original.len()),
+        penalty.reparam_invariant,
+        penalty.penalty_shrinkage_floor,
+    )?;
     let transformed_bounds = build_transformed_lower_bound_constraints(
         &reparam_result.qs,
         penalty.coefficient_lower_bounds,

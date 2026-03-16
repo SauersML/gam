@@ -8377,12 +8377,12 @@ fn duchon_radial_jets(
         //   t_rr(0)   = φ⁽⁶⁾(0) / 15.
         //
         // The fourth- and sixth-order collision derivatives are assembled from
-        // the Duchon partial-fraction blocks at the standard small-r floor.
-        out.t = duchon_phi_rrrr_collision(length_scale, k_dim, coeffs)? / 3.0;
+        // analytic Taylor coefficients of the partial-fraction blocks.
+        out.t = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 3.0;
         out.q_rr = out.t;
         out.lap_rr = (k_dim as f64 + 2.0) * out.t;
         out.t_r = 0.0;
-        out.t_rr = duchon_phi_rrrrrr_collision(length_scale, k_dim, coeffs)? / 15.0;
+        out.t_rr = duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()
@@ -8617,79 +8617,374 @@ fn duchon_polyharmonic_radial_derivative_at_r(
     c * falling_factorial(alpha, derivative_order) * r_safe.powf(e)
 }
 
-/// Assemble φ''''(0) from the partial-fraction blocks by evaluating the fourth
-/// radial derivative at the standard small-r floor.
+/// Euler-Mascheroni constant γ ≈ 0.5772.
+const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
+
+/// Digamma function ψ(n) for positive integer n.
+///
+/// ψ(1) = −γ, ψ(n+1) = −γ + H_n where H_n = Σ_{j=1}^{n} 1/j.
+#[inline(always)]
+fn digamma_pos_int(n: usize) -> f64 {
+    debug_assert!(n >= 1);
+    let mut h = 0.0_f64;
+    for j in 1..n {
+        h += 1.0 / j as f64;
+    }
+    -EULER_MASCHERONI + h
+}
+
+/// Extract the coefficient of r^{2j} (pure and log-r parts) from a single
+/// Matérn partial-fraction block g_n(r) = c · r^ν · K_{|ν|}(κr), where
+/// ν = n − d/2.
+///
+/// Returns `(pure_coeff, log_coeff)` such that the r^{2j} piece of g_n is
+///   pure_coeff · r^{2j}  +  log_coeff · r^{2j} · ln(r).
+///
+/// For even d (integer ν) the expansion uses the DLMF 10.31.1 series for
+/// K_n(z) at the origin, which involves digamma / harmonic-number terms.
+///
+/// For odd d (half-integer ν) the Bessel function is elementary; the Taylor
+/// coefficients come from convolving a finite polynomial in 1/r with e^{−κr},
+/// and there is no log-r contribution.
+fn duchon_matern_block_taylor_r2j(
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+    j: usize,
+) -> (f64, f64) {
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    let nu = n - k_half;
+    // Normalization constant for the Matérn block.
+    let c = kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half)
+            * 2.0_f64.powf(n - 1.0)
+            * gamma_lanczos(n));
+
+    if k_dim % 2 == 0 {
+        // Integer ν.
+        let nu_int = n_order as i64 - (k_dim as i64) / 2;
+        duchon_matern_block_taylor_r2j_integer_nu(kappa, c, nu_int, j)
+    } else {
+        // Half-integer ν.
+        duchon_matern_block_taylor_r2j_half_integer_nu(kappa, c, nu, j)
+    }
+}
+
+/// Taylor r^{2j} coefficients for integer-ν Matérn block.
+///
+/// Uses the K_μ(z) expansion for integer μ = |ν| ≥ 0 (A&S 9.6.11 / DLMF 10.31.1):
+///
+///   K_μ(z) = (−1)^{μ+1} I_μ(z) ln(z/2)
+///          + ½ Σ_{k=0}^{μ−1} (−1)^k (μ−k−1)!/k! · (z/2)^{2k−μ}   [singular]
+///          + (−1)^μ · ½ Σ_{k≥0} (z/2)^{μ+2k}/(k!(μ+k)!)
+///                              · [ψ(k+1)+ψ(μ+k+1)]                  [regular]
+///
+/// Multiplied by r^ν, the r^{2j} coefficient is assembled from the singular
+/// and/or regular+log series depending on the sign and magnitude of ν.
+fn duchon_matern_block_taylor_r2j_integer_nu(
+    kappa: f64,
+    c: f64,
+    nu_int: i64,
+    j: usize,
+) -> (f64, f64) {
+    let mu = nu_int.unsigned_abs() as usize; // |ν|
+
+    // Helper: compute (κ/2)^p for integer p.
+    let kappa_half = 0.5 * kappa;
+
+    if nu_int >= 0 {
+        let nu = nu_int as usize;
+        // Two potential sources for the r^{2j} coefficient:
+        //
+        // 1) Singular sum:  contributes when j ≤ ν−1 (the k=j term gives r^{2j}).
+        // 2) Regular+log sum: contributes when 2ν+2k = 2j, i.e. k = j−ν ≥ 0.
+        let mut pure = 0.0;
+        let mut log_part = 0.0;
+
+        // Source 1: singular sum at k = j.
+        if j < nu {
+            // (1/2) · (−1)^j · (ν−j−1)!/j! · (κ/2)^{2j−ν}
+            let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
+            let coeff = sign
+                * gamma_lanczos((nu - j) as f64)
+                / gamma_lanczos((j + 1) as f64)
+                * kappa_half.powi(2 * j as i32 - nu as i32)
+                * 0.5;
+            pure += coeff;
+        }
+
+        // Source 2: regular+log sum at k = j − ν.
+        if j >= nu {
+            let k = j - nu;
+            let inv_fac = 1.0
+                / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((nu + k + 1) as f64));
+            let kp = kappa_half.powi(2 * k as i32 + nu as i32);
+            let sign_mu = if mu % 2 == 0 { 1.0 } else { -1.0 }; // (−1)^μ
+
+            // Log coefficient: (−1)^{μ+1} · (κ/2)^{ν+2k} / (k!(ν+k)!)
+            log_part += -sign_mu * kp * inv_fac;
+
+            // Pure coefficient from the log series (ln(κ/2) piece):
+            //   (−1)^{μ+1} · (κ/2)^{ν+2k} / (k!(ν+k)!) · ln(κ/2)
+            // Plus the digamma series:
+            //   (−1)^μ · ½ · (κ/2)^{ν+2k} / (k!(ν+k)!) · [ψ(k+1)+ψ(ν+k+1)]
+            let psi_sum = digamma_pos_int(k + 1) + digamma_pos_int(nu + k + 1);
+            pure += -sign_mu * kp * inv_fac * kappa_half.ln();
+            pure += sign_mu * 0.5 * kp * inv_fac * psi_sum;
+        }
+
+        (c * pure, c * log_part)
+    } else {
+        // ν < 0: mu = |ν| > 0.
+        // Singular sum gives powers r^{2ν}, ..., r^{−2} (all negative).
+        // Regular+log sum gives r^0, r^2, r^4, ... at k = j.
+        let k = j;
+        let inv_fac = 1.0
+            / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((mu + k + 1) as f64));
+        let kp = kappa_half.powi(mu as i32 + 2 * k as i32);
+        let sign_mu = if mu % 2 == 0 { 1.0 } else { -1.0 };
+
+        // Log coefficient: (−1)^{μ+1} · (κ/2)^{μ+2k} / (k!(μ+k)!)
+        let log_part = -sign_mu * kp * inv_fac;
+
+        // Pure coefficient: log-series ln(κ/2) piece + digamma piece.
+        let psi_sum = digamma_pos_int(k + 1) + digamma_pos_int(mu + k + 1);
+        let pure = -sign_mu * kp * inv_fac * kappa_half.ln()
+            + sign_mu * 0.5 * kp * inv_fac * psi_sum;
+
+        (c * pure, c * log_part)
+    }
+}
+
+/// Taylor r^{2j} coefficients for half-integer-ν Matérn block.
+///
+/// For half-integer |ν| = l + ½, K_{l+½}(z) is elementary:
+///   K_{l+½}(z) = √(π/(2z)) · e^{−z} · Σ_{i=0}^{l} C_i · (2z)^{−i}
+/// where C_i = (l+i)! / (i! · (l−i)!).
+///
+/// The product r^ν · K_{|ν|}(κr) expands as an explicit polynomial in r
+/// (including possible negative powers) times e^{−κr}.  The r^{2j} Taylor
+/// coefficient is obtained by convolving with the exponential series
+/// e^{−κr} = Σ_q (−κ)^q r^q / q!.  There is never a log-r contribution.
+fn duchon_matern_block_taylor_r2j_half_integer_nu(
+    kappa: f64,
+    c: f64,
+    nu: f64,
+    j: usize,
+) -> (f64, f64) {
+    let nu_abs = nu.abs();
+    let l = (2.0 * nu_abs - 1.0).round().max(0.0) as usize;
+    // Compute the polynomial coefficients C_i / (2κ)^i for each r-power.
+    //
+    // r^ν · K_{l+½}(κr) = √(π/(2κ)) · e^{−κr} · Σ_{i=0}^{l} C_i (2κ)^{−i} r^{ν−½−i}
+    //
+    // (since K_{l+½}(z) = √(π/(2z)) e^{−z} Σ C_i (2z)^{−i}, multiplying by
+    // r^ν gives r^{ν−½} from the √(π/(2κr)) factor, then each (2κr)^{−i}
+    // contributes r^{−i}.)
+    let prefactor = (std::f64::consts::PI / (2.0 * kappa)).sqrt();
+
+    // Polynomial term i has r-power = ν − 0.5 − i.  We need to convolve
+    // each monomial with e^{−κr} = Σ_q (−κ)^q r^q / q! and extract the
+    // r^{2j} coefficient.
+    //
+    // For monomial r^p (p = ν−½−i) times e^{−κr}: the r^{2j} coefficient is
+    //   (−κ)^{2j−p} / (2j−p)!   when 2j−p is a non-negative integer.
+    let target = 2 * j;
+    let mut pure = 0.0;
+
+    for i in 0..=l {
+        let c_i = gamma_lanczos((l + i + 1) as f64)
+            / (gamma_lanczos((i + 1) as f64) * gamma_lanczos((l - i + 1) as f64));
+        let inv_2kappa_i = (2.0 * kappa).powi(-(i as i32));
+
+        // r-power of this polynomial term.
+        let p_f64 = nu - 0.5 - i as f64;
+        let p_round = p_f64.round() as i64;
+        if (p_f64 - p_round as f64).abs() > 1e-12 {
+            // Not integer/half-integer aligned — should not happen for half-integer ν.
+            continue;
+        }
+        let q_needed = target as i64 - p_round;
+        if q_needed < 0 {
+            continue;
+        }
+        let q = q_needed as usize;
+        let exp_coeff = (-kappa).powi(q as i32) / gamma_lanczos((q + 1) as f64);
+        pure += c_i * inv_2kappa_i * exp_coeff;
+    }
+
+    (c * prefactor * pure, 0.0) // No log contribution for half-integer ν.
+}
+
+/// Extract the r^{2j} Taylor coefficient from a polyharmonic block Φ_m(r).
+///
+/// Non-log case (d odd, or d even with m < d/2): Φ_m = c · r^α with α = 2m − d.
+///   Only contributes when α = 2j exactly: pure_coeff = c, log_coeff = 0.
+///
+/// Log case (d even, m ≥ d/2): Φ_m = c · r^α · ln(r).
+///   Only contributes when α = 2j: pure_coeff = 0, log_coeff = c.
+fn duchon_polyharmonic_block_taylor_r2j(
+    m: usize,
+    k_dim: usize,
+    j: usize,
+) -> (f64, f64) {
+    let k_half = 0.5 * k_dim as f64;
+    let alpha = 2 * m as i64 - k_dim as i64;
+
+    if alpha != 2 * j as i64 {
+        return (0.0, 0.0);
+    }
+
+    // α = 2j: compute the normalization constant.
+    if k_dim % 2 == 0 && m >= k_dim / 2 {
+        // Log case: Φ_m = c · r^α · ln(r).
+        let c = polyharmonic_log_sign(m, k_dim)
+            / (2.0_f64.powi((2 * m - 1) as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64)
+                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        (0.0, c)
+    } else {
+        // Non-log case: Φ_m = c · r^α.
+        let c = gamma_lanczos(k_half - m as f64)
+            / (4.0_f64.powi(m as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64));
+        (c, 0.0)
+    }
+}
+
+/// Compute the even-order radial derivative φ^{(2j)}(0) from analytic Taylor
+/// coefficients of the partial-fraction blocks.
+///
+/// For a C^{2j} radial kernel with Taylor expansion φ(r) = Σ_k a_{2k} r^{2k},
+/// φ^{(2j)}(0) = (2j)! · a_{2j}.  Each partial-fraction block (polyharmonic
+/// and Matérn) has a computable r^{2j} Taylor coefficient (both pure and
+/// ln(r) parts).  The ln(r) contributions cancel across blocks whenever the
+/// kernel is sufficiently smooth; the pure coefficients sum to give a_{2j}.
+///
+/// Convergence conditions (kernel is C^{2j} at the origin):
+///   2(p + s) > d + 2j.
+///
+/// When this condition fails (borderline or insufficient smoothness), the
+/// function falls back to evaluating the derivative at a small floor radius.
+fn duchon_phi_even_derivative_collision(
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+    j: usize,
+) -> Result<f64, BasisError> {
+    let smoothness_order = 2 * (p_order + s_order);
+    let required = k_dim + 2 * j;
+
+    if smoothness_order <= required {
+        // Kernel is not C^{2j} at the origin (borderline or worse).
+        // Fall back to evaluating the derivative at the standard small-r floor.
+        // Note: for the borderline case the true limit is logarithmically
+        // divergent, so any finite floor gives a regularized approximation.
+        let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
+        let kappa = 1.0 / length_scale.max(1e-300);
+        let mut result = 0.0;
+        let deriv_order = 2 * j;
+        for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+            if a_m == 0.0 {
+                continue;
+            }
+            result += a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, deriv_order);
+        }
+        for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+            if b_n == 0.0 {
+                continue;
+            }
+            result +=
+                b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, deriv_order)?;
+        }
+        return Ok(result);
+    }
+
+    // Analytic path: extract per-block Taylor r^{2j} coefficients and sum.
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let mut total_pure = 0.0;
+    let mut total_log = 0.0;
+
+    // Polyharmonic blocks.
+    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+        if a_m == 0.0 {
+            continue;
+        }
+        let (pure, log) = duchon_polyharmonic_block_taylor_r2j(m, k_dim, j);
+        total_pure += a_m * pure;
+        total_log += a_m * log;
+    }
+
+    // Matérn blocks.
+    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+        if b_n == 0.0 {
+            continue;
+        }
+        let (pure, log) = duchon_matern_block_taylor_r2j(kappa, n, k_dim, j);
+        total_pure += b_n * pure;
+        total_log += b_n * log;
+    }
+
+    // The ln(r) coefficients should cancel to zero (guaranteed by the PFD
+    // identity when 2(p+s) > d+2j).  Check this as a sanity guard.
+    if total_log.abs() > 1e-8 * total_pure.abs().max(1e-30) {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon Taylor a_{} log-coefficient did not cancel: log={total_log:.6e}, pure={total_pure:.6e}; \
+             p={p_order}, s={s_order}, d={k_dim}",
+            2 * j
+        )));
+    }
+
+    // φ^{(2j)}(0) = (2j)! · a_{2j}
+    let factorial_2j = gamma_lanczos((2 * j + 1) as f64);
+    Ok(factorial_2j * total_pure)
+}
+
+/// Assemble φ''''(0) from the partial-fraction blocks using analytic Taylor
+/// coefficients.
 ///
 /// For a radial kernel with Taylor expansion φ(r) = a₀ + a₂r² + a₄r⁴ + ...,
 /// we have φ''''(0) = 24 a₄.  This is used to compute the collision limit
 /// t(0) = φ''''(0) / 3, where t = R²φ = (φ'' - q) / r².
 ///
-/// Implementation: each polyharmonic block contributes its fourth derivative
-/// evaluated at r_eff analytically; each Matérn-Bessel block uses the exact
-/// closed-form fourth radial derivative of the shifted Matérn block.
+/// Each partial-fraction block (polyharmonic and Matérn) has a known Taylor
+/// expansion around r = 0; the r⁴ coefficient a₄ is extracted from the series
+/// and summed.  This avoids the catastrophic cancellation that occurs when
+/// evaluating divergent block derivatives at a small floor radius.
 fn duchon_phi_rrrr_collision(
     length_scale: f64,
+    p_order: usize,
+    s_order: usize,
     k_dim: usize,
     coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<f64, BasisError> {
-    let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
-    let kappa = 1.0 / length_scale.max(1e-300);
-
-    let mut phi_rrrr = 0.0;
-
-    // Polyharmonic blocks: Φ_m(r) = c · r^α [· ln(r)]
-    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
-        if a_m == 0.0 {
-            continue;
-        }
-        phi_rrrr += a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, 4);
-    }
-
-    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
-        if b_n == 0.0 {
-            continue;
-        }
-        phi_rrrr += b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, 4)?;
-    }
-
-    Ok(phi_rrrr)
+    duchon_phi_even_derivative_collision(length_scale, p_order, s_order, k_dim, coeffs, 2)
 }
 
-/// Assemble φ⁽⁶⁾(0) from the partial-fraction blocks by evaluating the sixth
-/// radial derivative at the standard small-r floor.
+/// Assemble φ⁽⁶⁾(0) from the partial-fraction blocks using analytic Taylor
+/// coefficients.
 ///
 /// For a radial kernel with Taylor expansion φ(r) = a₀ + a₂r² + a₄r⁴ + a₆r⁶ + ...,
 /// we have φ⁽⁶⁾(0) = 720 a₆. This gives the collision limit
 ///   t_rr(0) = φ⁽⁶⁾(0) / 15
 /// for t = R²φ.
 ///
-/// As with [`duchon_phi_rrrr_collision`], polyharmonic pieces are differentiated
-/// analytically, while Matérn-Bessel pieces use the exact closed-form sixth
-/// radial derivative of the shifted Matérn block.
+/// Like [`duchon_phi_rrrr_collision`], this extracts per-block Taylor
+/// coefficients analytically rather than evaluating divergent derivatives at
+/// a small floor radius.
 fn duchon_phi_rrrrrr_collision(
     length_scale: f64,
+    p_order: usize,
+    s_order: usize,
     k_dim: usize,
     coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<f64, BasisError> {
-    let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
-    let kappa = 1.0 / length_scale.max(1e-300);
-
-    let mut phi_rrrrrr = 0.0;
-
-    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
-        if a_m == 0.0 {
-            continue;
-        }
-        phi_rrrrrr += a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, 6);
-    }
-
-    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
-        if b_n == 0.0 {
-            continue;
-        }
-        phi_rrrrrr += b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, 6)?;
-    }
-    Ok(phi_rrrrrr)
+    duchon_phi_even_derivative_collision(length_scale, p_order, s_order, k_dim, coeffs, 3)
 }
 
 fn build_duchon_design_psi_derivativeswithworkspace(
@@ -14762,7 +15057,7 @@ mod tests {
         let (phi_rr, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
-        let t_collision = duchon_phi_rrrr_collision(length_scale, k_dim, &coeffs)
+        let t_collision = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("collision phi''''")
             / 3.0;
 
@@ -14922,7 +15217,7 @@ mod tests {
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let t_rr_collision = duchon_phi_rrrrrr_collision(length_scale, k_dim, &coeffs)
+        let t_rr_collision = duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("collision phi''''''")
             / 15.0;
 
