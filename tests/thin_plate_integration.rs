@@ -1,6 +1,8 @@
 use gam::basis::create_thin_plate_spline_basis_with_knot_count;
 use gam::construction::compute_penalty_square_roots;
-use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
+use gam::estimate::{FitOptions, fit_gam};
+use gam::predict::predict_gam;
+use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

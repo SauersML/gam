@@ -8,7 +8,7 @@ use gam::families::custom_family::{
 };
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::pirls::LinearInequalityConstraints;
-use gam::{
+use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState,
 };

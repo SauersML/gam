@@ -2,11 +2,12 @@ use gam::estimate::FittedLinkState;
 use gam::mixture_link::state_fromspec;
 use gam::probability::try_inverse_link_array;
 use gam::types::LinkComponent;
-use gam::{
-    FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
-    PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_posterior_mean,
-    predict_gamwith_uncertainty,
+use gam::estimate::{FitOptions, fit_gam};
+use gam::predict::{
+    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    coefficient_uncertainty, predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
+use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 
 #[test]
@@ -56,13 +57,13 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         .expect("conditional covariance should be available");
     assert_eq!(cov.nrows(), fit.beta.len());
     assert_eq!(cov.ncols(), fit.beta.len());
-    assert!(cov.iter().all(|v| v.is_finite()));
+    assert!(cov.iter().all(|v: &f64| v.is_finite()));
 
     let se = fit
         .beta_standard_errors()
         .expect("standard errors should be available");
     assert_eq!(se.len(), fit.beta.len());
-    assert!(se.iter().all(|v| v.is_finite() && *v >= 0.0));
+    assert!(se.iter().all(|v: &f64| v.is_finite() && *v >= 0.0));
 
     let coef_ci = coefficient_uncertainty(
         &fit,
@@ -77,7 +78,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             .lower
             .iter()
             .zip(coef_ci.upper.iter())
-            .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u)
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite() && u.is_finite() && l <= u)
     );
 }
 
@@ -142,18 +143,18 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
     assert!(
         pred.eta_standard_error
             .iter()
-            .all(|v| v.is_finite() && *v >= 0.0)
+            .all(|v: &f64| v.is_finite() && *v >= 0.0)
     );
     assert!(
         pred.mean_standard_error
             .iter()
-            .all(|v| v.is_finite() && *v >= 0.0)
+            .all(|v: &f64| v.is_finite() && *v >= 0.0)
     );
     assert!(
         pred.mean_lower
             .iter()
             .zip(pred.mean_upper.iter())
-            .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
     );
     assert!(pred.observation_lower.is_none());
     assert!(pred.observation_upper.is_none());
@@ -222,7 +223,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
         obs_lower
             .iter()
             .zip(obs_upper.iter())
-            .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u)
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite() && u.is_finite() && l <= u)
     );
 }
 
@@ -374,6 +375,6 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         pred.mean_lower
             .iter()
             .zip(pred.mean_upper.iter())
-            .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
     );
 }

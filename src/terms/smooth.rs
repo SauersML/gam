@@ -3117,7 +3117,7 @@ fn with_spatial_identifiability_transform(
     }
 }
 
-fn fit_term_collection_forspec(
+pub fn fit_term_collection_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -9171,7 +9171,7 @@ where
     })
 }
 
-pub(crate) fn fit_term_collectionwith_spatial_length_scale_optimization(
+pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: Array1<f64>,
     weights: Array1<f64>,

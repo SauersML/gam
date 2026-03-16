@@ -1,10 +1,11 @@
-use gam::estimate::AdaptiveRegularizationOptions;
-use gam::{
-    CenterStrategy, FitOptions, FittedTermCollectionWithSpec, LikelihoodFamily, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, fit_term_collection,
-    fit_term_collectionwith_spatial_length_scale_optimization, predict_gam,
+use gam::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
+use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
+use gam::predict::predict_gam;
+use gam::smooth::{
+    FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
+use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -64,7 +65,9 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
                     include_intercept: false,
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -72,11 +75,11 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let fitted = fit_term_collection(
+    let fitted = gam::smooth::fit_term_collection_forspec(
         x.view(),
-        y.clone(),
-        weights.clone(),
-        offset.clone(),
+        y.view(),
+        weights.view(),
+        offset.view(),
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
@@ -151,7 +154,9 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                     include_intercept: false,
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -159,11 +164,11 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let fitted = fit_term_collection(
+    let fitted = gam::smooth::fit_term_collection_forspec(
         x.view(),
-        y.clone(),
-        weights.clone(),
-        offset.clone(),
+        y.view(),
+        weights.view(),
+        offset.view(),
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
@@ -286,6 +291,7 @@ fn matern_3d_aniso_fits_successfully() {
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0; d]),
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -304,7 +310,7 @@ fn matern_3d_aniso_fits_successfully() {
     };
 
     let fitted: FittedTermCollectionWithSpec =
-        fit_term_collectionwith_spatial_length_scale_optimization(
+        gam::smooth::fit_term_collectionwith_spatial_length_scale_optimization(
             x.view(),
             y.clone(),
             weights.clone(),

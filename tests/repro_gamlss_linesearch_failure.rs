@@ -1,6 +1,6 @@
 use ndarray::Array1;
 
-use gam::solver::strategy::{
+use gam::solver::outer_strategy::{
     ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig, OuterEval,
 };
 
@@ -17,8 +17,9 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
             hessian: Derivative::Unavailable,
             n_params: 3,
             all_penalty_like: true,
+            has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
-            force_solver: None,
         },
         cost_fn: |ctx: &mut &mut (), x: &Array1<f64>| {
             let r2 = x.dot(x);
@@ -57,6 +58,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         tolerance: 1e-5,
         max_iter: 60,
         fd_step: 1e-5,
+        bounds: None,
         seed_config: gam::solver::seeding::SeedConfig {
             max_seeds: 1,
             screening_budget: 1,
@@ -65,10 +67,10 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         rho_bound: 30.0,
         heuristic_lambdas: None,
         initial_rho: Some(Array1::zeros(3)),
-        fallback_sequence: vec![],
+        fallback_policy: Default::default(),
     };
 
-    let result = gam::solver::strategy::run_outer(&mut obj, &config, "repro-linesearch");
+    let result = gam::solver::outer_strategy::run_outer(&mut obj, &config, "repro-linesearch");
 
     // The objective only has a finite value at the origin with a nonzero
     // gradient — any step away returns INFINITY. The solver must either
@@ -78,7 +80,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         Ok(r) => {
             // If it "converges" it should be at the origin with the initial cost.
             assert!(
-                r.rho.iter().all(|&v| v.abs() <= 1e-6),
+                r.rho.iter().all(|&v: &f64| v.abs() <= 1e-6),
                 "expected convergence at origin, got rho={:?}",
                 r.rho
             );

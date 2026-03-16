@@ -1,8 +1,9 @@
 use gam::{
-    CenterStrategy, FitOptions, FittedTermCollectionWithSpec, LikelihoodFamily, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
-    fit_term_collectionwith_spatial_length_scale_optimization,
+    basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu},
+    estimate::FitOptions,
+    smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec},
+    types::LikelihoodFamily,
+    FitRequest, FitResult, StandardFitRequest,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -76,6 +77,7 @@ fn aniso_matern_recovers_signal_axis() {
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -93,30 +95,36 @@ fn aniso_matern_recovers_signal_axis() {
         max_length_scale: 1e2,
     };
 
-    let fitted: FittedTermCollectionWithSpec =
-        fit_term_collectionwith_spatial_length_scale_optimization(
-            x.view(),
-            y.clone(),
-            weights.clone(),
-            offset.clone(),
-            &spec,
-            LikelihoodFamily::BinomialLogit,
-            &FitOptions {
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                compute_inference: false,
-                max_iter: 60,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                adaptive_regularization: None,
-                penalty_shrinkage_floor: None,
-            },
-            &kappa_options,
-        )
-        .expect("anisotropic Matérn fit should converge");
+    let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
+        data: x.view(),
+        y,
+        weights,
+        offset,
+        spec,
+        family: LikelihoodFamily::BinomialLogit,
+        options: FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 60,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+        },
+        kappa_options,
+        wiggle: None,
+        wiggle_options: None,
+    }))
+    .expect("anisotropic Matérn fit should converge");
+
+    let fitted = match result {
+        FitResult::Standard(s) => s,
+        _ => panic!("expected Standard fit result"),
+    };
 
     // Extract the resolved aniso_log_scales from the fitted spec.
     let resolved_term = &fitted.resolvedspec.smooth_terms[0];
@@ -164,5 +172,5 @@ fn aniso_matern_recovers_signal_axis() {
     );
 
     // Sanity: the fit should have finite coefficients.
-    assert!(fitted.fit.beta.iter().all(|v| v.is_finite()));
+    assert!(fitted.fit.beta.iter().all(|v: &f64| v.is_finite()));
 }

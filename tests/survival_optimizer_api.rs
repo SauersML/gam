@@ -1,4 +1,5 @@
-use gam::{FitOptions, LikelihoodFamily, fit_gam};
+use gam::estimate::{FitOptions, fit_gam};
+use gam::types::LikelihoodFamily;
 use ndarray::array;
 
 #[test]
@@ -22,7 +23,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
         penalty_shrinkage_floor: None,
     };
 
-    let err = match fit_gam(
+    let err: gam::estimate::EstimationError = match fit_gam(
         x.view(),
         y.view(),
         w.view(),

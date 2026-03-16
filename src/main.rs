@@ -10603,11 +10603,11 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCoefficientPriorSpec, CliFirthValidation, ColumnKindTag, DataSchema,
-        FAMILY_GAUSSIAN_LOCATION_SCALE, LikelihoodFamily, LinkChoice, LinkMode, MODEL_VERSION,
-        ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalBaselineConfig,
-        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_linkwiggle,
-        build_survival_feasible_initial_beta, build_survival_time_basis,
+        BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, ColumnKindTag, DataSchema,
+        FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
+        MODEL_VERSION, ModelKind, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
+        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
+        apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
@@ -10617,7 +10617,7 @@ mod tests {
         run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
-        survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
+        survival_basis_supports_structural_monotonicity,
         validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
         write_survival_prediction_csv,
     };
@@ -10638,7 +10638,7 @@ mod tests {
         SmoothTermSpec, TermCollectionSpec,
     };
     use gam::types::{InverseLink, LinkComponent, LinkFunction};
-    use ndarray::{Array1, Array2, ArrayView1, array};
+    use ndarray::{Array1, Array2, ArrayView1, array, s};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand_distr::{Distribution, StandardNormal};
@@ -10744,6 +10744,10 @@ mod tests {
             data: train_path.clone(),
             formula_positional: "y ~ x1 + x2".to_string(),
             predict_noise: None,
+            logslope_formula: None,
+            z_column: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
@@ -10762,6 +10766,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             adaptive_regularization: true,
+            scale_dimensions: false,
             out: Some(model_path.clone()),
         };
         run_fit(fit_args).expect("fit should succeed");
@@ -10813,6 +10818,10 @@ mod tests {
             data: train_path.clone(),
             formula_positional: "y ~ x1 + x2".to_string(),
             predict_noise: None,
+            logslope_formula: None,
+            z_column: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
             firth: true,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
@@ -10831,6 +10840,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             adaptive_regularization: false,
+            scale_dimensions: false,
             out: Some(model_path.clone()),
         };
         run_fit(fit_args).expect("Firth fit should succeed");
@@ -11379,16 +11389,16 @@ mod tests {
 
     #[test]
     fn survival_probability_is_bounded_and_monotone_decreasing_in_eta() {
-        let eta = array![-3.0, -1.0, 0.0, 1.0, 2.0];
+        let eta: Array1<f64> = array![-3.0, -1.0, 0.0, 1.0, 2.0];
         let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
-        assert!(surv.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+        assert!(surv.iter().all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0));
         assert!(surv.windows(2).into_iter().all(|w| w[1] <= w[0] + 1e-12));
     }
 
     #[test]
     fn concordance_depends_on_score_semantics() {
         let time = [12.0, 10.0, 8.0, 6.0, 4.0, 2.0];
-        let eta = array![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let eta: Array1<f64> = array![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
         let surv = eta
             .mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0))
             .to_vec();
@@ -12063,7 +12073,7 @@ mod tests {
             .as_nanos();
         path.push(format!("gam_survival_pred_schema_{ts}.csv"));
 
-        let eta = array![0.5, -0.25];
+        let eta: Array1<f64> = array![0.5, -0.25];
         let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
         write_survival_prediction_csv(&path, eta.view(), surv.view(), None, None, None)
             .expect("write survival prediction csv");
@@ -12222,6 +12232,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
@@ -12257,6 +12268,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         let err = parse_survival_time_basis_config(&args)
@@ -12731,6 +12743,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("sas".to_string());
@@ -12774,6 +12787,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("sas".to_string());
@@ -12811,6 +12825,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("logit".to_string());
@@ -12848,6 +12863,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("beta-logistic".to_string());
@@ -12891,6 +12907,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("beta-logistic".to_string());
@@ -12928,6 +12945,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("logit".to_string());
@@ -12965,6 +12983,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         let link = parse_survival_inverse_link(&args).expect("loglog survival link");
@@ -13030,6 +13049,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("flexible(logit)".to_string());
@@ -13066,6 +13086,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("flexible(blended(logit,probit))".to_string());
@@ -13104,6 +13125,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: None,
         };
         args.link = Some("bogus".to_string());
@@ -13458,6 +13480,7 @@ mod tests {
             threshold_time_degree: 3,
             sigma_time_k: None,
             sigma_time_degree: 3,
+            scale_dimensions: false,
             out: Some(out_path.clone()),
         };
         let result = super::run_survival(args);

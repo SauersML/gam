@@ -7,13 +7,12 @@
 // Reference: Polson, Scott & Windle (2013), "Bayesian Inference for
 // Logistic Models Using Pólya-Gamma Latent Variables", JASA 108(504).
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rand_distr::{Distribution, Exp as RandExp, Normal as RandNormal};
 use statrs::distribution::{Continuous, ContinuousCDF, Exp as StatrsExp, InverseGamma, Normal};
 use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
 
 const PI_SQ: f64 = PI * PI;
-const PI2_SQ_RECIP: f64 = 1.0 / (2.0 * PI_SQ);
 const PRECOMPUTE_K: usize = 50;
 
 /// Sampler for the Pólya-Gamma PG(1, c) distribution.
