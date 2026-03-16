@@ -6706,6 +6706,7 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
+    use std::sync::Arc;
     use crate::types::{Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};

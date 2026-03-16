@@ -13,6 +13,12 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::InverseLink;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use std::sync::Arc;
+
+/// Compute standard errors from a covariance matrix (sqrt of diagonal).
+pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
+    Array1::from_iter(cov.diag().iter().map(|&v| v.max(0.0).sqrt()))
+}
 
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
@@ -366,16 +372,16 @@ fn slice_predict_input(
     rows: std::ops::Range<usize>,
 ) -> Result<PredictInput, EstimationError> {
     Ok(PredictInput {
-        design: DesignMatrix::Dense(
+        design: DesignMatrix::Dense(Arc::new(
             design_row_chunk(&input.design, rows.clone()).map_err(EstimationError::InvalidInput)?,
-        ),
+        )),
         offset: input.offset.slice(ndarray::s![rows.clone()]).to_owned(),
         design_noise: input
             .design_noise
             .as_ref()
             .map(|design| {
                 design_row_chunk(design, rows.clone())
-                    .map(DesignMatrix::Dense)
+                    .map(|d| DesignMatrix::Dense(Arc::new(d)))
                     .map_err(EstimationError::InvalidInput)
             })
             .transpose()?,
@@ -1198,7 +1204,8 @@ impl BernoulliMarginalSlopePredictor {
         let backend = PredictionCovarianceBackend::from_dense(covariance.view());
         linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
-            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)?;
+            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
+                .map_err(|e| e.to_string())?;
             let grad = grad.ok_or_else(|| {
                 "bernoulli marginal-slope analytic predictor gradient was not produced".to_string()
             })?;
@@ -1223,7 +1230,8 @@ impl BernoulliMarginalSlopePredictor {
         };
         linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
-            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)?;
+            let (_, grad) = self.final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
+                .map_err(|e| e.to_string())?;
             let grad = grad.ok_or_else(|| {
                 "bernoulli marginal-slope analytic predictor gradient was not produced".to_string()
             })?;

@@ -13,8 +13,8 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
+    HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift, HyperCoordPair,
+    HyperOperator, InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
     compute_block_penalty_logdet_derivs, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::solver::estimate::{
@@ -3554,14 +3554,14 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
     if let Some(h_joint_unpen) = exact_joint_source {
         let compute_dh = Box::new(exact_newton_dh_closure(
             family,
-            synced.as_ref(),
+            Arc::clone(&synced),
             specs,
             total,
             hessian_workspace.clone(),
         ));
         let compute_d2h = Box::new(exact_newton_d2h_closure(
             family,
-            synced.as_ref(),
+            Arc::clone(&synced),
             specs,
             total,
             hessian_workspace,
@@ -3636,7 +3636,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
 /// The closure checks for non-finite values and replaces with zeros.
 fn exact_newton_dh_closure<'a, F: CustomFamily>(
     family: &'a F,
-    synced_states: &'a [ParameterBlockState],
+    synced_states: Arc<Vec<ParameterBlockState>>,
     specs: &'a [ParameterBlockSpec],
     total: usize,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -3646,7 +3646,7 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
             workspace.directional_derivative(v_k)?
         } else {
             family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                synced_states,
+                synced_states.as_ref(),
                 specs,
                 v_k,
             )?
@@ -3673,7 +3673,7 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
 /// Build a closure computing d²H[u,v] using exact Newton derivatives on synced states.
 fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     family: &'a F,
-    synced_states: &'a [ParameterBlockState],
+    synced_states: Arc<Vec<ParameterBlockState>>,
     specs: &'a [ParameterBlockSpec],
     total: usize,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -3682,7 +3682,7 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
         workspace.second_directional_derivative(u, v)?
     } else {
         family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-            synced_states,
+            synced_states.as_ref(),
             specs,
             u,
             v,
@@ -4963,7 +4963,7 @@ fn joint_outer_evaluate(
                                 joint_trace_diagonal_ridge,
                             );
                             Box::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges_vec)
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
                                     .map_err(|e| {
                                         format!("BlockCoupledOperator from joint Hessian: {e}")
                                     })?,
@@ -5012,7 +5012,7 @@ fn joint_outer_evaluate(
                                 joint_trace_diagonal_ridge,
                             );
                             Box::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges_vec)
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
                                     .map_err(|e| {
                                         format!("BlockCoupledOperator from joint Hessian: {e}")
                                     })?,
@@ -5034,7 +5034,7 @@ fn joint_outer_evaluate(
                 joint_trace_diagonal_ridge,
             );
             Box::new(
-                BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges.to_vec())
+                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
                     .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
             )
         };
@@ -6137,10 +6137,11 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         // ψ coordinates present: require exact Newton Hessian for consistency
         // with the psi derivative callbacks.
         let beta_flat = flatten_state_betas(&inner.block_states, specs);
-        let synced_joint_states =
-            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
+        let synced_joint_states = Arc::new(
+            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?,
+        );
         let hessian_workspace =
-            family.exact_newton_joint_hessian_workspace(&synced_joint_states, specs)?;
+            family.exact_newton_joint_hessian_workspace(synced_joint_states.as_ref(), specs)?;
         let h_joint_unpen = if use_joint_matrix_free_path(total, need_hessian) {
             hessian_workspace
                 .as_ref()
@@ -6205,7 +6206,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         let psi_workspace =
             if need_hessian || family.exact_newton_joint_psi_workspace_for_first_order_terms() {
                 family.exact_newton_joint_psi_workspace(
-                    &synced_joint_states,
+                    synced_joint_states.as_ref(),
                     specs,
                     derivative_blocks,
                 )?
@@ -6215,7 +6216,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
 
         let psi_coords = build_psi_hyper_coords(
             family,
-            &synced_joint_states,
+            synced_joint_states.as_ref(),
             specs,
             derivative_blocks,
             &beta_flat,
@@ -6229,7 +6230,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         let (ext_ext_fn, rho_ext_fn, drift_fn) = if need_hessian {
             let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
                 family,
-                &synced_joint_states,
+                synced_joint_states.as_ref(),
                 specs,
                 derivative_blocks,
                 &beta_flat,
@@ -6240,7 +6241,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             )?;
             let drift_fn = build_psi_drift_deriv_callback(
                 family,
-                &synced_joint_states,
+                synced_joint_states.as_ref(),
                 specs,
                 derivative_blocks,
                 hessian_beta_independent,
@@ -6261,14 +6262,14 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         // Build derivative provider for the ρ coordinates (D_β H[v]).
         let compute_dh = exact_newton_dh_closure(
             family,
-            &synced_joint_states,
+            Arc::clone(&synced_joint_states),
             specs,
             total,
             hessian_workspace.clone(),
         );
         let compute_d2h = exact_newton_d2h_closure(
             family,
-            &synced_joint_states,
+            Arc::clone(&synced_joint_states),
             specs,
             total,
             hessian_workspace,
@@ -7266,7 +7267,7 @@ mod tests {
 
         let specs = vec![ParameterBlockSpec {
             name: "x".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![array![[1.0]]],
             initial_log_lambdas: array![0.0],

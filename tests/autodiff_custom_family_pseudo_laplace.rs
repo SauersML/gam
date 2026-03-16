@@ -8,6 +8,7 @@ use gam::families::custom_family::{
 };
 use gam::matrix::SymmetricMatrix;
 use ndarray::{Array1, Array2, array};
+use std::sync::Arc;
 use num_dual::{DualNum, first_derivative};
 
 mod common;
@@ -159,7 +160,7 @@ fn scalar_pseudo_laplace_psiobjective_f64(psi: f64) -> f64 {
 fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
     let spec = ParameterBlockSpec {
         name: "rho_block".to_string(),
-        design: gam::matrix::DesignMatrix::Dense(array![[1.0]]),
+        design: gam::matrix::DesignMatrix::Dense(Arc::new(array![[1.0]])),
         offset: array![0.0],
         penalties: vec![Array2::eye(1)],
         initial_log_lambdas: array![0.0],
@@ -217,7 +218,7 @@ fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
 fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
     let spec = ParameterBlockSpec {
         name: "psi_block".to_string(),
-        design: gam::matrix::DesignMatrix::Dense(array![[1.0]]),
+        design: gam::matrix::DesignMatrix::Dense(Arc::new(array![[1.0]])),
         offset: array![0.0],
         penalties: vec![],
         initial_log_lambdas: Array1::zeros(0),
