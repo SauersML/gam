@@ -62,6 +62,7 @@ jobs:
 
       - name: Run fuzzer
         run: |
+          set -o pipefail
           python bench/fuzz_vs_mgcv.py --trials 100 --top 30 2>&1 | tee fuzz_output.txt
 
       - name: Upload fuzz results
