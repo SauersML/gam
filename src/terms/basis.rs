@@ -8625,7 +8625,7 @@ const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 /// ψ(1) = −γ, ψ(n+1) = −γ + H_n where H_n = Σ_{j=1}^{n} 1/j.
 #[inline(always)]
 fn digamma_pos_int(n: usize) -> f64 {
-    debug_assert!(n >= 1);
+    assert!(n >= 1);
     let mut h = 0.0_f64;
     for j in 1..n {
         h += 1.0 / j as f64;
