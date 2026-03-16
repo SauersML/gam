@@ -1527,7 +1527,7 @@ pub struct RemlLamlResult {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Canonical definitions live in estimate.rs; re-use them here.
-use crate::solver::estimate::{DP_FLOOR, smooth_floor_dp};
+use crate::solver::estimate::smooth_floor_dp;
 
 /// Ridge floor for denominator safety.
 const DENOM_RIDGE: f64 = 1e-8;
@@ -5318,6 +5318,7 @@ fn rademacher_probe(p: usize, rng: &mut Xoshiro256SS) -> Array1<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::estimate::DP_FLOOR;
     use ndarray::array;
 
     #[test]

@@ -1,7 +1,9 @@
 use gam::pirls::update_glmvectors_by_family;
 use gam::probability::normal_cdf;
 use gam::types::GlmLikelihoodFamily;
-use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
+use gam::estimate::{FitOptions, fit_gam};
+use gam::predict::predict_gam;
+use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -66,7 +68,7 @@ fn probit_fit_and_predict_fast_integration() {
     assert!(
         pred.mean
             .iter()
-            .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+            .all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
     );
 
     let brier = (&pred.mean - &y)
@@ -161,7 +163,7 @@ fn cloglog_fit_and_predict_fast_integration() {
     assert!(
         pred.mean
             .iter()
-            .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+            .all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
     );
 }
 

@@ -1,10 +1,11 @@
-use gam::estimate::AdaptiveRegularizationOptions;
-use gam::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions,
-    FittedTermCollectionWithSpec, LikelihoodFamily, ShapeConstraint, SmoothBasisSpec,
-    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec, fit_term_collection,
-    fit_term_collectionwith_spatial_length_scale_optimization, predict_gam,
+use gam::basis::{CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder};
+use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
+use gam::predict::predict_gam;
+use gam::smooth::{
+    FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
+use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -68,7 +69,9 @@ fn fit_duchon_simulated_10d(
                     power,
                     nullspace_order,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -76,11 +79,11 @@ fn fit_duchon_simulated_10d(
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let fitted = fit_term_collection(
+    let fitted = gam::smooth::fit_term_collection_forspec(
         x.view(),
-        y.clone(),
-        weights.clone(),
-        offset.clone(),
+        y.view(),
+        weights.view(),
+        offset.view(),
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
@@ -167,7 +170,9 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                     power: 2,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -175,11 +180,11 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let fitted = fit_term_collection(
+    let fitted = gam::smooth::fit_term_collection_forspec(
         x.view(),
-        y.clone(),
-        weights.clone(),
-        offset.clone(),
+        y.view(),
+        weights.view(),
+        offset.view(),
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
@@ -316,6 +321,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0; d]),
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -334,7 +340,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
     };
 
     let fitted: FittedTermCollectionWithSpec =
-        fit_term_collectionwith_spatial_length_scale_optimization(
+        gam::smooth::fit_term_collectionwith_spatial_length_scale_optimization(
             x.view(),
             y.clone(),
             weights.clone(),
@@ -448,6 +454,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0; d]),
                 },
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
         }],
@@ -466,7 +473,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
     };
 
     let fitted: FittedTermCollectionWithSpec =
-        fit_term_collectionwith_spatial_length_scale_optimization(
+        gam::smooth::fit_term_collectionwith_spatial_length_scale_optimization(
             x.view(),
             y.clone(),
             weights.clone(),

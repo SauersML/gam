@@ -942,6 +942,33 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub implicit_group_id: Option<usize>,
 }
 
+impl CustomFamilyBlockPsiDerivative {
+    /// Public constructor for use in tests and external consumers.
+    /// Sets `implicit_operator` to `None`.
+    pub fn new(
+        penalty_index: Option<usize>,
+        x_psi: Array2<f64>,
+        s_psi: Array2<f64>,
+        s_psi_components: Option<Vec<(usize, Array2<f64>)>>,
+        x_psi_psi: Option<Vec<Array2<f64>>>,
+        s_psi_psi: Option<Vec<Array2<f64>>>,
+        s_psi_psi_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+    ) -> Self {
+        Self {
+            penalty_index,
+            x_psi,
+            s_psi,
+            s_psi_components,
+            x_psi_psi,
+            s_psi_psi,
+            s_psi_psi_components,
+            implicit_operator: None,
+            implicit_axis: 0,
+            implicit_group_id: None,
+        }
+    }
+}
+
 pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
     fn n_data(&self) -> usize;
     fn p_out(&self) -> usize;
@@ -1629,6 +1656,49 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String>;
+}
+
+pub(crate) struct ExactNewtonJointPsiDirectCache<T> {
+    entries: Vec<Mutex<Option<Option<Arc<T>>>>>,
+}
+
+impl<T> ExactNewtonJointPsiDirectCache<T> {
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            entries: (0..len).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+
+    pub(crate) fn get_or_try_init<F>(
+        &self,
+        index: usize,
+        init: F,
+    ) -> Result<Option<Arc<T>>, String>
+    where
+        F: FnOnce() -> Result<Option<T>, String>,
+    {
+        let Some(entry) = self.entries.get(index) else {
+            return Err(format!(
+                "psi cache index {index} out of bounds for size {}",
+                self.entries.len()
+            ));
+        };
+        {
+            let guard = entry
+                .lock()
+                .map_err(|_| "joint psi direct cache poisoned".to_string())?;
+            if let Some(cached) = guard.as_ref() {
+                return Ok(cached.clone());
+            }
+        }
+
+        let computed = init()?.map(Arc::new);
+        let mut guard = entry
+            .lock()
+            .map_err(|_| "joint psi direct cache poisoned".to_string())?;
+        let cached = guard.get_or_insert_with(|| computed.clone());
+        Ok(cached.clone())
+    }
 }
 
 #[derive(Clone)]

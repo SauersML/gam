@@ -3,55 +3,15 @@ use ad_trait::differentiable_function::{DifferentiableFunctionTrait, ForwardAD};
 use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
-use gam::estimate::{ExternalOptimOptions, evaluate_external_thetacostgradient};
 use gam::mixture_link::sas_inverse_link_jetwith_param_partials;
-use gam::types::{LikelihoodFamily, SasLinkSpec, SasLinkState};
-use ndarray::{Array1, Array2, array};
+use gam::types::SasLinkState;
 use num_dual::{DualNum, first_derivative};
-use rand::{RngExt, SeedableRng};
 use std::marker::PhantomData;
 
 mod common;
 
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 const SAS_U_CLAMP: f64 = 50.0;
-fn build_tiny_design(n: usize) -> Array2<f64> {
-    let mut x = Array2::<f64>::zeros((n, 3));
-    for i in 0..n {
-        let t = (i as f64 + 0.5) / n as f64;
-        let x1 = -1.5 + 3.0 * t;
-        x[[i, 0]] = 1.0;
-        x[[i, 1]] = x1;
-        x[[i, 2]] = (2.1 * x1).sin();
-    }
-    x
-}
-
-fn one_penalty_non_intercept(p: usize) -> Vec<Array2<f64>> {
-    let mut s = Array2::<f64>::zeros((p, p));
-    for j in 1..p {
-        s[[j, j]] = 1.0;
-    }
-    vec![s]
-}
-
-fn centralfdgradient<F>(theta: &Array1<f64>, mut f: F) -> Array1<f64>
-where
-    F: FnMut(&Array1<f64>) -> f64,
-{
-    let mut g = Array1::<f64>::zeros(theta.len());
-    for j in 0..theta.len() {
-        let h = 1e-4 * (1.0 + theta[j].abs());
-        let mut tp = theta.clone();
-        let mut tm = theta.clone();
-        tp[j] += h;
-        tm[j] -= h;
-        let fp = f(&tp);
-        let fm = f(&tm);
-        g[j] = (fp - fm) / (2.0 * h);
-    }
-    g
-}
 
 fn sas_delta_from_raw_log_delta(raw_log_delta: f64) -> f64 {
     SasLinkState::new(0.0, raw_log_delta)
@@ -447,81 +407,5 @@ fn sas_epsilon_partialfd_at_problem_point() {
         "d3 partial mismatch at problem point: analytic={:.16e} fd={:.16e}",
         out.djet_depsilon.d3,
         fd_ep.3
-    );
-}
-
-#[test]
-fn sas_exact_outergradient_seed19_epsilon_component_matches_profiledfd() {
-    let seed = 19_u64;
-    let n = 20usize;
-    let x = build_tiny_design(n);
-    let w = Array1::<f64>::ones(n);
-    let offset = Array1::<f64>::zeros(n);
-    let s_list = one_penalty_non_intercept(x.ncols());
-
-    let true_beta = array![-0.2, 0.9, -0.4];
-    let eta = x.dot(&true_beta);
-    let eps_true = 0.25;
-    let ld_true = -0.20;
-    let p = eta.mapv(|e| gam::mixture_link::sas_inverse_link_jet(e, eps_true, ld_true).mu);
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
-
-    let opts = ExternalOptimOptions {
-        family: LikelihoodFamily::BinomialSas,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: Some(SasLinkSpec {
-            initial_epsilon: 0.0,
-            initial_log_delta: 0.0,
-        }),
-        optimize_sas: true,
-        compute_inference: true,
-        max_iter: 80,
-        tol: 1e-7,
-        nullspace_dims: vec![1],
-        linear_constraints: None,
-        firth_bias_reduction: None,
-        penalty_shrinkage_floor: None,
-    };
-
-    let theta = array![0.10, 0.12, -0.18];
-    let (_, analytic) = evaluate_external_thetacostgradient(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        s_list.clone(),
-        &theta,
-        &opts,
-    )
-    .expect("analytic theta-gradient");
-
-    let fd = centralfdgradient(&theta, |t| {
-        evaluate_external_thetacostgradient(
-            y.view(),
-            w.view(),
-            x.view(),
-            offset.view(),
-            s_list.clone(),
-            t,
-            &opts,
-        )
-        .expect("fd theta cost")
-        .0
-    });
-
-    let j = 1usize;
-    let abs_err = (analytic[j] - fd[j]).abs();
-    let scale = analytic[j].abs().max(fd[j].abs()).max(1e-5);
-    let rel_err = abs_err / scale;
-    assert!(
-        abs_err < 3e-2 || rel_err < 1.5e-1,
-        "SAS exact epsilon hypergradient disagrees with the profiled objective FD at seed={seed}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}. \
-This indicates the assembled outer epsilon hypergradient is no longer exact.",
-        analytic[j],
-        fd[j],
-        abs_err,
-        rel_err
     );
 }

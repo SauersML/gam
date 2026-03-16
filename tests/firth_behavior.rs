@@ -44,7 +44,6 @@ fn fit_beta_norm(
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
-        penalty_shrinkage_floor: None,
     };
     let offset = Array1::<f64>::zeros(y.len());
     let (fit, _) = fit_model_for_fixed_rho(
@@ -88,7 +87,6 @@ fn proxycostwith_pirls(
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
-        penalty_shrinkage_floor: None,
     };
     let offset = Array1::<f64>::zeros(y.len());
     let (fit, _) = fit_model_for_fixed_rho(

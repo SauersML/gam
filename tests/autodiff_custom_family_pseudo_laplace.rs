@@ -3,7 +3,7 @@ use gam::families::custom_family::{
     evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::SymmetricMatrix;
-use gam::{
+use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState,
 };
@@ -126,6 +126,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
             objective_psi: -2.0 * (beta - self.psi) + 0.5 * self.psi,
             score_psi: array![0.0],
             hessian_psi: array![[0.0]],
+            hessian_psi_operator: None,
         }))
     }
 }
@@ -222,15 +223,15 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
         initial_log_lambdas: Array1::zeros(0),
         initial_beta: Some(array![0.0]),
     };
-    let deriv = CustomFamilyBlockPsiDerivative {
-        penalty_index: Some(0),
-        x_psi: Array2::zeros((1, 1)),
-        s_psi: Array2::zeros((1, 1)),
-        s_psi_components: Some(Vec::new()),
-        x_psi_psi: None,
-        s_psi_psi: None,
-        s_psi_psi_components: None,
-    };
+    let deriv = CustomFamilyBlockPsiDerivative::new(
+        Some(0),
+        Array2::zeros((1, 1)),
+        Array2::zeros((1, 1)),
+        Some(Vec::new()),
+        None,
+        None,
+        None,
+    );
     let derivative_blocks = vec![vec![deriv]];
     let options = BlockwiseFitOptions {
         use_remlobjective: true,
