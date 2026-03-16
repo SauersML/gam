@@ -1,31 +1,31 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinethird_derivative_scalar,
+    create_basis, create_difference_penalty_matrix, evaluate_bspline_fourth_derivative_scalar,
+    evaluate_bsplinethird_derivative_scalar, BasisOptions, Dense, KnotSource,
 };
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
-    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction,
+    build_block_spatial_psi_derivatives, custom_family_outer_capability,
+    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
+    second_psi_linear_map, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    custom_family_outer_capability, evaluate_custom_family_joint_hyper, first_psi_linear_map,
-    fit_custom_family, second_psi_linear_map,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
 };
-use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
+use crate::estimate::{fit_gam, FitOptions, UnifiedFitResult};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
-use crate::families::gamlss::{ParameterBlockInput, initializewiggle_knots_from_seed};
+use crate::families::gamlss::{initializewiggle_knots_from_seed, ParameterBlockInput};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::quadrature::compute_gauss_hermite_n;
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design,
+    build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec,
 };
 use crate::types::LikelihoodFamily;
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
@@ -220,21 +220,8 @@ fn deviation_grid_from_knots(
     })))
 }
 
-fn deviation_transform(
-    knots: &Array1<f64>,
-    degree: usize,
-    seed: &Array1<f64>,
-) -> Result<Array2<f64>, String> {
-    let mut sorted = seed.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = if sorted.is_empty() {
-        0.0
-    } else if sorted.len() % 2 == 1 {
-        sorted[sorted.len() / 2]
-    } else {
-        0.5 * (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2])
-    };
-    let anchor = Array1::from_vec(vec![median]);
+fn deviation_transform(knots: &Array1<f64>, degree: usize) -> Result<Array2<f64>, String> {
+    let anchor = Array1::from_vec(vec![0.0]);
     let (value_basis, _) = create_basis::<Dense>(
         anchor.view(),
         KnotSource::Provided(knots.view()),
@@ -257,7 +244,8 @@ fn deviation_transform(
         .map_err(|e| format!("deviation RRQR failed: {e}"))?;
     if rank >= k || z.ncols() == 0 {
         return Err(
-            "deviation anchor constraints removed all columns; increase basis richness".to_string(),
+            "deviation zero-anchor constraints removed all columns; increase basis richness"
+                .to_string(),
         );
     }
     Ok(z)
@@ -267,11 +255,13 @@ fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    let knots = initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)?;
+    let knot_seed = Array1::from_iter(seed.iter().copied().chain(std::iter::once(0.0)));
+    let knots =
+        initializewiggle_knots_from_seed(knot_seed.view(), cfg.degree, cfg.num_internal_knots)?;
     let runtime = DeviationRuntime {
         knots: knots.clone(),
         degree: cfg.degree,
-        transform: deviation_transform(&knots, cfg.degree, seed)?,
+        transform: deviation_transform(&knots, cfg.degree)?,
     };
     let design = runtime.design(seed)?;
     let raw_dim = runtime.transform.nrows();
@@ -1298,9 +1288,14 @@ impl BernoulliMarginalSlopeFamily {
         p: usize,
         label: &str,
     ) -> Result<Array1<f64>, String> {
-        let action =
-            CustomFamilyPsiDesignAction::from_first_derivative(deriv, total_rows, p, 0..total_rows, label)
-                .ok();
+        let action = CustomFamilyPsiDesignAction::from_first_derivative(
+            deriv,
+            total_rows,
+            p,
+            0..total_rows,
+            label,
+        )
+        .ok();
         first_psi_linear_map(action.as_ref(), &deriv.x_psi, total_rows, p).row_vector(row)
     }
 
@@ -1322,7 +1317,10 @@ impl BernoulliMarginalSlopeFamily {
             0..total_rows,
             label,
         )?;
-        let dense = deriv_i.x_psi_psi.as_ref().and_then(|rows| rows.get(local_j));
+        let dense = deriv_i
+            .x_psi_psi
+            .as_ref()
+            .and_then(|rows| rows.get(local_j));
         second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
     }
 
@@ -1516,24 +1514,24 @@ impl BernoulliMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(slices.total);
         match block_idx {
-            0 => out.slice_mut(s![slices.marginal.clone()]).assign(
-                &self.psi_design_row_vector(
+            0 => out
+                .slice_mut(s![slices.marginal.clone()])
+                .assign(&self.psi_design_row_vector(
                     row,
                     deriv,
                     self.y.len(),
                     self.marginal_design.ncols(),
                     "BernoulliMarginalSlopeFamily marginal",
-                )?,
-            ),
-            1 => out.slice_mut(s![slices.logslope.clone()]).assign(
-                &self.psi_design_row_vector(
+                )?),
+            1 => out
+                .slice_mut(s![slices.logslope.clone()])
+                .assign(&self.psi_design_row_vector(
                     row,
                     deriv,
                     self.y.len(),
                     self.logslope_design.ncols(),
                     "BernoulliMarginalSlopeFamily log-slope",
-                )?,
-            ),
+                )?),
             _ => {
                 return Err(format!(
                     "bernoulli marginal-slope psi embedding only supports marginal/logslope blocks, got block {block_idx}"
@@ -1923,8 +1921,7 @@ impl BernoulliMarginalSlopeFamily {
                 diagonal[slices.marginal.start + local_idx] += value * value * row_hessian[[0, 0]];
             }
             for (local_idx, value) in self.logslope_design.row(row).iter().enumerate() {
-                diagonal[slices.logslope.start + local_idx] +=
-                    value * value * row_hessian[[1, 1]];
+                diagonal[slices.logslope.start + local_idx] += value * value * row_hessian[[1, 1]];
             }
 
             if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
@@ -2923,21 +2920,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
             }
             Ok(fit)
         },
-        |rho,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign],
-         need_hessian| {
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);
             let mut derivative_blocks = vec![
-                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
-                    .ok_or_else(|| {
-                        "missing bernoulli marginal spatial psi derivatives".to_string()
-                    })?,
-                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
-                    .ok_or_else(|| {
-                        "missing bernoulli logslope spatial psi derivatives".to_string()
-                    })?,
+                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                    || "missing bernoulli marginal spatial psi derivatives".to_string(),
+                )?,
+                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                    || "missing bernoulli logslope spatial psi derivatives".to_string(),
+                )?,
             ];
             if family.score_warp.is_some() {
                 derivative_blocks.push(Vec::new());
@@ -3182,37 +3174,87 @@ mod tests {
     }
 
     #[test]
-    fn deviation_transform_enforces_constraints_at_seed_median_anchor() {
+    fn deviation_transform_enforces_constraints_at_zero_anchor() {
         let seed = array![4.5, 5.0, 6.0, 7.5, 8.0];
         let degree = 3usize;
-        let knots = initializewiggle_knots_from_seed(seed.view(), degree, 4)
+        let knot_seed = Array1::from_iter(seed.iter().copied().chain(std::iter::once(0.0)));
+        let knots = initializewiggle_knots_from_seed(knot_seed.view(), degree, 4)
             .expect("initialize deviation knots");
-        let transform = deviation_transform(&knots, degree, &seed).expect("deviation transform");
-        let anchor = array![6.0];
+        let transform = deviation_transform(&knots, degree).expect("deviation transform");
+        let anchor = array![0.0];
         let (value_basis, _) = create_basis::<Dense>(
             anchor.view(),
             KnotSource::Provided(knots.view()),
             degree,
             BasisOptions::value(),
         )
-        .expect("median value basis");
+        .expect("zero-anchor value basis");
         let (d1_basis, _) = create_basis::<Dense>(
             anchor.view(),
             KnotSource::Provided(knots.view()),
             degree,
             BasisOptions::first_derivative(),
         )
-        .expect("median derivative basis");
+        .expect("zero-anchor derivative basis");
 
         let anchored_value = value_basis.dot(&transform);
         let anchored_d1 = d1_basis.dot(&transform);
         assert!(
             max_abs(&anchored_value) < 1e-8,
-            "value constraint should be imposed at the seed median anchor"
+            "value constraint should be imposed at zero"
         );
         assert!(
             max_abs(&anchored_d1) < 1e-8,
-            "derivative constraint should be imposed at the seed median anchor"
+            "derivative constraint should be imposed at zero"
+        );
+    }
+
+    #[test]
+    fn build_deviation_block_uses_zero_anchor_even_when_seed_excludes_zero() {
+        let seed = array![4.5, 5.0, 6.0, 7.5, 8.0];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                degree: 3,
+                num_internal_knots: 4,
+                derivative_grid_size: 16,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+
+        let left = prepared.runtime.knots[prepared.runtime.degree];
+        let right =
+            prepared.runtime.knots[prepared.runtime.knots.len() - prepared.runtime.degree - 1];
+        assert!(
+            left <= 0.0 && 0.0 <= right,
+            "deviation knot span should include the zero anchor"
+        );
+
+        let zero_value = prepared
+            .runtime
+            .design(&array![0.0])
+            .expect("zero-anchor design");
+        let zero_d1 = prepared
+            .runtime
+            .first_derivative_design(&array![0.0])
+            .expect("zero-anchor derivative design");
+        assert!(
+            max_abs(&zero_value) < 1e-8,
+            "deviation value basis should vanish at zero"
+        );
+        assert!(
+            max_abs(&zero_d1) < 1e-8,
+            "deviation derivative basis should vanish at zero"
+        );
+
+        let seed_median_value = prepared
+            .runtime
+            .design(&array![6.0])
+            .expect("seed-median design");
+        assert!(
+            max_abs(&seed_median_value) > 1e-6,
+            "seed median should no longer be the enforced anchor"
         );
     }
 

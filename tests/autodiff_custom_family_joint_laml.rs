@@ -13,9 +13,9 @@ use gam::families::custom_family::{
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::pirls::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, array};
-use std::sync::Arc;
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 mod common;
 

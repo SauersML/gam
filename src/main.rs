@@ -21,11 +21,11 @@ use gam::estimate::{
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
     predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
-use gam::families::family_meta::{
-    family_to_link, family_to_string, is_binomial_family, pretty_familyname,
-};
 use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime,
+};
+use gam::families::family_meta::{
+    family_to_link, family_to_string, is_binomial_family, pretty_familyname,
 };
 use gam::families::scale_design::{
     ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
@@ -70,11 +70,11 @@ use gam::survival_location_scale::{
     SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
     residual_distribution_inverse_link,
 };
+use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
     SasLinkSpec, SasLinkState,
 };
-use gam::transformation_normal::TransformationNormalConfig;
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
@@ -215,7 +215,9 @@ struct FitArgs {
         long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula_positional: String,
-    /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
+    /// Fit a second formula for the scale/noise block in location-scale mode.
+    /// This does not change the base mean link; use `link(type=...)` when you
+    /// want a non-default binomial link.
     #[arg(long = "predict-noise", alias = "predict-variance")]
     predict_noise: Option<String>,
     /// Secondary formula for the ancestry-varying log-slope surface in the
@@ -743,9 +745,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     if args.logslope_formula.is_some() || args.z_column.is_some() {
         if args.logslope_formula.is_none() || args.z_column.is_none() {
-            return Err(
-                "--logslope-formula and --z-column must be provided together".to_string(),
-            );
+            return Err("--logslope-formula and --z-column must be provided together".to_string());
         }
         return run_fit_bernoulli_marginal_slope(
             &args,
@@ -883,13 +883,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .map(|c| c.link)
         .unwrap_or_else(|| family_to_link(family));
 
-    if args.predict_noise.is_some()
-        && family == LikelihoodFamily::BinomialLogit
-        && link_choice.is_none()
-    {
-        family = LikelihoodFamily::BinomialProbit;
-        effective_link = family_to_link(family);
-    }
     let formula_linkwiggle = parsed.linkwiggle.clone();
     if parsed.timewiggle.is_some() {
         return Err("timewiggle(...) is only supported for survival models".to_string());
@@ -1276,13 +1269,11 @@ fn run_fit_bernoulli_marginal_slope(
         .z_column
         .as_ref()
         .ok_or_else(|| "missing --z-column".to_string())?;
-    let logslope_formula = normalizenoise_formula(logslope_formula_raw, &parsed.response);
-    let parsed_logslope = parse_formula(&logslope_formula)?;
-    if parsed_logslope.response != parsed.response {
-        return Err(
-            "--logslope-formula must use the same response column as the main formula".to_string(),
-        );
-    }
+    let (logslope_formula, parsed_logslope) = parse_matching_auxiliary_formula(
+        logslope_formula_raw,
+        &parsed.response,
+        "--logslope-formula",
+    )?;
     if parsed_logslope.linkspec.is_some() {
         return Err(
             "link(...) is not supported in --logslope-formula for the bernoulli marginal-slope family"
@@ -1381,9 +1372,7 @@ fn run_fit_bernoulli_marginal_slope(
     progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",
-        FAMILY_BERNOULLI_MARGINAL_SLOPE,
-        solved.fit.outer_iterations,
-        solved.fit.outer_converged
+        FAMILY_BERNOULLI_MARGINAL_SLOPE, solved.fit.outer_iterations, solved.fit.outer_converged
     );
     print_spatial_aniso_scales(&solved.marginalspec_resolved);
     print_spatial_aniso_scales(&solved.logslopespec_resolved);
@@ -1428,9 +1417,7 @@ fn run_fit_transformation_normal(
         return Err("--firth is not supported for the transformation-normal family".to_string());
     }
     if parsed.linkspec.is_some() {
-        return Err(
-            "link(...) is not supported for the transformation-normal family".to_string(),
-        );
+        return Err("link(...) is not supported for the transformation-normal family".to_string());
     }
     if parsed.linkwiggle.is_some() {
         return Err(
@@ -1438,12 +1425,13 @@ fn run_fit_transformation_normal(
         );
     }
     if args.predict_noise.is_some() {
-        return Err(
-            "--predict-noise cannot be combined with --transformation-normal".to_string(),
-        );
+        return Err("--predict-noise cannot be combined with --transformation-normal".to_string());
     }
 
-    progress.set_stage("fit", "building transformation-normal covariate specification");
+    progress.set_stage(
+        "fit",
+        "building transformation-normal covariate specification",
+    );
     let mut covariate_spec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut covariate_spec);
@@ -1489,9 +1477,7 @@ fn run_fit_transformation_normal(
     progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",
-        FAMILY_TRANSFORMATION_NORMAL,
-        solved.fit.outer_iterations,
-        solved.fit.outer_converged
+        FAMILY_TRANSFORMATION_NORMAL, solved.fit.outer_iterations, solved.fit.outer_converged
     );
     print_spatial_aniso_scales(&solved.covariate_spec_resolved);
 
@@ -1531,8 +1517,8 @@ fn run_fitwith_predict_noise(
     formula_text: &str,
 ) -> Result<(), String> {
     let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
-    let noise_formula = normalizenoise_formula(noise_formula_raw, &parsed.response);
-    let parsed_noise = parse_formula(&noise_formula)?;
+    let (noise_formula, parsed_noise) =
+        parse_matching_auxiliary_formula(noise_formula_raw, &parsed.response, "--predict-noise")?;
     if parsed_noise.linkwiggle.is_some() {
         return Err(
             "linkwiggle(...) is only supported in the mean formula, not --predict-noise"
@@ -2017,9 +2003,9 @@ fn build_predict_input_for_model(
         PredictModelClass::Survival => Err(
             "build_predict_input_for_model should not be called for survival models".to_string(),
         ),
-        PredictModelClass::TransformationNormal => Err(
-            "prediction for transformation-normal models is not yet supported".to_string(),
-        ),
+        PredictModelClass::TransformationNormal => {
+            Err("prediction for transformation-normal models is not yet supported".to_string())
+        }
     }
 }
 
@@ -2260,9 +2246,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             "bernoulli marginal-slope model unexpectedly bypassed the unified prediction path"
                 .to_string(),
         ),
-        PredictModelClass::TransformationNormal => Err(
-            "prediction for transformation-normal models is not yet supported".to_string(),
-        ),
+        PredictModelClass::TransformationNormal => {
+            Err("prediction for transformation-normal models is not yet supported".to_string())
+        }
         PredictModelClass::Standard => run_predict_standard(
             &mut progress,
             &args,
@@ -6239,8 +6225,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             )?,
             PredictModelClass::BernoulliMarginalSlope => {
                 return Err(
-                    "generate is not available for bernoulli marginal-slope models yet"
-                        .to_string(),
+                    "generate is not available for bernoulli marginal-slope models yet".to_string(),
                 );
             }
             PredictModelClass::Survival => {
@@ -8096,6 +8081,21 @@ fn normalizenoise_formula(noise: &str, response: &str) -> String {
     } else {
         format!("{response} ~ {noise}")
     }
+}
+
+fn parse_matching_auxiliary_formula(
+    formula: &str,
+    response: &str,
+    flag_name: &str,
+) -> Result<(String, ParsedFormula), String> {
+    let normalized_formula = normalizenoise_formula(formula, response);
+    let parsed_formula = parse_formula(&normalized_formula)?;
+    if parsed_formula.response != response {
+        return Err(format!(
+            "{flag_name} must use the same response column as the main formula"
+        ));
+    }
+    Ok((normalized_formula, parsed_formula))
 }
 
 fn print_inference_summary(notes: &[String]) {
@@ -10782,9 +10782,8 @@ mod tests {
         run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
-        survival_basis_supports_structural_monotonicity,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_survival_prediction_csv,
+        survival_basis_supports_structural_monotonicity, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use crate::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
     use csv::StringRecord;
@@ -10855,6 +10854,52 @@ mod tests {
             .expect("sigma should parse")
     }
 
+    fn write_binomial_location_scale_train_csv(path: &std::path::Path) {
+        fs::write(
+            path,
+            "x1,x2,y\n-2.0,-1.2,0\n-1.7,0.4,0\n-1.5,-0.7,0\n-1.2,1.1,1\n-1.0,-0.3,0\n-0.8,0.9,0\n-0.5,-1.1,1\n-0.2,0.2,0\n0.0,-0.8,1\n0.3,1.0,0\n0.5,-0.4,1\n0.7,0.6,1\n0.9,-1.3,0\n1.1,0.3,1\n1.4,-0.2,1\n1.8,1.2,1\n",
+        )
+        .expect("write training csv");
+    }
+
+    fn location_scale_fit_args(
+        data: PathBuf,
+        out: PathBuf,
+        formula: &str,
+        noise_formula: &str,
+    ) -> FitArgs {
+        FitArgs {
+            data,
+            formula_positional: formula.to_string(),
+            predict_noise: Some(noise_formula.to_string()),
+            logslope_formula: None,
+            z_column: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
+            transformation_normal: false,
+            firth: false,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            adaptive_regularization: false,
+            scale_dimensions: false,
+            out: Some(out),
+        }
+    }
+
     #[test]
     fn cli_firth_validation_uses_shared_family_support_rule() {
         let err = validate_cli_firth_configuration(CliFirthValidation {
@@ -10890,6 +10935,70 @@ mod tests {
             link_choice: Some(&choice),
         })
         .expect("flexible logit should remain eligible for Firth");
+    }
+
+    #[test]
+    fn cli_predict_noise_without_explicit_link_keeps_binomial_logit_base_link() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        let model_path = td.path().join("model.json");
+        write_binomial_location_scale_train_csv(&train_path);
+
+        run_fit(location_scale_fit_args(
+            train_path,
+            model_path.clone(),
+            "y ~ x1",
+            "y ~ x2",
+        ))
+        .expect("location-scale fit should succeed");
+
+        let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
+        assert_eq!(saved.link.as_deref(), Some("logit"));
+        match &saved.family_state {
+            FittedFamily::LocationScale {
+                likelihood,
+                base_link,
+            } => {
+                assert_eq!(*likelihood, LikelihoodFamily::BinomialLogit);
+                assert!(matches!(
+                    base_link.as_ref(),
+                    Some(InverseLink::Standard(LinkFunction::Logit))
+                ));
+            }
+            other => panic!("expected location-scale family state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_predict_noise_with_explicit_probit_keeps_binomial_probit_base_link() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        let model_path = td.path().join("model.json");
+        write_binomial_location_scale_train_csv(&train_path);
+
+        run_fit(location_scale_fit_args(
+            train_path,
+            model_path.clone(),
+            "y ~ x1 + link(type=probit)",
+            "y ~ x2",
+        ))
+        .expect("explicit probit location-scale fit should succeed");
+
+        let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
+        assert_eq!(saved.link.as_deref(), Some("probit"));
+        match &saved.family_state {
+            FittedFamily::LocationScale {
+                likelihood,
+                base_link,
+            } => {
+                assert_eq!(*likelihood, LikelihoodFamily::BinomialProbit);
+                assert!(matches!(
+                    base_link.as_ref(),
+                    Some(InverseLink::Standard(LinkFunction::Probit))
+                ));
+            }
+            other => panic!("expected location-scale family state, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11558,7 +11667,10 @@ mod tests {
     fn survival_probability_is_bounded_and_monotone_decreasing_in_eta() {
         let eta: Array1<f64> = array![-3.0, -1.0, 0.0, 1.0, 2.0];
         let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
-        assert!(surv.iter().all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+        assert!(
+            surv.iter()
+                .all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        );
         assert!(surv.windows(2).into_iter().all(|w| w[1] <= w[0] + 1e-12));
     }
 
@@ -14059,6 +14171,24 @@ mod tests {
     fn parse_formula_reports_unbalanced_parentheses() {
         let err = parse_formula("y ~ s(x, k=10").expect_err("expected parse failure");
         assert!(err.contains("unbalanced parentheses"));
+    }
+
+    #[test]
+    fn auxiliary_formula_normalizes_rhs_only_input_to_main_response() {
+        let (normalized, parsed) = parse_matching_auxiliary_formula("s(x)", "y", "--predict-noise")
+            .expect("auxiliary formula");
+        assert_eq!(normalized, "y ~ s(x)");
+        assert_eq!(parsed.response, "y");
+    }
+
+    #[test]
+    fn auxiliary_formula_rejects_mismatched_response_column() {
+        let err = parse_matching_auxiliary_formula("noise ~ s(x)", "y", "--predict-noise")
+            .expect_err("mismatched response should fail");
+        assert_eq!(
+            err,
+            "--predict-noise must use the same response column as the main formula"
+        );
     }
 
     #[test]

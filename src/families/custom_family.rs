@@ -3456,7 +3456,9 @@ fn exact_newton_joint_hessian_source_from_workspace(
         ));
     }
     if diagonal.iter().any(|value| !value.is_finite()) {
-        return Err(format!("{context}: operator diagonal contains non-finite values"));
+        return Err(format!(
+            "{context}: operator diagonal contains non-finite values"
+        ));
     }
 
     let zero = Array1::<f64>::zeros(total);
@@ -3471,7 +3473,9 @@ fn exact_newton_joint_hessian_source_from_workspace(
         ));
     }
     if zero_image.iter().any(|value| !value.is_finite()) {
-        return Err(format!("{context}: operator matvec returned non-finite values"));
+        return Err(format!(
+            "{context}: operator matvec returned non-finite values"
+        ));
     }
 
     let workspace_apply = Arc::clone(workspace);
@@ -3950,7 +3954,8 @@ fn blockwise_logdet_terms<F: CustomFamily>(
                             Array1::<f64>::zeros(total)
                         }
                     };
-                    let penalty = apply_joint_block_penalty(&apply_ranges, apply_s.as_ref(), v, 0.0);
+                    let penalty =
+                        apply_joint_block_penalty(&apply_ranges, apply_s.as_ref(), v, 0.0);
                     out += &penalty;
                     out
                 }) {
@@ -4361,7 +4366,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 };
                 add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
                 let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-                delta = solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE);
+                delta =
+                    solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE);
             }
 
             let Some(mut delta) = delta else {
@@ -4973,10 +4979,9 @@ fn joint_outer_evaluate(
                                 joint_trace_diagonal_ridge,
                             );
                             Box::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
-                                    .map_err(|e| {
-                                        format!("BlockCoupledOperator from joint Hessian: {e}")
-                                    })?,
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
+                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
+                                )?,
                             )
                         }
                     }
@@ -5022,10 +5027,9 @@ fn joint_outer_evaluate(
                                 joint_trace_diagonal_ridge,
                             );
                             Box::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
-                                    .map_err(|e| {
-                                        format!("BlockCoupledOperator from joint Hessian: {e}")
-                                    })?,
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
+                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
+                                )?,
                             )
                         }
                     }
@@ -6147,9 +6151,12 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         // ψ coordinates present: require exact Newton Hessian for consistency
         // with the psi derivative callbacks.
         let beta_flat = flatten_state_betas(&inner.block_states, specs);
-        let synced_joint_states = Arc::new(
-            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?,
-        );
+        let synced_joint_states = Arc::new(synchronized_states_from_flat_beta(
+            family,
+            specs,
+            &inner.block_states,
+            &beta_flat,
+        )?);
         let hessian_workspace =
             family.exact_newton_joint_hessian_workspace(synced_joint_states.as_ref(), specs)?;
         let h_joint_unpen = if use_joint_matrix_free_path(total, need_hessian) {
@@ -6984,23 +6991,26 @@ pub fn fit_custom_family<F: CustomFamily>(
         };
         let no_pen = vec![Array1::zeros(0); specs.len()];
         let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen);
-        return blockwise_fit_from_parts(BlockwiseFitResultParts {
-            block_states: inner.block_states,
-            log_likelihood: inner.log_likelihood,
-            log_lambdas: Array1::zeros(0),
-            lambdas: Array1::zeros(0),
-            covariance_conditional,
-            penalized_objective: finite_penalizedobjective(
-                inner.log_likelihood,
-                inner.penalty_value,
-                reml_term,
-            ),
-            outer_iterations: 0,
-            outer_gradient_norm: 0.0,
-            inner_cycles: inner.cycles,
-            outer_converged: true,
-            geometry,
-        }, specs)
+        return blockwise_fit_from_parts(
+            BlockwiseFitResultParts {
+                block_states: inner.block_states,
+                log_likelihood: inner.log_likelihood,
+                log_lambdas: Array1::zeros(0),
+                lambdas: Array1::zeros(0),
+                covariance_conditional,
+                penalized_objective: finite_penalizedobjective(
+                    inner.log_likelihood,
+                    inner.penalty_value,
+                    reml_term,
+                ),
+                outer_iterations: 0,
+                outer_gradient_norm: 0.0,
+                inner_cycles: inner.cycles,
+                outer_converged: true,
+                geometry,
+            },
+            specs,
+        )
         .map_err(CustomFamilyError::Optimization);
     }
 
@@ -7187,35 +7197,38 @@ pub fn fit_custom_family<F: CustomFamily>(
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
-    blockwise_fit_from_parts(BlockwiseFitResultParts {
-        block_states: inner.block_states,
-        log_likelihood: inner.log_likelihood,
-        log_lambdas: rho_star.clone(),
-        lambdas: rho_star.mapv(f64::exp),
-        covariance_conditional,
-        penalized_objective: finite_penalizedobjective(
-            inner.log_likelihood,
-            inner.penalty_value,
-            if include_exact_newton_logdet_h(family, options) {
-                0.5 * inner.block_logdet_h
-            } else {
-                0.0
-            } - if include_exact_newton_logdet_s(family, options) {
-                0.5 * inner.block_logdet_s
+    blockwise_fit_from_parts(
+        BlockwiseFitResultParts {
+            block_states: inner.block_states,
+            log_likelihood: inner.log_likelihood,
+            log_lambdas: rho_star.clone(),
+            lambdas: rho_star.mapv(f64::exp),
+            covariance_conditional,
+            penalized_objective: finite_penalizedobjective(
+                inner.log_likelihood,
+                inner.penalty_value,
+                if include_exact_newton_logdet_h(family, options) {
+                    0.5 * inner.block_logdet_h
+                } else {
+                    0.0
+                } - if include_exact_newton_logdet_s(family, options) {
+                    0.5 * inner.block_logdet_s
+                } else {
+                    0.0
+                },
+            ),
+            outer_iterations: outer_iters,
+            outer_gradient_norm: if outer_grad_norm.is_finite() {
+                outer_grad_norm
             } else {
                 0.0
             },
-        ),
-        outer_iterations: outer_iters,
-        outer_gradient_norm: if outer_grad_norm.is_finite() {
-            outer_grad_norm
-        } else {
-            0.0
+            inner_cycles: inner.cycles,
+            outer_converged: outer_result.converged,
+            geometry,
         },
-        inner_cycles: inner.cycles,
-        outer_converged: outer_result.converged,
-        geometry,
-    }, specs)
+        specs,
+    )
     .map_err(CustomFamilyError::Optimization)
 }
 
@@ -7357,7 +7370,11 @@ mod tests {
             2,
             "2D anisotropic term should expose two psi rows"
         );
-        assert_eq!(info_list.len(), 2, "info list should expose the same two psi rows");
+        assert_eq!(
+            info_list.len(),
+            2,
+            "info list should expose the same two psi rows"
+        );
 
         let x_cross_01 = derivs[0]
             .x_psi_psi
@@ -7391,8 +7408,14 @@ mod tests {
             .aniso_cross_designs
             .as_ref()
             .expect("psi1 cross designs");
-        assert_eq!(cross_designs_01[0].0, 1, "psi0 should point at psi1 cross design");
-        assert_eq!(cross_designs_10[0].0, 0, "psi1 should point at psi0 cross design");
+        assert_eq!(
+            cross_designs_01[0].0, 1,
+            "psi0 should point at psi1 cross design"
+        );
+        assert_eq!(
+            cross_designs_10[0].0, 0,
+            "psi1 should point at psi0 cross design"
+        );
         let expected_x_cross_01 = EmbeddedColumnBlock::new(
             &cross_designs_01[0].1,
             info_list[0].global_range.clone(),
@@ -7453,13 +7476,11 @@ mod tests {
             .as_ref()
             .expect("psi1 cross penalties");
         assert_eq!(
-            cross_penalties_01[0].0,
-            1,
+            cross_penalties_01[0].0, 1,
             "psi0 should point at psi1 cross penalties"
         );
         assert_eq!(
-            cross_penalties_10[0].0,
-            0,
+            cross_penalties_10[0].0, 0,
             "psi1 should point at psi0 cross penalties"
         );
         let expected_s_cross_01 = cross_penalties_01[0]

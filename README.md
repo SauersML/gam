@@ -176,6 +176,7 @@ Auto family resolution:
 
 - Binary `{0,1}` response -> binomial logit
 - Anything else -> gaussian identity
+- `--predict-noise` does not change that default; write `link(type=probit)` (or another explicit link) in the mean formula when you want a different binomial base link
 
 ### 2. Location-scale fits
 
@@ -185,6 +186,18 @@ Use a second formula for the scale/noise block:
 gam fit train.csv 'y ~ x1 + smooth(x2)' \
   --predict-noise 'y ~ smooth(x1)' \
   --out locscale.model.json
+```
+
+If you want a probit-vs-probit comparison between mean-only and location-scale
+fits, declare the link explicitly in both formulas:
+
+```bash
+gam fit train.csv 'y ~ x1 + smooth(x2) + link(type=probit)' \
+  --out probit.model.json
+
+gam fit train.csv 'y ~ x1 + smooth(x2) + link(type=probit)' \
+  --predict-noise 'y ~ smooth(x1)' \
+  --out probit.locscale.model.json
 ```
 
 The CLI exposes this path for Gaussian and binomial families, but current runtime behavior is still uneven enough that you should treat it as experimental and verify it on your exact formula/data combination before relying on it.

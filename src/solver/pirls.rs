@@ -780,9 +780,7 @@ impl PirlsWorkspace {
                                 .and(x_slice.rows())
                                 .and(&w_slice)
                                 .for_each(|mut dst, src, &w| {
-                                    Zip::from(&mut dst)
-                                        .and(&src)
-                                        .for_each(|d, &s| *d = s * w);
+                                    Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
                                 });
                         }
                         let chunkrowsview = chunk_buf.slice(s![0..rows, ..]);
@@ -2291,16 +2289,12 @@ fn add_diagonal_to_upper_sparse(
                 triplets.push(Triplet::new(row_idx[idx], col, new_values[idx]));
             }
         }
-        return SparseColMat::try_new_from_triplets(
-            matrix.nrows(),
-            matrix.ncols(),
-            &triplets,
-        )
-        .map_err(|_| {
-            EstimationError::InvalidInput(
-                "failed to rebuild sparse matrix with diagonal update".to_string(),
-            )
-        });
+        return SparseColMat::try_new_from_triplets(matrix.nrows(), matrix.ncols(), &triplets)
+            .map_err(|_| {
+                EstimationError::InvalidInput(
+                    "failed to rebuild sparse matrix with diagonal update".to_string(),
+                )
+            });
     }
 
     // Slow path: diagonal entries missing from structure, must rebuild.
@@ -6697,11 +6691,11 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
-    use std::sync::Arc;
     use crate::types::{Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+    use std::sync::Arc;
 
     #[test]
     fn gaussian_scale_uses_offset_in_residuals() {

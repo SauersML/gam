@@ -39,9 +39,7 @@ use crate::linalg::utils::{
     matrix_inversewith_regularization, row_mismatch_message,
 };
 use crate::matrix::DesignMatrix;
-use crate::mixture_link::{
-    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
-};
+use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
@@ -4484,10 +4482,10 @@ where
 
 #[cfg(test)]
 mod fd_policy_tests {
+    use super::reml::hyper::{LINK_BINOMIAL_AUX_MU_EPS, link_binomial_aux};
     use super::*;
     use crate::linalg::utils::max_abs_diag;
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-    use super::reml::hyper::{link_binomial_aux, LINK_BINOMIAL_AUX_MU_EPS};
     use crate::types::LikelihoodFamily;
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
@@ -4604,7 +4602,8 @@ mod fd_policy_tests {
         reml_state.set_link_states(None, Some(sas_state));
 
         let pirls_result = reml_state
-            .obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone())
+            .obtain_eval_bundle(&rho)
+            .map(|b| b.pirls_result.clone())
             .expect("pirls_result");
         println!(
             "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19 lastgradient_norm={:.6e} status={:?} iteration={}",
@@ -4622,7 +4621,8 @@ mod fd_policy_tests {
             );
             let mu = jets.jet.mu;
             let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
-            if (mu.is_finite() && (mu <= LINK_BINOMIAL_AUX_MU_EPS || mu >= 1.0 - LINK_BINOMIAL_AUX_MU_EPS))
+            if (mu.is_finite()
+                && (mu <= LINK_BINOMIAL_AUX_MU_EPS || mu >= 1.0 - LINK_BINOMIAL_AUX_MU_EPS))
                 || !mu.is_finite()
             {
                 clampedobs += 1;
@@ -4724,7 +4724,10 @@ mod fd_policy_tests {
             })
             .expect("fd sas state");
             state.set_link_states(None, Some(sas_state));
-            let pirls = state.obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone()).expect("fd pirls");
+            let pirls = state
+                .obtain_eval_bundle(&rho)
+                .map(|b| b.pirls_result.clone())
+                .expect("fd pirls");
             pirls.beta_transformed.as_ref().clone()
         };
         let beta_p = beta_at(theta[1] + fd_h);
@@ -4805,7 +4808,8 @@ mod fd_policy_tests {
         reml_state.set_link_states(None, Some(sas_state));
 
         let pirls_result = reml_state
-            .obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone())
+            .obtain_eval_bundle(&rho)
+            .map(|b| b.pirls_result.clone())
             .expect("pirls_result");
         let beta0 = pirls_result.beta_transformed.as_ref().clone();
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
@@ -4952,7 +4956,8 @@ mod fd_policy_tests {
         reml_state.set_link_states(None, Some(sas_state));
 
         let pirls_result = reml_state
-            .obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone())
+            .obtain_eval_bundle(&rho)
+            .map(|b| b.pirls_result.clone())
             .expect("pirls_result");
         let beta0 = pirls_result.beta_transformed.as_ref().clone();
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();

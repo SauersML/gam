@@ -906,31 +906,6 @@ pub fn precompute_reparam_invariant(
     })
 }
 
-/// Implements a fast, numerically stable reparameterization of the coefficient
-/// space that preserves the conditioning benefits of Wood (2011) Appendix B
-/// without the iterative similarity-transform loop.
-///
-/// The new strategy builds a lambda-independent “balanced” penalty matrix by
-/// scaling each penalty to unit Frobenius norm, performs a single eigenvalue
-/// decomposition to separate penalized and null-space directions, and then
-/// whitens the penalized block using the current smoothing parameters. This
-/// yields the same well-conditioned basis as the recursive algorithm while
-/// avoiding its repeated \(O(q^3)\) eigendecompositions.
-///
-/// Each entry in `rs_list` is a `p × rank_k` penalty square root for penalty
-/// `k`. The vector `lambdas` provides the smoothing parameters, and `layout`
-/// defines the model’s coefficient structure. The function returns the
-/// transformed penalties, the orthogonal basis, and log-determinant
-/// information required by PIRLS.
-pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>],
-    lambdas: &[f64],
-    p: usize,
-) -> Result<ReparamResult, EstimationError> {
-    let invariant = precompute_reparam_invariant(rs_list, p)?;
-    stable_reparameterizationwith_invariant(rs_list, lambdas, p, &invariant, None)
-}
-
 /// Apply stable reparameterization using precomputed lambda-invariant structures.
 ///
 /// `penalty_shrinkage_floor`: optional relative shrinkage floor for eigenvalues
@@ -1554,7 +1529,11 @@ mod tests {
         // where d_l are eigenvalues of S_k and δ = 1e-10 * max(lambda*d_l).
         let s_k_eigs = [9.0_f64, 1.0_f64];
         let lambda = 5.0_f64;
-        let max_ev = s_k_eigs.iter().map(|&d| lambda * d).fold(0.0_f64, f64::max).max(1.0);
+        let max_ev = s_k_eigs
+            .iter()
+            .map(|&d| lambda * d)
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
         let delta = 1e-10 * max_ev;
         let expected_det1: f64 = s_k_eigs
             .iter()

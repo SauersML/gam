@@ -501,26 +501,6 @@ struct LinearFitConditioning {
     columns: Vec<LinearColumnConditioning>,
 }
 
-pub struct TwoBlockSpatialLengthScaleOptimizationResult<FitOut> {
-    pub resolved_meanspec: TermCollectionSpec,
-    pub resolved_noisespec: TermCollectionSpec,
-    pub mean_design: TermCollectionDesign,
-    pub noise_design: TermCollectionDesign,
-    pub fit: FitOut,
-}
-
-#[derive(Debug, Clone)]
-pub struct TwoBlockExactJointHyperSetup {
-    // Exact-joint setup is parameterized in (rho, log_kappa). The spec still stores
-    // length_scale, so conversion happens only when rebuilding a candidate spec.
-    rho0: Array1<f64>,
-    rho_lower: Array1<f64>,
-    rho_upper: Array1<f64>,
-    log_kappa0: SpatialLogKappaCoords,
-    log_kappa_lower: SpatialLogKappaCoords,
-    log_kappa_upper: SpatialLogKappaCoords,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct SpatialPsiDerivative {
     // These are derivatives with respect to psi = log(kappa), not log(length_scale).
@@ -917,81 +897,6 @@ pub(crate) fn sync_aniso_contrasts_from_metadata(
                 let _ = set_spatial_aniso_log_scales(spec, term_idx, eta);
             }
         }
-    }
-}
-
-impl TwoBlockExactJointHyperSetup {
-    fn sanitize_rho_seed(
-        rho0: Array1<f64>,
-        rho_lower: &Array1<f64>,
-        rho_upper: &Array1<f64>,
-    ) -> Array1<f64> {
-        Array1::from_iter(rho0.iter().enumerate().map(|(idx, &value)| {
-            let lo = rho_lower[idx];
-            let hi = rho_upper[idx];
-            let fallback = 0.0_f64.clamp(lo, hi);
-            if value.is_finite() {
-                value.clamp(lo, hi)
-            } else {
-                fallback
-            }
-        }))
-    }
-
-    pub(crate) fn new(
-        rho0: Array1<f64>,
-        rho_lower: Array1<f64>,
-        rho_upper: Array1<f64>,
-        log_kappa0: SpatialLogKappaCoords,
-        log_kappa_lower: SpatialLogKappaCoords,
-        log_kappa_upper: SpatialLogKappaCoords,
-    ) -> Self {
-        let rho0 = Self::sanitize_rho_seed(rho0, &rho_lower, &rho_upper);
-        Self {
-            rho0,
-            rho_lower,
-            rho_upper,
-            log_kappa0,
-            log_kappa_lower,
-            log_kappa_upper,
-        }
-    }
-
-    pub(crate) fn rho_dim(&self) -> usize {
-        self.rho0.len()
-    }
-
-    pub(crate) fn log_kappa_dim(&self) -> usize {
-        self.log_kappa0.len()
-    }
-
-    pub(crate) fn theta0(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
-        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho0);
-        out.slice_mut(s![self.rho_dim()..])
-            .assign(self.log_kappa0.as_array());
-        out
-    }
-
-    pub(crate) fn lower(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
-        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_lower);
-        out.slice_mut(s![self.rho_dim()..])
-            .assign(self.log_kappa_lower.as_array());
-        out
-    }
-
-    pub(crate) fn upper(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
-        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_upper);
-        out.slice_mut(s![self.rho_dim()..])
-            .assign(self.log_kappa_upper.as_array());
-        out
-    }
-
-    /// Per-term dimensionality layout for the ψ block.
-    pub(crate) fn log_kappa_dims_per_term(&self) -> Vec<usize> {
-        self.log_kappa0.dims_per_term().to_vec()
     }
 }
 
@@ -4736,8 +4641,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     for (idx, penalty) in retained_penalties.iter().enumerate() {
         fixed_total.scaled_add(rho_star[idx].exp(), penalty);
     }
-    let final_family = base_family
-        .with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
+    let final_family =
+        base_family.with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
@@ -8019,7 +7924,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     } else {
         SpatialLogKappaCoords::upper_bounds(spatial_terms.len(), kappa_options)
     };
-    let setup = TwoBlockExactJointHyperSetup::new(
+    let setup = ExactJointHyperSetup::new(
         best.fit.lambdas.mapv(f64::ln),
         Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
         Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
@@ -9543,503 +9448,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct TwoBlockExactJointDesignCache<'d> {
-    mean_realizer: FrozenTermCollectionIncrementalRealizer<'d>,
-    noise_realizer: FrozenTermCollectionIncrementalRealizer<'d>,
-    current_theta: Option<Array1<f64>>,
-    last_cost: Option<f64>,
-    last_eval: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
-    mean_terms: Vec<usize>,
-    noise_terms: Vec<usize>,
-    rho_dim: usize,
-    all_dims: Vec<usize>,
-}
-
-impl<'d> TwoBlockExactJointDesignCache<'d> {
-    fn new(
-        data: ArrayView2<'d, f64>,
-        meanspec: TermCollectionSpec,
-        mean_design: TermCollectionDesign,
-        mean_terms: Vec<usize>,
-        noisespec: TermCollectionSpec,
-        noise_design: TermCollectionDesign,
-        noise_terms: Vec<usize>,
-        rho_dim: usize,
-        all_dims: Vec<usize>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            mean_realizer: FrozenTermCollectionIncrementalRealizer::new(
-                data,
-                meanspec,
-                mean_design,
-            )?,
-            noise_realizer: FrozenTermCollectionIncrementalRealizer::new(
-                data,
-                noisespec,
-                noise_design,
-            )?,
-            current_theta: None,
-            last_cost: None,
-            last_eval: None,
-            mean_terms,
-            noise_terms,
-            rho_dim,
-            all_dims,
-        })
-    }
-
-    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            return Ok(());
-        }
-
-        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-            theta,
-            self.rho_dim,
-            self.all_dims.clone(),
-        );
-        let (mean_lk, noise_lk) = log_kappa.split_at(self.mean_terms.len());
-        self.mean_realizer
-            .apply_log_kappa(&mean_lk, &self.mean_terms)?;
-        self.noise_realizer
-            .apply_log_kappa(&noise_lk, &self.noise_terms)?;
-        self.current_theta = Some(theta.clone());
-        self.last_cost = None;
-        self.last_eval = None;
-        Ok(())
-    }
-
-    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval
-                .as_ref()
-                .map(|cached| cached.0)
-                .or(self.last_cost)
-        } else {
-            None
-        }
-    }
-
-    fn memoized_eval(
-        &self,
-        theta: &Array1<f64>,
-    ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval.clone()
-        } else {
-            None
-        }
-    }
-
-    fn store_cost(&mut self, cost: f64) {
-        self.last_cost = Some(cost);
-    }
-
-    fn store_eval(&mut self, eval: (f64, Array1<f64>, Option<Array2<f64>>)) {
-        self.last_cost = Some(eval.0);
-        self.last_eval = Some(eval);
-    }
-
-    fn mean_spec(&self) -> &TermCollectionSpec {
-        self.mean_realizer.spec()
-    }
-
-    fn noise_spec(&self) -> &TermCollectionSpec {
-        self.noise_realizer.spec()
-    }
-
-    fn mean_design(&self) -> &TermCollectionDesign {
-        self.mean_realizer.design()
-    }
-
-    fn noise_design(&self) -> &TermCollectionDesign {
-        self.noise_realizer.design()
-    }
-}
-
-pub fn optimize_two_block_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn, ExactFn>(
-    data: ArrayView2<'_, f64>,
-    meanspec: &TermCollectionSpec,
-    noisespec: &TermCollectionSpec,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    joint_setup: &TwoBlockExactJointHyperSetup,
-    analytic_joint_gradient_available: bool,
-    analytic_joint_hessian_available: bool,
-    mut cost_fn: CostFn,
-    mut fit_fn: FitFn,
-    mut exact_fn: ExactFn,
-) -> Result<TwoBlockSpatialLengthScaleOptimizationResult<FitOut>, String>
-where
-    FitOut: Clone,
-    CostFn: FnMut(
-        &Array1<f64>,
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-        &TermCollectionDesign,
-        &TermCollectionDesign,
-    ) -> Result<f64, String>,
-    FitFn: FnMut(
-        &Array1<f64>,
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-        &TermCollectionDesign,
-        &TermCollectionDesign,
-    ) -> Result<FitOut, String>,
-    ExactFn: FnMut(
-        &Array1<f64>,
-        &TermCollectionSpec,
-        &TermCollectionSpec,
-        &TermCollectionDesign,
-        &TermCollectionDesign,
-        bool,
-    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
-{
-    let mean_terms = spatial_length_scale_term_indices(meanspec);
-    let noise_terms = spatial_length_scale_term_indices(noisespec);
-    // Total ψ dimension: accounts for d entries per aniso term.
-    let log_kappa_dim = joint_setup.log_kappa_dim();
-    if !kappa_options.enabled || log_kappa_dim == 0 {
-        let mean_design = build_term_collection_design(data, meanspec).map_err(|e| {
-            format!("failed to build mean design during exact joint κ optimization: {e}")
-        })?;
-        let noise_design = build_term_collection_design(data, noisespec).map_err(|e| {
-            format!("failed to build noise design during exact joint κ optimization: {e}")
-        })?;
-        let resolved_meanspec = freeze_spatial_length_scale_terms_from_design(
-            meanspec,
-            &mean_design,
-        )
-        .map_err(|e| {
-            format!(
-                "failed to freeze mean spatial basis centers during exact joint κ bootstrap: {e}"
-            )
-        })?;
-        let resolved_noisespec = freeze_spatial_length_scale_terms_from_design(
-            noisespec,
-            &noise_design,
-        )
-        .map_err(|e| {
-            format!(
-                "failed to freeze noise spatial basis centers during exact joint κ bootstrap: {e}"
-            )
-        })?;
-        let fit = fit_fn(
-            &joint_setup
-                .theta0()
-                .slice(s![..joint_setup.rho_dim()])
-                .to_owned(),
-            &resolved_meanspec,
-            &resolved_noisespec,
-            &mean_design,
-            &noise_design,
-        )?;
-        return Ok(TwoBlockSpatialLengthScaleOptimizationResult {
-            resolved_meanspec,
-            resolved_noisespec,
-            mean_design,
-            noise_design,
-            fit,
-        });
-    }
-
-    let theta0 = joint_setup.theta0();
-    let lower = joint_setup.lower();
-    let upper = joint_setup.upper();
-    if theta0.len() < log_kappa_dim || lower.len() != theta0.len() || upper.len() != theta0.len() {
-        return Err(format!(
-            "invalid exact joint theta setup: theta0={}, lower={}, upper={}, required_log_kappa_dim={}",
-            theta0.len(),
-            lower.len(),
-            upper.len(),
-            log_kappa_dim
-        ));
-    }
-    let rho_dim = joint_setup.rho_dim();
-    let all_dims = joint_setup.log_kappa_dims_per_term();
-    let bootmean_design = build_term_collection_design(data, meanspec).map_err(|e| {
-        format!("failed to build mean design during exact joint κ optimization: {e}")
-    })?;
-    let bootnoise_design = build_term_collection_design(data, noisespec).map_err(|e| {
-        format!("failed to build noise design during exact joint κ optimization: {e}")
-    })?;
-    let analytic_outer_hessian_available = analytic_joint_hessian_available
-        && crate::custom_family::joint_exact_analytic_outer_hessian_available(
-            bootmean_design.design.ncols() + bootnoise_design.design.ncols(),
-        );
-    let best_meanspec = freeze_spatial_length_scale_terms_from_design(meanspec, &bootmean_design)
-        .map_err(|e| {
-        format!("failed to freeze mean spatial basis centers during exact joint κ bootstrap: {e}")
-    })?;
-    let best_noisespec = freeze_spatial_length_scale_terms_from_design(
-        noisespec,
-        &bootnoise_design,
-    )
-    .map_err(|e| {
-        format!("failed to freeze noise spatial basis centers during exact joint κ bootstrap: {e}")
-    })?;
-
-    use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
-        OuterConfig, OuterEval,
-    };
-
-    let theta_dim = theta0.len();
-    let psi_dim = theta_dim - rho_dim;
-
-    struct TwoBlockExactJointState<'d> {
-        best_cost: f64,
-        cache: TwoBlockExactJointDesignCache<'d>,
-    }
-
-    impl<'d> TwoBlockExactJointState<'d> {
-        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
-            let _ = theta;
-            if cost < self.best_cost {
-                self.best_cost = cost;
-            }
-        }
-    }
-
-    let mut state = TwoBlockExactJointState {
-        best_cost: f64::INFINITY,
-        cache: TwoBlockExactJointDesignCache::new(
-            data,
-            best_meanspec.clone(),
-            bootmean_design.clone(),
-            mean_terms.clone(),
-            best_noisespec.clone(),
-            bootnoise_design.clone(),
-            noise_terms.clone(),
-            rho_dim,
-            all_dims.clone(),
-        )?,
-    };
-
-    let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
-    let all_dims_ref = &all_dims;
-
-    let outer_config = OuterConfig {
-        tolerance: kappa_options.rel_tol.max(1e-6),
-        max_iter: kappa_options.max_outer_iter.max(1),
-        fd_step: 1e-4,
-        bounds: Some((lower.clone(), upper.clone())),
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: psi_dim,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-    };
-
-    let mut obj = ClosureObjective {
-        state: &mut state,
-        cap: OuterCapability {
-            gradient: if analytic_joint_gradient_available {
-                Derivative::Analytic
-            } else {
-                Derivative::FiniteDifference
-            },
-            hessian: if analytic_outer_hessian_available {
-                Derivative::Analytic
-            } else {
-                Derivative::Unavailable
-            },
-            n_params: theta_dim,
-            all_penalty_like: false,
-            has_psi_coords: true,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut TwoBlockExactJointState<'_>, theta: &Array1<f64>| {
-            if let Some(cost) = ctx.cache.memoized_cost(theta) {
-                ctx.track_best(theta, cost);
-                return Ok(cost);
-            }
-            if ctx.cache.ensure_theta(theta).is_err() {
-                return Ok(f64::INFINITY);
-            }
-            match cost_fn(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                ctx.cache.mean_spec(),
-                ctx.cache.noise_spec(),
-                ctx.cache.mean_design(),
-                ctx.cache.noise_design(),
-            ) {
-                Ok(cost) => {
-                    ctx.cache.store_cost(cost);
-                    ctx.track_best(theta, cost);
-                    Ok(cost)
-                }
-                Err(_) => Ok(f64::INFINITY),
-            }
-        },
-        eval_fn: |ctx: &mut &mut TwoBlockExactJointState<'_>, theta: &Array1<f64>| {
-            if let Some((cost, mut grad, hess)) = ctx.cache.memoized_eval(theta) {
-                ctx.track_best(theta, cost);
-                if !cost.is_finite() {
-                    return Ok(OuterEval::infeasible(theta.len()));
-                }
-                if grad.iter().any(|v| !v.is_finite()) {
-                    return Err(EstimationError::RemlOptimizationFailed(
-                        "two-block exact-joint gradient contained non-finite values".to_string(),
-                    ));
-                }
-                project_psi_gradient(&mut grad, rho_dim, all_dims_ref);
-                let hessian_result = match hess {
-                    Some(mut h)
-                        if h.nrows() == theta.len()
-                            && h.ncols() == theta.len()
-                            && h.iter().all(|v| v.is_finite()) =>
-                    {
-                        project_psi_hessian(&mut h, rho_dim, all_dims_ref);
-                        HessianResult::Analytic(h)
-                    }
-                    _ => HessianResult::Unavailable,
-                };
-                return Ok(OuterEval {
-                    cost,
-                    gradient: grad,
-                    hessian: hessian_result,
-                });
-            }
-            if ctx.cache.ensure_theta(theta).is_err() {
-                return Ok(OuterEval::infeasible(theta.len()));
-            }
-            match (&mut *exact_fn_cell.borrow_mut())(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                ctx.cache.mean_spec(),
-                ctx.cache.noise_spec(),
-                ctx.cache.mean_design(),
-                ctx.cache.noise_design(),
-                analytic_outer_hessian_available,
-            ) {
-                Ok((cost, mut grad, hess)) => {
-                    ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
-                    ctx.track_best(theta, cost);
-                    if !cost.is_finite() {
-                        return Ok(OuterEval::infeasible(theta.len()));
-                    }
-                    if grad.iter().any(|v| !v.is_finite()) {
-                        return Err(EstimationError::RemlOptimizationFailed(
-                            "two-block exact-joint gradient contained non-finite values"
-                                .to_string(),
-                        ));
-                    }
-                    // Project ψ-block gradient and Hessian onto the constraint
-                    // tangent space (response.md §4b) to remove the gauge direction.
-                    project_psi_gradient(&mut grad, rho_dim, all_dims_ref);
-                    let hessian_result = match hess {
-                        Some(mut h)
-                            if h.nrows() == theta.len()
-                                && h.ncols() == theta.len()
-                                && h.iter().all(|v| v.is_finite()) =>
-                        {
-                            project_psi_hessian(&mut h, rho_dim, all_dims_ref);
-                            HessianResult::Analytic(h)
-                        }
-                        _ => HessianResult::Unavailable,
-                    };
-                    Ok(OuterEval {
-                        cost,
-                        gradient: grad,
-                        hessian: hessian_result,
-                    })
-                }
-                Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                    "two-block exact-joint derivative evaluation failed: {e}"
-                ))),
-            }
-        },
-        reset_fn: None::<fn(&mut &mut TwoBlockExactJointState<'_>)>,
-        efs_fn: None::<
-            fn(
-                &mut &mut TwoBlockExactJointState<'_>,
-                &Array1<f64>,
-            ) -> Result<EfsEval, EstimationError>,
-        >,
-    };
-
-    let result = crate::solver::outer_strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "two-block exact-joint spatial",
-    )
-    .map_err(|e| e.to_string())?;
-
-    let mut theta_star = result.rho;
-    // Enforce sum-to-zero on ψ coordinates with gauge-correct ρ_κ compensation.
-    //
-    // For the two-block case, we compute the penalty index mapping from the
-    // bootstrap designs. The combined ρ vector lays out mean penalties first,
-    // then noise penalties, matching the order of smooth_term_penalty_index
-    // within each block.
-    let noise_penalty_offset = bootmean_design.penalties.len();
-    let mean_rho_indices: Vec<usize> = mean_terms
-        .iter()
-        .map(|&ti| smooth_term_penalty_index(&best_meanspec, &bootmean_design, ti).unwrap_or(0))
-        .collect();
-    let noise_rho_indices: Vec<usize> = noise_terms
-        .iter()
-        .map(|&ti| {
-            smooth_term_penalty_index(&best_noisespec, &bootnoise_design, ti)
-                .map(|idx| noise_penalty_offset + idx)
-                .unwrap_or(0)
-        })
-        .collect();
-    let combined_rho_indices: Vec<usize> = mean_rho_indices
-        .iter()
-        .chain(noise_rho_indices.iter())
-        .copied()
-        .collect();
-    enforce_psi_sum_to_zero(
-        &mut theta_star,
-        rho_dim,
-        &all_dims,
-        Some(&combined_rho_indices),
-    );
-    state.cache.ensure_theta(&theta_star)?;
-    let resolved_meanspec = state.cache.mean_spec().clone();
-    let resolved_noisespec = state.cache.noise_spec().clone();
-    let mean_design = state.cache.mean_design().clone();
-    let noise_design = state.cache.noise_design().clone();
-    let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
-    let fit = fit_fn(
-        &rho_star,
-        &resolved_meanspec,
-        &resolved_noisespec,
-        &mean_design,
-        &noise_design,
-    )?;
-    log_spatial_aniso_scales(&resolved_meanspec);
-    log_spatial_aniso_scales(&resolved_noisespec);
-    Ok(TwoBlockSpatialLengthScaleOptimizationResult {
-        resolved_meanspec,
-        resolved_noisespec,
-        mean_design,
-        noise_design,
-        fit,
-    })
-}
-
 // ---------------------------------------------------------------------------
-// N-block generalization of the two-block spatial length-scale optimizer.
+// N-block spatial length-scale optimizer.
 // ---------------------------------------------------------------------------
 
 pub struct SpatialLengthScaleOptimizationResult<FitOut> {
@@ -10048,8 +9458,7 @@ pub struct SpatialLengthScaleOptimizationResult<FitOut> {
     pub fit: FitOut,
 }
 
-/// Generalization of `TwoBlockExactJointHyperSetup` for N blocks.
-/// (The fields are not inherently two-block-specific; only the old name was.)
+/// Exact-joint hyper-parameter setup for N-block spatial length-scale optimization.
 #[derive(Debug, Clone)]
 pub struct ExactJointHyperSetup {
     rho0: Array1<f64>,
@@ -10135,7 +9544,7 @@ impl ExactJointHyperSetup {
     }
 }
 
-/// N-block generalization of `TwoBlockExactJointDesignCache`.
+/// N-block design cache for exact-joint spatial length-scale optimization.
 ///
 /// Each block owns a `FrozenTermCollectionIncrementalRealizer` and a list of
 /// spatial term indices within that block's spec. The cache splits the
@@ -10297,11 +9706,8 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn, ExactFn>
 ) -> Result<SpatialLengthScaleOptimizationResult<FitOut>, String>
 where
     FitOut: Clone,
-    CostFn: FnMut(
-        &Array1<f64>,
-        &[TermCollectionSpec],
-        &[TermCollectionDesign],
-    ) -> Result<f64, String>,
+    CostFn:
+        FnMut(&Array1<f64>, &[TermCollectionSpec], &[TermCollectionDesign]) -> Result<f64, String>,
     FitFn: FnMut(
         &Array1<f64>,
         &[TermCollectionSpec],
@@ -10430,12 +9836,7 @@ where
 
     let mut state = NBlockExactJointState {
         best_cost: f64::INFINITY,
-        cache: ExactJointDesignCache::new(
-            data,
-            cache_blocks,
-            rho_dim,
-            all_dims.clone(),
-        )?,
+        cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
     };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
@@ -10500,11 +9901,7 @@ where
             }
             let specs = collect_specs(&ctx.cache);
             let designs = collect_designs(&ctx.cache);
-            match cost_fn(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                &specs,
-                &designs,
-            ) {
+            match cost_fn(&theta.slice(s![..rho_dim]).to_owned(), &specs, &designs) {
                 Ok(cost) => {
                     ctx.cache.store_cost(cost);
                     ctx.track_best(theta, cost);
@@ -10826,7 +10223,7 @@ mod tests {
         meanspec: &TermCollectionSpec,
         noisespec: &TermCollectionSpec,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> TwoBlockExactJointHyperSetup {
+    ) -> ExactJointHyperSetup {
         let mean_terms = spatial_length_scale_term_indices(meanspec);
         let noise_terms = spatial_length_scale_term_indices(noisespec);
         let mean_log_kappa =
@@ -10849,7 +10246,7 @@ mod tests {
             ),
             dims_per_term.clone(),
         );
-        TwoBlockExactJointHyperSetup::new(
+        ExactJointHyperSetup::new(
             Array1::zeros(0),
             Array1::zeros(0),
             Array1::zeros(0),
@@ -12249,29 +11646,36 @@ mod tests {
             isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
         let theta_dim = joint_setup.theta0().len();
 
-        let solved = optimize_two_block_spatial_length_scale_exact_joint(
+        let mean_terms = spatial_length_scale_term_indices(&meanspec);
+        let noise_terms = spatial_length_scale_term_indices(&noisespec);
+        let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
-            &meanspec,
-            &noisespec,
+            &[meanspec.clone(), noisespec.clone()],
+            &[mean_terms, noise_terms],
             &kappa_options,
             &joint_setup,
             true,
             true,
-            |rho, _, _, mean_design, noise_design| {
+            |rho, specs, designs| {
                 assert!(rho.is_empty());
-                Ok(mean_design.design.ncols() as f64
-                    + noise_design.design.ncols() as f64
-                    + mean_design.penalties.len() as f64
-                    + noise_design.penalties.len() as f64)
+                assert_eq!(specs.len(), 2);
+                Ok(designs[0].design.ncols() as f64
+                    + designs[1].design.ncols() as f64
+                    + designs[0].penalties.len() as f64
+                    + designs[1].penalties.len() as f64)
             },
-            |rho, _, _, mean_design, noise_design| {
+            |rho, specs, designs| {
                 assert!(rho.is_empty());
-                Ok(mean_design.design.ncols() as f64
-                    + noise_design.design.ncols() as f64
-                    + mean_design.penalties.len() as f64
-                    + noise_design.penalties.len() as f64)
+                assert_eq!(specs.len(), 2);
+                Ok(designs[0].design.ncols() as f64
+                    + designs[1].design.ncols() as f64
+                    + designs[0].penalties.len() as f64
+                    + designs[1].penalties.len() as f64)
             },
-            |_, _, _, _, _, need_hessian| {
+            |rho, specs, designs, need_hessian| {
+                assert!(rho.is_empty());
+                assert_eq!(specs.len(), 2);
+                assert!(!designs.is_empty());
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),
@@ -12281,7 +11685,7 @@ mod tests {
         )
         .expect("exact joint two-block κ optimization should succeed");
 
-        for resolved in [&solved.resolved_meanspec, &solved.resolved_noisespec] {
+        for resolved in [&solved.resolved_specs[0], &solved.resolved_specs[1]] {
             match &resolved.smooth_terms[0].basis {
                 SmoothBasisSpec::Matern { spec, .. } => {
                     assert!(matches!(
@@ -12499,18 +11903,26 @@ mod tests {
         let noise_frozen = freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
             .expect("freeze noise");
 
-        let mut cache = TwoBlockExactJointDesignCache::new(
+        let mean_term_indices = spatial_length_scale_term_indices(&mean_frozen);
+        let noise_term_indices = spatial_length_scale_term_indices(&noise_frozen);
+        let mut cache = ExactJointDesignCache::new(
             data.view(),
-            mean_frozen.clone(),
-            mean_design.clone(),
-            spatial_length_scale_term_indices(&mean_frozen),
-            noise_frozen.clone(),
-            noise_design.clone(),
-            spatial_length_scale_term_indices(&noise_frozen),
+            vec![
+                (
+                    mean_frozen.clone(),
+                    mean_design.clone(),
+                    mean_term_indices.clone(),
+                ),
+                (
+                    noise_frozen.clone(),
+                    noise_design.clone(),
+                    noise_term_indices.clone(),
+                ),
+            ],
             joint_setup.rho_dim(),
             joint_setup.log_kappa_dims_per_term(),
         )
-        .expect("two-block cache");
+        .expect("n-block cache");
 
         cache.ensure_theta(&theta0).expect("initial theta");
         assert!(cache.memoized_cost(&theta0).is_none());
@@ -12553,8 +11965,9 @@ mod tests {
             build_term_collection_design(data.view(), &mean_updated).expect("mean rebuilt");
         let noise_rebuilt =
             build_term_collection_design(data.view(), &noise_updated).expect("noise rebuilt");
-        assert_term_collection_designs_match(cache.mean_design(), &mean_rebuilt, "mean cache");
-        assert_term_collection_designs_match(cache.noise_design(), &noise_rebuilt, "noise cache");
+        let cache_designs = cache.designs();
+        assert_term_collection_designs_match(cache_designs[0], &mean_rebuilt, "mean cache");
+        assert_term_collection_designs_match(cache_designs[1], &noise_rebuilt, "noise cache");
     }
 
     #[test]
@@ -13247,29 +12660,36 @@ mod tests {
             isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
         let theta_dim = joint_setup.theta0().len();
 
-        let solved = optimize_two_block_spatial_length_scale_exact_joint(
+        let mean_terms = spatial_length_scale_term_indices(&meanspec);
+        let noise_terms = spatial_length_scale_term_indices(&noisespec);
+        let solved = optimize_spatial_length_scale_exact_joint(
             data.view(),
-            &meanspec,
-            &noisespec,
+            &[meanspec.clone(), noisespec.clone()],
+            &[mean_terms, noise_terms],
             &kappa_options,
             &joint_setup,
             true,
             true,
-            |rho, _, _, mean_design, noise_design| {
+            |rho, specs, designs| {
                 assert!(rho.is_empty());
-                Ok(mean_design.design.ncols() as f64
-                    + noise_design.design.ncols() as f64
-                    + mean_design.penalties.len() as f64
-                    + noise_design.penalties.len() as f64)
+                assert_eq!(specs.len(), 2);
+                Ok(designs[0].design.ncols() as f64
+                    + designs[1].design.ncols() as f64
+                    + designs[0].penalties.len() as f64
+                    + designs[1].penalties.len() as f64)
             },
-            |rho, _, _, mean_design, noise_design| {
+            |rho, specs, designs| {
                 assert!(rho.is_empty());
-                Ok(mean_design.design.ncols() as f64
-                    + noise_design.design.ncols() as f64
-                    + mean_design.penalties.len() as f64
-                    + noise_design.penalties.len() as f64)
+                assert_eq!(specs.len(), 2);
+                Ok(designs[0].design.ncols() as f64
+                    + designs[1].design.ncols() as f64
+                    + designs[0].penalties.len() as f64
+                    + designs[1].penalties.len() as f64)
             },
-            |_, _, _, _, _, need_hessian| {
+            |rho, specs, designs, need_hessian| {
+                assert!(rho.is_empty());
+                assert_eq!(specs.len(), 2);
+                assert!(!designs.is_empty());
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),
@@ -13279,7 +12699,7 @@ mod tests {
         )
         .expect("exact joint two-block spatial length-scale optimization should succeed");
 
-        for resolved in [&solved.resolved_meanspec, &solved.resolved_noisespec] {
+        for resolved in [&solved.resolved_specs[0], &solved.resolved_specs[1]] {
             match &resolved.smooth_terms[0].basis {
                 SmoothBasisSpec::Duchon { spec, .. } => {
                     assert!(matches!(
@@ -14453,7 +13873,7 @@ mod tests {
 
     #[test]
     fn two_block_exact_joint_setup_sanitizes_non_finite_rho_seed() {
-        let setup = TwoBlockExactJointHyperSetup::new(
+        let setup = ExactJointHyperSetup::new(
             array![f64::NEG_INFINITY, 0.25, f64::INFINITY],
             array![-12.0, -12.0, -12.0],
             array![12.0, 12.0, 12.0],

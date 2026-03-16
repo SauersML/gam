@@ -1,5 +1,5 @@
 use crate::basis::{
-    compute_geometric_constraint_transform, create_basis, BasisOptions, Dense, KnotSource,
+    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
 };
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::inference::predict::{
