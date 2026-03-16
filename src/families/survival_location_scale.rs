@@ -2,11 +2,11 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
-    ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, build_rowwise_kronecker_psi_operator,
-    evaluate_custom_family_joint_hyper, fit_custom_family, resolve_custom_family_x_psi,
-    resolve_custom_family_x_psi_psi, shared_dense_arc, wrap_spatial_implicit_psi_operator,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper, fit_custom_family,
+    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
+    wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::gamlss::{
@@ -3966,12 +3966,10 @@ impl SurvivalLocationScaleFamily {
 
         let log_sigma_score_row_exit = &q.d1_q1 * &q.dq_ls;
         let log_sigma_score_row_entry = &q.d1_q0 * dq_ls_entry;
-        let d_log_sigma_score_row_exit_i =
-            &q.d2_q1 * &q1_i * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_i;
+        let d_log_sigma_score_row_exit_i = &q.d2_q1 * &q1_i * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_i;
         let d_log_sigma_score_row_entry_i =
             &q.d2_q0 * &q0_i * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_i;
-        let d_log_sigma_score_row_exit_j =
-            &q.d2_q1 * &q1_j * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_j;
+        let d_log_sigma_score_row_exit_j = &q.d2_q1 * &q1_j * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_j;
         let d_log_sigma_score_row_entry_j =
             &q.d2_q0 * &q0_j * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_j;
         let d2_log_sigma_score_row_exit = &(&q.d3_q1 * &(&q1_i * &q1_j) * &q.dq_ls)
@@ -4293,11 +4291,7 @@ impl SurvivalLocationScaleFamily {
 
             let h_time_wiggle =
                 weighted_crossprod_dense(&self.x_time_entry, &(&q.d3_q0 * &q0_ab), xw_dense)?
-                    + weighted_crossprod_dense(
-                        &self.x_time_exit,
-                        &(&q.d3_q1 * &q1_ab),
-                        xw_dense,
-                    )?;
+                    + weighted_crossprod_dense(&self.x_time_exit, &(&q.d3_q1 * &q1_ab), xw_dense)?;
             assign_symmetric_block(&mut hessian_psi_psi, offsets[0], w_offset, &h_time_wiggle);
         }
 
@@ -4583,7 +4577,10 @@ impl SurvivalExactNewtonJointPsiWorkspace {
             .psi_directions
             .lock()
             .map_err(|_| "survival joint psi direction cache poisoned".to_string())?;
-        Ok(cache.entry(psi_index).or_insert_with(|| dir.clone()).clone())
+        Ok(cache
+            .entry(psi_index)
+            .or_insert_with(|| dir.clone())
+            .clone())
     }
 }
 
@@ -6262,10 +6259,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let delta_q_tls_exit_v = &q.d3q_tls_ls * &delta_ls_exit_v;
         let delta_q_ls_ls_exit_v = &q.d3q_tls_ls * &delta_t_exit_v + &q.d3q_ls * &delta_ls_exit_v;
 
-        // Perturbed curvature quantities for direction u.
+        // Perturbed curvature quantities for directions u and v on the exit side.
         let d_d1_q_exit_u = &q.d2_q1 * &delta_q_exit_u + &q.h_time_h1 * &delta_h1_u;
-        // Perturbed curvature quantities for direction v.
+        let d_d2_q_exit_u = &q.d3_q1 * &delta_q_exit_u - &q.d_h_h1 * &delta_h1_u;
         let d_d1_q_exit_v = &q.d2_q1 * &delta_q_exit_v + &q.h_time_h1 * &delta_h1_v;
+        let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v - &q.d_h_h1 * &delta_h1_v;
 
         let x_threshold_exit = self.x_threshold.to_dense();
         let x_threshold_entry = self.x_threshold_entry.as_ref().map(DesignMatrix::to_dense);

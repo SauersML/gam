@@ -307,7 +307,19 @@ fn pooled_probit_baseline(y: &Array1<f64>, z: &Array1<f64>) -> Result<(f64, f64)
         Array1::zeros(n).view(),
         &[],
         LikelihoodFamily::BinomialProbit,
-        &FitOptions::default(),
+        &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: true,
+            max_iter: 80,
+            tol: 1e-6,
+            nullspace_dims: Vec::new(),
+            linear_constraints: None,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: Some(1e-6),
+        },
     )
     .map_err(|e| format!("failed to fit pooled bernoulli-marginal-slope pilot probit: {e}"))?;
     let a = fit.beta.get(0).copied().unwrap_or(0.0);
@@ -594,7 +606,7 @@ impl BernoulliMarginalSlopeFamily {
             (None, None, None, None)
         };
 
-        let (a_w, a_qw, a_bw, a_hw, a_ww) = if let (Some(beta_w), Some(runtime)) =
+        let (a_w, a_qw, a_bw, a_hw, a_ww) = if let (Some(_), Some(runtime)) =
             (beta_w, &self.link_dev)
         {
             let basis = runtime.design(&v)?;
