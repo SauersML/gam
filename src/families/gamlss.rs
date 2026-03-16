@@ -1518,7 +1518,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                     .intercept_range
                     .end
                     .min(noise_design.design.ncols()),
-            )?),
+            )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.penalties.clone(),
             initial_log_lambdas: noise_log_lambdas,
@@ -1670,7 +1670,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                     .intercept_range
                     .end
                     .min(noise_design.design.ncols()),
-            )?),
+            )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.penalties.clone(),
             initial_log_lambdas: layout.noise_from(theta),
@@ -12257,6 +12257,8 @@ impl BinomialLocationScaleWiggleFamily {
                     let mut x_ls_psi = Array2::<f64>::zeros((n, pls));
                     let mut x_t_action = None;
                     let mut x_ls_action = None;
+                    let mut z_t_psi = Array1::<f64>::zeros(n);
+                    let mut z_ls_psi = Array1::<f64>::zeros(n);
                     match block_idx {
                         Self::BLOCK_T => {
                             x_t_action = CustomFamilyPsiDesignAction::from_first_derivative(
@@ -12267,12 +12269,17 @@ impl BinomialLocationScaleWiggleFamily {
                                 "BinomialLocationScaleWiggleFamily threshold",
                             )
                             .ok();
-                            x_t_psi.assign(&resolve_custom_family_x_psi(
-                                deriv,
-                                n,
-                                pt,
-                                "BinomialLocationScaleWiggleFamily threshold",
-                            )?);
+                            if let Some(action) = x_t_action.as_ref() {
+                                z_t_psi = action.forward_mul(beta_t.view());
+                            } else {
+                                x_t_psi.assign(&resolve_custom_family_x_psi(
+                                    deriv,
+                                    n,
+                                    pt,
+                                    "BinomialLocationScaleWiggleFamily threshold",
+                                )?);
+                                z_t_psi = x_t_psi.dot(beta_t);
+                            }
                         }
                         Self::BLOCK_LOG_SIGMA => {
                             x_ls_action = CustomFamilyPsiDesignAction::from_first_derivative(
@@ -12283,12 +12290,17 @@ impl BinomialLocationScaleWiggleFamily {
                                 "BinomialLocationScaleWiggleFamily log-sigma",
                             )
                             .ok();
-                            x_ls_psi.assign(&resolve_custom_family_x_psi(
-                                deriv,
-                                n,
-                                pls,
-                                "BinomialLocationScaleWiggleFamily log-sigma",
-                            )?);
+                            if let Some(action) = x_ls_action.as_ref() {
+                                z_ls_psi = action.forward_mul(beta_ls.view());
+                            } else {
+                                x_ls_psi.assign(&resolve_custom_family_x_psi(
+                                    deriv,
+                                    n,
+                                    pls,
+                                    "BinomialLocationScaleWiggleFamily log-sigma",
+                                )?);
+                                z_ls_psi = x_ls_psi.dot(beta_ls);
+                            }
                         }
                         Self::BLOCK_WIGGLE => return Ok(None),
                         _ => return Ok(None),
@@ -12298,8 +12310,8 @@ impl BinomialLocationScaleWiggleFamily {
                         local_idx,
                         x_t_action,
                         x_ls_action,
-                        z_t_psi: x_t_psi.dot(beta_t),
-                        z_ls_psi: x_ls_psi.dot(beta_ls),
+                        z_t_psi,
+                        z_ls_psi,
                         x_t_psi,
                         x_ls_psi,
                     }));
@@ -12318,40 +12330,75 @@ impl BinomialLocationScaleWiggleFamily {
         psi_b: &BinomialLocationScaleWiggleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>), String> {
+    ) -> Result<BinomialLocationScaleWiggleJointPsiSecondDrifts, String> {
         let n = self.y.len();
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_t = &block_states[Self::BLOCK_T].beta;
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let mut x_t_ab = Array2::<f64>::zeros((n, pt));
-        let mut x_ls_ab = Array2::<f64>::zeros((n, pls));
+        let mut x_t_ab_action = None;
+        let mut x_ls_ab_action = None;
+        let mut x_t_ab = None;
+        let mut x_ls_ab = None;
         if psi_a.block_idx == psi_b.block_idx {
             let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
-                Self::BLOCK_T => x_t_ab.assign(&resolve_custom_family_x_psi_psi(
-                    deriv,
-                    deriv_b,
-                    psi_b.local_idx,
-                    n,
-                    pt,
-                    "BinomialLocationScaleWiggleFamily threshold",
-                )?),
-                Self::BLOCK_LOG_SIGMA => x_ls_ab.assign(&resolve_custom_family_x_psi_psi(
-                    deriv,
-                    deriv_b,
-                    psi_b.local_idx,
-                    n,
-                    pls,
-                    "BinomialLocationScaleWiggleFamily log-sigma",
-                )?),
+                Self::BLOCK_T => {
+                    x_t_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                        deriv,
+                        deriv_b,
+                        n,
+                        pt,
+                        0..n,
+                        "BinomialLocationScaleWiggleFamily threshold",
+                    )?;
+                    if x_t_ab_action.is_none() {
+                        x_t_ab = Some(resolve_custom_family_x_psi_psi(
+                            deriv,
+                            deriv_b,
+                            psi_b.local_idx,
+                            n,
+                            pt,
+                            "BinomialLocationScaleWiggleFamily threshold",
+                        )?);
+                    }
+                }
+                Self::BLOCK_LOG_SIGMA => {
+                    x_ls_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                        deriv,
+                        deriv_b,
+                        n,
+                        pls,
+                        0..n,
+                        "BinomialLocationScaleWiggleFamily log-sigma",
+                    )?;
+                    if x_ls_ab_action.is_none() {
+                        x_ls_ab = Some(resolve_custom_family_x_psi_psi(
+                            deriv,
+                            deriv_b,
+                            psi_b.local_idx,
+                            n,
+                            pls,
+                            "BinomialLocationScaleWiggleFamily log-sigma",
+                        )?);
+                    }
+                }
                 _ => {}
             }
         }
-        let z_t_ab = x_t_ab.dot(beta_t);
-        let z_ls_ab = x_ls_ab.dot(beta_ls);
-        Ok((x_t_ab, x_ls_ab, z_t_ab, z_ls_ab))
+        let z_t_ab = second_psi_linear_map(x_t_ab_action.as_ref(), x_t_ab.as_ref(), n, pt)
+            .forward_mul(beta_t.view());
+        let z_ls_ab = second_psi_linear_map(x_ls_ab_action.as_ref(), x_ls_ab.as_ref(), n, pls)
+            .forward_mul(beta_ls.view());
+        Ok(BinomialLocationScaleWiggleJointPsiSecondDrifts {
+            x_t_ab_action,
+            x_ls_ab_action,
+            x_t_ab,
+            x_ls_ab,
+            z_t_ab,
+            z_ls_ab,
+        })
     }
 
     fn exact_newton_joint_psi_terms_from_designs(
@@ -12849,7 +12896,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
-        let (x_t_ab, x_ls_ab, z_t_ab, z_ls_ab) = self.exact_newton_joint_psisecond_design_drifts(
+        let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
             dir_a,
@@ -12910,6 +12957,24 @@ impl BinomialLocationScaleWiggleFamily {
         let pls = x_ls.ncols();
         let pw = b0.ncols();
         let total = pt + pls + pw;
+        let x_t_a_map = first_psi_linear_map(dir_a.x_t_action.as_ref(), &dir_a.x_t_psi, n, pt);
+        let x_t_b_map = first_psi_linear_map(dir_b.x_t_action.as_ref(), &dir_b.x_t_psi, n, pt);
+        let x_ls_a_map =
+            first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, n, pls);
+        let x_ls_b_map =
+            first_psi_linear_map(dir_b.x_ls_action.as_ref(), &dir_b.x_ls_psi, n, pls);
+        let x_t_ab_map = second_psi_linear_map(
+            second_drifts.x_t_ab_action.as_ref(),
+            second_drifts.x_t_ab.as_ref(),
+            n,
+            pt,
+        );
+        let x_ls_ab_map = second_psi_linear_map(
+            second_drifts.x_ls_ab_action.as_ref(),
+            second_drifts.x_ls_ab.as_ref(),
+            n,
+            pls,
+        );
         let mut objective_psi_psi = 0.0;
         let mut score_psi_psi = Array1::<f64>::zeros(total);
         let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
@@ -12978,23 +13043,24 @@ impl BinomialLocationScaleWiggleFamily {
 
             let q0_a = -r_sigma * dir_a.z_t_psi[row] - q0 * dir_a.z_ls_psi[row];
             let q0_b = -r_sigma * dir_b.z_t_psi[row] - q0 * dir_b.z_ls_psi[row];
-            let q0_ab = -r_sigma * z_t_ab[row]
+            let q0_ab = -r_sigma * second_drifts.z_t_ab[row]
                 + r_sigma
                     * (dir_a.z_t_psi[row] * dir_b.z_ls_psi[row]
                         + dir_b.z_t_psi[row] * dir_a.z_ls_psi[row])
-                + q0 * (dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row] - z_ls_ab[row]);
+                + q0
+                    * (dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row] - second_drifts.z_ls_ab[row]);
 
             let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
             let q0_t_b = q0_geom.q_tl * dir_b.z_ls_psi[row];
             let q0_t_ab = q0_geom.q_tl_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
-                + q0_geom.q_tl * z_ls_ab[row];
+                + q0_geom.q_tl * second_drifts.z_ls_ab[row];
             let q0_ls_a = q0_geom.q_tl * dir_a.z_t_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
             let q0_ls_b = q0_geom.q_tl * dir_b.z_t_psi[row] + q0_geom.q_ll * dir_b.z_ls_psi[row];
             let q0_ls_ab = -q0_ab;
             let q0_tl_a = q0_geom.q_tl_ls * dir_a.z_ls_psi[row];
             let q0_tl_b = q0_geom.q_tl_ls * dir_b.z_ls_psi[row];
             let q0_tl_ab = q0_tl_ls_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
-                + q0_geom.q_tl_ls * z_ls_ab[row];
+                + q0_geom.q_tl_ls * second_drifts.z_ls_ab[row];
             let q0_ll_a =
                 q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
             let q0_ll_b =
@@ -13104,12 +13170,12 @@ impl BinomialLocationScaleWiggleFamily {
 
             let xtr = x_t.row(row);
             let xlsr = x_ls.row(row);
-            let xta = dir_a.x_t_psi.row(row);
-            let xtb = dir_b.x_t_psi.row(row);
-            let xlsa = dir_a.x_ls_psi.row(row);
-            let xlsb = dir_b.x_ls_psi.row(row);
-            let xtab = x_t_ab.row(row);
-            let xlsab = x_ls_ab.row(row);
+            let xta = x_t_a_map.row_vector(row)?;
+            let xtb = x_t_b_map.row_vector(row)?;
+            let xlsa = x_ls_a_map.row_vector(row)?;
+            let xlsb = x_ls_b_map.row_vector(row)?;
+            let xtab = x_t_ab_map.row_vector(row)?;
+            let xlsab = x_ls_ab_map.row_vector(row)?;
 
             let mut b = Array1::<f64>::zeros(total);
             b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
@@ -13118,28 +13184,28 @@ impl BinomialLocationScaleWiggleFamily {
             b.slice_mut(s![pt + pls..]).assign(&brow);
             let mut c_a = Array1::<f64>::zeros(total);
             c_a.slice_mut(s![0..pt])
-                .assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
+                .assign(&(xtr.to_owned() * q_t_a + xta.clone() * q_t));
             c_a.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
+                .assign(&(xlsr.to_owned() * q_ls_a + xlsa.clone() * q_ls));
             c_a.slice_mut(s![pt + pls..]).assign(&qw_a);
             let mut c_b = Array1::<f64>::zeros(total);
             c_b.slice_mut(s![0..pt])
-                .assign(&(xtr.to_owned() * q_t_b + xtb.to_owned() * q_t));
+                .assign(&(xtr.to_owned() * q_t_b + xtb.clone() * q_t));
             c_b.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls_b + xlsb.to_owned() * q_ls));
+                .assign(&(xlsr.to_owned() * q_ls_b + xlsb.clone() * q_ls));
             c_b.slice_mut(s![pt + pls..]).assign(&qw_b);
             let mut c_ab = Array1::<f64>::zeros(total);
             c_ab.slice_mut(s![0..pt]).assign(
                 &(xtr.to_owned() * q_t_ab
-                    + xta.to_owned() * q_t_b
-                    + xtb.to_owned() * q_t_a
-                    + xtab.to_owned() * q_t),
+                    + xta.clone() * q_t_b
+                    + xtb.clone() * q_t_a
+                    + xtab.clone() * q_t),
             );
             c_ab.slice_mut(s![pt..pt + pls]).assign(
                 &(xlsr.to_owned() * q_ls_ab
-                    + xlsa.to_owned() * q_ls_b
-                    + xlsb.to_owned() * q_ls_a
-                    + xlsab.to_owned() * q_ls),
+                    + xlsa.clone() * q_ls_b
+                    + xlsb.clone() * q_ls_a
+                    + xlsab.clone() * q_ls),
             );
             c_ab.slice_mut(s![pt + pls..]).assign(&qw_ab);
 
@@ -13644,6 +13710,8 @@ impl BinomialLocationScaleWiggleFamily {
         }
         let xi_t = x_t.dot(&u_t);
         let xi_ls = x_ls.dot(&u_ls);
+        let x_t_map = first_psi_linear_map(dir_a.x_t_action.as_ref(), &dir_a.x_t_psi, n, pt);
+        let x_ls_map = first_psi_linear_map(dir_a.x_ls_action.as_ref(), &dir_a.x_ls_psi, n, pls);
         let m = d0.dot(betaw) + 1.0;
         let g2 = dd0.dot(betaw);
         let g3 = self.wiggle_d3q_dq03(base_core.q0.view(), betaw.view())?;
@@ -13692,8 +13760,8 @@ impl BinomialLocationScaleWiggleFamily {
 
             let xtr = x_t.row(row).to_owned();
             let xlsr = x_ls.row(row).to_owned();
-            let xta = dir_a.x_t_psi.row(row).to_owned();
-            let xlsa = dir_a.x_ls_psi.row(row).to_owned();
+            let xta = x_t_map.row_vector(row)?;
+            let xlsa = x_ls_map.row_vector(row)?;
             let br = b0.row(row).to_owned();
             let dr = d0.row(row).to_owned();
             let ddr = dd0.row(row).to_owned();
@@ -19068,7 +19136,7 @@ mod tests {
                 1 => t - 0.5,
                 _ => unreachable!(),
             }
-        }));
+        })));
         let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
@@ -19076,7 +19144,7 @@ mod tests {
                 1 => (2.0 * std::f64::consts::PI * t).cos(),
                 _ => unreachable!(),
             }
-        }));
+        })));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -19134,7 +19202,7 @@ mod tests {
                 1 => (2.0 * std::f64::consts::PI * t).sin(),
                 _ => unreachable!(),
             }
-        }));
+        })));
         let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
@@ -19142,7 +19210,7 @@ mod tests {
                 1 => t - 0.5,
                 _ => unreachable!(),
             }
-        }));
+        })));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
@@ -19203,7 +19271,7 @@ mod tests {
                 1 => (2.0 * std::f64::consts::PI * t).sin(),
                 _ => unreachable!(),
             }
-        }));
+        })));
         let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_shape_fn((n, 2), |(i, j)| {
             let t = i as f64 / (n as f64 - 1.0);
             match j {
@@ -19211,7 +19279,7 @@ mod tests {
                 1 => t - 0.5,
                 _ => unreachable!(),
             }
-        }));
+        })));
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),

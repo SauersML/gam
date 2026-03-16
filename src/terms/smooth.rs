@@ -8131,10 +8131,10 @@ fn try_exact_joint_spatial_length_scale_optimization(
 /// Joint [ρ, ψ] optimization for anisotropic spatial terms using analytic
 /// derivatives through the unified REML evaluator.
 ///
-/// At each outer iteration, the design X(ψ) and penalties S(ψ) are rebuilt
-/// for the current ψ, a temporary `RemlState` is constructed, and the
-/// unified evaluator returns cost + gradient + Hessian for the full θ = [ρ, ψ]
-/// vector. The ψ derivatives flow through:
+/// At each outer iteration, the frozen term topology is reused and only the
+/// spatial realized blocks affected by the current ψ are refreshed before the
+/// unified evaluator returns cost + gradient + Hessian for the full
+/// θ = [ρ, ψ] vector. The ψ derivatives flow through:
 ///
 ///   `AnisoBasisPsiDerivatives` → `SpatialPsiDerivative` → `DirectionalHyperParam`
 ///     → `build_tau_unified_objects` → `HyperCoord` ext_coords → unified evaluator
@@ -8218,7 +8218,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 )
             })?;
 
-            evaluate_joint_reml_at_theta(
+            let eval = evaluate_joint_reml_at_theta(
                 self.y,
                 self.weights,
                 self.offset,
@@ -8229,8 +8229,11 @@ fn try_exact_joint_spatial_aniso_optimization(
                 None,
                 self.family,
                 self.options,
-            )
-            .inspect(|eval| self.cache.store_eval(eval.clone()))
+            );
+            if let Ok(ref value) = eval {
+                self.cache.store_eval(value.clone());
+            }
+            eval
         }
 
         /// Cost-only evaluation on the current realized design.
@@ -8595,8 +8598,9 @@ pub(crate) fn project_psi_hessian(
 ///
 /// This is the isotropic counterpart of the anisotropic exact spatial path.
 /// Each spatial term contributes one log-κ coordinate, and the joint outer
-/// optimization runs directly on `[ρ, κ]` with gauge handling done by
-/// projection. The gradient and Hessian for log-κ flow through the same
+/// optimization runs directly on `[ρ, κ]` while reusing the frozen term
+/// topology and refreshing only the spatial realized blocks touched by κ.
+/// The gradient and Hessian for log-κ flow through the same
 /// directional-hyperparameter pipeline used elsewhere:
 ///
 ///   `SpatialPsiDerivative` → `DirectionalHyperParam` → `HyperCoord` ext_coords
@@ -8641,34 +8645,31 @@ fn try_exact_joint_spatial_isotropic_optimization(
         y: ArrayView1<'d, f64>,
         weights: ArrayView1<'d, f64>,
         offset: ArrayView1<'d, f64>,
-        resolvedspec: &'d TermCollectionSpec,
         family: LikelihoodFamily,
         options: &'d FitOptions,
-        spatial_terms: &'d [usize],
         dims_per_term: &'d [usize],
         rho_dim: usize,
         best_cost: f64,
+        cache: SingleBlockExactJointDesignCache<'d>,
     }
 
     impl<'d> IsoJointContext<'d> {
-        /// Full evaluation: rebuild design + hyper_dirs, compute cost + gradient + Hessian.
+        /// Full evaluation on the current realized design + hyper_dirs.
         fn eval_full(
-            &self,
+            &mut self,
             theta: &Array1<f64>,
         ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                self.rho_dim,
-                self.dims_per_term.to_vec(),
-            );
-            let spec_at_kappa = log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms)?;
-            let design_at_kappa = build_term_collection_design(self.data, &spec_at_kappa)?;
-
+            if let Some(eval) = self.cache.memoized_eval(theta) {
+                return Ok(eval);
+            }
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
             let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
                 self.data,
-                &spec_at_kappa,
-                &design_at_kappa,
-                self.spatial_terms,
+                self.cache.spec(),
+                self.cache.design(),
+                &self.cache.spatial_terms,
             )?
             .ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -8676,44 +8677,48 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 )
             })?;
 
-            evaluate_joint_reml_at_theta(
+            let eval = evaluate_joint_reml_at_theta(
                 self.y,
                 self.weights,
                 self.offset,
-                &design_at_kappa,
+                self.cache.design(),
                 theta,
                 self.rho_dim,
                 hyper_dirs,
                 None,
                 self.family,
                 self.options,
-            )
+            );
+            if let Ok(ref value) = eval {
+                self.cache.store_eval(value.clone());
+            }
+            eval
         }
 
-        /// Cost-only evaluation (cheaper: no hyper_dirs or gradient).
-        fn eval_cost(&self, theta: &Array1<f64>) -> f64 {
-            let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-                theta,
-                self.rho_dim,
-                self.dims_per_term.to_vec(),
-            );
-            let spec_at_kappa = match log_kappa.apply_tospec(self.resolvedspec, self.spatial_terms)
-            {
-                Ok(s) => s,
-                Err(_) => return f64::INFINITY,
-            };
+        /// Cost-only evaluation on the current realized design.
+        fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
+            if let Some(cost) = self.cache.memoized_cost(theta) {
+                return cost;
+            }
+            if self.cache.ensure_theta(theta).is_err() {
+                return f64::INFINITY;
+            }
             let rho_vec = theta.slice(s![..self.rho_dim]).mapv(f64::exp);
-            match fit_term_collection_forspecwith_heuristic_lambdas(
-                self.data,
+            match fit_term_collection_on_realized_design(
                 self.y,
                 self.weights,
                 self.offset,
-                &spec_at_kappa,
+                self.cache.spec(),
+                self.cache.design(),
                 rho_vec.as_slice(),
                 self.family,
                 self.options,
             ) {
-                Ok(fit) => fit_score(&fit.fit),
+                Ok(fit) => {
+                    let cost = fit_score(&fit.fit);
+                    self.cache.store_cost(cost);
+                    cost
+                }
                 Err(_) => f64::INFINITY,
             }
         }
@@ -8731,13 +8736,20 @@ fn try_exact_joint_spatial_isotropic_optimization(
         y,
         weights,
         offset,
-        resolvedspec,
         family,
         options,
-        spatial_terms,
         dims_per_term,
         rho_dim,
         best_cost: f64::INFINITY,
+        cache: SingleBlockExactJointDesignCache::new(
+            data,
+            resolvedspec.clone(),
+            baseline_design.clone(),
+            spatial_terms.to_vec(),
+            rho_dim,
+            dims_per_term.to_vec(),
+        )
+        .map_err(EstimationError::InvalidInput)?,
     };
 
     let outer_config = OuterConfig {
@@ -11936,6 +11948,93 @@ mod tests {
             build_term_collection_design(data.view(), &noise_updated).expect("noise rebuilt");
         assert_term_collection_designs_match(cache.mean_design(), &mean_rebuilt, "mean cache");
         assert_term_collection_designs_match(cache.noise_design(), &noise_rebuilt, "noise cache");
+    }
+
+    #[test]
+    fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
+        let n = 22usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.23 * i as f64).cos();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: 0.9,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen =
+            freeze_spatial_length_scale_terms_from_design(&spec, &design).expect("freeze spec");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let rho_dim = design.penalties.len();
+        let dims_per_term = vec![1];
+        let mut theta0 = Array1::<f64>::zeros(rho_dim + 1);
+        theta0[rho_dim] = -get_spatial_length_scale(&frozen, spatial_terms[0])
+            .expect("length scale")
+            .ln();
+
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("single-block cache");
+
+        cache.ensure_theta(&theta0).expect("initial theta");
+        assert!(cache.memoized_cost(&theta0).is_none());
+        assert!(cache.memoized_eval(&theta0).is_none());
+
+        cache.store_cost(1.75);
+        assert_eq!(cache.memoized_cost(&theta0), Some(1.75));
+        let eval = (
+            0.5,
+            Array1::<f64>::ones(theta0.len()),
+            Array2::<f64>::eye(theta0.len()),
+        );
+        cache.store_eval(eval.clone());
+        let cached_eval = cache.memoized_eval(&theta0).expect("cached eval");
+        assert!((cached_eval.0 - eval.0).abs() <= 1e-12);
+        assert_eq!(cached_eval.1, eval.1);
+        assert_eq!(cached_eval.2, eval.2);
+
+        let mut theta1 = theta0.clone();
+        theta1[rho_dim] += 0.35;
+        cache.ensure_theta(&theta1).expect("updated theta");
+        assert!(cache.memoized_cost(&theta1).is_none());
+        assert!(cache.memoized_eval(&theta1).is_none());
+
+        let updated_log_kappa =
+            SpatialLogKappaCoords::from_theta_tail_with_dims(&theta1, rho_dim, dims_per_term);
+        let updated_spec = updated_log_kappa
+            .apply_tospec(&frozen, &spatial_terms)
+            .expect("updated spec");
+        let rebuilt =
+            build_term_collection_design(data.view(), &updated_spec).expect("rebuilt design");
+        assert_term_collection_designs_match(cache.design(), &rebuilt, "single-block cache");
     }
 
     #[test]

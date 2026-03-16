@@ -644,18 +644,26 @@ impl PredictableModel for StandardPredictor {
         fit: &UnifiedFitResult,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         if self.link_wiggle.is_none() {
-            let cov = fit.beta_covariance().ok_or_else(|| {
+            let backend = posterior_mean_backend_or_warn(
+                fit,
+                self.covariance.as_ref(),
+                self.beta.len(),
+                "standard posterior mean",
+            )
+            .ok_or_else(|| {
                 EstimationError::InvalidInput(
-                    "posterior-mean prediction requires beta covariance in fit result".to_string(),
+                    "posterior-mean prediction requires beta covariance or penalized Hessian"
+                        .to_string(),
                 )
             })?;
-            return predict_gam_posterior_meanwith_fit(
+            let strategy = strategy_from_fit(self.family, fit)?;
+            return predict_gam_posterior_mean_from_backend(
                 input.design.clone(),
                 self.beta.view(),
                 input.offset.view(),
-                self.family,
-                cov.view(),
-                fit,
+                &backend,
+                &strategy,
+                "standard posterior mean",
             );
         }
         let runtime = self.link_wiggle.as_ref().expect("checked above");
@@ -2366,6 +2374,54 @@ pub struct PredictUncertaintyResult {
     pub covariance_corrected_used: bool,
 }
 
+fn predict_gam_posterior_mean_from_backend(
+    x: DesignMatrix,
+    beta: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    backend: &PredictionCovarianceBackend<'_>,
+    strategy: &dyn FamilyStrategy,
+    label: &str,
+) -> Result<PredictPosteriorMeanResult, EstimationError> {
+    if x.ncols() != beta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} dimension mismatch: X has {} columns but beta has length {}",
+            x.ncols(),
+            beta.len()
+        )));
+    }
+    if x.nrows() != offset.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} dimension mismatch: X has {} rows but offset has length {}",
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    if backend.nrows() != beta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} covariance/backend dimension mismatch: expected parameter dimension {}, got {}",
+            beta.len(),
+            backend.nrows()
+        )));
+    }
+
+    let mut eta = x.matrixvectormultiply(&beta.to_owned());
+    eta += &offset;
+    let etavar = linear_predictorvariance_from_backend(&x, backend)?;
+    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
+    let quadctx = crate::quadrature::QuadratureContext::new();
+    let means: Result<Vec<f64>, EstimationError> = eta
+        .iter()
+        .zip(eta_standard_error.iter())
+        .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
+        .collect();
+
+    Ok(PredictPosteriorMeanResult {
+        eta,
+        eta_standard_error,
+        mean: Array1::from_vec(means?),
+    })
+}
+
 pub struct CoefficientUncertaintyResult {
     pub estimate: Array1<f64>,
     pub standard_error: Array1<f64>,
@@ -2419,70 +2475,17 @@ pub fn predict_gam_posterior_mean<X>(
 where
     X: Into<DesignMatrix>,
 {
-    // Posterior mean prediction under Gaussian coefficient uncertainty.
-    //
-    // For each row x_i we first propagate coefficient covariance to the linear
-    // predictor:
-    //
-    //   eta_i       = x_i^T beta
-    //   Var(eta_i)  = x_i^T Var(beta) x_i.
-    //
-    // For nonlinear links the desired prediction is not the plug-in
-    // g^{-1}(eta_i), but the Gaussian-uncertainty average
-    //
-    //   E[g^{-1}(Eta_i)],   Eta_i ~ N(eta_i, Var(eta_i)).
-    //
-    // The key design choice is that prediction uses the same integrated-
-    // expectation dispatcher as integrated PIRLS. That keeps fitting-time and
-    // prediction-time uncertainty propagation on the same mathematical object:
-    // if a link has an exact closed form or guarded special-function backend,
-    // both paths use it; numerical failure is propagated rather than silently
-    // degrading to a plug-in mean.
     let x = x.into();
-    if x.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_mean dimension mismatch: X has {} columns but beta has length {}",
-            x.ncols(),
-            beta.len()
-        )));
-    }
-    if x.nrows() != offset.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_mean dimension mismatch: X has {} rows but offset has length {}",
-            x.nrows(),
-            offset.len()
-        )));
-    }
-    if covariance.nrows() != beta.len() || covariance.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_mean covariance dimension mismatch: expected {}x{}, got {}x{}",
-            beta.len(),
-            beta.len(),
-            covariance.nrows(),
-            covariance.ncols()
-        )));
-    }
-
-    let mut eta = x.matrixvectormultiply(&beta.to_owned());
-    eta += &offset;
-
     let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let etavar = linear_predictorvariance_from_backend(&x, &backend)?;
-    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
-    let quadctx = crate::quadrature::QuadratureContext::new();
     let strategy = strategy_for_family(family, None);
-    let means: Result<Vec<f64>, EstimationError> = eta
-        .iter()
-        .zip(eta_standard_error.iter())
-        .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
-        .collect();
-    let mean = Array1::from_vec(means?);
-
-    Ok(PredictPosteriorMeanResult {
-        eta,
-        eta_standard_error,
-        mean,
-    })
+    predict_gam_posterior_mean_from_backend(
+        x,
+        beta,
+        offset,
+        &backend,
+        &strategy,
+        "predict_gam_posterior_mean",
+    )
 }
 
 /// Nonlinear posterior-mean prediction with link-state support for SAS/mixture families.
@@ -2501,49 +2504,16 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if x.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_meanwith_fit dimension mismatch: X has {} columns but beta has length {}",
-            x.ncols(),
-            beta.len()
-        )));
-    }
-    if x.nrows() != offset.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_meanwith_fit dimension mismatch: X has {} rows but offset has length {}",
-            x.nrows(),
-            offset.len()
-        )));
-    }
-    if covariance.nrows() != beta.len() || covariance.ncols() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "predict_gam_posterior_meanwith_fit covariance dimension mismatch: expected {}x{}, got {}x{}",
-            beta.len(),
-            beta.len(),
-            covariance.nrows(),
-            covariance.ncols()
-        )));
-    }
-
-    let mut eta = x.matrixvectormultiply(&beta.to_owned());
-    eta += &offset;
     let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let etavar = linear_predictorvariance_from_backend(&x, &backend)?;
-    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
-    let quadctx = crate::quadrature::QuadratureContext::new();
     let strategy = strategy_from_fit(family, fit)?;
-    let means: Result<Vec<f64>, EstimationError> = eta
-        .iter()
-        .zip(eta_standard_error.iter())
-        .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
-        .collect();
-    let mean = Array1::from_vec(means?);
-
-    Ok(PredictPosteriorMeanResult {
-        eta,
-        eta_standard_error,
-        mean,
-    })
+    predict_gam_posterior_mean_from_backend(
+        x,
+        beta,
+        offset,
+        &backend,
+        &strategy,
+        "predict_gam_posterior_meanwith_fit",
+    )
 }
 
 /// Prediction with coefficient uncertainty propagation.

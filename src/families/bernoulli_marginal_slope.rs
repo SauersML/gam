@@ -4,10 +4,12 @@ use crate::basis::{
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    custom_family_outer_capability, evaluate_custom_family_joint_hyper, fit_custom_family,
+    custom_family_outer_capability, evaluate_custom_family_joint_hyper, first_psi_linear_map,
+    fit_custom_family, second_psi_linear_map,
 };
 use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
@@ -1288,6 +1290,42 @@ impl BernoulliMarginalSlopeFamily {
         None
     }
 
+    fn psi_design_row_vector(
+        &self,
+        row: usize,
+        deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
+        total_rows: usize,
+        p: usize,
+        label: &str,
+    ) -> Result<Array1<f64>, String> {
+        let action =
+            CustomFamilyPsiDesignAction::from_first_derivative(deriv, total_rows, p, 0..total_rows, label)
+                .ok();
+        first_psi_linear_map(action.as_ref(), &deriv.x_psi, total_rows, p).row_vector(row)
+    }
+
+    fn psi_second_design_row_vector(
+        &self,
+        row: usize,
+        deriv_i: &crate::custom_family::CustomFamilyBlockPsiDerivative,
+        deriv_j: &crate::custom_family::CustomFamilyBlockPsiDerivative,
+        local_j: usize,
+        total_rows: usize,
+        p: usize,
+        label: &str,
+    ) -> Result<Array1<f64>, String> {
+        let action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+            deriv_i,
+            deriv_j,
+            total_rows,
+            p,
+            0..total_rows,
+            label,
+        )?;
+        let dense = deriv_i.x_psi_psi.as_ref().and_then(|rows| rows.get(local_j));
+        second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
+    }
+
     fn row_primary_psi_direction(
         &self,
         row: usize,
@@ -1303,8 +1341,26 @@ impl BernoulliMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(primary.total);
         match block_idx {
-            0 => out[0] = deriv.x_psi.row(row).dot(&block_states[0].beta),
-            1 => out[1] = deriv.x_psi.row(row).dot(&block_states[1].beta),
+            0 => {
+                let x_row = self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.y.len(),
+                    self.marginal_design.ncols(),
+                    "BernoulliMarginalSlopeFamily marginal",
+                )?;
+                out[0] = x_row.dot(&block_states[0].beta);
+            }
+            1 => {
+                let x_row = self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.y.len(),
+                    self.logslope_design.ncols(),
+                    "BernoulliMarginalSlopeFamily log-slope",
+                )?;
+                out[1] = x_row.dot(&block_states[1].beta);
+            }
             _ => {
                 return Err(format!(
                     "bernoulli marginal-slope psi direction only supports spatial marginal/logslope blocks, got block {block_idx}"
@@ -1331,16 +1387,24 @@ impl BernoulliMarginalSlopeFamily {
         let mut out = Array1::<f64>::zeros(primary.total);
         match block_idx {
             0 => {
-                out[0] = deriv
-                    .x_psi
-                    .row(row)
-                    .dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned())
+                let x_row = self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.y.len(),
+                    self.marginal_design.ncols(),
+                    "BernoulliMarginalSlopeFamily marginal",
+                )?;
+                out[0] = x_row.dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned())
             }
             1 => {
-                out[1] = deriv
-                    .x_psi
-                    .row(row)
-                    .dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned())
+                let x_row = self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.y.len(),
+                    self.logslope_design.ncols(),
+                    "BernoulliMarginalSlopeFamily log-slope",
+                )?;
+                out[1] = x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned())
             }
             _ => {
                 return Err(format!(
@@ -1370,16 +1434,32 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Some(Array1::<f64>::zeros(primary.total)));
         }
         let deriv_i = &derivative_blocks[block_i][local_i];
-        let x_psi_psi = deriv_i
-            .x_psi_psi
-            .as_ref()
-            .and_then(|rows| rows.get(local_j))
-            .cloned()
-            .unwrap_or_else(|| Array2::<f64>::zeros((self.y.len(), deriv_i.x_psi.ncols())));
         let mut out = Array1::<f64>::zeros(primary.total);
         match block_i {
-            0 => out[0] = x_psi_psi.row(row).dot(&block_states[0].beta),
-            1 => out[1] = x_psi_psi.row(row).dot(&block_states[1].beta),
+            0 => {
+                let x_row = self.psi_second_design_row_vector(
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    self.y.len(),
+                    self.marginal_design.ncols(),
+                    "BernoulliMarginalSlopeFamily marginal",
+                )?;
+                out[0] = x_row.dot(&block_states[0].beta);
+            }
+            1 => {
+                let x_row = self.psi_second_design_row_vector(
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    self.y.len(),
+                    self.logslope_design.ncols(),
+                    "BernoulliMarginalSlopeFamily log-slope",
+                )?;
+                out[1] = x_row.dot(&block_states[1].beta);
+            }
             _ => {
                 return Err(format!(
                     "bernoulli marginal-slope psi second direction only supports marginal/logslope blocks, got block {block_i}"
@@ -1436,12 +1516,24 @@ impl BernoulliMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(slices.total);
         match block_idx {
-            0 => out
-                .slice_mut(s![slices.marginal.clone()])
-                .assign(&deriv.x_psi.row(row).to_owned()),
-            1 => out
-                .slice_mut(s![slices.logslope.clone()])
-                .assign(&deriv.x_psi.row(row).to_owned()),
+            0 => out.slice_mut(s![slices.marginal.clone()]).assign(
+                &self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.y.len(),
+                    self.marginal_design.ncols(),
+                    "BernoulliMarginalSlopeFamily marginal",
+                )?,
+            ),
+            1 => out.slice_mut(s![slices.logslope.clone()]).assign(
+                &self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.y.len(),
+                    self.logslope_design.ncols(),
+                    "BernoulliMarginalSlopeFamily log-slope",
+                )?,
+            ),
             _ => {
                 return Err(format!(
                     "bernoulli marginal-slope psi embedding only supports marginal/logslope blocks, got block {block_idx}"
@@ -1469,20 +1561,30 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Some((block_i, Array1::<f64>::zeros(slices.total))));
         }
         let deriv_i = &derivative_blocks[block_i][local_i];
-        let x_psi_psi = deriv_i
-            .x_psi_psi
-            .as_ref()
-            .and_then(|rows| rows.get(local_j))
-            .cloned()
-            .unwrap_or_else(|| Array2::<f64>::zeros((self.y.len(), deriv_i.x_psi.ncols())));
         let mut out = Array1::<f64>::zeros(slices.total);
         match block_i {
-            0 => out
-                .slice_mut(s![slices.marginal.clone()])
-                .assign(&x_psi_psi.row(row).to_owned()),
-            1 => out
-                .slice_mut(s![slices.logslope.clone()])
-                .assign(&x_psi_psi.row(row).to_owned()),
+            0 => out.slice_mut(s![slices.marginal.clone()]).assign(
+                &self.psi_second_design_row_vector(
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    self.y.len(),
+                    self.marginal_design.ncols(),
+                    "BernoulliMarginalSlopeFamily marginal",
+                )?,
+            ),
+            1 => out.slice_mut(s![slices.logslope.clone()]).assign(
+                &self.psi_second_design_row_vector(
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    self.y.len(),
+                    self.logslope_design.ncols(),
+                    "BernoulliMarginalSlopeFamily log-slope",
+                )?,
+            ),
             _ => {
                 return Err(format!(
                     "bernoulli marginal-slope psi second embedding only supports marginal/logslope blocks, got block {block_i}"
@@ -1788,6 +1890,57 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         Ok((ll, gradient, hessian))
+    }
+
+    fn exact_newton_joint_hessian_matvec_from_cache(
+        &self,
+        direction: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Array1<f64>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let mut out = Array1::<f64>::zeros(slices.total);
+        for row in 0..self.y.len() {
+            let row_dir = self.row_primary_direction_from_flat(row, slices, primary, direction)?;
+            let (_, row_hessian) = self.row_primary_gradient_hessian(row, &[], cache)?;
+            let row_action = row_hessian.dot(&row_dir);
+            out += &self.pullback_primary_vector(row, slices, primary, &row_action);
+        }
+        Ok(out)
+    }
+
+    fn exact_newton_joint_hessian_diagonal_from_cache(
+        &self,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Array1<f64>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let mut diagonal = Array1::<f64>::zeros(slices.total);
+        for row in 0..self.y.len() {
+            let (_, row_hessian) = self.row_primary_gradient_hessian(row, &[], cache)?;
+
+            for (local_idx, value) in self.marginal_design.row(row).iter().enumerate() {
+                diagonal[slices.marginal.start + local_idx] += value * value * row_hessian[[0, 0]];
+            }
+            for (local_idx, value) in self.logslope_design.row(row).iter().enumerate() {
+                diagonal[slices.logslope.start + local_idx] +=
+                    value * value * row_hessian[[1, 1]];
+            }
+
+            if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
+                for (local_idx, global_idx) in block_h.clone().enumerate() {
+                    diagonal[global_idx] +=
+                        row_hessian[[primary_h.start + local_idx, primary_h.start + local_idx]];
+                }
+            }
+            if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), slices.w.as_ref()) {
+                for (local_idx, global_idx) in block_w.clone().enumerate() {
+                    diagonal[global_idx] +=
+                        row_hessian[[primary_w.start + local_idx, primary_w.start + local_idx]];
+                }
+            }
+        }
+        Ok(diagonal)
     }
 
     fn exact_newton_joint_psi_terms_from_cache(
@@ -2370,6 +2523,18 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_matvec_from_cache(beta_flat, &self.cache)
+            .map(Some)
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_diagonal_from_cache(&self.cache)
+            .map(Some)
+    }
+
     fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
