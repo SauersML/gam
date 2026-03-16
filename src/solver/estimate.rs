@@ -407,97 +407,6 @@ impl FdGradientState<EstimationError> for RemlState<'_> {
     }
 }
 
-fn signed_xtv_x(
-    design: &DesignMatrix,
-    rowweights: &Array1<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    if rowweights.len() != design.nrows() {
-        return Err(EstimationError::InvalidInput(format!(
-            "signed_xtv_x row mismatch: weights={}, design rows={}",
-            rowweights.len(),
-            design.nrows()
-        )));
-    }
-    let p = design.ncols();
-    let mut xtvx = Array2::<f64>::zeros((p, p));
-    match design {
-        DesignMatrix::Dense(x) => {
-            for i in 0..x.nrows() {
-                let vi = rowweights[i];
-                if vi == 0.0 {
-                    continue;
-                }
-                for a in 0..p {
-                    let xa = x[[i, a]];
-                    for b in a..p {
-                        let value = vi * xa * x[[i, b]];
-                        xtvx[[a, b]] += value;
-                        if a != b {
-                            xtvx[[b, a]] += value;
-                        }
-                    }
-                }
-            }
-        }
-        DesignMatrix::Sparse(xs) => {
-            let csr = xs.to_csr_arc().ok_or_else(|| {
-                EstimationError::InvalidInput("signed_xtv_x: failed to obtain CSR view".to_string())
-            })?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-            for i in 0..design.nrows() {
-                let vi = rowweights[i];
-                if vi == 0.0 {
-                    continue;
-                }
-                let start = row_ptr[i];
-                let end = row_ptr[i + 1];
-                for a_ptr in start..end {
-                    let a = col_idx[a_ptr];
-                    let xa = vals[a_ptr];
-                    for b_ptr in a_ptr..end {
-                        let b = col_idx[b_ptr];
-                        let xb = vals[b_ptr];
-                        let value = vi * xa * xb;
-                        xtvx[[a, b]] += value;
-                        if a != b {
-                            xtvx[[b, a]] += value;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(xtvx)
-}
-
-fn assemble_parametric_score_beta_jacobian(
-    x_t: &DesignMatrix,
-    neg_du_deta: &Array1<f64>,
-    penalty: &Array2<f64>,
-    ridge: f64,
-) -> Result<Array2<f64>, EstimationError> {
-    let mut jacobian = signed_xtv_x(x_t, neg_du_deta)?;
-    if penalty.nrows() != jacobian.nrows() || penalty.ncols() != jacobian.ncols() {
-        return Err(EstimationError::InvalidInput(format!(
-            "parametric score beta jacobian penalty mismatch: penalty={}x{}, jacobian={}x{}",
-            penalty.nrows(),
-            penalty.ncols(),
-            jacobian.nrows(),
-            jacobian.ncols()
-        )));
-    }
-    jacobian += penalty;
-    if ridge > 0.0 {
-        for i in 0..jacobian.nrows() {
-            jacobian[[i, i]] += ridge;
-        }
-    }
-    Ok(jacobian)
-}
-
 #[derive(Clone, Debug)]
 struct ParametricColumnConditioning {
     intercept_idx: Option<usize>,
@@ -4425,34 +4334,6 @@ fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
     (epsilon, d_epsilon_d_raw)
 }
 
-const BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
-
-#[derive(Clone, Copy, Debug)]
-struct BinomialAuxTerms {
-    a1: f64,
-    a2: f64,
-    variance: f64,
-    variancemu_scale: f64,
-}
-
-#[inline]
-fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms {
-    let mu = if mu.is_finite() {
-        mu.clamp(BINOMIAL_AUX_MU_EPS, 1.0 - BINOMIAL_AUX_MU_EPS)
-    } else {
-        0.5
-    };
-    let one_minusmu = 1.0 - mu;
-    let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
-    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
-    BinomialAuxTerms {
-        a1,
-        a2,
-        variance: mu * one_minusmu,
-        variancemu_scale: 1.0 - 2.0 * mu,
-    }
-}
-
 #[inline]
 fn should_enable_firth_from_class_support(minority_support: f64, n_features: usize) -> bool {
     let complexity_threshold =
@@ -4606,6 +4487,7 @@ mod fd_policy_tests {
     use super::*;
     use crate::linalg::utils::max_abs_diag;
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
+    use super::reml::hyper::{link_binomial_aux, LINK_BINOMIAL_AUX_MU_EPS};
     use crate::types::LikelihoodFamily;
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
@@ -4721,8 +4603,8 @@ mod fd_policy_tests {
         .expect("sas state");
         reml_state.set_link_states(None, Some(sas_state));
 
-        let (pirls_result, _) = reml_state
-            .pirls_result_and_hpos_for_rho(&rho)
+        let pirls_result = reml_state
+            .obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone())
             .expect("pirls_result");
         println!(
             "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19 lastgradient_norm={:.6e} status={:?} iteration={}",
@@ -4739,8 +4621,8 @@ mod fd_policy_tests {
                 sas_state.log_delta,
             );
             let mu = jets.jet.mu;
-            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
-            if (mu.is_finite() && (mu <= BINOMIAL_AUX_MU_EPS || mu >= 1.0 - BINOMIAL_AUX_MU_EPS))
+            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+            if (mu.is_finite() && (mu <= LINK_BINOMIAL_AUX_MU_EPS || mu >= 1.0 - LINK_BINOMIAL_AUX_MU_EPS))
                 || !mu.is_finite()
             {
                 clampedobs += 1;
@@ -4766,7 +4648,7 @@ mod fd_policy_tests {
                 );
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
-                let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+                let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
                 out[i] = aux.a1 * d1;
             }
             out
@@ -4793,16 +4675,23 @@ mod fd_policy_tests {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
             neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
         }
-        let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
-            x_t,
-            &neg_du_deta,
-            &pirls_result.reparam_result.s_transformed,
-            pirls_result.ridge_used,
-        )
-        .expect("score beta jacobian");
+        let score_beta_jacobian = {
+            let x_dense = x_t.to_dense();
+            let diag_v = Array2::from_diag(&neg_du_deta);
+            let mut j = x_dense.t().dot(&diag_v).dot(&x_dense);
+            for ((r, c), v) in pirls_result.reparam_result.s_transformed.indexed_iter() {
+                j[[r, c]] += v;
+            }
+            if pirls_result.ridge_used > 0.0 {
+                for d in 0..j.nrows() {
+                    j[[d, d]] += pirls_result.ridge_used;
+                }
+            }
+            j
+        };
         let stable_solver = StableSolver::new("sas dbeta exact test");
         let mut dbeta_exact = stable_solver
             .solvevectorwithridge_retries(
@@ -4835,7 +4724,7 @@ mod fd_policy_tests {
             })
             .expect("fd sas state");
             state.set_link_states(None, Some(sas_state));
-            let (pirls, _) = state.pirls_result_and_hpos_for_rho(&rho).expect("fd pirls");
+            let pirls = state.obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone()).expect("fd pirls");
             pirls.beta_transformed.as_ref().clone()
         };
         let beta_p = beta_at(theta[1] + fd_h);
@@ -4915,8 +4804,8 @@ mod fd_policy_tests {
         .expect("sas state");
         reml_state.set_link_states(None, Some(sas_state));
 
-        let (pirls_result, _) = reml_state
-            .pirls_result_and_hpos_for_rho(&rho)
+        let pirls_result = reml_state
+            .obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone())
             .expect("pirls_result");
         let beta0 = pirls_result.beta_transformed.as_ref().clone();
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
@@ -4940,7 +4829,7 @@ mod fd_policy_tests {
                 );
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
-                let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+                let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
                 u[i] = aux.a1 * d1;
             }
             let mut g = -x_dense.t().dot(&u);
@@ -4964,7 +4853,7 @@ mod fd_policy_tests {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
             neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
         }
         let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
@@ -5062,8 +4951,8 @@ mod fd_policy_tests {
         .expect("sas state");
         reml_state.set_link_states(None, Some(sas_state));
 
-        let (pirls_result, _) = reml_state
-            .pirls_result_and_hpos_for_rho(&rho)
+        let pirls_result = reml_state
+            .obtain_eval_bundle(&rho).map(|b| b.pirls_result.clone())
             .expect("pirls_result");
         let beta0 = pirls_result.beta_transformed.as_ref().clone();
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
@@ -5087,7 +4976,7 @@ mod fd_policy_tests {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
             neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
         }
         let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
@@ -5111,7 +5000,7 @@ mod fd_policy_tests {
     }
 
     #[test]
-    fn stabilized_binomial_aux_terms_stay_finite_for_saturated_sas_probabilities() {
+    fn link_binomial_aux_stay_finite_for_saturated_sas_probabilities() {
         let saturated_cases = [
             (
                 0.0,
@@ -5127,7 +5016,7 @@ mod fd_policy_tests {
             ),
         ];
         for (yi, mu) in saturated_cases {
-            let aux = stabilized_binomial_aux_terms(yi, 1.0, mu);
+            let aux = link_binomial_aux(yi, 1.0, mu);
             assert!(aux.a1.is_finite(), "a1 must be finite for yi={yi} mu={mu}");
             assert!(aux.a2.is_finite(), "a2 must be finite for yi={yi} mu={mu}");
             assert!(

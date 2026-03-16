@@ -7,22 +7,22 @@ use crate::matrix::DenseRightProductView;
 // module so that hyper.rs can compute per-observation likelihood derivatives
 // without depending on the estimate module's private helpers.
 
-const LINK_BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
+pub(crate) const LINK_BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
 
 #[derive(Clone, Copy)]
-struct LinkBinomialAux {
+pub(crate) struct LinkBinomialAux {
     /// dℓ_i/dμ_i = w_i (y_i/μ_i − (1−y_i)/(1−μ_i))
-    a1: f64,
+    pub(crate) a1: f64,
     /// d²ℓ_i/dμ_i² = w_i (−y_i/μ_i² − (1−y_i)/(1−μ_i)²)
-    a2: f64,
+    pub(crate) a2: f64,
     /// μ(1−μ) — binomial variance function
-    variance: f64,
+    pub(crate) variance: f64,
     /// dVar/dμ = 1−2μ
-    variancemu_scale: f64,
+    pub(crate) variancemu_scale: f64,
 }
 
 #[inline]
-fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
+pub(crate) fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
     let mu = if mu.is_finite() {
         mu.clamp(LINK_BINOMIAL_AUX_MU_EPS, 1.0 - LINK_BINOMIAL_AUX_MU_EPS)
     } else {

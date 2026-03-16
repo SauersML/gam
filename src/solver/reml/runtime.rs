@@ -658,7 +658,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn obtain_eval_bundle(
+    pub(crate) fn obtain_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
@@ -679,13 +679,6 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
-    pub(crate) fn pirls_result_and_hpos_for_rho(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<(Arc<crate::pirls::PirlsResult>, Arc<Array2<f64>>), EstimationError> {
-        let bundle = self.obtain_eval_bundle(rho)?;
-        Ok((bundle.pirls_result.clone(), bundle.h_pos_factorw.clone()))
-    }
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
@@ -1237,7 +1230,6 @@ impl<'a> RemlState<'a> {
             geometry: RemlGeometry::DenseSpectral,
             h_eff: Arc::new(h_eff),
             h_total: Arc::new(h_total),
-            h_pos_factorw: Arc::new(w),
             active_subspace_rel_gap,
             active_subspace_unstable,
             sparse_exact: None,
@@ -1329,7 +1321,6 @@ impl<'a> RemlState<'a> {
             geometry: RemlGeometry::SparseExactSpd,
             h_eff: Arc::new(Array2::zeros((0, 0))),
             h_total: Arc::new(Array2::zeros((0, 0))),
-            h_pos_factorw: Arc::new(Array2::zeros((0, 0))),
             active_subspace_rel_gap: None,
             active_subspace_unstable: false,
             sparse_exact: Some(Arc::new(SparseExactEvalData {
