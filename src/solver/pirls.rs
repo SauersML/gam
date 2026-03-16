@@ -1267,8 +1267,9 @@ impl<'a> GamWorkingModel<'a> {
                     &mut workspace.hessian_buf,
                     get_global_parallelism(),
                 );
-                // Return owned copy — the buffer is reused on the next call.
-                Ok(workspace.hessian_buf.clone())
+                // Move the buffer out instead of cloning — saves O(p²) memcpy.
+                // Next call will reallocate (same cost as the existing zero-fill).
+                Ok(std::mem::take(&mut workspace.hessian_buf))
             }
             _ => design
                 .diag_xtw_x(weights)
@@ -1385,10 +1386,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
     ) -> Result<WorkingState, EstimationError> {
         let n = self.offset.len();
         if self.workspace.eta_buf.len() != n {
-            self.workspace.eta_buf = Array1::zeros(n);
+            // Use uninit — buffer is immediately overwritten by assign + add below.
+            unsafe {
+                self.workspace.eta_buf = Array1::uninit(n).assume_init();
+            }
         }
         if self.workspace.matvec_buf.len() != n {
-            self.workspace.matvec_buf = Array1::zeros(n);
+            // Use uninit — buffer is immediately overwritten by transformed_matvec_into.
+            unsafe {
+                self.workspace.matvec_buf = Array1::uninit(n).assume_init();
+            }
         }
         let mut matvec_tmp = std::mem::take(&mut self.workspace.matvec_buf);
         self.transformed_matvec_into(beta, &mut matvec_tmp);
@@ -1596,14 +1603,19 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
 
         let z = &self.lastz;
-        self.workspace
-            .working_residual
-            .assign(&self.workspace.eta_buf);
-        self.workspace.working_residual -= z;
-        self.workspace
-            .weighted_residual
-            .assign(&self.workspace.working_residual);
-        self.workspace.weighted_residual *= &weights;
+        // Fused single-pass: compute weighted_residual = (eta - z) * w
+        // and working_residual = eta - z simultaneously, avoiding two
+        // separate O(n) passes and an intermediate copy.
+        ndarray::Zip::from(&mut self.workspace.weighted_residual)
+            .and(&mut self.workspace.working_residual)
+            .and(&self.workspace.eta_buf)
+            .and(z)
+            .and(&weights)
+            .for_each(|wr, r, &eta, &zi, &wi| {
+                let residual = eta - zi;
+                *r = residual;
+                *wr = residual * wi;
+            });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
