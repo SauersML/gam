@@ -6,6 +6,7 @@ use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder, s};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::ops::Range;
@@ -334,6 +335,34 @@ impl SymmetricMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(mat) => mat.clone(),
+            Self::Sparse(mat) => {
+                let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
+                let (symbolic, values) = mat.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..mat.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        let value = values[idx];
+                        out[[row, col]] += value;
+                        if row != col {
+                            out[[col, row]] += value;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Consuming conversion: moves the inner `Array2` when `Dense`, converts
+    /// when `Sparse`.  Avoids the clone that `to_dense()` performs on a Dense
+    /// variant that is about to be dropped.
+    pub fn into_dense(self) -> Array2<f64> {
+        match self {
+            Self::Dense(mat) => mat,
             Self::Sparse(mat) => {
                 let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
                 let (symbolic, values) = mat.parts();
@@ -1554,6 +1583,24 @@ impl DesignMatrix {
         match self {
             Self::Dense(matrix) => Some(matrix.as_ref()),
             Self::Sparse(_) => None,
+        }
+    }
+
+    /// Zero-copy borrow when `Dense`, materialized conversion when `Sparse`.
+    ///
+    /// This avoids the unconditional clone that `to_dense()` performs on dense
+    /// matrices.  Callers that only need a `&Array2<f64>` should use this and
+    /// then call `Cow::as_ref()` or `&*cow`.
+    pub fn as_dense_cow(&self) -> Cow<'_, Array2<f64>> {
+        match self {
+            Self::Dense(matrix) => Cow::Borrowed(matrix.as_ref()),
+            Self::Sparse(matrix) => Cow::Owned(
+                matrix
+                    .try_to_dense_arc("DesignMatrix::as_dense_cow")
+                    .unwrap_or_else(|msg| panic!("{msg}"))
+                    .as_ref()
+                    .clone(),
+            ),
         }
     }
 
