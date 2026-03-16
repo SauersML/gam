@@ -53,7 +53,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python deps
-        run: pip install numpy pandas scikit-learn
+        run: pip install numpy pandas scikit-learn lifelines
 
       - name: Set up R
         uses: ./.github/actions/setup-bench-r
