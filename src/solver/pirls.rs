@@ -2282,12 +2282,25 @@ fn add_diagonal_to_upper_sparse(
                 }
             }
         }
-        // Reuse symbolic structure with updated values.
-        // Clone the original matrix, then overwrite its values.
-        let mut result = matrix.clone();
-        let (_, result_values) = result.parts_mut();
-        result_values.copy_from_slice(&new_values);
-        return Ok(result);
+        // Rebuild from triplets using the known structure.
+        // This is much faster than the general slow path below because we
+        // know exactly which entries exist and their positions.
+        let mut triplets = Vec::with_capacity(values.len());
+        for col in 0..matrix.ncols() {
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                triplets.push(Triplet::new(row_idx[idx], col, new_values[idx]));
+            }
+        }
+        return SparseColMat::try_new_from_triplets(
+            matrix.nrows(),
+            matrix.ncols(),
+            &triplets,
+        )
+        .map_err(|_| {
+            EstimationError::InvalidInput(
+                "failed to rebuild sparse matrix with diagonal update".to_string(),
+            )
+        });
     }
 
     // Slow path: diagonal entries missing from structure, must rebuild.
