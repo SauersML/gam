@@ -1,25 +1,25 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    create_basis, create_difference_penalty_matrix, BasisOptions, Dense, KnotSource,
 };
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, fit_custom_family,
+    fit_custom_family, BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation,
+    ParameterBlockSpec, ParameterBlockState,
 };
-use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
+use crate::estimate::{fit_gam, FitOptions, UnifiedFitResult};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
-use crate::families::gamlss::{ParameterBlockInput, initializewiggle_knots_from_seed};
+use crate::families::gamlss::{initializewiggle_knots_from_seed, ParameterBlockInput};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::quadrature::compute_gauss_hermite_n;
 use crate::smooth::{
+    build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
+    optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_two_block_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    TermCollectionSpec, TwoBlockExactJointHyperSetup,
 };
 use crate::types::LikelihoodFamily;
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use std::cell::RefCell;
 
 #[derive(Clone, Debug)]
@@ -242,7 +242,8 @@ fn build_deviation_block_from_seed(
         if order == cfg.penalty_order || order == 0 || order >= raw_dim {
             continue;
         }
-        let raw = create_difference_penalty_matrix(raw_dim, order, None).map_err(|e| e.to_string())?;
+        let raw =
+            create_difference_penalty_matrix(raw_dim, order, None).map_err(|e| e.to_string())?;
         penalties.push(fast_ab(
             &fast_atb(&runtime.transform, &raw),
             &runtime.transform,
@@ -270,7 +271,10 @@ fn build_deviation_block_from_seed(
     })
 }
 
-fn validate_spec(data: ArrayView2<'_, f64>, spec: &BernoulliMarginalSlopeTermSpec) -> Result<(), String> {
+fn validate_spec(
+    data: ArrayView2<'_, f64>,
+    spec: &BernoulliMarginalSlopeTermSpec,
+) -> Result<(), String> {
     let n = data.nrows();
     if spec.y.len() != n || spec.weights.len() != n || spec.z.len() != n {
         return Err(format!(
@@ -328,10 +332,16 @@ fn joint_setup(
     }
     let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
     let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
-    let marginal_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(marginalspec, &marginal_terms, kappa_options);
-    let logslope_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(logslopespec, &logslope_terms, kappa_options);
+    let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
+        marginalspec,
+        &marginal_terms,
+        kappa_options,
+    );
+    let logslope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
+        logslopespec,
+        &logslope_terms,
+        kappa_options,
+    );
     let mut values = marginal_kappa.as_array().to_vec();
     values.extend(logslope_kappa.as_array().iter());
     let mut dims = marginal_kappa.dims_per_term().to_vec();
@@ -566,20 +576,17 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
             let ah = mh.mapv(|v| -v / ma.max(1e-12));
-            let aqh = Array1::from_iter((0..ph).map(|m| {
-                -(a_q * (maa * ah[m] + mah[m])) / ma.max(1e-12)
-            }));
+            let aqh =
+                Array1::from_iter((0..ph).map(|m| -(a_q * (maa * ah[m] + mah[m])) / ma.max(1e-12)));
             let abh = Array1::from_iter((0..ph).map(|m| {
                 -(maa * a_b * ah[m] + mab * ah[m] + mah[m] * a_b + mbh[m]) / ma.max(1e-12)
             }));
             let mut ahh = Array2::<f64>::zeros((ph, ph));
             for m in 0..ph {
                 for n in 0..ph {
-                    ahh[[m, n]] = -(maa * ah[m] * ah[n]
-                        + mah[m] * ah[n]
-                        + mah[n] * ah[m]
-                        + mhh[[m, n]])
-                        / ma.max(1e-12);
+                    ahh[[m, n]] =
+                        -(maa * ah[m] * ah[n] + mah[m] * ah[n] + mah[n] * ah[m] + mhh[[m, n]])
+                            / ma.max(1e-12);
                 }
             }
             (Some(ah), Some(aqh), Some(abh), Some(ahh))
@@ -587,7 +594,9 @@ impl BernoulliMarginalSlopeFamily {
             (None, None, None, None)
         };
 
-        let (a_w, a_qw, a_bw, a_hw, a_ww) = if let (Some(beta_w), Some(runtime)) = (beta_w, &self.link_dev) {
+        let (a_w, a_qw, a_bw, a_hw, a_ww) = if let (Some(beta_w), Some(runtime)) =
+            (beta_w, &self.link_dev)
+        {
             let basis = runtime.design(&v)?;
             let basis_d1 = runtime.first_derivative_design(&v)?;
             let mut mw = Array1::<f64>::zeros(pw);
@@ -619,20 +628,17 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
             let aw = mw.mapv(|v| -v / ma.max(1e-12));
-            let aqw = Array1::from_iter((0..pw).map(|r| {
-                -(a_q * (maa * aw[r] + maw[r])) / ma.max(1e-12)
-            }));
+            let aqw =
+                Array1::from_iter((0..pw).map(|r| -(a_q * (maa * aw[r] + maw[r])) / ma.max(1e-12)));
             let abw = Array1::from_iter((0..pw).map(|r| {
                 -(maa * a_b * aw[r] + mab * aw[r] + maw[r] * a_b + mbw[r]) / ma.max(1e-12)
             }));
             let mut aww = Array2::<f64>::zeros((pw, pw));
             for r in 0..pw {
                 for s in 0..pw {
-                    aww[[r, s]] = -(maa * aw[r] * aw[s]
-                        + maw[r] * aw[s]
-                        + maw[s] * aw[r]
-                        + mww[[r, s]])
-                        / ma.max(1e-12);
+                    aww[[r, s]] =
+                        -(maa * aw[r] * aw[s] + maw[r] * aw[s] + maw[s] * aw[r] + mww[[r, s]])
+                            / ma.max(1e-12);
                 }
             }
             let ahw = if let (Some(ah), Some(mah), Some(mhw_mat)) = (&a_h, &a_qh, mhw) {
@@ -703,87 +709,109 @@ impl BernoulliMarginalSlopeFamily {
             } else {
                 self.z[i]
             };
-            let (eta0, eta_q, eta_g, eta_h, eta_w, eta_qq, eta_qg, eta_gg, eta_qh, eta_gh, eta_hh, eta_qw, eta_gw, eta_hw, eta_ww) =
-                if !self.flex_active() {
-                    let c = (1.0 + slope * slope).sqrt();
+            let (
+                eta0,
+                eta_q,
+                eta_g,
+                eta_h,
+                eta_w,
+                eta_qq,
+                eta_qg,
+                eta_gg,
+                eta_qh,
+                eta_gh,
+                eta_hh,
+                eta_qw,
+                eta_gw,
+                eta_hw,
+                eta_ww,
+            ) = if !self.flex_active() {
+                let c = (1.0 + slope * slope).sqrt();
+                (
+                    marginal_eta * c + slope * warped_obs,
+                    c,
+                    marginal_eta * (slope * slope / c) + slope * warped_obs,
+                    None,
+                    None,
+                    0.0,
+                    slope * slope / c,
+                    marginal_eta * slope * slope * (2.0 + slope * slope) / c.powi(3)
+                        + slope * warped_obs,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                let implicit = self.root_solve_row(
+                    marginal_eta,
+                    slope,
+                    &h_nodes,
+                    h_node_design.as_ref(),
+                    beta_w,
+                )?;
+                let eta_h = implicit.a_h.as_ref().map(|a| {
+                    let row = score_warp_obs
+                        .as_ref()
+                        .expect("score_warp_obs exists when h active")
+                        .0
+                        .row(i)
+                        .to_owned();
+                    a + &(row * slope)
+                });
+                let eta_gh = implicit.a_bh.as_ref().map(|v| {
+                    let row = score_warp_obs
+                        .as_ref()
+                        .expect("score_warp_obs exists when h active")
+                        .0
+                        .row(i)
+                        .to_owned();
+                    (v + &row) * slope
+                });
+                (
+                    implicit.intercept + slope * warped_obs,
+                    implicit.a_q,
+                    slope * (implicit.a_b + warped_obs),
+                    eta_h,
+                    implicit.a_w.clone(),
+                    implicit.a_qq,
+                    slope * implicit.a_qb,
+                    slope * (implicit.a_b + warped_obs) + slope * slope * implicit.a_bb,
+                    implicit.a_qh.clone(),
+                    eta_gh,
+                    implicit.a_hh.clone(),
+                    implicit.a_qw.clone(),
+                    implicit.a_bw.as_ref().map(|v| v * slope),
+                    implicit.a_hw.clone(),
+                    implicit.a_ww.clone(),
+                )
+            };
+
+            let (q, q1, q2, basis_w, basis_w_d1) =
+                if let (Some(runtime), Some(beta), Some(eta_w_vec)) =
+                    (&self.link_dev, beta_w, eta_w.as_ref())
+                {
+                    let eta_arr = Array1::from_vec(vec![eta0]);
+                    let basis = runtime.design(&eta_arr)?;
+                    let d1 = runtime.first_derivative_design(&eta_arr)?;
+                    let d2 = runtime.second_derivative_design(&eta_arr)?;
+                    let q = eta0 + basis.row(0).dot(beta);
+                    let q1 = 1.0 + d1.row(0).dot(beta);
+                    let q2 = d2.row(0).dot(beta);
+                    let _ = eta_w_vec;
                     (
-                        marginal_eta * c + slope * warped_obs,
-                        c,
-                        marginal_eta * (slope * slope / c) + slope * warped_obs,
-                        None,
-                        None,
-                        0.0,
-                        slope * slope / c,
-                        marginal_eta * slope * slope * (2.0 + slope * slope) / c.powi(3)
-                            + slope * warped_obs,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
+                        q,
+                        q1,
+                        q2,
+                        Some(basis.row(0).to_owned()),
+                        Some(d1.row(0).to_owned()),
                     )
                 } else {
-                    let implicit = self.root_solve_row(
-                        marginal_eta,
-                        slope,
-                        &h_nodes,
-                        h_node_design.as_ref(),
-                        beta_w,
-                    )?;
-                    let eta_h = implicit.a_h.as_ref().map(|a| {
-                        let row = score_warp_obs
-                            .as_ref()
-                            .expect("score_warp_obs exists when h active")
-                            .0
-                            .row(i)
-                            .to_owned();
-                        a + &(row * slope)
-                    });
-                    let eta_gh = implicit.a_bh.as_ref().map(|v| {
-                        let row = score_warp_obs
-                            .as_ref()
-                            .expect("score_warp_obs exists when h active")
-                            .0
-                            .row(i)
-                            .to_owned();
-                        (v + &row) * slope
-                    });
-                    (
-                        implicit.intercept + slope * warped_obs,
-                        implicit.a_q,
-                        slope * (implicit.a_b + warped_obs),
-                        eta_h,
-                        implicit.a_w.clone(),
-                        implicit.a_qq,
-                        slope * implicit.a_qb,
-                        slope * (implicit.a_b + warped_obs) + slope * slope * implicit.a_bb,
-                        implicit.a_qh.clone(),
-                        eta_gh,
-                        implicit.a_hh.clone(),
-                        implicit.a_qw.clone(),
-                        implicit.a_bw.as_ref().map(|v| v * slope),
-                        implicit.a_hw.clone(),
-                        implicit.a_ww.clone(),
-                    )
+                    (eta0, 1.0, 0.0, None, None)
                 };
-
-            let (q, q1, q2, basis_w, basis_w_d1) = if let (Some(runtime), Some(beta), Some(eta_w_vec)) =
-                (&self.link_dev, beta_w, eta_w.as_ref())
-            {
-                let eta_arr = Array1::from_vec(vec![eta0]);
-                let basis = runtime.design(&eta_arr)?;
-                let d1 = runtime.first_derivative_design(&eta_arr)?;
-                let d2 = runtime.second_derivative_design(&eta_arr)?;
-                let q = eta0 + basis.row(0).dot(beta);
-                let q1 = 1.0 + d1.row(0).dot(beta);
-                let q2 = d2.row(0).dot(beta);
-                let _ = eta_w_vec;
-                (q, q1, q2, Some(basis.row(0).to_owned()), Some(d1.row(0).to_owned()))
-            } else {
-                (eta0, 1.0, 0.0, None, None)
-            };
 
             let mu = normal_cdf(q).clamp(1e-12, 1.0 - 1e-12);
             ll += self.weights[i] * (self.y[i] * mu.ln() + (1.0 - self.y[i]) * (1.0 - mu).ln());
@@ -798,16 +826,12 @@ impl BernoulliMarginalSlopeFamily {
                 .fill(q1 * eta_g);
             if let Some(h_range) = slices.h.clone() {
                 if let Some(eta_h_vec) = eta_h.as_ref() {
-                    q_beta
-                        .slice_mut(s![h_range])
-                        .assign(&(eta_h_vec * q1));
+                    q_beta.slice_mut(s![h_range]).assign(&(eta_h_vec * q1));
                 }
             }
             if let Some(w_range) = slices.w.clone() {
                 if let (Some(eta_w_vec), Some(bw)) = (eta_w.as_ref(), basis_w.as_ref()) {
-                    q_beta
-                        .slice_mut(s![w_range])
-                        .assign(&(eta_w_vec * q1 + bw));
+                    q_beta.slice_mut(s![w_range]).assign(&(eta_w_vec * q1 + bw));
                 }
             }
             gradient -= &(q_beta.mapv(|v| m1 * v));
@@ -844,16 +868,18 @@ impl BernoulliMarginalSlopeFamily {
                     if let (Some(eta_h_vec), Some(eta_qh_vec), Some(eta_gh_vec)) =
                         (eta_h.as_ref(), eta_qh.as_ref(), eta_gh.as_ref())
                     {
-                        let qh = Array2::from_shape_fn((slices.marginal.len(), h_range.len()), |(_, j)| {
-                            q1 * eta_qh_vec[j] + q2 * eta_q * eta_h_vec[j]
-                        });
+                        let qh = Array2::from_shape_fn(
+                            (slices.marginal.len(), h_range.len()),
+                            |(_, j)| q1 * eta_qh_vec[j] + q2 * eta_q * eta_h_vec[j],
+                        );
                         hmat.slice_mut(s![slices.marginal.clone(), h_range.clone()])
                             .scaled_add(m1, &qh);
                         hmat.slice_mut(s![h_range.clone(), slices.marginal.clone()])
                             .scaled_add(m1, &qh.t().to_owned());
-                        let gh = Array2::from_shape_fn((slices.logslope.len(), h_range.len()), |(_, j)| {
-                            q1 * eta_gh_vec[j] + q2 * eta_g * eta_h_vec[j]
-                        });
+                        let gh = Array2::from_shape_fn(
+                            (slices.logslope.len(), h_range.len()),
+                            |(_, j)| q1 * eta_gh_vec[j] + q2 * eta_g * eta_h_vec[j],
+                        );
                         hmat.slice_mut(s![slices.logslope.clone(), h_range.clone()])
                             .scaled_add(m1, &gh);
                         hmat.slice_mut(s![h_range.clone(), slices.logslope.clone()])
@@ -876,30 +902,45 @@ impl BernoulliMarginalSlopeFamily {
                 if let Some(w_range) = slices.w.clone() {
                     if let (Some(eta_w_vec), Some(bw_d1)) = (eta_w.as_ref(), basis_w_d1.as_ref()) {
                         if let Some(eta_qw_vec) = eta_qw.as_ref() {
-                            let qw = Array2::from_shape_fn((slices.marginal.len(), w_range.len()), |(_, j)| {
-                                q1 * eta_qw_vec[j] + q2 * eta_q * eta_w_vec[j] + bw_d1[j] * eta_q
-                            });
+                            let qw = Array2::from_shape_fn(
+                                (slices.marginal.len(), w_range.len()),
+                                |(_, j)| {
+                                    q1 * eta_qw_vec[j]
+                                        + q2 * eta_q * eta_w_vec[j]
+                                        + bw_d1[j] * eta_q
+                                },
+                            );
                             hmat.slice_mut(s![slices.marginal.clone(), w_range.clone()])
                                 .scaled_add(m1, &qw);
                             hmat.slice_mut(s![w_range.clone(), slices.marginal.clone()])
                                 .scaled_add(m1, &qw.t().to_owned());
                         }
                         if let Some(eta_gw_vec) = eta_gw.as_ref() {
-                            let gw = Array2::from_shape_fn((slices.logslope.len(), w_range.len()), |(_, j)| {
-                                q1 * eta_gw_vec[j] + q2 * eta_g * eta_w_vec[j] + bw_d1[j] * eta_g
-                            });
+                            let gw = Array2::from_shape_fn(
+                                (slices.logslope.len(), w_range.len()),
+                                |(_, j)| {
+                                    q1 * eta_gw_vec[j]
+                                        + q2 * eta_g * eta_w_vec[j]
+                                        + bw_d1[j] * eta_g
+                                },
+                            );
                             hmat.slice_mut(s![slices.logslope.clone(), w_range.clone()])
                                 .scaled_add(m1, &gw);
                             hmat.slice_mut(s![w_range.clone(), slices.logslope.clone()])
                                 .scaled_add(m1, &gw.t().to_owned());
                         }
                         if let Some(h_range) = slices.h.clone() {
-                            if let (Some(eta_h_vec), Some(eta_hw_mat)) = (eta_h.as_ref(), eta_hw.as_ref()) {
-                                let hw = Array2::from_shape_fn((h_range.len(), w_range.len()), |(r, c)| {
-                                    q1 * eta_hw_mat[[r, c]]
-                                        + q2 * eta_h_vec[r] * eta_w_vec[c]
-                                        + bw_d1[c] * eta_h_vec[r]
-                                });
+                            if let (Some(eta_h_vec), Some(eta_hw_mat)) =
+                                (eta_h.as_ref(), eta_hw.as_ref())
+                            {
+                                let hw = Array2::from_shape_fn(
+                                    (h_range.len(), w_range.len()),
+                                    |(r, c)| {
+                                        q1 * eta_hw_mat[[r, c]]
+                                            + q2 * eta_h_vec[r] * eta_w_vec[c]
+                                            + bw_d1[c] * eta_h_vec[r]
+                                    },
+                                );
                                 hmat.slice_mut(s![h_range.clone(), w_range.clone()])
                                     .scaled_add(m1, &hw);
                                 hmat.slice_mut(s![w_range.clone(), h_range.clone()])
@@ -907,11 +948,12 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                         if let Some(eta_ww_mat) = eta_ww.as_ref() {
-                            let mut ww = Array2::from_shape_fn((w_range.len(), w_range.len()), |(r, c)| {
-                                q2 * eta_w_vec[r] * eta_w_vec[c]
-                                    + bw_d1[r] * eta_w_vec[c]
-                                    + bw_d1[c] * eta_w_vec[r]
-                            });
+                            let mut ww =
+                                Array2::from_shape_fn((w_range.len(), w_range.len()), |(r, c)| {
+                                    q2 * eta_w_vec[r] * eta_w_vec[c]
+                                        + bw_d1[r] * eta_w_vec[c]
+                                        + bw_d1[c] * eta_w_vec[r]
+                                });
                             ww.scaled_add(q1, eta_ww_mat);
                             hmat.slice_mut(s![w_range.clone(), w_range.clone()])
                                 .scaled_add(m1, &ww);
@@ -970,7 +1012,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        self.joint_gradient_hessian(block_states, false).map(|r| r.0)
+        self.joint_gradient_hessian(block_states, false)
+            .map(|r| r.0)
     }
 
     fn exact_newton_joint_hessian(
@@ -1243,10 +1286,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
         |rho, marginal_resolved, logslope_resolved, _, _, need_hessian| {
             let _ = need_hessian;
             let objective = {
-                let marginal_design =
-                    build_term_collection_design(data, marginal_resolved).map_err(|e| e.to_string())?;
-                let logslope_design =
-                    build_term_collection_design(data, logslope_resolved).map_err(|e| e.to_string())?;
+                let marginal_design = build_term_collection_design(data, marginal_resolved)
+                    .map_err(|e| e.to_string())?;
+                let logslope_design = build_term_collection_design(data, logslope_resolved)
+                    .map_err(|e| e.to_string())?;
                 let blocks = build_blocks(rho, &marginal_design, &logslope_design)?;
                 let family = make_family();
                 fit_score(&inner_fit(&family, &blocks, options)?)
@@ -1303,14 +1346,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 let minus_logslope_spec = minus_logslope
                     .apply_tospec(&logslopespec_boot, &logslope_terms)
                     .map_err(|e| e.to_string())?;
-                let plus_marginal_design =
-                    build_term_collection_design(data, &plus_marginal_spec).map_err(|e| e.to_string())?;
-                let plus_logslope_design =
-                    build_term_collection_design(data, &plus_logslope_spec).map_err(|e| e.to_string())?;
+                let plus_marginal_design = build_term_collection_design(data, &plus_marginal_spec)
+                    .map_err(|e| e.to_string())?;
+                let plus_logslope_design = build_term_collection_design(data, &plus_logslope_spec)
+                    .map_err(|e| e.to_string())?;
                 let minus_marginal_design =
-                    build_term_collection_design(data, &minus_marginal_spec).map_err(|e| e.to_string())?;
+                    build_term_collection_design(data, &minus_marginal_spec)
+                        .map_err(|e| e.to_string())?;
                 let minus_logslope_design =
-                    build_term_collection_design(data, &minus_logslope_spec).map_err(|e| e.to_string())?;
+                    build_term_collection_design(data, &minus_logslope_spec)
+                        .map_err(|e| e.to_string())?;
                 let plus_fit = {
                     let blocks = build_blocks(
                         &plus.slice(s![..rho_dim]).to_owned(),

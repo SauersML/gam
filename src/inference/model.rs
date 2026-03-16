@@ -1,5 +1,5 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
+    compute_geometric_constraint_transform, create_basis, BasisOptions, Dense, KnotSource,
 };
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::inference::predict::{
@@ -400,8 +400,7 @@ impl SavedAnchoredDeviationRuntime {
         for (i, row) in self.transform.iter().enumerate() {
             if row.len() != cols {
                 return Err(
-                    "saved anchored deviation transform rows have inconsistent widths"
-                        .to_string(),
+                    "saved anchored deviation transform rows have inconsistent widths".to_string(),
                 );
             }
             for (j, &value) in row.iter().enumerate() {
@@ -1004,6 +1003,31 @@ impl FittedModel {
         }
         if let Some(spec_noise) = self.resolved_termspec_noise.as_ref() {
             validate_frozen_term_collectionspec(spec_noise, "resolved_termspec_noise")?;
+        }
+        if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
+            if self.formula_logslope.is_none() {
+                return Err(
+                    "marginal-slope model is missing formula_logslope; refit with current CLI"
+                        .to_string(),
+                );
+            }
+            if self.z_column.is_none() {
+                return Err(
+                    "marginal-slope model is missing z_column; refit with current CLI".to_string(),
+                );
+            }
+            if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
+                return Err(
+                    "marginal-slope model is missing baseline offsets; refit with current CLI"
+                        .to_string(),
+                );
+            }
+            if self.resolved_termspec_noise.is_none() {
+                return Err(
+                    "marginal-slope model is missing resolved_termspec_noise for the logslope surface"
+                        .to_string(),
+                );
+            }
         }
 
         if matches!(

@@ -2,8 +2,9 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, build_rowwise_kronecker_psi_operator,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
+    ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, build_rowwise_kronecker_psi_operator,
     evaluate_custom_family_joint_hyper, fit_custom_family, resolve_custom_family_x_psi,
     resolve_custom_family_x_psi_psi, shared_dense_arc, wrap_spatial_implicit_psi_operator,
 };
@@ -41,7 +42,7 @@ use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const MIN_PROB: f64 = 1e-12;
 
@@ -879,6 +880,14 @@ struct SurvivalJointPsiDirection {
     z_t_entry_psi: Array1<f64>,
     z_ls_exit_psi: Array1<f64>,
     z_ls_entry_psi: Array1<f64>,
+}
+
+struct SurvivalExactNewtonJointPsiWorkspace {
+    family: SurvivalLocationScaleFamily,
+    block_states: Vec<ParameterBlockState>,
+    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    joint_quantities: SurvivalJointQuantities,
+    psi_directions: Mutex<HashMap<usize, Option<Arc<SurvivalJointPsiDirection>>>>,
 }
 
 struct SurvivalJointPsiAction {
@@ -3801,6 +3810,96 @@ fn lift_conditional_covariance(
         ]] = 1.0;
     }
     t_map.dot(cov_reduced).dot(&t_map.t())
+}
+
+impl SurvivalExactNewtonJointPsiWorkspace {
+    fn new(
+        family: SurvivalLocationScaleFamily,
+        block_states: Vec<ParameterBlockState>,
+        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    ) -> Result<Self, String> {
+        let joint_quantities = family.collect_joint_quantities(&block_states)?;
+        Ok(Self {
+            family,
+            block_states,
+            derivative_blocks,
+            joint_quantities,
+            psi_directions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn psi_direction(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<Arc<SurvivalJointPsiDirection>>, String> {
+        {
+            let cache = self
+                .psi_directions
+                .lock()
+                .map_err(|_| "survival joint psi direction cache poisoned".to_string())?;
+            if let Some(dir) = cache.get(&psi_index) {
+                return Ok(dir.clone());
+            }
+        }
+
+        let dir = self
+            .family
+            .exact_newton_joint_psi_direction(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_index,
+            )?
+            .map(Arc::new);
+
+        let mut cache = self
+            .psi_directions
+            .lock()
+            .map_err(|_| "survival joint psi direction cache poisoned".to_string())?;
+        Ok(cache.entry(psi_index).or_insert_with(|| dir.clone()).clone())
+    }
+}
+
+impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
+    fn second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some(dir_i) = self.psi_direction(psi_i)? else {
+            return Ok(None);
+        };
+        let Some(dir_j) = self.psi_direction(psi_j)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    &self.joint_quantities,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
+                )?,
+        ))
+    }
+
+    fn hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(dir) = self.psi_direction(psi_index)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.family
+                .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                    &self.joint_quantities,
+                    dir.as_ref(),
+                    d_beta_flat,
+                )?,
+        ))
+    }
 }
 
 /// Observed vs expected information: The survival location-scale family uses

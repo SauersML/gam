@@ -609,6 +609,25 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Optional per-evaluation workspace for exact joint ψ derivatives.
+    ///
+    /// Families with expensive exact ψ calculus can override this hook to
+    /// precompute shared state once per outer evaluation and serve:
+    ///
+    /// - exact fixed-β ψψ second-order terms, and
+    /// - exact mixed β/ψ Hessian drifts `D_β H_ψ[u]`
+    ///
+    /// from one cached workspace. Generic code falls back to the direct hooks
+    /// above when no workspace is provided.
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(None)
+    }
+
     /// Optional mixed beta/psi Hessian drift D_beta H_psi[u].
     ///
     /// This is the missing T_i[u] object in the full exact joint profiled
@@ -1577,6 +1596,20 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
     pub hessian_psi_psi: Array2<f64>,
+}
+
+pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
+    fn second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String>;
+
+    fn hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String>;
 }
 
 #[derive(Clone)]
@@ -4409,6 +4442,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     rho: &[f64],
     penalty_counts: &[usize],
     s_pinv: Option<&Array2<f64>>,
+    psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<
     (
         Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
@@ -4472,6 +4506,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let ranges_arc = Arc::clone(&ranges_arc);
         let psi_map = Arc::clone(&psi_map);
         let family_arc = Arc::clone(&family_arc);
+        let psi_workspace = psi_workspace.clone();
         let total = total;
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
@@ -4479,16 +4514,20 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let (block_j, local_j) = psi_map[psi_j];
 
             // Get family-provided second-order likelihood terms.
-            let psi2 = family_arc
-                .exact_newton_joint_psisecond_order_terms(
-                    &synced_arc,
-                    &specs_arc,
-                    &derivative_blocks,
-                    psi_i,
-                    psi_j,
-                )
-                .ok()
-                .flatten();
+            let psi2 = if let Some(workspace) = psi_workspace.as_ref() {
+                workspace.second_order_terms(psi_i, psi_j).ok().flatten()
+            } else {
+                family_arc
+                    .exact_newton_joint_psisecond_order_terms(
+                        &synced_arc,
+                        &specs_arc,
+                        &derivative_blocks,
+                        psi_i,
+                        psi_j,
+                    )
+                    .ok()
+                    .flatten()
+            };
 
             let (obj_ll, score_ll, hess_ll) = match psi2 {
                 Some(t) => (t.objective_psi_psi, t.score_psi_psi, t.hessian_psi_psi),
@@ -4675,6 +4714,7 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     specs: &[ParameterBlockSpec],
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     hessian_beta_independent: bool,
+    psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Option<FixedDriftDerivFn> {
     if hessian_beta_independent {
         // Likelihood Hessian is β-independent; M_i ≡ 0.
@@ -4685,21 +4725,29 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     let specs_arc = Arc::new(specs.to_vec());
     let derivative_blocks_arc = Arc::new(derivative_blocks.to_vec());
     let family_arc = Arc::new(family.clone());
+    let psi_workspace = psi_workspace;
 
     Some(Box::new(
         move |ext_idx: usize, direction: &Array1<f64>| -> Option<Array2<f64>> {
             // The family hook takes a psi index (0-based within ψ coordinates)
             // and a flattened coefficient direction.
-            family_arc
-                .exact_newton_joint_psihessian_directional_derivative(
-                    &synced_arc,
-                    &specs_arc,
-                    &derivative_blocks_arc,
-                    ext_idx,
-                    direction,
-                )
-                .ok()
-                .flatten()
+            if let Some(workspace) = psi_workspace.as_ref() {
+                workspace
+                    .hessian_directional_derivative(ext_idx, direction)
+                    .ok()
+                    .flatten()
+            } else {
+                family_arc
+                    .exact_newton_joint_psihessian_directional_derivative(
+                        &synced_arc,
+                        &specs_arc,
+                        &derivative_blocks_arc,
+                        ext_idx,
+                        direction,
+                    )
+                    .ok()
+                    .flatten()
+            }
         },
     ))
 }
@@ -4837,29 +4885,41 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             is_gaussian,
         )?;
 
-        let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
-            family,
-            &synced_joint_states,
-            specs,
-            derivative_blocks,
-            &beta_flat,
-            rho_current.as_slice().unwrap(),
-            &penalty_counts,
-            s_pinv_joint.as_ref(),
-        )?;
+        let psi_workspace = if need_hessian {
+            family.exact_newton_joint_psi_workspace(&synced_joint_states, specs, derivative_blocks)?
+        } else {
+            None
+        };
 
-        let drift_fn = build_psi_drift_deriv_callback(
-            family,
-            &synced_joint_states,
-            specs,
-            derivative_blocks,
-            is_gaussian,
-        );
+        let (ext_ext_fn, rho_ext_fn, drift_fn) = if need_hessian {
+            let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
+                family,
+                &synced_joint_states,
+                specs,
+                derivative_blocks,
+                &beta_flat,
+                rho_current.as_slice().unwrap(),
+                &penalty_counts,
+                s_pinv_joint.as_ref(),
+                psi_workspace.clone(),
+            )?;
+            let drift_fn = build_psi_drift_deriv_callback(
+                family,
+                &synced_joint_states,
+                specs,
+                derivative_blocks,
+                is_gaussian,
+                psi_workspace,
+            );
+            (Some(ext_ext_fn), Some(rho_ext_fn), drift_fn)
+        } else {
+            (None, None, None)
+        };
 
         let ext_bundle = ExtCoordBundle {
             coords: psi_coords,
-            ext_ext_fn: if need_hessian { Some(ext_ext_fn) } else { None },
-            rho_ext_fn: if need_hessian { Some(rho_ext_fn) } else { None },
+            ext_ext_fn,
+            rho_ext_fn,
             drift_fn,
         };
 
