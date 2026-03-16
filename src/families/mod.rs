@@ -1,6 +1,8 @@
+pub mod anchored_deviation;
 pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
+pub mod prevalence_slope;
 pub mod royston_parmar;
 pub mod scale_design;
 pub mod sigma_link;

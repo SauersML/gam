@@ -332,9 +332,9 @@ struct GaussHermiteRule {
     weights: [f64; N_POINTS],
 }
 
-struct GaussHermiteRuleDynamic {
-    nodes: Vec<f64>,
-    weights: Vec<f64>,
+pub(crate) struct GaussHermiteRuleDynamic {
+    pub(crate) nodes: Vec<f64>,
+    pub(crate) weights: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -536,7 +536,7 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
     }
 }
 
-fn compute_gauss_hermite_n(n: usize) -> GaussHermiteRuleDynamic {
+pub(crate) fn compute_gauss_hermite_n(n: usize) -> GaussHermiteRuleDynamic {
     let mut diag = vec![0.0f64; n];
     let mut off_diag = vec![0.0f64; n.saturating_sub(1)];
     for (i, od) in off_diag.iter_mut().enumerate() {

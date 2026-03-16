@@ -1617,13 +1617,9 @@ pub fn reml_laml_evaluate(
     // all k + ext_dim coordinates.
     let stochastic_trace_values: Option<Vec<f64>> = if use_stochastic_traces {
         // Check if any ext coordinate uses implicit operators.
-        let any_implicit = solution.ext_coords.iter().any(|c| c.b_operator.is_some());
+        let any_operator = solution.ext_coords.iter().any(|c| c.b_operator.is_some());
 
-        if any_implicit {
-            // Mixed path: some ext coordinates use implicit operators.
-            // Use the structural estimator that exploits the weighted-Gram
-            // structure A_d = X^T C_d X + P_d, sharing one H⁻¹ solve and
-            // two X multiplies per probe across all D axes.
+        if any_operator {
             let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
 
             // rho-coordinates: always dense.
@@ -1644,32 +1640,18 @@ pub fn reml_laml_evaluate(
                 dense_matrices.push(a_k);
             }
 
-            // ext-coordinates: separate into dense and implicit.
-            // Build a mapping: ext_trace_idx[i] tells where in the output
-            // the trace for ext coord i lives.
-            //
-            // Output layout: [rho_0..rho_k, dense_ext_0.., implicit_ext_0..]
-            let mut ext_is_implicit = Vec::with_capacity(ext_dim);
+            let mut ext_has_operator = Vec::with_capacity(ext_dim);
+            let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
             let mut implicit_ops: Vec<&ImplicitHyperOperator> = Vec::new();
             for coord in solution.ext_coords.iter() {
                 if let Some(ref op) = coord.b_operator {
+                    ext_has_operator.push(true);
                     if let Some(imp) = op.as_implicit() {
-                        ext_is_implicit.push(true);
                         implicit_ops.push(imp);
-                    } else {
-                        ext_is_implicit.push(false);
-                        let mut h_i = op.to_dense();
-                        if effective_deriv.has_corrections() {
-                            let v_i = hop.solve(&coord.g);
-                            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)
-                            {
-                                h_i += &corr;
-                            }
-                        }
-                        dense_matrices.push(h_i);
                     }
+                    generic_ops.push(op.as_ref());
                 } else {
-                    ext_is_implicit.push(false);
+                    ext_has_operator.push(false);
                     let mut h_i = coord.b_mat.clone();
                     if effective_deriv.has_corrections() {
                         let v_i = hop.solve(&coord.g);
@@ -1682,13 +1664,23 @@ pub fn reml_laml_evaluate(
             }
 
             let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
-            let raw_traces = stochastic_trace_hinv_products(
-                hop,
-                StochasticTraceTargets::Structural {
-                    dense_matrices: &dense_refs,
-                    implicit_ops: &implicit_ops,
-                },
-            );
+            let raw_traces = if generic_ops.len() == implicit_ops.len() {
+                stochastic_trace_hinv_products(
+                    hop,
+                    StochasticTraceTargets::Structural {
+                        dense_matrices: &dense_refs,
+                        implicit_ops: &implicit_ops,
+                    },
+                )
+            } else {
+                stochastic_trace_hinv_products(
+                    hop,
+                    StochasticTraceTargets::Mixed {
+                        dense_matrices: &dense_refs,
+                        operators: &generic_ops,
+                    },
+                )
+            };
 
             // Re-map traces back to the [rho_0..rho_k, ext_0..ext_N] layout.
             let mut result = Vec::with_capacity(k + ext_dim);
@@ -1696,15 +1688,13 @@ pub fn reml_laml_evaluate(
             for idx in 0..k {
                 result.push(raw_traces[idx]);
             }
-            // ext traces: dense ext are at indices k..(k+n_dense_ext),
-            // implicit ext are at indices n_all_dense..(n_all_dense+n_implicit).
-            let n_dense_ext = ext_is_implicit.iter().filter(|&&b| !b).count();
-            let mut dense_cursor = k; // next dense ext index in raw_traces
-            let mut implicit_cursor = k + n_dense_ext; // next implicit index
-            for &is_impl in &ext_is_implicit {
-                if is_impl {
-                    result.push(raw_traces[implicit_cursor]);
-                    implicit_cursor += 1;
+            let n_dense_ext = ext_has_operator.iter().filter(|&&b| !b).count();
+            let mut dense_cursor = k;
+            let mut operator_cursor = k + n_dense_ext;
+            for &has_operator in &ext_has_operator {
+                if has_operator {
+                    result.push(raw_traces[operator_cursor]);
+                    operator_cursor += 1;
                 } else {
                     result.push(raw_traces[dense_cursor]);
                     dense_cursor += 1;
@@ -2309,42 +2299,47 @@ fn compute_outer_hessian(
     let stochastic_cross_traces: Option<Array2<f64>> = if use_stochastic_cross_traces {
         let total_coords = k + ext_dim;
         let mut dense_mats: Vec<Array2<f64>> = Vec::new();
-        let mut coord_is_implicit: Vec<bool> = Vec::with_capacity(total_coords);
+        let mut coord_has_operator: Vec<bool> = Vec::with_capacity(total_coords);
+        let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
         let mut impl_ops: Vec<&ImplicitHyperOperator> = Vec::new();
 
         // rho coordinates: always dense.
         for idx in 0..k {
             dense_mats.push(h_k_matrices[idx].clone());
-            coord_is_implicit.push(false);
+            coord_has_operator.push(false);
         }
 
-        // ext coordinates: dense or implicit.
+        // ext coordinates: dense or operator-backed.
         for (ei, coord) in solution.ext_coords.iter().enumerate() {
             if let Some(ref op) = coord.b_operator {
+                coord_has_operator.push(true);
                 if let Some(imp) = op.as_implicit() {
-                    coord_is_implicit.push(true);
                     impl_ops.push(imp);
-                    continue;
                 }
+                generic_ops.push(op.as_ref());
+                continue;
             }
-            // Dense ext: use already-materialized matrix.
             dense_mats.push(ext_h_matrices[ei].clone());
-            coord_is_implicit.push(false);
+            coord_has_operator.push(false);
         }
 
         let estimator = StochasticTraceEstimator::with_defaults();
         let dense_refs: Vec<&Array2<f64>> = dense_mats.iter().collect();
-        let raw_cross = estimator.estimate_second_order_traces(hop, &dense_refs, &impl_ops);
+        let raw_cross = if generic_ops.len() == impl_ops.len() {
+            estimator.estimate_second_order_traces(hop, &dense_refs, &impl_ops)
+        } else {
+            estimator.estimate_second_order_traces_with_operators(hop, &dense_refs, &generic_ops)
+        };
 
-        // Re-map from [dense_0..N, implicit_0..M] to [rho_0..k, ext_0..D].
-        let n_dense_total = coord_is_implicit.iter().filter(|&&b| !b).count();
+        // Re-map from [dense_0..N, operator_0..M] to [rho_0..k, ext_0..D].
+        let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
         let mut original_to_raw: Vec<usize> = Vec::with_capacity(total_coords);
         let mut dense_cursor = 0usize;
-        let mut impl_cursor = n_dense_total;
-        for &is_impl in &coord_is_implicit {
-            if is_impl {
-                original_to_raw.push(impl_cursor);
-                impl_cursor += 1;
+        let mut operator_cursor = n_dense_total;
+        for &has_operator in &coord_has_operator {
+            if has_operator {
+                original_to_raw.push(operator_cursor);
+                operator_cursor += 1;
             } else {
                 original_to_raw.push(dense_cursor);
                 dense_cursor += 1;
@@ -4875,6 +4870,78 @@ impl StochasticTraceEstimator {
         // Symmetrize: T = (T + T^T) / 2
         let t_sym = (&t_sum + &t_sum.t()) / 2.0;
         t_sym
+    }
+
+    /// Estimate the full D×D matrix of second-order traces `tr(H⁻¹ A_d H⁻¹ A_e)`
+    /// for a mix of dense matrices and generic hyperoperators.
+    pub fn estimate_second_order_traces_with_operators(
+        &self,
+        hop: &dyn HessianOperator,
+        dense_matrices: &[&Array2<f64>],
+        operators: &[&dyn HyperOperator],
+    ) -> Array2<f64> {
+        let n_dense = dense_matrices.len();
+        let n_ops = operators.len();
+        let total = n_dense + n_ops;
+        if total == 0 {
+            return Array2::zeros((0, 0));
+        }
+
+        let p = hop.dim();
+        if p == 0 {
+            return Array2::zeros((total, total));
+        }
+
+        let mut t_sum = Array2::zeros((total, total));
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+
+        for _ in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+            let u = hop.solve(&z);
+
+            let mut q_columns = Array2::zeros((p, total));
+            for e in 0..n_dense {
+                let q_e = dense_matrices[e].dot(&z);
+                q_columns.column_mut(e).assign(&q_e);
+            }
+            for (oi, op) in operators.iter().enumerate() {
+                let e = n_dense + oi;
+                let q_e = op.mul_vec(&z);
+                q_columns.column_mut(e).assign(&q_e);
+            }
+
+            let r = hop.solve_multi(&q_columns);
+
+            let mut dense_a_u: Vec<Array1<f64>> = Vec::with_capacity(n_dense);
+            for d in 0..n_dense {
+                dense_a_u.push(dense_matrices[d].dot(&u));
+            }
+
+            for d in 0..total {
+                for e in d..total {
+                    let r_e = r.column(e);
+                    let val = if d < n_dense {
+                        dense_a_u[d].dot(&r_e)
+                    } else {
+                        operators[d - n_dense].bilinear(&r_e.to_owned(), &u)
+                    };
+                    t_sum[[d, e]] += val;
+                    if d != e {
+                        let r_d = r.column(d);
+                        let val_sym = if e < n_dense {
+                            dense_a_u[e].dot(&r_d)
+                        } else {
+                            operators[e - n_dense].bilinear(&r_d.to_owned(), &u)
+                        };
+                        t_sum[[e, d]] += val_sym;
+                    }
+                }
+            }
+        }
+
+        let n_probes = self.config.n_probes_max as f64;
+        t_sum /= n_probes;
+        (&t_sum + &t_sum.t()) / 2.0
     }
 
     /// Check the adaptive stopping criterion.
