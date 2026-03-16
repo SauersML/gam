@@ -1607,6 +1607,7 @@ pub fn fit_transformation_normal(
             freeze_spatial_length_scale_terms_from_design(covariate_spec, &cov_design)
                 .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
 
+        let cov_global_penalties = cov_design.global_penalties();
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             resp_val,
             resp_deriv,
@@ -1615,7 +1616,7 @@ pub fn fit_transformation_normal(
             config.response_degree,
             resp_transform,
             &cov_design.design,
-            &cov_design.penalties,
+            &cov_global_penalties,
             config,
             warm_start,
         )?;
@@ -1668,6 +1669,7 @@ pub fn fit_transformation_normal(
     )?.is_some();
 
     // Build an initial family + blocks for capability probing.
+    let boot_global_penalties = boot_design.global_penalties();
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
         resp_val.clone(),
         resp_deriv.clone(),
@@ -1676,7 +1678,7 @@ pub fn fit_transformation_normal(
         config.response_degree,
         resp_transform.clone(),
         &boot_design.design,
-        &boot_design.penalties,
+        &boot_global_penalties,
         config,
         warm_start,
     )?;
@@ -1715,6 +1717,7 @@ pub fn fit_transformation_normal(
 
     // Helper: build family from prebuilt response basis + covariate design.
     let make_family = |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
+        let gp = cov_design.global_penalties();
         TransformationNormalFamily::from_prebuilt_response_basis(
             rv.clone(),
             rd.clone(),
@@ -1723,7 +1726,7 @@ pub fn fit_transformation_normal(
             rdeg,
             rt.clone(),
             &cov_design.design,
-            &cov_design.penalties,
+            &gp,
             &cfg,
             ws.as_ref(),
         )

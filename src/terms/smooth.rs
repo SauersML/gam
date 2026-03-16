@@ -432,10 +432,76 @@ impl TermCollectionSpec {
     }
 }
 
+/// A penalty matrix stored at its natural block size together with the
+/// column range it occupies in the global coefficient vector.
+///
+/// Instead of embedding every penalty into a full `p_total × p_total` dense
+/// matrix filled with zeros, we keep the compact local matrix and reconstruct
+/// the global view only when a downstream consumer explicitly requires it.
+#[derive(Debug, Clone)]
+pub struct BlockwisePenalty {
+    /// Column range in the global coefficient vector that this penalty covers.
+    pub col_range: Range<usize>,
+    /// The local penalty matrix — dimensions `block_p × block_p` where
+    /// `block_p = col_range.len()`.
+    pub local: Array2<f64>,
+}
+
+impl BlockwisePenalty {
+    /// Create a new blockwise penalty.
+    pub fn new(col_range: Range<usize>, local: Array2<f64>) -> Self {
+        debug_assert_eq!(col_range.len(), local.nrows());
+        debug_assert_eq!(col_range.len(), local.ncols());
+        Self { col_range, local }
+    }
+
+    /// Expand this blockwise penalty into a full `p_total × p_total` dense
+    /// matrix (mostly zeros). Use sparingly — the whole point of blockwise
+    /// storage is to avoid this allocation.
+    pub fn to_global(&self, p_total: usize) -> Array2<f64> {
+        let mut g = Array2::<f64>::zeros((p_total, p_total));
+        let r = &self.col_range;
+        g.slice_mut(s![r.start..r.end, r.start..r.end])
+            .assign(&self.local);
+        g
+    }
+
+    /// The block size of this penalty.
+    #[inline]
+    pub fn block_size(&self) -> usize {
+        self.col_range.len()
+    }
+}
+
+/// Expand a full set of blockwise penalties into global `p_total × p_total`
+/// dense matrices. This is a compatibility shim for code paths that still
+/// consume `&[Array2<f64>]`.
+pub fn penalties_to_global(penalties: &[BlockwisePenalty], p_total: usize) -> Vec<Array2<f64>> {
+    penalties.iter().map(|bp| bp.to_global(p_total)).collect()
+}
+
+/// Compute `Σ_k λ_k S_k` directly from blockwise penalties, accumulating
+/// into a pre-allocated `p_total × p_total` output without ever materializing
+/// individual global matrices.
+pub fn weighted_blockwise_penalty_sum(
+    penalties: &[BlockwisePenalty],
+    lambdas: &[f64],
+    p_total: usize,
+) -> Array2<f64> {
+    debug_assert_eq!(penalties.len(), lambdas.len());
+    let mut out = Array2::<f64>::zeros((p_total, p_total));
+    for (bp, &lam) in penalties.iter().zip(lambdas.iter()) {
+        let r = &bp.col_range;
+        let mut slice = out.slice_mut(s![r.start..r.end, r.start..r.end]);
+        slice.scaled_add(lam, &bp.local);
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct TermCollectionDesign {
     pub design: Array2<f64>,
-    pub penalties: Vec<Array2<f64>>,
+    pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyBlockInfo>,
     pub dropped_penaltyinfo: Vec<DroppedPenaltyBlockInfo>,
@@ -450,6 +516,22 @@ pub struct TermCollectionDesign {
     pub random_effect_ranges: Vec<(String, Range<usize>)>,
     pub random_effect_levels: Vec<(String, Vec<u64>)>,
     pub smooth: SmoothDesign,
+}
+
+impl TermCollectionDesign {
+    /// Expand blockwise penalties to global `p_total × p_total` dense matrices.
+    /// This is a compatibility shim; prefer operating on blockwise penalties
+    /// directly when possible.
+    pub fn global_penalties(&self) -> Vec<Array2<f64>> {
+        let p = self.design.ncols();
+        penalties_to_global(&self.penalties, p)
+    }
+
+    /// Number of penalty blocks.
+    #[inline]
+    pub fn num_penalties(&self) -> usize {
+        self.penalties.len()
+    }
 }
 
 #[derive(Clone)]
@@ -2393,7 +2475,7 @@ pub fn build_term_collection_design(
             .assign(&smooth.design);
     }
 
-    let mut penalties = Vec::<Array2<f64>>::new();
+    let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();
     let mut penaltyinfo = Vec::<PenaltyBlockInfo>::new();
     let mut dropped_penaltyinfo = Vec::<DroppedPenaltyBlockInfo>::new();
@@ -2423,12 +2505,18 @@ pub fn build_term_collection_design(
     }
 
     if !penalized_linear_cols.is_empty() {
-        let mut s = Array2::<f64>::zeros((p_total, p_total));
+        // Build a compact penalty covering the range of penalized linear columns.
+        let min_col = *penalized_linear_cols.iter().min().unwrap();
+        let max_col = *penalized_linear_cols.iter().max().unwrap();
+        let block_range = min_col..(max_col + 1);
+        let block_size = block_range.len();
+        let mut s_local = Array2::<f64>::zeros((block_size, block_size));
         for &col in &penalized_linear_cols {
-            s[[col, col]] = 1.0;
+            let local_idx = col - min_col;
+            s_local[[local_idx, local_idx]] = 1.0;
         }
         let global_index = penalties.len();
-        penalties.push(s);
+        penalties.push(BlockwisePenalty::new(block_range, s_local));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
@@ -2449,12 +2537,10 @@ pub fn build_term_collection_design(
         if range.is_empty() {
             continue;
         }
-        let mut s = Array2::<f64>::zeros((p_total, p_total));
-        for j in range.clone() {
-            s[[j, j]] = 1.0;
-        }
+        let block_size = range.len();
+        let s_local = Array2::<f64>::eye(block_size);
         let global_index = penalties.len();
-        penalties.push(s);
+        penalties.push(BlockwisePenalty::new(range.clone(), s_local));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
@@ -2484,12 +2570,12 @@ pub fn build_term_collection_design(
         .zip(smooth.nullspace_dims.iter())
         .zip(smooth.penaltyinfo.iter())
     {
-        let mut s = Array2::<f64>::zeros((p_total, p_total));
         let start = p_intercept + p_lin + p_rand;
-        s.slice_mut(s![start..(start + p_smooth), start..(start + p_smooth)])
-            .assign(s_local);
         let global_index = penalties.len();
-        penalties.push(s);
+        penalties.push(BlockwisePenalty::new(
+            start..(start + p_smooth),
+            s_local.clone(),
+        ));
         nullspace_dims.push(ns);
         let mut penalty = localinfo.penalty.clone();
         penalty.nullspace_dim_hint = ns;
@@ -3090,13 +3176,14 @@ fn fit_term_collection_on_realized_design(
         );
     }
     let base_fit_opts = adaptive_fit_options_base(options, design);
+    let global_penalties = design.global_penalties();
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.view(),
             y,
             weights,
             offset,
-            &design.penalties,
+            &global_penalties,
             heuristic_lambdas,
             family,
             &base_fit_opts,
@@ -4255,21 +4342,22 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     //      computed on the same exact surface.
     let adaptive_opts = options.adaptive_regularization.clone().unwrap_or_default();
     let adaptive_penalty_indices = exact_spatial_adaptive_penalty_index_set(runtime_caches);
+    let p_total = baseline.design.design.ncols();
     let mut retained_penalties = Vec::<Array2<f64>>::new();
     let mut retained_log_lambdas = Vec::<f64>::new();
     let mut retained_global_indices = Vec::<usize>::new();
-    let mut fixed_quadratichessian = Array2::<f64>::zeros((
-        baseline.design.design.ncols(),
-        baseline.design.design.ncols(),
-    ));
-    for (idx, penalty) in baseline.design.penalties.iter().enumerate() {
+    let mut fixed_quadratichessian = Array2::<f64>::zeros((p_total, p_total));
+    for (idx, bp) in baseline.design.penalties.iter().enumerate() {
         if adaptive_penalty_indices.contains(&idx) {
             continue;
         }
-        retained_penalties.push(penalty.clone());
+        retained_penalties.push(bp.to_global(p_total));
         retained_log_lambdas.push(baseline.fit.lambdas[idx].max(1e-12).ln());
         retained_global_indices.push(idx);
-        fixed_quadratichessian.scaled_add(baseline.fit.lambdas[idx], penalty);
+        let r = &bp.col_range;
+        fixed_quadratichessian
+            .slice_mut(s![r.start..r.end, r.start..r.end])
+            .scaled_add(baseline.fit.lambdas[idx], &bp.local);
     }
 
     let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
@@ -4697,7 +4785,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
     let mut local_penalty_blocks =
         Vec::<Array2<f64>>::with_capacity(baseline.design.penalties.len());
-    for (global_idx, penalty) in baseline.design.penalties.iter().enumerate() {
+    for (global_idx, bp) in baseline.design.penalties.iter().enumerate() {
         if adaptive_penalty_indices.contains(&global_idx) {
             let cache = runtime_caches
                 .iter()
@@ -4744,7 +4832,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &local,
             ));
         } else {
-            local_penalty_blocks.push(penalty.mapv(|v| v * full_lambdas[global_idx]));
+            local_penalty_blocks.push(bp.to_global(p_total).mapv(|v| v * full_lambdas[global_idx]));
         }
     }
     let (edf_by_block, edf_total) = if let Some(cov) = beta_covariance.as_ref() {
@@ -6798,7 +6886,8 @@ fn fit_bounded_term_collection_with_design(
         .collect();
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
     let fit_design = conditioning.apply_to_design(&design.design);
-    let fit_penalties = conditioning.transform_penalties_to_internal(&design.penalties);
+    let global_penalties = design.global_penalties();
+    let fit_penalties = conditioning.transform_penalties_to_internal(&global_penalties);
     if design.linear_constraints.is_some() {
         return Err(EstimationError::InvalidInput(
             "bounded() terms are not yet compatible with explicit linear constraints".to_string(),
@@ -6928,11 +7017,11 @@ fn fit_bounded_term_collection_with_design(
     penalized_hessian += &s_lambda_internal;
     let penalized_hessian =
         conditioning.transform_penalized_hessian_to_original(&penalized_hessian);
-    let mut s_lambda_original =
-        Array2::<f64>::zeros((design.design.ncols(), design.design.ncols()));
-    for (k, penalty) in design.penalties.iter().enumerate() {
-        s_lambda_original.scaled_add(fit.lambdas[k], penalty);
-    }
+    let s_lambda_original = weighted_blockwise_penalty_sum(
+        &design.penalties,
+        fit.lambdas.as_slice().unwrap(),
+        design.design.ncols(),
+    );
     let penalty_term = beta_user.dot(&s_lambda_original.dot(&beta_user));
     let deviance = match family {
         LikelihoodFamily::GaussianIdentity => y
@@ -7163,7 +7252,7 @@ fn evaluate_joint_reml_at_theta(
         weights,
         design.design.clone(),
         offset,
-        design.penalties.clone(),
+        design.global_penalties(),
         theta,
         rho_dim,
         hyper_dirs,
@@ -9407,7 +9496,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 .slice_mut(s![coeff_range.clone(), coeff_range.clone()])
                 .assign(penalty_local);
 
-            let full_penalty =
+            let full_bp =
                 self.design
                     .penalties
                     .get_mut(full_penalty_idx)
@@ -9417,9 +9506,14 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                             full_penalty_idx, term_idx
                         )
                     })?;
-            full_penalty.fill(0.0);
-            full_penalty
-                .slice_mut(s![full_range.clone(), full_range.clone()])
+            // Update the blockwise penalty in-place: the col_range stays the
+            // same (same smooth block in the global layout), only the local
+            // matrix changes.
+            full_bp.local.fill(0.0);
+            let local_start = coeff_range.start;
+            let local_end = coeff_range.end;
+            full_bp.local
+                .slice_mut(s![local_start..local_end, local_start..local_end])
                 .assign(penalty_local);
 
             self.design.smooth.nullspace_dims[smooth_penalty_idx] = nullspace_dim;
@@ -10293,7 +10387,11 @@ mod tests {
             .zip(right.penalties.iter())
             .enumerate()
         {
-            let penalty_diff = max_abs_diff_matrix(lp, rp);
+            assert_eq!(
+                lp.col_range, rp.col_range,
+                "{label} penalty {idx} col_range mismatch"
+            );
+            let penalty_diff = max_abs_diff_matrix(&lp.local, &rp.local);
             assert!(
                 penalty_diff <= 1e-10,
                 "{label} penalty {idx} mismatch max_abs={penalty_diff}"
@@ -12863,8 +12961,11 @@ mod tests {
         assert_eq!(design.penaltyinfo[0].penalty.effective_rank, 2);
         let x1 = design.linear_ranges[0].1.start;
         let x2 = design.linear_ranges[1].1.start;
-        assert_eq!(design.penalties[0][[x1, x1]], 1.0);
-        assert_eq!(design.penalties[0][[x2, x2]], 1.0);
+        let bp = &design.penalties[0];
+        let x1_local = x1 - bp.col_range.start;
+        let x2_local = x2 - bp.col_range.start;
+        assert_eq!(bp.local[[x1_local, x1_local]], 1.0);
+        assert_eq!(bp.local[[x2_local, x2_local]], 1.0);
     }
 
     #[test]
@@ -13954,15 +14055,16 @@ mod tests {
             &s2,
         );
 
-        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx])
+        let p_total = design.design.ncols();
+        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx])
+        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx])
+        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
@@ -14035,15 +14137,16 @@ mod tests {
             &s2,
         );
 
-        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx])
+        let p_total = design.design.ncols();
+        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx])
+        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx])
+        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
