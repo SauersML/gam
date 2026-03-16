@@ -979,10 +979,10 @@ fn compute_smoothing_correction(
     }
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
-    // The unified evaluator handles conservative degradation internally
-    // (dropping the log|H|₊ trace-curvature block when it produces non-finite
-    // values), so compute_lamlhessian_consistent always returns a usable
-    // Hessian unless the PIRLS/bundle setup itself fails.
+    // The authoritative inner-strategy path chooses the rho-space Hessian
+    // evaluation policy here. Unified may still perform local numerical
+    // salvage inside the exact branch, but the branch choice itself no longer
+    // lives inline at the call site.
     let mut hessian_rho = match reml_state.compute_lamlhessian_consistent(final_rho) {
         Ok(h) => h,
         Err(err) => {
@@ -1566,7 +1566,8 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{
-            ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+            ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability,
+            OuterConfig, OuterEval,
         };
 
         let outer_config = OuterConfig {
@@ -1578,7 +1579,7 @@ where
             rho_bound: crate::estimate::RHO_BOUND,
             heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
             initial_rho: None,
-            fallback_sequence: Vec::new(),
+            fallback_policy: FallbackPolicy::Automatic,
         };
 
         let mut obj = ClosureObjective {
@@ -1589,6 +1590,7 @@ where
                 n_params: k,
                 all_penalty_like: true,
                 has_psi_coords: false,
+                fixed_point_available: true,
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
@@ -1673,8 +1675,8 @@ where
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         smoothing_options_mix.seed_config.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::outer_strategy::{
-            ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig,
-            OuterEval,
+            ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
+            OuterConfig, OuterEval,
         };
         let initial_link_kind = cfg.link_kind.clone();
         let outer_config = OuterConfig {
@@ -1686,7 +1688,7 @@ where
             rho_bound: crate::estimate::RHO_BOUND,
             heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
             initial_rho: None,
-            fallback_sequence: Vec::new(),
+            fallback_policy: FallbackPolicy::Automatic,
         };
         let mut obj = ClosureObjective {
             state: &mut reml_state,
@@ -1697,6 +1699,7 @@ where
                 // Mixture/SAS coords are design-moving (not penalty-like).
                 all_penalty_like: false,
                 has_psi_coords: true,
+                fixed_point_available: false,
                 barrier_config: self::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),

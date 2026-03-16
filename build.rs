@@ -281,6 +281,9 @@ impl ViolationCollector {
         error_msg.push_str(
             "   Either use the variable (removing the underscore) or remove it completely.\n",
         );
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, rename to `_`, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -384,6 +387,9 @@ impl NoopTouchCollector {
             "\n⚠️ No-op touches (e.g., \"Foo::bar;\" or \".as_ref();\") are forbidden.\n",
         );
         error_msg.push_str("   Remove the dead code or use the value meaningfully.\n");
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -496,6 +502,9 @@ impl DeadCodeCollector {
         error_msg.push_str(
             "   Clippy lints are pointless to suppress — we don't run clippy and don't care about its opinions.\n",
         );
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -591,6 +600,9 @@ impl EmptyBlockCollector {
 
         error_msg.push_str("\n⚠️ Empty control-flow blocks are forbidden in this project.\n");
         error_msg.push_str("   Remove the block or add meaningful logic.\n");
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -729,6 +741,9 @@ impl DeadCodeAnchorCollector {
         error_msg.push_str(
             "   Either wire the code into a real call site or delete it.\n",
         );
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -780,6 +795,9 @@ impl NoEffectCollector {
             "   If a parameter is truly unused, delete it and refactor the function signature.\n",
         );
         error_msg.push_str("   Do NOT use no-op statements to pretend variables are being used.\n");
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -922,6 +940,9 @@ impl DegenerateBooleanCollector {
             "   These patterns often exist only to fake-use variables or hide dead logic.\n",
         );
         error_msg.push_str("   Rewrite the condition directly or delete it.\n");
+        error_msg.push_str(
+            "\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n",
+        );
 
         Some(error_msg)
     }
@@ -2011,18 +2032,24 @@ fn manually_check_for_unusedvariables() {
                     eprintln!(
                         "   Either use the variable or remove it completely. Underscore prefixes are NOT allowed."
                     );
+                    eprintln!("   These are the only two options: fully wire it into real use, or delete it entirely.");
+                    eprintln!("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.");
                     std::process::exit(1);
                 } else if stderr.contains("function is never used") {
                     eprintln!("\n❌ ERROR: Unused functions detected in build.rs!");
                     eprintln!("{stderr}");
                     eprintln!("\n⚠️ Unused functions are STRICTLY FORBIDDEN in this project.");
                     eprintln!("   Either use the function or remove it completely.");
+                    eprintln!("   These are the only two options: fully wire it into real use, or delete it entirely.");
+                    eprintln!("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.");
                     std::process::exit(1);
                 } else if stderr.contains("unused import") {
                     eprintln!("\n❌ ERROR: Unused imports detected in build.rs!");
                     eprintln!("{stderr}");
                     eprintln!("\n⚠️ Unused imports are STRICTLY FORBIDDEN in this project.");
                     eprintln!("   Either use the imported item or remove the import completely.");
+                    eprintln!("   These are the only two options: fully wire it into real use, or delete it entirely.");
+                    eprintln!("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.");
                     std::process::exit(1);
                 } else {
                     eprintln!(
@@ -3805,7 +3832,7 @@ fn scan_for_inert_touch_calls() -> Vec<String> {
                 "inert touch calls",
                 path,
                 &file_violations,
-                "Use the value meaningfully or delete it. Standalone black_box/size_of_val touches do not count as real use.",
+                "Use the value meaningfully or delete it. Standalone black_box/size_of_val touches do not count as real use.\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
             ));
         }
     }
@@ -3855,7 +3882,7 @@ fn scan_for_cfg_test_evasion() -> Vec<String> {
             "newly-added #[cfg(test)] production gates",
             path,
             &violations,
-            "Do not mark production imports, fields, constants, constructors, or helper methods as #[cfg(test)] to suppress dead_code in normal builds. Either wire the code into production, delete it, or keep the test-only logic inside a real #[cfg(test)] test module.",
+            "Do not mark production imports, fields, constants, constructors, or helper methods as #[cfg(test)] to suppress dead_code in normal builds. Either wire the code into production, delete it, or keep the test-only logic inside a real #[cfg(test)] test module.\n   These are the only two options: fully wire it into real use, or delete it entirely.\n   Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
         ));
     }
 
@@ -5120,6 +5147,8 @@ fn scan_for_fake_usage() -> Vec<String> {
                 msg.push_str("\n⚠️ This looks like a dummy check to mask an unused variable.\n");
                 msg.push_str("   \"No-Op Variable Access\": The variable is checked but never referenced again.\n");
                 msg.push_str("   Remove the variable (or rename to _) and the check.\n");
+                msg.push_str("   These are the only two options: fully wire it into real use, or delete it entirely.\n");
+                msg.push_str("   Do not suppress, hide, no-op, stub, or work around this lint in any other way.\n");
                 allviolations.push(msg);
             }
         }
@@ -6194,7 +6223,9 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
                 "VISIBILITY DOWNGRADE EVASION",
                 "This item was changed to pub(crate) but is still dead.\n   \
                  Reducing visibility does NOT constitute use.\n   \
-                 Wire this into production code, or delete it.",
+                 Wire this into production code, or delete it.\n   \
+                 These are the only two options: fully wire it into real use, or delete it entirely.\n   \
+                 Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
             )
         } else if test_refs > 0 {
             (
@@ -6204,13 +6235,17 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
                  Either:\n   \
                    \u{2022} Wire the item into production code (preferred), OR\n   \
                    \u{2022} Move it to #[cfg(test)] if it is genuinely a test helper, OR\n   \
-                   \u{2022} Delete both the item and its tests.",
+                   \u{2022} Delete both the item and its tests.\n   \
+                 These are the only options. Fully wire it into real use, or delete it entirely.\n   \
+                 Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
             )
         } else {
             (
                 "DEAD EVERYWHERE",
                 "This item has no references anywhere in the codebase.\n   \
-                 Wire it into production code, or delete it.",
+                 Wire it into production code, or delete it.\n   \
+                 These are the only two options: fully wire it into real use, or delete it entirely.\n   \
+                 Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
             )
         };
 

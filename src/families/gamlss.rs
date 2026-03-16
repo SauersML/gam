@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-use std::sync::Arc;
 use crate::basis::{
     BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
     create_difference_penalty_matrix, evaluate_bspline_fourth_derivative_scalar,
@@ -14,9 +12,7 @@ use crate::custom_family::{
     wrap_spatial_implicit_psi_operator,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::{
-    fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
-};
+use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
@@ -40,6 +36,8 @@ use crate::smooth::{
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use std::borrow::Cow;
+use std::sync::Arc;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
@@ -2534,7 +2532,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterConfig, OuterEval,
+        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability, OuterConfig,
+        OuterEval,
     };
 
     let mut obj = ClosureObjective {
@@ -2555,6 +2554,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             n_params: theta_dim,
             all_penalty_like: false,
             has_psi_coords: false,
+            fixed_point_available: false,
             barrier_config: None,
         },
         cost_fn: |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
@@ -2628,26 +2628,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         rho_bound: RHO_BOUND,
         heuristic_lambdas: None,
         initial_rho: Some(theta0),
-        // With analytic Hessian available, the primary path is Arc/Newton.
-        // Fallback sequence: BFGS (analytic gradient, no Hessian) → FD gradient.
-        fallback_sequence: vec![
-            OuterCapability {
-                gradient: Derivative::Analytic,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                has_psi_coords: false,
-                barrier_config: None,
-            },
-            OuterCapability {
-                gradient: Derivative::FiniteDifference,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                all_penalty_like: false,
-                has_psi_coords: false,
-                barrier_config: None,
-            },
-        ],
+        fallback_policy: FallbackPolicy::Automatic,
     };
 
     let outer = crate::solver::outer_strategy::run_outer(
@@ -8352,12 +8333,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
         let pw = geom.basis.ncols();
-        let implicit_dir = self.exact_newton_joint_psi_action(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            p_eta,
-        )?;
+        let implicit_dir =
+            self.exact_newton_joint_psi_action(block_states, derivative_blocks, psi_index, p_eta)?;
         let dense_dir = if implicit_dir.is_none() {
             self.exact_newton_joint_psi_direction(
                 block_states,
@@ -8433,21 +8410,82 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             let operator = CustomFamilyJointPsiOperator::new(
                 p_eta + pw,
                 vec![
-                    CustomFamilyJointDesignChannel::new(0..p_eta, Arc::clone(&x_eta_arc), Some(action)),
-                    CustomFamilyJointDesignChannel::new(p_eta..p_eta + pw, Arc::clone(&basis_arc), None),
-                    CustomFamilyJointDesignChannel::new(p_eta..p_eta + pw, Arc::clone(&basis_d1_arc), None),
-                    CustomFamilyJointDesignChannel::new(p_eta..p_eta + pw, Arc::clone(&basis_d2_arc), None),
+                    CustomFamilyJointDesignChannel::new(
+                        0..p_eta,
+                        Arc::clone(&x_eta_arc),
+                        Some(action),
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        p_eta..p_eta + pw,
+                        Arc::clone(&basis_arc),
+                        None,
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        p_eta..p_eta + pw,
+                        Arc::clone(&basis_d1_arc),
+                        None,
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        p_eta..p_eta + pw,
+                        Arc::clone(&basis_d2_arc),
+                        None,
+                    ),
                 ],
                 vec![
-                    CustomFamilyJointDesignPairContribution::new(0, 0, coeff_eta_eta_xa_x.clone(), coeff_eta_eta_xx.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 1, coeff_eta_w_xa_b.clone(), coeff_eta_w_x_b.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 0, coeff_eta_w_xa_b.clone(), coeff_eta_w_x_b.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 2, coeff_eta_w_xa_d1.clone(), coeff_eta_w_x_d1.clone()),
-                    CustomFamilyJointDesignPairContribution::new(2, 0, coeff_eta_w_xa_d1.clone(), coeff_eta_w_x_d1.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 3, zeros.clone(), coeff_eta_w_x_d2.clone()),
-                    CustomFamilyJointDesignPairContribution::new(3, 0, zeros.clone(), coeff_eta_w_x_d2.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 1, zeros.clone(), coeff_ww_bb.clone()),
-                    CustomFamilyJointDesignPairContribution::new(2, 1, zeros.clone(), coeff_ww_db.clone()),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        0,
+                        coeff_eta_eta_xa_x.clone(),
+                        coeff_eta_eta_xx.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        1,
+                        coeff_eta_w_xa_b.clone(),
+                        coeff_eta_w_x_b.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        0,
+                        coeff_eta_w_xa_b.clone(),
+                        coeff_eta_w_x_b.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        2,
+                        coeff_eta_w_xa_d1.clone(),
+                        coeff_eta_w_x_d1.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        2,
+                        0,
+                        coeff_eta_w_xa_d1.clone(),
+                        coeff_eta_w_x_d1.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        3,
+                        zeros.clone(),
+                        coeff_eta_w_x_d2.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        3,
+                        0,
+                        zeros.clone(),
+                        coeff_eta_w_x_d2.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        1,
+                        zeros.clone(),
+                        coeff_ww_bb.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        2,
+                        1,
+                        zeros.clone(),
+                        coeff_ww_db.clone(),
+                    ),
                     CustomFamilyJointDesignPairContribution::new(1, 2, zeros, coeff_ww_db.clone()),
                 ],
             );
@@ -8459,7 +8497,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             }));
         }
 
-        let dir_a = dense_dir.expect("dense psi direction should exist when implicit direction is absent");
+        let dir_a =
+            dense_dir.expect("dense psi direction should exist when implicit direction is absent");
         let score_psi = binomial_pack_mean_wiggle_joint_score(
             &(dir_a.x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
             &score_w,
@@ -9743,8 +9782,13 @@ impl BinomialLocationScaleFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let total = pt + pls;
-        let implicit_dir =
-            build_binomial_location_scale_joint_psi_action(block_states, derivative_blocks, psi_index, pt, pls)?;
+        let implicit_dir = build_binomial_location_scale_joint_psi_action(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            pt,
+            pls,
+        )?;
         let dense_dir = if implicit_dir.is_none() {
             self.exact_newton_joint_psi_direction(
                 block_states,
@@ -9844,8 +9888,9 @@ impl BinomialLocationScaleFamily {
             score.slice_mut(s![pt..pt + pls]).assign(&score_ls);
             score
         } else {
-            let psi_dir =
-                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            let psi_dir = dense_dir
+                .as_ref()
+                .expect("dense psi direction should exist when implicit direction is absent");
             let mut score = Array1::<f64>::zeros(total);
             score
                 .slice_mut(s![0..pt])
@@ -9858,8 +9903,9 @@ impl BinomialLocationScaleFamily {
         let hessian_psi = if hessian_psi_operator.is_some() {
             Array2::<f64>::zeros((0, 0))
         } else {
-            let psi_dir =
-                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            let psi_dir = dense_dir
+                .as_ref()
+                .expect("dense psi direction should exist when implicit direction is absent");
             let x_t_psi = &psi_dir.x_t_psi;
             let x_ls_psi = &psi_dir.x_ls_psi;
             let h_tt_block = xt_diag_y_dense(&x_t_psi, &h_tt, x_t)?
@@ -10224,7 +10270,8 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let n = self.y.len();
@@ -11368,8 +11415,13 @@ impl BinomialLocationScaleWiggleFamily {
         let pls = x_ls.ncols();
         let pw = b0.ncols();
         let total = pt + pls + pw;
-        let implicit_dir =
-            build_binomial_location_scale_wiggle_joint_psi_action(block_states, derivative_blocks, psi_index, pt, pls)?;
+        let implicit_dir = build_binomial_location_scale_wiggle_joint_psi_action(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            pt,
+            pls,
+        )?;
         let dense_dir = if implicit_dir.is_none() {
             self.exact_newton_joint_psi_direction(
                 block_states,
@@ -11521,40 +11573,44 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_tw_b_w[row] = loss_2 * q_t;
             coeff_tw_b_d[row] = loss_3 * alpha * q_t + loss_2 * q_t_a;
             coeff_tw_d1_w[row] = loss_1 * q0_geom.q_t;
-            coeff_tw_d1_d[row] =
-                loss_2 * (q_t * q0_a + alpha * q0_geom.q_t) + loss_1 * q0_t_a;
+            coeff_tw_d1_d[row] = loss_2 * (q_t * q0_a + alpha * q0_geom.q_t) + loss_1 * q0_t_a;
             coeff_tw_d2_d[row] = loss_1 * q0_a * q0_geom.q_t;
 
             coeff_lw_b_w[row] = loss_2 * q_ls;
             coeff_lw_b_d[row] = loss_3 * alpha * q_ls + loss_2 * q_ls_a;
             coeff_lw_d1_w[row] = loss_1 * q0_geom.q_ls;
-            coeff_lw_d1_d[row] =
-                loss_2 * (q_ls * q0_a + alpha * q0_geom.q_ls) + loss_1 * q0_ls_a;
+            coeff_lw_d1_d[row] = loss_2 * (q_ls * q0_a + alpha * q0_geom.q_ls) + loss_1 * q0_ls_a;
             coeff_lw_d2_d[row] = loss_1 * q0_a * q0_geom.q_ls;
 
             coeff_ww_bb[row] = loss_3 * alpha;
             coeff_ww_db[row] = loss_2 * q0_a;
         }
         let score_t = if let Some(ref dir_a) = implicit_dir {
-            dir_a.x_t_psi
+            dir_a
+                .x_t_psi
                 .as_ref()
                 .map(|action: &CustomFamilyPsiDesignAction| action.transpose_mul(score_t_xa.view()))
                 .unwrap_or_else(|| Array1::zeros(pt))
                 + x_t.t().dot(&score_t_x)
         } else {
-            let dir_a =
-                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            let dir_a = dense_dir
+                .as_ref()
+                .expect("dense psi direction should exist when implicit direction is absent");
             dir_a.x_t_psi.t().dot(&score_t_xa) + x_t.t().dot(&score_t_x)
         };
         let score_ls = if let Some(ref dir_a) = implicit_dir {
-            dir_a.x_ls_psi
+            dir_a
+                .x_ls_psi
                 .as_ref()
-                .map(|action: &CustomFamilyPsiDesignAction| action.transpose_mul(score_ls_xa.view()))
+                .map(|action: &CustomFamilyPsiDesignAction| {
+                    action.transpose_mul(score_ls_xa.view())
+                })
                 .unwrap_or_else(|| Array1::zeros(pls))
                 + x_ls.t().dot(&score_ls_x)
         } else {
-            let dir_a =
-                dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+            let dir_a = dense_dir
+                .as_ref()
+                .expect("dense psi direction should exist when implicit direction is absent");
             dir_a.x_ls_psi.t().dot(&score_ls_xa) + x_ls.t().dot(&score_ls_x)
         };
         let score_w = b0.t().dot(&score_w_b) + d0.t().dot(&score_w_d1);
@@ -11571,31 +11627,141 @@ impl BinomialLocationScaleWiggleFamily {
             let operator = CustomFamilyJointPsiOperator::new(
                 total,
                 vec![
-                    CustomFamilyJointDesignChannel::new(0..pt, shared_dense_arc(x_t), dir_a.x_t_psi),
-                    CustomFamilyJointDesignChannel::new(pt..pt + pls, shared_dense_arc(x_ls), dir_a.x_ls_psi),
-                    CustomFamilyJointDesignChannel::new(pt + pls..total, Arc::clone(&basis_arc), None),
-                    CustomFamilyJointDesignChannel::new(pt + pls..total, Arc::clone(&basis_d1_arc), None),
-                    CustomFamilyJointDesignChannel::new(pt + pls..total, Arc::clone(&basis_d2_arc), None),
+                    CustomFamilyJointDesignChannel::new(
+                        0..pt,
+                        shared_dense_arc(x_t),
+                        dir_a.x_t_psi,
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        pt..pt + pls,
+                        shared_dense_arc(x_ls),
+                        dir_a.x_ls_psi,
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        pt + pls..total,
+                        Arc::clone(&basis_arc),
+                        None,
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        pt + pls..total,
+                        Arc::clone(&basis_d1_arc),
+                        None,
+                    ),
+                    CustomFamilyJointDesignChannel::new(
+                        pt + pls..total,
+                        Arc::clone(&basis_d2_arc),
+                        None,
+                    ),
                 ],
                 vec![
-                    CustomFamilyJointDesignPairContribution::new(0, 0, coeff_tt_w.clone(), coeff_tt_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 1, coeff_tl_w.clone(), coeff_tl_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 0, coeff_tl_w.clone(), coeff_tl_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 1, coeff_ll_w.clone(), coeff_ll_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 2, coeff_tw_b_w.clone(), coeff_tw_b_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(2, 0, coeff_tw_b_w.clone(), coeff_tw_b_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 3, coeff_tw_d1_w.clone(), coeff_tw_d1_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(3, 0, coeff_tw_d1_w.clone(), coeff_tw_d1_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(0, 4, zeros.clone(), coeff_tw_d2_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(4, 0, zeros.clone(), coeff_tw_d2_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 2, coeff_lw_b_w.clone(), coeff_lw_b_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(2, 1, coeff_lw_b_w.clone(), coeff_lw_b_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 3, coeff_lw_d1_w.clone(), coeff_lw_d1_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(3, 1, coeff_lw_d1_w.clone(), coeff_lw_d1_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(1, 4, zeros.clone(), coeff_lw_d2_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(4, 1, zeros.clone(), coeff_lw_d2_d.clone()),
-                    CustomFamilyJointDesignPairContribution::new(2, 2, zeros.clone(), coeff_ww_bb.clone()),
-                    CustomFamilyJointDesignPairContribution::new(3, 2, zeros.clone(), coeff_ww_db.clone()),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        0,
+                        coeff_tt_w.clone(),
+                        coeff_tt_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        1,
+                        coeff_tl_w.clone(),
+                        coeff_tl_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        0,
+                        coeff_tl_w.clone(),
+                        coeff_tl_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        1,
+                        coeff_ll_w.clone(),
+                        coeff_ll_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        2,
+                        coeff_tw_b_w.clone(),
+                        coeff_tw_b_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        2,
+                        0,
+                        coeff_tw_b_w.clone(),
+                        coeff_tw_b_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        3,
+                        coeff_tw_d1_w.clone(),
+                        coeff_tw_d1_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        3,
+                        0,
+                        coeff_tw_d1_w.clone(),
+                        coeff_tw_d1_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        0,
+                        4,
+                        zeros.clone(),
+                        coeff_tw_d2_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        4,
+                        0,
+                        zeros.clone(),
+                        coeff_tw_d2_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        2,
+                        coeff_lw_b_w.clone(),
+                        coeff_lw_b_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        2,
+                        1,
+                        coeff_lw_b_w.clone(),
+                        coeff_lw_b_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        3,
+                        coeff_lw_d1_w.clone(),
+                        coeff_lw_d1_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        3,
+                        1,
+                        coeff_lw_d1_w.clone(),
+                        coeff_lw_d1_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        1,
+                        4,
+                        zeros.clone(),
+                        coeff_lw_d2_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        4,
+                        1,
+                        zeros.clone(),
+                        coeff_lw_d2_d.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        2,
+                        2,
+                        zeros.clone(),
+                        coeff_ww_bb.clone(),
+                    ),
+                    CustomFamilyJointDesignPairContribution::new(
+                        3,
+                        2,
+                        zeros.clone(),
+                        coeff_ww_db.clone(),
+                    ),
                     CustomFamilyJointDesignPairContribution::new(2, 3, zeros, coeff_ww_db.clone()),
                 ],
             );
@@ -11607,8 +11773,9 @@ impl BinomialLocationScaleWiggleFamily {
             }));
         }
 
-        let dir_a =
-            dense_dir.as_ref().expect("dense psi direction should exist when implicit direction is absent");
+        let dir_a = dense_dir
+            .as_ref()
+            .expect("dense psi direction should exist when implicit direction is absent");
         let h_tt_block = xt_diag_y_dense(&dir_a.x_t_psi, &coeff_tt_w, x_t)?
             + &xt_diag_y_dense(x_t, &coeff_tt_w, &dir_a.x_t_psi)?
             + &xt_diag_x_dense(x_t, &coeff_tt_d)?;
