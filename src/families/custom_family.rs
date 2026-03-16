@@ -3,8 +3,14 @@ use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{
     StableSolver, boundary_hit_step_fraction, default_slq_parameters, stochastic_lanczos_logdet_spd,
 };
-use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
+use crate::matrix::{
+    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
+};
 use crate::pirls::LinearInequalityConstraints;
+use crate::smooth::{
+    TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
+    try_build_spatial_log_kappa_derivativeinfo_list,
+};
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordPair, HyperOperator, InnerSolutionBuilder,
@@ -1195,6 +1201,103 @@ pub(crate) fn wrap_spatial_implicit_psi_operator(
     op
 }
 
+pub(crate) fn build_block_spatial_psi_derivatives(
+    data: ndarray::ArrayView2<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+    let spatial_terms = spatial_length_scale_term_indices(resolvedspec);
+    let Some(info_list) =
+        try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, &spatial_terms)
+            .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let psi_dim = info_list.len();
+    Ok(Some(
+        info_list
+            .into_iter()
+            .enumerate()
+            .map(|(psi_idx, info)| {
+                let x_full = EmbeddedColumnBlock::new(
+                    &info.x_psi_local,
+                    info.global_range.clone(),
+                    info.total_p,
+                )
+                .materialize();
+                let s_full = EmbeddedSquareBlock::new(
+                    &info.s_psi_local,
+                    info.global_range.clone(),
+                    info.total_p,
+                )
+                .materialize();
+                let penalty_indices = info.penalty_indices.clone();
+                CustomFamilyBlockPsiDerivative {
+                    penalty_index: Some(info.penalty_index),
+                    x_psi: x_full.clone(),
+                    s_psi: s_full,
+                    s_psi_components: Some(
+                        info.penalty_indices
+                            .into_iter()
+                            .zip(info.s_psi_components_local.into_iter().map(|local| {
+                                EmbeddedSquareBlock::new(
+                                    &local,
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                                .materialize()
+                            }))
+                            .collect(),
+                    ),
+                    x_psi_psi: Some({
+                        let mut rows =
+                            vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
+                        rows[psi_idx] = EmbeddedColumnBlock::new(
+                            &info.x_psi_psi_local,
+                            info.global_range.clone(),
+                            info.total_p,
+                        )
+                        .materialize();
+                        rows
+                    }),
+                    s_psi_psi: Some({
+                        let mut rows =
+                            vec![Array2::<f64>::zeros((info.total_p, info.total_p)); psi_dim];
+                        rows[psi_idx] = EmbeddedSquareBlock::new(
+                            &info.s_psi_psi_local,
+                            info.global_range.clone(),
+                            info.total_p,
+                        )
+                        .materialize();
+                        rows
+                    }),
+                    s_psi_psi_components: Some({
+                        let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+                        rows[psi_idx] = penalty_indices
+                            .into_iter()
+                            .zip(info.s_psi_psi_components_local.into_iter().map(|local| {
+                                EmbeddedSquareBlock::new(
+                                    &local,
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                                .materialize()
+                            }))
+                            .collect();
+                        rows
+                    }),
+                    implicit_operator: info
+                        .implicit_operator
+                        .as_ref()
+                        .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op))),
+                    implicit_axis: info.implicit_axis,
+                    implicit_group_id: info.aniso_group_id,
+                }
+            })
+            .collect(),
+    ))
+}
+
 #[derive(Clone)]
 pub(crate) struct CustomFamilyPsiDesignAction {
     operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -1669,11 +1772,7 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
         }
     }
 
-    pub(crate) fn get_or_try_init<F>(
-        &self,
-        index: usize,
-        init: F,
-    ) -> Result<Option<Arc<T>>, String>
+    pub(crate) fn get_or_try_init<F>(&self, index: usize, init: F) -> Result<Option<Arc<T>>, String>
     where
         F: FnOnce() -> Result<Option<T>, String>,
     {
@@ -3250,6 +3349,24 @@ impl BlockEtaCheckpoint {
         }
     }
 
+    /// Capture into a pre-allocated buffer, returning the filled checkpoint.
+    /// The buffer is taken (O(1) move) and filled with eta's data (O(n) copy).
+    fn capture_reuse(state: &ParameterBlockState, buf: &mut Array1<f64>) -> Self {
+        if buf.len() == state.eta.len() {
+            buf.assign(&state.eta);
+            Self {
+                saved: std::mem::take(buf),
+            }
+        } else {
+            Self::capture(state)
+        }
+    }
+
+    /// Return the internal buffer for recycling.
+    fn into_buffer(self) -> Array1<f64> {
+        self.saved
+    }
+
     /// Restore: `state.eta = saved`.
     fn restore_eta(&self, state: &mut ParameterBlockState) {
         state.eta.assign(&self.saved);
@@ -3318,6 +3435,12 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut lastobjective = -cached_eval.log_likelihood + current_penalty;
     let mut converged = false;
     let mut cycles_done = 0usize;
+    // Pre-allocate per-block eta backup buffers to avoid O(n) allocation
+    // per block per cycle in the backtracking line search.
+    let mut eta_backups: Vec<Array1<f64>> = states
+        .iter()
+        .map(|s| Array1::zeros(s.eta.len()))
+        .collect();
 
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
@@ -3406,8 +3529,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
             // Damped update: require non-increasing penalized objective under dynamic geometry.
             // Precompute X * delta once so line-search eta updates are O(n) not O(np).
-            // Swap eta into backup buffer instead of cloning to avoid O(n) allocation.
-            let eta_checkpoint = BlockEtaCheckpoint::capture(&states[b]);
+            // Reuse pre-allocated eta backup to avoid O(n) allocation per block per cycle.
+            let eta_checkpoint = BlockEtaCheckpoint::capture_reuse(&states[b], &mut eta_backups[b]);
             let x_delta = if !is_dynamic {
                 Some(spec.design.matrixvectormultiply(&delta))
             } else {
@@ -3512,6 +3635,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);
             }
+            // Recycle the checkpoint's buffer back into the pre-allocated pool.
+            eta_backups[b] = eta_checkpoint.into_buffer();
         }
 
         // For non-dynamic families, incremental eta updates within the block loop
@@ -4984,8 +5109,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         };
 
         // Build ψ HyperCoords, pair callbacks, and drift derivative callback.
-        let is_gaussian =
-            family.exact_newton_outerobjective() == ExactNewtonOuterObjective::QuadraticReml;
+        let hessian_beta_independent = !family.exact_newton_joint_hessian_beta_dependent();
 
         let psi_coords = build_psi_hyper_coords(
             family,
@@ -4996,7 +5120,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             rho_current.as_slice().unwrap(),
             &penalty_counts,
             s_pinv_joint.as_ref(),
-            is_gaussian,
+            hessian_beta_independent,
         )?;
 
         let psi_workspace = if need_hessian {
@@ -5026,7 +5150,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
                 &synced_joint_states,
                 specs,
                 derivative_blocks,
-                is_gaussian,
+                hessian_beta_independent,
                 psi_workspace,
             );
             (Some(ext_ext_fn), Some(rho_ext_fn), drift_fn)
@@ -5776,11 +5900,13 @@ pub fn fit_custom_family<F: CustomFamily>(
             }
         },
         eval_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
-            let cached = outer.warm_cache.clone();
+            // Use a reference to the warm cache instead of cloning it.
+            // The clone was O(Σp_i) per outer evaluation — unnecessary since
+            // we only need read access for the proximity check.
             let warm_ref = if has_exact_hess {
                 None
             } else {
-                cached.as_ref()
+                outer.warm_cache.as_ref()
             };
             let (cost, grad, hess_opt) = match outerobjectivegradienthessian(
                 family,
@@ -5801,7 +5927,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                 {
                     // Warm-start proximity check: discard warm cache if rho
                     // jumped too far from the cached point.
-                    let seed_ok = cached
+                    let seed_ok = outer.warm_cache
                         .as_ref()
                         .map(|c| {
                             c.rho.len() == rho.len()
