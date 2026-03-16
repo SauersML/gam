@@ -3463,7 +3463,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 .slice_mut(ndarray::s![start..end, start..end])
                 .assign(s_lambda);
         }
-        if ridge > 0.0 && options.ridge_policy.include_stabilization_in_objective {
+        if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
             for d in 0..total_p {
                 s_joint[[d, d]] += ridge;
             }
@@ -3505,9 +3505,10 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
             // Solve the joint system with ridge retries for robustness
             let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-            let Some(delta) = solver.solvevectorwithridge_retries(&lhs, &rhs, 1e-10) else {
+            let Some(delta_raw) = solver.solvevectorwithridge_retries(&lhs, &rhs, 1e-10) else {
                 break; // Fall back to blockwise
             };
+            let mut delta = delta_raw;
 
             // Trust region: cap step size
             let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
@@ -3527,7 +3528,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let mut accepted = false;
             for bt in 0..8 {
                 let alpha = 0.5f64.powi(bt);
-                for (b, spec) in specs.iter().enumerate() {
+                for b in 0..specs.len() {
                     let (start, end) = ranges[b];
                     states[b].beta.assign(&old_beta[b]);
                     states[b].beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
