@@ -1303,24 +1303,27 @@ impl EngineDims {
 }
 
 /// Engine-facing stable reparameterization API using only `(p, k)`.
+///
+/// When `cached_invariant` is `Some`, reuses the precomputed eigendecomposition
+/// (the hot path inside the REML loop). When `None`, computes the invariant on
+/// the fly (the post-REML refit path). Merging both cases into a single entry
+/// point ensures `penalty_shrinkage_floor` is always applied regardless of
+/// whether a cached invariant is available.
 pub fn stable_reparameterization_engine(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     dims: EngineDims,
+    cached_invariant: Option<&ReparamInvariant>,
     penalty_shrinkage_floor: Option<f64>,
 ) -> Result<ReparamResult, EstimationError> {
-    let invariant = precompute_reparam_invariant(rs_list, dims.p)?;
-    stable_reparameterizationwith_invariant(rs_list, lambdas, dims.p, &invariant, penalty_shrinkage_floor)
-}
-
-/// Engine-facing stable reparameterization API with precomputed invariant using only `(p, k)`.
-pub fn stable_reparameterizationwith_invariant_engine(
-    rs_list: &[Array2<f64>],
-    lambdas: &[f64],
-    dims: EngineDims,
-    invariant: &ReparamInvariant,
-    penalty_shrinkage_floor: Option<f64>,
-) -> Result<ReparamResult, EstimationError> {
+    let owned;
+    let invariant = match cached_invariant {
+        Some(inv) => inv,
+        None => {
+            owned = precompute_reparam_invariant(rs_list, dims.p)?;
+            &owned
+        }
+    };
     stable_reparameterizationwith_invariant(
         rs_list,
         lambdas,
