@@ -1256,6 +1256,17 @@ fn run_fit_bernoulli_marginal_slope(
         .ok_or_else(|| "missing --z-column".to_string())?;
     let logslope_formula = normalizenoise_formula(logslope_formula_raw, &parsed.response);
     let parsed_logslope = parse_formula(&logslope_formula)?;
+    if parsed_logslope.response != parsed.response {
+        return Err(
+            "--logslope-formula must use the same response column as the main formula".to_string(),
+        );
+    }
+    if parsed_logslope.linkspec.is_some() {
+        return Err(
+            "link(...) is not supported in --logslope-formula for the bernoulli marginal-slope family"
+                .to_string(),
+        );
+    }
     if parsed_logslope.linkwiggle.is_some() {
         return Err(
             "linkwiggle(...) is not supported in --logslope-formula for the bernoulli marginal-slope family"
@@ -6529,7 +6540,61 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         let parsed = parse_formula(&model.formula)?;
 
         if let Some(y_col) = col_map.get(&parsed.response).copied() {
-            if matches!(
+            if model.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
+                let y = ds.values.column(y_col).to_owned();
+                n_obs = Some(y.len());
+                if let Some(predictor) = model.predictor() {
+                    let pred_input = build_predict_input_for_model(
+                        model,
+                        ds.values.view(),
+                        &col_map,
+                        training_headers,
+                    )?;
+                    progress.set_stage("report", "building report diagnostics design");
+                    progress.advance_workflow(3);
+                    let pred = predictor
+                        .predict_plugin_response(&pred_input)
+                        .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
+
+                    let residuals: Vec<f64> =
+                        y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
+                    let mut residuals_sorted = residuals.clone();
+                    residuals_sorted
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let n = residuals_sorted.len().max(1);
+                    let theoretical_quantiles = (0..n)
+                        .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut bin_pred = [0.0f64; 10];
+                    let mut bin_obs = [0.0f64; 10];
+                    let mut counts = [0usize; 10];
+                    for i in 0..y.len() {
+                        let p = pred.mean[i].clamp(0.0, 1.0);
+                        let b = ((p * 10.0).floor() as usize).min(9);
+                        bin_pred[b] += p;
+                        bin_obs[b] += y[i];
+                        counts[b] += 1;
+                    }
+                    let mut mp = Vec::new();
+                    let mut or = Vec::new();
+                    for b in 0..10 {
+                        if counts[b] > 0 {
+                            mp.push(bin_pred[b] / counts[b] as f64);
+                            or.push((bin_obs[b] / counts[b] as f64).clamp(0.0, 1.0));
+                        }
+                    }
+                    diagnostics = Some(report::DiagnosticsInput {
+                        residuals_sorted,
+                        theoretical_quantiles,
+                        y_observed: y.to_vec(),
+                        y_predicted: pred.mean.to_vec(),
+                        calibration: Some(report::CalibrationData {
+                            mean_predicted: mp,
+                            observed_rate: or,
+                        }),
+                    });
+                }
+            } else if matches!(
                 model.predict_model_class(),
                 PredictModelClass::Standard | PredictModelClass::BinomialLocationScale
             ) {
