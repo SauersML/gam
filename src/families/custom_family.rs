@@ -3384,11 +3384,11 @@ fn inner_blockwise_fit<F: CustomFamily>(
     } else {
         options.inner_tol
     };
-    // Cap at 500 cycles instead of 4000. Well-conditioned GAMLSS
-    // converges in 20-100 cycles. If 500 isn't enough, the problem
-    // is pathologically ill-conditioned and more cycles won't help.
+    // Cap at 200 cycles instead of 4000. Exact Newton blockwise
+    // converges in 20-100 cycles for well-conditioned GAMLSS. The
+    // 1e-8 tolerance is tight enough that 200 is generous.
     let inner_max_cycles = if has_joint_exacthessian {
-        options.inner_max_cycles.max(500)
+        options.inner_max_cycles.max(200)
     } else {
         options.inner_max_cycles
     };
