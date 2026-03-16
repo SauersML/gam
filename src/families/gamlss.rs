@@ -28,10 +28,10 @@ use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::normal_pdf;
 use crate::smooth::{
-    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design,
-    optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
@@ -564,7 +564,7 @@ fn build_two_block_exact_joint_setup(
     noise_penalties: usize,
     extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> TwoBlockExactJointHyperSetup {
+) -> ExactJointHyperSetup {
     // Exact-joint setup stores the spatial tail in log(kappa), not log(length_scale).
     let mean_terms = spatial_length_scale_term_indices(meanspec);
     let noise_terms = spatial_length_scale_term_indices(noisespec);
@@ -594,7 +594,7 @@ fn build_two_block_exact_joint_setup(
     let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&all_dims, kappa_options);
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&all_dims, kappa_options);
 
-    TwoBlockExactJointHyperSetup::new(
+    ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
         rho_upper,
@@ -1350,45 +1350,47 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 extra_rho0.as_slice().unwrap_or(&[]),
                 kappa_options,
             );
+            let mean_terms = spatial_length_scale_term_indices(builder.meanspec());
+            let noise_terms = spatial_length_scale_term_indices(builder.noisespec());
             let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
             let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
-            optimize_two_block_spatial_length_scale_exact_joint(
+            optimize_spatial_length_scale_exact_joint(
                 data,
-                builder.meanspec(),
-                builder.noisespec(),
+                &[builder.meanspec().clone(), builder.noisespec().clone()],
+                &[mean_terms, noise_terms],
                 kappa_options,
                 &joint_setup,
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
-                |rho, _, _, mean_design, noise_design| {
+                |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let fit = {
                         let blocks = builder.build_blocks(
                             rho,
-                            mean_design,
-                            noise_design,
+                            &designs[0],
+                            &designs[1],
                             mean_beta_hint_cell.borrow().clone(),
                             noise_beta_hint_cell.borrow().clone(),
                         )?;
-                        let family = builder.build_family(mean_design, noise_design);
+                        let family = builder.build_family(&designs[0], &designs[1]);
                         fit_custom_family(&family, &blocks, options)?
                     };
                     Ok(gamlss_fit_score(&fit))
                 },
-                |rho, _, _, mean_design, noise_design| {
+                |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let fit = {
                         let blocks = builder.build_blocks(
                             rho,
-                            mean_design,
-                            noise_design,
+                            &designs[0],
+                            &designs[1],
                             mean_beta_hint_cell.borrow().clone(),
                             noise_beta_hint_cell.borrow().clone(),
                         )?;
-                        let family = builder.build_family(mean_design, noise_design);
+                        let family = builder.build_family(&designs[0], &designs[1]);
                         fit_custom_family(&family, &blocks, options)?
                     };
                     let layout = GamlssLambdaLayout::two_block(
-                        builder.mean_penalty_count(mean_design),
-                        builder.noise_penalty_count(noise_design),
+                        builder.mean_penalty_count(&designs[0]),
+                        builder.noise_penalty_count(&designs[1]),
                     );
                     if fit.log_lambdas.len() >= layout.total() {
                         mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
@@ -1402,10 +1404,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     Ok(fit)
                 },
                 |rho,
-                 meanspec_resolved,
-                 noisespec_resolved,
-                 mean_design,
-                 noise_design,
+                 specs: &[TermCollectionSpec],
+                 designs: &[TermCollectionDesign],
                  need_hessian| {
                     if !analytic_joint_derivatives_available {
                         return Err(
@@ -1415,18 +1415,18 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     let blocks = builder.build_blocks(
                         rho,
-                        mean_design,
-                        noise_design,
+                        &designs[0],
+                        &designs[1],
                         mean_beta_hint_cell.borrow().clone(),
                         noise_beta_hint_cell.borrow().clone(),
                     )?;
-                    let family = builder.build_family(mean_design, noise_design);
+                    let family = builder.build_family(&designs[0], &designs[1]);
                     let psiderivative_blocks = builder.build_psiderivative_blocks(
                         data,
-                        meanspec_resolved,
-                        noisespec_resolved,
-                        mean_design,
-                        noise_design,
+                        &specs[0],
+                        &specs[1],
+                        &designs[0],
+                        &designs[1],
                     )?;
                     let eval = evaluate_custom_family_joint_hyper(
                         &family,
@@ -1452,14 +1452,17 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut solved = run_exact_joint_spatial!()
         .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
 
-    builder.augment_result_designs(&mut solved.mean_design, &mut solved.noise_design);
+    builder.augment_result_designs(
+        &mut solved.designs[0],
+        &mut solved.designs[1],
+    );
 
     BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit: solved.fit,
-        meanspec_resolved: solved.resolved_meanspec,
-        noisespec_resolved: solved.resolved_noisespec,
-        mean_design: solved.mean_design,
-        noise_design: solved.noise_design,
+        meanspec_resolved: solved.resolved_specs.remove(0),
+        noisespec_resolved: solved.resolved_specs.remove(0),
+        mean_design: solved.designs.remove(0),
+        noise_design: solved.designs.remove(0),
     })
 }
 

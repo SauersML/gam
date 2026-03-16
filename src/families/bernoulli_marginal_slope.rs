@@ -19,10 +19,10 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::quadrature::compute_gauss_hermite_n;
 use crate::smooth::{
-    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design,
-    optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -389,7 +389,7 @@ fn joint_setup(
     logslope_penalties: usize,
     extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> TwoBlockExactJointHyperSetup {
+) -> ExactJointHyperSetup {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
     let rho_dim = marginal_penalties + logslope_penalties + extra_rho0.len();
@@ -416,7 +416,7 @@ fn joint_setup(
     let log_kappa0 = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(values), dims.clone());
     let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&dims, kappa_options);
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&dims, kappa_options);
-    TwoBlockExactJointHyperSetup::new(
+    ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
         rho_upper,
@@ -2880,23 +2880,25 @@ pub fn fit_bernoulli_marginal_slope_terms(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
-    let solved = optimize_two_block_spatial_length_scale_exact_joint(
+    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+    let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
+    let solved = optimize_spatial_length_scale_exact_joint(
         data,
-        &marginalspec_boot,
-        &logslopespec_boot,
+        &[marginalspec_boot.clone(), logslopespec_boot.clone()],
+        &[marginal_terms, logslope_terms],
         kappa_options,
         &setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, _, _, marginal_design, logslope_design| {
-            let blocks = build_blocks(rho, marginal_design, logslope_design)?;
-            let family = make_family(marginal_design, logslope_design);
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+            let family = make_family(&designs[0], &designs[1]);
             let fit = inner_fit(&family, &blocks, options)?;
             Ok(fit_score(&fit))
         },
-        |rho, _, _, marginal_design, logslope_design| {
-            let blocks = build_blocks(rho, marginal_design, logslope_design)?;
-            let family = make_family(marginal_design, logslope_design);
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+            let family = make_family(&designs[0], &designs[1]);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             let mut bidx = 0usize;
@@ -2922,19 +2924,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
             Ok(fit)
         },
         |rho,
-         marginal_resolved,
-         logslope_resolved,
-         marginal_design,
-         logslope_design,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
          need_hessian| {
-            let blocks = build_blocks(rho, marginal_design, logslope_design)?;
-            let family = make_family(marginal_design, logslope_design);
+            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+            let family = make_family(&designs[0], &designs[1]);
             let mut derivative_blocks = vec![
-                build_block_spatial_psi_derivatives(data, marginal_resolved, marginal_design)?
+                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
                     .ok_or_else(|| {
                         "missing bernoulli marginal spatial psi derivatives".to_string()
                     })?,
-                build_block_spatial_psi_derivatives(data, logslope_resolved, logslope_design)?
+                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
                     .ok_or_else(|| {
                         "missing bernoulli logslope spatial psi derivatives".to_string()
                     })?,
@@ -2965,12 +2965,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
         },
     )?;
 
+    let mut resolved_specs = solved.resolved_specs;
+    let mut designs = solved.designs;
     Ok(BernoulliMarginalSlopeFitResult {
         fit: solved.fit,
-        marginalspec_resolved: solved.resolved_meanspec,
-        logslopespec_resolved: solved.resolved_noisespec,
-        marginal_design: solved.mean_design,
-        logslope_design: solved.noise_design,
+        marginalspec_resolved: resolved_specs.remove(0),
+        logslopespec_resolved: resolved_specs.remove(0),
+        marginal_design: designs.remove(0),
+        logslope_design: designs.remove(0),
         baseline_marginal: baseline.0,
         baseline_logslope: baseline.1,
         score_warp_runtime,

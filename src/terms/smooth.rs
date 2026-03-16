@@ -10038,6 +10038,618 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// N-block generalization of the two-block spatial length-scale optimizer.
+// ---------------------------------------------------------------------------
+
+pub struct SpatialLengthScaleOptimizationResult<FitOut> {
+    pub resolved_specs: Vec<TermCollectionSpec>,
+    pub designs: Vec<TermCollectionDesign>,
+    pub fit: FitOut,
+}
+
+/// Generalization of `TwoBlockExactJointHyperSetup` for N blocks.
+/// (The fields are not inherently two-block-specific; only the old name was.)
+#[derive(Debug, Clone)]
+pub struct ExactJointHyperSetup {
+    rho0: Array1<f64>,
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
+    log_kappa0: SpatialLogKappaCoords,
+    log_kappa_lower: SpatialLogKappaCoords,
+    log_kappa_upper: SpatialLogKappaCoords,
+}
+
+impl ExactJointHyperSetup {
+    fn sanitize_rho_seed(
+        rho0: Array1<f64>,
+        rho_lower: &Array1<f64>,
+        rho_upper: &Array1<f64>,
+    ) -> Array1<f64> {
+        Array1::from_iter(rho0.iter().enumerate().map(|(idx, &value)| {
+            let lo = rho_lower[idx];
+            let hi = rho_upper[idx];
+            let fallback = 0.0_f64.clamp(lo, hi);
+            if value.is_finite() {
+                value.clamp(lo, hi)
+            } else {
+                fallback
+            }
+        }))
+    }
+
+    pub(crate) fn new(
+        rho0: Array1<f64>,
+        rho_lower: Array1<f64>,
+        rho_upper: Array1<f64>,
+        log_kappa0: SpatialLogKappaCoords,
+        log_kappa_lower: SpatialLogKappaCoords,
+        log_kappa_upper: SpatialLogKappaCoords,
+    ) -> Self {
+        let rho0 = Self::sanitize_rho_seed(rho0, &rho_lower, &rho_upper);
+        Self {
+            rho0,
+            rho_lower,
+            rho_upper,
+            log_kappa0,
+            log_kappa_lower,
+            log_kappa_upper,
+        }
+    }
+
+    pub(crate) fn rho_dim(&self) -> usize {
+        self.rho0.len()
+    }
+
+    pub(crate) fn log_kappa_dim(&self) -> usize {
+        self.log_kappa0.len()
+    }
+
+    pub(crate) fn theta0(&self) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho0);
+        out.slice_mut(s![self.rho_dim()..])
+            .assign(self.log_kappa0.as_array());
+        out
+    }
+
+    pub(crate) fn lower(&self) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_lower);
+        out.slice_mut(s![self.rho_dim()..])
+            .assign(self.log_kappa_lower.as_array());
+        out
+    }
+
+    pub(crate) fn upper(&self) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_upper);
+        out.slice_mut(s![self.rho_dim()..])
+            .assign(self.log_kappa_upper.as_array());
+        out
+    }
+
+    /// Per-term dimensionality layout for the psi block.
+    pub(crate) fn log_kappa_dims_per_term(&self) -> Vec<usize> {
+        self.log_kappa0.dims_per_term().to_vec()
+    }
+}
+
+/// N-block generalization of `TwoBlockExactJointDesignCache`.
+///
+/// Each block owns a `FrozenTermCollectionIncrementalRealizer` and a list of
+/// spatial term indices within that block's spec. The cache splits the
+/// combined psi vector into per-block slices using precomputed offsets.
+struct ExactJointDesignCache<'d> {
+    realizers: Vec<FrozenTermCollectionIncrementalRealizer<'d>>,
+    block_term_indices: Vec<Vec<usize>>,
+    current_theta: Option<Array1<f64>>,
+    last_cost: Option<f64>,
+    last_eval: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
+    rho_dim: usize,
+    all_dims: Vec<usize>,
+    /// For block i, the per-term dims that belong to it start at
+    /// `block_term_offsets[i]` in the `all_dims` / `dims_per_term` layout.
+    block_term_offsets: Vec<usize>,
+    block_term_counts: Vec<usize>,
+}
+
+impl<'d> ExactJointDesignCache<'d> {
+    fn new(
+        data: ArrayView2<'d, f64>,
+        blocks: Vec<(TermCollectionSpec, TermCollectionDesign, Vec<usize>)>,
+        rho_dim: usize,
+        all_dims: Vec<usize>,
+    ) -> Result<Self, String> {
+        let n_blocks = blocks.len();
+        let mut realizers = Vec::with_capacity(n_blocks);
+        let mut block_term_indices = Vec::with_capacity(n_blocks);
+        let mut block_term_offsets = Vec::with_capacity(n_blocks);
+        let mut block_term_counts = Vec::with_capacity(n_blocks);
+        let mut term_cursor = 0usize;
+
+        for (spec, design, terms) in blocks {
+            block_term_offsets.push(term_cursor);
+            block_term_counts.push(terms.len());
+            term_cursor += terms.len();
+            block_term_indices.push(terms);
+            realizers.push(FrozenTermCollectionIncrementalRealizer::new(
+                data, spec, design,
+            )?);
+        }
+
+        Ok(Self {
+            realizers,
+            block_term_indices,
+            current_theta: None,
+            last_cost: None,
+            last_eval: None,
+            rho_dim,
+            all_dims,
+            block_term_offsets,
+            block_term_counts,
+        })
+    }
+
+    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            return Ok(());
+        }
+
+        let full_log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            theta,
+            self.rho_dim,
+            self.all_dims.clone(),
+        );
+
+        // Split the full log_kappa into per-block sub-coords using split_at.
+        // We split from the front iteratively: after extracting block 0..N-2,
+        // the remainder is the last block.
+        let n = self.realizers.len();
+        let mut remaining = full_log_kappa;
+        for block_idx in 0..n {
+            let count = self.block_term_counts[block_idx];
+            if block_idx < n - 1 {
+                let (block_lk, rest) = remaining.split_at(count);
+                self.realizers[block_idx]
+                    .apply_log_kappa(&block_lk, &self.block_term_indices[block_idx])?;
+                remaining = rest;
+            } else {
+                // Last block gets the remainder.
+                self.realizers[block_idx]
+                    .apply_log_kappa(&remaining, &self.block_term_indices[block_idx])?;
+            }
+        }
+
+        self.current_theta = Some(theta.clone());
+        self.last_cost = None;
+        self.last_eval = None;
+        Ok(())
+    }
+
+    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval
+                .as_ref()
+                .map(|cached| cached.0)
+                .or(self.last_cost)
+        } else {
+            None
+        }
+    }
+
+    fn memoized_eval(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval.clone()
+        } else {
+            None
+        }
+    }
+
+    fn store_cost(&mut self, cost: f64) {
+        self.last_cost = Some(cost);
+    }
+
+    fn store_eval(&mut self, eval: (f64, Array1<f64>, Option<Array2<f64>>)) {
+        self.last_cost = Some(eval.0);
+        self.last_eval = Some(eval);
+    }
+
+    fn specs(&self) -> Vec<&TermCollectionSpec> {
+        self.realizers.iter().map(|r| r.spec()).collect()
+    }
+
+    fn designs(&self) -> Vec<&TermCollectionDesign> {
+        self.realizers.iter().map(|r| r.design()).collect()
+    }
+
+    fn n_blocks(&self) -> usize {
+        self.realizers.len()
+    }
+}
+
+pub fn optimize_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn, ExactFn>(
+    data: ArrayView2<'_, f64>,
+    block_specs: &[TermCollectionSpec],
+    block_term_indices: &[Vec<usize>],
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    joint_setup: &ExactJointHyperSetup,
+    analytic_joint_gradient_available: bool,
+    analytic_joint_hessian_available: bool,
+    mut cost_fn: CostFn,
+    mut fit_fn: FitFn,
+    mut exact_fn: ExactFn,
+) -> Result<SpatialLengthScaleOptimizationResult<FitOut>, String>
+where
+    FitOut: Clone,
+    CostFn: FnMut(
+        &Array1<f64>,
+        &[TermCollectionSpec],
+        &[TermCollectionDesign],
+    ) -> Result<f64, String>,
+    FitFn: FnMut(
+        &Array1<f64>,
+        &[TermCollectionSpec],
+        &[TermCollectionDesign],
+    ) -> Result<FitOut, String>,
+    ExactFn: FnMut(
+        &Array1<f64>,
+        &[TermCollectionSpec],
+        &[TermCollectionDesign],
+        bool,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
+{
+    let n_blocks = block_specs.len();
+    if block_term_indices.len() != n_blocks {
+        return Err(format!(
+            "block_specs ({}) and block_term_indices ({}) length mismatch",
+            n_blocks,
+            block_term_indices.len()
+        ));
+    }
+
+    let log_kappa_dim = joint_setup.log_kappa_dim();
+
+    // -----------------------------------------------------------------------
+    // Fast path: kappa disabled or no spatial terms — build designs once.
+    // -----------------------------------------------------------------------
+    if !kappa_options.enabled || log_kappa_dim == 0 {
+        let mut resolved_specs = Vec::with_capacity(n_blocks);
+        let mut designs = Vec::with_capacity(n_blocks);
+        for (blk_idx, spec) in block_specs.iter().enumerate() {
+            let design = build_term_collection_design(data, spec).map_err(|e| {
+                format!(
+                    "failed to build block-{blk_idx} design during exact joint kappa optimization: {e}"
+                )
+            })?;
+            let resolved = freeze_spatial_length_scale_terms_from_design(spec, &design)
+                .map_err(|e| {
+                    format!(
+                        "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
+                    )
+                })?;
+            resolved_specs.push(resolved);
+            designs.push(design);
+        }
+        let rho_only = joint_setup
+            .theta0()
+            .slice(s![..joint_setup.rho_dim()])
+            .to_owned();
+
+        // Build temporary owned slices for the closure call.
+        let spec_refs: Vec<TermCollectionSpec> = resolved_specs.clone();
+        let design_refs: Vec<TermCollectionDesign> = designs.clone();
+        let fit = fit_fn(&rho_only, &spec_refs, &design_refs)?;
+        return Ok(SpatialLengthScaleOptimizationResult {
+            resolved_specs,
+            designs,
+            fit,
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Full optimization path.
+    // -----------------------------------------------------------------------
+    let theta0 = joint_setup.theta0();
+    let lower = joint_setup.lower();
+    let upper = joint_setup.upper();
+    if theta0.len() < log_kappa_dim || lower.len() != theta0.len() || upper.len() != theta0.len() {
+        return Err(format!(
+            "invalid exact joint theta setup: theta0={}, lower={}, upper={}, required_log_kappa_dim={}",
+            theta0.len(),
+            lower.len(),
+            upper.len(),
+            log_kappa_dim
+        ));
+    }
+    let rho_dim = joint_setup.rho_dim();
+    let all_dims = joint_setup.log_kappa_dims_per_term();
+
+    // Build bootstrap designs and frozen specs for each block.
+    let mut boot_designs = Vec::with_capacity(n_blocks);
+    let mut best_specs = Vec::with_capacity(n_blocks);
+    let mut total_design_cols = 0usize;
+    for (blk_idx, spec) in block_specs.iter().enumerate() {
+        let design = build_term_collection_design(data, spec).map_err(|e| {
+            format!(
+                "failed to build block-{blk_idx} design during exact joint kappa optimization: {e}"
+            )
+        })?;
+        let frozen = freeze_spatial_length_scale_terms_from_design(spec, &design).map_err(|e| {
+            format!(
+                "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
+            )
+        })?;
+        total_design_cols += design.design.ncols();
+        best_specs.push(frozen);
+        boot_designs.push(design);
+    }
+
+    let analytic_outer_hessian_available = analytic_joint_hessian_available
+        && crate::custom_family::joint_exact_analytic_outer_hessian_available(total_design_cols);
+
+    let theta_dim = theta0.len();
+    let psi_dim = theta_dim - rho_dim;
+
+    // Build the cache with one realizer per block.
+    let cache_blocks: Vec<(TermCollectionSpec, TermCollectionDesign, Vec<usize>)> = best_specs
+        .iter()
+        .zip(boot_designs.iter())
+        .zip(block_term_indices.iter())
+        .map(|((spec, design), terms)| (spec.clone(), design.clone(), terms.clone()))
+        .collect();
+
+    struct NBlockExactJointState<'d> {
+        best_cost: f64,
+        cache: ExactJointDesignCache<'d>,
+    }
+
+    impl<'d> NBlockExactJointState<'d> {
+        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            let _ = theta;
+            if cost < self.best_cost {
+                self.best_cost = cost;
+            }
+        }
+    }
+
+    let mut state = NBlockExactJointState {
+        best_cost: f64::INFINITY,
+        cache: ExactJointDesignCache::new(
+            data,
+            cache_blocks,
+            rho_dim,
+            all_dims.clone(),
+        )?,
+    };
+
+    let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
+    let all_dims_ref = &all_dims;
+
+    use crate::solver::outer_strategy::{
+        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
+        OuterConfig, OuterEval,
+    };
+
+    let outer_config = OuterConfig {
+        tolerance: kappa_options.rel_tol.max(1e-6),
+        max_iter: kappa_options.max_outer_iter.max(1),
+        fd_step: 1e-4,
+        bounds: Some((lower.clone(), upper.clone())),
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            num_auxiliary_trailing: psi_dim,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
+        initial_rho: Some(theta0.clone()),
+        fallback_policy: FallbackPolicy::Automatic,
+    };
+
+    // Helper: collect specs and designs from cache into owned Vecs for closure calls.
+    fn collect_specs(cache: &ExactJointDesignCache<'_>) -> Vec<TermCollectionSpec> {
+        cache.specs().into_iter().cloned().collect()
+    }
+    fn collect_designs(cache: &ExactJointDesignCache<'_>) -> Vec<TermCollectionDesign> {
+        cache.designs().into_iter().cloned().collect()
+    }
+
+    let mut obj = ClosureObjective {
+        state: &mut state,
+        cap: OuterCapability {
+            gradient: if analytic_joint_gradient_available {
+                Derivative::Analytic
+            } else {
+                Derivative::FiniteDifference
+            },
+            hessian: if analytic_outer_hessian_available {
+                Derivative::Analytic
+            } else {
+                Derivative::Unavailable
+            },
+            n_params: theta_dim,
+            all_penalty_like: false,
+            has_psi_coords: true,
+            fixed_point_available: false,
+            barrier_config: None,
+        },
+        cost_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+            if let Some(cost) = ctx.cache.memoized_cost(theta) {
+                ctx.track_best(theta, cost);
+                return Ok(cost);
+            }
+            if ctx.cache.ensure_theta(theta).is_err() {
+                return Ok(f64::INFINITY);
+            }
+            let specs = collect_specs(&ctx.cache);
+            let designs = collect_designs(&ctx.cache);
+            match cost_fn(
+                &theta.slice(s![..rho_dim]).to_owned(),
+                &specs,
+                &designs,
+            ) {
+                Ok(cost) => {
+                    ctx.cache.store_cost(cost);
+                    ctx.track_best(theta, cost);
+                    Ok(cost)
+                }
+                Err(_) => Ok(f64::INFINITY),
+            }
+        },
+        eval_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+            if let Some((cost, mut grad, hess)) = ctx.cache.memoized_eval(theta) {
+                ctx.track_best(theta, cost);
+                if !cost.is_finite() {
+                    return Ok(OuterEval::infeasible(theta.len()));
+                }
+                if grad.iter().any(|v| !v.is_finite()) {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "n-block exact-joint gradient contained non-finite values".to_string(),
+                    ));
+                }
+                project_psi_gradient(&mut grad, rho_dim, all_dims_ref);
+                let hessian_result = match hess {
+                    Some(mut h)
+                        if h.nrows() == theta.len()
+                            && h.ncols() == theta.len()
+                            && h.iter().all(|v| v.is_finite()) =>
+                    {
+                        project_psi_hessian(&mut h, rho_dim, all_dims_ref);
+                        HessianResult::Analytic(h)
+                    }
+                    _ => HessianResult::Unavailable,
+                };
+                return Ok(OuterEval {
+                    cost,
+                    gradient: grad,
+                    hessian: hessian_result,
+                });
+            }
+            if ctx.cache.ensure_theta(theta).is_err() {
+                return Ok(OuterEval::infeasible(theta.len()));
+            }
+            let specs = collect_specs(&ctx.cache);
+            let designs = collect_designs(&ctx.cache);
+            match (&mut *exact_fn_cell.borrow_mut())(
+                &theta.slice(s![..rho_dim]).to_owned(),
+                &specs,
+                &designs,
+                analytic_outer_hessian_available,
+            ) {
+                Ok((cost, mut grad, hess)) => {
+                    ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
+                    ctx.track_best(theta, cost);
+                    if !cost.is_finite() {
+                        return Ok(OuterEval::infeasible(theta.len()));
+                    }
+                    if grad.iter().any(|v| !v.is_finite()) {
+                        return Err(EstimationError::RemlOptimizationFailed(
+                            "n-block exact-joint gradient contained non-finite values".to_string(),
+                        ));
+                    }
+                    project_psi_gradient(&mut grad, rho_dim, all_dims_ref);
+                    let hessian_result = match hess {
+                        Some(mut h)
+                            if h.nrows() == theta.len()
+                                && h.ncols() == theta.len()
+                                && h.iter().all(|v| v.is_finite()) =>
+                        {
+                            project_psi_hessian(&mut h, rho_dim, all_dims_ref);
+                            HessianResult::Analytic(h)
+                        }
+                        _ => HessianResult::Unavailable,
+                    };
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: hessian_result,
+                    })
+                }
+                Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                    "n-block exact-joint derivative evaluation failed: {e}"
+                ))),
+            }
+        },
+        reset_fn: None::<fn(&mut &mut NBlockExactJointState<'_>)>,
+        efs_fn: None::<
+            fn(
+                &mut &mut NBlockExactJointState<'_>,
+                &Array1<f64>,
+            ) -> Result<EfsEval, EstimationError>,
+        >,
+    };
+
+    let result = crate::solver::outer_strategy::run_outer(
+        &mut obj,
+        &outer_config,
+        "n-block exact-joint spatial",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut theta_star = result.rho;
+
+    // Enforce sum-to-zero on psi coordinates with gauge-correct rho_kappa
+    // compensation.
+    //
+    // Build the combined penalty-index mapping across all N blocks.
+    // The combined rho vector lays out block-0 penalties, then block-1, etc.
+    let mut combined_rho_indices: Vec<usize> = Vec::new();
+    let mut penalty_offset = 0usize;
+    for blk_idx in 0..n_blocks {
+        let blk_spec = &best_specs[blk_idx];
+        let blk_design = &boot_designs[blk_idx];
+        for &ti in &block_term_indices[blk_idx] {
+            let idx = smooth_term_penalty_index(blk_spec, blk_design, ti)
+                .map(|idx| penalty_offset + idx)
+                .unwrap_or(0);
+            combined_rho_indices.push(idx);
+        }
+        penalty_offset += blk_design.penalties.len();
+    }
+
+    enforce_psi_sum_to_zero(
+        &mut theta_star,
+        rho_dim,
+        &all_dims,
+        Some(&combined_rho_indices),
+    );
+
+    state.cache.ensure_theta(&theta_star)?;
+
+    let resolved_specs: Vec<TermCollectionSpec> = collect_specs(&state.cache);
+    let designs: Vec<TermCollectionDesign> = collect_designs(&state.cache);
+
+    let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
+    let fit = fit_fn(&rho_star, &resolved_specs, &designs)?;
+
+    for spec in &resolved_specs {
+        log_spatial_aniso_scales(spec);
+    }
+
+    Ok(SpatialLengthScaleOptimizationResult {
+        resolved_specs,
+        designs,
+        fit,
+    })
+}
+
 pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: Array1<f64>,

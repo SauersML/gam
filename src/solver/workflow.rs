@@ -4,6 +4,10 @@ use crate::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec,
     fit_bernoulli_marginal_slope_terms,
 };
+use crate::families::transformation_normal::{
+    TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
+    fit_transformation_normal,
+};
 use crate::families::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
     BlockwiseTermFitResultParts, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
@@ -87,12 +91,23 @@ pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
+pub struct TransformationNormalFitRequest<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub response: Array1<f64>,
+    pub covariate_spec: TermCollectionSpec,
+    pub config: TransformationNormalConfig,
+    pub options: BlockwiseFitOptions,
+    pub kappa_options: SpatialLengthScaleOptimizationOptions,
+    pub warm_start: Option<TransformationWarmStart>,
+}
+
 pub enum FitRequest<'a> {
     Standard(StandardFitRequest<'a>),
     GaussianLocationScale(GaussianLocationScaleFitRequest<'a>),
     BinomialLocationScale(BinomialLocationScaleFitRequest<'a>),
     SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest<'a>),
+    TransformationNormal(TransformationNormalFitRequest<'a>),
 }
 
 pub struct StandardFitResult {
@@ -118,6 +133,7 @@ pub enum FitResult {
     BinomialLocationScale(BinomialLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitResult),
+    TransformationNormal(TransformationNormalFitResult),
 }
 
 fn resolved_wiggle_inverse_link(
@@ -574,6 +590,20 @@ fn fit_bernoulli_marginal_slope_model(
     )
 }
 
+fn fit_transformation_normal_model(
+    request: TransformationNormalFitRequest<'_>,
+) -> Result<TransformationNormalFitResult, String> {
+    fit_transformation_normal(
+        &request.response,
+        request.data,
+        &request.covariate_spec,
+        &request.config,
+        &request.options,
+        &request.kappa_options,
+        request.warm_start.as_ref(),
+    )
+}
+
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     match request {
         FitRequest::Standard(request) => fit_standard_model(request).map(FitResult::Standard),
@@ -588,6 +618,9 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
         }
         FitRequest::BernoulliMarginalSlope(request) => {
             fit_bernoulli_marginal_slope_model(request).map(FitResult::BernoulliMarginalSlope)
+        }
+        FitRequest::TransformationNormal(request) => {
+            fit_transformation_normal_model(request).map(FitResult::TransformationNormal)
         }
     }
 }

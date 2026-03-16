@@ -25,20 +25,23 @@ use crate::construction::kronecker_product;
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyJointHyperResult, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    CustomFamilyWarmStart, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    build_block_spatial_psi_derivatives, custom_family_outer_capability,
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::families::gamlss::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
-    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, ArrayView2, s};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +117,14 @@ pub struct TransformationNormalFamily {
     /// penalty on the deviation part.
     response_penalties: Vec<Array2<f64>>,
 
+    // --- Response-direction knots and transform (stored for prediction) ---
+    /// B-spline knots for the response direction.
+    response_knots: Array1<f64>,
+    /// B-spline degree for the response direction.
+    response_degree: usize,
+    /// Nullspace transform for the deviation basis.
+    response_transform: Array2<f64>,
+
     // --- Covariate side (rebuilt on κ change) ---
     /// Number of covariate basis columns.
     p_cov: usize,
@@ -178,7 +189,7 @@ impl TransformationNormalFamily {
         }
 
         // ----- 1. Build response-direction basis -----
-        let (resp_val, resp_deriv, resp_penalties) =
+        let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
             build_response_basis(response, config)?;
         let p_resp = resp_val.ncols();
 
@@ -198,6 +209,9 @@ impl TransformationNormalFamily {
             response,
             covariate_design,
             &x_deriv,
+            &resp_knots,
+            config.response_degree,
+            &resp_transform,
             config,
         )?;
 
@@ -219,6 +233,100 @@ impl TransformationNormalFamily {
             response_val_basis: resp_val,
             response_deriv_basis: resp_deriv,
             response_penalties: resp_penalties,
+            response_knots: resp_knots,
+            response_degree: config.response_degree,
+            response_transform: resp_transform,
+            p_cov,
+            tensor_penalties,
+            monotonicity_constraints,
+            initial_beta,
+            initial_log_lambdas,
+            epsilon: config.monotonicity_eps,
+            block_name: "transformation".to_string(),
+        })
+    }
+
+    /// Build from a prebuilt response basis, skipping response basis construction.
+    ///
+    /// For the outer loop where the response basis is precomputed once and reused
+    /// across κ iterations.
+    pub fn from_prebuilt_response_basis(
+        response_val_basis: Array2<f64>,
+        response_deriv_basis: Array2<f64>,
+        response_penalties: Vec<Array2<f64>>,
+        response_knots: Array1<f64>,
+        response_degree: usize,
+        response_transform: Array2<f64>,
+        covariate_design: &Array2<f64>,
+        covariate_penalties: &[Array2<f64>],
+        config: &TransformationNormalConfig,
+        warm_start: Option<&TransformationWarmStart>,
+    ) -> Result<Self, String> {
+        let n = response_val_basis.nrows();
+        if covariate_design.nrows() != n {
+            return Err(format!(
+                "response basis rows {} != covariate design rows {}",
+                n,
+                covariate_design.nrows()
+            ));
+        }
+        let p_cov = covariate_design.ncols();
+        if p_cov == 0 {
+            return Err("covariate design has zero columns".to_string());
+        }
+        for (i, sp) in covariate_penalties.iter().enumerate() {
+            if sp.nrows() != p_cov || sp.ncols() != p_cov {
+                return Err(format!(
+                    "covariate penalty {} has shape {:?}, expected ({p_cov}, {p_cov})",
+                    i,
+                    sp.dim()
+                ));
+            }
+        }
+
+        let p_resp = response_val_basis.ncols();
+
+        // Row-wise Kronecker product.
+        let x_val = rowwise_kronecker(&response_val_basis, covariate_design);
+        let x_deriv = rowwise_kronecker(&response_deriv_basis, covariate_design);
+        let p_total = p_resp * p_cov;
+        debug_assert_eq!(x_val.ncols(), p_total);
+        debug_assert_eq!(x_deriv.ncols(), p_total);
+
+        // Tensor penalties.
+        let tensor_penalties =
+            build_tensor_penalties(&response_penalties, covariate_penalties, p_resp, p_cov, config)?;
+
+        // Monotonicity constraints.
+        // We need the original response values to build the boundary grid, but
+        // from_prebuilt only has the basis. Use the derivative design rows directly.
+        let monotonicity_constraints = LinearInequalityConstraints {
+            a: x_deriv.clone(),
+            b: Array1::from_elem(x_deriv.nrows(), config.monotonicity_eps),
+        };
+
+        // Warm start: need response values for location-scale init.
+        // Extract response from column 1 of response_val_basis (which stores y).
+        let response_approx = response_val_basis.column(1).to_owned();
+        let initial_beta = compute_warm_start(
+            &response_approx,
+            covariate_design,
+            p_resp,
+            p_cov,
+            warm_start,
+        )?;
+
+        let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
+
+        Ok(Self {
+            x_val: Arc::new(x_val),
+            x_deriv,
+            response_val_basis,
+            response_deriv_basis,
+            response_penalties,
+            response_knots,
+            response_degree,
+            response_transform,
             p_cov,
             tensor_penalties,
             monotonicity_constraints,
@@ -271,61 +379,75 @@ impl TransformationNormalFamily {
                 self.p_total()
             ));
         }
-        // Evaluate response basis at new response values.
-        let resp_val = evaluate_response_value_basis_at(
-            response,
-            &self.response_val_basis,
-            self.response_deriv_basis.ncols(), // p_resp
-        )?;
+        let resp_val = self.evaluate_response_value_basis_at(response)?;
         let x_val_new = rowwise_kronecker(&resp_val, covariate_design);
         Ok(x_val_new.dot(beta))
     }
 
-    /// Rebuild the family at a new covariate design (e.g., after κ change).
-    ///
-    /// The response-direction basis is fixed; only the covariate side and the
-    /// resulting tensor products, penalties, and constraints are rebuilt.
-    pub fn rebuild_at_covariate_design(
-        &mut self,
+    /// Evaluate the derivative h'(y|x) at new data points (for diagnostics).
+    pub fn predict_jacobian(
+        &self,
+        response: &Array1<f64>,
         covariate_design: &Array2<f64>,
-        covariate_penalties: &[Array2<f64>],
-        config: &TransformationNormalConfig,
-    ) -> Result<(), String> {
-        let n = self.response_val_basis.nrows();
+        beta: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = response.len();
         if covariate_design.nrows() != n {
-            return Err(format!(
-                "new covariate design has {} rows, expected {n}",
-                covariate_design.nrows()
-            ));
+            return Err("response and covariate design row counts differ".to_string());
         }
-        let p_cov = covariate_design.ncols();
-        let p_resp = self.response_val_basis.ncols();
-
-        self.x_val = Arc::new(rowwise_kronecker(&self.response_val_basis, covariate_design));
-        self.x_deriv = rowwise_kronecker(&self.response_deriv_basis, covariate_design);
-        self.p_cov = p_cov;
-        self.tensor_penalties = build_tensor_penalties(
-            &self.response_penalties,
-            covariate_penalties,
-            p_resp,
-            p_cov,
-            config,
-        )?;
-
-        // Rebuild constraints with new x_deriv.
-        // We need the original response values to rebuild the boundary grid,
-        // but we can reuse the current x_deriv rows plus recompute the grid.
-        // For simplicity, rebuild from the current x_deriv rows only.
-        self.monotonicity_constraints = LinearInequalityConstraints {
-            a: self.x_deriv.clone(),
-            b: Array1::from_elem(self.x_deriv.nrows(), self.epsilon),
-        };
-
-        self.initial_log_lambdas = Array1::zeros(self.tensor_penalties.len());
-        Ok(())
+        let resp_deriv = self.evaluate_response_deriv_basis_at(response)?;
+        let x_deriv_new = rowwise_kronecker(&resp_deriv, covariate_design);
+        Ok(x_deriv_new.dot(beta))
     }
 
-    // --- Internal helpers for evaluate ---
+    // --- Internal helpers ---
+
+    /// Evaluate the response value basis at new response values using stored knots/transform.
+    fn evaluate_response_value_basis_at(
+        &self,
+        response: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = response.len();
+        let (raw_val, _) = create_basis::<Dense>(
+            response.view(),
+            KnotSource::Provided(self.response_knots.view()),
+            self.response_degree,
+            BasisOptions::value(),
+        )
+        .map_err(|e| e.to_string())?;
+        let dev_val = raw_val.as_ref().dot(&self.response_transform);
+        let dev_dim = dev_val.ncols();
+        let p_resp = 2 + dev_dim;
+        let mut basis = Array2::<f64>::zeros((n, p_resp));
+        basis.column_mut(0).fill(1.0);
+        basis.column_mut(1).assign(&response.view());
+        basis.slice_mut(s![.., 2..]).assign(&dev_val);
+        Ok(basis)
+    }
+
+    /// Evaluate the response derivative basis at new response values using stored knots/transform.
+    fn evaluate_response_deriv_basis_at(
+        &self,
+        response: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = response.len();
+        let (raw_d1, _) = create_basis::<Dense>(
+            response.view(),
+            KnotSource::Provided(self.response_knots.view()),
+            self.response_degree,
+            BasisOptions::first_derivative(),
+        )
+        .map_err(|e| e.to_string())?;
+        let dev_d1 = raw_d1.as_ref().dot(&self.response_transform);
+        let dev_dim = dev_d1.ncols();
+        let p_resp = 2 + dev_dim;
+        let mut basis = Array2::<f64>::zeros((n, p_resp));
+        // Column 0: d(1)/dy = 0
+        // Column 1: d(y)/dy = 1
+        basis.column_mut(1).fill(1.0);
+        basis.slice_mut(s![.., 2..]).assign(&dev_d1);
+        Ok(basis)
+    }
 
     /// Compute h and h' from the current coefficients.
     fn compute_h_and_h_prime(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
@@ -587,11 +709,11 @@ impl CustomFamily for TransformationNormalFamily {
 
 /// Build the response-direction basis: `[1, y, anchored deviations]`.
 ///
-/// Returns (value_basis, derivative_basis, penalties).
+/// Returns (value_basis, derivative_basis, penalties, knots, transform).
 fn build_response_basis(
     response: &Array1<f64>,
     config: &TransformationNormalConfig,
-) -> Result<(Array2<f64>, Array2<f64>, Vec<Array2<f64>>), String> {
+) -> Result<(Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array1<f64>, Array2<f64>), String> {
     let n = response.len();
     if n < 4 {
         return Err(format!("need at least 4 observations, got {n}"));
@@ -686,7 +808,7 @@ fn build_response_basis(
         add_penalty(order, &mut resp_penalties)?;
     }
 
-    Ok((resp_val, resp_deriv, resp_penalties))
+    Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
 }
 
 /// Build the nullspace projection that anchors B-spline deviations at the response
@@ -808,6 +930,9 @@ fn build_monotonicity_constraints(
     response: &Array1<f64>,
     covariate_design: &Array2<f64>,
     x_deriv: &Array2<f64>,
+    response_knots: &Array1<f64>,
+    response_degree: usize,
+    response_transform: &Array2<f64>,
     config: &TransformationNormalConfig,
 ) -> Result<LinearInequalityConstraints, String> {
     let n = x_deriv.nrows();
@@ -828,22 +953,15 @@ fn build_monotonicity_constraints(
     // a representative subset of covariate basis rows.
     let grid = response_derivative_grid(response, config)?;
     if !grid.is_empty() && covariate_design.nrows() > 0 {
-        // Evaluate response derivative basis at grid points.
-        let knots = initializewiggle_knots_from_seed(
-            response.view(),
-            config.response_degree,
-            config.response_num_internal_knots,
-        )?;
-        let transform =
-            response_deviation_transform(&knots, config.response_degree, response)?;
+        // Evaluate response derivative basis at grid points using provided knots/transform.
         let (raw_d1, _) = create_basis::<Dense>(
             grid.view(),
-            KnotSource::Provided(knots.view()),
-            config.response_degree,
+            KnotSource::Provided(response_knots.view()),
+            response_degree,
             BasisOptions::first_derivative(),
         )
         .map_err(|e| e.to_string())?;
-        let dev_d1 = raw_d1.as_ref().dot(&transform);
+        let dev_d1 = raw_d1.as_ref().dot(response_transform);
         let p_resp = 2 + dev_d1.ncols();
         let g = grid.len();
         let mut grid_resp_deriv = Array2::<f64>::zeros((g, p_resp));
@@ -1034,160 +1152,6 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     out
 }
 
-/// Evaluate the response value basis at new response values.
-///
-/// This is a simplified version for prediction: it rebuilds [1, y, dev(y)] at new y.
-/// Note: the knots and transform are derived from the training data and stored in the
-/// family's response_val_basis dimensions; for full prediction support, the family
-/// should store knots and transform explicitly. This placeholder returns an error
-/// indicating that full prediction requires stored knots.
-fn evaluate_response_value_basis_at(
-    _response: &Array1<f64>,
-    _training_basis: &Array2<f64>,
-    _p_resp: usize,
-) -> Result<Array2<f64>, String> {
-    Err(
-        "predict_transform requires stored knots and transform; \
-         use TransformationNormalPredictable for out-of-sample prediction"
-            .to_string(),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Prediction support
-// ---------------------------------------------------------------------------
-
-/// Extended family that stores knots and transform for out-of-sample prediction.
-pub struct TransformationNormalPredictable {
-    /// The fitted family.
-    pub family: TransformationNormalFamily,
-    /// B-spline knots for the response direction.
-    pub response_knots: Array1<f64>,
-    /// B-spline degree for the response direction.
-    pub response_degree: usize,
-    /// Nullspace transform for the deviation basis.
-    pub response_transform: Array2<f64>,
-}
-
-impl TransformationNormalPredictable {
-    /// Build a predictable family (stores knots and transform alongside the family).
-    pub fn new(
-        response: &Array1<f64>,
-        covariate_design: &Array2<f64>,
-        covariate_penalties: &[Array2<f64>],
-        config: &TransformationNormalConfig,
-        warm_start: Option<&TransformationWarmStart>,
-    ) -> Result<Self, String> {
-        let knots = initializewiggle_knots_from_seed(
-            response.view(),
-            config.response_degree,
-            config.response_num_internal_knots,
-        )?;
-        let transform =
-            response_deviation_transform(&knots, config.response_degree, response)?;
-        let family = TransformationNormalFamily::new(
-            response,
-            covariate_design,
-            covariate_penalties,
-            config,
-            warm_start,
-        )?;
-        Ok(Self {
-            family,
-            response_knots: knots,
-            response_degree: config.response_degree,
-            response_transform: transform,
-        })
-    }
-
-    /// Evaluate h(y|x) = z at new data points.
-    pub fn predict_transform(
-        &self,
-        response: &Array1<f64>,
-        covariate_design: &Array2<f64>,
-        beta: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let n = response.len();
-        if covariate_design.nrows() != n {
-            return Err("response and covariate design row counts differ".to_string());
-        }
-        let p_total = beta.len();
-
-        // Evaluate response basis at new values.
-        let resp_val = self.evaluate_response_value_basis(response)?;
-        let x_val_new = rowwise_kronecker(&resp_val, covariate_design);
-        if x_val_new.ncols() != p_total {
-            return Err(format!(
-                "prediction design has {} columns but beta has {} entries",
-                x_val_new.ncols(),
-                p_total
-            ));
-        }
-        Ok(x_val_new.dot(beta))
-    }
-
-    /// Evaluate the derivative h'(y|x) at new data points (for diagnostics).
-    pub fn predict_jacobian(
-        &self,
-        response: &Array1<f64>,
-        covariate_design: &Array2<f64>,
-        beta: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let n = response.len();
-        if covariate_design.nrows() != n {
-            return Err("response and covariate design row counts differ".to_string());
-        }
-        let resp_deriv = self.evaluate_response_deriv_basis(response)?;
-        let x_deriv_new = rowwise_kronecker(&resp_deriv, covariate_design);
-        Ok(x_deriv_new.dot(beta))
-    }
-
-    fn evaluate_response_value_basis(
-        &self,
-        response: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let n = response.len();
-        let (raw_val, _) = create_basis::<Dense>(
-            response.view(),
-            KnotSource::Provided(self.response_knots.view()),
-            self.response_degree,
-            BasisOptions::value(),
-        )
-        .map_err(|e| e.to_string())?;
-        let dev_val = raw_val.as_ref().dot(&self.response_transform);
-        let dev_dim = dev_val.ncols();
-        let p_resp = 2 + dev_dim;
-        let mut basis = Array2::<f64>::zeros((n, p_resp));
-        basis.column_mut(0).fill(1.0);
-        basis.column_mut(1).assign(&response.view());
-        basis.slice_mut(s![.., 2..]).assign(&dev_val);
-        Ok(basis)
-    }
-
-    fn evaluate_response_deriv_basis(
-        &self,
-        response: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let n = response.len();
-        let (raw_d1, _) = create_basis::<Dense>(
-            response.view(),
-            KnotSource::Provided(self.response_knots.view()),
-            self.response_degree,
-            BasisOptions::first_derivative(),
-        )
-        .map_err(|e| e.to_string())?;
-        let dev_d1 = raw_d1.as_ref().dot(&self.response_transform);
-        let dev_dim = dev_d1.ncols();
-        let p_resp = 2 + dev_dim;
-        let mut basis = Array2::<f64>::zeros((n, p_resp));
-        // Column 0: d(1)/dy = 0
-        // Column 1: d(y)/dy = 1
-        basis.column_mut(1).fill(1.0);
-        basis.slice_mut(s![.., 2..]).assign(&dev_d1);
-        Ok(basis)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Psi derivative builder (for κ optimization of the covariate basis)
 // ---------------------------------------------------------------------------
@@ -1282,365 +1246,314 @@ pub fn build_tensor_psi_derivatives(
 }
 
 // ---------------------------------------------------------------------------
-// Fitting orchestrator
+// Top-level fit function
 // ---------------------------------------------------------------------------
 
-/// Result of fitting a transformation model.
+/// Result of `fit_transformation_normal`.
 pub struct TransformationNormalFitResult {
-    /// The fitted family (with final covariate design).
     pub family: TransformationNormalFamily,
-    /// The inner fit result (coefficients, smoothing parameters, covariance).
     pub fit: UnifiedFitResult,
-    /// Final resolved covariate spec (with optimized κ if applicable).
     pub covariate_spec_resolved: TermCollectionSpec,
-    /// Final covariate design.
     pub covariate_design: TermCollectionDesign,
-    /// Response-direction knots (for out-of-sample prediction).
-    pub response_knots: Array1<f64>,
-    /// Response-direction degree.
-    pub response_degree: usize,
-    /// Response-direction deviation transform.
-    pub response_transform: Array2<f64>,
 }
 
-/// Fit a conditional transformation model with full REML, including joint
-/// (λ, κ) optimization when the covariate basis has spatial length scales.
+/// Fit a conditional transformation model with N-block spatial length-scale
+/// optimization over the covariate side.
 ///
-/// This is the unified entry point. It:
-/// 1. Builds the covariate design from the spec
-/// 2. Builds the TransformationNormalFamily (response basis + tensor product)
-/// 3. If κ optimization is enabled and the covariate spec has spatial terms:
-///    runs the joint [ρ, ψ] outer loop via `evaluate_custom_family_joint_hyper`
-/// 4. Otherwise: calls `fit_custom_family` for λ-only optimization
-///
-/// # Arguments
-///
-/// * `response` - The response variable y.
-/// * `covariate_data` - Raw covariate data (n × d) for building the covariate basis.
-/// * `covariate_spec` - Covariate-side term collection specification.
-/// * `config` - Response-direction basis configuration.
-/// * `options` - Blockwise fitting options (inner tolerance, outer iterations, etc.).
-/// * `kappa_options` - Spatial length-scale optimization options.
-/// * `warm_start` - Optional location/scale from a prior normalizer.
+/// The response-direction basis is built once (it does not depend on κ).
+/// If no spatial length-scale terms are present in the covariate spec, the
+/// model is fit directly. Otherwise, the N-block joint hyper-parameter
+/// optimizer is used with a single block (the covariate spec).
 pub fn fit_transformation_normal(
     response: &Array1<f64>,
-    covariate_data: ndarray::ArrayView2<'_, f64>,
+    covariate_data: ArrayView2<'_, f64>,
     covariate_spec: &TermCollectionSpec,
     config: &TransformationNormalConfig,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
-    // Build initial covariate design.
-    let covariate_design = build_term_collection_design(covariate_data, covariate_spec)
-        .map_err(|e| format!("failed to build covariate design: {e}"))?;
-    let resolved_spec =
-        freeze_spatial_length_scale_terms_from_design(covariate_spec, &covariate_design)
-            .map_err(|e| format!("failed to freeze covariate spatial basis: {e}"))?;
+    // 1. Build response basis ONCE — it is independent of κ.
+    let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
+        build_response_basis(response, config)?;
 
-    // Build response-direction knots and transform (stored for prediction).
-    let response_knots = initializewiggle_knots_from_seed(
-        response.view(),
-        config.response_degree,
-        config.response_num_internal_knots,
-    )?;
-    let response_transform =
-        response_deviation_transform(&response_knots, config.response_degree, response)?;
+    // 2. Check whether spatial κ optimization is needed.
+    let spatial_terms = spatial_length_scale_term_indices(covariate_spec);
 
-    // Extract covariate design matrix and penalties.
-    let cov_mat = covariate_design.design.to_dense();
-    let cov_penalties: Vec<Array2<f64>> = covariate_design.penalties.clone();
+    if spatial_terms.is_empty() || !kappa_options.enabled {
+        // ------------------------------------------------------------------
+        // NO κ: build family directly, fit, return.
+        // ------------------------------------------------------------------
+        let cov_design = build_term_collection_design(covariate_data, covariate_spec)
+            .map_err(|e| format!("failed to build covariate design: {e}"))?;
+        let cov_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(covariate_spec, &cov_design)
+                .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
 
-    // Build the family.
-    let family = TransformationNormalFamily::new(
-        response, &cov_mat, &cov_penalties, config, warm_start,
-    )?;
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            resp_val,
+            resp_deriv,
+            resp_penalties,
+            resp_knots.clone(),
+            config.response_degree,
+            resp_transform,
+            &cov_design.design,
+            &cov_design.penalties,
+            config,
+            warm_start,
+        )?;
+        let blocks = vec![family.block_spec()];
+        let fit = fit_custom_family(&family, &blocks, options)
+            .map_err(|e| format!("transformation fit failed: {e}"))?;
 
-    // Check whether κ optimization is needed.
-    let spatial_terms = spatial_length_scale_term_indices(&resolved_spec);
-    let has_kappa = kappa_options.enabled && !spatial_terms.is_empty();
-
-    if !has_kappa {
-        // --- No κ optimization: use fit_custom_family directly ---
-        let spec = family.block_spec();
-        let fit = fit_custom_family(&family, &[spec], options)
-            .map_err(|e| format!("transformation normal fit failed: {e}"))?;
         return Ok(TransformationNormalFitResult {
             family,
             fit,
-            covariate_spec_resolved: resolved_spec,
-            covariate_design,
-            response_knots,
-            response_degree: config.response_degree,
-            response_transform,
+            covariate_spec_resolved: cov_spec_resolved,
+            covariate_design: cov_design,
         });
     }
 
-    // --- Joint (λ, κ) optimization ---
-    // Use the same ClosureObjective + run_outer pattern as the two-block spatial
-    // optimizer, but adapted for our single-block tensor-product family.
+    // ------------------------------------------------------------------
+    // YES κ: use the N-block spatial length-scale optimizer (1 block).
+    // ------------------------------------------------------------------
 
-    use crate::families::custom_family::build_block_spatial_psi_derivatives;
-    use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
-        OuterConfig, OuterEval,
+    // Build bootstrap covariate design and frozen spec.
+    let boot_design = build_term_collection_design(covariate_data, covariate_spec)
+        .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
+    let boot_spec = freeze_spatial_length_scale_terms_from_design(covariate_spec, &boot_design)
+        .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
+
+    // Build ExactJointHyperSetup for 1 block.
+    let n_penalties = boot_design.penalties.len();
+    let rho0 = Array1::<f64>::zeros(n_penalties);
+    let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
+    let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
+    let kappa0 =
+        SpatialLogKappaCoords::from_length_scales_aniso(covariate_spec, &spatial_terms, kappa_options);
+    let kappa_dims = kappa0.dims_per_term().to_vec();
+    let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
+    let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
+    let joint_setup = ExactJointHyperSetup::new(
+        rho0,
+        rho_lower,
+        rho_upper,
+        kappa0,
+        kappa_lower,
+        kappa_upper,
+    );
+
+    // Check analytic derivative capability.
+    let analytic_psi_available = build_block_spatial_psi_derivatives(
+        covariate_data,
+        &boot_spec,
+        &boot_design,
+    )?.is_some();
+
+    // Build an initial family + blocks for capability probing.
+    let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
+        resp_val.clone(),
+        resp_deriv.clone(),
+        resp_penalties.clone(),
+        resp_knots.clone(),
+        config.response_degree,
+        resp_transform.clone(),
+        &boot_design.design,
+        &boot_design.penalties,
+        config,
+        warm_start,
+    )?;
+    let probe_blocks = vec![probe_family.block_spec()];
+    let joint_cap = custom_family_outer_capability(
+        &probe_family,
+        &probe_blocks,
+        options,
+        joint_setup.rho_dim() + joint_setup.log_kappa_dim(),
+        joint_setup.log_kappa_dim() > 0,
+    );
+    let analytic_gradient = analytic_psi_available
+        && matches!(
+            joint_cap.gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+    let analytic_hessian = analytic_psi_available
+        && matches!(
+            joint_cap.hessian,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+
+    // Shared mutable state for warm-starting across optimizer iterations.
+    let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);
+    let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
+
+    // Clone response basis parts for use inside closures.
+    let rv = resp_val.clone();
+    let rd = resp_deriv.clone();
+    let rp = resp_penalties.clone();
+    let rk = resp_knots.clone();
+    let rt = resp_transform.clone();
+    let rdeg = config.response_degree;
+    let cfg = config.clone();
+    let ws = warm_start.cloned();
+
+    // Helper: build family from prebuilt response basis + covariate design.
+    let make_family = |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
+        TransformationNormalFamily::from_prebuilt_response_basis(
+            rv.clone(),
+            rd.clone(),
+            rp.clone(),
+            rk.clone(),
+            rdeg,
+            rt.clone(),
+            &cov_design.design,
+            &cov_design.penalties,
+            &cfg,
+            ws.as_ref(),
+        )
     };
 
-    // Count psi dimensions (one per aniso axis per spatial term).
-    let psi_dim: usize = spatial_terms.iter().map(|&ti| {
-        resolved_spec.smooth_terms.get(ti)
-            .and_then(|t| t.spatial_aniso_log_scales.as_ref())
-            .map(|s| s.len())
-            .unwrap_or(1)
-    }).sum();
+    // Helper: build blocks from family + beta hint.
+    let make_blocks = |family: &TransformationNormalFamily| -> Vec<ParameterBlockSpec> {
+        let mut spec = family.block_spec();
+        if let Some(hint) = beta_hint.borrow().as_ref() {
+            if hint.len() == spec.design.ncols() {
+                spec.initial_beta = Some(hint.clone());
+            }
+        }
+        vec![spec]
+    };
 
-    // Build initial theta = [rho, psi].
-    let spec0 = family.block_spec();
-    let rho0 = spec0.initial_log_lambdas.clone();
-    let rho_dim = rho0.len();
+    let block_specs_slice = [boot_spec.clone()];
+    let block_term_indices_slice = [spatial_terms.clone()];
 
-    let mut psi0 = Vec::with_capacity(psi_dim);
-    for &ti in &spatial_terms {
-        if let Some(term) = resolved_spec.smooth_terms.get(ti) {
-            if let Some(scales) = &term.spatial_aniso_log_scales {
-                psi0.extend(scales.iter().copied());
-            } else if let Some(ls) = term.length_scale {
-                psi0.push((1.0 / ls).ln());
+    let solved = optimize_spatial_length_scale_exact_joint(
+        covariate_data,
+        &block_specs_slice,
+        &block_term_indices_slice,
+        kappa_options,
+        &joint_setup,
+        analytic_gradient,
+        analytic_hessian,
+        // cost_fn
+        |_rho, _specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let family = make_family(&designs[0])?;
+            let blocks = make_blocks(&family);
+            let fit = fit_custom_family(&family, &blocks, options)
+                .map_err(|e| format!("transformation cost_fn: {e}"))?;
+            Ok(transformation_fit_score(&fit))
+        },
+        // fit_fn
+        |_rho, _specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let family = make_family(&designs[0])?;
+            let blocks = make_blocks(&family);
+            let fit = fit_custom_family(&family, &blocks, options)
+                .map_err(|e| format!("transformation fit_fn: {e}"))?;
+            // Update warm start hints.
+            if let Some(block) = fit.block_states.first() {
+                *beta_hint.borrow_mut() = Some(block.beta.clone());
+            }
+            Ok((family, fit))
+        },
+        // exact_fn
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+            let family = make_family(&designs[0])?;
+            let blocks = make_blocks(&family);
+
+            // Build covariate-side psi derivatives, then lift to tensor product space.
+            let cov_psi_derivs = build_block_spatial_psi_derivatives(
+                covariate_data,
+                &specs[0],
+                &designs[0],
+            )?
+            .ok_or_else(|| "missing covariate spatial psi derivatives for transformation model".to_string())?;
+
+            // Extract covariate-space arrays for build_tensor_psi_derivatives.
+            let cov_psi_designs: Vec<Array2<f64>> = cov_psi_derivs.iter()
+                .map(|d| d.x_psi.clone())
+                .collect();
+            let cov_psi_penalties: Vec<Vec<(usize, Array2<f64>)>> = cov_psi_derivs.iter()
+                .map(|d| d.s_psi_components.clone().unwrap_or_default())
+                .collect();
+
+            // Second-order design derivatives.
+            let has_second_designs = cov_psi_derivs.iter().all(|d| d.x_psi_psi.is_some());
+            let cov_psi_second_designs: Option<Vec<Vec<Array2<f64>>>> = if has_second_designs {
+                Some(cov_psi_derivs.iter()
+                    .map(|d| d.x_psi_psi.clone().unwrap_or_default())
+                    .collect())
             } else {
-                psi0.push(0.0);
-            }
-        }
-    }
-
-    let theta_dim = rho_dim + psi_dim;
-    let mut theta0 = Array1::zeros(theta_dim);
-    theta0.slice_mut(s![..rho_dim]).assign(&rho0);
-    for (i, &v) in psi0.iter().enumerate() {
-        theta0[rho_dim + i] = v;
-    }
-
-    // Bounds: rho is unbounded (large range), psi is bounded by kappa_options.
-    let log_kappa_lower = (1.0 / kappa_options.max_length_scale).ln();
-    let log_kappa_upper = (1.0 / kappa_options.min_length_scale).ln();
-    let mut lower = Array1::from_elem(theta_dim, -12.0);
-    let mut upper = Array1::from_elem(theta_dim, 12.0);
-    for i in rho_dim..theta_dim {
-        lower[i] = log_kappa_lower;
-        upper[i] = log_kappa_upper;
-    }
-
-    let outer_config = OuterConfig {
-        tolerance: kappa_options.rel_tol.max(1e-6),
-        max_iter: kappa_options.max_outer_iter.max(1),
-        fd_step: 1e-4,
-        bounds: Some((lower, upper)),
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: psi_dim,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-    };
-
-    // Mutable state for the outer loop.
-    struct OuterState {
-        current_spec: TermCollectionSpec,
-        current_design: TermCollectionDesign,
-        current_psi: Vec<f64>,
-        warm: Option<CustomFamilyWarmStart>,
-    }
-
-    let mut state = OuterState {
-        current_spec: resolved_spec.clone(),
-        current_design: covariate_design.clone(),
-        current_psi: psi0.clone(),
-        warm: None,
-    };
-
-    // Helper: rebuild covariate design at new psi values.
-    let rebuild_at_psi = |psi_vals: &[f64],
-                          base_spec: &TermCollectionSpec,
-                          spatial_terms: &[usize],
-                          data: ndarray::ArrayView2<'_, f64>|
-     -> Result<(TermCollectionSpec, TermCollectionDesign), String> {
-        let mut spec = base_spec.clone();
-        let mut offset = 0;
-        for &ti in spatial_terms {
-            if let Some(term) = spec.smooth_terms.get_mut(ti) {
-                if let Some(scales) = term.spatial_aniso_log_scales.as_mut() {
-                    let d = scales.len();
-                    for j in 0..d {
-                        scales[j] = psi_vals[offset + j];
-                    }
-                    offset += d;
-                } else {
-                    let kappa = psi_vals[offset].exp();
-                    term.length_scale = Some(1.0 / kappa);
-                    offset += 1;
-                }
-            }
-        }
-        let design = build_term_collection_design(data, &spec)
-            .map_err(|e| format!("failed to rebuild covariate design at new κ: {e}"))?;
-        let frozen = freeze_spatial_length_scale_terms_from_design(&spec, &design)
-            .map_err(|e| format!("failed to freeze rebuilt spec: {e}"))?;
-        Ok((frozen, design))
-    };
-
-    // References for closures.
-    let spatial_terms_ref = &spatial_terms;
-    let covariate_spec_ref = &resolved_spec;
-    let config_ref = config;
-    let response_ref = response;
-    let warm_start_ref = warm_start;
-
-    let mut obj = ClosureObjective {
-        state: &mut state,
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable, // Start conservative; upgrade if small enough.
-            n_params: theta_dim,
-            all_penalty_like: false,
-            has_psi_coords: true,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut OuterState, theta: &Array1<f64>| {
-            let psi_vals: Vec<f64> = theta.slice(s![rho_dim..]).to_vec();
-            if psi_vals != ctx.current_psi {
-                match rebuild_at_psi(
-                    &psi_vals, covariate_spec_ref, spatial_terms_ref, covariate_data,
-                ) {
-                    Ok((spec, design)) => {
-                        ctx.current_spec = spec;
-                        ctx.current_design = design;
-                        ctx.current_psi = psi_vals;
-                    }
-                    Err(_) => return Ok(f64::INFINITY),
-                }
-            }
-            let cov_mat = ctx.current_design.design.to_dense();
-            let cov_pens: Vec<Array2<f64>> = ctx.current_design.penalties.clone();
-            match TransformationNormalFamily::new(
-                response_ref, &cov_mat, &cov_pens, config_ref, warm_start_ref,
-            ) {
-                Ok(fam) => {
-                    let sp = fam.block_spec();
-                    match fit_custom_family(&fam, &[sp], options) {
-                        Ok(fit) => Ok(fit.log_likelihood),
-                        Err(_) => Ok(f64::INFINITY),
-                    }
-                }
-                Err(_) => Ok(f64::INFINITY),
-            }
-        },
-        eval_fn: |ctx: &mut &mut OuterState, theta: &Array1<f64>| {
-            use crate::solver::estimate::EstimationError;
-            let map_err = |msg: String| EstimationError::RemlOptimizationFailed(msg);
-
-            let rho = theta.slice(s![..rho_dim]).to_owned();
-            let psi_vals: Vec<f64> = theta.slice(s![rho_dim..]).to_vec();
-            if psi_vals != ctx.current_psi {
-                let (spec, design) = rebuild_at_psi(
-                    &psi_vals, covariate_spec_ref, spatial_terms_ref, covariate_data,
-                ).map_err(map_err)?;
-                ctx.current_spec = spec;
-                ctx.current_design = design;
-                ctx.current_psi = psi_vals;
-            }
-            let cov_mat = ctx.current_design.design.to_dense();
-            let cov_pens: Vec<Array2<f64>> = ctx.current_design.penalties.clone();
-            let family = TransformationNormalFamily::new(
-                response_ref, &cov_mat, &cov_pens, config_ref, warm_start_ref,
-            ).map_err(|e| map_err(e))?;
-            let spec = family.block_spec();
-
-            // Build psi derivatives for the covariate basis.
-            let psi_derivs = build_block_spatial_psi_derivatives(
-                covariate_data, &ctx.current_spec, &ctx.current_design,
-            ).map_err(|e| map_err(e))?;
-
-            // Lift to tensor product space.
-            let derivative_blocks = match psi_derivs {
-                Some(cov_psi) => {
-                    let cov_psi_designs: Vec<Array2<f64>> =
-                        cov_psi.iter().map(|d| d.x_psi.clone()).collect();
-                    let cov_psi_penalties: Vec<Vec<(usize, Array2<f64>)>> =
-                        cov_psi.iter().map(|d| {
-                            d.s_psi_components.clone().unwrap_or_default()
-                        }).collect();
-                    let tensor_psi = build_tensor_psi_derivatives(
-                        &family, &cov_psi_designs, &cov_psi_penalties, None, None,
-                    ).map_err(|e| map_err(e))?;
-                    vec![tensor_psi]
-                }
-                None => vec![Vec::new()],
+                None
             };
+
+            // Second-order penalty derivatives.
+            let has_second_penalties = cov_psi_derivs.iter().all(|d| d.s_psi_psi_components.is_some());
+            let cov_psi_second_penalties: Option<Vec<Vec<Vec<(usize, Array2<f64>)>>>> =
+                if has_second_penalties {
+                    Some(cov_psi_derivs.iter()
+                        .map(|d| d.s_psi_psi_components.clone().unwrap_or_default())
+                        .collect())
+                } else {
+                    None
+                };
+
+            let tensor_derivs = build_tensor_psi_derivatives(
+                &family,
+                &cov_psi_designs,
+                &cov_psi_penalties,
+                cov_psi_second_designs.as_deref(),
+                cov_psi_second_penalties.as_deref(),
+            )?;
+
+            // Single block: derivative_blocks[0] = tensor_derivs.
+            let derivative_blocks = vec![tensor_derivs];
 
             let eval = evaluate_custom_family_joint_hyper(
                 &family,
-                &[spec],
+                &blocks,
                 options,
-                &rho,
+                rho,
                 &derivative_blocks,
-                ctx.warm.as_ref(),
-                false, // gradient-only for now
-            ).map_err(|e| map_err(format!("{e}")))?;
+                exact_warm_start.borrow().as_ref(),
+                need_hessian,
+            )
+            .map_err(|e| format!("transformation exact_fn: {e}"))?;
 
-            ctx.warm = Some(eval.warm_start);
+            exact_warm_start.replace(Some(eval.warm_start));
 
-            if !eval.objective.is_finite() {
-                return Ok(OuterEval::infeasible(theta_dim));
+            if need_hessian && eval.outer_hessian.is_none() {
+                return Err(
+                    "transformation exact joint objective did not return an outer Hessian"
+                        .to_string(),
+                );
             }
-            if eval.gradient.iter().any(|v| !v.is_finite()) {
-                return Err(map_err(
-                    "transformation normal joint gradient non-finite".to_string(),
-                ));
-            }
-            Ok(OuterEval {
-                cost: eval.objective,
-                gradient: eval.gradient,
-                hessian: match eval.outer_hessian {
-                    Some(h) if h.iter().all(|v| v.is_finite()) => HessianResult::Analytic(h),
-                    _ => HessianResult::Unavailable,
-                },
-            })
+
+            Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        reset_fn: None::<fn(&mut &mut OuterState)>,
-        efs_fn: None::<
-            fn(&mut &mut OuterState, &Array1<f64>) -> Result<EfsEval, crate::solver::estimate::EstimationError>,
-        >,
-    };
-
-    let result = crate::solver::outer_strategy::run_outer(
-        &mut obj, &outer_config, "transformation-normal joint spatial",
-    ).map_err(|e| format!("outer optimization failed: {e}"))?;
-
-    // Final fit at the optimized theta.
-    let theta_star = result.rho;
-    let psi_star: Vec<f64> = theta_star.slice(s![rho_dim..]).to_vec();
-    let (final_spec, final_design) =
-        rebuild_at_psi(&psi_star, covariate_spec_ref, spatial_terms_ref, covariate_data)?;
-    let cov_mat = final_design.design.to_dense();
-    let cov_pens: Vec<Array2<f64>> = final_design.penalties.clone();
-    let final_family = TransformationNormalFamily::new(
-        response, &cov_mat, &cov_pens, config, warm_start,
     )?;
-    let final_spec_block = final_family.block_spec();
-    let final_fit = fit_custom_family(&final_family, &[final_spec_block], options)
-        .map_err(|e| format!("final fit failed: {e}"))?;
+
+    // Extract the family and fit from the optimizer result.
+    let (family, fit) = solved.fit;
 
     Ok(TransformationNormalFitResult {
-        family: final_family,
-        fit: final_fit,
-        covariate_spec_resolved: final_spec,
-        covariate_design: final_design,
-        response_knots,
-        response_degree: config.response_degree,
-        response_transform,
+        family,
+        fit,
+        covariate_spec_resolved: solved.resolved_specs.into_iter().next().unwrap(),
+        covariate_design: solved.designs.into_iter().next().unwrap(),
     })
+}
+
+/// Score function for transformation model fits, matching the pattern used by
+/// GAMLSS and BernoulliMarginalSlope: prefer REML score, fall back to
+/// penalized objective.
+fn transformation_fit_score(fit: &UnifiedFitResult) -> f64 {
+    if fit.reml_score.is_finite() {
+        fit.reml_score
+    } else {
+        let score = 0.5 * fit.deviance + 0.5 * fit.stable_penalty_term;
+        if score.is_finite() {
+            score
+        } else {
+            f64::INFINITY
+        }
+    }
 }
