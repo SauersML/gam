@@ -1,3 +1,4 @@
+use super::inner_strategy::{GeometryBackendKind, HessianEvalStrategyKind};
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
@@ -261,8 +262,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         let mode = super::unified::EvalMode::ValueGradientHessian;
-        let result = if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd
-        {
+        let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.evaluate_unified_sparse(rho, &bundle, mode)?
         } else {
             self.evaluate_unified(rho, &bundle, mode)?

@@ -1,14 +1,33 @@
 use super::*;
 use crate::faer_ndarray::FaerLblt;
-use crate::linalg::sparse_exact::SparseTraceWorkspace;
 use crate::linalg::utils::{
     StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
 };
 use crate::pirls::PirlsWorkspace;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
-use std::sync::Mutex;
 
 impl<'a> RemlState<'a> {
+    pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
+        match pirls_result.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                pirls_result.beta_transformed.as_ref().clone()
+            }
+            pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                .reparam_result
+                .qs
+                .dot(pirls_result.beta_transformed.as_ref()),
+        }
+    }
+
+    pub(crate) fn last_ridge_used(&self) -> Option<f64> {
+        self.cache_manager
+            .current_eval_bundle
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|bundle| bundle.ridge_passport.delta)
+    }
+
     pub(crate) fn third_derivative_projection_from_design(
         &self,
         design: &DesignMatrix,
@@ -467,20 +486,6 @@ impl<'a> RemlState<'a> {
         self.invalidate_link_dependent_state();
     }
 
-    pub(super) fn runtime_inverse_link(&self) -> InverseLink {
-        if let Some(state) = self.runtime_mixture_link_state.clone() {
-            InverseLink::Mixture(state)
-        } else if let Some(state) = self.runtime_sas_link_state {
-            if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
-                InverseLink::BetaLogistic(state)
-            } else {
-                InverseLink::Sas(state)
-            }
-        } else {
-            self.config.link_kind.clone()
-        }
-    }
-
     /// Returns the eta-derivative carriers (c = dW/deta, d = d^2W/deta^2) for
     /// the exact Hessian surface that PIRLS accepted at the mode.
     ///
@@ -932,45 +937,6 @@ impl<'a> RemlState<'a> {
         zt_m.dot(z)
     }
 
-    pub(super) fn positive_part_factorw(
-        matrix: &Array2<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        // Build W such that M_+^dagger = W W^T on the retained positive subspace.
-        // This is the objective-consistent generalized inverse used for both
-        // pseudo-logdet derivatives and IFT sensitivities in exact joint blocks.
-        let (evals, evecs) = matrix
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        let p = matrix.nrows();
-        let max_ev = evals
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        let tol = (p.max(1) as f64) * f64::EPSILON * max_ev;
-        let keep: Vec<usize> = evals
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
-            .collect();
-        if keep.is_empty() {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        let mut w = Array2::<f64>::zeros((p, keep.len()));
-        for (col_idx, &eig_idx) in keep.iter().enumerate() {
-            let scale = 1.0 / evals[eig_idx].sqrt();
-            let u_col = evecs.column(eig_idx);
-            let mut w_col = w.column_mut(col_idx);
-            Zip::from(&mut w_col)
-                .and(&u_col)
-                .for_each(|w_elem, &u_elem| *w_elem = u_elem * scale);
-        }
-        Ok(w)
-    }
-
     /// Compute the structural penalty rank and smooth pseudo-logdet L_δ(S).
     ///
     /// Uses the smooth δ-regularized pseudo-logdet:
@@ -1153,43 +1119,6 @@ impl<'a> RemlState<'a> {
             }
             planner.bumpwith_matrix(h);
         }
-    }
-
-    pub(super) fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
-        // Cache strategy: ρ alone is the key.
-        // The cache deliberately ignores which Hessian matrix we are factoring.  Today this is
-        // sound because every caller obeys a single rule:
-        //   • Identity/Gaussian REML cost & gradient only ever request factors of the
-        //     stabilized Hessian.
-        //   • Non-Gaussian (logit/LAML) cost and gradient request factors of the effective/ridged Hessian.
-        // Consequently each ρ corresponds to exactly one matrix within the lifetime of a
-        // `RemlState`, so returning the cached factorization is correct.
-        // This design is still brittle: adding a new code path that calls `get_faer_factor`
-        // with a different H for the same ρ would silently reuse the wrong factor.  If such a
-        // path ever appears, extend the key (for example by tagging the Hessian variant) or
-        // split the cache.  The current key maximizes cache
-        // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
-        let key_opt = self.rhokey_sanitized(rho);
-        if let Some(key) = &key_opt
-            && let Some(f) = self
-                .cache_manager
-                .faer_factor_cache
-                .read()
-                .unwrap()
-                .get(key)
-        {
-            return Arc::clone(f);
-        }
-        let fact = Arc::new(self.factorize_faer(h));
-
-        if let Some(key) = key_opt {
-            let mut cache = self.cache_manager.faer_factor_cache.write().unwrap();
-            if cache.len() > 64 {
-                cache.clear();
-            }
-            cache.insert(key, Arc::clone(&fact));
-        }
-        fact
     }
 
     // Accessor methods for private fields
@@ -1515,7 +1444,6 @@ impl<'a> RemlState<'a> {
                 logdet_h: sparse_system.logdet_h,
                 logdet_s_pos,
                 det1_values: Arc::new(det1_values),
-                traceworkspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
             })),
             firth_dense_operator: None,
             firth_dense_operator_original,
@@ -1770,7 +1698,7 @@ impl<'a> RemlState<'a> {
                 return Err(e);
             }
         };
-        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let result =
                 self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
             return Ok(result.cost);
@@ -2664,7 +2592,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         use super::unified::{PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root};
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -3075,7 +3003,7 @@ impl<'a> RemlState<'a> {
         log_likelihood: f64,
         penalty_quadratic: f64,
         barrier_config: Option<super::unified::BarrierConfig>,
-    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         use super::unified::{
             InnerSolutionBuilder, compute_efs_update, compute_hybrid_efs_update, reml_laml_evaluate,
         };
@@ -3151,7 +3079,7 @@ impl<'a> RemlState<'a> {
                 Some(hybrid.psi_indices)
             };
 
-            Ok(crate::solver::strategy::EfsEval {
+            Ok(crate::solver::outer_strategy::EfsEval {
                 cost: cost_result.cost,
                 steps: hybrid.steps,
                 beta: Some(beta_for_barrier),
@@ -3162,7 +3090,7 @@ impl<'a> RemlState<'a> {
             // Pure EFS path: no ψ coordinates.
             let steps = compute_efs_update(&inner_solution, rho.as_slice().unwrap());
 
-            Ok(crate::solver::strategy::EfsEval {
+            Ok(crate::solver::outer_strategy::EfsEval {
                 cost: cost_result.cost,
                 steps,
                 beta: Some(beta_for_barrier),
@@ -3181,7 +3109,7 @@ impl<'a> RemlState<'a> {
     pub fn compute_efs_steps(
         &self,
         p: &Array1<f64>,
-    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -3197,7 +3125,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Dispatch to the appropriate backend.
-        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             return self.evaluate_unified_sparse_for_efs(p, &bundle);
         }
 
@@ -3211,7 +3139,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-    ) -> Result<crate::solver::strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         use super::unified::{DenseSpectralOperator, PenaltyLogdetDerivs};
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -3325,7 +3253,7 @@ impl<'a> RemlState<'a> {
                 return Err(e);
             }
         };
-        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let result = self.evaluate_unified_sparse(
                 p,
                 &bundle,

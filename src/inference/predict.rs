@@ -2376,8 +2376,8 @@ mod tests {
         )
         .expect("royston-parmar point prediction");
         let expected_eta = array![0.4, 1.2];
-        let expected_mean =
-            expected_eta.mapv(|eta| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
+        let expected_mean = expected_eta
+            .mapv(|eta: f64| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
         assert_eq!(out.eta, expected_eta);
         for i in 0..out.mean.len() {
             assert!((out.mean[i] - expected_mean[i]).abs() <= 1e-12);

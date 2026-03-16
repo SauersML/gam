@@ -21,7 +21,7 @@ use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
     TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use crate::solver::strategy::{
+use crate::solver::outer_strategy::{
     ClosureObjective, Derivative, OuterCapability, OuterConfig, OuterEval,
 };
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkSpec, SasLinkSpec};
@@ -443,10 +443,10 @@ fn fit_survival_location_scale_model(
                         &mut (),
                         &Array1<f64>,
                     )
-                        -> Result<crate::solver::strategy::EfsEval, EstimationError>,
+                        -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
                 >,
             };
-            match crate::solver::strategy::run_outer(&mut obj, &outer_config, name) {
+            match crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, name) {
                 Ok(result) => {
                     if let Some(link) = recover(&result.rho) {
                         eprintln!(

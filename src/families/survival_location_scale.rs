@@ -784,22 +784,12 @@ struct SurvivalRowDerivatives {
     d2_q0: f64,
     /// Entry-only third derivative: d³ ell / dq0³ = w * r''(u0).
     d3_q0: f64,
-    /// Entry-only fourth derivative: d⁴ ell / dq0⁴ = w * r'''(u0).
-    ///
-    /// The 3rd derivative of the survival ratio r = f/S enters the (s,s,s,s)
-    /// and (ϑ,s,s,s) blocks of the outer Hessian drift via the 4th-order
-    /// Faà di Bruno formula.
-    d4_q0: f64,
     /// Exit-only derivative: d ell / dq1.
     d1_q1: f64,
     /// Exit-only second derivative: d² ell / dq1².
     d2_q1: f64,
     /// Exit-only third derivative: d³ ell / dq1³.
     d3_q1: f64,
-    /// Exit-only fourth derivative: d⁴ ell / dq1⁴.
-    ///
-    /// Analogous to d4_q0 but for the exit side.
-    d4_q1: f64,
     grad_time_eta_h0: f64,
     grad_time_eta_h1: f64,
     grad_time_eta_d: f64,
@@ -831,14 +821,10 @@ struct SurvivalJointQuantities {
     d1_q0: Array1<f64>,
     d2_q0: Array1<f64>,
     d3_q0: Array1<f64>,
-    /// Entry-only 4th derivative: d⁴ℓ/dq0⁴.
-    d4_q0: Array1<f64>,
     /// Exit-only derivatives of ell w.r.t. q1.
     d1_q1: Array1<f64>,
     d2_q1: Array1<f64>,
     d3_q1: Array1<f64>,
-    /// Exit-only 4th derivative: d⁴ℓ/dq1⁴.
-    d4_q1: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,
@@ -1069,11 +1055,9 @@ impl SurvivalLocationScaleFamily {
         let mut d1_q0 = Array1::<f64>::zeros(n);
         let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d3_q0 = Array1::<f64>::zeros(n);
-        let mut d4_q0 = Array1::<f64>::zeros(n);
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d2_q1 = Array1::<f64>::zeros(n);
         let mut d3_q1 = Array1::<f64>::zeros(n);
-        let mut d4_q1 = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
@@ -1107,11 +1091,9 @@ impl SurvivalLocationScaleFamily {
             d1_q0[i] = row.d1_q0;
             d2_q0[i] = row.d2_q0;
             d3_q0[i] = row.d3_q0;
-            d4_q0[i] = row.d4_q0;
             d1_q1[i] = row.d1_q1;
             d2_q1[i] = row.d2_q1;
             d3_q1[i] = row.d3_q1;
-            d4_q1[i] = row.d4_q1;
             h_time_h0[i] = row.h_time_h0;
             h_time_h1[i] = row.h_time_h1;
             h_time_d[i] = row.h_time_d;
@@ -1182,11 +1164,9 @@ impl SurvivalLocationScaleFamily {
             d1_q0,
             d2_q0,
             d3_q0,
-            d4_q0,
             d1_q1,
             d2_q1,
             d3_q1,
-            d4_q1,
             h_time_h0,
             h_time_h1,
             h_time_d,
@@ -1537,31 +1517,6 @@ impl SurvivalLocationScaleFamily {
             - 6.0 * fp2 * fp2 / f4
     }
 
-    /// Clamp-aware survival value and derivatives of `-log(clamp(S, MIN_PROB, 1))`.
-    ///
-    /// Returns `(S_clamped, r, dr, ddr)` where:
-    /// - `r   = d/du[-log S_clamped]`
-    /// - `dr  = d²/du²[-log S_clamped]`
-    /// - `ddr = d³/du³[-log S_clamped]`
-    ///
-    /// If `S` is clamped at either bound (`S <= MIN_PROB` or `S >= 1`), these
-    /// derivatives are all zero because the clamped log term is locally constant.
-    fn clamped_survival_neglog_derivatives(
-        raw_s: f64,
-        f: f64,
-        fp: f64,
-        fpp: f64,
-    ) -> (f64, f64, f64, f64) {
-        let s = raw_s.clamp(MIN_PROB, 1.0);
-        if raw_s <= MIN_PROB || raw_s >= 1.0 {
-            (s, 0.0, 0.0, 0.0)
-        } else {
-            let (r, dr) = Self::survival_ratio_first_derivative(f, fp, s);
-            let ddr = Self::survival_ratiosecond_derivative(r, dr, f, fp, fpp, s);
-            (s, r, dr, ddr)
-        }
-    }
-
     /// Clamp-aware survival value and derivatives of `-log(clamp(S, MIN_PROB, 1))`
     /// through **4th order**.
     ///
@@ -1781,11 +1736,9 @@ impl SurvivalLocationScaleFamily {
             d1_q0,
             d2_q0,
             d3_q0,
-            d4_q0,
             d1_q1,
             d2_q1,
             d3_q1,
-            d4_q1,
             grad_time_eta_h0: -w * r0,
             grad_time_eta_h1: -w * (d * dlogphi1 + (1.0 - d) * (-r1)),
             grad_time_eta_d: w * d * d_log_g,
@@ -4766,6 +4719,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             objective_psi,
             score_psi,
             hessian_psi,
+            hessian_psi_operator: None,
         }))
     }
 
@@ -7657,25 +7611,30 @@ mod tests {
     #[test]
     fn clamped_survival_neglog_derivatives_arezero_on_clamp_bounds() {
         // Lower clamp active.
-        let (s_low, r_low, dr_low, ddr_low) =
-            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives(
+        let (s_low, r_low, dr_low, ddr_low, dddr_low) =
+            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives_fourth(
                 MIN_PROB * 0.1,
                 0.2,
                 -0.3,
                 0.4,
+                -0.5,
             );
         assert_eq!(s_low, MIN_PROB);
         assert_eq!(r_low, 0.0);
         assert_eq!(dr_low, 0.0);
         assert_eq!(ddr_low, 0.0);
+        assert_eq!(dddr_low, 0.0);
 
         // Upper clamp active.
-        let (s_high, r_high, dr_high, ddr_high) =
-            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives(1.1, 0.2, -0.3, 0.4);
+        let (s_high, r_high, dr_high, ddr_high, dddr_high) =
+            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives_fourth(
+                1.1, 0.2, -0.3, 0.4, -0.5,
+            );
         assert_eq!(s_high, 1.0);
         assert_eq!(r_high, 0.0);
         assert_eq!(dr_high, 0.0);
         assert_eq!(ddr_high, 0.0);
+        assert_eq!(dddr_high, 0.0);
     }
 
     #[test]
@@ -8636,11 +8595,11 @@ mod tests {
         let reduced = predict_survival_location_scale_posterior_mean(&input, &fit, &covariance)
             .expect("reduced posterior mean");
 
-        let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time) + input.eta_time_offset_exit[0];
+        let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
         let x_t = input.x_threshold.to_dense_arc();
         let x_ls = input.x_log_sigma.to_dense_arc();
-        let mu_t = x_t.row(0).dot(&fit.beta_threshold);
-        let mu_ls = x_ls.row(0).dot(&fit.beta_log_sigma);
+        let mu_t = x_t.row(0).dot(&fit.beta_threshold());
+        let mu_ls = x_ls.row(0).dot(&fit.beta_log_sigma());
         let cov_hh = covariance.slice(s![0..2, 0..2]).to_owned();
         let cov_tt = covariance.slice(s![2..4, 2..4]).to_owned();
         let cov_ll = covariance.slice(s![4..6, 4..6]).to_owned();
@@ -8763,12 +8722,12 @@ mod tests {
             .as_ref()
             .expect("wiggle design")
             .to_dense_arc();
-        let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time) + input.eta_time_offset_exit[0];
-        let mu_t = x_t.row(0).dot(&fit.beta_threshold);
-        let mu_ls = x_ls.row(0).dot(&fit.beta_log_sigma);
+        let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
+        let mu_t = x_t.row(0).dot(&fit.beta_threshold());
+        let mu_ls = x_ls.row(0).dot(&fit.beta_log_sigma());
         let muw = xw
             .row(0)
-            .dot(fit.beta_link_wiggle.as_ref().expect("wiggle beta"));
+            .dot(fit.beta_link_wiggle().as_ref().expect("wiggle beta"));
         let cov_hh = covariance.slice(s![0..2, 0..2]).to_owned();
         let cov_tt = covariance.slice(s![2..4, 2..4]).to_owned();
         let cov_ll = covariance.slice(s![4..6, 4..6]).to_owned();
@@ -9004,9 +8963,9 @@ mod tests {
                     "fit succeeded: log_likelihood={:.6e}",
                     result.log_likelihood
                 );
-                eprintln!("beta_time: {:?}", result.beta_time);
-                eprintln!("beta_threshold: {:?}", result.beta_threshold);
-                eprintln!("beta_log_sigma: {:?}", result.beta_log_sigma);
+                eprintln!("beta_time: {:?}", result.beta_time());
+                eprintln!("beta_threshold: {:?}", result.beta_threshold());
+                eprintln!("beta_log_sigma: {:?}", result.beta_log_sigma());
             }
             Err(e) => {
                 panic!("fit_survival_location_scale failed: {e}");

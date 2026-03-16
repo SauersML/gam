@@ -1,7 +1,5 @@
-use super::unified::{LAML_RIDGE, smooth_floor_dp};
 use super::*;
 use crate::matrix::DenseRightProductView;
-use crate::pirls::DirectionalWorkingCurvature;
 
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //
@@ -41,6 +39,12 @@ fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
     }
 }
 
+#[derive(Clone)]
+enum TauTauDesignTerm {
+    Dense(Array2<f64>),
+    Implicit(HyperDesignDerivative),
+}
+
 impl<'a> RemlState<'a> {
     fn get_pairwisesecond_penalty_components(
         hyper_dirs: &[DirectionalHyperParam],
@@ -58,26 +62,6 @@ impl<'a> RemlState<'a> {
             .and_then(|dir| dir.penaltysecond_components_for(i))
             .map(|components| components.to_vec())
             .unwrap_or_default()
-    }
-
-    fn add_penalty_components_to_state(
-        s_mod: &mut [Array2<f64>],
-        components: &[PenaltyDerivativeComponent],
-        amp: f64,
-    ) -> Result<(), EstimationError> {
-        for component in components {
-            if component.penalty_index >= s_mod.len() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "penalty_index {} out of bounds for {} penalties",
-                    component.penalty_index,
-                    s_mod.len()
-                )));
-            }
-            component
-                .matrix
-                .scaled_add_to(&mut s_mod[component.penalty_index], amp)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn validate_penalty_component_shapes(
@@ -120,139 +104,37 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn get_pairwisesecond_derivative(
-        hyper_dirs: &[DirectionalHyperParam],
-        i: usize,
-        j: usize,
-        x_term: bool,
-    ) -> Option<Array2<f64>> {
-        if !x_term {
-            return None;
-        }
-        hyper_dirs
-            .get(i)
-            .and_then(|d| d.x_tau_tau_nth_dense(j))
-            .or_else(|| hyper_dirs.get(j).and_then(|d| d.x_tau_tau_nth_dense(i)))
-    }
-
-    pub(super) fn build_joint_perturbed_state(
-        &self,
-        psi: &Array1<f64>,
-        hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<RemlState<'a>, EstimationError> {
-        if psi.len() != hyper_dirs.len() {
+    fn weighted_cross_from_design_derivative(
+        deriv: &HyperDesignDerivative,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        x_dense: &Array2<f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let p = x_dense.ncols();
+        let n = x_dense.nrows();
+        if weights.len() != n {
             return Err(EstimationError::InvalidInput(format!(
-                "psi/hyper_dirs mismatch: psi={}, hyper_dirs={}",
-                psi.len(),
-                hyper_dirs.len()
+                "weighted_cross_from_design_derivative weight length mismatch: got {}, expected {}",
+                weights.len(),
+                n
             )));
         }
-        let has_design_drift = hyper_dirs.iter().enumerate().any(|(j, dir)| {
-            if psi[j] == 0.0 {
-                return false;
-            }
-            if dir.x_tau_original.any_nonzero() {
-                return true;
-            }
-            if let Some(x2) = dir.x_tau_tau_original.as_ref() {
-                return x2.iter().flatten().any(HyperDesignDerivative::any_nonzero);
-            }
-            false
-        });
-        let mut x_mod_dense = if has_design_drift {
-            Some(
-                self.x()
-                    .try_to_dense_arc("perturbed REML state requires dense design for design drift")
-                    .map_err(EstimationError::InvalidInput)?
-                    .as_ref()
-                    .clone(),
-            )
-        } else {
-            None
-        };
-        let mut s_mod = self.s_full_list.as_ref().clone();
-        for (j, dir) in hyper_dirs.iter().enumerate() {
-            let amp = psi[j];
-            if amp == 0.0 {
-                continue;
-            }
-            if let Some(x_mod) = x_mod_dense.as_ref()
-                && (dir.x_tau_original.nrows() != x_mod.nrows()
-                    || dir.x_tau_original.ncols() != x_mod.ncols())
-            {
+
+        let mut out = Array2::<f64>::zeros((p, p));
+        for col in 0..p {
+            let rhs = weights * &x_dense.column(col).to_owned();
+            let result = deriv.transformed_transpose_mul(qs, free_basis_opt, &rhs)?;
+            if result.len() != p {
                 return Err(EstimationError::InvalidInput(format!(
-                    "joint perturbation X_tau shape mismatch: expected {}x{}, got {}x{}",
-                    x_mod.nrows(),
-                    x_mod.ncols(),
-                    dir.x_tau_original.nrows(),
-                    dir.x_tau_original.ncols()
+                    "weighted_cross_from_design_derivative column size mismatch: got {}, expected {}",
+                    result.len(),
+                    p
                 )));
             }
-            Self::validate_penalty_component_shapes(
-                dir.penalty_first_components(),
-                self.p,
-                "joint perturbation S_tau",
-            )?;
-            if let Some(x_mod) = x_mod_dense.as_mut() {
-                dir.x_tau_original.scaled_add_to(x_mod, amp)?;
-            }
-            Self::add_penalty_components_to_state(&mut s_mod, dir.penalty_first_components(), amp)?;
+            out.column_mut(col).assign(&result);
         }
-        // Optional nonlinear tau parameterization:
-        //   X(psi) += 0.5 * sum_{i,j} psi_i psi_j X_{ij},
-        //   S(psi) += 0.5 * sum_{i,j} psi_i psi_j S_{ij}.
-        // Pairwise derivatives can be provided from either direction i->j or j->i.
-        for i in 0..hyper_dirs.len() {
-            if psi[i] == 0.0 {
-                continue;
-            }
-            for j in 0..hyper_dirs.len() {
-                if psi[j] == 0.0 {
-                    continue;
-                }
-                let amp = 0.5 * psi[i] * psi[j];
-                if amp == 0.0 {
-                    continue;
-                }
-                if let Some(x_ij) = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true)
-                    && let Some(x_mod) = x_mod_dense.as_mut()
-                {
-                    x_mod.scaled_add(amp, &x_ij);
-                }
-                let second_components =
-                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
-                Self::add_penalty_components_to_state(&mut s_mod, &second_components, amp)?;
-            }
-        }
-        let x_mod = x_mod_dense
-            .map(DesignMatrix::from)
-            .unwrap_or_else(|| self.x().clone());
-        let warm_start_beta = self
-            .warm_start_beta
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|beta| beta.as_ref().clone());
-        let mut pert_state = RemlState::newwith_offset(
-            self.y,
-            x_mod,
-            self.weights,
-            self.offset.view(),
-            s_mod,
-            self.p,
-            self.config,
-            Some(self.nullspace_dims.clone()),
-            self.coefficient_lower_bounds.clone(),
-            self.linear_constraints.clone(),
-        )?;
-        pert_state.set_link_states(
-            self.runtime_mixture_link_state.clone(),
-            self.runtime_sas_link_state,
-        );
-        if let Some(beta) = warm_start_beta.as_ref() {
-            pert_state.setwarm_start_original_beta(Some(beta.view()));
-        }
-        Ok(pert_state)
+        Ok(out)
     }
 
     pub(crate) fn compute_joint_hypercostgradienthessian(
@@ -320,456 +202,6 @@ impl<'a> RemlState<'a> {
         let (ext_pair_fn, rho_ext_pair_fn) =
             self.build_tau_pair_callbacks(rho, &bundle, hyper_dirs)?;
         Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
-    }
-
-    pub(super) fn compute_directional_hypergradientwith_bundle(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        hyper_dir: &DirectionalHyperParam,
-    ) -> Result<f64, EstimationError> {
-        // Exact directional hyper-gradient for one moving hyperparameter τ with
-        // both X(τ) and S(τ) varying, under the same piecewise-smooth
-        // fixed-active-subspace conventions used for rho-derivatives.
-        //
-        // Objective-level identity (inner minimization convention):
-        //   V_τ
-        //   = ∂_τ L*(β̂,τ)
-        //     + 0.5 tr(H_+^dagger H_τ)
-        //     - 0.5 tr(S_+^dagger S_τ),
-        // where L* = -ℓ + 0.5 β'Sβ - Φ and H = X'W_HX + S - H_φ on the Firth path.
-        //
-        // The envelope theorem removes explicit β̂_τ terms from ∂_τ L*(β̂,τ);
-        // β̂_τ appears only through total curvature drift H_τ.
-        //
-        // This routine evaluates all currently implemented exact pieces:
-        //   - fit block: -u'X_τβ̂ + 0.5 β̂'S_τβ̂ + Φ_τ|β (Firth),
-        //   - log|H|_+ trace on positive spectral subspace when available,
-        //   - log|S|_+ structural penalty trace.
-        // Dense Firth branch includes design-moving terms in g_τ and fit_part,
-        // and evaluates H_τ on the full chain:
-        //   H_τ = H_std,τ - (H_φ)_τ|β - D(H_φ)[β_τ],
-        // where (H_φ)_τ|β is assembled from reduced-space exact kernels.
-        if rho.len() != self.s_full_list.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "rho dimension mismatch for psi gradient: expected {}, got {}",
-                self.s_full_list.len(),
-                rho.len()
-            )));
-        }
-        if Self::geometry_backend_kind(bundle) == GeometryBackendKind::SparseExactSpd {
-            return self.compute_directional_hypergradient_sparse_exact(rho, bundle, hyper_dir);
-        }
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let reparam_result = &pirls_result.reparam_result;
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let (h_eff_eval, h_total_eval, beta_eval, e_eval);
-        let x_dense_arc;
-        let x_dense_owned;
-
-        let x_psi_t = hyper_dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
-
-        if let Some(z) = free_basis_opt.as_ref() {
-            h_eff_eval = Self::projectwith_basis(bundle.h_eff.as_ref(), z);
-            h_total_eval = Self::projectwith_basis(bundle.h_total.as_ref(), z);
-            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
-            let constrained_dense = pirls_result
-                .x_transformed
-                .try_to_dense_arc(
-                    "directional hyper-gradient with active constraints requires dense transformed design",
-                )
-                .map_err(EstimationError::InvalidInput)?;
-            x_dense_owned = Some(
-                DenseRightProductView::new(constrained_dense.as_ref())
-                    .with_factor(z)
-                    .materialize(),
-            );
-            x_dense_arc = None;
-            e_eval = reparam_result.e_transformed.dot(z);
-        } else {
-            h_eff_eval = bundle.h_eff.as_ref().clone();
-            h_total_eval = bundle.h_total.as_ref().clone();
-            beta_eval = pirls_result.beta_transformed.as_ref().clone();
-            e_eval = reparam_result.e_transformed.clone();
-            x_dense_arc = Some(
-                pirls_result
-                    .x_transformed
-                    .try_to_dense_arc(
-                        "exact directional hyper-gradient requires dense transformed design",
-                    )
-                    .map_err(EstimationError::InvalidInput)?,
-            );
-            x_dense_owned = None;
-        }
-        let x_dense = x_dense_owned.as_ref().unwrap_or_else(|| {
-            x_dense_arc
-                .as_ref()
-                .expect("dense design arc missing")
-                .as_ref()
-        });
-        let transformed_penalty_components = Self::transform_penalty_components(
-            hyper_dir.penalty_first_components(),
-            &reparam_result.qs,
-            free_basis_opt.as_ref(),
-        );
-        let s_psi_t = transformed_penalty_components.iter().try_fold(
-            Array2::<f64>::zeros((beta_eval.len(), beta_eval.len())),
-            |mut acc, component| {
-                if component.penalty_index >= rho.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "penalty_index {} out of bounds for rho dimension {}",
-                        component.penalty_index,
-                        rho.len()
-                    )));
-                }
-                component
-                    .matrix
-                    .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
-                Ok(acc)
-            },
-        )?;
-
-        if x_psi_t.nrows() != self.y.len() || x_psi_t.ncols() != beta_eval.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "X_psi shape mismatch: expected {}x{}, got {}x{}",
-                self.y.len(),
-                beta_eval.len(),
-                x_psi_t.nrows(),
-                x_psi_t.ncols()
-            )));
-        }
-        if s_psi_t.nrows() != beta_eval.len() || s_psi_t.ncols() != beta_eval.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_psi shape mismatch: expected {}x{}, got {}x{}",
-                beta_eval.len(),
-                beta_eval.len(),
-                s_psi_t.nrows(),
-                s_psi_t.ncols()
-            )));
-        }
-        let s_psi_total_t = s_psi_t.clone();
-        let firth_op = if firth_logit_active {
-            if let Some(cached) = bundle.firth_dense_operator.as_ref() {
-                Some(cached.as_ref().clone())
-            } else {
-                Some(Self::build_firth_dense_operator(
-                    x_dense,
-                    &pirls_result.final_eta,
-                )?)
-            }
-        } else {
-            None
-        };
-        let h_solve_eval = if firth_logit_active {
-            &h_total_eval
-        } else {
-            &h_eff_eval
-        };
-        // Objective-consistent generalized inverse for implicit solves:
-        // when the retained positive eigenspace factor W is available in the
-        // current coordinates (no free-basis projection), use
-        //   H_+^dagger v = W (W' v)
-        // for beta_tau and all stacked linear solves in this routine.
-        //
-        // This matches the same pseudo-logdet active subspace used in
-        // 0.5*tr(H_+^dagger H_tau), avoiding inverse-mismatch between trace and IFT.
-        let prefer_h_pos = !bundle.active_subspace_unstable;
-        let h_posw_for_solve = if prefer_h_pos {
-            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == h_solve_eval.nrows() {
-                Some(bundle.h_pos_factorw.as_ref().clone())
-            } else {
-                None
-            }
-        } else {
-            log::warn!(
-                "Directional hyper-gradient using stabilized direct fallback for implicit solves (active subspace unstable)."
-            );
-            None
-        };
-        let h_posw_for_solve_t = h_posw_for_solve.as_ref().map(|w| w.t().to_owned());
-        enum DirectionalSolveFactor {
-            Cached(Arc<FaerFactor>),
-            Local(FaerFactor),
-        }
-        impl DirectionalSolveFactor {
-            fn solve_in_place(&self, rhs: faer::MatMut<'_, f64>) {
-                match self {
-                    DirectionalSolveFactor::Cached(f) => f.solve_in_place(rhs),
-                    DirectionalSolveFactor::Local(f) => f.solve_in_place(rhs),
-                }
-            }
-        }
-        let h_solve_factor = if h_posw_for_solve.is_some() {
-            None
-        } else if free_basis_opt.is_none() && !firth_logit_active {
-            Some(DirectionalSolveFactor::Cached(
-                self.get_faer_factor(rho, h_solve_eval),
-            ))
-        } else {
-            Some(DirectionalSolveFactor::Local(
-                self.factorize_faer(h_solve_eval),
-            ))
-        };
-        let solve_hvec = |rhs: &Array1<f64>| -> Array1<f64> {
-            if rhs.is_empty() {
-                return rhs.clone();
-            }
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
-                // Minimum-norm active-subspace solve:
-                //   beta_tau = H_+^dagger rhs = W (W' rhs),  H_+^dagger = W W'.
-                let tmp = w_t.dot(rhs);
-                return w.dot(&tmp);
-            }
-            let mut rhs_mat = Array2::<f64>::zeros((rhs.len(), 1));
-            rhs_mat.column_mut(0).assign(rhs);
-            let mut rhsview = array2_to_matmut(&mut rhs_mat);
-            if let Some(f) = h_solve_factor.as_ref() {
-                f.solve_in_place(rhsview.as_mut());
-            }
-            rhs_mat.column(0).to_owned()
-        };
-        let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            if rhs.ncols() == 0 {
-                return rhs.clone();
-            }
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
-                let wt_rhs = fast_ab(w_t, rhs);
-                return fast_ab(w, &wt_rhs);
-            }
-            let mut out = rhs.clone();
-            let mut outview = array2_to_matmut(&mut out);
-            if let Some(f) = h_solve_factor.as_ref() {
-                f.solve_in_place(outview.as_mut());
-            }
-            out
-        };
-        // Preferred exact trace evaluator for the log|H|_+ term:
-        //   0.5 * tr(H_+^dagger A) = 0.5 * tr(W^T A W), H_+^dagger = W W^T.
-        // Fall back to solve-surface contraction only when projected/active
-        // coordinates are not aligned with the cached spectral basis.
-        let h_posw = if prefer_h_pos {
-            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == h_solve_eval.nrows() {
-                Some(bundle.h_pos_factorw.as_ref().clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let h_posw_t = h_posw.as_ref().map(|w| w.t().to_owned());
-        let half_trace_h_pos = |a: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_posw.as_ref(), h_posw_t.as_ref()) {
-                // Derivation:
-                //   d/dτ [0.5 log|H|_+] = 0.5 tr(H_+^dagger H_τ),
-                //   H_+^dagger = W W^T on the retained positive eigenspace.
-                // Therefore:
-                //   0.5 tr(H_+^dagger A) = 0.5 tr(W^T A W).
-                let wt_a = fast_ab(w_t, a);
-                let g = fast_ab(&wt_a, w);
-                0.5 * g.diag().sum()
-            } else {
-                let h_solved = solve_h_mat(a);
-                0.5 * h_solved.diag().sum()
-            }
-        };
-
-        let u = &pirls_result.solveweights
-            * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        // `u` is the current predictor-space score contribution g pulled through
-        // the PIRLS linearization, so X_τ^T g is represented by x_psi_t^T u.
-        let xpsi_beta = x_psi_t.dot(&beta_eval);
-        let weighted_xpsi_beta = &pirls_result.finalweights * &xpsi_beta;
-        // Differentiate the stationarity equation
-        //   0 = X^T g - S β̂
-        // along the solution path β̂(τ):
-        //
-        //   0 = X_τ^T g + X^T(dg/dτ) - S_τ β̂ - S B,
-        //   dg/dτ = -W η̇,
-        //   η̇ = X_τ β̂ + X B.
-        //
-        // Rearranging gives the implicit solve
-        //   H_solve B = X_τ^T g - X^T W(X_τ β̂) - S_τ β̂ - (gphi)_tau|beta,
-        // where:
-        //   - non-Firth: H_solve = X^T W X + S,
-        //   - Firth logit: H_solve = H_total = X^T W X + S - Hphi.
-        // This matches the stationarity surface used by the fitted objective.
-        //
-        // With Firth enabled this is:
-        //   g_τ = (g_std)_τ - (gphi)_τ|_{beta fixed},
-        // where (gphi)_τ comes from reduced Fisher pseudodeterminant calculus:
-        //   Phi = 0.5 log|I_r|_+, I_r = X_r^T W X_r.
-        // This RHS is exactly `g_psi`, and `solve_hvec(g_psi)` computes B
-        // without ever forming H^{-1} explicitly.
-        let mut g_psi = x_psi_t.t().dot(&u)
-            - x_dense.t().dot(&weighted_xpsi_beta)
-            - s_psi_total_t.dot(&beta_eval);
-        let mut fit_firth_partial = 0.0_f64;
-        let mut tau_kernel_opt: Option<FirthTauPartialKernel> = None;
-        if let Some(op) = firth_op.as_ref() {
-            // Exact Firth design-moving partial score correction (beta held fixed):
-            //   g_tau = (g_std)_tau - (gphi)_tau,
-            // where (gphi)_tau and Phi_tau|beta are computed from reduced Fisher
-            // pseudodeterminant calculus under fixed active subspace.
-            //
-            // Implemented formulas:
-            //   (gphi)_tau
-            //   = 0.5 X_tau' (w' ⊙ h)
-            //     + 0.5 X'((w'' ⊙ (X_tau β)) ⊙ h + w' ⊙ h_tau|beta),
-            //   Phi_tau|beta = 0.5 tr(I_r^{-1} I_{r,tau}),
-            // with I_r = X_r' W X_r and h_i = x_{r,i}' I_r^{-1} x_{r,i}.
-            let need_tau_kernel = x_psi_t.iter().any(|v| *v != 0.0);
-            let tau_bundle =
-                Self::firth_exact_tau_kernel(op, &x_psi_t, &beta_eval, need_tau_kernel);
-            g_psi -= &tau_bundle.gphi_tau;
-            fit_firth_partial = tau_bundle.phi_tau_partial;
-            if need_tau_kernel {
-                tau_kernel_opt = Some(tau_bundle.tau_kernel.expect(
-                    "exact directional assembly requires tau kernel when design drift is active",
-                ));
-            }
-        }
-        let beta_psi = solve_hvec(&g_psi);
-        // Total predictor drift:
-        //   η̇ = d/dτ(X β̂) = X_τ β̂ + X B.
-        let eta_psi = &xpsi_beta + &x_dense.dot(&beta_psi);
-
-        // Penalized-fit block:
-        //   d/dτ[-ℓ(β̂,τ) + 0.5 β̂^T S β̂]
-        //     = -ℓ_β^T B - ℓ_τ + β̂^T S B + 0.5 β̂^T S_τ β̂.
-        //
-        // Since stationarity gives ℓ_β = S β̂, the B terms cancel exactly:
-        //   -ℓ_β^T B + β̂^T S B = 0,
-        // leaving only the explicit τ-dependence
-        //   -ℓ_τ + 0.5 β̂^T S_τ β̂ = -g^T X_τ β̂ + 0.5 β̂^T S_τ β̂.
-        // Envelope fit block:
-        //   d/dtau J(beta_hat,tau) = partial_tau J | beta_hat,
-        // i.e. no explicit B term.
-        // For Firth-logit:
-        //   Phi_tau|beta = 0.5 tr(I_r^+ I_{r,tau}),
-        // added via `fit_firth_partial`.
-        let fit_block = -u.dot(&xpsi_beta)
-            + 0.5 * beta_eval.dot(&s_psi_total_t.dot(&beta_eval))
-            + fit_firth_partial;
-        // Literal mapping to V_τ decomposition used in return values:
-        //   V_τ = fit_block + trace_term + pseudo_det_term,
-        // where
-        //   fit_block      = ∂_τ[-ℓ + 0.5β^T S β - Φ]|_{β=β̂}  (envelope form),
-        //   trace_term     = 0.5 tr(H_+^† H_τ^tot),
-        //   pseudo_det_term= -0.5 tr(S_+^† S_τ).
-        //
-        // Non-Gaussian branch computes H_τ^tot explicitly via X_τ, W_τ, S_τ and
-        // Firth drifts. Gaussian identity branch uses profiled dispersion algebra:
-        //   D_{p,τ} = 2*fit_block and profiled_fit_term = D_{p,τ}/(2φ̂).
-
-        let w = &pirls_result.finalweights;
-        let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
-        let mut h_psi = Self::weighted_cross(&x_psi_t, &x_dense, w);
-        h_psi += &Self::weighted_cross(&x_dense, &x_psi_t, w);
-
-        match self.config.link_function() {
-            LinkFunction::Identity => {
-                // Profiled Gaussian REML:
-                //   V = D_p/(2φ̂) + 0.5 log|H| - 0.5 log|S|_+ + ((n-M_p)/2) log(2πφ̂),
-                //   φ̂ = D_p/(n-M_p).
-                //
-                // Exact profiled derivative (holding M_p locally fixed):
-                //   dV/dτ = D_{p,τ}/(2φ̂)
-                //         + 0.5 tr(H^{-1} H_τ)
-                //         - 0.5 tr(S^+ S_τ),
-                // with
-                //   H_τ = X_τ^T W X + X^T W X_τ + S_τ
-                // (W_τ = 0 for Gaussian identity) and
-                //   D_{p,τ} = 2 * fit_block
-                // by stationarity cancellation in the fit block.
-                h_psi += &s_psi_total_t;
-
-                let n = self.y.len() as f64;
-                let (penalty_rank, _) = self
-                    .fixed_subspace_penalty_rank_and_logdet(&e_eval, pirls_result.ridge_passport)?;
-                let p_eff_dim = h_eff_eval.ncols();
-                let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
-                let dp = pirls_result.deviance + pirls_result.stable_penalty_term;
-                let denom = (n - mp).max(LAML_RIDGE);
-                let (dp_c, _) = smooth_floor_dp(dp);
-                let phi = dp_c / denom;
-                if !phi.is_finite() || phi <= 0.0 {
-                    return Err(EstimationError::InvalidInput(
-                        "invalid profiled Gaussian dispersion in directional hyper-gradient"
-                            .to_string(),
-                    ));
-                }
-
-                let trace_term = half_trace_h_pos(&h_psi);
-                let pseudo_det_trace = self.fixed_subspace_penalty_trace(
-                    &e_eval,
-                    &s_psi_total_t,
-                    pirls_result.ridge_passport,
-                )?;
-                let pseudo_det_term = -0.5 * pseudo_det_trace;
-                let dp_tau = 2.0 * fit_block;
-                let profiled_fit_term = dp_tau / (2.0 * phi);
-                Ok(profiled_fit_term + trace_term + pseudo_det_term)
-            }
-            _ => {
-                let w_direction = crate::pirls::directionalworking_curvature_from_c_array(
-                    &pirls_result.solve_c_array,
-                    &pirls_result.finalweights,
-                    &eta_psi,
-                );
-                match &w_direction {
-                    // Directional curvature derivative:
-                    //   W_τ = T[η̇].
-                    //
-                    // The family-dispatched PIRLS callback returns the operator form of
-                    // this derivative. Built-in links are diagonal in observation space,
-                    // so the operator is represented by the per-row vector `w_direction`.
-                    DirectionalWorkingCurvature::Diagonal(w_direction) => {
-                        h_psi +=
-                            &Self::xt_diag_x_dense_into(&x_dense, w_direction, &mut weighted_xtdx);
-                    }
-                }
-                // Exact total curvature derivative:
-                //   H_τ = d/dτ(X^T W X + S)
-                //       = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ.
-                h_psi += &s_psi_total_t;
-                if let Some(op) = firth_op.as_ref() {
-                    // Firth-adjusted curvature surface:
-                    //   H_total = H_std - Hphi.
-                    // Exact total Firth contribution in this branch:
-                    //   H_{phi,tau} = (Hphi)_tau|beta + D(Hphi)[beta_tau].
-                    // Therefore:
-                    //   H_total,tau = H_std,tau - H_{phi,tau}
-                    //               = H_std,tau
-                    //                 - (Hphi)_tau|beta
-                    //                 - D(Hphi)[beta_tau].
-                    //
-                    // We apply both terms explicitly.
-                    if x_psi_t.iter().any(|v| *v != 0.0) {
-                        let kernel = tau_kernel_opt.as_ref().expect(
-                            "exact directional assembly requires cached tau kernel for Hphi,tau",
-                        );
-                        let eye = Array2::<f64>::eye(beta_eval.len());
-                        let hphi_tau_partial =
-                            Self::firth_hphi_tau_partial_apply(op, &x_psi_t, kernel, &eye);
-                        h_psi -= &hphi_tau_partial;
-                    }
-                    let firth_dir = Self::firth_direction(op, &beta_psi);
-                    h_psi -= &Self::firth_hphi_direction(op, &firth_dir);
-                }
-
-                let trace_term = half_trace_h_pos(&h_psi);
-                let pseudo_det_trace = self.fixed_subspace_penalty_trace(
-                    &e_eval,
-                    &s_psi_total_t,
-                    pirls_result.ridge_passport,
-                )?;
-                let pseudo_det_term = -0.5 * pseudo_det_trace;
-                Ok(fit_block + trace_term + pseudo_det_term)
-            }
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1242,24 +674,32 @@ impl<'a> RemlState<'a> {
             .map(|x_tau| x_tau.dot(&beta_eval))
             .collect();
 
-        // Pre-compute second-order design matrices X_{τ_i τ_j} for all pairs.
-        let mut x_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
+        let qs_eval = std::sync::Arc::new(reparam_result.qs.clone());
+        let free_basis_eval: std::sync::Arc<Option<Array2<f64>>> =
+            std::sync::Arc::new(free_basis_opt.clone());
+
+        // Pre-compute second-order design terms for all pairs.
+        // Dense derivatives are transformed eagerly. Implicit derivatives keep
+        // the original operator-backed representation and are evaluated through
+        // transformed forward/transpose products inside the pair callback.
+        let mut x_tau_tau: Vec<Vec<Option<TauTauDesignTerm>>> = vec![vec![None; psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in i..psi_dim {
-                let xij = hyper_dirs[i]
-                    .transformed_x_tau_tau_at(j, &reparam_result.qs, free_basis_opt.as_ref())
-                    .ok()
-                    .flatten()
-                    .or_else(|| {
-                        hyper_dirs[j]
-                            .transformed_x_tau_tau_at(
-                                i,
-                                &reparam_result.qs,
-                                free_basis_opt.as_ref(),
-                            )
-                            .ok()
-                            .flatten()
-                    });
+                let xij =
+                    hyper_dirs[i]
+                        .x_tau_tau_entry_at(j)
+                        .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
+                        .map(|entry| {
+                            if entry.uses_implicit_storage() {
+                                TauTauDesignTerm::Implicit(entry)
+                            } else {
+                                TauTauDesignTerm::Dense(
+                            entry
+                                .transformed(&reparam_result.qs, free_basis_opt.as_ref())
+                                .expect("valid transformed X_tau_tau in build_tau_pair_callbacks"),
+                        )
+                            }
+                        });
                 if xij.is_some() {
                     x_tau_tau[j][i] = xij.clone();
                 }
@@ -1313,6 +753,8 @@ impl<'a> RemlState<'a> {
         let x_tau_list = Arc::new(x_tau_list);
         let x_tau_beta_list = Arc::new(x_tau_beta_list);
         let x_tau_tau = Arc::new(x_tau_tau);
+        let qs_eval_tt = Arc::clone(&qs_eval);
+        let free_basis_tt = Arc::clone(&free_basis_eval);
         let u = Arc::new(u);
         let w_diag = Arc::new(w_diag);
         let c_array = Arc::new(c_array);
@@ -1373,10 +815,22 @@ impl<'a> RemlState<'a> {
             let x_tau_j_beta = &x_tau_beta_tt[j];
             let w_x_tau_j_beta = w_tt.as_ref() * x_tau_j_beta;
             let a_ij_likelihood = x_tau_i_beta.dot(&w_x_tau_j_beta);
-            let a_ij_design2 = x_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|xij| -u_tt.dot(&xij.dot(beta_tt.as_ref())))
-                .unwrap_or(0.0);
+            let x_tau_tau_beta = match x_tau_tau_tt[i][j].as_ref() {
+                Some(TauTauDesignTerm::Dense(xij)) => xij.dot(beta_tt.as_ref()),
+                Some(TauTauDesignTerm::Implicit(deriv)) => deriv
+                    .transformed_forward_mul(
+                        qs_eval_tt.as_ref(),
+                        free_basis_tt.as_ref().as_ref(),
+                        beta_tt.as_ref(),
+                    )
+                    .expect("valid transformed implicit X_tau_tau beta product"),
+                None => Array1::<f64>::zeros(u_tt.len()),
+            };
+            let a_ij_design2 = if x_tau_tau_tt[i][j].is_some() {
+                -u_tt.dot(&x_tau_tau_beta)
+            } else {
+                0.0
+            };
             let a_ij_penalty = 0.5
                 * s_tau_tau_tt[i][j]
                     .as_ref()
@@ -1401,10 +855,17 @@ impl<'a> RemlState<'a> {
             let x_tau_j = &x_tau_list_tt[j];
 
             // term1: X_{τ_i τ_j}^T u
-            let term1 = x_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|xij| xij.t().dot(u_tt.as_ref()))
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+            let term1 = match x_tau_tau_tt[i][j].as_ref() {
+                Some(TauTauDesignTerm::Dense(xij)) => xij.t().dot(u_tt.as_ref()),
+                Some(TauTauDesignTerm::Implicit(deriv)) => deriv
+                    .transformed_transpose_mul(
+                        qs_eval_tt.as_ref(),
+                        free_basis_tt.as_ref().as_ref(),
+                        u_tt.as_ref(),
+                    )
+                    .expect("valid transformed implicit X_tau_tau^T u product"),
+                None => Array1::<f64>::zeros(p_dim_tt),
+            };
 
             // term2: -X_{τ_j}^T diag(w)(X_{τ_i} β̂)
             let term2 = x_tau_j.t().dot(&(w_tt.as_ref() * x_tau_i_beta));
@@ -1417,14 +878,11 @@ impl<'a> RemlState<'a> {
             let term4 = x_dense_tt.t().dot(&(&c_x_tau_i_beta * x_tau_j_beta));
 
             // term5: -X^T W(X_{τ_i τ_j} β̂)
-            let term5 = x_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|xij| {
-                    x_dense_tt
-                        .t()
-                        .dot(&(w_tt.as_ref() * &xij.dot(beta_tt.as_ref())))
-                })
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
+            let term5 = if x_tau_tau_tt[i][j].is_some() {
+                x_dense_tt.t().dot(&(w_tt.as_ref() * &x_tau_tau_beta))
+            } else {
+                Array1::<f64>::zeros(p_dim_tt)
+            };
 
             // term6: -S_{τ_i τ_j} β̂
             let term6 = s_tau_tau_tt[i][j]
@@ -1453,8 +911,23 @@ impl<'a> RemlState<'a> {
 
             // (a) second-design terms
             if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
-                b_ij += &Self::weighted_cross(xij, x_dense_tt.as_ref(), w_tt.as_ref());
-                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), xij, w_tt.as_ref());
+                let cross = match xij {
+                    TauTauDesignTerm::Dense(xij) => {
+                        Self::weighted_cross(xij, x_dense_tt.as_ref(), w_tt.as_ref())
+                    }
+                    TauTauDesignTerm::Implicit(deriv) => {
+                        Self::weighted_cross_from_design_derivative(
+                            deriv,
+                            qs_eval_tt.as_ref(),
+                            free_basis_tt.as_ref().as_ref(),
+                            x_dense_tt.as_ref(),
+                            w_tt.as_ref(),
+                        )
+                        .expect("valid transformed implicit weighted cross")
+                    }
+                };
+                b_ij += &cross;
+                b_ij += &cross.t().to_owned();
             }
 
             // (b) cross-design terms
@@ -1481,8 +954,8 @@ impl<'a> RemlState<'a> {
                 );
 
                 // (f) second-design weight: X^T diag(c ⊙ X_{τ_i τ_j} β̂) X
-                if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
-                    let c_xij_beta = c_tt.as_ref() * &xij.dot(beta_tt.as_ref());
+                if x_tau_tau_tt[i][j].is_some() {
+                    let c_xij_beta = c_tt.as_ref() * &x_tau_tau_beta;
                     b_ij += &Self::xt_diag_x_dense_into(
                         x_dense_tt.as_ref(),
                         &c_xij_beta,

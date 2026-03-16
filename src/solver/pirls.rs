@@ -1052,7 +1052,6 @@ struct GamModelFinalState {
     final_d2mu_deta2: Array1<f64>,
     final_d3mu_deta3: Array1<f64>,
     penalty_term: f64,
-    hessian_curvature: HessianCurvatureKind,
 }
 
 impl<'a> GamWorkingModel<'a> {
@@ -1162,7 +1161,6 @@ impl<'a> GamWorkingModel<'a> {
             lasthessian_weights,
             lasthessian_c,
             lasthessian_d,
-            lasthessian_curvature,
             last_dmu_deta,
             last_d2mu_deta2,
             last_d3mu_deta3,
@@ -1194,7 +1192,6 @@ impl<'a> GamWorkingModel<'a> {
             final_d2mu_deta2: last_d2mu_deta2,
             final_d3mu_deta3: last_d3mu_deta3,
             penalty_term: last_penalty_term,
-            hessian_curvature: lasthessian_curvature,
         }
     }
 
@@ -5230,68 +5227,6 @@ pub fn update_glmvectors_by_family(
 ///   exact non-GHQ representations (Gamma / erfc / asymptotic series), which
 ///   is also relevant to survival transforms of the form exp(-exp(eta)).
 ///
-pub(crate) fn update_glmvectors_integrated_for_link(
-    quadctx: &crate::quadrature::QuadratureContext,
-    y: ArrayView1<f64>,
-    eta: &Array1<f64>,
-    se: ArrayView1<f64>,
-    inverse_link: &InverseLink,
-    priorweights: ArrayView1<f64>,
-    mu: &mut Array1<f64>,
-    weights: &mut Array1<f64>,
-    z: &mut Array1<f64>,
-    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) -> Result<(), EstimationError> {
-    let link = inverse_link.link_function();
-    let family = match link {
-        LinkFunction::Log => {
-            update_glmvectors(
-                y,
-                eta,
-                inverse_link,
-                priorweights,
-                mu,
-                weights,
-                z,
-                derivatives,
-            )?;
-            return Ok(());
-        }
-        LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
-        LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
-        LinkFunction::CLogLog => GlmLikelihoodFamily::BinomialCLogLog,
-        LinkFunction::Sas => GlmLikelihoodFamily::BinomialSas,
-        LinkFunction::BetaLogistic => GlmLikelihoodFamily::BinomialBetaLogistic,
-        LinkFunction::Identity => {
-            update_glmvectors(
-                y,
-                eta,
-                inverse_link,
-                priorweights,
-                mu,
-                weights,
-                z,
-                derivatives,
-            )?;
-            return Ok(());
-        }
-    };
-    update_glmvectors_integrated_by_family(
-        quadctx,
-        y,
-        eta,
-        se,
-        family,
-        priorweights,
-        mu,
-        weights,
-        z,
-        derivatives,
-        inverse_link.mixture_state(),
-        inverse_link.sas_state(),
-    )
-}
-
 /// Family-dispatched integrated GLM vector update helper.
 ///
 /// This is the intended dispatch point for eliminating GHQ link-by-link:
@@ -6577,12 +6512,12 @@ fn calculate_scale(
 mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
-        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut,
-        bernoulli_geometry_from_jet, calculate_scale, compress_activeworking_set,
-        compute_constraint_kkt_diagnostics, default_beta_guess_external, fit_model_for_fixed_rho,
-        logit_clampzero_enabled, should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
+        calculate_scale, compress_activeworking_set, compute_constraint_kkt_diagnostics,
+        default_beta_guess_external, fit_model_for_fixed_rho, logit_clampzero_enabled,
+        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        update_glmvectors_integrated_for_link, working_set_kkt_diagnostics_frommultipliers,
+        working_set_kkt_diagnostics_frommultipliers,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -6877,79 +6812,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn integrated_logit_update_uses_integrated_curvature_derivatives() {
-        let ctx = crate::quadrature::QuadratureContext::new();
-        let y = array![1.0_f64];
-        let eta = array![0.8_f64];
-        let se = array![0.9_f64];
-        let prior = array![1.0_f64];
-        let mut mu = Array1::<f64>::zeros(1);
-        let mut weights = Array1::<f64>::zeros(1);
-        let mut z = Array1::<f64>::zeros(1);
-        let mut c = Array1::<f64>::zeros(1);
-        let mut d = Array1::<f64>::zeros(1);
-        let mut d1 = Array1::<f64>::zeros(1);
-        let mut d2 = Array1::<f64>::zeros(1);
-        let mut d3 = Array1::<f64>::zeros(1);
-
-        update_glmvectors_integrated_for_link(
-            &ctx,
-            y.view(),
-            &eta,
-            se.view(),
-            &InverseLink::Standard(LinkFunction::Logit),
-            prior.view(),
-            &mut mu,
-            &mut weights,
-            &mut z,
-            Some(WorkingDerivativeBuffersMut {
-                c: &mut c,
-                d: &mut d,
-                dmu_deta: &mut d1,
-                d2mu_deta2: &mut d2,
-                d3mu_deta3: &mut d3,
-            }),
-        )
-        .expect("integrated link update");
-
-        let jet = crate::quadrature::integrated_inverse_link_jet(
-            &ctx,
-            LinkFunction::Logit,
-            eta[0].clamp(-700.0, 700.0),
-            se[0],
-        )
-        .expect("logit integrated inverse-link jet should evaluate");
-        let expected = bernoulli_geometry_from_jet(
-            eta[0],
-            eta[0].clamp(-700.0, 700.0),
-            y[0],
-            prior[0],
-            InverseLinkJet {
-                mu: jet.mean,
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-            },
-            false,
-            logit_clampzero_enabled(),
-        );
-
-        assert_relative_eq!(mu[0], expected.mu, epsilon = 1e-12);
-        assert_relative_eq!(weights[0], expected.weight, epsilon = 1e-12);
-        assert_relative_eq!(c[0], expected.c, epsilon = 1e-12);
-        assert_relative_eq!(d[0], expected.d, epsilon = 1e-12);
-        assert_relative_eq!(d1[0], jet.d1, epsilon = 1e-12);
-        assert_relative_eq!(d2[0], jet.d2, epsilon = 1e-12);
-        assert_relative_eq!(d3[0], jet.d3, epsilon = 1e-12);
-
-        let legacy_c = mu[0] * (1.0 - mu[0]) * (1.0 - 2.0 * mu[0]);
-        assert!(
-            (c[0] - legacy_c).abs() > 1e-4,
-            "integrated curvature should differ from legacy canonical logit reconstruction"
-        );
     }
 
     #[test]
