@@ -869,6 +869,9 @@ fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectio
         .push(identity_penalty(design.design.ncols()));
 }
 
+// Honest warm start for the binomial location-scale model: run a short fit on
+// the actual two-block family instead of introducing a fake surrogate family
+// with a neutral log-sigma block.
 fn binomial_location_scalewarm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
