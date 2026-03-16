@@ -112,40 +112,6 @@ impl<'a> RemlState<'a> {
         }))
     }
 
-    pub(crate) fn trace_hdag_operator_apply<S, A>(
-        p_dim: usize,
-        h_posw: Option<&Array2<f64>>,
-        h_posw_t: Option<&Array2<f64>>,
-        mut solve_h_mat: S,
-        mut apply_to_block: A,
-    ) -> f64
-    where
-        S: FnMut(&Array2<f64>) -> Array2<f64>,
-        A: FnMut(&Array2<f64>) -> Array2<f64>,
-    {
-        if let (Some(w), Some(w_t)) = (h_posw, h_posw_t) {
-            let aw = apply_to_block(w);
-            return Self::trace_product(w_t, &aw);
-        }
-        const BLOCK: usize = 32;
-        let mut acc = 0.0_f64;
-        let mut start = 0usize;
-        while start < p_dim {
-            let width = (p_dim - start).min(BLOCK);
-            let mut basis = Array2::<f64>::zeros((p_dim, width));
-            for j in 0..width {
-                basis[[start + j, j]] = 1.0;
-            }
-            let a_block = apply_to_block(&basis);
-            let solved = solve_h_mat(&a_block);
-            for j in 0..width {
-                acc += solved[[start + j, j]];
-            }
-            start += width;
-        }
-        acc
-    }
-
     pub(crate) fn reducedweighted_gram(z: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
         // Returns Zᵀ diag(weights) Z (exact).
         //

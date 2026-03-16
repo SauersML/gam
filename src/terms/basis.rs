@@ -538,34 +538,6 @@ impl BasisOutputFormat for Sparse {
     }
 }
 
-/// Compute a heuristic smoothing weight based on knot span, penalty order, and spline degree.
-pub fn baseline_lambda_seed(knot_vector: &Array1<f64>, degree: usize, penalty_order: usize) -> f64 {
-    let mut min_knot = f64::INFINITY;
-    let mut max_knot = f64::NEG_INFINITY;
-    for &value in knot_vector.iter() {
-        if !value.is_finite() {
-            continue;
-        }
-        if value < min_knot {
-            min_knot = value;
-        }
-        if value > max_knot {
-            max_knot = value;
-        }
-    }
-
-    let span = if min_knot.is_finite() && max_knot.is_finite() && max_knot > min_knot {
-        max_knot - min_knot
-    } else {
-        1.0
-    };
-    let order = penalty_order.max(1) as f64;
-    let degree = degree.max(1) as f64;
-    let normalized_span = (span / (span + 1.0)).max(1e-3);
-    let lambda = 0.5 * (order / (degree + 1.0)) / normalized_span;
-    lambda.clamp(1e-6, 1e3)
-}
-
 fn validate_knots_for_degree(
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -6309,26 +6281,6 @@ fn build_matern_double_penalty_candidates(
 ///
 /// NOTE: This follows the RKHS Gram construction S = K_CC (not K_CC^{-1}) in
 /// coefficient space, with global scaling absorbed by the smoothing parameter λ.
-pub fn create_matern_spline_basis(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    length_scale: f64,
-    nu: MaternNu,
-    include_intercept: bool,
-    aniso_log_scales: Option<&[f64]>,
-) -> Result<MaternSplineBasis, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_matern_spline_basiswithworkspace(
-        data,
-        centers,
-        length_scale,
-        nu,
-        include_intercept,
-        aniso_log_scales,
-        &mut workspace,
-    )
-}
-
 pub fn create_matern_spline_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,

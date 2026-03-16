@@ -2,20 +2,17 @@ use self::cache::AtomicFlagGuard;
 use self::reml_strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
 use super::*;
 use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
-#[cfg(test)]
 use crate::linalg::sparse_exact::SparseTraceWorkspace;
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
     build_sparse_penalty_blocks, leverages_from_factor, solve_sparse_spd, solve_sparse_spdmulti,
-};
-use crate::pirls::{
-    DirectionalWorkingCurvature, PirlsWorkspace, directionalworking_curvature_from_c_array,
 };
 use crate::types::SasLinkState;
 use faer::Side;
 use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::s;
 use std::ops::Range;
+use std::sync::Mutex;
 
 mod cache;
 mod eval;
@@ -150,7 +147,7 @@ mod tests {
         //   H_τ = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ,
         // with W_τ provided by the family directional curvature callback.
         let eta_dot = &x_tau_beta + &x.dot(&b_analytic);
-        let w_direction = directionalworking_curvature_from_c_array(
+        let w_direction = crate::pirls::directionalworking_curvature_from_c_array(
             &pr.solve_c_array,
             &pr.finalweights,
             &eta_dot,
@@ -159,7 +156,7 @@ mod tests {
         let wx_tau = RemlState::row_scale(&x_tau, &pr.finalweights);
         let mut xwtau_x = x.clone();
         match w_direction {
-            super::DirectionalWorkingCurvature::Diagonal(diag) => {
+            crate::pirls::DirectionalWorkingCurvature::Diagonal(diag) => {
                 xwtau_x = RemlState::row_scale(&xwtau_x, &diag);
             }
         }
@@ -1176,7 +1173,6 @@ impl ImplicitDerivativeOp {
         self.operator.p_out()
     }
 
-    #[cfg(test)]
     fn forward_mul_vec(&self, u: &Array1<f64>) -> Array1<f64> {
         match self.level {
             ImplicitDerivLevel::First(axis) => self.operator.forward_mul(axis, &u.view()),
@@ -1189,7 +1185,6 @@ impl ImplicitDerivativeOp {
         }
     }
 
-    #[cfg(test)]
     fn transpose_mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         match self.level {
             ImplicitDerivLevel::First(axis) => self.operator.transpose_mul(axis, &v.view()),
@@ -1291,7 +1286,6 @@ impl HyperDesignDerivative {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn t_dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.t().dot(rhs),
@@ -1305,7 +1299,6 @@ impl HyperDesignDerivative {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
@@ -1326,7 +1319,6 @@ impl HyperDesignDerivative {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn t_dot_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.t().dot(rhs),
@@ -1350,7 +1342,6 @@ impl HyperDesignDerivative {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn transpose_row_block(&self, rows: Range<usize>) -> Array2<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.slice(s![rows, ..]).t().to_owned(),
@@ -1388,7 +1379,6 @@ impl HyperDesignDerivative {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn scaled_add_to(
         &self,
         target: &mut Array2<f64>,
@@ -1504,7 +1494,6 @@ impl HyperDesignDerivative {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match &self.storage {
             DerivativeMatrixStorage::Dense(dense) => dense.dot(rhs),
@@ -1810,7 +1799,6 @@ impl DirectionalHyperParam {
             .transpose()?)
     }
 
-    #[cfg(test)]
     pub(crate) fn x_tau_tau_nth_dense(&self, j: usize) -> Option<Array2<f64>> {
         self.x_tau_tau_original
             .as_ref()
@@ -1876,7 +1864,6 @@ impl DirectionalHyperParam {
         self.penaltysecond_components.as_deref()
     }
 
-    #[cfg(test)]
     pub(crate) fn penalty_total_at(
         &self,
         rho: &Array1<f64>,
@@ -1915,7 +1902,6 @@ struct SparseExactEvalData {
     logdet_h: f64,
     logdet_s_pos: f64,
     det1_values: Arc<Array1<f64>>,
-    #[cfg(test)]
     traceworkspace: Arc<Mutex<SparseTraceWorkspace>>,
 }
 
@@ -1976,7 +1962,7 @@ pub(crate) struct FirthDenseOperator {
 }
 
 #[derive(Clone)]
-struct FirthDirection {
+pub(crate) struct FirthDirection {
     deta: Array1<f64>,
     g_u_reduced: Array2<f64>,
     a_u_reduced: Array2<f64>,
@@ -1986,7 +1972,7 @@ struct FirthDirection {
 }
 
 #[derive(Clone)]
-struct FirthTauPartialKernel {
+pub(crate) struct FirthTauPartialKernel {
     dotw1: Array1<f64>,
     dotw2: Array1<f64>,
     dot_h_partial: Array1<f64>,
@@ -2000,7 +1986,7 @@ struct FirthTauPartialKernel {
 }
 
 #[derive(Clone)]
-struct FirthTauExactKernel {
+pub(crate) struct FirthTauExactKernel {
     gphi_tau: Array1<f64>,
     phi_tau_partial: f64,
     tau_kernel: Option<FirthTauPartialKernel>,

@@ -12,8 +12,8 @@ use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
 use crate::families::sigma_link::{
-    exp_sigma_derivs_up_to_fourth, exp_sigma_derivs_up_to_fourth_scalar,
-    exp_sigma_derivs_up_to_third, exp_sigma_derivs_up_to_third_scalar,
+    exp_sigma_derivs_up_to_fourth, exp_sigma_derivs_up_to_third,
+    exp_sigma_derivs_up_to_third_scalar,
 };
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, SymmetricMatrix, xt_diag_x_symmetric,
@@ -25,7 +25,7 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, TwoBlockExactJointHyperSetup,
+    TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design,
     optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
@@ -857,26 +857,6 @@ struct SurvivalJointQuantities {
     d2q_ls: Array1<f64>,
     d3q_tls_ls: Array1<f64>,
     d3q_ls: Array1<f64>,
-    /// 4th-order chain-rule derivative: ∂⁴q/∂η_ϑ∂η_s³ = σ⁻¹.
-    ///
-    /// This follows the alternating-sign pattern of the exp link (σ = exp(η_s)):
-    ///   u_ϑ = -σ⁻¹,  u_ϑs = σ⁻¹,  u_ϑss = -σ⁻¹,  u_ϑsss = σ⁻¹
-    /// The sign alternates at each additional s-derivative because
-    /// d/d(η_s)[σ⁻¹] = -σ⁻¹ (chain rule through exp).
-    ///
-    /// Needed by the (ϑ,s,s,s) block of the outer Hessian drift Q[v_k, v_l].
-    /// See response.md Section 6.
-    d4q_tls_ls_ls: Array1<f64>,
-    /// 4th-order chain-rule derivative: ∂⁴q/∂η_s⁴ = -ϑ/σ.
-    ///
-    /// Follows the same alternating-sign pattern:
-    ///   u_s = ϑ/σ,  u_ss = -ϑ/σ,  u_sss = ϑ/σ,  u_ssss = -ϑ/σ
-    /// Each additional s-derivative flips the sign because
-    /// d/d(η_s)[ϑ/σ] = -ϑ/σ.
-    ///
-    /// Needed by the (s,s,s,s) block of the outer Hessian drift Q[v_k, v_l].
-    /// See response.md Section 6.
-    d4q_ls: Array1<f64>,
     /// Entry-side dq0/d(eta_t_entry) = -1/sigma_entry (only for time-varying).
     dq_t_entry: Option<Array1<f64>>,
     /// Entry-side chain-rule derivatives for sigma at entry (only for time-varying sigma).
@@ -885,10 +865,6 @@ struct SurvivalJointQuantities {
     d2q_ls_entry: Option<Array1<f64>>,
     d3q_tls_ls_entry: Option<Array1<f64>>,
     d3q_ls_entry: Option<Array1<f64>>,
-    /// Entry-side 4th-order chain-rule: ∂⁴q/∂η_ϑ∂η_s³ at entry.
-    d4q_tls_ls_ls_entry: Option<Array1<f64>>,
-    /// Entry-side 4th-order chain-rule: ∂⁴q/∂η_s⁴ at entry.
-    d4q_ls_entry: Option<Array1<f64>>,
 }
 
 struct SurvivalJointPsiDirection {
@@ -1225,16 +1201,12 @@ impl SurvivalLocationScaleFamily {
             d2q_ls: exit_qd.d2q_ls,
             d3q_tls_ls: exit_qd.d3q_tls_ls,
             d3q_ls: exit_qd.d3q_ls,
-            d4q_tls_ls_ls: exit_qd.d4q_tls_ls_ls,
-            d4q_ls: exit_qd.d4q_ls,
             dq_t_entry,
             dq_ls_entry: entry_qd.as_ref().map(|q| q.dq_ls.clone()),
             d2q_tls_entry: entry_qd.as_ref().map(|q| q.d2q_tls.clone()),
             d2q_ls_entry: entry_qd.as_ref().map(|q| q.d2q_ls.clone()),
             d3q_tls_ls_entry: entry_qd.as_ref().map(|q| q.d3q_tls_ls.clone()),
             d3q_ls_entry: entry_qd.as_ref().map(|q| q.d3q_ls.clone()),
-            d4q_tls_ls_ls_entry: entry_qd.as_ref().map(|q| q.d4q_tls_ls_ls.clone()),
-            d4q_ls_entry: entry_qd.as_ref().map(|q| q.d4q_ls.clone()),
         })
     }
 
@@ -1265,7 +1237,7 @@ impl SurvivalLocationScaleFamily {
 
         let mut global = 0usize;
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for deriv in block_derivs {
+            for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
                     let mut x_t_exit_psi = Array2::<f64>::zeros((n, pt));
                     let mut x_t_entry_psi = Array2::<f64>::zeros((n, pt));
@@ -1762,14 +1734,14 @@ impl SurvivalLocationScaleFamily {
         //   ell_q0   = w r(u0)
         //   ell_q0q0 = w r'(u0)
         //   ell_q0q0q0 = w r''(u0)
-        //   ell_q0q0q0q0 = w r'''(u0)        ← NEW: 4th-order entry derivative
+        //   ell_q0q0q0q0 = w r'''(u0)        ← 4th-order entry derivative
         //
         // and exit-only derivatives (w.r.t. q1):
         //
         //   ell_q1   = w [ d d/du log f(u1) + (1-d) (-r(u1)) ]
         //   ell_q1q1 = w [ d d²/du² log f(u1) + (1-d) (-r'(u1)) ]
         //   ell_q1q1q1 = w [ d d³/du³ log f(u1) + (1-d) (-r''(u1)) ]
-        //   ell_q1q1q1q1 = w [ d d⁴/du⁴ log f(u1) + (1-d) (-r'''(u1)) ]  ← NEW
+        //   ell_q1q1q1q1 = w [ d d⁴/du⁴ log f(u1) + (1-d) (-r'''(u1)) ]  ← 4th-order exit derivative
         //
         // When q0 = q1 = q (time-invariant blocks), ell_q = ell_q0 + ell_q1.
         //
@@ -1995,11 +1967,10 @@ pub(crate) fn q_chain_derivs_fourth_scalar(
     // d4q_ls in the struct = ∂⁴q/∂η_s⁴ = u_ssss
     //   = η_ϑ · [σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³ + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵]
     //
-    // So the 4th-order q chain derivatives that are genuinely NEW are:
+    // So the 4th-order q chain derivatives that are introduced here are:
     //   (a) u_ϑsss = 3rd s-partial of u_ϑ — already computed as q_ll_ls/eta_t
     //       but stored explicitly for the Faà di Bruno formula
     //   (b) u_ssss = 4th s-partial of q — needs σ''''
-    let q_tl_ls_ls = q_ll_ls / eta_t.max(1e-300).min(-1e-300).copysign(eta_t);
     // Recompute cleanly to avoid division issues when eta_t ≈ 0:
     let q_tl_ls_ls_clean = d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * ds2 * dsigma / s4;
 
@@ -4607,7 +4578,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d3q_tls_ls_entry = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
         let d3q_ls_entry = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
 
-        let q0_psi = &(&dq_t_entry * &dir.z_t_entry_psi) + &(&dq_ls_entry * &dir.z_ls_entry_psi);
+        let q0_psi = &(dq_t_entry * &dir.z_t_entry_psi) + &(dq_ls_entry * &dir.z_ls_entry_psi);
         let q1_psi = &(&q.dq_t * &dir.z_t_exit_psi) + &(&q.dq_ls * &dir.z_ls_exit_psi);
         let dq_t_entry_psi = d2q_tls_entry * &dir.z_ls_entry_psi;
         let dq_t_exit_psi = &q.d2q_tls * &dir.z_ls_exit_psi;
@@ -4869,9 +4840,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // 4th-order chain-rule derivatives for the second-order Hessian drift.
         // These enter the (ϑ,s,s,s) and (s,s,s,s) blocks of the bilinear
         // d²q_chain/dψ² computation via the Faà di Bruno formula.
-        let d4q_tls_ls_ls_entry = q.d4q_tls_ls_ls_entry.as_ref().unwrap_or(&q.d4q_tls_ls_ls);
-        let d4q_ls_entry = q.d4q_ls_entry.as_ref().unwrap_or(&q.d4q_ls);
-
         let entry_cross = &(&dir_i.z_t_entry_psi * &dir_j.z_ls_entry_psi)
             + &(&dir_j.z_t_entry_psi * &dir_i.z_ls_entry_psi);
         let exit_cross = &(&dir_i.z_t_exit_psi * &dir_j.z_ls_exit_psi)
@@ -4937,63 +4905,46 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         //   Σ_k (∂³q/∂α∂β∂η_k) · z_k_ab
         //     + Σ_{k,l} (∂⁴q/∂α∂β∂η_k∂η_l) · z_k_i · z_l_j
         //
-        // The second sum is the NEW 4th-order contribution. It is nonzero
+        // The second sum is the additional 4th-order contribution. It is nonzero
         // only when at least one of k,l is an η_s index, because:
         //   u_ϑsss = ∂⁴q/∂η_ϑ∂η_s³ ≠ 0
         //   u_ssss = ∂⁴q/∂η_s⁴ ≠ 0
         //
         // For the (ϑ,s) cross block: ∂²(d2q_tls)/dψ² needs d4q_tls_ls_ls.
         // For the (s,s) block: ∂²(d2q_ls)/dψ² needs d4q_tls_ls_ls and d4q_ls.
-        let ls_prod_entry = &dir_i.z_ls_entry_psi * &dir_j.z_ls_entry_psi;
-        let ls_prod_exit = &dir_i.z_ls_exit_psi * &dir_j.z_ls_exit_psi;
-        let d2q_tls_entry_ab =
-            &(d3q_tls_ls_entry * &z_ls_entry_ab) + &(d4q_tls_ls_ls_entry * &ls_prod_entry);
-        let d2q_tls_exit_ab =
-            &(&q.d3q_tls_ls * &z_ls_exit_ab) + &(&q.d4q_tls_ls_ls * &ls_prod_exit);
-        let tls_cross_entry = &(&dir_i.z_t_entry_psi * &dir_j.z_ls_entry_psi)
-            + &(&dir_j.z_t_entry_psi * &dir_i.z_ls_entry_psi);
-        let tls_cross_exit = &(&dir_i.z_t_exit_psi * &dir_j.z_ls_exit_psi)
-            + &(&dir_j.z_t_exit_psi * &dir_i.z_ls_exit_psi);
-        let d2q_ls_entry_ab = &(d3q_tls_ls_entry * &z_t_entry_ab)
-            + &(d3q_ls_entry * &z_ls_entry_ab)
-            + &(d4q_tls_ls_ls_entry * &tls_cross_entry)
-            + &(d4q_ls_entry * &ls_prod_entry);
-        let d2q_ls_exit_ab = &(&q.d3q_tls_ls * &z_t_exit_ab)
-            + &(&q.d3q_ls * &z_ls_exit_ab)
-            + &(&q.d4q_tls_ls_ls * &tls_cross_exit)
-            + &(&q.d4q_ls * &ls_prod_exit);
-
-        let objective_psi_psi = (&q.d2_q0 * &(q0_i * q0_j)).sum()
-            + q.d1_q0.dot(q0_ab)
-            + (&q.d2_q1 * &(q1_i * q1_j)).sum()
-            + q.d1_q1.dot(q1_ab);
+        let objective_psi_psi = (&q.d2_q0 * &(&q0_i * &q0_j)).sum()
+            + q.d1_q0.dot(&q0_ab)
+            + (&q.d2_q1 * &(&q1_i * &q1_j)).sum()
+            + q.d1_q1.dot(&q1_ab);
 
         let mut score_psi_psi = Array1::<f64>::zeros(p_total);
         let time_score = self
             .x_time_entry
             .t()
-            .dot(&(-(&q.d3_q0 * &(q0_i * q0_j) + &q.d2_q0 * q0_ab)))
+            .dot(&(-(&q.d3_q0 * &(&q0_i * &q0_j) + &q.d2_q0 * &q0_ab)))
             + self
                 .x_time_exit
                 .t()
-                .dot(&(-(&q.d3_q1 * &(q1_i * q1_j) + &q.d2_q1 * q1_ab)));
+                .dot(&(-(&q.d3_q1 * &(&q1_i * &q1_j) + &q.d2_q1 * &q1_ab)));
         score_psi_psi
             .slice_mut(s![offsets[0]..offsets[1]])
             .assign(&time_score);
 
         let threshold_score_row_exit = &q.d1_q1 * &q.dq_t;
         let threshold_score_row_entry = &q.d1_q0 * dq_t_entry;
-        let d_threshold_score_row_exit_i = &q.d2_q1 * q1_i * &q.dq_t + &q.d1_q1 * &dq_t_exit_i;
-        let d_threshold_score_row_entry_i = &q.d2_q0 * q0_i * dq_t_entry + &q.d1_q0 * &dq_t_entry_i;
-        let d_threshold_score_row_exit_j = &q.d2_q1 * q1_j * &q.dq_t + &q.d1_q1 * &dq_t_exit_j;
-        let d_threshold_score_row_entry_j = &q.d2_q0 * q0_j * dq_t_entry + &q.d1_q0 * &dq_t_entry_j;
-        let d2_threshold_score_row_exit = &(&q.d3_q1 * &(q1_i * q1_j) * &q.dq_t)
-            + &(&q.d2_q1 * q1_ab * &q.dq_t)
-            + &(&q.d2_q1 * &(q1_i * &dq_t_exit_j + q1_j * &dq_t_exit_i))
+        let d_threshold_score_row_exit_i = &q.d2_q1 * &q1_i * &q.dq_t + &q.d1_q1 * &dq_t_exit_i;
+        let d_threshold_score_row_entry_i =
+            &q.d2_q0 * &q0_i * dq_t_entry + &q.d1_q0 * &dq_t_entry_i;
+        let d_threshold_score_row_exit_j = &q.d2_q1 * &q1_j * &q.dq_t + &q.d1_q1 * &dq_t_exit_j;
+        let d_threshold_score_row_entry_j =
+            &q.d2_q0 * &q0_j * dq_t_entry + &q.d1_q0 * &dq_t_entry_j;
+        let d2_threshold_score_row_exit = &(&q.d3_q1 * &(&q1_i * &q1_j) * &q.dq_t)
+            + &(&q.d2_q1 * &q1_ab * &q.dq_t)
+            + &(&q.d2_q1 * &(&q1_i * &dq_t_exit_j + &q1_j * &dq_t_exit_i))
             + &(&q.d1_q1 * dq_t_exit_ab);
-        let d2_threshold_score_row_entry = &(&q.d3_q0 * &(q0_i * q0_j) * dq_t_entry)
-            + &(&q.d2_q0 * q0_ab * dq_t_entry)
-            + &(&q.d2_q0 * &(q0_i * &dq_t_entry_j + q0_j * &dq_t_entry_i))
+        let d2_threshold_score_row_entry = &(&q.d3_q0 * &(&q0_i * &q0_j) * dq_t_entry)
+            + &(&q.d2_q0 * &q0_ab * dq_t_entry)
+            + &(&q.d2_q0 * &(&q0_i * &dq_t_entry_j + &q0_j * &dq_t_entry_i))
             + &(&q.d1_q0 * dq_t_entry_ab);
         let threshold_score = x_t_exit_ab.t().dot(&threshold_score_row_exit)
             + dir_i.x_t_exit_psi.t().dot(&d_threshold_score_row_exit_j)
@@ -5009,19 +4960,19 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let log_sigma_score_row_exit = &q.d1_q1 * &q.dq_ls;
         let log_sigma_score_row_entry = &q.d1_q0 * dq_ls_entry;
-        let d_log_sigma_score_row_exit_i = &q.d2_q1 * q1_i * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_i;
+        let d_log_sigma_score_row_exit_i = &q.d2_q1 * &q1_i * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_i;
         let d_log_sigma_score_row_entry_i =
-            &q.d2_q0 * q0_i * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_i;
-        let d_log_sigma_score_row_exit_j = &q.d2_q1 * q1_j * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_j;
+            &q.d2_q0 * &q0_i * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_i;
+        let d_log_sigma_score_row_exit_j = &q.d2_q1 * &q1_j * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_j;
         let d_log_sigma_score_row_entry_j =
-            &q.d2_q0 * q0_j * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_j;
-        let d2_log_sigma_score_row_exit = &(&q.d3_q1 * &(q1_i * q1_j) * &q.dq_ls)
-            + &(&q.d2_q1 * q1_ab * &q.dq_ls)
-            + &(&q.d2_q1 * &(q1_i * &dq_ls_exit_j + q1_j * &dq_ls_exit_i))
+            &q.d2_q0 * &q0_j * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_j;
+        let d2_log_sigma_score_row_exit = &(&q.d3_q1 * &(&q1_i * &q1_j) * &q.dq_ls)
+            + &(&q.d2_q1 * &q1_ab * &q.dq_ls)
+            + &(&q.d2_q1 * &(&q1_i * &dq_ls_exit_j + &q1_j * &dq_ls_exit_i))
             + &(&q.d1_q1 * dq_ls_exit_ab);
-        let d2_log_sigma_score_row_entry = &(&q.d3_q0 * &(q0_i * q0_j) * dq_ls_entry)
-            + &(&q.d2_q0 * q0_ab * dq_ls_entry)
-            + &(&q.d2_q0 * &(q0_i * &dq_ls_entry_j + q0_j * &dq_ls_entry_i))
+        let d2_log_sigma_score_row_entry = &(&q.d3_q0 * &(&q0_i * &q0_j) * dq_ls_entry)
+            + &(&q.d2_q0 * &q0_ab * dq_ls_entry)
+            + &(&q.d2_q0 * &(&q0_i * &dq_ls_entry_j + &q0_j * &dq_ls_entry_i))
             + &(&q.d1_q0 * dq_ls_entry_ab);
         let log_sigma_score = x_ls_exit_ab.t().dot(&log_sigma_score_row_exit)
             + dir_i.x_ls_exit_psi.t().dot(&d_log_sigma_score_row_exit_j)
@@ -5037,10 +4988,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         if let (Some(xw_dense), Some(w_offset)) = (xw.as_ref(), offsets.get(3).copied()) {
             let wiggle_score = xw_dense.t().dot(
-                &(&q.d3_q0 * &(q0_i * q0_j)
-                    + &q.d2_q0 * q0_ab
-                    + &q.d3_q1 * &(q1_i * q1_j)
-                    + &q.d2_q1 * q1_ab),
+                &(&q.d3_q0 * &(&q0_i * &q0_j)
+                    + &q.d2_q0 * &q0_ab
+                    + &q.d3_q1 * &(&q1_i * &q1_j)
+                    + &q.d2_q1 * &q1_ab),
             );
             score_psi_psi
                 .slice_mut(s![w_offset..offsets[4]])
@@ -5062,22 +5013,22 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
         let h_time_time = fast_xt_diag_x(
             &self.x_time_entry,
-            &(-(&q.d3_q0 * q0_ab) - &(&q.d_h_h0 * &(q0_i * q0_j))),
+            &(-(&q.d3_q0 * &q0_ab) - &(&q.d_h_h0 * &(&q0_i * &q0_j))),
         ) + fast_xt_diag_x(
             &self.x_time_exit,
-            &(-(&q.d3_q1 * q1_ab) - &(&q.d_h_h1 * &(q1_i * q1_j))),
+            &(-(&q.d3_q1 * &q1_ab) - &(&q.d_h_h1 * &(&q1_i * &q1_j))),
         );
         assign_symmetric_block(&mut hessian_psi_psi, offsets[0], offsets[0], &h_time_time);
 
         let h_tt_entry = -(&q.d2_q0 * &dq_t_entry.mapv(|v| v * v));
         let h_tt_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| v * v));
-        let dh_tt_entry_i = -(&q.d3_q0 * q0_i * &dq_t_entry.mapv(|v| v * v)
+        let dh_tt_entry_i = -(&q.d3_q0 * &q0_i * &dq_t_entry.mapv(|v| v * v)
             + &(2.0 * &q.d2_q0 * dq_t_entry * &dq_t_entry_i));
-        let dh_tt_exit_i = -(&q.d3_q1 * q1_i * &q.dq_t.mapv(|v| v * v)
+        let dh_tt_exit_i = -(&q.d3_q1 * &q1_i * &q.dq_t.mapv(|v| v * v)
             + &(2.0 * &q.d2_q1 * &q.dq_t * &dq_t_exit_i));
-        let dh_tt_entry_j = -(&q.d3_q0 * q0_j * &dq_t_entry.mapv(|v| v * v)
+        let dh_tt_entry_j = -(&q.d3_q0 * &q0_j * &dq_t_entry.mapv(|v| v * v)
             + &(2.0 * &q.d2_q0 * dq_t_entry * &dq_t_entry_j));
-        let dh_tt_exit_j = -(&q.d3_q1 * q1_j * &q.dq_t.mapv(|v| v * v)
+        let dh_tt_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_t.mapv(|v| v * v)
             + &(2.0 * &q.d2_q1 * &q.dq_t * &dq_t_exit_j));
         let h_threshold_threshold =
             weighted_crossprod_dense(&x_t_exit_ab, &h_tt_exit, &x_threshold_exit)?
@@ -5129,21 +5080,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let h_ll_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| v * v) + &(&q.d1_q0 * d2q_ls_entry));
         let h_ll_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| v * v) + &(&q.d1_q1 * &q.d2q_ls));
-        let dh_ll_entry_i = -(&q.d3_q0 * q0_i * &dq_ls_entry.mapv(|v| v * v)
+        let dh_ll_entry_i = -(&q.d3_q0 * &q0_i * &dq_ls_entry.mapv(|v| v * v)
             + &(2.0 * &q.d2_q0 * dq_ls_entry * &dq_ls_entry_i)
-            + &(&q.d2_q0 * q0_i * d2q_ls_entry)
+            + &(&q.d2_q0 * &q0_i * d2q_ls_entry)
             + &(&q.d1_q0 * &d2q_ls_entry_i));
-        let dh_ll_exit_i = -(&q.d3_q1 * q1_i * &q.dq_ls.mapv(|v| v * v)
+        let dh_ll_exit_i = -(&q.d3_q1 * &q1_i * &q.dq_ls.mapv(|v| v * v)
             + &(2.0 * &q.d2_q1 * &q.dq_ls * &dq_ls_exit_i)
-            + &(&q.d2_q1 * q1_i * &q.d2q_ls)
+            + &(&q.d2_q1 * &q1_i * &q.d2q_ls)
             + &(&q.d1_q1 * &d2q_ls_exit_i));
-        let dh_ll_entry_j = -(&q.d3_q0 * q0_j * &dq_ls_entry.mapv(|v| v * v)
+        let dh_ll_entry_j = -(&q.d3_q0 * &q0_j * &dq_ls_entry.mapv(|v| v * v)
             + &(2.0 * &q.d2_q0 * dq_ls_entry * &dq_ls_entry_j)
-            + &(&q.d2_q0 * q0_j * d2q_ls_entry)
+            + &(&q.d2_q0 * &q0_j * d2q_ls_entry)
             + &(&q.d1_q0 * &d2q_ls_entry_j));
-        let dh_ll_exit_j = -(&q.d3_q1 * q1_j * &q.dq_ls.mapv(|v| v * v)
+        let dh_ll_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_ls.mapv(|v| v * v)
             + &(2.0 * &q.d2_q1 * &q.dq_ls * &dq_ls_exit_j)
-            + &(&q.d2_q1 * q1_j * &q.d2q_ls)
+            + &(&q.d2_q1 * &q1_j * &q.d2q_ls)
             + &(&q.d1_q1 * &d2q_ls_exit_j));
         let h_log_sigma_log_sigma =
             weighted_crossprod_dense(&x_ls_exit_ab, &h_ll_exit, &x_log_sigma_exit)?
@@ -5195,21 +5146,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let h_tl_entry = -(&q.d2_q0 * &(dq_t_entry * dq_ls_entry) + &(&q.d1_q0 * d2q_tls_entry));
         let h_tl_exit = -(&q.d2_q1 * &(&q.dq_t * &q.dq_ls) + &(&q.d1_q1 * &q.d2q_tls));
-        let dh_tl_entry_i = -(&q.d3_q0 * q0_i * &(dq_t_entry * dq_ls_entry)
+        let dh_tl_entry_i = -(&q.d3_q0 * &q0_i * &(dq_t_entry * dq_ls_entry)
             + &(&q.d2_q0 * &(&dq_t_entry_i * dq_ls_entry + dq_t_entry * &dq_ls_entry_i))
-            + &(&q.d2_q0 * q0_i * d2q_tls_entry)
+            + &(&q.d2_q0 * &q0_i * d2q_tls_entry)
             + &(&q.d1_q0 * &d2q_tls_entry_i));
-        let dh_tl_exit_i = -(&q.d3_q1 * q1_i * &(&q.dq_t * &q.dq_ls)
+        let dh_tl_exit_i = -(&q.d3_q1 * &q1_i * &(&q.dq_t * &q.dq_ls)
             + &(&q.d2_q1 * &(&dq_t_exit_i * &q.dq_ls + &q.dq_t * &dq_ls_exit_i))
-            + &(&q.d2_q1 * q1_i * &q.d2q_tls)
+            + &(&q.d2_q1 * &q1_i * &q.d2q_tls)
             + &(&q.d1_q1 * &d2q_tls_exit_i));
-        let dh_tl_entry_j = -(&q.d3_q0 * q0_j * &(dq_t_entry * dq_ls_entry)
+        let dh_tl_entry_j = -(&q.d3_q0 * &q0_j * &(dq_t_entry * dq_ls_entry)
             + &(&q.d2_q0 * &(&dq_t_entry_j * dq_ls_entry + dq_t_entry * &dq_ls_entry_j))
-            + &(&q.d2_q0 * q0_j * d2q_tls_entry)
+            + &(&q.d2_q0 * &q0_j * d2q_tls_entry)
             + &(&q.d1_q0 * &d2q_tls_entry_j));
-        let dh_tl_exit_j = -(&q.d3_q1 * q1_j * &(&q.dq_t * &q.dq_ls)
+        let dh_tl_exit_j = -(&q.d3_q1 * &q1_j * &(&q.dq_t * &q.dq_ls)
             + &(&q.d2_q1 * &(&dq_t_exit_j * &q.dq_ls + &q.dq_t * &dq_ls_exit_j))
-            + &(&q.d2_q1 * q1_j * &q.d2q_tls)
+            + &(&q.d2_q1 * &q1_j * &q.d2q_tls)
             + &(&q.d1_q1 * &d2q_tls_exit_j));
         let h_threshold_log_sigma =
             weighted_crossprod_dense(&x_t_exit_ab, &h_tl_exit, &x_log_sigma_exit)?
@@ -5261,10 +5212,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let h_h0_t = &q.d2_q0 * dq_t_entry;
         let h_h1_t = &q.d2_q1 * &q.dq_t;
-        let dh_h0_t_i = &q.d3_q0 * q0_i * dq_t_entry + &q.d2_q0 * &dq_t_entry_i;
-        let dh_h1_t_i = &q.d3_q1 * q1_i * &q.dq_t + &q.d2_q1 * &dq_t_exit_i;
-        let dh_h0_t_j = &q.d3_q0 * q0_j * dq_t_entry + &q.d2_q0 * &dq_t_entry_j;
-        let dh_h1_t_j = &q.d3_q1 * q1_j * &q.dq_t + &q.d2_q1 * &dq_t_exit_j;
+        let dh_h0_t_i = &q.d3_q0 * &q0_i * dq_t_entry + &q.d2_q0 * &dq_t_entry_i;
+        let dh_h1_t_i = &q.d3_q1 * &q1_i * &q.dq_t + &q.d2_q1 * &dq_t_exit_i;
+        let dh_h0_t_j = &q.d3_q0 * &q0_j * dq_t_entry + &q.d2_q0 * &dq_t_entry_j;
+        let dh_h1_t_j = &q.d3_q1 * &q1_j * &q.dq_t + &q.d2_q1 * &dq_t_exit_j;
         let h_time_threshold =
             weighted_crossprod_dense(&self.x_time_entry, &dh_h0_t_j, &dir_i.x_t_entry_psi)?
                 + weighted_crossprod_dense(&self.x_time_entry, &dh_h0_t_i, &dir_j.x_t_entry_psi)?
@@ -5281,10 +5232,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let h_h0_ls = &q.d2_q0 * dq_ls_entry;
         let h_h1_ls = &q.d2_q1 * &q.dq_ls;
-        let dh_h0_ls_i = &q.d3_q0 * q0_i * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_i;
-        let dh_h1_ls_i = &q.d3_q1 * q1_i * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_i;
-        let dh_h0_ls_j = &q.d3_q0 * q0_j * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_j;
-        let dh_h1_ls_j = &q.d3_q1 * q1_j * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_j;
+        let dh_h0_ls_i = &q.d3_q0 * &q0_i * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_i;
+        let dh_h1_ls_i = &q.d3_q1 * &q1_i * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_i;
+        let dh_h0_ls_j = &q.d3_q0 * &q0_j * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_j;
+        let dh_h1_ls_j = &q.d3_q1 * &q1_j * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_j;
         let h_time_log_sigma =
             weighted_crossprod_dense(&self.x_time_entry, &dh_h0_ls_j, &dir_i.x_ls_entry_psi)?
                 + weighted_crossprod_dense(&self.x_time_entry, &dh_h0_ls_i, &dir_j.x_ls_entry_psi)?
@@ -5300,16 +5251,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         );
 
         if let (Some(xw_dense), Some(w_offset)) = (xw.as_ref(), offsets.get(3).copied()) {
-            let h_ww = -(&q.d3_q0 * q0_ab + &q.d3_q1 * q1_ab);
+            let h_ww = -(&q.d3_q0 * &q0_ab + &q.d3_q1 * &q1_ab);
             let h_wiggle_wiggle = weighted_crossprod_dense(xw_dense, &h_ww, xw_dense)?;
             assign_symmetric_block(&mut hessian_psi_psi, w_offset, w_offset, &h_wiggle_wiggle);
 
             let h_tw_entry = -(&q.d2_q0 * dq_t_entry);
             let h_tw_exit = -(&q.d2_q1 * &q.dq_t);
-            let dh_tw_entry_i = -(&q.d3_q0 * q0_i * dq_t_entry + &q.d2_q0 * &dq_t_entry_i);
-            let dh_tw_exit_i = -(&q.d3_q1 * q1_i * &q.dq_t + &q.d2_q1 * &dq_t_exit_i);
-            let dh_tw_entry_j = -(&q.d3_q0 * q0_j * dq_t_entry + &q.d2_q0 * &dq_t_entry_j);
-            let dh_tw_exit_j = -(&q.d3_q1 * q1_j * &q.dq_t + &q.d2_q1 * &dq_t_exit_j);
+            let dh_tw_entry_i = -(&q.d3_q0 * &q0_i * dq_t_entry + &q.d2_q0 * &dq_t_entry_i);
+            let dh_tw_exit_i = -(&q.d3_q1 * &q1_i * &q.dq_t + &q.d2_q1 * &dq_t_exit_i);
+            let dh_tw_entry_j = -(&q.d3_q0 * &q0_j * dq_t_entry + &q.d2_q0 * &dq_t_entry_j);
+            let dh_tw_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_t + &q.d2_q1 * &dq_t_exit_j);
             let h_threshold_wiggle =
                 weighted_crossprod_dense(&dir_i.x_t_exit_psi, &dh_tw_exit_j, xw_dense)?
                     + weighted_crossprod_dense(&dir_j.x_t_exit_psi, &dh_tw_exit_i, xw_dense)?
@@ -5326,10 +5277,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
             let h_lw_entry = -(&q.d2_q0 * dq_ls_entry);
             let h_lw_exit = -(&q.d2_q1 * &q.dq_ls);
-            let dh_lw_entry_i = -(&q.d3_q0 * q0_i * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_i);
-            let dh_lw_exit_i = -(&q.d3_q1 * q1_i * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_i);
-            let dh_lw_entry_j = -(&q.d3_q0 * q0_j * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_j);
-            let dh_lw_exit_j = -(&q.d3_q1 * q1_j * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_j);
+            let dh_lw_entry_i = -(&q.d3_q0 * &q0_i * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_i);
+            let dh_lw_exit_i = -(&q.d3_q1 * &q1_i * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_i);
+            let dh_lw_entry_j = -(&q.d3_q0 * &q0_j * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_j);
+            let dh_lw_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_j);
             let h_log_sigma_wiggle =
                 weighted_crossprod_dense(&dir_i.x_ls_exit_psi, &dh_lw_exit_j, xw_dense)?
                     + weighted_crossprod_dense(&dir_j.x_ls_exit_psi, &dh_lw_exit_i, xw_dense)?
@@ -5345,8 +5296,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             );
 
             let h_time_wiggle =
-                weighted_crossprod_dense(&self.x_time_entry, &(&q.d3_q0 * q0_ab), xw_dense)?
-                    + weighted_crossprod_dense(&self.x_time_exit, &(&q.d3_q1 * q1_ab), xw_dense)?;
+                weighted_crossprod_dense(&self.x_time_entry, &(&q.d3_q0 * &q0_ab), xw_dense)?
+                    + weighted_crossprod_dense(&self.x_time_exit, &(&q.d3_q1 * &q1_ab), xw_dense)?;
             assign_symmetric_block(&mut hessian_psi_psi, offsets[0], w_offset, &h_time_wiggle);
         }
 
@@ -5403,7 +5354,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let delta_h0 = self.x_time_entry.dot(&time_dir);
         let delta_h1 = self.x_time_exit.dot(&time_dir);
-        let delta_d = self.x_time_deriv.dot(&time_dir);
         let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
         let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
         let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
@@ -5479,24 +5429,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         let dq_t_entry = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
         let dq_ls_entry = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-        let d2q_tls_entry = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
         let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
 
         let q0_psi = &(dq_t_entry * &dir.z_t_entry_psi) + &(dq_ls_entry * &dir.z_ls_entry_psi);
         let q1_psi = &(&q.dq_t * &dir.z_t_exit_psi) + &(&q.dq_ls * &dir.z_ls_exit_psi);
-        let dq_t_entry_psi = d2q_tls_entry * &dir.z_ls_entry_psi;
-        let dq_t_exit_psi = &q.d2q_tls * &dir.z_ls_exit_psi;
-        let dq_ls_entry_psi =
-            d2q_tls_entry * &dir.z_t_entry_psi + d2q_ls_entry * &dir.z_ls_entry_psi;
-        let dq_ls_exit_psi = &q.d2q_tls * &dir.z_t_exit_psi + &q.d2q_ls * &dir.z_ls_exit_psi;
-        let d2q_tls_entry_psi =
-            q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls) * &dir.z_ls_entry_psi;
-        let d2q_tls_exit_psi = &q.d3q_tls_ls * &dir.z_ls_exit_psi;
-        let d2q_ls_entry_psi = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls)
-            * &dir.z_t_entry_psi
-            + q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls) * &dir.z_ls_entry_psi;
-        let d2q_ls_exit_psi = &q.d3q_tls_ls * &dir.z_t_exit_psi + &q.d3q_ls * &dir.z_ls_exit_psi;
-
         let z_t_entry_psi_u = dir.x_t_entry_psi.dot(&threshold_dir);
         let z_t_exit_psi_u = dir.x_t_exit_psi.dot(&threshold_dir);
         let z_ls_entry_psi_u = dir.x_ls_entry_psi.dot(&log_sigma_dir);
@@ -5509,19 +5445,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             + &(&q.dq_t * &z_t_exit_psi_u)
             + &(&delta_q_ls_exit * &dir.z_ls_exit_psi)
             + &(&q.dq_ls * &z_ls_exit_psi_u);
-        let dq_t_entry_psi_u = &(&entry_deltas.delta_q_tls * &dir.z_ls_entry_psi)
-            + &(d2q_tls_entry * &z_ls_entry_psi_u);
-        let dq_t_exit_psi_u =
-            &(&delta_q_tls_exit * &dir.z_ls_exit_psi) + &(&q.d2q_tls * &z_ls_exit_psi_u);
-        let dq_ls_entry_psi_u = &(&entry_deltas.delta_q_tls * &dir.z_t_entry_psi)
-            + &(d2q_tls_entry * &z_t_entry_psi_u)
-            + &(&entry_deltas.delta_q_ls_ls * &dir.z_ls_entry_psi)
-            + &(d2q_ls_entry * &z_ls_entry_psi_u);
-        let dq_ls_exit_psi_u = &(&delta_q_tls_exit * &dir.z_t_exit_psi)
-            + &(&q.d2q_tls * &z_t_exit_psi_u)
-            + &(&delta_q_ls_ls_exit * &dir.z_ls_exit_psi)
-            + &(&q.d2q_ls * &z_ls_exit_psi_u);
-
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
         let time_time = fast_xt_diag_x(
@@ -6429,8 +6352,8 @@ pub(crate) fn fit_survival_location_scale_terms(
     let exact_warm_start = std::cell::RefCell::new(None::<CustomFamilyWarmStart>);
 
     let build_spec = |rho: &Array1<f64>,
-                      _thresholdspec_resolved: &TermCollectionSpec,
-                      _log_sigmaspec_resolved: &TermCollectionSpec,
+                      _: &TermCollectionSpec,
+                      _: &TermCollectionSpec,
                       threshold_design: &TermCollectionDesign,
                       log_sigma_design: &TermCollectionDesign|
      -> Result<SurvivalLocationScaleSpec, String> {

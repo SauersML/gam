@@ -711,7 +711,7 @@ impl SpatialLogKappaCoords {
     }
 
     /// Reconstruct from theta tail with known dimensionality layout.
-    fn from_theta_tail_with_dims(
+    pub(crate) fn from_theta_tail_with_dims(
         theta: &Array1<f64>,
         start: usize,
         dims_per_term: Vec<usize>,
@@ -724,7 +724,7 @@ impl SpatialLogKappaCoords {
     }
 
     /// Total number of ψ values in the flat array (= sum of dims_per_term).
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.values.len()
     }
 
@@ -4503,6 +4503,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 x_psi_psi: None,
                 s_psi_psi: None,
                 s_psi_psi_components: None,
+                implicit_operator: None,
+                implicit_axis: 0,
+                implicit_group_id: None,
             })
             .collect::<Vec<_>>(),
     ];
@@ -8416,7 +8419,7 @@ fn enforce_psi_sum_to_zero(
                 // the projection changes the model (response.md §4a).
                 if let Some(rho_indices) = rho_kappa_indices {
                     if let Some(&rho_idx) = rho_indices.get(term_slot) {
-                        debug_assert!(
+                        assert!(
                             rho_idx < rho_dim,
                             "rho_kappa_indices[{}]={} exceeds rho_dim={}",
                             term_slot,
@@ -8630,93 +8633,6 @@ pub(crate) fn project_psi_hessian(
 /// but avoids forming the (D+1)×(D+1) KKT matrix by working in the
 /// (D−1)-dimensional reduced space directly.
 ///
-/// Returns `None` if the reduced Hessian is singular or the solve fails.
-pub(crate) fn constrained_psi_newton_step(
-    g_psi: &[f64],
-    h_psi: &Array2<f64>,
-) -> Option<Array1<f64>> {
-    let d = g_psi.len();
-    if d < 2 {
-        return Some(Array1::zeros(d));
-    }
-    debug_assert_eq!(h_psi.nrows(), d);
-    debug_assert_eq!(h_psi.ncols(), d);
-
-    let c = helmert_contrast_matrix(d);
-
-    // Reduced gradient: g̃ = C^T g_ψ  (size D−1)
-    let g_psi_arr = ArrayView1::from(g_psi);
-    let g_tilde = c.t().dot(&g_psi_arr);
-
-    // Reduced Hessian: H̃ = C^T H_ψψ C  (size (D−1)×(D−1))
-    let h_tilde = c.t().dot(&h_psi.dot(&c));
-
-    // Solve (D−1)×(D−1) system: H̃ δψ̃ = −g̃
-    // For small D (typically 2-10), direct Gaussian elimination is fine.
-    let neg_g_tilde = -&g_tilde;
-    let dm1 = d - 1;
-    let mut aug = Array2::<f64>::zeros((dm1, dm1 + 1));
-    aug.slice_mut(s![.., ..dm1]).assign(&h_tilde);
-    aug.slice_mut(s![.., dm1]).assign(&neg_g_tilde);
-
-    // Gaussian elimination with partial pivoting
-    for col in 0..dm1 {
-        // Find pivot
-        let mut max_val = aug[[col, col]].abs();
-        let mut max_row = col;
-        for row in (col + 1)..dm1 {
-            let val = aug[[row, col]].abs();
-            if val > max_val {
-                max_val = val;
-                max_row = row;
-            }
-        }
-        if max_val < 1e-14 {
-            return None; // Singular reduced Hessian
-        }
-        if max_row != col {
-            for j in 0..=dm1 {
-                let tmp = aug[[col, j]];
-                aug[[col, j]] = aug[[max_row, j]];
-                aug[[max_row, j]] = tmp;
-            }
-        }
-        // Eliminate below
-        let pivot = aug[[col, col]];
-        for row in (col + 1)..dm1 {
-            let factor = aug[[row, col]] / pivot;
-            for j in col..=dm1 {
-                aug[[row, j]] -= factor * aug[[col, j]];
-            }
-        }
-    }
-
-    // Back-substitution
-    let mut delta_tilde = Array1::<f64>::zeros(dm1);
-    for col in (0..dm1).rev() {
-        let mut sum = aug[[col, dm1]];
-        for j in (col + 1)..dm1 {
-            sum -= aug[[col, j]] * delta_tilde[j];
-        }
-        if aug[[col, col]].abs() < 1e-14 {
-            return None;
-        }
-        delta_tilde[col] = sum / aug[[col, col]];
-    }
-
-    // Lift back to ambient space: δψ = C δψ̃
-    let delta_psi = c.dot(&delta_tilde);
-
-    // Verify constraint: 1^T δψ ≈ 0
-    debug_assert!(
-        delta_psi.sum().abs() < 1e-10,
-        "constrained Newton step violates sum-to-zero: sum = {}",
-        delta_psi.sum()
-    );
-
-    Some(delta_psi)
-}
-
 /// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
 /// derivatives through the unified REML evaluator.
 ///
@@ -8744,7 +8660,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     rho_dim: usize,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    _: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());

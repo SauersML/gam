@@ -69,27 +69,6 @@ fn matref_is_finite(mat: MatRef<'_, f64>) -> bool {
     true
 }
 
-const BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
-
-#[derive(Clone, Copy, Debug)]
-struct BinomialAuxTerms {
-    a1: f64,
-    a2: f64,
-}
-
-#[inline]
-fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms {
-    let mu = if mu.is_finite() {
-        mu.clamp(BINOMIAL_AUX_MU_EPS, 1.0 - BINOMIAL_AUX_MU_EPS)
-    } else {
-        0.5
-    };
-    let one_minusmu = 1.0 - mu;
-    let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
-    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
-    BinomialAuxTerms { a1, a2 }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PirlsLinearSolvePath {
     DenseTransformed,
@@ -1178,8 +1157,8 @@ impl<'a> GamWorkingModel<'a> {
             lastmu,
             lastweights,
             lastz,
-            last_c,
-            last_d,
+            last_c: _,
+            last_d: _,
             lasthessian_weights,
             lasthessian_c,
             lasthessian_d,
@@ -3359,7 +3338,7 @@ where
     //   links, but either choice finds the same mode.
     // - Fisher scoring internally is FINE --- any convergent algorithm works.
     //   If observed curvature fails (non-SPD), we fall back to Fisher scoring.
-    // - The CRITICAL requirement is that the **output** Hessian (which flows
+    // - The requirement is that the output Hessian (which flows
     //   into the outer REML log|H| and trace terms) uses observed information.
     //   This is ensured by `into_final_state()` which stores the
     //   `lasthessian_weights` (observed when available) as `finalweights`.

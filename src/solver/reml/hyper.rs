@@ -1,5 +1,7 @@
+use super::unified::{LAML_RIDGE, smooth_floor_dp};
 use super::*;
 use crate::matrix::DenseRightProductView;
+use crate::pirls::DirectionalWorkingCurvature;
 
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //

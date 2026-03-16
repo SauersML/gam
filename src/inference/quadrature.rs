@@ -3188,19 +3188,6 @@ where
     }
 }
 
-/// Adaptive 2D GHQ expectation for correlated Gaussian latents.
-pub fn normal_expectation_2d_adaptive<F>(
-    ctx: &QuadratureContext,
-    mu: [f64; 2],
-    cov: [[f64; 2]; 2],
-    f: F,
-) -> f64
-where
-    F: Fn(f64, f64) -> f64,
-{
-    normal_expectation_nd_adaptive::<2, _>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
-}
-
 /// Adaptive 2D GHQ expectation for correlated Gaussian latents with a fallible integrand.
 pub fn normal_expectation_2d_adaptive_result<F, E>(
     ctx: &QuadratureContext,

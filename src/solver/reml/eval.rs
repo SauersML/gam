@@ -78,7 +78,7 @@ impl<'a> RemlState<'a> {
         }
 
         // Eigendecomposition of S(ρ).
-        let (evals, _evecs) = s_lambda
+        let (evals, _) = s_lambda
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
