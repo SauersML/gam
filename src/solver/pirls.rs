@@ -4442,6 +4442,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             penalty.rs_original,
             lambdas_slice,
             EngineDims::new(penalty.p, penalty.rs_original.len()),
+            penalty.penalty_shrinkage_floor,
         )?
     };
     let transformed_bounds = build_transformed_lower_bound_constraints(

@@ -132,7 +132,10 @@ mod tests {
                 .expect("single-penalty hyper direction");
         let rho = array![0.0];
 
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, false);
+        // Tight inner tolerance: the envelope theorem requires an exact inner
+        // P-IRLS optimum; 1e-10 leaves enough residual gradient to cause ~12%
+        // V_tau mismatch on this small (n=8) logistic problem.
+        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-14, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
@@ -253,12 +256,12 @@ mod tests {
             "V_tau sign mismatch: analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
         );
         assert!(
-            v_rel < 5e-2,
+            v_rel < 1e-3,
             "V_tau mismatch vs FD: rel={v_rel:.3e}, abs={v_abs:.3e}, analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
         );
 
         assert!(
-            cancellation.abs() < 5e-7,
+            cancellation.abs() < 1e-10,
             "stationarity cancellation failed: | -ell_beta^T B + beta^T S B | = {:.3e}",
             cancellation.abs()
         );
@@ -636,22 +639,47 @@ mod tests {
             .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
+        // FD via physical perturbation of design/penalty matrices (matching
+        // the V_tau FD pattern).  For column j we perturb X and S₀ along
+        // direction j, build fresh states, and evaluate the τ-gradient for
+        // every direction i at those perturbed states.
+        let x_tau_mats: Vec<Array2<f64>> = vec![
+            Array2::<f64>::zeros((x.nrows(), x.ncols())),
+            Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
+        ];
+        let s_tau_mats: Vec<Array2<f64>> = vec![
+            array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15]],
+            Array2::<f64>::zeros((x.ncols(), x.ncols())),
+        ];
+
         let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
+        let h = 1e-5;
         for j in 0..hyper_dirs.len() {
-            let h = 1e-5;
-            let mut theta_plus = theta.clone();
-            let mut theta_minus = theta.clone();
-            theta_plus[rho.len() + j] += h;
-            theta_minus[rho.len() + j] -= h;
-            let (_, g_plus, _) = state
-                .compute_joint_hypercostgradienthessian(&theta_plus, rho.len(), &hyper_dirs)
-                .expect("g+");
-            let (_, g_minus, _) = state
-                .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
-                .expect("g-");
-            let tau_col =
-                (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
-            h_ttfd.column_mut(j).assign(&tau_col);
+            let x_plus = &x + &x_tau_mats[j].mapv(|v| h * v);
+            let x_minus = &x - &x_tau_mats[j].mapv(|v| h * v);
+            let s_plus = &s0 + &s_tau_mats[j].mapv(|v| h * v);
+            let s_minus = &s0 - &s_tau_mats[j].mapv(|v| h * v);
+
+            let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
+            let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
+            state_plus.clearwarm_start();
+            state_minus.clearwarm_start();
+
+            for i in 0..hyper_dirs.len() {
+                let g_plus = single_directional_tau_gradient(
+                    &state_plus,
+                    &rho,
+                    hyper_dirs[i].clone(),
+                )
+                .expect("g+ for FD");
+                let g_minus = single_directional_tau_gradient(
+                    &state_minus,
+                    &rho,
+                    hyper_dirs[i].clone(),
+                )
+                .expect("g- for FD");
+                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
+            }
         }
         for i in 0..h_ttfd.nrows() {
             for j in 0..i {
@@ -760,22 +788,47 @@ mod tests {
         assert_eq!(h_tt_analytic.nrows(), hyper_dirs.len());
         assert_eq!(h_tt_analytic.ncols(), hyper_dirs.len());
 
+        // FD via physical perturbation of design/penalty matrices (matching
+        // the V_tau FD pattern).  For column j we perturb X and S₀ along
+        // direction j, build fresh states, and evaluate the τ-gradient for
+        // every direction i at those perturbed states.
+        let x_tau_mats: Vec<Array2<f64>> = vec![
+            Array2::<f64>::zeros((x.nrows(), x.ncols())),
+            Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
+        ];
+        let s_tau_mats: Vec<Array2<f64>> = vec![
+            array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15]],
+            Array2::<f64>::zeros((x.ncols(), x.ncols())),
+        ];
+
         let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
+        let h = 1e-5;
         for j in 0..hyper_dirs.len() {
-            let h = 1e-5;
-            let mut theta_plus = theta.clone();
-            let mut theta_minus = theta.clone();
-            theta_plus[rho.len() + j] += h;
-            theta_minus[rho.len() + j] -= h;
-            let (_, g_plus, _) = state
-                .compute_joint_hypercostgradienthessian(&theta_plus, rho.len(), &hyper_dirs)
-                .expect("g+");
-            let (_, g_minus, _) = state
-                .compute_joint_hypercostgradienthessian(&theta_minus, rho.len(), &hyper_dirs)
-                .expect("g-");
-            let col =
-                (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
-            h_ttfd.column_mut(j).assign(&col);
+            let x_plus = &x + &x_tau_mats[j].mapv(|v| h * v);
+            let x_minus = &x - &x_tau_mats[j].mapv(|v| h * v);
+            let s_plus = &s0 + &s_tau_mats[j].mapv(|v| h * v);
+            let s_minus = &s0 - &s_tau_mats[j].mapv(|v| h * v);
+
+            let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
+            let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
+            state_plus.clearwarm_start();
+            state_minus.clearwarm_start();
+
+            for i in 0..hyper_dirs.len() {
+                let g_plus = single_directional_tau_gradient(
+                    &state_plus,
+                    &rho,
+                    hyper_dirs[i].clone(),
+                )
+                .expect("g+ for FD");
+                let g_minus = single_directional_tau_gradient(
+                    &state_minus,
+                    &rho,
+                    hyper_dirs[i].clone(),
+                )
+                .expect("g- for FD");
+                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
+            }
         }
         for i in 0..h_ttfd.nrows() {
             for j in 0..i {
