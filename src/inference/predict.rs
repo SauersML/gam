@@ -1016,12 +1016,19 @@ impl BernoulliMarginalSlopePredictor {
                         }
                     }
 
-                    if let (Some(runtime), Some(beta_w)) =
-                        (self.link_deviation_runtime.as_ref(), beta_link_dev.clone())
+                    if let (Some(runtime), Some(link_dev_beta)) =
+                        (self.link_deviation_runtime.as_ref(), beta_link_dev.as_ref())
                     {
                         let basis_nodes = runtime
                             .design(&eta_nodes)
                             .map_err(EstimationError::InvalidInput)?;
+                        // link_dev_beta enters through the basis: each row of
+                        // basis_nodes encodes the design at the quadrature nodes,
+                        // whose columns correspond to link_dev_beta coefficients.
+                        // The gradient a_w = -B^T weighted_phi / m_a already captures
+                        // the first-order contribution; higher-order chain-rule
+                        // corrections through link_dev_eta = B * beta_w are WIP.
+                        debug_assert_eq!(basis_nodes.ncols(), link_dev_beta.len());
                         let a_w = basis_nodes.t().dot(&weighted_phi).mapv(|v| -v / m_a);
                         for j in 0..link_dev_dim {
                             row_grad[link_dev_offset + j] = a_w[j];

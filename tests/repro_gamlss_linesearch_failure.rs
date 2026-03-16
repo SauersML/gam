@@ -9,9 +9,8 @@ use gam::solver::outer_strategy::{
 /// pathological case that triggers a line-search failure inside BFGS.
 #[test]
 fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
-    let mut dummy = ();
     let mut obj = ClosureObjective {
-        state: &mut dummy,
+        state: 0i32,
         cap: OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -21,7 +20,8 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
             fixed_point_available: false,
             barrier_config: None,
         },
-        cost_fn: |ctx: &mut &mut (), x: &Array1<f64>| {
+        cost_fn: |ctx: &mut i32, x: &Array1<f64>| {
+            *ctx += 1;
             let r2 = x.dot(x);
             if r2 <= 1e-24 {
                 Ok(833.403058988699)
@@ -29,7 +29,8 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                 Ok(f64::INFINITY)
             }
         },
-        eval_fn: |ctx: &mut &mut (), x: &Array1<f64>| {
+        eval_fn: |ctx: &mut i32, x: &Array1<f64>| {
+            *ctx += 1;
             let r2 = x.dot(x);
             if r2 <= 1e-24 {
                 Ok(OuterEval {
@@ -45,10 +46,10 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                 })
             }
         },
-        reset_fn: None::<fn(&mut &mut ())>,
+        reset_fn: None::<fn(&mut i32)>,
         efs_fn: None::<
             fn(
-                &mut &mut (),
+                &mut i32,
                 &Array1<f64>,
             ) -> Result<EfsEval, gam::solver::estimate::EstimationError>,
         >,
@@ -67,7 +68,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         rho_bound: 30.0,
         heuristic_lambdas: None,
         initial_rho: Some(Array1::zeros(3)),
-        fallback_policy: Default::default(),
+        fallback_policy: gam::solver::outer_strategy::FallbackPolicy::Automatic,
     };
 
     let result = gam::solver::outer_strategy::run_outer(&mut obj, &config, "repro-linesearch");

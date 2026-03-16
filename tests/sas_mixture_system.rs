@@ -6,7 +6,7 @@ use gam::inference::predict::{
 };
 use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_fromspec};
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
-use ndarray::{Array1, Array2, array};
+use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 

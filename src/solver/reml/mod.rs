@@ -15,7 +15,7 @@ use std::ops::Range;
 mod cache;
 mod eval;
 mod firth;
-mod hyper;
+pub(crate) mod hyper;
 mod inner_strategy;
 mod runtime;
 mod trace;
@@ -1643,7 +1643,7 @@ pub(crate) struct FirthTauExactKernel {
 #[derive(Clone)]
 pub(crate) struct EvalShared {
     key: Option<Vec<u64>>,
-    pirls_result: Arc<PirlsResult>,
+    pub(crate) pirls_result: Arc<PirlsResult>,
     ridge_passport: RidgePassport,
     geometry: RemlGeometry,
     h_eff: Arc<Array2<f64>>,
@@ -1699,16 +1699,6 @@ pub(crate) struct EvalShared {
     ///   W := U_+ diag(1 / sqrt(mu_i))
     /// gives
     ///   H_+^dagger = W W'.
-    /// For any penalty root R_k with S_k = R_k' R_k,
-    ///   tr(H_+^dagger S_k)
-    /// = tr(W W' R_k' R_k)
-    /// = tr((R_k W)' (R_k W))
-    /// = ||R_k W||_F^2.
-    /// This is why the current code can evaluate the trace term from the
-    /// spectral factor alone, but it also means the computation is tied to a
-    /// dense eigenbasis rather than a sparse factorization.
-    h_pos_factorw: Arc<Array2<f64>>,
-
     /// Relative eigengap between kept and dropped spectra around the H_+
     /// threshold used for pseudo-logdet derivatives (if available).
     active_subspace_rel_gap: Option<f64>,
