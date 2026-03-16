@@ -742,7 +742,7 @@ impl SpatialLogKappaCoords {
 
     /// Split at a logical-term boundary. `mid` is the number of terms in the
     /// first half (not a flat-array index).
-    fn split_at(&self, mid: usize) -> (Self, Self) {
+    pub(crate) fn split_at(&self, mid: usize) -> (Self, Self) {
         let flat_mid: usize = self.dims_per_term[..mid].iter().sum();
         (
             Self {

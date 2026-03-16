@@ -7,8 +7,7 @@ use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HyperCoord, HyperCoordPair, HyperOperator,
-    InnerSolutionBuilder,
+    HessianDerivativeProvider, HyperCoord, HyperCoordPair, HyperOperator, InnerSolutionBuilder,
     compute_block_penalty_logdet_derivs, embed_penalty_root, penalty_matrix_root,
     reml_laml_evaluate,
 };
@@ -19,7 +18,7 @@ use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, s};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -1230,7 +1229,8 @@ impl CustomFamilyPsiDesignAction {
         Ok(Self {
             operator: Arc::clone(&self.operator),
             axis: self.axis,
-            row_range: (self.row_range.start + row_range.start)..(self.row_range.start + row_range.end),
+            row_range: (self.row_range.start + row_range.start)
+                ..(self.row_range.start + row_range.end),
             p: self.p,
         })
     }
@@ -1326,15 +1326,20 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
         let base_vals: Vec<Array1<f64>> = self
             .channels
             .iter()
-            .map(|channel| channel.design.dot(&v.slice(ndarray::s![channel.range.clone()])))
+            .map(|channel| {
+                channel
+                    .design
+                    .dot(&v.slice(ndarray::s![channel.range.clone()]))
+            })
             .collect();
         let deriv_vals: Vec<Option<Array1<f64>>> = self
             .channels
             .iter()
             .map(|channel| {
-                channel.psi_derivative.as_ref().map(|deriv| {
-                    deriv.forward_mul(v.slice(ndarray::s![channel.range.clone()]))
-                })
+                channel
+                    .psi_derivative
+                    .as_ref()
+                    .map(|deriv| deriv.forward_mul(v.slice(ndarray::s![channel.range.clone()])))
             })
             .collect();
 
@@ -1368,29 +1373,39 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
         let base_v: Vec<Array1<f64>> = self
             .channels
             .iter()
-            .map(|channel| channel.design.dot(&v.slice(ndarray::s![channel.range.clone()])))
+            .map(|channel| {
+                channel
+                    .design
+                    .dot(&v.slice(ndarray::s![channel.range.clone()]))
+            })
             .collect();
         let base_u: Vec<Array1<f64>> = self
             .channels
             .iter()
-            .map(|channel| channel.design.dot(&u.slice(ndarray::s![channel.range.clone()])))
+            .map(|channel| {
+                channel
+                    .design
+                    .dot(&u.slice(ndarray::s![channel.range.clone()]))
+            })
             .collect();
         let deriv_v: Vec<Option<Array1<f64>>> = self
             .channels
             .iter()
             .map(|channel| {
-                channel.psi_derivative.as_ref().map(|deriv| {
-                    deriv.forward_mul(v.slice(ndarray::s![channel.range.clone()]))
-                })
+                channel
+                    .psi_derivative
+                    .as_ref()
+                    .map(|deriv| deriv.forward_mul(v.slice(ndarray::s![channel.range.clone()])))
             })
             .collect();
         let deriv_u: Vec<Option<Array1<f64>>> = self
             .channels
             .iter()
             .map(|channel| {
-                channel.psi_derivative.as_ref().map(|deriv| {
-                    deriv.forward_mul(u.slice(ndarray::s![channel.range.clone()]))
-                })
+                channel
+                    .psi_derivative
+                    .as_ref()
+                    .map(|deriv| deriv.forward_mul(u.slice(ndarray::s![channel.range.clone()])))
             })
             .collect();
 
@@ -1424,9 +1439,12 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
     }
 
     fn is_implicit(&self) -> bool {
-        self.channels
-            .iter()
-            .any(|channel| channel.psi_derivative.as_ref().is_some_and(|d| d.is_implicit()))
+        self.channels.iter().any(|channel| {
+            channel
+                .psi_derivative
+                .as_ref()
+                .is_some_and(|d| d.is_implicit())
+        })
     }
 }
 
@@ -1468,7 +1486,8 @@ fn maybe_add_dense_to_operator(
     })
 }
 
-fn shared_dense_design_cache() -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>> {
+fn shared_dense_design_cache() -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>
+{
     static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -4461,27 +4480,76 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     let specs_arc = Arc::new(specs.to_vec());
     let beta_arc = Arc::new(beta_flat.clone());
     let synced_arc = Arc::new(synced_states.to_vec());
-    let s_pinv_arc = Arc::new(s_pinv.cloned());
     let ranges_arc = Arc::new(ranges);
     let family_arc = Arc::new(family.clone());
 
-    // Build the psi coordinate index -> (block_idx, local_idx) mapping.
-    let mut psi_map: Vec<(usize, usize)> = Vec::new();
-    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-        for local_idx in 0..block_derivs.len() {
-            psi_map.push((block_idx, local_idx));
-        }
-    }
-    let psi_map = Arc::new(psi_map);
+    let s_pinv_block_cache = Arc::new(s_pinv.map(|sp| {
+        ranges_arc
+            .iter()
+            .map(|&(start, end)| sp.slice(s![start..end, start..end]).to_owned())
+            .collect::<Vec<_>>()
+    }));
 
-    // Also build the rho coordinate -> (block_idx, penalty_idx) mapping.
-    let mut rho_map: Vec<(usize, usize)> = Vec::new();
-    for (block_idx, &count) in penalty_counts.iter().enumerate() {
-        for penalty_idx in 0..count {
-            rho_map.push((block_idx, penalty_idx));
+    struct PsiPenaltyCacheEntry {
+        block_idx: usize,
+        local_idx: usize,
+        start: usize,
+        end: usize,
+        spinv_s_local: Option<Array2<f64>>,
+    }
+
+    struct RhoPenaltyCacheEntry {
+        block_idx: usize,
+        penalty_idx: usize,
+        start: usize,
+        end: usize,
+        spinv_s_local: Option<Array2<f64>>,
+    }
+
+    // Build the psi coordinate cache once. These block-local S_psi matrices are
+    // reused by ψψ and ρψ callbacks, avoiding repeated assembly inside the
+    // O(q²) ext-ext loop.
+    let mut psi_penalty_cache: Vec<PsiPenaltyCacheEntry> = Vec::new();
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        let (start, end) = ranges_arc[block_idx];
+        let p_block = end - start;
+        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            let s_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
+            let spinv_s_local = s_pinv_block_cache
+                .as_ref()
+                .as_ref()
+                .map(|blocks| blocks[block_idx].dot(&s_local));
+            psi_penalty_cache.push(PsiPenaltyCacheEntry {
+                block_idx,
+                local_idx,
+                start,
+                end,
+                spinv_s_local,
+            });
         }
     }
-    let rho_map = Arc::new(rho_map);
+    let psi_penalty_cache = Arc::new(psi_penalty_cache);
+
+    let mut rho_penalty_cache: Vec<RhoPenaltyCacheEntry> = Vec::new();
+    for (block_idx, &count) in penalty_counts.iter().enumerate() {
+        let (start, end) = ranges_arc[block_idx];
+        for penalty_idx in 0..count {
+            let s_local = specs_arc[block_idx].penalties[penalty_idx]
+                .mapv(|v| per_block[block_idx][penalty_idx].exp() * v);
+            let spinv_s_local = s_pinv_block_cache
+                .as_ref()
+                .as_ref()
+                .map(|blocks| blocks[block_idx].dot(&s_local));
+            rho_penalty_cache.push(RhoPenaltyCacheEntry {
+                block_idx,
+                penalty_idx,
+                start,
+                end,
+                spinv_s_local,
+            });
+        }
+    }
+    let rho_penalty_cache = Arc::new(rho_penalty_cache);
 
     // ── Smooth δ-regularized inverse for ld_s pair computations ──
     //
@@ -4502,16 +4570,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let specs_arc = Arc::clone(&specs_arc);
         let beta_arc = Arc::clone(&beta_arc);
         let synced_arc = Arc::clone(&synced_arc);
-        let s_pinv_arc = Arc::clone(&s_pinv_arc);
-        let ranges_arc = Arc::clone(&ranges_arc);
-        let psi_map = Arc::clone(&psi_map);
+        let s_pinv_block_cache = Arc::clone(&s_pinv_block_cache);
+        let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let family_arc = Arc::clone(&family_arc);
         let psi_workspace = psi_workspace.clone();
         let total = total;
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
-            let (block_i, local_i) = psi_map[psi_i];
-            let (block_j, local_j) = psi_map[psi_j];
+            let cache_i = &psi_penalty_cache[psi_i];
+            let cache_j = &psi_penalty_cache[psi_j];
 
             // Get family-provided second-order likelihood terms.
             let psi2 = if let Some(workspace) = psi_workspace.as_ref() {
@@ -4534,67 +4601,49 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 None => (0.0, Array1::zeros(total), Array2::zeros((total, total))),
             };
 
-            // Assemble S_{ψ_i ψ_j} in joint space.
-            // Only nonzero when both coordinates share the same block.
-            let s_ij = if block_i == block_j {
-                let (start, end) = ranges_arc[block_i];
-                let p_block = end - start;
-                let deriv_i = &derivative_blocks[block_i][local_i];
-                let s_local =
-                    assemble_block_local_s_psi_psi(deriv_i, local_j, &per_block[block_i], p_block);
-                embed_block_local_matrix(&s_local, start, end, total)
-            } else {
-                Array2::<f64>::zeros((total, total))
-            };
+            let mut a = obj_ll;
+            let mut g = score_ll;
+            let mut b_mat = hess_ll;
 
-            let s_ij_beta = s_ij.dot(&*beta_arc);
-            let a = obj_ll + 0.5 * beta_arc.dot(&s_ij_beta);
-            let g = score_ll + &s_ij_beta;
-            let b_mat = hess_ll + &s_ij;
+            // Assemble S_{ψ_i ψ_j} only on the touched block.
+            let ld_s = if cache_i.block_idx == cache_j.block_idx {
+                let p_block = cache_i.end - cache_i.start;
+                let deriv_i = &derivative_blocks[cache_i.block_idx][cache_i.local_idx];
+                let s_local = assemble_block_local_s_psi_psi(
+                    deriv_i,
+                    cache_j.local_idx,
+                    &per_block[cache_i.block_idx],
+                    p_block,
+                );
 
-            // ld_s_{ij}: second derivative of L_δ(S) = log det(S + δI) − m₀ log δ
-            // w.r.t. ψ_i, ψ_j.
-            //
-            // Using the smooth δ-regularized inverse (S + δI)⁻¹:
-            //   ∂²_ij L_δ = tr((S+δI)⁻¹ S_{ij}) − tr((S+δI)⁻¹ S_j (S+δI)⁻¹ S_i)
-            //
-            // No leakage/moving-nullspace correction is needed because (S + δI)
-            // is always full rank. The full-rank inverse automatically captures
-            // what previously required explicit U₊/U₀ partitioning and leakage
-            // matrix computation.
-            //
-            // Reference: response.md Section 7.
-            let ld_s = if let Some(ref sp) = *s_pinv_arc {
-                let tr_spinv_sij = trace_product(sp, &s_ij);
+                let beta_block = beta_arc.slice(s![cache_i.start..cache_i.end]).to_owned();
+                let s_ij_beta_local = s_local.dot(&beta_block);
+                a += 0.5 * beta_block.dot(&s_ij_beta_local);
+                {
+                    let mut g_local = g.slice_mut(s![cache_i.start..cache_i.end]);
+                    g_local += &s_ij_beta_local;
+                }
+                {
+                    let mut b_local = b_mat
+                        .slice_mut(s![cache_i.start..cache_i.end, cache_i.start..cache_i.end]);
+                    b_local += &s_local;
+                }
 
-                // Compute the quadratic piece.
-                let s_i_local = assemble_block_local_s_psi(
-                    &derivative_blocks[block_i][local_i],
-                    &per_block[block_i],
-                    ranges_arc[block_i].1 - ranges_arc[block_i].0,
-                );
-                let s_i = embed_block_local_matrix(
-                    &s_i_local,
-                    ranges_arc[block_i].0,
-                    ranges_arc[block_i].1,
-                    total,
-                );
-                let (bj_block, bj_local) = psi_map[psi_j];
-                let s_j_local = assemble_block_local_s_psi(
-                    &derivative_blocks[bj_block][bj_local],
-                    &per_block[bj_block],
-                    ranges_arc[bj_block].1 - ranges_arc[bj_block].0,
-                );
-                let s_j = embed_block_local_matrix(
-                    &s_j_local,
-                    ranges_arc[bj_block].0,
-                    ranges_arc[bj_block].1,
-                    total,
-                );
-                let spinv_si = sp.dot(&s_i);
-                let spinv_sj = sp.dot(&s_j);
-                let tr_quad = trace_product(&spinv_sj, &spinv_si);
-                tr_spinv_sij - tr_quad
+                if let Some(ref spinv_blocks) = *s_pinv_block_cache {
+                    let tr_spinv_sij = trace_product(&spinv_blocks[cache_i.block_idx], &s_local);
+                    let tr_quad =
+                        trace_product(
+                            cache_j.spinv_s_local.as_ref().expect(
+                                "psi cache should include (S+δI)^-1 S_psi when s_pinv exists",
+                            ),
+                            cache_i.spinv_s_local.as_ref().expect(
+                                "psi cache should include (S+δI)^-1 S_psi when s_pinv exists",
+                            ),
+                        );
+                    tr_spinv_sij - tr_quad
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             };
@@ -4607,77 +4656,72 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     let rho_ext = {
         let per_block = Arc::clone(&per_block);
         let derivative_blocks = Arc::clone(&derivative_blocks);
-        let specs_arc = Arc::clone(&specs_arc);
         let beta_arc = Arc::clone(&beta_arc);
-        let s_pinv_arc = Arc::clone(&s_pinv_arc);
-        let ranges_arc = Arc::clone(&ranges_arc);
-        let psi_map = Arc::clone(&psi_map);
-        let rho_map = Arc::clone(&rho_map);
+        let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
+        let rho_penalty_cache = Arc::clone(&rho_penalty_cache);
+        let s_pinv_block_cache = Arc::clone(&s_pinv_block_cache);
         let total = total;
 
         Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
-            let (rho_block, rho_penalty) = rho_map[rho_k];
-            let (psi_block, psi_local) = psi_map[psi_j];
+            let rho_cache = &rho_penalty_cache[rho_k];
+            let psi_cache = &psi_penalty_cache[psi_j];
+            let mut a = 0.0;
+            let mut g = Array1::<f64>::zeros(total);
+            let mut b_mat = Array2::<f64>::zeros((total, total));
 
             // S_{ρ_k, ψ_j} = λ_k ∂S_k/∂ψ_j.
             // Only nonzero when both coordinates share the same block and the
             // ψ derivative touches the k-th penalty.
-            let s_kj = if rho_block == psi_block {
-                let (start, end) = ranges_arc[rho_block];
-                let p_block = end - start;
-                let deriv = &derivative_blocks[psi_block][psi_local];
-                let lambda_k = per_block[rho_block][rho_penalty].exp();
+            let ld_s = if rho_cache.block_idx == psi_cache.block_idx {
+                let p_block = rho_cache.end - rho_cache.start;
+                let deriv = &derivative_blocks[psi_cache.block_idx][psi_cache.local_idx];
+                let lambda_k = per_block[rho_cache.block_idx][rho_cache.penalty_idx].exp();
                 let local = if let Some(ref components) = deriv.s_psi_components {
                     let mut m = Array2::<f64>::zeros((p_block, p_block));
                     for (penalty_idx, s_part) in components {
-                        if *penalty_idx == rho_penalty {
+                        if *penalty_idx == rho_cache.penalty_idx {
                             m.scaled_add(lambda_k, s_part);
                         }
                     }
                     m
-                } else if deriv.penalty_index == Some(rho_penalty) {
+                } else if deriv.penalty_index == Some(rho_cache.penalty_idx) {
                     deriv.s_psi.mapv(|v| lambda_k * v)
                 } else {
                     Array2::<f64>::zeros((p_block, p_block))
                 };
-                embed_block_local_matrix(&local, start, end, total)
-            } else {
-                Array2::<f64>::zeros((total, total))
-            };
 
-            let s_kj_beta = s_kj.dot(&*beta_arc);
-            let a = 0.5 * beta_arc.dot(&s_kj_beta);
-            let g = s_kj_beta;
-            let b_mat = s_kj.clone();
+                let beta_block = beta_arc
+                    .slice(s![rho_cache.start..rho_cache.end])
+                    .to_owned();
+                let s_kj_beta_local = local.dot(&beta_block);
+                a = 0.5 * beta_block.dot(&s_kj_beta_local);
+                {
+                    let mut g_local = g.slice_mut(s![rho_cache.start..rho_cache.end]);
+                    g_local += &s_kj_beta_local;
+                }
+                {
+                    let mut b_local = b_mat.slice_mut(s![
+                        rho_cache.start..rho_cache.end,
+                        rho_cache.start..rho_cache.end
+                    ]);
+                    b_local += &local;
+                }
 
-            // ld_s for ρ-ψ cross: tr((S+δI)⁻¹ S_{kj}) − tr((S+δI)⁻¹ S_j (S+δI)⁻¹ S_k)
-            // No leakage correction needed — (S + δI) is full rank.
-            // Reference: response.md Section 7.
-            let ld_s = if let Some(ref sp) = *s_pinv_arc {
-                let tr_spinv_skj = trace_product(sp, &s_kj);
-
-                // Reconstruct S_k (penalty-only derivative for ρ_k).
-                let s_k = {
-                    let (start, end) = ranges_arc[rho_block];
-                    let local = specs_arc[rho_block].penalties[rho_penalty]
-                        .mapv(|v| per_block[rho_block][rho_penalty].exp() * v);
-                    embed_block_local_matrix(&local, start, end, total)
-                };
-                // Reconstruct S_j (ψ penalty derivative).
-                let s_j = {
-                    let (start, end) = ranges_arc[psi_block];
-                    let p_block = end - start;
-                    let s_local = assemble_block_local_s_psi(
-                        &derivative_blocks[psi_block][psi_local],
-                        &per_block[psi_block],
-                        p_block,
-                    );
-                    embed_block_local_matrix(&s_local, start, end, total)
-                };
-                let spinv_sk = sp.dot(&s_k);
-                let spinv_sj = sp.dot(&s_j);
-                let tr_quad = trace_product(&spinv_sj, &spinv_sk);
-                tr_spinv_skj - tr_quad
+                if let Some(ref spinv_blocks) = *s_pinv_block_cache {
+                    let tr_spinv_skj = trace_product(&spinv_blocks[rho_cache.block_idx], &local);
+                    let tr_quad =
+                        trace_product(
+                            psi_cache.spinv_s_local.as_ref().expect(
+                                "psi cache should include (S+δI)^-1 S_psi when s_pinv exists",
+                            ),
+                            rho_cache.spinv_s_local.as_ref().expect(
+                                "rho cache should include (S+δI)^-1 S_rho when s_pinv exists",
+                            ),
+                        );
+                    tr_spinv_skj - tr_quad
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             };
@@ -4886,7 +4930,11 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         )?;
 
         let psi_workspace = if need_hessian {
-            family.exact_newton_joint_psi_workspace(&synced_joint_states, specs, derivative_blocks)?
+            family.exact_newton_joint_psi_workspace(
+                &synced_joint_states,
+                specs,
+                derivative_blocks,
+            )?
         } else {
             None
         };

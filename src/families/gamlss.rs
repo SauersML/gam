@@ -11320,16 +11320,18 @@ impl BinomialLocationScaleWiggleFamily {
         if !binomial_link_has_closed_form(&self.link_kind) {
             return Ok(None);
         }
-        let Some(dir_a) = self.exact_newton_joint_psi_direction(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            x_t,
-            x_ls,
-        )?
-        else {
+        if self
+            .exact_newton_joint_psi_direction(
+                block_states,
+                derivative_blocks,
+                psi_index,
+                x_t,
+                x_ls,
+            )?
+            .is_none()
+        {
             return Ok(None);
-        };
+        }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
