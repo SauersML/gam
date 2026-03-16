@@ -2282,8 +2282,12 @@ fn add_diagonal_to_upper_sparse(
                 }
             }
         }
-        // Reuse symbolic structure — avoids O(nnz) triplet reconstruction.
-        return Ok(SparseColMat::new(symbolic.clone(), new_values));
+        // Reuse symbolic structure with updated values.
+        // Clone the original matrix, then overwrite its values.
+        let mut result = matrix.clone();
+        let (_, result_values) = result.parts_mut();
+        result_values.copy_from_slice(&new_values);
+        return Ok(result);
     }
 
     // Slow path: diagonal entries missing from structure, must rebuild.
