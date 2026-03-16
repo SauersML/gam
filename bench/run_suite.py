@@ -75,17 +75,9 @@ for _k, _v in _SERIAL_ENV_OVERRIDES.items():
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-try:
-    from lifelines import CoxPHFitter, KaplanMeierFitter, LogNormalAFTFitter, WeibullAFTFitter  # noqa: E402
-    from lifelines.exceptions import ConvergenceWarning  # noqa: E402
-    from lifelines.utils import concordance_index  # noqa: E402
-except ImportError:
-    CoxPHFitter = None  # type: ignore[assignment,misc]
-    KaplanMeierFitter = None  # type: ignore[assignment,misc]
-    LogNormalAFTFitter = None  # type: ignore[assignment,misc]
-    WeibullAFTFitter = None  # type: ignore[assignment,misc]
-    ConvergenceWarning = None  # type: ignore[assignment,misc]
-    concordance_index = None  # type: ignore[assignment,misc]
+from lifelines import CoxPHFitter, KaplanMeierFitter, LogNormalAFTFitter, WeibullAFTFitter  # noqa: E402
+from lifelines.exceptions import ConvergenceWarning  # noqa: E402
+from lifelines.utils import concordance_index  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
