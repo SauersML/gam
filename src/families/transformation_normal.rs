@@ -25,9 +25,10 @@ use crate::construction::kronecker_product;
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyWarmStart, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    custom_family_outer_capability, evaluate_custom_family_joint_hyper, fit_custom_family,
+    CustomFamilyWarmStart, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    build_block_spatial_psi_derivatives, custom_family_outer_capability,
+    evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::families::gamlss::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
@@ -103,9 +104,18 @@ pub struct TransformationWarmStart {
 pub struct TransformationNormalFamily {
     // --- Tensor product design matrices ---
     /// Value design: n × p_total. The block's official design matrix.
+    /// Materialized for the solver (ParameterBlockSpec needs a DesignMatrix).
     x_val: Arc<Array2<f64>>,
     /// Derivative design: n × p_total. Family-owned, not exposed to the solver.
     x_deriv: Array2<f64>,
+
+    // --- Kronecker-aware operators (biobank scaling) ---
+    /// Lazy value design operator: stores factors separately for large problems.
+    x_val_kron: KroneckerDesign,
+    /// Lazy derivative design operator: stores factors separately for large problems.
+    x_deriv_kron: KroneckerDesign,
+    /// Separable Kronecker-form penalties for operator-form penalty application.
+    kron_penalties: Vec<KroneckerPenalty>,
 
     // --- Response-direction basis (fixed, does not depend on κ) ---
     /// Response value basis: n × p_resp. Columns: [1, y, dev_1(y), ..., dev_k(y)].
@@ -192,16 +202,18 @@ impl TransformationNormalFamily {
             build_response_basis(response, config)?;
         let p_resp = resp_val.ncols();
 
-        // ----- 2. Row-wise Kronecker product -----
+        // ----- 2. Row-wise Kronecker product (dense + operator form) -----
+        let x_val_kron = KroneckerDesign::new(&resp_val, covariate_design);
+        let x_deriv_kron = KroneckerDesign::new(&resp_deriv, covariate_design);
         let x_val = rowwise_kronecker(&resp_val, covariate_design);
         let x_deriv = rowwise_kronecker(&resp_deriv, covariate_design);
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val.ncols(), p_total);
         debug_assert_eq!(x_deriv.ncols(), p_total);
 
-        // ----- 3. Tensor penalties -----
-        let tensor_penalties =
-            build_tensor_penalties(&resp_penalties, covariate_penalties, p_resp, p_cov, config)?;
+        // ----- 3. Tensor penalties (dense + Kronecker-separable) -----
+        let (tensor_penalties, kron_penalties) =
+            build_tensor_penalties_kronecker(&resp_penalties, covariate_penalties, p_resp, p_cov, config)?;
 
         // ----- 4. Monotonicity constraints -----
         let monotonicity_constraints = build_monotonicity_constraints(
@@ -215,8 +227,13 @@ impl TransformationNormalFamily {
         )?;
 
         // ----- 5. Warm start -----
-        let initial_beta =
-            compute_warm_start(response, covariate_design, p_resp, p_cov, warm_start)?;
+        let initial_beta = compute_warm_start(
+            response,
+            covariate_design,
+            p_resp,
+            p_cov,
+            warm_start,
+        )?;
 
         // ----- 6. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
@@ -224,6 +241,9 @@ impl TransformationNormalFamily {
         Ok(Self {
             x_val: Arc::new(x_val),
             x_deriv,
+            x_val_kron,
+            x_deriv_kron,
+            kron_penalties,
             response_val_basis: resp_val,
             response_deriv_basis: resp_deriv,
             response_penalties: resp_penalties,
@@ -280,29 +300,27 @@ impl TransformationNormalFamily {
 
         let p_resp = response_val_basis.ncols();
 
-        // Row-wise Kronecker product.
+        // Row-wise Kronecker product (dense + operator form).
+        let x_val_kron = KroneckerDesign::new(&response_val_basis, covariate_design);
+        let x_deriv_kron = KroneckerDesign::new(&response_deriv_basis, covariate_design);
         let x_val = rowwise_kronecker(&response_val_basis, covariate_design);
         let x_deriv = rowwise_kronecker(&response_deriv_basis, covariate_design);
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val.ncols(), p_total);
         debug_assert_eq!(x_deriv.ncols(), p_total);
 
-        // Tensor penalties.
-        let tensor_penalties = build_tensor_penalties(
-            &response_penalties,
-            covariate_penalties,
-            p_resp,
-            p_cov,
-            config,
-        )?;
+        // Tensor penalties (dense + Kronecker-separable).
+        let (tensor_penalties, kron_penalties) =
+            build_tensor_penalties_kronecker(&response_penalties, covariate_penalties, p_resp, p_cov, config)?;
 
         // Monotonicity constraints.
         // We need the original response values to build the boundary grid, but
         // from_prebuilt only has the basis. Use the derivative design rows directly.
-        let monotonicity_constraints = LinearInequalityConstraints {
-            a: x_deriv.clone(),
-            b: Array1::from_elem(x_deriv.nrows(), config.monotonicity_eps),
-        };
+        // For biobank scale, subsample the training rows for constraints.
+        let monotonicity_constraints = build_subsampled_monotonicity_constraints(
+            &x_deriv_kron,
+            config,
+        );
 
         // Warm start: need response values for location-scale init.
         // Extract response from column 1 of response_val_basis (which stores y).
@@ -320,6 +338,9 @@ impl TransformationNormalFamily {
         Ok(Self {
             x_val: Arc::new(x_val),
             x_deriv,
+            x_val_kron,
+            x_deriv_kron,
+            kron_penalties,
             response_val_basis,
             response_deriv_basis,
             response_penalties,
@@ -449,9 +470,13 @@ impl TransformationNormalFamily {
     }
 
     /// Compute h and h' from the current coefficients.
+    ///
+    /// Uses the Kronecker-aware operators when in factored mode, avoiding
+    /// full n × p_total matrix-vector products through the materialized
+    /// tensor product.
     fn compute_h_and_h_prime(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let h = self.x_val.dot(beta);
-        let h_prime = self.x_deriv.dot(beta);
+        let h = self.x_val_kron.forward_mul(beta);
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
         (h, h_prime)
     }
 
@@ -469,7 +494,10 @@ impl TransformationNormalFamily {
 // ---------------------------------------------------------------------------
 
 impl CustomFamily for TransformationNormalFamily {
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    fn evaluate(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 1 {
             return Err(format!(
                 "TransformationNormalFamily expects 1 block, got {}",
@@ -499,18 +527,17 @@ impl CustomFamily for TransformationNormalFamily {
         let inv_h_prime = h_prime.mapv(|v| 1.0 / v);
         // gradient = -X_val^T h + X_deriv^T inv_h_prime
         let grad = {
-            let neg_xvt_h = self.x_val.t().dot(&h).mapv(|v| -v);
-            let xdt_inv = self.x_deriv.t().dot(&inv_h_prime);
+            let neg_xvt_h = self.x_val_kron.transpose_mul(&h).mapv(|v| -v);
+            let xdt_inv = self.x_deriv_kron.transpose_mul(&inv_h_prime);
             neg_xvt_h + &xdt_inv
         };
 
         // Hessian of negative log-likelihood: -∇²ℓ = X_val^T X_val + X_deriv^T diag(1/h'²) X_deriv
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let hessian = {
-            let xtx_val = fast_atb(self.x_val.as_ref(), self.x_val.as_ref());
+            let xtx_val = self.x_val_kron.gram();
             // X_deriv^T diag(w) X_deriv where w = 1/h'^2
-            let weighted_xd = weight_rows(&self.x_deriv, &inv_h_prime_sq);
-            let xtx_deriv = fast_atb(&weighted_xd, &self.x_deriv);
+            let xtx_deriv = self.x_deriv_kron.weighted_gram(&inv_h_prime_sq);
             xtx_val + &xtx_deriv
         };
 
@@ -523,7 +550,10 @@ impl CustomFamily for TransformationNormalFamily {
         })
     }
 
-    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+    fn log_likelihood_only(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<f64, String> {
         if block_states.len() != 1 {
             return Err("expected 1 block".to_string());
         }
@@ -581,8 +611,8 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv.dot(beta);
-        let d_h_prime = self.x_deriv.dot(d_beta);
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let d_h_prime = self.x_deriv_kron.forward_mul(d_beta);
 
         // ∂H/∂β · d_beta = -2 X_deriv^T diag((X_deriv · d_beta) / h'^3) X_deriv
         let n = h_prime.len();
@@ -590,8 +620,7 @@ impl CustomFamily for TransformationNormalFamily {
         for i in 0..n {
             weight[i] = -2.0 * d_h_prime[i] / (h_prime[i] * h_prime[i] * h_prime[i]);
         }
-        let weighted_xd = weight_rows(&self.x_deriv, &weight);
-        let dd = fast_atb(&weighted_xd, &self.x_deriv);
+        let dd = self.x_deriv_kron.weighted_gram(&weight);
         Ok(Some(dd))
     }
 
@@ -601,11 +630,10 @@ impl CustomFamily for TransformationNormalFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv.dot(beta);
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
-        let xtx_val = fast_atb(self.x_val.as_ref(), self.x_val.as_ref());
-        let weighted_xd = weight_rows(&self.x_deriv, &inv_h_prime_sq);
-        let xtx_deriv = fast_atb(&weighted_xd, &self.x_deriv);
+        let xtx_val = self.x_val_kron.gram();
+        let xtx_deriv = self.x_deriv_kron.weighted_gram(&inv_h_prime_sq);
         Ok(Some(xtx_val + &xtx_deriv))
     }
 
@@ -636,12 +664,13 @@ impl CustomFamily for TransformationNormalFamily {
         // Build ∂x_deriv/∂ψ from x_val_psi.
         // x_val_psi[:, 0:p_cov] = ∂cov_design/∂ψ (because resp_val[:,0] = 1).
         let cov_psi = self.extract_covariate_psi(x_val_psi);
-        let x_deriv_psi = rowwise_kronecker(&self.response_deriv_basis, &cov_psi);
+        let x_deriv_psi_kron = KroneckerDesign::new(&self.response_deriv_basis, &cov_psi);
+        let x_deriv_psi = x_deriv_psi_kron.to_dense();
 
         // v_val = x_val_psi · β (n-vector): ∂h/∂ψ
         let v_val = x_val_psi.dot(beta);
         // v_deriv = x_deriv_psi · β (n-vector): ∂h'/∂ψ
-        let v_deriv = x_deriv_psi.dot(beta);
+        let v_deriv = x_deriv_psi_kron.forward_mul(beta);
 
         let inv_h_prime: Array1<f64> = h_prime.mapv(|v| 1.0 / v);
         let inv_h_prime_sq: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v));
@@ -657,10 +686,10 @@ impl CustomFamily for TransformationNormalFamily {
         // = x_val_psi^T h + x_val^T v_val - x_deriv_psi^T (1/h') + x_deriv^T (v_deriv/h'^2)
         let score_psi = {
             let term1 = x_val_psi.t().dot(&h);
-            let term2 = self.x_val.t().dot(&v_val);
-            let term3 = x_deriv_psi.t().dot(&inv_h_prime).mapv(|v| -v);
+            let term2 = self.x_val_kron.transpose_mul(&v_val);
+            let term3 = x_deriv_psi_kron.transpose_mul(&inv_h_prime).mapv(|v| -v);
             let w_deriv = &v_deriv * &inv_h_prime_sq;
-            let term4 = self.x_deriv.t().dot(&w_deriv);
+            let term4 = self.x_deriv_kron.transpose_mul(&w_deriv);
             term1 + &term2 + &term3 + &term4
         };
 
@@ -670,19 +699,17 @@ impl CustomFamily for TransformationNormalFamily {
         //   - 2·x_deriv^T diag(v_deriv / h'^3) x_deriv
         let hessian_psi = {
             // sym(A^T B) = (A^T B + B^T A) / 2; we compute A^T B and symmetrize.
-            let xvt_xvp = fast_atb(self.x_val.as_ref(), x_val_psi);
+            let xvt_xvp = self.x_val_kron.weighted_cross(&Array1::ones(n), x_val_psi);
             let sym_val = &xvt_xvp + &xvt_xvp.t();
 
-            let weighted_xd = weight_rows(&self.x_deriv, &inv_h_prime_sq);
-            let xdt_xdp = fast_atb(&weighted_xd, &x_deriv_psi);
+            let xdt_xdp = self.x_deriv_kron.weighted_cross(&inv_h_prime_sq, &*x_deriv_psi);
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
             let mut w_cubic = Array1::zeros(n);
             for i in 0..n {
                 w_cubic[i] = -2.0 * v_deriv[i] / (h_prime[i] * h_prime[i] * h_prime[i]);
             }
-            let weighted_xd2 = weight_rows(&self.x_deriv, &w_cubic);
-            let cubic_term = fast_atb(&weighted_xd2, &self.x_deriv);
+            let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic);
 
             sym_val + &sym_deriv + &cubic_term
         };
@@ -706,16 +733,7 @@ impl CustomFamily for TransformationNormalFamily {
 fn build_response_basis(
     response: &Array1<f64>,
     config: &TransformationNormalConfig,
-) -> Result<
-    (
-        Array2<f64>,
-        Array2<f64>,
-        Vec<Array2<f64>>,
-        Array1<f64>,
-        Array2<f64>,
-    ),
-    String,
-> {
+) -> Result<(Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array1<f64>, Array2<f64>), String> {
     let n = response.len();
     if n < 4 {
         return Err(format!("need at least 4 observations, got {n}"));
@@ -758,7 +776,7 @@ fn build_response_basis(
     let raw_deriv = raw_deriv_basis.as_ref().clone();
 
     // --- Apply deviation transform: dev = raw · Z ---
-    let dev_val = raw_val.dot(&transform); // n × dev_dim
+    let dev_val = raw_val.dot(&transform);   // n × dev_dim
     let dev_deriv = raw_deriv.dot(&transform); // n × dev_dim
 
     // --- Assemble full response basis: [1, y, dev] ---
@@ -775,8 +793,12 @@ fn build_response_basis(
     resp_deriv.column_mut(1).fill(1.0);
 
     // Columns 2..: deviations
-    resp_val.slice_mut(s![.., 2..]).assign(&dev_val);
-    resp_deriv.slice_mut(s![.., 2..]).assign(&dev_deriv);
+    resp_val
+        .slice_mut(s![.., 2..])
+        .assign(&dev_val);
+    resp_deriv
+        .slice_mut(s![.., 2..])
+        .assign(&dev_deriv);
 
     // --- Response-direction penalties ---
     // Penalty acts on the deviation part only; affine columns [1, y] are in the nullspace.
@@ -791,7 +813,9 @@ fn build_response_basis(
         let dev_pen = fast_ab(&fast_atb(&transform, &raw_pen), &transform); // dev_dim × dev_dim
         // Embed in full response basis: zeros for [1, y], dev_pen for deviation part.
         let mut full_pen = Array2::<f64>::zeros((p_resp, p_resp));
-        full_pen.slice_mut(s![2.., 2..]).assign(&dev_pen);
+        full_pen
+            .slice_mut(s![2.., 2..])
+            .assign(&dev_pen);
         penalties.push(full_pen);
         Ok(())
     };
@@ -883,6 +907,257 @@ fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Kronecker-aware operator for biobank-scale tensor products
+// ---------------------------------------------------------------------------
+
+/// Materialization threshold: if n * p_resp * p_cov exceeds this, keep
+/// factors separate and use operator-form mul.  Below the threshold the
+/// full n × (p_resp · p_cov) dense matrix is materialized for BLAS speed.
+const KRONECKER_MATERIALIZE_THRESHOLD: u64 = 500_000;
+
+/// A lazy representation of the row-wise Kronecker product `A ⊙ B`
+/// (face-splitting product / Khatri–Rao row-wise product).
+///
+/// For small problems the full dense matrix is materialized at construction
+/// time and all operations delegate to standard BLAS.  For large problems
+/// only the two factor matrices are stored and products are evaluated in
+/// factored form:
+///
+///   forward_mul(β):  reshape β → (p_a, p_b), then result[i] = Σ_j A[i,j] * (B[i,:] · β[j,:])
+///   transpose_mul(v): result[j, k] = Σ_i v[i] * A[i,j] * B[i,k]
+///
+/// Storage: O(n·(p_a + p_b)) vs O(n·p_a·p_b) for the materialized form.
+enum KroneckerDesign {
+    /// Full dense materialization (small problems).
+    Dense(Array2<f64>),
+    /// Factored form: (left_factor, right_factor) where the tensor product
+    /// row i is `left[i,:] ⊗ right[i,:]`.
+    Factored {
+        left: Array2<f64>,   // n × p_a
+        right: Array2<f64>,  // n × p_b
+    },
+}
+
+impl KroneckerDesign {
+    /// Build from two factor matrices, choosing materialization or factored
+    /// form based on the size threshold.
+    fn new(left: &Array2<f64>, right: &Array2<f64>) -> Self {
+        let n = left.nrows() as u64;
+        let pa = left.ncols() as u64;
+        let pb = right.ncols() as u64;
+        if n * pa * pb <= KRONECKER_MATERIALIZE_THRESHOLD {
+            KroneckerDesign::Dense(rowwise_kronecker(left, right))
+        } else {
+            KroneckerDesign::Factored {
+                left: left.clone(),
+                right: right.clone(),
+            }
+        }
+    }
+
+    /// Force-materialize (used when we truly need the full matrix, e.g. for
+    /// legacy code paths that have not been converted to operator form).
+    fn to_dense(&self) -> std::borrow::Cow<'_, Array2<f64>> {
+        match self {
+            KroneckerDesign::Dense(m) => std::borrow::Cow::Borrowed(m),
+            KroneckerDesign::Factored { left, right } => {
+                std::borrow::Cow::Owned(rowwise_kronecker(left, right))
+            }
+        }
+    }
+
+    fn nrows(&self) -> usize {
+        match self {
+            KroneckerDesign::Dense(m) => m.nrows(),
+            KroneckerDesign::Factored { left, .. } => left.nrows(),
+        }
+    }
+
+    fn ncols(&self) -> usize {
+        match self {
+            KroneckerDesign::Dense(m) => m.ncols(),
+            KroneckerDesign::Factored { left, right } => left.ncols() * right.ncols(),
+        }
+    }
+
+    /// Compute `self · beta` where beta has length p_a * p_b.
+    /// Returns an n-vector.
+    fn forward_mul(&self, beta: &Array1<f64>) -> Array1<f64> {
+        match self {
+            KroneckerDesign::Dense(m) => m.dot(beta),
+            KroneckerDesign::Factored { left, right } => {
+                let pa = left.ncols();
+                let pb = right.ncols();
+                let n = left.nrows();
+                debug_assert_eq!(beta.len(), pa * pb);
+                // Reshape beta into (pa, pb) and compute:
+                //   result[i] = Σ_j left[i,j] * (right[i,:] · beta_mat[j,:])
+                let beta_mat = beta.view().into_shape_with_order((pa, pb)).unwrap();
+                // First compute X_cov @ beta_mat^T  → n × p_a
+                // (right · beta_mat^T)[i, j] = Σ_k right[i,k] * beta_mat[j,k]
+                let right_beta = fast_ab(right, &beta_mat.t().to_owned());
+                // Then element-wise multiply with left and sum across columns.
+                let mut result = Array1::zeros(n);
+                for i in 0..n {
+                    let mut acc = 0.0;
+                    for j in 0..pa {
+                        acc += left[[i, j]] * right_beta[[i, j]];
+                    }
+                    result[i] = acc;
+                }
+                result
+            }
+        }
+    }
+
+    /// Compute `self^T · v` where v is an n-vector.
+    /// Returns a (p_a * p_b)-vector.
+    fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
+        match self {
+            KroneckerDesign::Dense(m) => m.t().dot(v),
+            KroneckerDesign::Factored { left, right } => {
+                let pa = left.ncols();
+                let pb = right.ncols();
+                let n = left.nrows();
+                debug_assert_eq!(v.len(), n);
+                // result[j, k] = Σ_i v[i] * left[i,j] * right[i,k]
+                // = (left^T diag(v) right)[j, k]
+                // Compute diag(v) * right first (weight rows of right by v).
+                let weighted_right = weight_rows(right, v);
+                let result_mat = fast_atb(left, &weighted_right); // pa × pb
+                // Flatten to (pa * pb) vector in row-major order.
+                Array1::from_iter(result_mat.iter().copied())
+            }
+        }
+    }
+
+    /// Compute `self^T · self`, the Gram matrix.
+    /// Returns a (p_a·p_b) × (p_a·p_b) matrix.
+    fn gram(&self) -> Array2<f64> {
+        match self {
+            KroneckerDesign::Dense(m) => fast_atb(m, m),
+            KroneckerDesign::Factored { .. } => {
+                // Fall back to materialization for the Gram matrix, which is
+                // needed for the inner Newton step.  A fully operator-form
+                // Gram would require PCG, which is future work.
+                let dense = self.to_dense();
+                fast_atb(&dense, &dense)
+            }
+        }
+    }
+
+    /// Compute `self^T · diag(w) · self` (weighted Gram).
+    fn weighted_gram(&self, w: &Array1<f64>) -> Array2<f64> {
+        match self {
+            KroneckerDesign::Dense(m) => {
+                let wm = weight_rows(m, w);
+                fast_atb(&wm, m)
+            }
+            KroneckerDesign::Factored { .. } => {
+                let dense = self.to_dense();
+                let wm = weight_rows(&dense, w);
+                fast_atb(&wm, &dense)
+            }
+        }
+    }
+
+    /// Compute `self^T · diag(w) · other` where other is a dense matrix with
+    /// the same number of rows.
+    fn weighted_cross(&self, w: &Array1<f64>, other: &Array2<f64>) -> Array2<f64> {
+        match self {
+            KroneckerDesign::Dense(m) => {
+                let wm = weight_rows(m, w);
+                fast_atb(&wm, other)
+            }
+            KroneckerDesign::Factored { .. } => {
+                let dense = self.to_dense();
+                let wm = weight_rows(&dense, w);
+                fast_atb(&wm, other)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kronecker-form penalties
+// ---------------------------------------------------------------------------
+
+/// A penalty matrix in separable Kronecker form: `S_left ⊗ S_right`.
+///
+/// Penalty-vector product: given β reshaped as (p_left, p_right),
+///   (S_left ⊗ S_right) · vec(β) = vec(S_left · β_mat · S_right^T)
+/// This costs O(p_left² · p_right + p_left · p_right²) vs
+/// O((p_left · p_right)²) for the materialized product.
+struct KroneckerPenalty {
+    left: Array2<f64>,   // p_left × p_left
+    right: Array2<f64>,  // p_right × p_right
+    p_left: usize,
+    p_right: usize,
+}
+
+impl KroneckerPenalty {
+    fn new(left: Array2<f64>, right: Array2<f64>) -> Self {
+        let p_left = left.nrows();
+        let p_right = right.nrows();
+        debug_assert_eq!(left.ncols(), p_left);
+        debug_assert_eq!(right.ncols(), p_right);
+        KroneckerPenalty { left, right, p_left, p_right }
+    }
+
+    /// Compute `(S_left ⊗ S_right) · beta`.
+    fn mul_vec(&self, beta: &Array1<f64>) -> Array1<f64> {
+        let beta_mat = beta.view().into_shape_with_order((self.p_left, self.p_right)).unwrap();
+        // result = S_left · beta_mat · S_right^T
+        let tmp = fast_ab(&self.left, &beta_mat.to_owned());  // p_left × p_right
+        let result_mat = fast_ab(&tmp, &self.right.t().to_owned()); // p_left × p_right
+        Array1::from_iter(result_mat.iter().copied())
+    }
+
+    /// Materialize the full (p_left·p_right) × (p_left·p_right) penalty matrix.
+    fn to_dense(&self) -> Array2<f64> {
+        kronecker_product(&self.left, &self.right)
+    }
+}
+
+/// Build tensor product penalties in Kronecker-separable form.
+///
+/// Returns both the materialized dense penalties (for the solver, which needs
+/// them for now) and the separable Kronecker form (for operator-form penalty
+/// application).
+fn build_tensor_penalties_kronecker(
+    response_penalties: &[Array2<f64>],
+    covariate_penalties: &[Array2<f64>],
+    p_resp: usize,
+    p_cov: usize,
+    config: &TransformationNormalConfig,
+) -> Result<(Vec<Array2<f64>>, Vec<KroneckerPenalty>), String> {
+    let eye_resp = Array2::<f64>::eye(p_resp);
+    let eye_cov = Array2::<f64>::eye(p_cov);
+    let mut dense_penalties = Vec::new();
+    let mut kron_penalties = Vec::new();
+
+    // Covariate penalties: I_resp ⊗ S_cov_m
+    for s_cov in covariate_penalties {
+        kron_penalties.push(KroneckerPenalty::new(eye_resp.clone(), s_cov.clone()));
+        dense_penalties.push(kronecker_product(&eye_resp, s_cov));
+    }
+
+    // Response penalties: S_resp_m ⊗ I_cov
+    for s_resp in response_penalties {
+        kron_penalties.push(KroneckerPenalty::new(s_resp.clone(), eye_cov.clone()));
+        dense_penalties.push(kronecker_product(s_resp, &eye_cov));
+    }
+
+    // Double penalty: global ridge (I_resp ⊗ I_cov = I_total)
+    if config.double_penalty {
+        kron_penalties.push(KroneckerPenalty::new(eye_resp.clone(), eye_cov.clone()));
+        dense_penalties.push(Array2::<f64>::eye(p_resp * p_cov));
+    }
+
+    Ok((dense_penalties, kron_penalties))
 }
 
 /// Build tensor product penalties: one per covariate penalty (I_resp ⊗ S_cov_m),
@@ -1035,14 +1310,58 @@ fn subsample_covariate_rows(design: &Array2<f64>, max_rows: usize) -> Array2<f64
         return design.to_owned();
     }
     let step = n as f64 / max_rows as f64;
-    let indices: Vec<usize> = (0..max_rows)
-        .map(|i| ((i as f64 * step) as usize).min(n - 1))
-        .collect();
+    let indices: Vec<usize> = (0..max_rows).map(|i| ((i as f64 * step) as usize).min(n - 1)).collect();
     let mut out = Array2::zeros((indices.len(), design.ncols()));
     for (r, &idx) in indices.iter().enumerate() {
         out.row_mut(r).assign(&design.row(idx));
     }
     out
+}
+
+/// Maximum number of constraint rows for biobank-scale monotonicity.
+///
+/// When the training set is large (e.g. 400K), using all n derivative rows as
+/// hard constraints is prohibitively expensive.  This cap limits the constraint
+/// matrix to a manageable size while still covering the design space.
+const MAX_MONOTONICITY_CONSTRAINT_ROWS: usize = 4096;
+
+/// Build monotonicity constraints from a KroneckerDesign, subsampling for
+/// large problems.
+///
+/// For small problems (n <= MAX_MONOTONICITY_CONSTRAINT_ROWS), all derivative
+/// rows are used.  For large problems, a uniform subsample is taken.
+fn build_subsampled_monotonicity_constraints(
+    x_deriv_kron: &KroneckerDesign,
+    config: &TransformationNormalConfig,
+) -> LinearInequalityConstraints {
+    let n = x_deriv_kron.nrows();
+    let p = x_deriv_kron.ncols();
+    let eps = config.monotonicity_eps;
+
+    let dense = x_deriv_kron.to_dense();
+
+    if n <= MAX_MONOTONICITY_CONSTRAINT_ROWS {
+        // Use all training-point rows.
+        LinearInequalityConstraints {
+            a: dense.into_owned(),
+            b: Array1::from_elem(n, eps),
+        }
+    } else {
+        // Subsample uniformly.
+        let step = n as f64 / MAX_MONOTONICITY_CONSTRAINT_ROWS as f64;
+        let indices: Vec<usize> = (0..MAX_MONOTONICITY_CONSTRAINT_ROWS)
+            .map(|i| ((i as f64 * step) as usize).min(n - 1))
+            .collect();
+        let n_sub = indices.len();
+        let mut a = Array2::zeros((n_sub, p));
+        for (r, &idx) in indices.iter().enumerate() {
+            a.row_mut(r).assign(&dense.row(idx));
+        }
+        LinearInequalityConstraints {
+            a,
+            b: Array1::from_elem(n_sub, eps),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,10 +1402,7 @@ fn compute_warm_start(
         }
         None => {
             let mean = response.mean().unwrap_or(0.0);
-            let var = response
-                .iter()
-                .map(|&v| (v - mean) * (v - mean))
-                .sum::<f64>()
+            let var = response.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>()
                 / (n.max(2) - 1) as f64;
             let sd = var.sqrt().max(1e-12);
             let intercept = Array1::from_elem(n, -mean / sd);
@@ -1120,10 +1436,7 @@ fn compute_warm_start(
         Err(_) => {
             // Fallback: use global mean/SD.
             let mean = response.mean().unwrap_or(0.0);
-            let var = response
-                .iter()
-                .map(|&v| (v - mean) * (v - mean))
-                .sum::<f64>()
+            let var = response.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>()
                 / (n.max(2) - 1) as f64;
             let sd = var.sqrt().max(1e-12);
             // Only set the first covariate column (assumes intercept is first column).
@@ -1171,7 +1484,7 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
 /// - `s_psi`: the tensor penalty derivative (for the S_cov penalties that move with ψ)
 pub fn build_tensor_psi_derivatives(
     family: &TransformationNormalFamily,
-    covariate_psi_designs: &[Array2<f64>], // per-axis ∂cov_design/∂ψ_a
+    covariate_psi_designs: &[Array2<f64>],    // per-axis ∂cov_design/∂ψ_a
     covariate_psi_penalties: &[Vec<(usize, Array2<f64>)>], // per-axis [(cov_penalty_idx, ∂S_cov/∂ψ_a)]
     covariate_psi_second_designs: Option<&[Vec<Array2<f64>>]>, // per-axis-pair ∂²cov_design/∂ψ_a∂ψ_b
     covariate_psi_second_penalties: Option<&[Vec<Vec<(usize, Array2<f64>)>>]>,
@@ -1333,20 +1646,26 @@ pub fn fit_transformation_normal(
     let rho0 = Array1::<f64>::zeros(n_penalties);
     let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
-    let kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
-        covariate_spec,
-        &spatial_terms,
-        kappa_options,
-    );
+    let kappa0 =
+        SpatialLogKappaCoords::from_length_scales_aniso(covariate_spec, &spatial_terms, kappa_options);
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
-    let joint_setup =
-        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
+    let joint_setup = ExactJointHyperSetup::new(
+        rho0,
+        rho_lower,
+        rho_upper,
+        kappa0,
+        kappa_lower,
+        kappa_upper,
+    );
 
     // Check analytic derivative capability.
-    let analytic_psi_available =
-        build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?.is_some();
+    let analytic_psi_available = build_block_spatial_psi_derivatives(
+        covariate_data,
+        &boot_spec,
+        &boot_design,
+    )?.is_some();
 
     // Build an initial family + blocks for capability probing.
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
@@ -1395,21 +1714,20 @@ pub fn fit_transformation_normal(
     let ws = warm_start.cloned();
 
     // Helper: build family from prebuilt response basis + covariate design.
-    let make_family =
-        |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
-            TransformationNormalFamily::from_prebuilt_response_basis(
-                rv.clone(),
-                rd.clone(),
-                rp.clone(),
-                rk.clone(),
-                rdeg,
-                rt.clone(),
-                &cov_design.design,
-                &cov_design.penalties,
-                &cfg,
-                ws.as_ref(),
-            )
-        };
+    let make_family = |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
+        TransformationNormalFamily::from_prebuilt_response_basis(
+            rv.clone(),
+            rd.clone(),
+            rp.clone(),
+            rk.clone(),
+            rdeg,
+            rt.clone(),
+            &cov_design.design,
+            &cov_design.penalties,
+            &cfg,
+            ws.as_ref(),
+        )
+    };
 
     // Helper: build blocks from family + beta hint.
     let make_blocks = |family: &TransformationNormalFamily| -> Vec<ParameterBlockSpec> {
@@ -1459,46 +1777,38 @@ pub fn fit_transformation_normal(
             let blocks = make_blocks(&family);
 
             // Build covariate-side psi derivatives, then lift to tensor product space.
-            let cov_psi_derivs =
-                build_block_spatial_psi_derivatives(covariate_data, &specs[0], &designs[0])?
-                    .ok_or_else(|| {
-                        "missing covariate spatial psi derivatives for transformation model"
-                            .to_string()
-                    })?;
+            let cov_psi_derivs = build_block_spatial_psi_derivatives(
+                covariate_data,
+                &specs[0],
+                &designs[0],
+            )?
+            .ok_or_else(|| "missing covariate spatial psi derivatives for transformation model".to_string())?;
 
             // Extract covariate-space arrays for build_tensor_psi_derivatives.
-            let cov_psi_designs: Vec<Array2<f64>> =
-                cov_psi_derivs.iter().map(|d| d.x_psi.clone()).collect();
-            let cov_psi_penalties: Vec<Vec<(usize, Array2<f64>)>> = cov_psi_derivs
-                .iter()
+            let cov_psi_designs: Vec<Array2<f64>> = cov_psi_derivs.iter()
+                .map(|d| d.x_psi.clone())
+                .collect();
+            let cov_psi_penalties: Vec<Vec<(usize, Array2<f64>)>> = cov_psi_derivs.iter()
                 .map(|d| d.s_psi_components.clone().unwrap_or_default())
                 .collect();
 
             // Second-order design derivatives.
             let has_second_designs = cov_psi_derivs.iter().all(|d| d.x_psi_psi.is_some());
             let cov_psi_second_designs: Option<Vec<Vec<Array2<f64>>>> = if has_second_designs {
-                Some(
-                    cov_psi_derivs
-                        .iter()
-                        .map(|d| d.x_psi_psi.clone().unwrap_or_default())
-                        .collect(),
-                )
+                Some(cov_psi_derivs.iter()
+                    .map(|d| d.x_psi_psi.clone().unwrap_or_default())
+                    .collect())
             } else {
                 None
             };
 
             // Second-order penalty derivatives.
-            let has_second_penalties = cov_psi_derivs
-                .iter()
-                .all(|d| d.s_psi_psi_components.is_some());
+            let has_second_penalties = cov_psi_derivs.iter().all(|d| d.s_psi_psi_components.is_some());
             let cov_psi_second_penalties: Option<Vec<Vec<Vec<(usize, Array2<f64>)>>>> =
                 if has_second_penalties {
-                    Some(
-                        cov_psi_derivs
-                            .iter()
-                            .map(|d| d.s_psi_psi_components.clone().unwrap_or_default())
-                            .collect(),
-                    )
+                    Some(cov_psi_derivs.iter()
+                        .map(|d| d.s_psi_psi_components.clone().unwrap_or_default())
+                        .collect())
                 } else {
                     None
                 };
@@ -1549,18 +1859,21 @@ pub fn fit_transformation_normal(
     })
 }
 
-/// Score function for transformation model fits, matching the pattern used by
-/// GAMLSS and BernoulliMarginalSlope: prefer REML score, fall back to
-/// penalized objective.
+/// Score function for transformation model fits.
+///
+/// Returns the penalized objective (−ℓ + penalty + REML/logdet terms), which
+/// is the same quantity that `evaluate_custom_family_joint_hyper` computes as
+/// `eval.objective`.  Using a consistent objective across the cost-only and
+/// exact evaluation paths is critical: the outer optimizer compares cost_fn
+/// values with exact_fn values, and a mismatch causes zigzagging /
+/// non-convergence.
 fn transformation_fit_score(fit: &UnifiedFitResult) -> f64 {
-    if fit.reml_score.is_finite() {
-        fit.reml_score
+    // penalized_objective already incorporates the REML/logdet correction
+    // when available, and gracefully degrades to −ℓ + penalty when the
+    // log-det is non-finite (see finite_penalizedobjective in custom_family).
+    if fit.penalized_objective.is_finite() {
+        fit.penalized_objective
     } else {
-        let score = 0.5 * fit.deviance + 0.5 * fit.stable_penalty_term;
-        if score.is_finite() {
-            score
-        } else {
-            f64::INFINITY
-        }
+        f64::INFINITY
     }
 }
