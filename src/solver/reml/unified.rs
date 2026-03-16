@@ -1030,10 +1030,12 @@ impl HyperOperator for ImplicitHyperOperator {
         // Term 1: (∂X/∂ψ_d)^T (W · (X · v))
         let x_v = self.x_dense.dot(v); // (n,)
         let w_x_v = &*self.w_diag * &x_v; // (n,)
-        let term1 = self.implicit_deriv.transpose_mul(self.axis, &w_x_v.view()); // (p,)
+        let term1 = self.implicit_deriv.transpose_mul(self.axis, &w_x_v.view())
+            .expect("radial scalar evaluation failed during implicit hyper transpose_mul"); // (p,)
 
         // Term 2: X^T (W · ((∂X/∂ψ_d) · v))
-        let dx_v = self.implicit_deriv.forward_mul(self.axis, &v.view()); // (n,)
+        let dx_v = self.implicit_deriv.forward_mul(self.axis, &v.view())
+            .expect("radial scalar evaluation failed during implicit hyper forward_mul"); // (n,)
         let w_dx_v = &*self.w_diag * &dx_v; // (n,)
         let term2 = self.x_dense.t().dot(&w_dx_v); // (p,)
 
@@ -1099,8 +1101,10 @@ impl ImplicitHyperOperator {
         u: &Array1<f64>,
     ) -> f64 {
         // Design part: dx_z^T (w ⊙ y_vec) + dx_u^T (w ⊙ x_vec)
-        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view());
-        let dx_u = self.implicit_deriv.forward_mul(self.axis, &u.view());
+        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view())
+            .expect("radial scalar evaluation failed during implicit hyper forward_mul");
+        let dx_u = self.implicit_deriv.forward_mul(self.axis, &u.view())
+            .expect("radial scalar evaluation failed during implicit hyper forward_mul");
 
         let mut design = 0.0f64;
         let w = &*self.w_diag;
@@ -1130,10 +1134,12 @@ impl ImplicitHyperOperator {
         let w_x_vec = &*self.w_diag * x_vec;
         let term1 = self
             .implicit_deriv
-            .transpose_mul(self.axis, &w_x_vec.view());
+            .transpose_mul(self.axis, &w_x_vec.view())
+            .expect("radial scalar evaluation failed during implicit hyper transpose_mul");
 
         // Term 2: X^T (W · ((∂X/∂ψ_d) · z))
-        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view());
+        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view())
+            .expect("radial scalar evaluation failed during implicit hyper forward_mul");
         let w_dx_z = &*self.w_diag * &dx_z;
         let term2 = self.x_dense.t().dot(&w_dx_z);
 
@@ -5522,7 +5528,8 @@ impl StochasticTraceEstimator {
             // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
             let implicit_dx_u: Vec<Array1<f64>> = implicit_ops
                 .iter()
-                .map(|op| op.implicit_deriv.forward_mul(op.axis, &u.view()))
+                .map(|op| op.implicit_deriv.forward_mul(op.axis, &u.view())
+                    .expect("radial scalar evaluation failed during implicit derivative forward_mul"))
                 .collect();
 
             // Precompute u^T S_psi for each implicit axis (for penalty dot products).
@@ -5545,7 +5552,8 @@ impl StochasticTraceEstimator {
                         let x_re = x_r.column(e);
 
                         let dx_u = &implicit_dx_u[oi];
-                        let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e);
+                        let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e)
+                            .expect("radial scalar evaluation failed during implicit derivative forward_mul");
 
                         let w = &*op.w_diag;
                         let mut design_val = 0.0f64;
@@ -5574,7 +5582,8 @@ impl StochasticTraceEstimator {
                             let x_rd = x_r.column(d);
 
                             let dx_u = &implicit_dx_u[oi];
-                            let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d);
+                            let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d)
+                                .expect("radial scalar evaluation failed during implicit derivative forward_mul");
 
                             let w = &*op.w_diag;
                             let mut design_val = 0.0f64;
