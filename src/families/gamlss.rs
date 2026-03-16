@@ -806,11 +806,14 @@ fn binomial_location_scalewarm_start(
             initial_beta: noise_beta_hint.cloned(),
         },
     ];
+    // Reduced iteration budget: 4×10=40 iterations instead of 8×20=160.
+    // Warm-start only needs rough initialization, not convergence.
+    // Relaxed tolerance further accelerates early exit.
     let warm_options = BlockwiseFitOptions {
-        inner_max_cycles: 20,
-        inner_tol: 1e-6,
-        outer_max_iter: 8,
-        outer_tol: 1e-6,
+        inner_max_cycles: 10,
+        inner_tol: 1e-4,
+        outer_max_iter: 4,
+        outer_tol: 1e-4,
         minweight: MIN_WEIGHT,
         ridge_floor: 1e-10,
         ridge_policy: BlockwiseFitOptions::default().ridge_policy,
@@ -4421,11 +4424,17 @@ impl GaussianLocationScaleFamily {
                 }
             }
         }
-        let scalars = Arc::new(gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?);
+        let scalars = Arc::new(gaussian_jointrow_scalars(
+            &self.y,
+            etamu,
+            eta_ls,
+            &self.weights,
+        )?);
         *self
             .cached_row_scalars
             .write()
-            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, Arc::clone(&scalars)));
+            .expect("cached_row_scalars lock poisoned") =
+            Some((key.0, key.1, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
@@ -6108,11 +6117,17 @@ impl GaussianLocationScaleWiggleFamily {
                 return Ok(Arc::clone(scalars));
             }
         }
-        let scalars = Arc::new(gaussian_jointrow_scalars(&self.y, q, eta_ls, &self.weights)?);
+        let scalars = Arc::new(gaussian_jointrow_scalars(
+            &self.y,
+            q,
+            eta_ls,
+            &self.weights,
+        )?);
         *self
             .cached_row_scalars
             .write()
-            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, Arc::clone(&scalars)));
+            .expect("cached_row_scalars lock poisoned") =
+            Some((key.0, key.1, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
