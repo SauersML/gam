@@ -8974,8 +8974,28 @@ fn build_single_smooth_term_realization(
     let term = terms.into_iter().next().ok_or_else(|| {
         BasisError::InvalidInput("single-term smooth build returned no term".to_string())
     })?;
+
+    // build_smooth_design strips FrozenTransform identifiability to None for
+    // ThinPlate/Duchon terms (so it can build the raw basis), but the frozen
+    // transform must still be applied to reduce the column count to match the
+    // original design.  Apply it here if the spec carries one.
+    let design_local = match spatial_identifiability_policy(termspec) {
+        Some(SpatialIdentifiability::FrozenTransform { transform }) => {
+            if design.ncols() != transform.nrows() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen spatial identifiability transform mismatch in incremental realizer: \
+                     raw design has {} columns but transform has {} rows",
+                    design.ncols(),
+                    transform.nrows()
+                )));
+            }
+            design.dot(transform)
+        }
+        _ => design,
+    };
+
     Ok(SingleSmoothTermRealization {
-        design_local: design,
+        design_local,
         term,
         dropped_penaltyinfo,
     })

@@ -1177,55 +1177,53 @@ pub fn stable_reparameterizationwith_invariant(
 
     let mut det1vec = vec![0.0; lambdas.len()];
 
-    // Build (S + δI)⁻¹ = U diag(1/(d + δ)) U' in the invariant penalized basis.
-    //
-    // Unlike the old pseudoinverse S⁺ which used hard eigenvalue thresholding,
-    // the δ-regularized inverse includes ALL eigenvectors (both positive and
-    // null), shifted by δ. This makes it full rank and C∞ smooth, and
-    // automatically captures the leakage correction.
-    let mut s_reg_inv = Mat::<f64>::zeros(p, p);
-    for l in 0..penalized_rank {
-        let eigenval = range_eigs_sorted[l];
-        let inv_d = 1.0 / (eigenval + delta);
-        // (S+δI)⁻¹[i,j] += (1/(d_l + δ)) * U[i,l] * U[j,l]
-        for i in 0..penalized_rank {
-            for j in 0..penalized_rank {
-                s_reg_inv[(i, j)] += inv_d * range_rotation[(i, l)] * range_rotation[(j, l)];
-            }
-        }
-    }
-
     for (k, lambda) in lambdas.iter().enumerate() {
         let s_k = &s_k_transformed_cache[k];
-        // tr((S+δI)⁻¹ S_k) via element-wise contraction on the penalized block.
+        // Compute tr((S+δI)⁻¹ S_k) via the eigenbasis to avoid precision loss
+        // from materializing s_reg_inv.  Each eigencomponent contributes
+        //   (U^T S_k U)_{l,l} / (d_l + δ),
+        // which we evaluate without forming the full rotated matrix.
         let mut trace = 0.0_f64;
-        for i in 0..penalized_rank {
-            for j in 0..penalized_rank {
-                trace += s_reg_inv[(i, j)] * s_k[(j, i)];
+        for l in 0..penalized_rank {
+            let eigenval = range_eigs_sorted[l];
+            let inv_d = 1.0 / (eigenval + delta);
+            // (U^T S_k U)_{l,l} = sum_{i,j} U[i,l] * S_k[i,j] * U[j,l]
+            let mut diag_ll = 0.0_f64;
+            for i in 0..penalized_rank {
+                for j in 0..penalized_rank {
+                    diag_ll += range_rotation[(i, l)] * s_k[(i, j)] * range_rotation[(j, l)];
+                }
             }
+            trace += inv_d * diag_ll;
         }
         det1vec[k] = *lambda * trace;
     }
 
     #[cfg(debug_assertions)]
     {
-        // Algebraic guardrail: keep the optimized det1 path tied to the general
-        // definition det1_k = lambda_k * tr((S+δI)⁻¹ S_k).
+        // Algebraic guardrail: cross-check the eigenbasis det1 against the
+        // materialized (S+δI)⁻¹ matrix contraction.  The eigenbasis path is
+        // primary; this validates that s_reg_inv is consistent.
+        let mut s_reg_inv = Mat::<f64>::zeros(p, p);
+        for l in 0..penalized_rank {
+            let eigenval = range_eigs_sorted[l];
+            let inv_d = 1.0 / (eigenval + delta);
+            for i in 0..penalized_rank {
+                for j in 0..penalized_rank {
+                    s_reg_inv[(i, j)] += inv_d * range_rotation[(i, l)] * range_rotation[(j, l)];
+                }
+            }
+        }
         let mut maxdet1_mismatch = 0.0_f64;
         for (k, lambda) in lambdas.iter().enumerate() {
             let s_k = &s_k_transformed_cache[k];
-            let mut product = Mat::<f64>::zeros(p, p);
-            matmul(
-                product.as_mut(),
-                Accum::Replace,
-                s_reg_inv.as_ref(),
-                s_k.as_ref(),
-                1.0,
-                Par::Seq,
-            );
+            // Reference: tr(s_reg_inv * S_k) restricted to the penalized block
+            // (s_reg_inv is structurally zero outside it).
             let mut trace = 0.0_f64;
-            for i in 0..p {
-                trace += product[(i, i)];
+            for i in 0..penalized_rank {
+                for j in 0..penalized_rank {
+                    trace += s_reg_inv[(i, j)] * s_k[(j, i)];
+                }
             }
             let reference = *lambda * trace;
             maxdet1_mismatch = maxdet1_mismatch.max((reference - det1vec[k]).abs());
@@ -1499,7 +1497,15 @@ mod tests {
         assert!(rep.e_transformed[[0, 0]].abs() > 0.0);
         assert!(rep.e_transformed[[0, 1]].abs() <= 1e-12);
         assert!(rep.e_transformed[[0, 2]].abs() <= 1e-12);
-        assert!((rep.det1[0] - 1.0).abs() <= 1e-10);
+        // Compute expected det1 from the δ-regularized formula rather than
+        // comparing against the idealized rank.  Single rank-1 penalty with
+        // eigenvalue ||rs||² = 1 in the penalized block.
+        let s_k_eig = 1.0_f64; // single eigenvalue of S_k
+        let lambda = 4.0_f64;
+        let max_ev = (lambda * s_k_eig).max(1.0);
+        let delta = 1e-10 * max_ev;
+        let expected_det1 = lambda * s_k_eig / (lambda * s_k_eig + delta);
+        assert!((rep.det1[0] - expected_det1).abs() <= 1e-12);
 
         let s = rep.s_transformed;
         let mut max_offdiag = 0.0_f64;
@@ -1538,10 +1544,20 @@ mod tests {
 
         assert_eq!(rep.e_transformed.nrows(), p);
         let det1 = rep.det1[0];
+        // Compute expected det1 from the δ-regularized formula:
+        //   det1 = lambda * sum_l d_l / (lambda*d_l + δ)
+        // where d_l are eigenvalues of S_k and δ = 1e-10 * max(lambda*d_l).
+        let s_k_eigs = [9.0_f64, 1.0_f64];
+        let lambda = 5.0_f64;
+        let max_ev = s_k_eigs.iter().map(|&d| lambda * d).fold(0.0_f64, f64::max).max(1.0);
+        let delta = 1e-10 * max_ev;
+        let expected_det1: f64 = s_k_eigs
+            .iter()
+            .map(|&d| lambda * d / (lambda * d + delta))
+            .sum();
         assert!(
-            (det1 - p as f64).abs() <= 1e-9,
-            "expected det1={}, got {det1}",
-            p
+            (det1 - expected_det1).abs() <= 1e-12,
+            "expected det1={expected_det1}, got {det1}",
         );
 
         let s = rep.s_transformed;

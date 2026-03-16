@@ -1027,13 +1027,17 @@ mod tests {
 
     fn logisticweight(eta: f64) -> f64 {
         let e = eta.clamp(-700.0, 700.0);
-        let mu = if e >= 0.0 {
-            1.0 / (1.0 + (-e).exp())
+        // Stable form: z / (1+z)^2 avoids catastrophic cancellation
+        // when mu rounds to 1.0 (large positive eta) or 0.0 (large negative eta).
+        if e >= 0.0 {
+            let z = (-e).exp();
+            let opz = 1.0 + z;
+            z / (opz * opz)
         } else {
-            let ex = e.exp();
-            ex / (1.0 + ex)
-        };
-        mu * (1.0 - mu)
+            let z = e.exp();
+            let opz = 1.0 + z;
+            z / (opz * opz)
+        }
     }
 
     fn d1fd(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {

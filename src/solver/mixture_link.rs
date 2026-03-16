@@ -443,20 +443,26 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                 };
             }
             let mu = logistic_stable(eta);
-            let d1 = if eta.is_finite() {
-                mu * (1.0 - mu)
+            // Stable derivatives using z/(1+z)^2 to avoid catastrophic
+            // cancellation when mu rounds to 1.0 at large positive eta.
+            let (d1, d2, d3) = if !eta.is_finite() {
+                (0.0, 0.0, 0.0)
+            } else if eta >= 0.0 {
+                let z = (-eta).exp();
+                let opz = 1.0 + z;
+                let w = z / (opz * opz); // = mu*(1-mu), stable
+                let one_minus_2mu = (z - 1.0) / opz; // = 1 - 2*mu, stable
+                let d2v = w * one_minus_2mu;
+                let d3v = w * (1.0 - 6.0 * w);
+                (w, d2v, d3v)
             } else {
-                0.0
-            };
-            let d2 = if eta.is_finite() {
-                d1 * (1.0 - 2.0 * mu)
-            } else {
-                0.0
-            };
-            let d3 = if eta.is_finite() {
-                d1 * (1.0 - 6.0 * d1)
-            } else {
-                0.0
+                let z = eta.exp();
+                let opz = 1.0 + z;
+                let w = z / (opz * opz); // = mu*(1-mu), stable
+                let one_minus_2mu = (1.0 - z) / opz; // = 1 - 2*mu, stable
+                let d2v = w * one_minus_2mu;
+                let d3v = w * (1.0 - 6.0 * w);
+                (w, d2v, d3v)
             };
             InverseLinkJet { mu, d1, d2, d3 }
         }
