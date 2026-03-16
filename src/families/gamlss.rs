@@ -8,9 +8,9 @@ use crate::custom_family::{
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, shared_dense_arc,
-    wrap_spatial_implicit_psi_operator,
+    ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
+    evaluate_custom_family_joint_hyper, fit_custom_family, resolve_custom_family_x_psi,
+    resolve_custom_family_x_psi_psi, shared_dense_arc,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -22,9 +22,7 @@ use crate::families::sigma_link::{
     exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar, safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
-use crate::matrix::{
-    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, SymmetricMatrix, xt_diag_x_symmetric,
-};
+use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::normal_pdf;
 use crate::smooth::{
@@ -32,7 +30,6 @@ use crate::smooth::{
     TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design,
     optimize_two_block_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
-    try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
@@ -556,106 +553,6 @@ fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64
         ));
     }
     Ok(lambdas)
-}
-
-fn build_block_spatial_psi_derivatives(
-    data: ndarray::ArrayView2<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    design: &TermCollectionDesign,
-) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
-    // Custom-family exact blocks consume psi = log(kappa) derivatives. The exact-joint
-    // setup is typed in SpatialLogKappaCoords so these derivatives stay in the same
-    // parameterization end-to-end.
-    let spatial_terms = spatial_length_scale_term_indices(resolvedspec);
-    let Some(info_list) =
-        try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, &spatial_terms)
-            .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
-    };
-    let psi_dim = info_list.len();
-    Ok(Some(
-        info_list
-            .into_iter()
-            .enumerate()
-            .map(|(psi_idx, info)| {
-                let x_full = EmbeddedColumnBlock::new(
-                    &info.x_psi_local,
-                    info.global_range.clone(),
-                    info.total_p,
-                )
-                .materialize();
-                let s_full = EmbeddedSquareBlock::new(
-                    &info.s_psi_local,
-                    info.global_range.clone(),
-                    info.total_p,
-                )
-                .materialize();
-                let penalty_indices = info.penalty_indices.clone();
-                CustomFamilyBlockPsiDerivative {
-                    penalty_index: Some(info.penalty_index),
-                    x_psi: x_full.clone(),
-                    s_psi: s_full,
-                    s_psi_components: Some(
-                        info.penalty_indices
-                            .into_iter()
-                            .zip(info.s_psi_components_local.into_iter().map(|local| {
-                                EmbeddedSquareBlock::new(
-                                    &local,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                                .materialize()
-                            }))
-                            .collect(),
-                    ),
-                    x_psi_psi: Some({
-                        let mut rows =
-                            vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
-                        rows[psi_idx] = EmbeddedColumnBlock::new(
-                            &info.x_psi_psi_local,
-                            info.global_range.clone(),
-                            info.total_p,
-                        )
-                        .materialize();
-                        rows
-                    }),
-                    s_psi_psi: Some({
-                        let mut rows =
-                            vec![Array2::<f64>::zeros((info.total_p, info.total_p)); psi_dim];
-                        rows[psi_idx] = EmbeddedSquareBlock::new(
-                            &info.s_psi_psi_local,
-                            info.global_range.clone(),
-                            info.total_p,
-                        )
-                        .materialize();
-                        rows
-                    }),
-                    s_psi_psi_components: Some({
-                        let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-                        rows[psi_idx] = penalty_indices
-                            .into_iter()
-                            .zip(info.s_psi_psi_components_local.into_iter().map(|local| {
-                                EmbeddedSquareBlock::new(
-                                    &local,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                                .materialize()
-                            }))
-                            .collect();
-                        rows
-                    }),
-                    implicit_operator: info
-                        .implicit_operator
-                        .as_ref()
-                        .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op))),
-                    implicit_axis: info.implicit_axis,
-                    implicit_group_id: info.aniso_group_id,
-                }
-            })
-            .collect(),
-    ))
 }
 
 fn build_two_block_exact_joint_setup(
@@ -3768,7 +3665,7 @@ pub struct GaussianLocationScaleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     /// Cached per-observation row scalars keyed by (eta_mu[0], eta_ls[0]) fingerprint.
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
-    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, GaussianJointRowScalars)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleFamily {
@@ -3818,13 +3715,15 @@ impl GaussianLocationScaleExactNewtonJointPsiWorkspace {
         let Some((xmu, x_ls)) = family.exact_joint_dense_block_designs(Some(specs))? else {
             return Err("GaussianLocationScaleFamily exact joint psi workspace requires dense block designs".to_string());
         };
+        let xmu = xmu.into_owned();
+        let x_ls = x_ls.into_owned();
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
             block_states,
             derivative_blocks,
-            xmu: xmu.into_owned(),
-            x_ls: x_ls.into_owned(),
+            xmu,
+            x_ls,
             psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
         })
     }
@@ -3858,14 +3757,15 @@ impl ExactNewtonJointPsiWorkspace for GaussianLocationScaleExactNewtonJointPsiWo
             return Ok(None);
         };
         Ok(Some(
-            self.family.exact_newton_joint_psisecond_order_terms_from_parts(
-                &self.block_states,
-                &self.derivative_blocks,
-                dir_i.as_ref(),
-                dir_j.as_ref(),
-                &self.xmu,
-                &self.x_ls,
-            )?,
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
+                    &self.xmu,
+                    &self.x_ls,
+                )?,
         ))
     }
 
@@ -4505,7 +4405,7 @@ impl GaussianLocationScaleFamily {
         &self,
         etamu: &Array1<f64>,
         eta_ls: &Array1<f64>,
-    ) -> Result<GaussianJointRowScalars, String> {
+    ) -> Result<Arc<GaussianJointRowScalars>, String> {
         let key = (
             etamu.get(0).copied().unwrap_or(f64::NAN),
             eta_ls.get(0).copied().unwrap_or(f64::NAN),
@@ -4517,15 +4417,15 @@ impl GaussianLocationScaleFamily {
                 .expect("cached_row_scalars lock poisoned");
             if let Some((k0, k1, ref scalars)) = *cache {
                 if k0 == key.0 && k1 == key.1 {
-                    return Ok(scalars.clone());
+                    return Ok(Arc::clone(scalars));
                 }
             }
         }
-        let scalars = gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?;
+        let scalars = Arc::new(gaussian_jointrow_scalars(&self.y, etamu, eta_ls, &self.weights)?);
         *self
             .cached_row_scalars
             .write()
-            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, scalars.clone()));
+            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
@@ -5094,14 +4994,16 @@ impl GaussianLocationScaleFamily {
         else {
             return Ok(None);
         };
-        Ok(Some(self.exact_newton_joint_psisecond_order_terms_from_parts(
-            block_states,
-            derivative_blocks,
-            &dir_i,
-            &dir_j,
-            xmu,
-            x_ls,
-        )?))
+        Ok(Some(
+            self.exact_newton_joint_psisecond_order_terms_from_parts(
+                block_states,
+                derivative_blocks,
+                &dir_i,
+                &dir_j,
+                xmu,
+                x_ls,
+            )?,
+        ))
     }
 
     fn exact_newton_joint_psisecond_order_terms_from_parts(
@@ -5782,13 +5684,15 @@ impl GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace {
                     .to_string(),
             );
         };
+        let xmu = xmu.into_owned();
+        let x_ls = x_ls.into_owned();
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
             block_states,
             derivative_blocks,
-            xmu: xmu.into_owned(),
-            x_ls: x_ls.into_owned(),
+            xmu,
+            x_ls,
             psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
         })
     }
@@ -5822,14 +5726,15 @@ impl ExactNewtonJointPsiWorkspace for GaussianLocationScaleWiggleExactNewtonJoin
             return Ok(None);
         };
         Ok(Some(
-            self.family.exact_newton_joint_psisecond_order_terms_from_parts(
-                &self.block_states,
-                &self.derivative_blocks,
-                dir_i.as_ref(),
-                dir_j.as_ref(),
-                &self.xmu,
-                &self.x_ls,
-            )?,
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
+                    &self.xmu,
+                    &self.x_ls,
+                )?,
         ))
     }
 
@@ -5927,7 +5832,7 @@ pub struct GaussianLocationScaleWiggleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
-    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, GaussianJointRowScalars)>>,
+    cached_row_scalars: std::sync::RwLock<Option<(f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleWiggleFamily {
@@ -6186,7 +6091,7 @@ impl GaussianLocationScaleWiggleFamily {
         &self,
         q: &Array1<f64>,
         eta_ls: &Array1<f64>,
-    ) -> Result<GaussianJointRowScalars, String> {
+    ) -> Result<Arc<GaussianJointRowScalars>, String> {
         let key = (
             q.get(0).copied().unwrap_or(f64::NAN),
             eta_ls.get(0).copied().unwrap_or(f64::NAN),
@@ -6200,14 +6105,14 @@ impl GaussianLocationScaleWiggleFamily {
                 && k0 == key.0
                 && k1 == key.1
             {
-                return Ok(scalars.clone());
+                return Ok(Arc::clone(scalars));
             }
         }
-        let scalars = gaussian_jointrow_scalars(&self.y, q, eta_ls, &self.weights)?;
+        let scalars = Arc::new(gaussian_jointrow_scalars(&self.y, q, eta_ls, &self.weights)?);
         *self
             .cached_row_scalars
             .write()
-            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, scalars.clone()));
+            .expect("cached_row_scalars lock poisoned") = Some((key.0, key.1, Arc::clone(&scalars)));
         Ok(scalars)
     }
 
@@ -6828,14 +6733,16 @@ impl GaussianLocationScaleWiggleFamily {
         else {
             return Ok(None);
         };
-        Ok(Some(self.exact_newton_joint_psisecond_order_terms_from_parts(
-            block_states,
-            derivative_blocks,
-            &dir_a,
-            &dir_b,
-            xmu,
-            x_ls,
-        )?))
+        Ok(Some(
+            self.exact_newton_joint_psisecond_order_terms_from_parts(
+                block_states,
+                derivative_blocks,
+                &dir_a,
+                &dir_b,
+                xmu,
+                x_ls,
+            )?,
+        ))
     }
 
     fn exact_newton_joint_psisecond_order_terms_from_parts(
@@ -7578,6 +7485,25 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             psi_index,
             d_beta_flat,
         )
+    }
+
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+                specs,
+                derivative_blocks.to_vec(),
+            )?,
+        )))
     }
 
     fn block_geometry(
@@ -9223,13 +9149,15 @@ impl BinomialLocationScaleExactNewtonJointPsiWorkspace {
                     .to_string(),
             );
         };
+        let x_t = x_t.into_owned();
+        let x_ls = x_ls.into_owned();
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
             block_states,
             derivative_blocks,
-            x_t: x_t.into_owned(),
-            x_ls: x_ls.into_owned(),
+            x_t,
+            x_ls,
             psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
         })
     }
@@ -9263,14 +9191,15 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
             return Ok(None);
         };
         Ok(Some(
-            self.family.exact_newton_joint_psisecond_order_terms_from_parts(
-                &self.block_states,
-                &self.derivative_blocks,
-                dir_i.as_ref(),
-                dir_j.as_ref(),
-                &self.x_t,
-                &self.x_ls,
-            )?,
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
+                    &self.x_t,
+                    &self.x_ls,
+                )?,
         ))
     }
 
@@ -9328,13 +9257,15 @@ impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
                     .to_string(),
             );
         };
+        let x_t = x_t.into_owned();
+        let x_ls = x_ls.into_owned();
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
             family,
             block_states,
             derivative_blocks,
-            x_t: x_t.into_owned(),
-            x_ls: x_ls.into_owned(),
+            x_t,
+            x_ls,
             psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
         })
     }
@@ -9368,14 +9299,15 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJoin
             return Ok(None);
         };
         Ok(Some(
-            self.family.exact_newton_joint_psisecond_order_terms_from_parts(
-                &self.block_states,
-                &self.derivative_blocks,
-                dir_i.as_ref(),
-                dir_j.as_ref(),
-                &self.x_t,
-                &self.x_ls,
-            )?,
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
+                    &self.x_t,
+                    &self.x_ls,
+                )?,
         ))
     }
 
@@ -10268,11 +10200,11 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
-        let (block_idx, local_idx, z_t, z_ls) =
-            (dir_a.block_idx, dir_a.local_idx, &dir_a.z_t_psi, &dir_a.z_ls_psi);
+        let (z_t, z_ls) = (&dir_a.z_t_psi, &dir_a.z_ls_psi);
 
         let mut r_t = Array1::<f64>::zeros(n);
         let mut r_ls = Array1::<f64>::zeros(n);
@@ -10337,9 +10269,7 @@ impl BinomialLocationScaleFamily {
             + x_ls.t().dot(&dr_ls);
         let mut score_psi = Array1::<f64>::zeros(total);
         score_psi.slice_mut(s![0..pt]).assign(&score_t);
-        score_psi
-            .slice_mut(s![pt..pt + pls])
-            .assign(&score_ls);
+        score_psi.slice_mut(s![pt..pt + pls]).assign(&score_ls);
         let hessian_psi = if hessian_psi_operator.is_some() {
             Array2::<f64>::zeros((0, 0))
         } else {
@@ -10405,11 +10335,32 @@ impl BinomialLocationScaleFamily {
         else {
             return Ok(None);
         };
+        Ok(Some(
+            self.exact_newton_joint_psisecond_order_terms_from_parts(
+                block_states,
+                derivative_blocks,
+                &dir_i,
+                &dir_j,
+                x_t,
+                x_ls,
+            )?,
+        ))
+    }
+
+    fn exact_newton_joint_psisecond_order_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        dir_i: &BinomialLocationScaleJointPsiDirection,
+        dir_j: &BinomialLocationScaleJointPsiDirection,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
         let (x_t_ab, x_ls_ab, z_t_ab, z_ls_ab) = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
-            &dir_i,
-            &dir_j,
+            dir_i,
+            dir_j,
             x_t,
             x_ls,
         )?;
@@ -10681,13 +10632,11 @@ impl BinomialLocationScaleFamily {
             .assign(&h_ll_block);
         mirror_upper_to_lower(&mut hessian_psi_psi);
 
-        Ok(Some(
-            crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
-                objective_psi_psi,
-                score_psi_psi,
-                hessian_psi_psi,
-            },
-        ))
+        Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+        })
     }
 
     fn exact_newton_joint_psihessian_directional_derivative_from_designs(
@@ -10709,6 +10658,25 @@ impl BinomialLocationScaleFamily {
         else {
             return Ok(None);
         };
+        Ok(Some(
+            self.exact_newton_joint_psihessian_directional_derivative_from_parts(
+                block_states,
+                &dir_a,
+                d_beta_flat,
+                x_t,
+                x_ls,
+            )?,
+        ))
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        dir_a: &BinomialLocationScaleJointPsiDirection,
+        d_beta_flat: &Array1<f64>,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -10841,7 +10809,7 @@ impl BinomialLocationScaleFamily {
         out.slice_mut(s![pt..pt + pls, pt..pt + pls])
             .assign(&ll_block);
         mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        Ok(out)
     }
 }
 
@@ -11163,6 +11131,25 @@ impl CustomFamily for BinomialLocationScaleFamily {
             psi_index,
             d_beta_flat,
         )
+    }
+
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            BinomialLocationScaleExactNewtonJointPsiWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+                specs,
+                derivative_blocks.to_vec(),
+            )?,
+        )))
     }
 
     fn exact_newton_hessian_directional_derivative(
@@ -11876,7 +11863,8 @@ impl BinomialLocationScaleWiggleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let (z_t_psi, z_ls_psi) = (&dir_a.z_t_psi, &dir_a.z_ls_psi);
@@ -12284,11 +12272,32 @@ impl BinomialLocationScaleWiggleFamily {
         else {
             return Ok(None);
         };
+        Ok(Some(
+            self.exact_newton_joint_psisecond_order_terms_from_parts(
+                block_states,
+                derivative_blocks,
+                &dir_a,
+                &dir_b,
+                x_t,
+                x_ls,
+            )?,
+        ))
+    }
+
+    fn exact_newton_joint_psisecond_order_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        dir_a: &BinomialLocationScaleWiggleJointPsiDirection,
+        dir_b: &BinomialLocationScaleWiggleJointPsiDirection,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
         let (x_t_ab, x_ls_ab, z_t_ab, z_ls_ab) = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
-            &dir_a,
-            &dir_b,
+            dir_a,
+            dir_b,
             x_t,
             x_ls,
         )?;
@@ -12980,13 +12989,11 @@ impl BinomialLocationScaleWiggleFamily {
                 + (loss_4 * q_a * q_b + loss_3 * q_ab) * bb);
         }
 
-        Ok(Some(
-            crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
-                objective_psi_psi,
-                score_psi_psi,
-                hessian_psi_psi,
-            },
-        ))
+        Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+        })
     }
 
     fn exact_newton_joint_psihessian_directional_derivative_from_designs(
@@ -13011,6 +13018,25 @@ impl BinomialLocationScaleWiggleFamily {
         else {
             return Ok(None);
         };
+        Ok(Some(
+            self.exact_newton_joint_psihessian_directional_derivative_from_parts(
+                block_states,
+                &dir_a,
+                d_beta_flat,
+                x_t,
+                x_ls,
+            )?,
+        ))
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        dir_a: &BinomialLocationScaleWiggleJointPsiDirection,
+        d_beta_flat: &Array1<f64>,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let n = self.y.len();
@@ -13543,7 +13569,7 @@ impl BinomialLocationScaleWiggleFamily {
             out += &((loss_4 * alpha * q_a + loss_3 * alpha_a) * &bb);
         }
         mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        Ok(out)
     }
 
     /// Build a turnkey wiggle block from a q-seed vector and knot settings.
@@ -14553,6 +14579,25 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             psi_index,
             d_beta_flat,
         )
+    }
+
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+                specs,
+                derivative_blocks.to_vec(),
+            )?,
+        )))
     }
 
     fn block_geometry(
