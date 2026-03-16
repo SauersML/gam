@@ -55,11 +55,11 @@ fn safe_exp_active_derivative(eta: f64, sigma: f64) -> f64 {
 
 #[inline]
 pub fn exp_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
-    let jet = exp_sigma_jet4_scalar(eta);
-    SigmaJet1 {
-        sigma: jet.sigma,
-        d1: jet.d1,
-    }
+    // Compute only sigma and first derivative directly, avoiding the
+    // unnecessary computation of d2/d3/d4 in exp_sigma_jet4_scalar.
+    let sigma = safe_exp(eta);
+    let d1 = safe_exp_active_derivative(eta, sigma);
+    SigmaJet1 { sigma, d1 }
 }
 
 #[inline]
@@ -95,10 +95,14 @@ pub fn exp_sigma_derivs_up_to_third(
     eta: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
     let n = eta.len();
-    let mut sigma = Array1::<f64>::zeros(n);
-    let mut d1 = Array1::<f64>::zeros(n);
-    let mut d2 = Array1::<f64>::zeros(n);
-    let mut d3 = Array1::<f64>::zeros(n);
+    // Use uninit — every element is written in the loop below.
+    let (mut sigma, mut d1, mut d2, mut d3);
+    unsafe {
+        sigma = Array1::<f64>::uninit(n).assume_init();
+        d1 = Array1::<f64>::uninit(n).assume_init();
+        d2 = Array1::<f64>::uninit(n).assume_init();
+        d3 = Array1::<f64>::uninit(n).assume_init();
+    }
     for i in 0..n {
         let jet = exp_sigma_jet3_scalar(eta[i]);
         sigma[i] = jet.sigma;
@@ -138,11 +142,15 @@ pub fn exp_sigma_derivs_up_to_fourth(
     Array1<f64>,
 ) {
     let n = eta.len();
-    let mut sigma = Array1::<f64>::zeros(n);
-    let mut d1 = Array1::<f64>::zeros(n);
-    let mut d2 = Array1::<f64>::zeros(n);
-    let mut d3 = Array1::<f64>::zeros(n);
-    let mut d4 = Array1::<f64>::zeros(n);
+    // Use uninit — every element is written in the loop below.
+    let (mut sigma, mut d1, mut d2, mut d3, mut d4);
+    unsafe {
+        sigma = Array1::<f64>::uninit(n).assume_init();
+        d1 = Array1::<f64>::uninit(n).assume_init();
+        d2 = Array1::<f64>::uninit(n).assume_init();
+        d3 = Array1::<f64>::uninit(n).assume_init();
+        d4 = Array1::<f64>::uninit(n).assume_init();
+    }
     for i in 0..n {
         let jet = exp_sigma_jet4_scalar(eta[i]);
         sigma[i] = jet.sigma;
