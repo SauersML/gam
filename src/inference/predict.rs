@@ -780,27 +780,14 @@ impl BernoulliMarginalSlopePredictor {
         Ok((marginal, logslope, score_warp, link_dev))
     }
 
-    fn normal_expectation_nodes(n: usize) -> (Vec<f64>, Vec<f64>) {
+    fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
         let gh = crate::quadrature::compute_gauss_hermite_n(n);
         let scale = 2.0_f64.sqrt();
         let norm = std::f64::consts::PI.sqrt();
         (
-            gh.nodes.into_iter().map(|x| scale * x).collect(),
-            gh.weights.into_iter().map(|w| w / norm).collect(),
+            Array1::from_iter(gh.nodes.into_iter().map(|x| scale * x)),
+            Array1::from_iter(gh.weights.into_iter().map(|w| w / norm)),
         )
-    }
-
-    fn warp_values(
-        runtime: Option<&SavedAnchoredDeviationRuntime>,
-        beta: Option<ArrayView1<'_, f64>>,
-        z: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        if let (Some(runtime), Some(beta)) = (runtime, beta) {
-            let design = runtime.design(z).map_err(EstimationError::InvalidInput)?;
-            Ok(z + &design.dot(&beta.to_owned()))
-        } else {
-            Ok(z.clone())
-        }
     }
 
     fn link_values(
@@ -831,24 +818,15 @@ impl BernoulliMarginalSlopePredictor {
         }
     }
 
-    fn solve_intercept_scalar(
+    fn solve_intercept_scalar_with_nodes(
         &self,
         marginal_eta: f64,
         slope: f64,
-        score_warp_beta: Option<ArrayView1<'_, f64>>,
+        warped_nodes: &Array1<f64>,
+        quadrature_weights: &Array1<f64>,
         link_dev_beta: Option<ArrayView1<'_, f64>>,
     ) -> Result<f64, EstimationError> {
-        if self.score_warp_runtime.is_none() && self.link_deviation_runtime.is_none() {
-            return Ok(marginal_eta * (1.0 + slope * slope).sqrt());
-        }
         let target = crate::probability::normal_cdf(marginal_eta).clamp(1e-12, 1.0 - 1e-12);
-        let (nodes, weights) = Self::normal_expectation_nodes(20);
-        let node_arr = Array1::from_vec(nodes);
-        let warped_nodes = Self::warp_values(
-            self.score_warp_runtime.as_ref(),
-            score_warp_beta,
-            &node_arr,
-        )?;
         let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
         for _ in 0..20 {
             let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
@@ -862,7 +840,7 @@ impl BernoulliMarginalSlopePredictor {
                 link_dev_beta,
                 &eta_nodes,
             )?;
-            let f = weights
+            let f = quadrature_weights
                 .iter()
                 .zip(linked.iter())
                 .map(|(&w, &q)| w * crate::probability::normal_cdf(q))
@@ -871,7 +849,7 @@ impl BernoulliMarginalSlopePredictor {
             if f.abs() < 1e-10 {
                 break;
             }
-            let df = weights
+            let df = quadrature_weights
                 .iter()
                 .zip(linked.iter().zip(linked_d1.iter()))
                 .map(|(&w, (&q, &dq))| w * crate::probability::normal_pdf(q) * dq)
@@ -882,15 +860,17 @@ impl BernoulliMarginalSlopePredictor {
         Ok(intercept)
     }
 
-    fn final_eta_from_theta(
+    fn final_eta_and_gradient_from_theta(
         &self,
         input: &PredictInput,
         theta: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+        need_gradient: bool,
+    ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
         let z = input.auxiliary_scalar.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                format!("bernoulli marginal-slope prediction requires auxiliary z column '{}'", self.z_column),
-            )
+            EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction requires auxiliary z column '{}'",
+                self.z_column
+            ))
         })?;
         let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -899,27 +879,219 @@ impl BernoulliMarginalSlopePredictor {
         })?;
         let (beta_marginal, beta_logslope, beta_score_warp, beta_link_dev) =
             self.split_theta(theta)?;
-        let marginal_eta =
-            input
-                .design
-                .dot(&beta_marginal.to_owned())
-                .mapv(|v| v + self.baseline_marginal);
+        if self.score_warp_runtime.is_some() != beta_score_warp.is_some() {
+            return Err(EstimationError::InvalidInput(
+                "bernoulli marginal-slope saved score-warp runtime/coefficients are inconsistent"
+                    .to_string(),
+            ));
+        }
+        if self.link_deviation_runtime.is_some() != beta_link_dev.is_some() {
+            return Err(EstimationError::InvalidInput(
+                "bernoulli marginal-slope saved link-deviation runtime/coefficients are inconsistent"
+                    .to_string(),
+            ));
+        }
+        let design_marginal = need_gradient.then(|| input.design.to_dense());
+        let design_logslope_dense = need_gradient.then(|| design_logslope.to_dense());
+        let marginal_eta = input
+            .design
+            .dot(&beta_marginal.to_owned())
+            .mapv(|v| v + self.baseline_marginal);
         let logslope_eta = design_logslope
             .dot(&beta_logslope.to_owned())
             .mapv(|v| v + self.baseline_logslope);
-        let warped_z = Self::warp_values(self.score_warp_runtime.as_ref(), beta_score_warp, z)?;
-        let mut eta_base = Array1::<f64>::zeros(z.len());
+        let flex_active =
+            self.score_warp_runtime.is_some() || self.link_deviation_runtime.is_some();
+        let (nodes, quadrature_weights) = Self::normal_expectation_nodes(20);
+        let score_warp_obs_design = self
+            .score_warp_runtime
+            .as_ref()
+            .map(|runtime| runtime.design(z).map_err(EstimationError::InvalidInput))
+            .transpose()?;
+        let score_warp_node_design = self
+            .score_warp_runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .design(&nodes)
+                    .map_err(EstimationError::InvalidInput)
+            })
+            .transpose()?;
+        let warped_nodes = if let (Some(design), Some(beta)) =
+            (score_warp_node_design.as_ref(), beta_score_warp.clone())
+        {
+            &nodes + &design.dot(&beta.to_owned())
+        } else {
+            nodes.clone()
+        };
+        let warped_z = if let (Some(design), Some(beta)) =
+            (score_warp_obs_design.as_ref(), beta_score_warp.clone())
+        {
+            z + &design.dot(&beta.to_owned())
+        } else {
+            z.clone()
+        };
+        let mut final_eta = Array1::<f64>::zeros(z.len());
+        let mut grad = need_gradient.then(|| Array2::<f64>::zeros((z.len(), theta.len())));
+        let marginal_dim = self.beta_marginal.len();
+        let logslope_dim = self.beta_logslope.len();
+        let score_warp_dim = self.beta_score_warp.as_ref().map_or(0, Array1::len);
+        let link_dev_dim = self.beta_link_dev.as_ref().map_or(0, Array1::len);
+        let logslope_offset = marginal_dim;
+        let score_warp_offset = logslope_offset + logslope_dim;
+        let link_dev_offset = score_warp_offset + score_warp_dim;
         for i in 0..z.len() {
+            let q = marginal_eta[i];
             let slope = logslope_eta[i].exp();
-            let intercept = self.solve_intercept_scalar(
-                marginal_eta[i],
-                slope,
-                beta_score_warp.clone(),
-                beta_link_dev.clone(),
-            )?;
-            eta_base[i] = intercept + slope * warped_z[i];
+            let intercept = if flex_active {
+                self.solve_intercept_scalar_with_nodes(
+                    q,
+                    slope,
+                    &warped_nodes,
+                    &quadrature_weights,
+                    beta_link_dev.clone(),
+                )?
+            } else {
+                q * (1.0 + slope * slope).sqrt()
+            };
+            let eta_base = intercept + slope * warped_z[i];
+            let mut row_grad = if need_gradient {
+                Some(Array1::<f64>::zeros(theta.len()))
+            } else {
+                None
+            };
+            if let Some(row_grad) = row_grad.as_mut() {
+                if flex_active {
+                    let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
+                    let linked_nodes = Self::link_values(
+                        self.link_deviation_runtime.as_ref(),
+                        beta_link_dev.clone(),
+                        &eta_nodes,
+                    )?;
+                    let linked_d1 = Self::link_derivative(
+                        self.link_deviation_runtime.as_ref(),
+                        beta_link_dev.clone(),
+                        &eta_nodes,
+                    )?;
+                    let phi_nodes = linked_nodes.mapv(crate::probability::normal_pdf);
+                    let weighted_phi = &quadrature_weights * &phi_nodes;
+                    let weighted_c1 = &weighted_phi * &linked_d1;
+                    let m_a = weighted_c1.sum().max(1e-12);
+                    let a_q = crate::probability::normal_pdf(q) / m_a;
+                    let m_b = weighted_c1.dot(&warped_nodes);
+                    let a_b = -m_b / m_a;
+                    let design_marginal = design_marginal.as_ref().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "bernoulli marginal-slope analytic gradient missing marginal design"
+                                .to_string(),
+                        )
+                    })?;
+                    let design_logslope_dense =
+                        design_logslope_dense.as_ref().ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "bernoulli marginal-slope analytic gradient missing logslope design"
+                                    .to_string(),
+                            )
+                        })?;
+
+                    for j in 0..marginal_dim {
+                        row_grad[j] = a_q * design_marginal[[i, j]];
+                    }
+
+                    let g_scale = slope * (a_b + warped_z[i]);
+                    for j in 0..logslope_dim {
+                        row_grad[logslope_offset + j] = g_scale * design_logslope_dense[[i, j]];
+                    }
+
+                    if let (Some(obs_design), Some(node_design)) = (
+                        score_warp_obs_design.as_ref(),
+                        score_warp_node_design.as_ref(),
+                    ) {
+                        let a_h = node_design
+                            .t()
+                            .dot(&weighted_c1)
+                            .mapv(|v| -(slope * v) / m_a);
+                        for j in 0..score_warp_dim {
+                            row_grad[score_warp_offset + j] = a_h[j] + slope * obs_design[[i, j]];
+                        }
+                    }
+
+                    if let (Some(runtime), Some(beta_w)) =
+                        (self.link_deviation_runtime.as_ref(), beta_link_dev.clone())
+                    {
+                        let basis_nodes = runtime
+                            .design(&eta_nodes)
+                            .map_err(EstimationError::InvalidInput)?;
+                        let a_w = basis_nodes.t().dot(&weighted_phi).mapv(|v| -v / m_a);
+                        for j in 0..link_dev_dim {
+                            row_grad[link_dev_offset + j] = a_w[j];
+                        }
+                    }
+                } else {
+                    let c = (1.0 + slope * slope).sqrt();
+                    let design_marginal = design_marginal.as_ref().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "bernoulli marginal-slope analytic gradient missing marginal design"
+                                .to_string(),
+                        )
+                    })?;
+                    let design_logslope_dense =
+                        design_logslope_dense.as_ref().ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "bernoulli marginal-slope analytic gradient missing logslope design"
+                                    .to_string(),
+                            )
+                        })?;
+                    for j in 0..marginal_dim {
+                        row_grad[j] = c * design_marginal[[i, j]];
+                    }
+                    let g_scale = q * slope * slope / c + slope * warped_z[i];
+                    for j in 0..logslope_dim {
+                        row_grad[logslope_offset + j] = g_scale * design_logslope_dense[[i, j]];
+                    }
+                }
+            }
+
+            if let (Some(runtime), Some(beta_w)) =
+                (self.link_deviation_runtime.as_ref(), beta_link_dev.clone())
+            {
+                let eta_base_arr = Array1::from_vec(vec![eta_base]);
+                let basis_obs = runtime
+                    .design(&eta_base_arr)
+                    .map_err(EstimationError::InvalidInput)?;
+                let d1_obs = runtime
+                    .first_derivative_design(&eta_base_arr)
+                    .map_err(EstimationError::InvalidInput)?;
+                let basis_row = basis_obs.row(0).to_owned();
+                let c_obs = d1_obs.row(0).dot(&beta_w.to_owned()) + 1.0;
+                final_eta[i] = eta_base + basis_row.dot(&beta_w.to_owned());
+                if let Some(row_grad) = row_grad.as_mut() {
+                    row_grad
+                        .slice_mut(ndarray::s![..link_dev_offset])
+                        .mapv_inplace(|v| c_obs * v);
+                    for j in 0..link_dev_dim {
+                        row_grad[link_dev_offset + j] =
+                            c_obs * row_grad[link_dev_offset + j] + basis_row[j];
+                    }
+                }
+            } else {
+                final_eta[i] = eta_base;
+            }
+
+            if let (Some(grad), Some(row_grad)) = (grad.as_mut(), row_grad.as_ref()) {
+                grad.row_mut(i).assign(row_grad);
+            }
         }
-        Self::link_values(self.link_deviation_runtime.as_ref(), beta_link_dev, &eta_base)
+        Ok((final_eta, grad))
+    }
+
+    fn final_eta_from_theta(
+        &self,
+        input: &PredictInput,
+        theta: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let (eta, _) = self.final_eta_and_gradient_from_theta(input, theta, false)?;
+        Ok(eta)
     }
 
     fn eta_standard_error_from_covariance(
@@ -928,19 +1100,12 @@ impl BernoulliMarginalSlopePredictor {
         covariance: &Array2<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let theta = self.theta();
-        let eta0 = self.final_eta_from_theta(input, &theta)?;
-        let mut grad = Array2::<f64>::zeros((eta0.len(), theta.len()));
-        for j in 0..theta.len() {
-            let h = 1e-4 * (1.0 + theta[j].abs());
-            let mut plus = theta.clone();
-            plus[j] += h;
-            let mut minus = theta.clone();
-            minus[j] -= h;
-            let eta_plus = self.final_eta_from_theta(input, &plus)?;
-            let eta_minus = self.final_eta_from_theta(input, &minus)?;
-            let diff = (&eta_plus - &eta_minus) / (2.0 * h);
-            grad.column_mut(j).assign(&diff);
-        }
+        let (_, grad) = self.final_eta_and_gradient_from_theta(input, &theta, true)?;
+        let grad = grad.ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "bernoulli marginal-slope analytic predictor gradient was not produced".to_string(),
+            )
+        })?;
         Ok(linear_predictor_se_from_grad(&grad, covariance))
     }
 
@@ -990,8 +1155,7 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
                 )));
             }
             let eta_se = self.eta_standard_error_from_covariance(input, covariance)?;
-            let mean_se =
-                eta_se.clone() * plugin.eta.mapv(crate::probability::normal_pdf);
+            let mean_se = eta_se.clone() * plugin.eta.mapv(crate::probability::normal_pdf);
             (Some(eta_se), Some(mean_se))
         } else {
             (None, None)
@@ -2801,8 +2965,8 @@ mod tests {
         )
         .expect("royston-parmar point prediction");
         let expected_eta = array![0.4, 1.2];
-        let expected_mean = expected_eta
-            .mapv(|eta: f64| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
+        let expected_mean =
+            expected_eta.mapv(|eta: f64| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
         assert_eq!(out.eta, expected_eta);
         for i in 0..out.mean.len() {
             assert!((out.mean[i] - expected_mean[i]).abs() <= 1e-12);

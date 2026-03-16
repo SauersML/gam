@@ -779,19 +779,12 @@ pub struct HyperCoord {
     pub a: f64,
     /// ∂_i (∇_β F)|_β — fixed-β score (p-vector).
     pub g: Array1<f64>,
-    /// ∂_i H|_β — fixed-β Hessian drift (p×p matrix).
+    /// ∂_i H|_β — fixed-β Hessian drift.
     ///
-    /// For dense mode, this is the fully materialized B_i matrix.
-    /// When `b_operator` is `Some(...)`, this field may be a zero-sized
-    /// placeholder and all B_i · v operations should go through the operator.
-    pub b_mat: Array2<f64>,
-    /// Optional implicit operator for B_i · v products.
-    ///
-    /// When present, the stochastic trace estimator uses this instead of
-    /// `b_mat.dot(v)`, avoiding materialization of the (p × p) matrix.
-    /// This is activated for anisotropic ψ coordinates when the problem size
-    /// exceeds the implicit operator memory threshold.
-    pub b_operator: Option<Box<dyn HyperOperator>>,
+    /// The drift may have a materialized dense contribution, an operator
+    /// contribution, or both. This replaces the old `b_mat + optional
+    /// b_operator + zero-sized placeholder` convention.
+    pub drift: HyperCoordDrift,
     /// ∂_i L_δ(S) — smooth penalty pseudo-logdet first derivative.
     /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
     pub ld_s: f64,
@@ -878,6 +871,82 @@ pub trait HyperOperator: Send + Sync {
     /// structure (A_d = X^T C_d X + P_d), `None` for dense wrappers.
     fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
         None
+    }
+}
+
+/// Fixed-β Hessian drift payload for a single hyper coordinate.
+///
+/// Some coordinates are naturally dense. Others are most efficient as
+/// operator-backed implicit drifts. A few workflows need to carry both a dense
+/// correction and an operator-backed main term, so this type can represent both
+/// simultaneously without relying on dummy zero-sized matrices.
+pub struct HyperCoordDrift {
+    pub dense: Option<Array2<f64>>,
+    pub operator: Option<Box<dyn HyperOperator>>,
+}
+
+impl HyperCoordDrift {
+    pub fn none() -> Self {
+        Self {
+            dense: None,
+            operator: None,
+        }
+    }
+
+    pub fn from_dense(dense: Array2<f64>) -> Self {
+        Self {
+            dense: Some(dense),
+            operator: None,
+        }
+    }
+
+    pub fn from_operator(operator: Box<dyn HyperOperator>) -> Self {
+        Self {
+            dense: None,
+            operator: Some(operator),
+        }
+    }
+
+    pub fn from_parts(
+        dense: Option<Array2<f64>>,
+        operator: Option<Box<dyn HyperOperator>>,
+    ) -> Self {
+        let dense = dense.filter(|mat| !(operator.is_some() && mat.is_empty()));
+        Self { dense, operator }
+    }
+
+    pub fn has_operator(&self) -> bool {
+        self.operator.is_some()
+    }
+
+    pub fn uses_operator_fast_path(&self) -> bool {
+        self.operator.is_some() && self.dense.is_none()
+    }
+
+    pub fn operator_ref(&self) -> Option<&dyn HyperOperator> {
+        self.operator.as_deref()
+    }
+
+    pub fn materialize(&self) -> Array2<f64> {
+        match (&self.dense, &self.operator) {
+            (Some(dense), Some(operator)) => {
+                let mut out = dense.clone();
+                out += &operator.to_dense();
+                out
+            }
+            (Some(dense), None) => dense.clone(),
+            (None, Some(operator)) => operator.to_dense(),
+            (None, None) => Array2::zeros((0, 0)),
+        }
+    }
+
+    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        match (&self.dense, &self.operator) {
+            (Some(dense), Some(operator)) => dense.dot(v) + operator.mul_vec(v),
+            (Some(dense), None) => dense.dot(v),
+            (None, Some(operator)) => operator.mul_vec(v),
+            (None, None) => Array1::zeros(0),
+        }
     }
 }
 

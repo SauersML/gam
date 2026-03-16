@@ -36,12 +36,11 @@ use crate::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
-    matrix_inversewith_regularization, max_abs_diag, row_mismatch_message,
+    matrix_inversewith_regularization, row_mismatch_message,
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    sas_inverse_link_jetwith_param_partials, state_from_beta_logisticspec, state_from_sasspec,
-    state_fromspec,
+    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
@@ -4605,7 +4604,8 @@ where
 #[cfg(test)]
 mod fd_policy_tests {
     use super::*;
-    use crate::mixture_link::sas_inverse_link_jet;
+    use crate::linalg::utils::max_abs_diag;
+    use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
     use crate::types::LikelihoodFamily;
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
