@@ -937,7 +937,7 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub x_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
-    pub implicit_operator: Option<Arc<dyn CustomFamilyPsiDerivativeOperator>>,
+    pub(crate) implicit_operator: Option<Arc<dyn CustomFamilyPsiDerivativeOperator>>,
     pub implicit_axis: usize,
     pub implicit_group_id: Option<usize>,
 }

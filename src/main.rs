@@ -6545,7 +6545,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 n_obs = Some(y.len());
                 if let Some(predictor) = model.predictor() {
                     let pred_input = build_predict_input_for_model(
-                        model,
+                        &model,
                         ds.values.view(),
                         &col_map,
                         training_headers,

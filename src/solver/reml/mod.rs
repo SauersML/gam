@@ -42,11 +42,11 @@ mod tests {
     use super::{
         DirectionalHyperParam, EvalShared, FirthDenseOperator, LinkFunction, RemlConfig, RemlState,
     };
+    use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::pirls::PirlsCoordinateFrame;
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
-    use std::sync::Arc;
 
     fn build_logit_state<'a>(
         y: &'a Array1<f64>,

@@ -776,14 +776,6 @@ struct SurvivalRowDerivatives {
     d2_q: f64,
     /// d³ ell / dq³ summed.
     d3_q: f64,
-    /// d⁴ ell / dq⁴ summed.
-    ///
-    /// This is the m4 quantity from the Faà di Bruno chain rule. It is needed
-    /// by the outer REML Hessian's Q[v_k, v_l] term: the 4th-order composed
-    /// derivative F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... uses this as the leading
-    /// coefficient. See response.md Section 6 for the derivation confirming
-    /// that 3rd-order chain terms in q are insufficient for the outer Hessian.
-    d4_q: f64,
     /// Entry-only derivative: d ell / dq0 = w * r(u0).
     d1_q0: f64,
     /// Entry-only second derivative: d² ell / dq0² = w * r'(u0).
@@ -822,11 +814,6 @@ struct SurvivalJointQuantities {
     d1_q: Array1<f64>,
     d2_q: Array1<f64>,
     d3_q: Array1<f64>,
-    /// d⁴ℓ/dq⁴ summed over entry+exit.
-    ///
-    /// The m4 quantity needed by the 4th-order Faà di Bruno chain rule for the
-    /// outer REML Hessian's Q[v_k, v_l] term. See response.md Section 6.
-    d4_q: Array1<f64>,
     /// Entry-only derivatives of ell w.r.t. q0.
     d1_q0: Array1<f64>,
     d2_q0: Array1<f64>,
@@ -891,8 +878,6 @@ struct SurvivalExactNewtonJointPsiWorkspace {
 }
 
 struct SurvivalJointPsiAction {
-    block_idx: usize,
-    local_idx: usize,
     x_t_exit_psi: Option<CustomFamilyPsiDesignAction>,
     x_t_entry_psi: Option<CustomFamilyPsiDesignAction>,
     x_ls_exit_psi: Option<CustomFamilyPsiDesignAction>,
@@ -1088,7 +1073,6 @@ impl SurvivalLocationScaleFamily {
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
-        let mut d4_q = Array1::<f64>::zeros(n);
         let mut d1_q0 = Array1::<f64>::zeros(n);
         let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d3_q0 = Array1::<f64>::zeros(n);
@@ -1126,7 +1110,6 @@ impl SurvivalLocationScaleFamily {
             d1_q[i] = row.d1_q;
             d2_q[i] = row.d2_q;
             d3_q[i] = row.d3_q;
-            d4_q[i] = row.d4_q;
             d1_q0[i] = row.d1_q0;
             d2_q0[i] = row.d2_q0;
             d3_q0[i] = row.d3_q0;
@@ -1201,7 +1184,6 @@ impl SurvivalLocationScaleFamily {
             d1_q,
             d2_q,
             d3_q,
-            d4_q,
             d1_q0,
             d2_q0,
             d3_q0,
@@ -1355,7 +1337,7 @@ impl SurvivalLocationScaleFamily {
 
         let mut global = 0usize;
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            for deriv in block_derivs {
                 if global == psi_index {
                     match block_idx {
                         Self::BLOCK_THRESHOLD => {
@@ -1376,8 +1358,6 @@ impl SurvivalLocationScaleFamily {
                                 (action.clone(), action)
                             };
                             return Ok(Some(SurvivalJointPsiAction {
-                                block_idx,
-                                local_idx,
                                 z_t_exit_psi: exit_action.forward_mul(beta_t.view()),
                                 z_t_entry_psi: entry_action.forward_mul(beta_t.view()),
                                 z_ls_exit_psi: Array1::zeros(n),
@@ -1406,8 +1386,6 @@ impl SurvivalLocationScaleFamily {
                                 (action.clone(), action)
                             };
                             return Ok(Some(SurvivalJointPsiAction {
-                                block_idx,
-                                local_idx,
                                 z_t_exit_psi: Array1::zeros(n),
                                 z_t_entry_psi: Array1::zeros(n),
                                 z_ls_exit_psi: exit_action.forward_mul(beta_ls.view()),
@@ -1871,14 +1849,11 @@ impl SurvivalLocationScaleFamily {
         let d1_q = d1_q0 + d1_q1;
         let d2_q = d2_q0 + d2_q1;
         let d3_q = d3_q0 + d3_q1;
-        let d4_q = d4_q0 + d4_q1;
-
         Ok(Some(SurvivalRowDerivatives {
             ll: w * (d * (logphi1 + log_g_safe) + (1.0 - d) * s1.ln() - s0.ln()),
             d1_q,
             d2_q,
             d3_q,
-            d4_q,
             d1_q0,
             d2_q0,
             d3_q0,
