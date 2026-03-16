@@ -639,7 +639,7 @@ pub fn fast_joint_hessian_2x2<
             );
             // Block [pa..total, pa..total]: X_b^T diag(w_bb) X_b
             matmul(
-                out_mat.rb_mut().submatrix_mut(pa, 0, pb, pb),
+                out_mat.rb_mut().submatrix_mut(pa, pa, pb, pb),
                 Accum::Add,
                 xb_view.as_ref().transpose(),
                 wbb_xb_view.as_ref(),
