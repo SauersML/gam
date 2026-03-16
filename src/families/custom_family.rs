@@ -1227,6 +1227,14 @@ pub(crate) fn build_block_spatial_psi_derivatives(
         return Ok(None);
     };
     let psi_dim = info_list.len();
+    let axis_lookup: HashMap<(usize, usize), usize> = info_list
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, info)| {
+            info.aniso_group_id
+                .map(|gid| ((gid, info.implicit_axis), idx))
+        })
+        .collect();
     Ok(Some(
         info_list
             .into_iter()
@@ -1245,60 +1253,90 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 )
                 .materialize();
                 let penalty_indices = info.penalty_indices.clone();
+                let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
+                    EmbeddedSquareBlock::new(
+                        local,
+                        info.global_range.clone(),
+                        info.total_p,
+                    )
+                    .materialize()
+                };
+                let s_components: Vec<(usize, Array2<f64>)> = info
+                    .penalty_indices
+                    .into_iter()
+                    .zip(info.s_psi_components_local.into_iter().map(|local| {
+                        embed_penalty(&local)
+                    }))
+                    .collect();
+                // Build x_psi_psi rows with cross-derivative designs
+                let x_psi_psi_rows = {
+                    let mut rows =
+                        vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
+                    rows[psi_idx] = EmbeddedColumnBlock::new(
+                        &info.x_psi_psi_local,
+                        info.global_range.clone(),
+                        info.total_p,
+                    )
+                    .materialize();
+                    if let (Some(gid), Some(cross_designs)) =
+                        (info.aniso_group_id, info.aniso_cross_designs.as_ref())
+                    {
+                        for (axis_j, local) in cross_designs {
+                            if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                                rows[global_j] = EmbeddedColumnBlock::new(
+                                    local,
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                                .materialize();
+                            }
+                        }
+                    }
+                    rows
+                };
+                // Build s_psi_psi_components with cross-penalty terms
+                let mut s_psi_psi_comp_rows =
+                    vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+                s_psi_psi_comp_rows[psi_idx] = penalty_indices
+                    .iter()
+                    .copied()
+                    .zip(info.s_psi_psi_components_local.iter().map(|local| {
+                        embed_penalty(local)
+                    }))
+                    .collect();
+                if let (Some(gid), Some(cross_penalties)) =
+                    (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
+                {
+                    for (axis_j, local_components) in cross_penalties {
+                        if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                            s_psi_psi_comp_rows[global_j] = penalty_indices
+                                .iter()
+                                .copied()
+                                .zip(local_components.iter().map(|local| {
+                                    embed_penalty(local)
+                                }))
+                                .collect();
+                        }
+                    }
+                }
+                // Derive s_psi_psi by summing components per row
+                let s_psi_psi_rows: Vec<Array2<f64>> = s_psi_psi_comp_rows
+                    .iter()
+                    .map(|components| {
+                        components.iter().fold(
+                            Array2::<f64>::zeros((info.total_p, info.total_p)),
+                            |acc, (_, matrix)| acc + matrix,
+                        )
+                    })
+                    .collect();
                 CustomFamilyBlockPsiDerivative {
                     penalty_index: Some(info.penalty_index),
                     x_psi: x_full.clone(),
                     s_psi: s_full,
-                    s_psi_components: Some(
-                        info.penalty_indices
-                            .into_iter()
-                            .zip(info.s_psi_components_local.into_iter().map(|local| {
-                                EmbeddedSquareBlock::new(
-                                    &local,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                                .materialize()
-                            }))
-                            .collect(),
-                    ),
-                    x_psi_psi: Some({
-                        let mut rows =
-                            vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
-                        rows[psi_idx] = EmbeddedColumnBlock::new(
-                            &info.x_psi_psi_local,
-                            info.global_range.clone(),
-                            info.total_p,
-                        )
-                        .materialize();
-                        rows
-                    }),
-                    s_psi_psi: Some({
-                        let mut rows =
-                            vec![Array2::<f64>::zeros((info.total_p, info.total_p)); psi_dim];
-                        rows[psi_idx] = EmbeddedSquareBlock::new(
-                            &info.s_psi_psi_local,
-                            info.global_range.clone(),
-                            info.total_p,
-                        )
-                        .materialize();
-                        rows
-                    }),
-                    s_psi_psi_components: Some({
-                        let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-                        rows[psi_idx] = penalty_indices
-                            .into_iter()
-                            .zip(info.s_psi_psi_components_local.into_iter().map(|local| {
-                                EmbeddedSquareBlock::new(
-                                    &local,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                                .materialize()
-                            }))
-                            .collect();
-                        rows
-                    }),
+                    s_psi_components: Some(s_components),
+                    x_psi_psi: Some(x_psi_psi_rows),
+                    s_psi_psi: Some(s_psi_psi_rows),
+                    s_psi_psi_components: Some(s_psi_psi_comp_rows),
                     implicit_operator: info
                         .implicit_operator
                         .as_ref()
@@ -3176,11 +3214,15 @@ fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f
     Ok(pinv)
 }
 
-fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(family: &F) -> bool {
-    matches!(
-        family.exact_newton_outerobjective(),
-        ExactNewtonOuterObjective::QuadraticReml | ExactNewtonOuterObjective::PseudoLaplace
-    )
+fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
+    family: &F,
+    options: &BlockwiseFitOptions,
+) -> bool {
+    options.use_remlobjective
+        && matches!(
+            family.exact_newton_outerobjective(),
+            ExactNewtonOuterObjective::QuadraticReml | ExactNewtonOuterObjective::PseudoLaplace
+        )
 }
 
 fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
@@ -3431,9 +3473,9 @@ fn inner_blockwise_fit<F: CustomFamily>(
     //
     // Falls back to blockwise iteration if the joint Hessian is unavailable,
     // the joint solve fails, or constraints are present.
-    let has_constraints = specs.iter().any(|s| {
+    let has_constraints = specs.iter().enumerate().any(|(b, s)| {
         family
-            .block_linear_constraints(&states, 0, s)
+            .block_linear_constraints(&states, b, s)
             .ok()
             .flatten()
             .is_some()
@@ -4179,7 +4221,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     warm_start: Option<&ConstrainedWarmStart>,
     need_hessian: bool,
 ) -> Result<OuterObjectiveEvalResult, String> {
-    let include_logdet_h = include_exact_newton_logdet_h(family);
+    let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho, penalty_counts)?;
@@ -5194,7 +5236,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     }
 
     // ── Common setup: inner solve, ridge, refresh, ranges ──
-    let include_logdet_h = include_exact_newton_logdet_h(family);
+    let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
@@ -5984,7 +6026,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             outer_iterations: 0,
             outer_gradient_norm: 0.0,
             inner_cycles: inner.cycles,
-            outer_converged: inner.converged,
+            outer_converged: true,
             geometry,
         })
         .map_err(CustomFamilyError::Optimization);
@@ -6009,7 +6051,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         last_error: Option<String>,
     }
 
-    let has_exact_hess = include_exact_newton_logdet_h(family);
+    let has_exact_hess = include_exact_newton_logdet_h(family, options);
     let n_rho = rho0.len();
 
     let hessian_deriv = if has_exact_hess {
@@ -6196,7 +6238,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         penalized_objective: finite_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
-            if include_exact_newton_logdet_h(family) {
+            if include_exact_newton_logdet_h(family, options) {
                 0.5 * inner.block_logdet_h
             } else {
                 0.0
@@ -6213,7 +6255,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             0.0
         },
         inner_cycles: inner.cycles,
-        outer_converged: inner.converged,
+        outer_converged: outer_result.converged,
         geometry,
     })
     .map_err(CustomFamilyError::Optimization)
