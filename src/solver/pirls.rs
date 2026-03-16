@@ -2263,6 +2263,30 @@ fn add_diagonal_to_upper_sparse(
     let (symbolic, values) = matrix.parts();
     let col_ptr = symbolic.col_ptr();
     let row_idx = symbolic.row_idx();
+
+    // Fast path: if diagonal entries already exist in the sparse structure,
+    // clone values and modify in-place (avoids triplet reconstruction).
+    let has_all_diags = (0..matrix.ncols()).all(|col| {
+        let start = col_ptr[col];
+        let end = col_ptr[col + 1];
+        row_idx[start..end].contains(&col)
+    });
+
+    if has_all_diags {
+        let mut new_values = values.to_vec();
+        for col in 0..matrix.ncols() {
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                if row_idx[idx] == col {
+                    new_values[idx] += diagonal;
+                    break;
+                }
+            }
+        }
+        // Reuse symbolic structure — avoids O(nnz) triplet reconstruction.
+        return Ok(SparseColMat::new(symbolic.clone(), new_values));
+    }
+
+    // Slow path: diagonal entries missing from structure, must rebuild.
     let mut triplets = Vec::with_capacity(values.len() + matrix.ncols());
     for col in 0..matrix.ncols() {
         let mut saw_diag = false;
