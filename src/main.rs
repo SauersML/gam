@@ -717,6 +717,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .get(&parsed.response)
         .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
     let y = ds.values.column(y_col).to_owned();
+    let mut inference_notes: Vec<String> = Vec::new();
 
     if args.logslope_formula.is_some() || args.z_column.is_some() {
         if args.logslope_formula.is_none() || args.z_column.is_none() {
@@ -842,7 +843,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     };
 
     let mut family = resolve_family(FamilyArg::Auto, link_choice.clone(), y.view())?;
-    let mut inference_notes: Vec<String> = Vec::new();
     if link_choice.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
@@ -1207,6 +1207,176 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
     progress.finish_progress("fit complete");
+    Ok(())
+}
+
+fn run_fit_bernoulli_marginal_slope(
+    args: &FitArgs,
+    progress: &mut gam::visualizer::VisualizerSession,
+    fit_total_steps: usize,
+    ds: &Dataset,
+    col_map: &HashMap<String, usize>,
+    parsed: &ParsedFormula,
+    formula_text: &str,
+    y: &Array1<f64>,
+    inference_notes: &mut Vec<String>,
+) -> Result<(), String> {
+    if !is_binary_response(y.view()) {
+        return Err(
+            "bernoulli marginal-slope fitting requires a binary {0,1} response".to_string(),
+        );
+    }
+    if args.firth {
+        return Err("--firth is not supported for the bernoulli marginal-slope family".to_string());
+    }
+    if parsed.linkspec.is_some() {
+        return Err(
+            "link(...) is not supported for the bernoulli marginal-slope family; the family has a fixed probit base link with optional internal link deviation"
+                .to_string(),
+        );
+    }
+    if parsed.linkwiggle.is_some() {
+        return Err(
+            "linkwiggle(...) is not supported in the bernoulli marginal-slope family; use the built-in link-deviation block instead"
+                .to_string(),
+        );
+    }
+    if args.predict_noise.is_some() {
+        return Err(
+            "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
+        );
+    }
+    let logslope_formula_raw = args
+        .logslope_formula
+        .as_deref()
+        .ok_or_else(|| "missing --logslope-formula".to_string())?;
+    let z_column = args
+        .z_column
+        .as_ref()
+        .ok_or_else(|| "missing --z-column".to_string())?;
+    let logslope_formula = normalizenoise_formula(logslope_formula_raw, &parsed.response);
+    let parsed_logslope = parse_formula(&logslope_formula)?;
+    if parsed_logslope.linkwiggle.is_some() {
+        return Err(
+            "linkwiggle(...) is not supported in --logslope-formula for the bernoulli marginal-slope family"
+                .to_string(),
+        );
+    }
+
+    progress.set_stage("fit", "building marginal/logslope term specifications");
+    progress.start_secondary_workflow("Marginal/Slope Terms", 2);
+    let mut marginalspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    let mut logslopespec = build_termspec(&parsed_logslope.terms, ds, col_map, inference_notes)?;
+    if args.scale_dimensions {
+        enable_scale_dimensions(&mut marginalspec);
+        enable_scale_dimensions(&mut logslopespec);
+    }
+    progress.advance_secondary_workflow(2);
+    progress.finish_secondary_progress("marginal and logslope terms resolved");
+    progress.advance_workflow(2);
+
+    let mut spatial_usagewarnings =
+        collect_spatial_smooth_usagewarnings(&marginalspec, &ds.headers, "marginal model");
+    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
+        &marginalspec,
+        &ds.headers,
+        "marginal model",
+    ));
+    spatial_usagewarnings.extend(collect_spatial_smooth_usagewarnings(
+        &logslopespec,
+        &ds.headers,
+        "logslope model",
+    ));
+    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
+        &logslopespec,
+        &ds.headers,
+        "logslope model",
+    ));
+    emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
+    print_inference_summary(inference_notes);
+
+    let z_col = *col_map
+        .get(z_column)
+        .ok_or_else(|| format!("z column '{z_column}' not found"))?;
+    let z = ds.values.column(z_col).to_owned();
+    let options = blockwise_options_from_fit_args(args)?;
+    progress.set_stage("fit", "optimizing bernoulli marginal-slope model");
+    let solved = match fit_model(FitRequest::BernoulliMarginalSlope(
+        BernoulliMarginalSlopeFitRequest {
+            data: ds.values.view(),
+            spec: BernoulliMarginalSlopeTermSpec {
+                y: y.clone(),
+                weights: Array1::ones(y.len()),
+                z,
+                marginalspec: marginalspec.clone(),
+                logslopespec: logslopespec.clone(),
+                score_warp: if args.disable_score_warp {
+                    None
+                } else {
+                    Some(DeviationBlockConfig::default())
+                },
+                link_dev: if args.disable_link_dev {
+                    None
+                } else {
+                    Some(DeviationBlockConfig::default())
+                },
+                quadrature_points: 20,
+            },
+            options,
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+        },
+    )) {
+        Ok(FitResult::BernoulliMarginalSlope(result)) => result,
+        Ok(_) => {
+            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            return Err(
+                "internal bernoulli marginal-slope workflow returned the wrong result variant"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            return Err(format!("bernoulli marginal-slope fit failed: {e}"));
+        }
+    };
+    progress.advance_workflow(3);
+
+    let frozen_marginal =
+        freeze_term_collectionspec(&solved.marginalspec_resolved, &solved.marginal_design)?;
+    let frozen_logslope =
+        freeze_term_collectionspec(&solved.logslopespec_resolved, &solved.logslope_design)?;
+    progress.advance_workflow(4);
+    println!(
+        "model fit complete | family={} | outer_iter={} | converged={}",
+        FAMILY_BERNOULLI_MARGINAL_SLOPE,
+        solved.fit.outer_iterations,
+        solved.fit.outer_converged
+    );
+    print_spatial_aniso_scales(&solved.marginalspec_resolved);
+    print_spatial_aniso_scales(&solved.logslopespec_resolved);
+
+    if let Some(out) = args.out.as_ref() {
+        progress.set_stage("fit", "writing bernoulli marginal-slope model");
+        let model = build_bernoulli_marginal_slope_saved_model(
+            formula_text.to_string(),
+            ds.schema.clone(),
+            logslope_formula,
+            z_column.clone(),
+            ds.headers.clone(),
+            frozen_marginal,
+            frozen_logslope,
+            solved.fit,
+            solved.baseline_marginal,
+            solved.baseline_logslope,
+            solved.score_warp_runtime.as_ref(),
+            solved.link_dev_runtime.as_ref(),
+        );
+        write_model_json(out, &model)?;
+        progress.advance_workflow(fit_total_steps);
+    }
+
+    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    progress.finish_progress("bernoulli marginal-slope fit complete");
     Ok(())
 }
 
@@ -7132,6 +7302,57 @@ fn build_location_scale_saved_model(
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_termspec);
     payload.resolved_termspec_noise = Some(resolved_termspec_noise);
+    SavedModel::from_payload(payload)
+}
+
+fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
+    SavedAnchoredDeviationRuntime {
+        knots: runtime.knots.to_vec(),
+        degree: runtime.degree,
+        transform: runtime
+            .transform
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+    }
+}
+
+fn build_bernoulli_marginal_slope_saved_model(
+    formula: String,
+    data_schema: DataSchema,
+    logslope_formula: String,
+    z_column: String,
+    training_headers: Vec<String>,
+    resolved_marginalspec: TermCollectionSpec,
+    resolved_logslopespec: TermCollectionSpec,
+    fit_result: UnifiedFitResult,
+    baseline_marginal: f64,
+    baseline_logslope: f64,
+    score_warp_runtime: Option<&DeviationRuntime>,
+    link_dev_runtime: Option<&DeviationRuntime>,
+) -> SavedModel {
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::MarginalSlope,
+        FittedFamily::MarginalSlope {
+            likelihood: LikelihoodFamily::BinomialProbit,
+        },
+        FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
+    );
+    payload.unified = Some(fit_result.clone());
+    payload.fit_result = Some(fit_result);
+    payload.data_schema = Some(data_schema);
+    payload.formula_logslope = Some(logslope_formula);
+    payload.z_column = Some(z_column);
+    payload.marginal_baseline = Some(baseline_marginal);
+    payload.logslope_baseline = Some(baseline_logslope);
+    payload.training_headers = Some(training_headers);
+    payload.resolved_termspec = Some(resolved_marginalspec);
+    payload.resolved_termspec_noise = Some(resolved_logslopespec);
+    payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
+    payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
     SavedModel::from_payload(payload)
 }
 

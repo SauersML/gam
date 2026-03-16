@@ -8357,8 +8357,8 @@ pub(crate) fn project_psi_gradient(
 /// is left unchanged. Cross-blocks (ρ-ψ and ψ-ρ) are also projected to
 /// maintain consistency.
 ///
-/// See response.md §4b: the intrinsic Hessian on the affine subspace M is
-/// H_M = P H_ψψ P restricted to 1⊥.
+/// See response.md §4b: after removing the all-ones gauge direction, the
+/// intrinsic Hessian on the zero-sum tangent space is P H_ψψ P.
 pub(crate) fn project_psi_hessian(
     hessian: &mut Array2<f64>,
     rho_dim: usize,
@@ -8448,39 +8448,17 @@ pub(crate) fn project_psi_hessian(
     }
 }
 
-/// Compute a constraint-aware Newton step for the ψ block via Helmert
-/// reparameterization (response.md §4d).
-///
-/// Given the full-space gradient g_ψ ∈ ℝ^D and Hessian H_ψψ ∈ ℝ^{D×D}
-/// for an anisotropic group, computes the constrained step δψ ∈ 1⊥ via:
-///
-///   1. Reduce to free coordinates: g̃ = C^T g_ψ, H̃ = C^T H_ψψ C
-///      where C is the D×(D−1) Helmert contrast matrix.
-///   2. Solve the (D−1)-dimensional system: δψ̃ = −H̃^{-1} g̃
-///   3. Lift back: δψ = C δψ̃
-///
-/// The result satisfies 1^T δψ = 0 by construction (since C^T 1 = 0,
-/// the step lies in the tangent space of the constraint manifold).
-///
-/// This is equivalent to solving the KKT system (response.md §4c):
-///
-///   [H_ψψ  1] [δψ]   = - [g_ψ]
-///   [1^T   0] [λ ]       [0  ]
-///
-/// but avoids forming the (D+1)×(D+1) KKT matrix by working in the
-/// (D−1)-dimensional reduced space directly.
-///
 /// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
 /// derivatives through the unified REML evaluator.
 ///
-/// This is the isotropic counterpart of `try_exact_joint_spatial_aniso_optimization`.
-/// Each spatial term contributes a single log-κ coordinate (rather than d
-/// per-axis ψ_a coordinates in the anisotropic case). The analytic gradient
-/// and Hessian w.r.t. log-κ flow through the same pipeline:
+/// This is the isotropic counterpart of the anisotropic exact spatial path.
+/// Each spatial term contributes one log-κ coordinate, and the joint outer
+/// optimization runs directly on `[ρ, κ]` with gauge handling done by
+/// projection. The gradient and Hessian for log-κ flow through the same
+/// directional-hyperparameter pipeline used elsewhere:
 ///
 ///   `SpatialPsiDerivative` → `DirectionalHyperParam` → `HyperCoord` ext_coords
 ///     → unified REML evaluator
-///
 /// This gives BFGS/Newton quadratic convergence on the length-scale parameters.
 fn try_exact_joint_spatial_isotropic_optimization(
     data: ArrayView2<'_, f64>,

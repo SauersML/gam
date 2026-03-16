@@ -178,34 +178,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Build the extended-coordinate objects for τ (directional) hyperparameters
-    /// using the unified evaluator representation.
-    ///
-    /// This is the single dispatch point for directional hyperparameter objects:
-    /// - dense / transformed backends use the transformed-coordinate builders
-    /// - sparse exact backends use the original-basis sparse builders
-    ///
-    /// In both cases it assembles the first-order `HyperCoord` objects and the
-    /// second-order pair callbacks suitable for
-    /// `InnerSolutionBuilder::ext_coords()` and related pair-callback setters.
-    ///
-    /// Returns `(coords, ext_pair_fn, rho_ext_pair_fn)`.
-    pub(crate) fn build_tau_unified_objects(
-        &self,
-        rho: &Array1<f64>,
-        hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<
-        (
-            Vec<super::unified::HyperCoord>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        ),
-        EstimationError,
-    > {
-        let bundle = self.obtain_eval_bundle(rho)?;
-        self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)
-    }
-
     pub(crate) fn build_tau_unified_objects_from_bundle(
         &self,
         rho: &Array1<f64>,
@@ -262,9 +234,6 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
         let psi_dim = hyper_dirs.len();
-        if psi_dim == 0 {
-            return Ok(Vec::new());
-        }
 
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
@@ -531,9 +500,6 @@ impl<'a> RemlState<'a> {
         }
 
         let psi_dim = hyper_dirs.len();
-        if psi_dim == 0 {
-            return Ok(Vec::new());
-        }
 
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_eval = self.sparse_exact_beta_original(pirls_result);
@@ -691,26 +657,18 @@ impl<'a> RemlState<'a> {
         let k_count = rho.len();
         let lambdas = rho.mapv(f64::exp);
 
-        if psi_dim == 0 || p_dim == 0 {
-            let tau_tau_pair_fn = move |i: usize, j: usize| {
-                std::hint::black_box(i);
-                std::hint::black_box(j);
-                super::unified::HyperCoordPair {
-                    a: 0.0,
-                    g: Array1::zeros(p_dim),
-                    b_mat: Array2::zeros((p_dim, p_dim)),
-                    ld_s: 0.0,
-                }
+        if p_dim == 0 {
+            let tau_tau_pair_fn = move |_: usize, _: usize| super::unified::HyperCoordPair {
+                a: 0.0,
+                g: Array1::zeros(p_dim),
+                b_mat: Array2::zeros((p_dim, p_dim)),
+                ld_s: 0.0,
             };
-            let rho_tau_pair_fn = move |k: usize, j: usize| {
-                std::hint::black_box(k);
-                std::hint::black_box(j);
-                super::unified::HyperCoordPair {
-                    a: 0.0,
-                    g: Array1::zeros(p_dim),
-                    b_mat: Array2::zeros((p_dim, p_dim)),
-                    ld_s: 0.0,
-                }
+            let rho_tau_pair_fn = move |_: usize, _: usize| super::unified::HyperCoordPair {
+                a: 0.0,
+                g: Array1::zeros(p_dim),
+                b_mat: Array2::zeros((p_dim, p_dim)),
+                ld_s: 0.0,
             };
             return Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)));
         }

@@ -899,15 +899,24 @@ impl BernoulliMarginalSlopePredictor {
         })?;
         let (beta_marginal, beta_logslope, beta_score_warp, beta_link_dev) =
             self.split_theta(theta)?;
-        let marginal_eta = input.design.dot(&beta_marginal.to_owned()) + self.baseline_marginal;
-        let logslope_eta =
-            design_logslope.dot(&beta_logslope.to_owned()) + self.baseline_logslope;
+        let marginal_eta =
+            input
+                .design
+                .dot(&beta_marginal.to_owned())
+                .mapv(|v| v + self.baseline_marginal);
+        let logslope_eta = design_logslope
+            .dot(&beta_logslope.to_owned())
+            .mapv(|v| v + self.baseline_logslope);
         let warped_z = Self::warp_values(self.score_warp_runtime.as_ref(), beta_score_warp, z)?;
         let mut eta_base = Array1::<f64>::zeros(z.len());
         for i in 0..z.len() {
             let slope = logslope_eta[i].exp();
-            let intercept =
-                self.solve_intercept_scalar(marginal_eta[i], slope, beta_score_warp, beta_link_dev)?;
+            let intercept = self.solve_intercept_scalar(
+                marginal_eta[i],
+                slope,
+                beta_score_warp.clone(),
+                beta_link_dev.clone(),
+            )?;
             eta_base[i] = intercept + slope * warped_z[i];
         }
         Self::link_values(self.link_deviation_runtime.as_ref(), beta_link_dev, &eta_base)
