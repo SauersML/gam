@@ -3425,19 +3425,16 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
         let mut objective_cycle_prev = lastobjective;
         // Reuse cached evaluation from end of previous cycle (or initial eval).
-        // For non-dynamic families this avoids a redundant evaluate per cycle.
-        // Dynamic families re-evaluate per block to capture geometry changes.
-        let mut cycle_eval = if is_dynamic {
-            family.evaluate(&states)?
-        } else {
-            std::mem::replace(
-                &mut cached_eval,
-                FamilyEvaluation {
-                    log_likelihood: 0.0,
-                    blockworking_sets: Vec::new(),
-                },
-            )
-        };
+        // For dynamic families, the end-of-cycle evaluation is also reused here
+        // instead of re-evaluating redundantly — the state hasn't changed since
+        // the last cycle's final evaluate.
+        let mut cycle_eval = std::mem::replace(
+            &mut cached_eval,
+            FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: Vec::new(),
+            },
+        );
         if cycle_eval.blockworking_sets.len() != specs.len() {
             return Err(format!(
                 "family returned {} block working sets, expected {}",
@@ -3445,8 +3442,14 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 specs.len()
             ));
         }
+        // Track whether any block was modified this cycle (for dynamic families,
+        // we only need to re-evaluate before block b if a previous block changed).
+        let mut any_block_modified = false;
         for b in 0..specs.len() {
-            if is_dynamic {
+            if is_dynamic && any_block_modified {
+                // Only re-evaluate if a previous block in this cycle actually
+                // modified coefficients. Skips the redundant evaluate for the
+                // first block (b=0) since cached_eval is still valid.
                 refresh_all_block_etas(family, specs, &mut states)?;
                 cycle_eval = family.evaluate(&states)?;
                 if cycle_eval.blockworking_sets.len() != specs.len() {
@@ -3611,6 +3614,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
             if !accepted {
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);
+            } else {
+                any_block_modified = true;
             }
             // Recycle the checkpoint's buffer back into the pre-allocated pool.
             eta_backups[b] = eta_checkpoint.into_buffer();
@@ -3890,7 +3895,7 @@ fn joint_outer_evaluate(
     } else {
         None
     };
-    for (b, _spec) in specs.iter().enumerate() {
+    for b in 0..specs.len() {
         let (start, end) = ranges[b];
         // Reuse pre-assembled S(ρ) from inner_blockwise_fit instead of
         // re-computing lambdas and accumulating penalties from scratch.
@@ -3906,7 +3911,7 @@ fn joint_outer_evaluate(
         if let Some(s_pinv) = s_pinv_joint.as_mut() {
             let mut s_for_logdet = s_lambda.clone();
             if options.ridge_policy.include_penalty_logdet {
-                for d in 0..p {
+                for d in 0..(end - start) {
                     s_for_logdet[[d, d]] += ridge;
                 }
             }
