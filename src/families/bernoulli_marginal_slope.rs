@@ -217,8 +217,21 @@ fn deviation_grid_from_knots(
     })))
 }
 
-fn deviation_transform(knots: &Array1<f64>, degree: usize) -> Result<Array2<f64>, String> {
-    let anchor = Array1::from_vec(vec![0.0]);
+fn deviation_transform(
+    knots: &Array1<f64>,
+    degree: usize,
+    seed: &Array1<f64>,
+) -> Result<Array2<f64>, String> {
+    let mut sorted = seed.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.is_empty() {
+        0.0
+    } else if sorted.len() % 2 == 1 {
+        sorted[sorted.len() / 2]
+    } else {
+        0.5 * (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2])
+    };
+    let anchor = Array1::from_vec(vec![median]);
     let (value_basis, _) = create_basis::<Dense>(
         anchor.view(),
         KnotSource::Provided(knots.view()),
@@ -255,7 +268,7 @@ fn build_deviation_block_from_seed(
     let runtime = DeviationRuntime {
         knots: knots.clone(),
         degree: cfg.degree,
-        transform: deviation_transform(&knots, cfg.degree)?,
+        transform: deviation_transform(&knots, cfg.degree, seed)?,
     };
     let design = runtime.design(seed)?;
     let raw_dim = runtime.transform.nrows();
@@ -321,10 +334,18 @@ fn validate_spec(
     {
         return Err("bernoulli-marginal-slope requires binary y in {0,1}".to_string());
     }
+    if spec.weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+        return Err(
+            "bernoulli-marginal-slope requires finite non-negative weights".to_string(),
+        );
+    }
+    if spec.z.iter().any(|&zi| !zi.is_finite()) {
+        return Err("bernoulli-marginal-slope requires finite z values".to_string());
+    }
     Ok(())
 }
 
-fn pooled_probit_baseline(y: &Array1<f64>, z: &Array1<f64>) -> Result<(f64, f64), String> {
+fn pooled_probit_baseline(y: &Array1<f64>, z: &Array1<f64>, weights: &Array1<f64>) -> Result<(f64, f64), String> {
     let n = y.len();
     let mut x = Array2::<f64>::zeros((n, 2));
     x.column_mut(0).fill(1.0);
@@ -332,7 +353,7 @@ fn pooled_probit_baseline(y: &Array1<f64>, z: &Array1<f64>) -> Result<(f64, f64)
     let fit = fit_gam(
         x.view(),
         y.view(),
-        Array1::ones(n).view(),
+        weights.view(),
         Array1::zeros(n).view(),
         &[],
         LikelihoodFamily::BinomialProbit,
@@ -2337,7 +2358,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     validate_spec(data, &spec)?;
-    let baseline = pooled_probit_baseline(&spec.y, &spec.z)?;
+    let baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let marginal_design =
         build_term_collection_design(data, &spec.marginalspec).map_err(|e| e.to_string())?;
     let logslope_design =

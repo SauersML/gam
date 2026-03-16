@@ -532,7 +532,6 @@ pub(crate) struct SpatialPsiDerivative {
     pub s_psi_local: Array2<f64>,
     pub s_psi_components_local: Vec<Array2<f64>>,
     pub x_psi_psi_local: Array2<f64>,
-    pub s_psi_psi_local: Array2<f64>,
     pub s_psi_psi_components_local: Vec<Array2<f64>>,
     pub aniso_group_id: Option<usize>,
     /// Pre-computed cross-derivative design matrices for other axes
@@ -7302,8 +7301,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         .collect::<Vec<_>>();
     let penalty_index = penalty_indices[0];
     let s_psi0 = s_psi_local;
-    let s_psi_psi0 = s_psi_psi_local;
-    if s_psi0.nrows() == 0 || s_psi_psi0.nrows() == 0 {
+    if s_psi0.nrows() == 0 || s_psi_psi_local.nrows() == 0 {
         return Ok(None);
     }
     Ok(Some(SpatialPsiDerivative {
@@ -7315,7 +7313,6 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         s_psi_local: s_psi0,
         s_psi_components_local,
         x_psi_psi_local,
-        s_psi_psi_local: s_psi_psi0,
         s_psi_psi_components_local,
         aniso_group_id: None,
         aniso_cross_designs: None,
@@ -7460,9 +7457,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         let s_psi_local = s_psi_components
             .iter()
             .fold(Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m);
-        let s_psi_psi_local = s_psi_psi_components
-            .iter()
-            .fold(Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m);
         // Build cross-design entries for other axes b != a in this group.
         // These will be indexed by (b, cross_matrix) where b is the axis
         // offset within the d-entry block.
@@ -7508,7 +7502,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             s_psi_local,
             s_psi_components_local: s_psi_components,
             x_psi_psi_local,
-            s_psi_psi_local,
             s_psi_psi_components_local: s_psi_psi_components,
             aniso_group_id: Some(aniso_group_id),
             aniso_cross_designs: if cross_designs.is_empty() {
