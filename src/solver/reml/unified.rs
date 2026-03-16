@@ -1260,6 +1260,164 @@ pub struct PenaltyLogdetDerivs {
     pub second: Option<Array2<f64>>,
 }
 
+/// Unified representation of a single smoothing-parameter penalty coordinate.
+///
+/// A rho-coordinate always contributes
+///
+///   A_k = λ_k S_k,
+///   S_k = R_k^T R_k.
+///
+/// For single-block/small problems it is fine to store the full-root `R_k`
+/// in the joint basis. For exact-joint multi-block paths that scaling is
+/// wasteful: the root is naturally block-local. This enum lets the unified
+/// evaluator consume both forms through one interface.
+#[derive(Clone, Debug)]
+pub enum PenaltyCoordinate {
+    DenseRoot(Array2<f64>),
+    BlockRoot {
+        root: Array2<f64>,
+        start: usize,
+        end: usize,
+        total_dim: usize,
+    },
+}
+
+impl PenaltyCoordinate {
+    pub fn from_dense_root(root: Array2<f64>) -> Self {
+        Self::DenseRoot(root)
+    }
+
+    pub fn from_block_root(root: Array2<f64>, start: usize, end: usize, total_dim: usize) -> Self {
+        debug_assert_eq!(root.ncols(), end.saturating_sub(start));
+        debug_assert!(end <= total_dim);
+        Self::BlockRoot {
+            root,
+            start,
+            end,
+            total_dim,
+        }
+    }
+
+    pub fn rank(&self) -> usize {
+        match self {
+            Self::DenseRoot(root) | Self::BlockRoot { root, .. } => root.nrows(),
+        }
+    }
+
+    pub fn dim(&self) -> usize {
+        match self {
+            Self::DenseRoot(root) => root.ncols(),
+            Self::BlockRoot { total_dim, .. } => *total_dim,
+        }
+    }
+
+    pub fn uses_operator_fast_path(&self) -> bool {
+        matches!(self, Self::BlockRoot { .. })
+    }
+
+    fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(beta.len(), self.dim());
+        match self {
+            Self::DenseRoot(root) => root.dot(beta),
+            Self::BlockRoot {
+                root, start, end, ..
+            } => root.dot(&beta.slice(ndarray::s![*start..*end])),
+        }
+    }
+
+    pub fn apply_penalty(&self, beta: &Array1<f64>, scale: f64) -> Array1<f64> {
+        debug_assert_eq!(beta.len(), self.dim());
+        let root_beta = self.apply_root(beta);
+        match self {
+            Self::DenseRoot(root) => {
+                let mut out = root.t().dot(&root_beta);
+                out *= scale;
+                out
+            }
+            Self::BlockRoot {
+                root,
+                start,
+                end,
+                total_dim,
+            } => {
+                let mut out = Array1::<f64>::zeros(*total_dim);
+                let mut block = root.t().dot(&root_beta);
+                block *= scale;
+                out.slice_mut(ndarray::s![*start..*end]).assign(&block);
+                out
+            }
+        }
+    }
+
+    pub fn quadratic(&self, beta: &Array1<f64>, scale: f64) -> f64 {
+        let root_beta = self.apply_root(beta);
+        scale * root_beta.dot(&root_beta)
+    }
+
+    pub fn scaled_dense_matrix(&self, scale: f64) -> Array2<f64> {
+        match self {
+            Self::DenseRoot(root) => {
+                let mut out = root.t().dot(root);
+                out *= scale;
+                out
+            }
+            Self::BlockRoot {
+                root,
+                start,
+                end,
+                total_dim,
+            } => {
+                let mut out = Array2::<f64>::zeros((*total_dim, *total_dim));
+                let mut block = root.t().dot(root);
+                block *= scale;
+                out.slice_mut(ndarray::s![*start..*end, *start..*end])
+                    .assign(&block);
+                out
+            }
+        }
+    }
+
+    pub fn scaled_operator<'a>(
+        &'a self,
+        scale: f64,
+        dense_correction: Option<&'a Array2<f64>>,
+    ) -> PenaltyHyperOperator<'a> {
+        PenaltyHyperOperator {
+            coord: self,
+            scale,
+            dense_correction,
+        }
+    }
+}
+
+pub struct PenaltyHyperOperator<'a> {
+    coord: &'a PenaltyCoordinate,
+    scale: f64,
+    dense_correction: Option<&'a Array2<f64>>,
+}
+
+impl HyperOperator for PenaltyHyperOperator<'_> {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = self.coord.apply_penalty(v, self.scale);
+        if let Some(correction) = self.dense_correction {
+            out += &correction.dot(v);
+        }
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = self.coord.scaled_dense_matrix(self.scale);
+        if let Some(correction) = self.dense_correction {
+            out += correction;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
 /// Default δ scale factor for the smooth pseudo-logdet regularization.
 ///
 /// δ is set to SMOOTH_LOGDET_DELTA_SCALE × max(eigenvalues of S), ensuring
@@ -1360,9 +1518,12 @@ pub struct InnerSolution<'dp> {
     /// β̂ — coefficients at the converged mode (in the operator's native basis).
     pub beta: Array1<f64>,
 
-    /// Penalty square roots Rₖ where Sₖ = RₖᵀRₖ.
-    /// One per smoothing parameter.
-    pub penalty_roots: Vec<Array2<f64>>,
+    /// Penalty coordinates for the rho block.
+    ///
+    /// Each coordinate represents one smoothing-parameter direction
+    ///   A_k = λ_k S_k
+    /// through either a full-root or a block-local root.
+    pub penalty_coords: Vec<PenaltyCoordinate>,
 
     /// Derivatives of log|S(ρ)|₊ — precomputed from penalty structure.
     pub penalty_logdet: PenaltyLogdetDerivs,
@@ -1437,7 +1598,7 @@ pub struct InnerSolutionBuilder<'dp> {
     penalty_quadratic: f64,
     hessian_op: Box<dyn HessianOperator>,
     beta: Array1<f64>,
-    penalty_roots: Vec<Array2<f64>>,
+    penalty_coords: Vec<PenaltyCoordinate>,
     penalty_logdet: PenaltyLogdetDerivs,
     n_observations: usize,
     dispersion: DispersionHandling,
@@ -1464,7 +1625,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         beta: Array1<f64>,
         n_observations: usize,
         hessian_op: Box<dyn HessianOperator>,
-        penalty_roots: Vec<Array2<f64>>,
+        penalty_coords: Vec<PenaltyCoordinate>,
         penalty_logdet: PenaltyLogdetDerivs,
         dispersion: DispersionHandling,
     ) -> Self {
@@ -1473,7 +1634,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             penalty_quadratic,
             hessian_op,
             beta,
-            penalty_roots,
+            penalty_coords,
             penalty_logdet,
             n_observations,
             dispersion,
@@ -1515,7 +1676,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
     /// Override the auto-computed nullspace dimension.
     ///
     /// By default, `build()` computes nullspace_dim as
-    /// `beta.len() - sum(penalty_root.nrows())`. Use this when the caller
+    /// `beta.len() - sum(penalty_coord.rank())`. Use this when the caller
     /// has a different authoritative value (e.g. from stored per-penalty dims).
     pub fn nullspace_dim_override(mut self, dim: f64) -> Self {
         self.nullspace_dim_override = Some(dim);
@@ -1557,7 +1718,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
             let total_p = self.beta.len();
-            let penalty_rank: usize = self.penalty_roots.iter().map(|r| r.nrows()).sum();
+            let penalty_rank: usize = self.penalty_coords.iter().map(PenaltyCoordinate::rank).sum();
             total_p.saturating_sub(penalty_rank) as f64
         });
 
@@ -1566,7 +1727,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             penalty_quadratic: self.penalty_quadratic,
             hessian_op: self.hessian_op,
             beta: self.beta,
-            penalty_roots: self.penalty_roots,
+            penalty_coords: self.penalty_coords,
             penalty_logdet: self.penalty_logdet,
             deriv_provider: self.deriv_provider,
             tk_correction: self.tk_correction,
@@ -1615,6 +1776,14 @@ use crate::solver::estimate::smooth_floor_dp;
 
 /// Ridge floor for denominator safety.
 const DENOM_RIDGE: f64 = 1e-8;
+
+fn penalty_a_k_beta(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) -> Array1<f64> {
+    coord.apply_penalty(beta, lambda)
+}
+
+fn penalty_a_k_quadratic(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) -> f64 {
+    coord.quadratic(beta, lambda)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  The single evaluator
@@ -1788,6 +1957,28 @@ pub fn reml_laml_evaluate(
 
     let ext_dim = solution.ext_coords.len();
     let mut grad = Array1::zeros(k + ext_dim);
+    let rho_a_k_betas: Vec<Array1<f64>> = solution
+        .penalty_coords
+        .iter()
+        .zip(lambdas.iter().copied())
+        .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
+        .collect();
+    let need_rho_v = effective_deriv.has_corrections() || solution.firth_op.is_some();
+    let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
+        Some(rho_a_k_betas.iter().map(|a_k_beta| hop.solve(a_k_beta)).collect())
+    } else {
+        None
+    };
+    let rho_corrections: Vec<Option<Array2<f64>>> = if effective_deriv.has_corrections() {
+        rho_v_ks
+            .as_ref()
+            .expect("rho mode responses required for Hessian corrections")
+            .iter()
+            .map(|v_k| effective_deriv.hessian_derivative_correction(v_k))
+            .collect()
+    } else {
+        vec![None; k]
+    };
 
     // --- Stochastic trace estimation decision ---
     //
@@ -1811,49 +2002,54 @@ pub fn reml_laml_evaluate(
     // This amortizes the H^{-1} solve cost: ONE solve per probe, shared across
     // all k + ext_dim coordinates.
     let stochastic_trace_values: Option<Vec<f64>> = if use_stochastic_traces {
-        // Check if any ext coordinate uses implicit operators.
+        // Check if any coordinate uses operator-backed drifts.
         let any_operator = solution
+            .penalty_coords
+            .iter()
+            .any(PenaltyCoordinate::uses_operator_fast_path)
+            || solution
             .ext_coords
             .iter()
             .any(|c| c.drift.uses_operator_fast_path());
 
         if any_operator {
             let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
+            let mut rho_ops = Vec::new();
+            let mut coord_has_operator = Vec::with_capacity(k + ext_dim);
 
-            // rho-coordinates: always dense.
             for idx in 0..k {
-                let r_k = &solution.penalty_roots[idx];
-                let mut a_k = r_k.t().dot(r_k);
-                a_k *= lambdas[idx];
-
-                if effective_deriv.has_corrections() {
-                    let r_beta = r_k.dot(&solution.beta);
-                    let s_k_beta = r_k.t().dot(&r_beta);
-                    let a_k_beta = &s_k_beta * lambdas[idx];
-                    let v_k = hop.solve(&a_k_beta);
-                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k) {
-                        a_k += &corr;
+                let coord = &solution.penalty_coords[idx];
+                if coord.uses_operator_fast_path() {
+                    rho_ops.push(coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref()));
+                    coord_has_operator.push(true);
+                } else {
+                    let mut a_k = coord.scaled_dense_matrix(lambdas[idx]);
+                    if let Some(corr) = rho_corrections[idx].as_ref() {
+                        a_k += corr;
                     }
+                    dense_matrices.push(a_k);
+                    coord_has_operator.push(false);
                 }
-                dense_matrices.push(a_k);
             }
 
-            let mut ext_has_operator = Vec::with_capacity(ext_dim);
             let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
             let mut implicit_ops: Vec<&ImplicitHyperOperator> = Vec::new();
+            for op in &rho_ops {
+                generic_ops.push(op);
+            }
             for coord in solution.ext_coords.iter() {
                 if let Some(op) = coord
                     .drift
                     .operator_ref()
                     .filter(|_| coord.drift.uses_operator_fast_path())
                 {
-                    ext_has_operator.push(true);
+                    coord_has_operator.push(true);
                     if let Some(imp) = op.as_implicit() {
                         implicit_ops.push(imp);
                     }
                     generic_ops.push(op);
                 } else {
-                    ext_has_operator.push(false);
+                    coord_has_operator.push(false);
                     let mut h_i = coord.drift.materialize();
                     if effective_deriv.has_corrections() {
                         let v_i = hop.solve(&coord.g);
@@ -1884,16 +2080,11 @@ pub fn reml_laml_evaluate(
                 )
             };
 
-            // Re-map traces back to the [rho_0..rho_k, ext_0..ext_N] layout.
             let mut result = Vec::with_capacity(k + ext_dim);
-            // rho traces come first in raw_traces.
-            for idx in 0..k {
-                result.push(raw_traces[idx]);
-            }
-            let n_dense_ext = ext_has_operator.iter().filter(|&&b| !b).count();
-            let mut dense_cursor = k;
-            let mut operator_cursor = k + n_dense_ext;
-            for &has_operator in &ext_has_operator {
+            let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
+            let mut dense_cursor = 0usize;
+            let mut operator_cursor = n_dense_total;
+            for &has_operator in &coord_has_operator {
                 if has_operator {
                     result.push(raw_traces[operator_cursor]);
                     operator_cursor += 1;
@@ -1910,18 +2101,9 @@ pub fn reml_laml_evaluate(
 
             // rho-coordinates: H_k = A_k + correction(v_k)
             for idx in 0..k {
-                let r_k = &solution.penalty_roots[idx];
-                let mut a_k = r_k.t().dot(r_k);
-                a_k *= lambdas[idx];
-
-                if effective_deriv.has_corrections() {
-                    let r_beta = r_k.dot(&solution.beta);
-                    let s_k_beta = r_k.t().dot(&r_beta);
-                    let a_k_beta = &s_k_beta * lambdas[idx];
-                    let v_k = hop.solve(&a_k_beta);
-                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k) {
-                        a_k += &corr;
-                    }
+                let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(lambdas[idx]);
+                if let Some(corr) = rho_corrections[idx].as_ref() {
+                    a_k += corr;
                 }
                 all_h_k_matrices.push(a_k);
             }
@@ -1949,19 +2131,13 @@ pub fn reml_laml_evaluate(
     };
 
     for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
-
-        // Sₖβ̂ via penalty roots: Sₖβ = Rₖᵀ(Rₖβ)
-        let r_beta = r_k.dot(&solution.beta);
-        let s_k_beta = r_k.t().dot(&r_beta);
-
-        // Aₖ = λₖ Sₖ (the penalty matrix derivative)
-        let a_k_beta = &s_k_beta * lambdas[idx];
+        let coord = &solution.penalty_coords[idx];
+        let a_k_beta = &rho_a_k_betas[idx];
 
         // Term 1: penalty quadratic derivative.
         // For Gaussian (profiled): dp_cgrad × D_k / (2φ̂) where D_k = β̂ᵀAₖβ̂.
         // For non-Gaussian: 0.5 × β̂ᵀAₖβ̂ (direct from LAML formula).
-        let d_k = lambdas[idx] * solution.beta.dot(&s_k_beta);
+        let d_k = solution.beta.dot(a_k_beta);
 
         let penalty_term = match &solution.dispersion {
             DispersionHandling::ProfiledGaussian => dp_cgrad * (d_k / (2.0 * profiled_scale)),
@@ -1981,22 +2157,16 @@ pub fn reml_laml_evaluate(
             // single pass, amortizing the H⁻¹ solve across coordinates.
             0.5 * stoch_traces[idx]
         } else {
-            // Exact path: compute tr(G_ε(H) Hₖ) via the spectral operator.
-            // Build Aₖ = λₖ RₖᵀRₖ
-            let a_k_matrix = {
-                let mut m = r_k.t().dot(r_k);
-                m *= lambdas[idx];
-                m
-            };
-
-            let correction = if effective_deriv.has_corrections() {
-                let v_k = hop.solve(&a_k_beta);
-                effective_deriv.hessian_derivative_correction(&v_k)
+            if coord.uses_operator_fast_path() {
+                let op = coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref());
+                0.5 * hop.trace_logdet_h_k_operator(&op, None)
             } else {
-                None
-            };
-
-            0.5 * hop.trace_logdet_h_k(&a_k_matrix, correction.as_ref())
+                let mut a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+                if let Some(corr) = rho_corrections[idx].as_ref() {
+                    a_k_matrix += corr;
+                }
+                0.5 * hop.trace_logdet_h_k(&a_k_matrix, None)
+            }
         };
 
         // Term 3: −½ ∂/∂ρₖ L_δ(S) — smooth pseudo-logdet derivative.
@@ -2070,11 +2240,9 @@ pub fn reml_laml_evaluate(
     // trace computation) to avoid storing intermediate vectors.
     if let Some(ref firth_op) = solution.firth_op {
         for idx in 0..k {
-            let r_k = &solution.penalty_roots[idx];
-            let r_beta = r_k.dot(&solution.beta);
-            let s_k_beta = r_k.t().dot(&r_beta);
-            let a_k_beta = &s_k_beta * lambdas[idx];
-            let v_k = hop.solve(&a_k_beta);
+            let v_k = &rho_v_ks
+                .as_ref()
+                .expect("rho mode responses required for Firth gradient")[idx];
             let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_k).mapv(|v| -v);
             let dir_k = firth_op.direction_from_deta(deta_k);
             let dhphi_k = firth_op.hphi_direction(&dir_k);
@@ -2362,10 +2530,8 @@ fn compute_outer_hessian(
     let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
 
     for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
-        let r_beta = r_k.dot(&solution.beta);
-        let s_k_beta = r_k.t().dot(&r_beta);
-        let a_k_beta = &s_k_beta * lambdas[idx];
+        let coord = &solution.penalty_coords[idx];
+        let a_k_beta = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
         let v_k = hop.solve(&a_k_beta);
         a_k_betas.push(a_k_beta);
         v_ks.push(v_k);
@@ -2385,9 +2551,7 @@ fn compute_outer_hessian(
     let mut a_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
-        let r_k = &solution.penalty_roots[idx];
-        let mut a_k = r_k.t().dot(r_k);
-        a_k *= lambdas[idx];
+        let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(lambdas[idx]);
         a_k_matrices.push(a_k.clone());
 
         let correction = if effective_deriv.has_corrections() {

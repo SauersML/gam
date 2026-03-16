@@ -373,8 +373,8 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Optional per-evaluation workspace for exact joint Hessian directional
-    /// derivatives.
+    /// Optional per-evaluation workspace for exact joint Hessian operators and
+    /// directional derivatives.
     ///
     /// Families with expensive cache construction can override this to build
     /// shared state once and reuse it across the repeated `dH[v]` / `d²H[u,v]`
@@ -2250,6 +2250,14 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
 }
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
+    fn hessian_matvec(&self, _: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        Ok(None)
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(None)
+    }
+
     fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -3380,6 +3388,94 @@ fn exact_newton_joint_hessian_symmetrized<F: CustomFamily>(
     Ok(Some(h))
 }
 
+enum JointHessianSource {
+    Dense(Array2<f64>),
+    Operator {
+        apply: Arc<dyn Fn(&Array1<f64>) -> Result<Array1<f64>, String> + Send + Sync>,
+        diagonal: Array1<f64>,
+    },
+}
+
+fn materialize_joint_hessian_source(
+    source: &JointHessianSource,
+    total: usize,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    match source {
+        JointHessianSource::Dense(matrix) => Ok(matrix.clone()),
+        JointHessianSource::Operator { apply, .. } => {
+            let mut matrix = Array2::<f64>::zeros((total, total));
+            let mut basis = Array1::<f64>::zeros(total);
+            for col in 0..total {
+                basis[col] = 1.0;
+                let applied = apply(&basis)?;
+                basis[col] = 0.0;
+                if applied.len() != total {
+                    return Err(format!(
+                        "{context}: operator matvec length mismatch: got {}, expected {}",
+                        applied.len(),
+                        total
+                    ));
+                }
+                if applied.iter().any(|value| !value.is_finite()) {
+                    return Err(format!(
+                        "{context}: operator matvec returned non-finite values"
+                    ));
+                }
+                matrix.column_mut(col).assign(&applied);
+            }
+            symmetrize_dense_in_place(&mut matrix);
+            Ok(matrix)
+        }
+    }
+}
+
+fn exact_newton_joint_hessian_source_from_workspace(
+    workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
+    total: usize,
+    context: &str,
+) -> Result<Option<JointHessianSource>, String> {
+    let Some(diagonal) = workspace.hessian_diagonal()? else {
+        return Ok(None);
+    };
+    if diagonal.len() != total {
+        return Err(format!(
+            "{context}: operator diagonal length mismatch: got {}, expected {}",
+            diagonal.len(),
+            total
+        ));
+    }
+    if diagonal.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{context}: operator diagonal contains non-finite values"));
+    }
+
+    let zero = Array1::<f64>::zeros(total);
+    let Some(zero_image) = workspace.hessian_matvec(&zero)? else {
+        return Ok(None);
+    };
+    if zero_image.len() != total {
+        return Err(format!(
+            "{context}: operator matvec length mismatch: got {}, expected {}",
+            zero_image.len(),
+            total
+        ));
+    }
+    if zero_image.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{context}: operator matvec returned non-finite values"));
+    }
+
+    let workspace_apply = Arc::clone(workspace);
+    Ok(Some(JointHessianSource::Operator {
+        apply: Arc::new(move |v: &Array1<f64>| {
+            let Some(out) = workspace_apply.hessian_matvec(v)? else {
+                return Err("joint exact-newton operator matvec unavailable".to_string());
+            };
+            Ok(out)
+        }),
+        diagonal,
+    }))
+}
+
 fn symmetrized_square_matrix(
     mut matrix: Array2<f64>,
     expected: usize,
@@ -3399,9 +3495,9 @@ fn symmetrized_square_matrix(
 }
 
 /// Try exact Newton joint Hessian first, then surrogate. Returns `None` if
-/// neither path provides a joint Hessian. When successful, returns the
-/// unpenalized joint Hessian, flat beta, and boxed closures for computing
-/// directional derivatives dH[v] and d²H[u,v].
+/// neither path provides a joint Hessian. When successful, returns the joint
+/// Hessian source, flat beta, and boxed closures for computing directional
+/// derivatives dH[v] and d²H[u,v].
 ///
 /// This eliminates the previously duplicated exact-Newton and surrogate
 /// code blocks in `outerobjectivegradienthessian_internal`.
@@ -3410,9 +3506,10 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
     block_states: &'a [ParameterBlockState],
     specs: &'a [ParameterBlockSpec],
     total: usize,
+    need_hessian: bool,
 ) -> Result<
     Option<(
-        Array2<f64>,
+        JointHessianSource,
         Array1<f64>,
         Box<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
         Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
@@ -3420,22 +3517,41 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
     String,
 > {
     // Path 1: exact Newton joint Hessian (preferred).
-    if let Some(h_joint_unpen) = exact_newton_joint_hessian_symmetrized(
+    let beta_flat = flatten_state_betas(block_states, specs);
+    let synced = Arc::new(synchronized_states_from_flat_beta(
         family,
-        block_states,
         specs,
-        total,
-        "joint exact-newton Hessian shape mismatch in outer gradient",
-    )? {
-        let beta_flat = flatten_state_betas(block_states, specs);
-        let synced = Arc::new(synchronized_states_from_flat_beta(
+        block_states,
+        &beta_flat,
+    )?);
+    let hessian_workspace = family.exact_newton_joint_hessian_workspace(synced.as_ref(), specs)?;
+    let exact_joint_source = if use_joint_matrix_free_path(total, need_hessian) {
+        hessian_workspace
+            .as_ref()
+            .map(|workspace| {
+                exact_newton_joint_hessian_source_from_workspace(
+                    workspace,
+                    total,
+                    "joint exact-newton operator mismatch in outer gradient",
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let exact_joint_source = match exact_joint_source {
+        Some(source) => Some(source),
+        None => exact_newton_joint_hessian_symmetrized(
             family,
-            specs,
             block_states,
-            &beta_flat,
-        )?);
-        let hessian_workspace =
-            family.exact_newton_joint_hessian_workspace(synced.as_ref(), specs)?;
+            specs,
+            total,
+            "joint exact-newton Hessian shape mismatch in outer gradient",
+        )
+        .map(|source| source.map(JointHessianSource::Dense))?,
+    };
+    if let Some(h_joint_unpen) = exact_joint_source {
         let compute_dh = Box::new(exact_newton_dh_closure(
             family,
             synced.as_ref(),
@@ -3505,7 +3621,12 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
                 }
             },
         );
-        return Ok(Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)));
+        return Ok(Some((
+            JointHessianSource::Dense(h_joint_unpen),
+            beta_flat,
+            compute_dh,
+            compute_d2h,
+        )));
     }
 
     Ok(None)
@@ -3768,42 +3889,100 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    if let Some(h_joint) = exact_newton_joint_hessian_symmetrized(
+    let mut s_lambdas = Vec::with_capacity(specs.len());
+    let mut penalty_logdet_s_total = 0.0;
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let p = end - start;
+        let lambdas = block_log_lambdas[b].mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s_lambda.scaled_add(lambdas[k], s);
+        }
+        if include_logdet_s {
+            penalty_logdet_s_total += stable_logdet_with_ridge_policy(
+                &s_lambda,
+                options.ridge_floor,
+                options.ridge_policy,
+            )?;
+        }
+        s_lambdas.push(s_lambda);
+    }
+    let exact_joint_source = if !strict_spd && use_joint_matrix_free_path(total, false) {
+        family
+            .exact_newton_joint_hessian_workspace(states, specs)?
+            .as_ref()
+            .map(|workspace| {
+                exact_newton_joint_hessian_source_from_workspace(
+                    workspace,
+                    total,
+                    "joint exact-newton operator mismatch in logdet terms",
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(h_joint_source) = exact_joint_source {
+        match h_joint_source {
+            JointHessianSource::Operator { apply, diagonal } => {
+                let preconditioner_diag =
+                    joint_penalty_preconditioner_diag(&diagonal, &ranges, &s_lambdas, 0.0);
+                let apply_h = Arc::clone(&apply);
+                let apply_ranges = ranges.clone();
+                let apply_s = Arc::new(s_lambdas.clone());
+                if let Ok(op) = MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                    let mut out = match apply_h(v) {
+                        Ok(out) => out,
+                        Err(error) => {
+                            log::warn!("joint logdet operator matvec failed: {error}");
+                            Array1::<f64>::zeros(total)
+                        }
+                    };
+                    let penalty = apply_joint_block_penalty(&apply_ranges, apply_s.as_ref(), v, 0.0);
+                    out += &penalty;
+                    out
+                }) {
+                    return Ok((op.logdet(), penalty_logdet_s_total));
+                }
+
+                let mut h = materialize_joint_hessian_source(
+                    &JointHessianSource::Operator { apply, diagonal },
+                    total,
+                    "joint exact-newton Hessian materialization in logdet terms",
+                )?;
+                for (b, s_lambda) in s_lambdas.iter().enumerate() {
+                    let (start, end) = ranges[b];
+                    h.slice_mut(ndarray::s![start..end, start..end])
+                        .scaled_add(1.0, s_lambda);
+                }
+                let logdet_h_total =
+                    stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
+                return Ok((logdet_h_total, penalty_logdet_s_total));
+            }
+            JointHessianSource::Dense(_) => {}
+        }
+    }
+    if let Some(mut h_joint) = exact_newton_joint_hessian_symmetrized(
         family,
         states,
         specs,
         total,
         "joint exact-newton Hessian shape mismatch in logdet terms",
     )? {
-        let mut s_joint = Array2::<f64>::zeros((total, total));
-        let mut logdet_s_total = 0.0;
-        for (b, spec) in specs.iter().enumerate() {
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
             let (start, end) = ranges[b];
-            let p = end - start;
-            let lambdas = block_log_lambdas[b].mapv(f64::exp);
-            let mut s_lambda = Array2::<f64>::zeros((p, p));
-            for (k, s) in spec.penalties.iter().enumerate() {
-                s_lambda.scaled_add(lambdas[k], s);
-            }
-            s_joint
+            h_joint
                 .slice_mut(ndarray::s![start..end, start..end])
-                .assign(&s_lambda);
-            if include_logdet_s {
-                logdet_s_total += stable_logdet_with_ridge_policy(
-                    &s_lambda,
-                    options.ridge_floor,
-                    options.ridge_policy,
-                )?;
-            }
+                .scaled_add(1.0, s_lambda);
         }
-        let mut h = h_joint;
-        h += &s_joint;
         let logdet_h_total = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(&h, allow_semidefinite)?
+            strict_logdet_spd_with_semidefinite_option(&h_joint, allow_semidefinite)?
         } else {
-            stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
+            stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
         };
-        return Ok((logdet_h_total, logdet_s_total));
+        return Ok((logdet_h_total, penalty_logdet_s_total));
     }
 
     let eval = family.evaluate(states)?;
@@ -3816,7 +3995,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     }
 
     let mut logdet_h_total = 0.0;
-    let mut logdet_s_total = 0.0;
+    let logdet_s_total = penalty_logdet_s_total;
     for b in 0..specs.len() {
         let spec = &specs[b];
         let work = &eval.blockworking_sets[b];
@@ -3847,25 +4026,17 @@ fn blockwise_logdet_terms<F: CustomFamily>(
             }
         };
 
-        let lambdas = block_log_lambdas[b].mapv(f64::exp);
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s_lambda.scaled_add(lambdas[k], s);
-        }
+        let s_lambda = &s_lambdas[b];
 
         let mut h = xtwx;
-        h += &s_lambda;
+        h += s_lambda;
         logdet_h_total += if strict_spd {
             strict_logdet_spd_with_semidefinite_option(&h, allow_semidefinite)?
         } else {
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
         };
         if include_logdet_s {
-            logdet_s_total += stable_logdet_with_ridge_policy(
-                &s_lambda,
-                options.ridge_floor,
-                options.ridge_policy,
-            )?;
+            // Already accumulated above from the shared penalty blocks.
         }
     }
     Ok((logdet_h_total, logdet_s_total))
@@ -3933,7 +4104,24 @@ fn inner_blockwise_fit<F: CustomFamily>(
 ) -> Result<BlockwiseInnerResult, String> {
     let mut states = buildblock_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
-    let has_joint_exacthessian = family.exact_newton_joint_hessian(&states)?.is_some();
+    let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    let has_joint_exacthessian = if use_joint_matrix_free_path(total_joint_p, false) {
+        let workspace = family.exact_newton_joint_hessian_workspace(&states, specs)?;
+        match workspace.as_ref() {
+            Some(workspace) => {
+                exact_newton_joint_hessian_source_from_workspace(
+                    workspace,
+                    total_joint_p,
+                    "joint exact-newton operator mismatch during inner availability probe",
+                )?
+                .is_some()
+                    || family.exact_newton_joint_hessian(&states)?.is_some()
+            }
+            None => family.exact_newton_joint_hessian(&states)?.is_some(),
+        }
+    } else {
+        family.exact_newton_joint_hessian(&states)?.is_some()
+    };
     let inner_tol = if has_joint_exacthessian {
         options.inner_tol.min(1e-10)
     } else {
@@ -4024,9 +4212,38 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
         for cycle in 0..inner_max_cycles {
             // Get joint Hessian and block gradients from the current evaluation.
-            let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
-            let Some(h_joint) = h_joint_opt else {
-                break; // Fall back to blockwise if joint Hessian unavailable
+            let joint_hessian_source = if use_joint_matrix_free_path(total_p, false) {
+                family
+                    .exact_newton_joint_hessian_workspace(&states, specs)?
+                    .as_ref()
+                    .map(|workspace| {
+                        exact_newton_joint_hessian_source_from_workspace(
+                            workspace,
+                            total_p,
+                            "joint Newton inner exact-newton operator mismatch",
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let joint_hessian_source = match joint_hessian_source {
+                Some(source) => source,
+                None => {
+                    let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
+                    let Some(h_joint) = h_joint_opt else {
+                        break; // Fall back to blockwise if joint Hessian unavailable
+                    };
+                    match symmetrized_square_matrix(
+                        h_joint,
+                        total_p,
+                        "joint Newton inner exact-newton Hessian shape mismatch",
+                    ) {
+                        Ok(matrix) => JointHessianSource::Dense(matrix),
+                        Err(_) => break,
+                    }
+                }
             };
 
             // Concatenate block gradients and betas.
@@ -4055,49 +4272,89 @@ fn inner_blockwise_fit<F: CustomFamily>(
             );
             let rhs = &grad_joint - &penalty_beta;
 
-            let Some(mut delta) = (if use_joint_matrix_free_path(total_p, false) {
-                let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
-                let preconditioner_diag = joint_penalty_preconditioner_diag(
-                    &h_joint,
-                    &ranges,
-                    &s_lambdas,
-                    trace_diagonal_ridge,
-                );
-                crate::linalg::utils::solve_spd_pcg(
-                    |v| {
-                        let mut out = h_joint.dot(v);
-                        let penalty =
-                            apply_joint_block_penalty(&ranges, &s_lambdas, v, trace_diagonal_ridge);
-                        out += &penalty;
-                        out
-                    },
-                    &rhs,
-                    &preconditioner_diag,
-                    JOINT_PCG_REL_TOL,
-                    JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                )
-                .or_else(|| {
-                    let mut lhs = h_joint.clone();
-                    add_joint_penalty_to_matrix(
-                        &mut lhs,
+            let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+            let mut delta = if use_joint_matrix_free_path(total_p, false) {
+                let preconditioner_diag = match &joint_hessian_source {
+                    JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
+                        &h_joint.diag().to_owned(),
                         &ranges,
                         &s_lambdas,
                         trace_diagonal_ridge,
-                    );
-                    let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-                    solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE)
-                })
+                    ),
+                    JointHessianSource::Operator { diagonal, .. } => {
+                        joint_penalty_preconditioner_diag(
+                            diagonal,
+                            &ranges,
+                            &s_lambdas,
+                            trace_diagonal_ridge,
+                        )
+                    }
+                };
+                match &joint_hessian_source {
+                    JointHessianSource::Dense(h_joint) => crate::linalg::utils::solve_spd_pcg(
+                        |v| {
+                            let mut out = h_joint.dot(v);
+                            let penalty = apply_joint_block_penalty(
+                                &ranges,
+                                &s_lambdas,
+                                v,
+                                trace_diagonal_ridge,
+                            );
+                            out += &penalty;
+                            out
+                        },
+                        &rhs,
+                        &preconditioner_diag,
+                        JOINT_PCG_REL_TOL,
+                        JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                    ),
+                    JointHessianSource::Operator { apply, .. } => {
+                        let apply_h = Arc::clone(apply);
+                        crate::linalg::utils::solve_spd_pcg(
+                            |v| {
+                                let mut out = match apply_h(v) {
+                                    Ok(out) => out,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "joint Newton inner operator matvec failed: {error}"
+                                        );
+                                        Array1::<f64>::zeros(total_p)
+                                    }
+                                };
+                                let penalty = apply_joint_block_penalty(
+                                    &ranges,
+                                    &s_lambdas,
+                                    v,
+                                    trace_diagonal_ridge,
+                                );
+                                out += &penalty;
+                                out
+                            },
+                            &rhs,
+                            &preconditioner_diag,
+                            JOINT_PCG_REL_TOL,
+                            JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                        )
+                    }
+                }
             } else {
-                let mut lhs = h_joint.clone();
-                add_joint_penalty_to_matrix(
-                    &mut lhs,
-                    &ranges,
-                    &s_lambdas,
-                    joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE,
-                );
+                None
+            };
+            if delta.is_none() {
+                let mut lhs = match materialize_joint_hessian_source(
+                    &joint_hessian_source,
+                    total_p,
+                    "joint Newton inner Hessian materialization",
+                ) {
+                    Ok(matrix) => matrix,
+                    Err(_) => break,
+                };
+                add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
                 let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-                solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE)
-            }) else {
+                delta = solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE);
+            }
+
+            let Some(mut delta) = delta else {
                 break; // Fall back to blockwise
             };
             if !delta.iter().all(|v| v.is_finite()) {
@@ -4622,7 +4879,7 @@ fn unified_joint_cost_gradient(
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
 ///
 /// Both paths differ only in:
-/// - how `h_joint_unpen` is obtained (exact vs surrogate family methods)
+/// - how the joint Hessian source is obtained (exact vs surrogate family methods)
 /// - the closure for computing D_β H_L[v] (`compute_dh`)
 /// - the closure for computing D²_β H_L[u, v] (`compute_d2h`)
 /// - whether a tangent-basis projection is applied to the mode inverse
@@ -4636,7 +4893,7 @@ fn joint_outer_evaluate(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    h_joint_unpen: Array2<f64>,
+    h_joint_unpen: JointHessianSource,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -4671,47 +4928,106 @@ fn joint_outer_evaluate(
 
     let hessian_op: Box<dyn crate::solver::estimate::reml::unified::HessianOperator> =
         if use_joint_matrix_free_path(total, need_hessian) {
-            let h_joint = Arc::new(h_joint_unpen);
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(inner.s_lambdas.clone());
             let trace_diagonal_ridge = joint_trace_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
-            let preconditioner_diag = joint_penalty_preconditioner_diag(
-                h_joint.as_ref(),
-                &ranges_vec,
-                s_lambdas.as_ref(),
-                trace_diagonal_ridge,
-            );
-            let apply_h = Arc::clone(&h_joint);
-            let apply_ranges = ranges_vec.clone();
-            let apply_s = Arc::clone(&s_lambdas);
-            match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
-                let mut out = apply_h.dot(v);
-                let penalty = apply_joint_block_penalty(
-                    &apply_ranges,
-                    apply_s.as_ref(),
-                    v,
-                    trace_diagonal_ridge,
-                );
-                out += &penalty;
-                out
-            }) {
-                Ok(op) => Box::new(op),
-                Err(_) => {
-                    let mut j_for_traces = (*h_joint).clone();
-                    add_joint_penalty_to_matrix(
-                        &mut j_for_traces,
+            match h_joint_unpen {
+                JointHessianSource::Dense(h_joint) => {
+                    let h_joint = Arc::new(h_joint);
+                    let preconditioner_diag = joint_penalty_preconditioner_diag(
+                        &h_joint.diag().to_owned(),
                         &ranges_vec,
                         s_lambdas.as_ref(),
-                        joint_trace_diagonal_ridge,
+                        trace_diagonal_ridge,
                     );
-                    Box::new(
-                        BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges_vec)
-                            .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
-                    )
+                    let apply_h = Arc::clone(&h_joint);
+                    let apply_ranges = ranges_vec.clone();
+                    let apply_s = Arc::clone(&s_lambdas);
+                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                        let mut out = apply_h.dot(v);
+                        let penalty = apply_joint_block_penalty(
+                            &apply_ranges,
+                            apply_s.as_ref(),
+                            v,
+                            trace_diagonal_ridge,
+                        );
+                        out += &penalty;
+                        out
+                    }) {
+                        Ok(op) => Box::new(op),
+                        Err(_) => {
+                            let mut j_for_traces = (*h_joint).clone();
+                            add_joint_penalty_to_matrix(
+                                &mut j_for_traces,
+                                &ranges_vec,
+                                s_lambdas.as_ref(),
+                                joint_trace_diagonal_ridge,
+                            );
+                            Box::new(
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges_vec)
+                                    .map_err(|e| {
+                                        format!("BlockCoupledOperator from joint Hessian: {e}")
+                                    })?,
+                            )
+                        }
+                    }
+                }
+                JointHessianSource::Operator { apply, diagonal } => {
+                    let preconditioner_diag = joint_penalty_preconditioner_diag(
+                        &diagonal,
+                        &ranges_vec,
+                        s_lambdas.as_ref(),
+                        trace_diagonal_ridge,
+                    );
+                    let apply_h = Arc::clone(&apply);
+                    let apply_ranges = ranges_vec.clone();
+                    let apply_s = Arc::clone(&s_lambdas);
+                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                        let mut out = match apply_h(v) {
+                            Ok(out) => out,
+                            Err(error) => {
+                                log::warn!("joint exact-newton operator matvec failed: {error}");
+                                Array1::<f64>::zeros(total)
+                            }
+                        };
+                        let penalty = apply_joint_block_penalty(
+                            &apply_ranges,
+                            apply_s.as_ref(),
+                            v,
+                            trace_diagonal_ridge,
+                        );
+                        out += &penalty;
+                        out
+                    }) {
+                        Ok(op) => Box::new(op),
+                        Err(_) => {
+                            let mut j_for_traces = materialize_joint_hessian_source(
+                                &JointHessianSource::Operator { apply, diagonal },
+                                total,
+                                "joint exact-newton operator materialization",
+                            )?;
+                            add_joint_penalty_to_matrix(
+                                &mut j_for_traces,
+                                &ranges_vec,
+                                s_lambdas.as_ref(),
+                                joint_trace_diagonal_ridge,
+                            );
+                            Box::new(
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges_vec)
+                                    .map_err(|e| {
+                                        format!("BlockCoupledOperator from joint Hessian: {e}")
+                                    })?,
+                            )
+                        }
+                    }
                 }
             }
         } else {
-            let mut j_for_traces = h_joint_unpen;
+            let mut j_for_traces = materialize_joint_hessian_source(
+                &h_joint_unpen,
+                total,
+                "joint exact-newton Hessian materialization",
+            )?;
             add_joint_penalty_to_matrix(
                 &mut j_for_traces,
                 ranges,
@@ -4867,7 +5183,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     // synchronization. Once we have the Hessian source, the downstream
     // evaluation through joint_outer_evaluate() is identical.
     if let Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)) =
-        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+        build_joint_hessian_closures(family, &inner.block_states, specs, total, need_hessian)?
     {
         return joint_outer_evaluate(
             &inner,
@@ -5059,7 +5375,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
         &per_block,
         rho,
         beta,
-        h_joint_unpen,
+        JointHessianSource::Dense(h_joint_unpen),
         &ranges,
         total,
         ridge,
@@ -5821,22 +6137,42 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     if psi_dim > 0 {
         // ψ coordinates present: require exact Newton Hessian for consistency
         // with the psi derivative callbacks.
-        let h_joint_unpen = exact_newton_joint_hessian_symmetrized(
-            family,
-            &inner.block_states,
-            specs,
-            total,
-            "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
-        )?
+        let beta_flat = flatten_state_betas(&inner.block_states, specs);
+        let synced_joint_states =
+            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
+        let hessian_workspace =
+            family.exact_newton_joint_hessian_workspace(&synced_joint_states, specs)?;
+        let h_joint_unpen = if use_joint_matrix_free_path(total, need_hessian) {
+            hessian_workspace
+                .as_ref()
+                .map(|workspace| {
+                    exact_newton_joint_hessian_source_from_workspace(
+                        workspace,
+                        total,
+                        "joint exact-newton operator mismatch in joint hyper evaluator",
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let h_joint_unpen = match h_joint_unpen {
+            Some(source) => Some(source),
+            None => exact_newton_joint_hessian_symmetrized(
+                family,
+                &inner.block_states,
+                specs,
+                total,
+                "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
+            )
+            .map(|source| source.map(JointHessianSource::Dense))?,
+        }
         .ok_or_else(|| -> CustomFamilyError {
             "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus"
                 .to_string()
                 .into()
         })?;
-
-        let beta_flat = flatten_state_betas(&inner.block_states, specs);
-        let synced_joint_states =
-            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
 
         // Compute smooth δ-regularized inverse (S + δI)⁻¹ for the ψ builders.
         //
@@ -5923,9 +6259,6 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             drift_fn,
         };
 
-        let hessian_workspace =
-            family.exact_newton_joint_hessian_workspace(&synced_joint_states, specs)?;
-
         // Build derivative provider for the ρ coordinates (D_β H[v]).
         let compute_dh = exact_newton_dh_closure(
             family,
@@ -5984,7 +6317,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     // surrogate Hessian sources, then call joint_outer_evaluate with no
     // extended coordinates.
     if let Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)) =
-        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+        build_joint_hessian_closures(family, &inner.block_states, specs, total, need_hessian)?
     {
         let eval_result = joint_outer_evaluate(
             &inner,
@@ -6171,7 +6504,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         &per_block,
         rho_current,
         &beta_flat,
-        h_joint_unpen,
+        JointHessianSource::Dense(h_joint_unpen),
         &ranges,
         total,
         ridge,
@@ -6240,12 +6573,12 @@ fn apply_joint_block_penalty(
 }
 
 fn joint_penalty_preconditioner_diag(
-    h_joint_unpen: &Array2<f64>,
+    base_diagonal: &Array1<f64>,
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
 ) -> Array1<f64> {
-    let mut diag = h_joint_unpen.diag().to_owned();
+    let mut diag = base_diagonal.clone();
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
         for (local_idx, global_idx) in (start..end).enumerate() {
