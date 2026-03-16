@@ -28,9 +28,9 @@ use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::normal_pdf;
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design,
+    BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
@@ -762,9 +762,10 @@ fn identity_penalty(dim: usize) -> Array2<f64> {
 }
 
 fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
+    let p = design.design.ncols();
     design
         .penalties
-        .push(identity_penalty(design.design.ncols()));
+        .push(BlockwisePenalty::new(0..p, identity_penalty(p)));
 }
 
 // Honest warm start for the binomial location-scale model: run a short fit on
@@ -947,17 +948,16 @@ fn validate_term_collection_design(
             design.penalties.len()
         ));
     }
-    for (idx, penalty) in design.penalties.iter().enumerate() {
+    for (idx, bp) in design.penalties.iter().enumerate() {
         validate_all_finite_estimation(
             &format!("{label}.penalties[{idx}]"),
-            penalty.iter().copied(),
+            bp.local.iter().copied(),
         )
         .map_err(|e| e.to_string())?;
-        let (rows, cols) = penalty.dim();
-        if rows != p || cols != p {
+        if bp.col_range.end > p {
             return Err(format!(
-                "{label}.penalties[{idx}] must be {}x{}, got {}x{}",
-                p, p, rows, cols
+                "{label}.penalties[{idx}] col_range {}..{} exceeds design width {}",
+                bp.col_range.start, bp.col_range.end, p
             ));
         }
     }
@@ -1507,7 +1507,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             name: "mu".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
         };
@@ -1523,7 +1523,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                     .min(noise_design.design.ncols()),
             )?)),
             offset: Array1::zeros(self.y.len()),
-            penalties: noise_design.penalties.clone(),
+            penalties: noise_design.global_penalties(),
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
         };
@@ -1659,7 +1659,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             name: "mu".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1675,7 +1675,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                     .min(noise_design.design.ncols()),
             )?)),
             offset: Array1::zeros(self.y.len()),
-            penalties: noise_design.penalties.clone(),
+            penalties: noise_design.global_penalties(),
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
@@ -1830,13 +1830,13 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let mut log_sigma_penalties = noise_design.penalties.clone();
+        let mut log_sigma_penalties = noise_design.global_penalties();
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1984,13 +1984,13 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let mut log_sigma_penalties = noise_design.penalties.clone();
+        let mut log_sigma_penalties = noise_design.global_penalties();
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design.penalties.clone(),
+            penalties: mean_design.global_penalties(),
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -2356,7 +2356,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 eta_block: ParameterBlockInput {
                     design: DesignMatrix::Dense(Arc::new(pilot_design.design.clone())),
                     offset: Array1::zeros(y.len()),
-                    penalties: pilot_design.penalties.clone(),
+                    penalties: pilot_design.global_penalties(),
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
                 },
@@ -2456,7 +2456,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 name: "eta".to_string(),
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y_cloned.len()),
-                penalties: design.penalties.clone(),
+                penalties: design.global_penalties(),
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
             },
@@ -2620,7 +2620,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             eta_block: ParameterBlockInput {
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y.len()),
-                penalties: design.penalties.clone(),
+                penalties: design.global_penalties(),
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),
             },
