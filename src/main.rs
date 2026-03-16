@@ -1,3 +1,4 @@
+use std::sync::Arc;
 #![deny(unused_variables)]
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -1823,7 +1824,7 @@ fn build_predict_input_for_model(
                 ));
             }
             Ok(PredictInput {
-                design: DesignMatrix::Dense(design.design),
+                design: DesignMatrix::Dense(Arc::new(design.design)),
                 offset,
                 design_noise: None,
                 offset_noise: None,
@@ -1859,9 +1860,9 @@ fn build_predict_input_for_model(
             };
 
             Ok(PredictInput {
-                design: DesignMatrix::Dense(design.design),
+                design: DesignMatrix::Dense(Arc::new(design.design)),
                 offset,
-                design_noise: Some(DesignMatrix::Dense(prepared_noise_design)),
+                design_noise: Some(DesignMatrix::Dense(Arc::new(prepared_noise_design))),
                 offset_noise: Some(Array1::zeros(n)),
                 auxiliary_scalar: None,
             })
@@ -1884,9 +1885,9 @@ fn build_predict_input_for_model(
             let design_logslope = build_term_collection_design(data, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
             Ok(PredictInput {
-                design: DesignMatrix::Dense(design.design),
+                design: DesignMatrix::Dense(Arc::new(design.design)),
                 offset,
-                design_noise: Some(DesignMatrix::Dense(design_logslope.design)),
+                design_noise: Some(DesignMatrix::Dense(Arc::new(design_logslope.design))),
                 offset_noise: Some(Array1::zeros(n)),
                 auxiliary_scalar: Some(z),
             })
@@ -2299,9 +2300,9 @@ fn run_predict_survival(
         } else {
             raw_sigma_design.design.clone()
         };
-        let eta_t = DesignMatrix::Dense(threshold_design.design.clone())
+        let eta_t = DesignMatrix::Dense(Arc::new(threshold_design.design.clone()))
             .matrixvectormultiply(&beta_threshold);
-        let eta_ls = DesignMatrix::Dense(prepared_sigma_design.clone())
+        let eta_ls = DesignMatrix::Dense(Arc::new(prepared_sigma_design.clone()))
             .matrixvectormultiply(&beta_log_sigma);
         let sigma = eta_ls.mapv(f64::exp);
         let beta_link_wiggle = model
@@ -2322,9 +2323,9 @@ fn run_predict_survival(
         let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
-            x_threshold: DesignMatrix::Dense(threshold_design.design.clone()),
+            x_threshold: DesignMatrix::Dense(Arc::new(threshold_design.design.clone())),
             eta_threshold_offset: Array1::zeros(n),
-            x_log_sigma: DesignMatrix::Dense(prepared_sigma_design),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(prepared_sigma_design)),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: x_link_wiggle.clone(),
             inverse_link: survival_inverse_link.clone(),
@@ -3063,7 +3064,7 @@ fn run_predict_standard(
         .predictor()
         .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
     let pred_input = PredictInput {
-        design: DesignMatrix::Dense(design.design.clone()),
+        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: offset.clone(),
         design_noise: None,
         offset_noise: None,
@@ -6433,7 +6434,7 @@ fn run_generate_standard(
     }
     let offset = Array1::zeros(design.design.nrows());
     let pred_input = PredictInput {
-        design: DesignMatrix::Dense(design.design.clone()),
+        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset,
         design_noise: None,
         offset_noise: None,

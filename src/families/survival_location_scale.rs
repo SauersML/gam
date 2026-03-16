@@ -2372,7 +2372,7 @@ fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> Des
                 }
             }
         }
-        DesignMatrix::Dense(out)
+        DesignMatrix::Dense(Arc::new(out))
     }
 }
 
@@ -2423,7 +2423,7 @@ fn build_survival_covariate_block_from_design(
     match template {
         SurvivalCovariateTermBlockTemplate::Static => {
             Ok(CovariateBlockKind::Static(CovariateBlockInput {
-                design: DesignMatrix::Dense(cov_design.design.clone()),
+                design: DesignMatrix::Dense(Arc::new(cov_design.design.clone())),
                 offset: Array1::zeros(cov_design.design.nrows()),
                 penalties: cov_design.penalties.clone(),
                 initial_log_lambdas,
@@ -2437,7 +2437,7 @@ fn build_survival_covariate_block_from_design(
         } => {
             let p_cov = cov_design.design.ncols();
             let p_time = time_basis_exit.ncols();
-            let design_covariates = DesignMatrix::Dense(cov_design.design.clone());
+            let design_covariates = DesignMatrix::Dense(Arc::new(cov_design.design.clone()));
             let i_cov = Array2::<f64>::eye(p_cov);
             let i_time = Array2::<f64>::eye(p_time);
             let mut penalties =
@@ -2587,12 +2587,12 @@ fn build_survival_covariate_block_psi_derivatives(
                         } => {
                             let tensorize_design = |base: &Array2<f64>| {
                                 let exit = rowwise_kronecker(
-                                    &DesignMatrix::Dense(base.clone()),
+                                    &DesignMatrix::Dense(Arc::new(base.clone())),
                                     time_basis_exit,
                                 )
                                 .to_dense();
                                 let entry = rowwise_kronecker(
-                                    &DesignMatrix::Dense(base.clone()),
+                                    &DesignMatrix::Dense(Arc::new(base.clone())),
                                     time_basis_entry,
                                 )
                                 .to_dense();
@@ -2903,7 +2903,7 @@ fn prepare_survival_location_scale_model(
     let time_stacked_offset = stack_time_offset(&spec.time_block);
     let timespec = ParameterBlockSpec {
         name: "time_transform".to_string(),
-        design: DesignMatrix::Dense(time_stacked_design),
+        design: DesignMatrix::Dense(Arc::new(time_stacked_design)),
         offset: time_stacked_offset,
         penalties: time_prepared.penalties.clone(),
         initial_log_lambdas: initial_log_lambdas(
@@ -2929,7 +2929,7 @@ fn prepare_survival_location_scale_model(
             offset_stacked
                 .slice_mut(s![n..2 * n])
                 .assign(&threshold_prep.offset);
-            (DesignMatrix::Dense(stacked), offset_stacked)
+            (DesignMatrix::Dense(Arc::new(stacked)), offset_stacked)
         } else {
             (
                 threshold_prep.design_exit.clone(),
@@ -2997,10 +2997,10 @@ fn prepare_survival_location_scale_model(
             offset_stacked
                 .slice_mut(s![n..2 * n])
                 .assign(&log_sigma_prep.offset);
-            (DesignMatrix::Dense(stacked), offset_stacked)
+            (DesignMatrix::Dense(Arc::new(stacked)), offset_stacked)
         } else {
             (
-                DesignMatrix::Dense(log_sigma_design.clone()),
+                DesignMatrix::Dense(Arc::new(log_sigma_design.clone())),
                 log_sigma_prep.offset.clone(),
             )
         };
@@ -3041,7 +3041,7 @@ fn prepare_survival_location_scale_model(
         offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
-        x_log_sigma: DesignMatrix::Dense(log_sigma_design),
+        x_log_sigma: DesignMatrix::Dense(Arc::new(log_sigma_design)),
         x_log_sigma_entry: log_sigma_entry_design.map(DesignMatrix::Dense),
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
     };
@@ -7626,9 +7626,9 @@ mod tests {
             x_time_exit: array![[1.2], [0.9], [1.4]],
             x_time_deriv: array![[1.0], [1.0], [1.0]],
             offset_time_deriv: array![0.5, 0.7, 0.6],
-            x_threshold: DesignMatrix::Dense(array![[1.0], [0.4], [-0.6]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0], [0.4], [-0.6]])),
             x_threshold_entry: None,
-            x_log_sigma: DesignMatrix::Dense(array![[1.0], [-0.3], [0.5]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0], [-0.3], [0.5]])),
             x_log_sigma_entry: None,
             x_link_wiggle: None,
         }
@@ -7710,7 +7710,7 @@ mod tests {
         vec![
             ParameterBlockSpec {
                 name: "time_transform".to_string(),
-                design: DesignMatrix::Dense(array![
+                design: DesignMatrix::Dense(Arc::new(array![
                     [1.0],
                     [1.0],
                     [1.0],
@@ -7728,7 +7728,7 @@ mod tests {
             },
             ParameterBlockSpec {
                 name: "threshold".to_string(),
-                design: DesignMatrix::Dense(array![[1.0], [0.4], [-0.6]]),
+                design: DesignMatrix::Dense(Arc::new(array![[1.0], [0.4], [-0.6]])),
                 offset: Array1::zeros(3),
                 penalties: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
@@ -7736,7 +7736,7 @@ mod tests {
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(array![[1.0], [-0.3], [0.5]]),
+                design: DesignMatrix::Dense(Arc::new(array![[1.0], [-0.3], [0.5]])),
                 offset: Array1::zeros(3),
                 penalties: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
@@ -8895,9 +8895,9 @@ mod tests {
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
-            x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, -0.2]])),
             eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
@@ -8983,9 +8983,9 @@ mod tests {
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
-            x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, -0.2]])),
             eta_threshold_offset: array![0.7],
-            x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.4],
             x_link_wiggle: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
@@ -9019,11 +9019,11 @@ mod tests {
         let dense_input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5], [1.0, -0.3]],
             eta_time_offset_exit: array![0.2, -0.1],
-            x_threshold: DesignMatrix::Dense(x_threshold_dense.clone()),
+            x_threshold: DesignMatrix::Dense(Arc::new(x_threshold_dense.clone())),
             eta_threshold_offset: array![0.7, -0.2],
-            x_log_sigma: DesignMatrix::Dense(x_log_sigma_dense.clone()),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(x_log_sigma_dense.clone())),
             eta_log_sigma_offset: array![0.4, 0.1],
-            x_link_wiggle: Some(DesignMatrix::Dense(xwiggle_dense.clone())),
+            x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(xwiggle_dense.clone()))),
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let sparse_input = SurvivalLocationScalePredictInput {
@@ -9103,9 +9103,9 @@ mod tests {
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.1],
-            x_threshold: DesignMatrix::Dense(array![[1.0, 0.25]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, 0.25]])),
             eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(array![[1.0, -0.15]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, -0.15]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
@@ -9177,9 +9177,9 @@ mod tests {
         let dense_input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5], [1.0, -0.4]],
             eta_time_offset_exit: array![0.1, -0.2],
-            x_threshold: DesignMatrix::Dense(x_threshold_dense.clone()),
+            x_threshold: DesignMatrix::Dense(Arc::new(x_threshold_dense.clone())),
             eta_threshold_offset: array![0.0, 0.05],
-            x_log_sigma: DesignMatrix::Dense(x_log_sigma_dense.clone()),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(x_log_sigma_dense.clone())),
             eta_log_sigma_offset: array![0.0, -0.03],
             x_link_wiggle: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
@@ -9221,11 +9221,11 @@ mod tests {
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
-            x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, -0.2]])),
             eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
-            x_link_wiggle: Some(DesignMatrix::Dense(array![[1.0, 0.1]])),
+            x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(array![[1.0, 0.1]]))),
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = test_survival_fit(
@@ -9317,9 +9317,9 @@ mod tests {
         let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
-            x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, -0.2]])),
             eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
             inverse_link: InverseLink::Standard(LinkFunction::BetaLogistic),
@@ -9337,9 +9337,9 @@ mod tests {
         let base = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
-            x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
+            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, -0.2]])),
             eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
             inverse_link: InverseLink::Standard(LinkFunction::Probit),
@@ -9473,14 +9473,14 @@ mod tests {
                 initial_beta: None,
             },
             threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
-                design: DesignMatrix::Dense(Array2::ones((n, 1))),
+                design: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),
             log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
-                design: DesignMatrix::Dense(Array2::ones((n, 1))),
+                design: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
                 initial_log_lambdas: None,
@@ -9547,9 +9547,9 @@ mod tests {
             x_time_exit: x_exit.clone(),
             x_time_deriv: x_deriv.clone(),
             offset_time_deriv: offset_deriv.clone(),
-            x_threshold: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_threshold: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_threshold_entry: None,
-            x_log_sigma: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_log_sigma_entry: None,
             x_link_wiggle: None,
         };
@@ -9676,9 +9676,9 @@ mod tests {
             x_time_exit: Array2::ones((n, 1)),
             x_time_deriv: Array2::ones((n, 1)),
             offset_time_deriv: Array1::zeros(n),
-            x_threshold: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_threshold: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_threshold_entry: None,
-            x_log_sigma: DesignMatrix::Dense(Array2::ones((n, 1))),
+            x_log_sigma: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_log_sigma_entry: None,
             x_link_wiggle: None,
         };

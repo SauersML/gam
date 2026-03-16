@@ -299,9 +299,13 @@ impl AsRef<SparseColMat<usize, f64>> for SparseDesignMatrix {
 }
 
 /// Unified design matrix representation for dense and sparse workflows.
+///
+/// Dense matrices are wrapped in Arc for O(1) cloning — at biobank scale
+/// design matrices are 100-500MB and get cloned repeatedly during GAMLSS
+/// family construction, warm-start caching, and prediction.
 #[derive(Clone)]
 pub enum DesignMatrix {
-    Dense(Array2<f64>),
+    Dense(Arc<Array2<f64>>),
     Sparse(SparseDesignMatrix),
 }
 
@@ -329,7 +333,7 @@ impl SymmetricMatrix {
 
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
-            Self::Dense(mat) => mat.clone(),
+            Self::Dense(mat) => (**mat).clone(),
             Self::Sparse(mat) => {
                 let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
                 let (symbolic, values) = mat.parts();
@@ -1220,7 +1224,7 @@ impl LinearOperator for DenseRightProductView<'_> {
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         let dense = self.materialize();
-        DesignMatrix::Dense(dense).quadratic_form_diag(middle)
+        DesignMatrix::Dense(Arc::new(dense)).quadratic_form_diag(middle)
     }
 }
 
@@ -1346,7 +1350,7 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
 
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
         let mut out = Array1::<f64>::zeros(self.total_cols);
-        let local = DesignMatrix::Dense(self.local.clone()).diag_gram(weights)?;
+        let local = DesignMatrix::Dense(Arc::new(self.local.clone())).diag_gram(weights)?;
         out.slice_mut(ndarray::s![self.global_range.clone()])
             .assign(&local);
         Ok(out)
@@ -1375,7 +1379,7 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
                 self.global_range.clone()
             ])
             .to_owned();
-        DesignMatrix::Dense(self.local.clone()).quadratic_form_diag(&middle_local)
+        DesignMatrix::Dense(Arc::new(self.local.clone())).quadratic_form_diag(&middle_local)
     }
 }
 
@@ -1555,7 +1559,7 @@ impl DesignMatrix {
 
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
-            Self::Dense(matrix) => matrix.clone(),
+            Self::Dense(matrix) => (**matrix).clone(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense")
                 .unwrap_or_else(|msg| panic!("{msg}"))
@@ -1704,19 +1708,19 @@ impl DesignMatrix {
 
 impl<'a> From<ArrayView2<'a, f64>> for DesignMatrix {
     fn from(value: ArrayView2<'a, f64>) -> Self {
-        Self::Dense(value.to_owned())
+        Self::Dense(Arc::new(value.to_owned()))
     }
 }
 
 impl From<Array2<f64>> for DesignMatrix {
     fn from(value: Array2<f64>) -> Self {
-        Self::Dense(value)
+        Self::Dense(Arc::new(value))
     }
 }
 
 impl From<&Array2<f64>> for DesignMatrix {
     fn from(value: &Array2<f64>) -> Self {
-        Self::Dense(value.clone())
+        Self::Dense(Arc::new(value.clone()))
     }
 }
 
@@ -1843,7 +1847,7 @@ mod tests {
         let sparse = SparseColMat::try_new_from_triplets(3, 3, &triplets)
             .expect("sparse design should build");
         let sparse_design = DesignMatrix::from(sparse);
-        let dense_design = DesignMatrix::Dense(sparse_design.to_dense());
+        let dense_design = DesignMatrix::Dense(Arc::new(sparse_design.to_dense()));
         let weights = array![1.5, 0.75, 2.0];
         let rhs = array![1.0, -0.5, 2.0];
         let penalty = Array2::from_diag(&array![0.25, 0.5, 0.75]);
@@ -1867,7 +1871,7 @@ mod tests {
 
     #[test]
     fn solve_system_stabilizes_indefinite_penalty_and_returns_finite_solution() {
-        let design = DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 0.0]]);
+        let design = DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 0.0]]));
         let weights = array![1.0, 1.0];
         let rhs = array![2.0, 0.0];
         let penalty = array![[0.0, 0.0], [0.0, -1e-12]];
@@ -1893,7 +1897,7 @@ mod tests {
                     + 0.001 * (j as f64);
             }
         }
-        let design = DesignMatrix::Dense(x.clone());
+        let design = DesignMatrix::Dense(Arc::new(x.clone()));
         let weights = Array1::from_iter((0..n).map(|i| 0.5 + (i as f64) / (2.0 * n as f64)));
         let rhs = Array1::from_iter((0..p).map(|j| ((j % 13) as f64 - 6.0) / 13.0));
         let penalty = Array2::from_diag(&Array1::from_iter(
@@ -1935,7 +1939,7 @@ mod tests {
                 x[[i, j]] = (((2 * i + j + 11) % 23) as f64 / 23.0) + 0.0005 * (j as f64);
             }
         }
-        let design = DesignMatrix::Dense(x);
+        let design = DesignMatrix::Dense(Arc::new(x));
         let weights = Array1::from_iter((0..n).map(|i| 1.0 + 0.01 * i as f64));
         let rhs = Array1::from_iter((0..p).map(|j| ((j % 5) as f64) - 2.0));
         let penalty = Array2::from_diag(&Array1::from_iter(
@@ -1977,7 +1981,7 @@ mod tests {
                     + 1e-4 * j as f64;
             }
         }
-        let design = DesignMatrix::Dense(x.clone());
+        let design = DesignMatrix::Dense(Arc::new(x.clone()));
         assert!(design.should_use_matrix_free_pcg());
         let weights = Array1::from_iter((0..n).map(|i| 0.75 + 0.01 * i as f64));
         let rhs = Array1::from_iter((0..p).map(|j| ((j % 9) as f64 - 4.0) / 9.0));

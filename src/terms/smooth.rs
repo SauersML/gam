@@ -4459,7 +4459,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     }));
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(baseline.design.design.clone()),
+        design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
         offset: offset.to_owned(),
         penalties: retained_penalties.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
@@ -4712,7 +4712,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .with_adaptive_params(adaptive_params.clone(), SyncArc::new(fixed_total.clone()));
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(baseline.design.design.clone()),
+        design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
         offset: offset.to_owned(),
         penalties: vec![],
         initial_log_lambdas: Array1::zeros(0),
@@ -6686,7 +6686,7 @@ impl CustomFamily for BoundedLinearFamily {
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
         if block_states.is_empty() {
             return Ok((
-                DesignMatrix::Dense(self.designzeroed.clone()),
+                DesignMatrix::Dense(Arc::new(self.designzeroed.clone())),
                 self.offset.clone(),
             ));
         }
@@ -6698,7 +6698,7 @@ impl CustomFamily for BoundedLinearFamily {
         } else {
             return Err("bounded linear family design column mismatch".to_string());
         };
-        Ok((DesignMatrix::Dense(x), offset))
+        Ok((DesignMatrix::Dense(Arc::new(x)), offset))
     }
 
     fn block_geometry_is_dynamic(&self) -> bool {
@@ -6951,7 +6951,7 @@ fn fit_bounded_term_collection_forspec(
     };
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(designzeroed),
+        design: DesignMatrix::Dense(Arc::new(designzeroed)),
         offset: offset.to_owned(),
         penalties: fit_penalties.clone(),
         initial_log_lambdas,
@@ -11667,7 +11667,7 @@ mod tests {
         };
         let spec = ParameterBlockSpec {
             name: "toy".to_string(),
-            design: DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -12112,7 +12112,7 @@ mod tests {
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
-            design: DesignMatrix::Dense(baseline.design.design.clone()),
+            design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
             offset: Array1::zeros(n),
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -12303,7 +12303,7 @@ mod tests {
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
-            design: DesignMatrix::Dense(baseline.design.design.clone()),
+            design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
             offset: Array1::zeros(n),
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),

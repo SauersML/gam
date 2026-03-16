@@ -14,8 +14,8 @@ use crate::smooth::{
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    InnerSolutionBuilder, compute_block_penalty_logdet_derivs, embed_penalty_root,
-    penalty_matrix_root, reml_laml_evaluate,
+    InnerSolutionBuilder, MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs,
+    embed_penalty_root, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -3497,19 +3497,12 @@ fn inner_blockwise_fit<F: CustomFamily>(
         };
         let total_p: usize = ranges.last().map_or(0, |r| r.1);
 
-        // Assemble joint block-diagonal penalty.
-        let mut s_joint = Array2::<f64>::zeros((total_p, total_p));
-        for (b, s_lambda) in s_lambdas.iter().enumerate() {
-            let (start, end) = ranges[b];
-            s_joint
-                .slice_mut(ndarray::s![start..end, start..end])
-                .assign(s_lambda);
-        }
-        if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
-            for d in 0..total_p {
-                s_joint[[d, d]] += ridge;
-            }
-        }
+        let joint_mode_diagonal_ridge = if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty
+        {
+            ridge
+        } else {
+            0.0
+        };
 
         for cycle in 0..inner_max_cycles {
             // Get joint Hessian and block gradients from the current evaluation.
@@ -3517,13 +3510,6 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let Some(h_joint) = h_joint_opt else {
                 break; // Fall back to blockwise if joint Hessian unavailable
             };
-
-            // Assemble joint penalized system: (H + S) delta = -(S*beta - grad)
-            let mut lhs = h_joint + &s_joint;
-            // Add small ridge for numerical stability
-            for d in 0..total_p {
-                lhs[[d, d]] += 1e-10;
-            }
 
             // Concatenate block gradients and betas.
             let mut grad_joint = Array1::<f64>::zeros(total_p);
@@ -3543,14 +3529,65 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
 
             // Stationarity residual: r = S*beta - gradient (for penalized NLL)
-            let rhs = &grad_joint - &s_joint.dot(&beta_joint);
+            let penalty_beta =
+                apply_joint_block_penalty(&ranges, &s_lambdas, &beta_joint, joint_mode_diagonal_ridge);
+            let rhs = &grad_joint - &penalty_beta;
 
-            // Solve the joint system with ridge retries for robustness
-            let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-            let Some(delta_raw) = solver.solvevectorwithridge_retries(&lhs, &rhs, 1e-10) else {
+            let Some(mut delta) = (if use_joint_matrix_free_path(total_p, false) {
+                let apply_ranges = ranges.clone();
+                let apply_penalties = s_lambdas.clone();
+                let apply_h = h_joint.clone();
+                let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+                let preconditioner_diag = joint_penalty_preconditioner_diag(
+                    &apply_h,
+                    &apply_ranges,
+                    &apply_penalties,
+                    trace_diagonal_ridge,
+                );
+                crate::linalg::utils::solve_spd_pcg(
+                    move |v| {
+                        let mut out = apply_h.dot(v);
+                        let penalty = apply_joint_block_penalty(
+                            &apply_ranges,
+                            &apply_penalties,
+                            v,
+                            trace_diagonal_ridge,
+                        );
+                        out += &penalty;
+                        out
+                    },
+                    &rhs,
+                    &preconditioner_diag,
+                    JOINT_PCG_REL_TOL,
+                    JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                )
+                .or_else(|| {
+                    let mut lhs = h_joint.clone();
+                    add_joint_penalty_to_matrix(
+                        &mut lhs,
+                        &ranges,
+                        &s_lambdas,
+                        trace_diagonal_ridge,
+                    );
+                    let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
+                    solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE)
+                })
+            } else {
+                let mut lhs = h_joint.clone();
+                add_joint_penalty_to_matrix(
+                    &mut lhs,
+                    &ranges,
+                    &s_lambdas,
+                    joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE,
+                );
+                let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
+                solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE)
+            }) else {
                 break; // Fall back to blockwise
             };
-            let mut delta = delta_raw;
+            if !delta.iter().all(|v| v.is_finite()) {
+                break; // Fall back to blockwise
+            }
 
             // Trust region: cap step size
             let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
@@ -3959,7 +3996,7 @@ struct ExtCoordBundle {
 ///
 /// This is the bridge between the custom family's joint Hessian infrastructure
 /// and the unified REML/LAML evaluator. It:
-/// 1. Wraps `j_for_traces` in a [`BlockCoupledOperator`] (joint multi-block Hessian)
+/// 1. Receives a unified [`HessianOperator`] backend (dense or matrix-free)
 /// 2. Builds penalty roots in the joint parameter space
 /// 3. Computes penalty logdet derivatives
 /// 4. Assembles an `InnerSolution` and calls `reml_laml_evaluate`
@@ -3973,7 +4010,7 @@ fn unified_joint_cost_gradient(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    j_for_traces: &Array2<f64>,
+    hessian_op: Box<dyn crate::solver::estimate::reml::unified::HessianOperator>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -3984,14 +4021,10 @@ fn unified_joint_cost_gradient(
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    // Build BlockCoupledOperator from the joint Hessian with block structure.
-    let hop = BlockCoupledOperator::from_joint_hessian(j_for_traces, ranges.to_vec())
-        .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?;
-
-    // Build penalty roots in joint basis, using the operator's block ranges.
+    // Build penalty roots in joint basis from the joint block ranges.
     let mut penalty_roots_joint = Vec::new();
     for (b, spec) in specs.iter().enumerate() {
-        let (start, end) = hop.block_ranges()[b];
+        let (start, end) = ranges[b];
         for s_k in spec.penalties.iter() {
             let root = penalty_matrix_root(s_k)?;
             let embedded = embed_penalty_root(&root, start, end, total);
@@ -4031,7 +4064,7 @@ fn unified_joint_cost_gradient(
         inner.penalty_value,
         beta_flat.clone(),
         n_observations,
-        Box::new(hop),
+        hessian_op,
         penalty_roots_joint,
         penalty_logdet,
         DispersionHandling::Fixed {
@@ -4101,59 +4134,12 @@ fn joint_outer_evaluate(
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<OuterObjectiveEvalResult, String> {
-    // Assemble joint penalty matrix S(ρ) and its smooth δ-regularized inverse (S + δI)⁻¹.
-    //
-    // Instead of the hard-truncated pseudoinverse S⁺ (which creates non-smooth
-    // derivatives and requires explicit leakage correction), we use the
-    // smooth δ-regularized inverse. This is C∞ in all outer parameters and
-    // automatically captures the moving-nullspace correction.
-    //
-    // Reference: response.md Section 7.
-    let mut s_joint = Array2::<f64>::zeros((total, total));
-    let mut s_pinv_joint = if include_logdet_s {
-        Some(Array2::<f64>::zeros((total, total)))
-    } else {
-        None
-    };
-    for b in 0..specs.len() {
-        let (start, end) = ranges[b];
-        // Reuse pre-assembled S(ρ) from inner_blockwise_fit instead of
-        // re-computing lambdas and accumulating penalties from scratch.
-        let s_lambda = &inner.s_lambdas[b];
-        s_joint
-            .slice_mut(ndarray::s![start..end, start..end])
-            .assign(s_lambda);
-        if moderidge > 0.0 {
-            for d in start..end {
-                s_joint[[d, d]] += moderidge;
-            }
-        }
-        if let Some(s_pinv) = s_pinv_joint.as_mut() {
-            let mut s_for_logdet = s_lambda.clone();
-            if options.ridge_policy.include_penalty_logdet {
-                for d in 0..(end - start) {
-                    s_for_logdet[[d, d]] += ridge;
-                }
-            }
-            // Use δ-regularized inverse (S + δI)⁻¹ instead of pseudoinverse.
-            let s_reg_inv = delta_regularized_inverse(&s_for_logdet)?;
-            s_pinv
-                .slice_mut(ndarray::s![start..end, start..end])
-                .assign(&s_reg_inv);
-        }
-    }
-
-    // J_mode = H_L + S(ρ)
-    let mut j_joint = h_joint_unpen;
-    j_joint += &s_joint;
-
-    // J_trace may include an extra logdet-only ridge.
-    let mut j_for_traces = j_joint.clone();
-    if !strict_spd && extra_logdet_ridge > 0.0 {
-        for d in 0..total {
-            j_for_traces[[d, d]] += extra_logdet_ridge;
-        }
-    }
+    let joint_trace_diagonal_ridge = moderidge
+        + if !strict_spd {
+            extra_logdet_ridge
+        } else {
+            0.0
+        };
 
     // Build derivative provider from the caller-supplied closures.
     let compute_d2h_ref: Option<
@@ -4171,13 +4157,68 @@ fn joint_outer_evaluate(
         EvalMode::ValueAndGradient
     };
 
+    let hessian_op: Box<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+        if use_joint_matrix_free_path(total, need_hessian) {
+            let h_joint = Arc::new(h_joint_unpen);
+            let ranges_vec = ranges.to_vec();
+            let s_lambdas = Arc::new(inner.s_lambdas.clone());
+            let trace_diagonal_ridge = joint_trace_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+            let preconditioner_diag = joint_penalty_preconditioner_diag(
+                h_joint.as_ref(),
+                &ranges_vec,
+                s_lambdas.as_ref(),
+                trace_diagonal_ridge,
+            );
+            let apply_h = Arc::clone(&h_joint);
+            let apply_ranges = ranges_vec.clone();
+            let apply_s = Arc::clone(&s_lambdas);
+            match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                let mut out = apply_h.dot(v);
+                let penalty = apply_joint_block_penalty(
+                    &apply_ranges,
+                    apply_s.as_ref(),
+                    v,
+                    trace_diagonal_ridge,
+                );
+                out += &penalty;
+                out
+            }) {
+                Ok(op) => Box::new(op),
+                Err(_) => {
+                    let mut j_for_traces = (*h_joint).clone();
+                    add_joint_penalty_to_matrix(
+                        &mut j_for_traces,
+                        &ranges_vec,
+                        s_lambdas.as_ref(),
+                        joint_trace_diagonal_ridge,
+                    );
+                    Box::new(
+                        BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges_vec)
+                            .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
+                    )
+                }
+            }
+        } else {
+            let mut j_for_traces = h_joint_unpen;
+            add_joint_penalty_to_matrix(
+                &mut j_for_traces,
+                ranges,
+                &inner.s_lambdas,
+                joint_trace_diagonal_ridge,
+            );
+            Box::new(
+                BlockCoupledOperator::from_joint_hessian(&j_for_traces, ranges.to_vec())
+                    .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
+            )
+        };
+
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
         inner,
         specs,
         per_block,
         rho,
         beta_flat,
-        &j_for_traces,
+        hessian_op,
         ranges,
         total,
         ridge,
@@ -4758,7 +4799,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
-    s_pinv: Option<&Array2<f64>>,
+    s_pinv_blocks: Option<&[Array2<f64>]>,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<Vec<HyperCoord>, String> {
@@ -4812,8 +4853,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             } else {
                 &psi_terms.hessian_psi + &s_psi
             };
-            let ld_s = if let Some(sp) = s_pinv {
-                trace_product(sp, &s_psi)
+            let ld_s = if let Some(blocks) = s_pinv_blocks {
+                trace_product(&blocks[block_idx], &s_psi_local)
             } else {
                 0.0
             };
@@ -4859,7 +4900,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
 /// * `beta_flat` - Flattened joint coefficient vector at the inner mode.
 /// * `rho` - Current log-smoothing parameters (flat).
 /// * `penalty_counts` - Number of penalties per block.
-/// * `s_pinv` - Optional pseudo-inverse of total penalty S (for ld_s).
+/// * `s_pinv_blocks` - Optional block-local `(S_b + δI)⁻¹` slices (for ld_s).
 pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
@@ -4868,7 +4909,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
-    s_pinv: Option<&Array2<f64>>,
+    s_pinv_blocks: Option<&[Array2<f64>]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<
     (
@@ -4891,12 +4932,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     let ranges_arc = Arc::new(ranges);
     let family_arc = Arc::new(family.clone());
 
-    let s_pinv_block_cache = Arc::new(s_pinv.map(|sp| {
-        ranges_arc
-            .iter()
-            .map(|&(start, end)| sp.slice(s![start..end, start..end]).to_owned())
-            .collect::<Vec<_>>()
-    }));
+    let s_pinv_block_cache = Arc::new(s_pinv_blocks.map(|blocks| blocks.to_vec()));
 
     struct PsiPenaltyCacheEntry {
         block_idx: usize,
@@ -5296,27 +5332,23 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         // and eliminating the need for leakage/moving-nullspace corrections.
         //
         // Reference: response.md Section 7.
-        let s_pinv_joint = if include_logdet_s {
-            let mut sp = Array2::<f64>::zeros((total, total));
+        let s_pinv_blocks = if include_logdet_s {
+            let mut blocks = Vec::with_capacity(specs.len());
             for (b, spec) in specs.iter().enumerate() {
-                let (start, end) = ranges[b];
-                let p = end - start;
+                let p = spec.design.ncols();
                 let lambdas = per_block[b].mapv(f64::exp);
                 let mut s_lambda = Array2::<f64>::zeros((p, p));
                 for (k, s) in spec.penalties.iter().enumerate() {
                     s_lambda.scaled_add(lambdas[k], s);
                 }
-                let mut s_for_logdet = s_lambda;
                 if options.ridge_policy.include_penalty_logdet {
                     for d in 0..p {
-                        s_for_logdet[[d, d]] += ridge;
+                        s_lambda[[d, d]] += ridge;
                     }
                 }
-                let s_part = delta_regularized_inverse(&s_for_logdet)?;
-                sp.slice_mut(ndarray::s![start..end, start..end])
-                    .assign(&s_part);
+                blocks.push(delta_regularized_inverse(&s_lambda)?);
             }
-            Some(sp)
+            Some(blocks)
         } else {
             None
         };
@@ -5342,7 +5374,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             &beta_flat,
             rho_current.as_slice().unwrap(),
             &penalty_counts,
-            s_pinv_joint.as_ref(),
+            s_pinv_blocks.as_deref(),
             hessian_beta_independent,
             psi_workspace.clone(),
         )?;
@@ -5356,7 +5388,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
                 &beta_flat,
                 rho_current.as_slice().unwrap(),
                 &penalty_counts,
-                s_pinv_joint.as_ref(),
+                s_pinv_blocks.as_deref(),
                 psi_workspace.clone(),
             )?;
             let drift_fn = build_psi_drift_deriv_callback(
@@ -5647,6 +5679,74 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
         at += p;
     }
     out
+}
+
+const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
+const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
+const JOINT_PCG_REL_TOL: f64 = 1e-8;
+const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
+
+pub(crate) fn joint_exact_analytic_outer_hessian_available(total_p: usize) -> bool {
+    total_p < JOINT_MATRIX_FREE_MIN_DIM
+}
+
+fn use_joint_matrix_free_path(total_p: usize, need_hessian: bool) -> bool {
+    total_p >= JOINT_MATRIX_FREE_MIN_DIM && !need_hessian
+}
+
+fn apply_joint_block_penalty(
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    vector: &Array1<f64>,
+    diagonal_ridge: f64,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(vector.len());
+    for (b, s_lambda) in s_lambdas.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let block = vector.slice(s![start..end]).to_owned();
+        out.slice_mut(s![start..end]).assign(&s_lambda.dot(&block));
+    }
+    if diagonal_ridge > 0.0 {
+        out.scaled_add(diagonal_ridge, vector);
+    }
+    out
+}
+
+fn joint_penalty_preconditioner_diag(
+    h_joint_unpen: &Array2<f64>,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    diagonal_ridge: f64,
+) -> Array1<f64> {
+    let mut diag = h_joint_unpen.diag().to_owned();
+    for (b, s_lambda) in s_lambdas.iter().enumerate() {
+        let (start, end) = ranges[b];
+        for (local_idx, global_idx) in (start..end).enumerate() {
+            diag[global_idx] += s_lambda[[local_idx, local_idx]];
+        }
+    }
+    if diagonal_ridge > 0.0 {
+        diag += diagonal_ridge;
+    }
+    diag.mapv(|v| v.abs().max(1e-10))
+}
+
+fn add_joint_penalty_to_matrix(
+    matrix: &mut Array2<f64>,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    diagonal_ridge: f64,
+) {
+    for (b, s_lambda) in s_lambdas.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let mut block = matrix.slice_mut(s![start..end, start..end]);
+        block += s_lambda;
+    }
+    if diagonal_ridge > 0.0 {
+        for d in 0..matrix.nrows() {
+            matrix[[d, d]] += diagonal_ridge;
+        }
+    }
 }
 
 fn flatten_state_betas(
@@ -6053,9 +6153,14 @@ pub fn fit_custom_family<F: CustomFamily>(
 
     let has_exact_hess = include_exact_newton_logdet_h(family, options);
     let n_rho = rho0.len();
+    let total_joint_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
 
     let hessian_deriv = if has_exact_hess {
-        Derivative::Analytic
+        if joint_exact_analytic_outer_hessian_available(total_joint_p) {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        }
     } else {
         Derivative::Unavailable
     };
@@ -6758,7 +6863,7 @@ mod tests {
         // 0.5 * ridge * beta^2 even when no smoothing penalties are present.
         let spec = ParameterBlockSpec {
             name: "b0".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -6794,7 +6899,7 @@ mod tests {
         let family = OneBlockGaussianFamily { y: array![1.0] };
         let spec = ParameterBlockSpec {
             name: "b0".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![array![[1.0]]],
             initial_log_lambdas: array![10.0_f64.ln()],
@@ -6834,7 +6939,7 @@ mod tests {
         let y = Array1::from_vec(vec![0.4, -0.2, 0.8, 1.0, -0.5, 0.3, 0.1, -0.7]);
         let spec = ParameterBlockSpec {
             name: "b0".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.2],
@@ -6902,7 +7007,7 @@ mod tests {
     fn outergradient_prefers_joint_exact_pathwhen_available() {
         let spec = ParameterBlockSpec {
             name: "joint_exact".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -6935,7 +7040,7 @@ mod tests {
     fn outergradient_uses_joint_surrogate_formultiblock_diagonal_family() {
         let spec0 = ParameterBlockSpec {
             name: "block0".to_string(),
-            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -6943,7 +7048,7 @@ mod tests {
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
-            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -6977,7 +7082,7 @@ mod tests {
     fn exact_newton_pseudo_laplace_objective_uses_logdet_h_without_logdet_s() {
         let spec = ParameterBlockSpec {
             name: "pseudo_laplace".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -7008,7 +7113,7 @@ mod tests {
     fn exact_newton_joint_psi_hook_can_supply_fixed_beta_termswithout_quadratic_spsi() {
         let spec = ParameterBlockSpec {
             name: "psi_hook".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -7052,7 +7157,7 @@ mod tests {
     fn pseudo_laplace_exact_newton_rejects_non_spdhessian() {
         let spec = ParameterBlockSpec {
             name: "indefinite".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -7099,7 +7204,7 @@ mod tests {
     fn pseudo_laplace_exact_newton_symmetrizes_nearly_symmetrichessian() {
         let spec = ParameterBlockSpec {
             name: "nearly_symmetric".to_string(),
-            design: DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -7127,8 +7232,8 @@ mod tests {
         let n = 7usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
-        let log_sigma_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0)));
+        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0)));
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: threshold_design.clone(),
@@ -7243,7 +7348,7 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7251,7 +7356,7 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7336,7 +7441,7 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7344,7 +7449,7 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7429,7 +7534,7 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7437,7 +7542,7 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7567,7 +7672,7 @@ mod tests {
             .expect("sparse matrix build should succeed");
 
         let beta_dense = solve_blockweighted_system(
-            &DesignMatrix::Dense(x_dense.clone()),
+            &DesignMatrix::Dense(Arc::new(x_dense.clone())),
             &y_star,
             &w,
             &s_lambda,
@@ -7604,7 +7709,7 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7612,7 +7717,7 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7713,7 +7818,7 @@ mod tests {
         let s_lambda = array![[0.0, 0.0], [0.0, -1e-12]];
 
         let beta = solve_blockweighted_system(
-            &DesignMatrix::Dense(x_dense),
+            &DesignMatrix::Dense(Arc::new(x_dense)),
             &y_star,
             &w,
             &s_lambda,
@@ -7737,7 +7842,7 @@ mod tests {
     fn exact_newton_block_enforces_linear_constraints() {
         let spec = ParameterBlockSpec {
             name: "exact_block".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -7838,7 +7943,7 @@ mod tests {
         // the real evaluation error instead of returning an opaque line-search failure.
         let spec = ParameterBlockSpec {
             name: "err_block".to_string(),
-            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -7864,7 +7969,7 @@ mod tests {
     fn fit_fails_when_requested_covariance_cannot_be_computed() {
         let spec = ParameterBlockSpec {
             name: "cov_block".to_string(),
-            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -7989,7 +8094,7 @@ mod tests {
         vec![
             ParameterBlockSpec {
                 name: "mu".to_string(),
-                design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: Array1::zeros(0),
@@ -7997,7 +8102,7 @@ mod tests {
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(Array2::from_elem((n, 2), 1.0)),
+                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: Array1::zeros(0),
@@ -8200,7 +8305,7 @@ mod tests {
             ParameterBlockSpec {
                 name: "big_block".to_string(),
                 // 3n rows — mimics survival time block stacking
-                design: DesignMatrix::Dense(Array2::from_elem((3 * n, p0), 1.0)),
+                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((3 * n, p0), 1.0))),
                 offset: Array1::zeros(3 * n),
                 penalties: vec![],
                 initial_log_lambdas: Array1::zeros(0),
@@ -8209,7 +8314,7 @@ mod tests {
             ParameterBlockSpec {
                 name: "small_block".to_string(),
                 // n rows — mimics threshold/log-sigma block
-                design: DesignMatrix::Dense(Array2::from_elem((n, p1), 1.0)),
+                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, p1), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: Array1::zeros(0),
@@ -8253,7 +8358,7 @@ mod tests {
         let specs = vec![
             ParameterBlockSpec {
                 name: "block_a".to_string(),
-                design: DesignMatrix::Dense(Array2::from_elem((n, 2), 1.0)),
+                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: Array1::zeros(0),
@@ -8261,7 +8366,7 @@ mod tests {
             },
             ParameterBlockSpec {
                 name: "block_b".to_string(),
-                design: DesignMatrix::Dense(Array2::from_elem((n, 2), 1.0)),
+                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 initial_log_lambdas: Array1::zeros(0),

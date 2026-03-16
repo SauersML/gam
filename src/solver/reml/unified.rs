@@ -33,9 +33,13 @@
 //! with a different numerical threshold.
 
 use ndarray::{Array1, Array2, Zip};
+use std::sync::{Arc, OnceLock};
 
 use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
+use crate::linalg::utils::{
+    default_slq_parameters, solve_spd_pcg_with_info, stochastic_lanczos_logdet_spd_operator,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core traits
@@ -188,6 +192,16 @@ pub trait HessianOperator: Send + Sync {
     /// traces are already cheap and stochastic estimation is not needed.
     fn is_dense(&self) -> bool {
         false
+    }
+
+    /// Whether the unified evaluator should batch large trace computations
+    /// through the stochastic Hutchinson path for this operator.
+    ///
+    /// Dense eigendecomposition backends prefer this once `p` is large because
+    /// exact per-coordinate traces are O(p²). Matrix-free iterative backends
+    /// have the same preference even though they do not store a dense factor.
+    fn prefers_stochastic_trace_estimation(&self) -> bool {
+        self.is_dense()
     }
 }
 
@@ -1789,7 +1803,8 @@ pub fn reml_laml_evaluate(
     // up to O(eps) -- negligible compared to the Monte Carlo tolerance (0.05)
     // since eps = sqrt(machine_eps) * spectral_scale ~ 1.5e-8 * scale.
     let total_p = hop.dim();
-    let use_stochastic_traces = total_p > 500 && hop.is_dense() && incl_logdet_h;
+    let use_stochastic_traces =
+        total_p > 500 && hop.prefers_stochastic_trace_estimation() && incl_logdet_h;
 
     // When using stochastic traces, pre-collect all H_k matrices (both rho and
     // ext coordinates) and batch them through a single StochasticTraceEstimator.
@@ -2428,7 +2443,7 @@ fn compute_outer_hessian(
     // is a dense p x p matrix, so we fall back to dense materialization.
     let use_stochastic_cross_traces = any_ext_implicit
         && total_p > 500
-        && hop.is_dense()
+        && hop.prefers_stochastic_trace_estimation()
         && incl_logdet_h
         && !effective_deriv.has_corrections();
 
@@ -4455,6 +4470,176 @@ impl HessianOperator for BlockCoupledOperator {
     }
 
     fn is_dense(&self) -> bool {
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Matrix-free SPD HessianOperator implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Matrix-free SPD Hessian operator.
+///
+/// This backend keeps the penalized Hessian behind a matvec closure and uses:
+/// - PCG for linear solves
+/// - SLQ for logdet
+/// - Hutchinson/Lanczos estimators for trace products
+///
+/// A dense spectral fallback is materialized only if the iterative solve fails.
+pub struct MatrixFreeSpdOperator {
+    apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    preconditioner_diag: Array1<f64>,
+    cached_logdet: f64,
+    n_dim: usize,
+    solve_rel_tol: f64,
+    max_iter: usize,
+    dense_fallback: OnceLock<Option<DenseSpectralOperator>>,
+}
+
+impl MatrixFreeSpdOperator {
+    const DEFAULT_SOLVE_REL_TOL: f64 = 1e-8;
+    const DEFAULT_MAX_ITER_MULTIPLIER: usize = 4;
+    const DEFAULT_LOGDET_SEED: u64 = 0x5A17_1C5D;
+
+    pub fn new<F>(dim: usize, preconditioner_diag: Array1<f64>, apply: F) -> Result<Self, String>
+    where
+        F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync + 'static,
+    {
+        if preconditioner_diag.len() != dim {
+            return Err(format!(
+                "MatrixFreeSpdOperator preconditioner length mismatch: got {}, expected {}",
+                preconditioner_diag.len(),
+                dim
+            ));
+        }
+
+        let apply = Arc::new(apply);
+        let (probes, steps) = default_slq_parameters(dim);
+        let cached_logdet = stochastic_lanczos_logdet_spd_operator(
+            dim,
+            |v| apply(v),
+            probes,
+            steps,
+            Self::DEFAULT_LOGDET_SEED,
+        )?;
+
+        Ok(Self {
+            apply,
+            preconditioner_diag,
+            cached_logdet,
+            n_dim: dim,
+            solve_rel_tol: Self::DEFAULT_SOLVE_REL_TOL,
+            max_iter: Self::DEFAULT_MAX_ITER_MULTIPLIER * dim.max(1),
+            dense_fallback: OnceLock::new(),
+        })
+    }
+
+    fn solve_pcg(&self, rhs: &Array1<f64>) -> Option<Array1<f64>> {
+        solve_spd_pcg_with_info(
+            |v| (self.apply)(v),
+            rhs,
+            &self.preconditioner_diag,
+            self.solve_rel_tol,
+            self.max_iter,
+        )
+        .and_then(|(solution, info)| {
+            (info.converged
+                && info.relative_residual_norm.is_finite()
+                && solution.iter().all(|v| v.is_finite()))
+            .then_some(solution)
+        })
+    }
+
+    fn materialize_dense_operator(&self) -> Option<DenseSpectralOperator> {
+        let mut matrix = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+        let mut basis = Array1::<f64>::zeros(self.n_dim);
+        for j in 0..self.n_dim {
+            basis[j] = 1.0;
+            let col = (self.apply)(&basis);
+            basis[j] = 0.0;
+            if col.len() != self.n_dim || !col.iter().all(|v| v.is_finite()) {
+                return None;
+            }
+            matrix.column_mut(j).assign(&col);
+        }
+        for i in 0..self.n_dim {
+            for j in (i + 1)..self.n_dim {
+                let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+                matrix[[i, j]] = avg;
+                matrix[[j, i]] = avg;
+            }
+        }
+        DenseSpectralOperator::from_symmetric(&matrix).ok()
+    }
+
+    fn dense_fallback(&self) -> Option<&DenseSpectralOperator> {
+        self.dense_fallback
+            .get_or_init(|| self.materialize_dense_operator())
+            .as_ref()
+    }
+}
+
+impl HessianOperator for MatrixFreeSpdOperator {
+    fn logdet(&self) -> f64 {
+        self.cached_logdet
+    }
+
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        let estimator = StochasticTraceEstimator::with_defaults();
+        estimator.estimate_single_trace(self, a)
+    }
+
+    fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        let estimator = StochasticTraceEstimator::with_defaults();
+        let no_dense: [&Array2<f64>; 0] = [];
+        estimator.estimate_traces_with_operators(self, &no_dense, &[op])[0]
+    }
+
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.trace_hinv_operator(op)
+    }
+
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        if let Some(solution) = self.solve_pcg(rhs) {
+            return solution;
+        }
+        if let Some(fallback) = self.dense_fallback() {
+            return fallback.solve(rhs);
+        }
+        log::warn!("MatrixFreeSpdOperator::solve failed; returning zeros");
+        Array1::zeros(self.n_dim)
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.n_dim, rhs.ncols()));
+        for col in 0..rhs.ncols() {
+            let solved = self.solve(&rhs.column(col).to_owned());
+            out.column_mut(col).assign(&solved);
+        }
+        out
+    }
+
+    fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
+        let estimator = StochasticTraceEstimator::with_defaults();
+        let no_ops: [&dyn HyperOperator; 0] = [];
+        let mats = [h_i, h_j];
+        let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
+        -cross[[0, 1]]
+    }
+
+    fn active_rank(&self) -> usize {
+        self.n_dim
+    }
+
+    fn dim(&self) -> usize {
+        self.n_dim
+    }
+
+    fn is_dense(&self) -> bool {
+        true
+    }
+
+    fn prefers_stochastic_trace_estimation(&self) -> bool {
         true
     }
 }
