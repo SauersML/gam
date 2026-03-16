@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::f64;
 use std::ops::Range;
-use std::sync::Arc as SyncArc;
+use std::sync::Arc;
 
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
@@ -4438,13 +4438,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         })
         .transpose()
         .map_err(EstimationError::InvalidInput)?;
-    let shared_y = SyncArc::new(y.to_owned());
-    let sharedweights = SyncArc::new(weights.to_owned());
-    let shared_design = SyncArc::new(baseline.design.design.clone());
-    let shared_offset = SyncArc::new(offset.to_owned());
-    let shared_runtime_caches = SyncArc::new(runtime_caches.to_vec());
-    let shared_hyperspecs = SyncArc::new(hyperspecs.clone());
-    let zero_quadratic = SyncArc::new(Array2::<f64>::zeros((
+    let shared_y = Arc::new(y.to_owned());
+    let sharedweights = Arc::new(weights.to_owned());
+    let shared_design = Arc::new(baseline.design.design.clone());
+    let shared_offset = Arc::new(offset.to_owned());
+    let shared_runtime_caches = Arc::new(runtime_caches.to_vec());
+    let shared_hyperspecs = Arc::new(hyperspecs.clone());
+    let zero_quadratic = Arc::new(Array2::<f64>::zeros((
         baseline.design.design.ncols(),
         baseline.design.design.ncols(),
     )));
@@ -4737,7 +4737,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         fixed_total.scaled_add(rho_star[idx].exp(), penalty);
     }
     let final_family = base_family
-        .with_adaptive_params(adaptive_params.clone(), SyncArc::new(fixed_total.clone()));
+        .with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
@@ -5380,22 +5380,22 @@ struct SpatialAdaptiveExactFamily {
     family: LikelihoodFamily,
     mixture_link_state: Option<MixtureLinkState>,
     sas_link_state: Option<SasLinkState>,
-    y: SyncArc<Array1<f64>>,
-    weights: SyncArc<Array1<f64>>,
-    design: SyncArc<Array2<f64>>,
-    offset: SyncArc<Array1<f64>>,
+    y: Arc<Array1<f64>>,
+    weights: Arc<Array1<f64>>,
+    design: Arc<Array2<f64>>,
+    offset: Arc<Array1<f64>>,
     linear_constraints: Option<LinearInequalityConstraints>,
-    runtime_caches: SyncArc<Vec<SpatialOperatorRuntimeCache>>,
+    runtime_caches: Arc<Vec<SpatialOperatorRuntimeCache>>,
     adaptive_params: Vec<SpatialAdaptiveTermHyperParams>,
-    fixed_quadratichessian: SyncArc<Array2<f64>>,
-    hyperspecs: SyncArc<Vec<SpatialAdaptiveHyperSpec>>,
+    fixed_quadratichessian: Arc<Array2<f64>>,
+    hyperspecs: Arc<Vec<SpatialAdaptiveHyperSpec>>,
 }
 
 impl SpatialAdaptiveExactFamily {
     fn with_adaptive_params(
         &self,
         adaptive_params: Vec<SpatialAdaptiveTermHyperParams>,
-        fixed_quadratichessian: SyncArc<Array2<f64>>,
+        fixed_quadratichessian: Arc<Array2<f64>>,
     ) -> Self {
         Self {
             family: self.family,
@@ -6871,29 +6871,6 @@ fn exact_bounded_edf(
         as f64;
     let edf_total = (p as f64 - trace_sum).clamp(nullity_total, p as f64);
     Ok((edf_by_block, edf_total))
-}
-
-fn fit_bounded_term_collection_forspec(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    spec: &TermCollectionSpec,
-    heuristic_lambdas: Option<&[f64]>,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-) -> Result<FittedTermCollection, EstimationError> {
-    let design = build_term_collection_design(data, spec)?;
-    fit_bounded_term_collection_with_design(
-        y,
-        weights,
-        offset,
-        spec,
-        &design,
-        heuristic_lambdas,
-        family,
-        options,
-    )
 }
 
 fn fit_bounded_term_collection_with_design(
@@ -8647,7 +8624,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         offset: ArrayView1<'d, f64>,
         family: LikelihoodFamily,
         options: &'d FitOptions,
-        dims_per_term: &'d [usize],
         rho_dim: usize,
         best_cost: f64,
         cache: SingleBlockExactJointDesignCache<'d>,
@@ -8738,7 +8714,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         offset,
         family,
         options,
-        dims_per_term,
         rho_dim,
         best_cost: f64::INFINITY,
         cache: SingleBlockExactJointDesignCache::new(
@@ -12981,12 +12956,12 @@ mod tests {
             family: LikelihoodFamily::GaussianIdentity,
             mixture_link_state: None,
             sas_link_state: None,
-            y: SyncArc::new(array![0.0, 0.0]),
-            weights: SyncArc::new(array![1.0, 1.0]),
-            design: SyncArc::new(array![[1.0, 0.0], [0.0, 1.0]]),
-            offset: SyncArc::new(array![0.0, 0.0]),
+            y: Arc::new(array![0.0, 0.0]),
+            weights: Arc::new(array![1.0, 1.0]),
+            design: Arc::new(array![[1.0, 0.0], [0.0, 1.0]]),
+            offset: Arc::new(array![0.0, 0.0]),
             linear_constraints: None,
-            runtime_caches: SyncArc::new(vec![SpatialOperatorRuntimeCache {
+            runtime_caches: Arc::new(vec![SpatialOperatorRuntimeCache {
                 termname: "toy".to_string(),
                 feature_cols: vec![0],
                 coeff_global_range: 0..2,
@@ -13003,8 +12978,8 @@ mod tests {
                 lambda: [1.0, 1.0, 1.0],
                 epsilon: [1.0, 1.0, 1.0],
             }],
-            fixed_quadratichessian: SyncArc::new(array![[0.0, 0.1], [3.0, 0.0]]),
-            hyperspecs: SyncArc::new(build_spatial_adaptive_hyperspecs(1)),
+            fixed_quadratichessian: Arc::new(array![[0.0, 0.1], [3.0, 0.0]]),
+            hyperspecs: Arc::new(build_spatial_adaptive_hyperspecs(1)),
         };
         let spec = ParameterBlockSpec {
             name: "toy".to_string(),
@@ -13438,18 +13413,18 @@ mod tests {
             family: LikelihoodFamily::GaussianIdentity,
             mixture_link_state: None,
             sas_link_state: None,
-            y: SyncArc::new(y.clone()),
-            weights: SyncArc::new(Array1::ones(n)),
-            design: SyncArc::new(baseline.design.design.clone()),
-            offset: SyncArc::new(Array1::zeros(n)),
+            y: Arc::new(y.clone()),
+            weights: Arc::new(Array1::ones(n)),
+            design: Arc::new(baseline.design.design.clone()),
+            offset: Arc::new(Array1::zeros(n)),
             linear_constraints: baseline.design.linear_constraints.clone(),
-            runtime_caches: SyncArc::new(runtime_caches.clone()),
+            runtime_caches: Arc::new(runtime_caches.clone()),
             adaptive_params: Vec::new(),
-            fixed_quadratichessian: SyncArc::new(Array2::<f64>::zeros((
+            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
                 baseline.design.design.ncols(),
                 baseline.design.design.ncols(),
             ))),
-            hyperspecs: SyncArc::new(hyperspecs),
+            hyperspecs: Arc::new(hyperspecs),
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
@@ -13474,7 +13449,7 @@ mod tests {
                     lambda: [theta[0].exp(), theta[1].exp(), theta[2].exp()],
                     epsilon: [theta[3].exp(), theta[4].exp(), theta[5].exp()],
                 }],
-                SyncArc::new(Array2::<f64>::zeros((
+                Arc::new(Array2::<f64>::zeros((
                     baseline.design.design.ncols(),
                     baseline.design.design.ncols(),
                 ))),
@@ -13629,18 +13604,18 @@ mod tests {
             family: LikelihoodFamily::GaussianIdentity,
             mixture_link_state: None,
             sas_link_state: None,
-            y: SyncArc::new(y.clone()),
-            weights: SyncArc::new(Array1::ones(n)),
-            design: SyncArc::new(baseline.design.design.clone()),
-            offset: SyncArc::new(Array1::zeros(n)),
+            y: Arc::new(y.clone()),
+            weights: Arc::new(Array1::ones(n)),
+            design: Arc::new(baseline.design.design.clone()),
+            offset: Arc::new(Array1::zeros(n)),
             linear_constraints: baseline.design.linear_constraints.clone(),
-            runtime_caches: SyncArc::new(runtime_caches.clone()),
+            runtime_caches: Arc::new(runtime_caches.clone()),
             adaptive_params: Vec::new(),
-            fixed_quadratichessian: SyncArc::new(Array2::<f64>::zeros((
+            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
                 baseline.design.design.ncols(),
                 baseline.design.design.ncols(),
             ))),
-            hyperspecs: SyncArc::new(hyperspecs),
+            hyperspecs: Arc::new(hyperspecs),
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
@@ -13665,7 +13640,7 @@ mod tests {
                     lambda: [1e-12, log_lambda_g.exp(), 1e-12],
                     epsilon: [eps_0, eps_g, eps_c],
                 }],
-                SyncArc::new(Array2::<f64>::zeros((
+                Arc::new(Array2::<f64>::zeros((
                     baseline.design.design.ncols(),
                     baseline.design.design.ncols(),
                 ))),

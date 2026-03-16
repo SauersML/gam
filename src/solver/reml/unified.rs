@@ -1297,8 +1297,8 @@ impl PenaltyCoordinate {
     }
 
     pub fn from_block_root(root: Array2<f64>, start: usize, end: usize, total_dim: usize) -> Self {
-        debug_assert_eq!(root.ncols(), end.saturating_sub(start));
-        debug_assert!(end <= total_dim);
+        assert_eq!(root.ncols(), end.saturating_sub(start));
+        assert!(end <= total_dim);
         Self::BlockRoot {
             root,
             start,
@@ -4607,9 +4607,6 @@ impl HessianOperator for SparseCholeskyOperator {
 ///
 /// A joint model with B parameter blocks has a joint Hessian of dimension
 /// `p_total = sum_b p_b`. Each block occupies rows/columns
-/// `block_ranges[b] = (start, end)`. Smoothing parameters are mapped to blocks
-/// via these ranges when embedding per-block penalties into the joint space.
-///
 /// # When to use
 ///
 /// Use `BlockCoupledOperator` whenever building an [`InnerSolution`] for a joint
@@ -4618,45 +4615,23 @@ impl HessianOperator for SparseCholeskyOperator {
 pub struct BlockCoupledOperator {
     /// Inner spectral operator over the full joint Hessian.
     inner: DenseSpectralOperator,
-    /// Block ranges: `block_ranges[b] = (start, end)` in the joint parameter space.
-    block_ranges: Vec<(usize, usize)>,
 }
 
 impl BlockCoupledOperator {
-    /// Create from an assembled joint Hessian and block ranges.
+    /// Create from an assembled joint Hessian.
     ///
     /// `joint_hessian` is the full `p_total x p_total` penalized Hessian.
-    /// `block_ranges` maps each block index to `(start, end)` column ranges.
     ///
     /// Internally performs a single eigendecomposition of `joint_hessian`.
     pub fn from_joint_hessian(
         joint_hessian: &Array2<f64>,
-        block_ranges: Vec<(usize, usize)>,
     ) -> Result<Self, String> {
-        let total_dim = joint_hessian.nrows();
-
-        // Validate block ranges do not exceed the matrix dimension.
-        if let Some(&(_, end)) = block_ranges.last() {
-            if end > total_dim {
-                return Err(format!(
-                    "BlockCoupledOperator: last block end ({end}) exceeds \
-                     matrix dimension ({total_dim})"
-                ));
-            }
-        }
-
         let inner = DenseSpectralOperator::from_symmetric(joint_hessian)
             .map_err(|e| format!("BlockCoupledOperator eigendecomposition: {e}"))?;
 
         Ok(Self {
             inner,
-            block_ranges,
         })
-    }
-
-    /// Return the block ranges for embedding per-block penalties.
-    pub fn block_ranges(&self) -> &[(usize, usize)] {
-        &self.block_ranges
     }
 }
 

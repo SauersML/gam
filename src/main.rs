@@ -1,5 +1,5 @@
-use std::sync::Arc;
 #![deny(unused_variables)]
+use std::sync::Arc;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
@@ -2316,7 +2316,7 @@ fn run_predict_survival(
                     .zip(sigma.iter())
                     .map(|(&t, &s)| -t / s.max(1e-12)),
             );
-            saved_linkwiggle_design(&q0, model)?.map(DesignMatrix::Dense)
+            saved_linkwiggle_design(&q0, model)?.map(|d| DesignMatrix::Dense(Arc::new(d)))
         } else {
             None
         };

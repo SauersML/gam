@@ -7369,8 +7369,8 @@ impl GaussianLocationScaleWiggleFamily {
 
         let xi = xmu.dot(&umu);
         let zeta = x_ls.dot(&u_ls);
-        let zmu_a_u = xmu_map.forward_mul(umu);
-        let zls_a_u = x_ls_map.forward_mul(u_ls);
+        let zmu_a_u = xmu_map.forward_mul(umu.view());
+        let zls_a_u = x_ls_map.forward_mul(u_ls.view());
         let b1u = geom.basis_d1.dot(&uw);
         let b2u = geom.basis_d2.dot(&uw);
         let b3u = geom.basis_d3.dot(&uw);

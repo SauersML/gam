@@ -13,6 +13,7 @@ use gam::families::custom_family::{
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::pirls::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, array};
+use std::sync::Arc;
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
 
@@ -395,7 +396,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
     let specs = vec![
         ParameterBlockSpec {
             name: "shape".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -403,7 +404,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),
@@ -476,7 +477,7 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
     let family = LowerBoundConstrainedExactFamily { target, lower };
     let specs = vec![ParameterBlockSpec {
         name: "constrained".to_string(),
-        design: DesignMatrix::Dense(array![[1.0]]),
+        design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
         offset: array![0.0],
         penalties: vec![Array2::eye(1)],
         initial_log_lambdas: array![0.0],
@@ -548,7 +549,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
     let specs = vec![
         ParameterBlockSpec {
             name: "shape".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![Array2::eye(1)],
             initial_log_lambdas: array![0.0],
@@ -556,7 +557,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
-            design: DesignMatrix::Dense(array![[1.0]]),
+            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             initial_log_lambdas: Array1::zeros(0),

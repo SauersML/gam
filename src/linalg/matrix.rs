@@ -333,7 +333,7 @@ impl SymmetricMatrix {
 
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
-            Self::Dense(mat) => (**mat).clone(),
+            Self::Dense(mat) => mat.clone(),
             Self::Sparse(mat) => {
                 let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
                 let (symbolic, values) = mat.parts();
@@ -1552,7 +1552,7 @@ impl DesignMatrix {
     /// Returns a reference to the inner dense array if this is a `Dense` variant.
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
-            Self::Dense(matrix) => Some(matrix),
+            Self::Dense(matrix) => Some(matrix.as_ref()),
             Self::Sparse(_) => None,
         }
     }
@@ -1570,7 +1570,7 @@ impl DesignMatrix {
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
-            Self::Dense(matrix) => Arc::new(matrix.clone()),
+            Self::Dense(matrix) => matrix.clone(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense_arc")
                 .unwrap_or_else(|msg| panic!("{msg}")),
@@ -1579,7 +1579,7 @@ impl DesignMatrix {
 
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
         match self {
-            Self::Dense(matrix) => Ok(Arc::new(matrix.clone())),
+            Self::Dense(matrix) => Ok(matrix.clone()),
             Self::Sparse(matrix) => matrix.try_to_dense_arc(context),
         }
     }
@@ -1600,7 +1600,7 @@ impl DesignMatrix {
 
     pub fn as_dense(&self) -> Option<&Array2<f64>> {
         match self {
-            Self::Dense(matrix) => Some(matrix),
+            Self::Dense(matrix) => Some(matrix.as_ref()),
             Self::Sparse(_) => None,
         }
     }
@@ -1752,6 +1752,7 @@ mod tests {
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, Axis, array};
+    use std::sync::Arc;
 
     fn exact_weighted_penalized_solve(
         design: &Array2<f64>,

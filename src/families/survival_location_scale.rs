@@ -3156,7 +3156,7 @@ fn prepare_survival_location_scale_model(
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
         x_log_sigma: DesignMatrix::Dense(Arc::new(log_sigma_design)),
-        x_log_sigma_entry: log_sigma_entry_design.map(DesignMatrix::Dense),
+        x_log_sigma_entry: log_sigma_entry_design.map(|x| DesignMatrix::Dense(Arc::new(x))),
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
     };
 
@@ -7755,7 +7755,6 @@ pub fn predict_survival_location_scalewith_uncertainty(
     })
 }
 
-#[inline]
 #[cfg(test)]
 mod tests {
     use super::*;
