@@ -8,12 +8,13 @@ use crate::custom_family::{
     second_psi_linear_map,
 };
 use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
-use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
-use crate::families::gamlss::ParameterBlockInput;
+use crate::families::bernoulli_marginal_slope::{
+    MultiDirJet, unary_derivatives_exp, unary_derivatives_sqrt, unary_derivatives_neglog_phi,
+    unary_derivatives_log, unary_derivatives_log_normal_pdf,
+};
 use crate::families::survival_location_scale::TimeBlockInput;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -23,7 +24,7 @@ use crate::smooth::{
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::cell::RefCell;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 // ── Spec and result types ─────────────────────────────────────────────
 
@@ -50,6 +51,13 @@ pub struct SurvivalMarginalSlopeFitResult {
 
 // ── Family struct ─────────────────────────────────────────────────────
 
+/// The time block has one beta vector but THREE design matrices (entry, exit,
+/// derivative-at-exit). The ParameterBlockSpec uses the exit design as its
+/// "official" design, so block_states[0].eta = design_exit @ beta + offset_exit.
+/// This eta is NOT used in the likelihood computation — row_neglog_directional
+/// recomputes all 3 linear predictors from beta_time directly. The exit-design
+/// eta exists only to satisfy the CustomFamily/PIRLS interface; ExactNewton
+/// blocks do not use eta for working response/weights.
 #[derive(Clone)]
 struct SurvivalMarginalSlopeFamily {
     n: usize,
@@ -57,15 +65,14 @@ struct SurvivalMarginalSlopeFamily {
     weights: Array1<f64>,
     z: Array1<f64>,
     derivative_guard: f64,
-    derivative_softness: f64,
-    // Time block designs (n × p_time)
+    /// Time block: 3 designs sharing one beta vector.
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
     offset_entry: Array1<f64>,
     offset_exit: Array1<f64>,
     derivative_offset_exit: Array1<f64>,
-    // Slope design (n × p_slope)
+    /// Log-slope block: standard single design.
     logslope_design: Array2<f64>,
 }
 
@@ -88,245 +95,6 @@ fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
     }
 }
 
-// ── MultiDirJet (copied from bernoulli_marginal_slope) ────────────────
-
-fn subset_partition_table() -> &'static Vec<Vec<Vec<usize>>> {
-    fn build_partitions(mask: usize) -> Vec<Vec<usize>> {
-        if mask == 0 {
-            return vec![Vec::new()];
-        }
-        let first = mask & mask.wrapping_neg();
-        let rest = mask ^ first;
-        let mut out = Vec::new();
-        let mut subset = rest;
-        loop {
-            let block = first | subset;
-            for mut remainder in build_partitions(rest ^ subset) {
-                remainder.push(block);
-                out.push(remainder);
-            }
-            if subset == 0 {
-                break;
-            }
-            subset = (subset - 1) & rest;
-        }
-        out
-    }
-
-    static TABLE: OnceLock<Vec<Vec<Vec<usize>>>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = vec![Vec::new(); 16];
-        for mask in 0..16 {
-            table[mask] = build_partitions(mask);
-        }
-        table
-    })
-}
-
-#[derive(Clone, Debug)]
-struct MultiDirJet {
-    n_dirs: usize,
-    coeffs: [f64; 16],
-}
-
-impl MultiDirJet {
-    fn zero(n_dirs: usize) -> Self {
-        Self {
-            n_dirs,
-            coeffs: [0.0; 16],
-        }
-    }
-
-    fn constant(n_dirs: usize, value: f64) -> Self {
-        let mut out = Self::zero(n_dirs);
-        out.coeffs[0] = value;
-        out
-    }
-
-    fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
-        let mut out = Self::constant(n_dirs, base);
-        for (idx, &value) in first.iter().enumerate() {
-            out.coeffs[1usize << idx] = value;
-        }
-        out
-    }
-
-    fn full_mask(&self) -> usize {
-        (1usize << self.n_dirs) - 1
-    }
-
-    fn coeff(&self, mask: usize) -> f64 {
-        self.coeffs[mask]
-    }
-
-    fn set_coeff(&mut self, mask: usize, value: f64) {
-        self.coeffs[mask] = value;
-    }
-
-    fn add(&self, other: &Self) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeffs[mask] + other.coeffs[mask];
-        }
-        out
-    }
-
-    fn sub(&self, other: &Self) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeffs[mask] - other.coeffs[mask];
-        }
-        out
-    }
-
-    fn scale(&self, scalar: f64) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeffs[mask] * scalar;
-        }
-        out
-    }
-
-    fn mul(&self, other: &Self) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            let mut total = 0.0;
-            let mut submask = mask;
-            loop {
-                total += self.coeffs[submask] * other.coeffs[mask ^ submask];
-                if submask == 0 {
-                    break;
-                }
-                submask = (submask - 1) & mask;
-            }
-            out.coeffs[mask] = total;
-        }
-        out
-    }
-
-    fn compose_unary(&self, derivs: [f64; 5]) -> Self {
-        let mut out = Self::constant(self.n_dirs, derivs[0]);
-        let partitions = subset_partition_table();
-        for mask in 1..=self.full_mask() {
-            let mut total = 0.0;
-            for partition in &partitions[mask] {
-                let order = partition.len();
-                if order == 0 || order >= derivs.len() {
-                    continue;
-                }
-                let mut prod = 1.0;
-                for &block in partition {
-                    prod *= self.coeffs[block];
-                }
-                total += derivs[order] * prod;
-            }
-            out.coeffs[mask] = total;
-        }
-        out
-    }
-}
-
-// ── Unary derivative functions ────────────────────────────────────────
-
-fn unary_derivatives_exp(x: f64) -> [f64; 5] {
-    let ex = x.exp();
-    [ex, ex, ex, ex, ex]
-}
-
-fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
-    let s = x.max(1e-300).sqrt();
-    let x1 = x.max(1e-300);
-    let x2 = x1 * x1;
-    let x3 = x2 * x1;
-    [
-        s,
-        0.5 / s,
-        -0.25 / (x1 * s),
-        3.0 / (8.0 * x2 * s),
-        -15.0 / (16.0 * x3 * s),
-    ]
-}
-
-#[inline]
-fn erfcx_nonnegative(x: f64) -> f64 {
-    if !x.is_finite() {
-        return if x.is_sign_positive() {
-            0.0
-        } else {
-            f64::INFINITY
-        };
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    // Rational approximation from Abramowitz & Stegun, improved.
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    poly
-}
-
-fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
-    if x < 0.0 {
-        let u = -x / std::f64::consts::SQRT_2;
-        let ex = erfcx_nonnegative(u).max(1e-300);
-        let log_cdf = -u * u + (0.5 * ex).ln();
-        let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
-        (log_cdf, lambda)
-    } else {
-        let cdf = normal_cdf(x).clamp(1e-300, 1.0);
-        let lambda = normal_pdf(x) / cdf;
-        (cdf.ln(), lambda)
-    }
-}
-
-fn signed_probit_neglog_derivatives_up_to_fourth(
-    signed_margin: f64,
-    weight: f64,
-) -> (f64, f64, f64, f64) {
-    if weight == 0.0 || !signed_margin.is_finite() {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-    let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
-    let k1 = -lambda;
-    let k2 = lambda * (signed_margin + lambda);
-    let k3 = lambda
-        * (1.0
-            - signed_margin * signed_margin
-            - 3.0 * signed_margin * lambda
-            - 2.0 * lambda * lambda);
-    let k4 = lambda
-        * ((signed_margin.powi(3) - 3.0 * signed_margin)
-            + (7.0 * signed_margin * signed_margin - 4.0) * lambda
-            + 12.0 * signed_margin * lambda * lambda
-            + 6.0 * lambda.powi(3));
-    (weight * k1, weight * k2, weight * k3, weight * k4)
-}
-
-/// Derivatives of -log Phi(x) (negated log-normal-CDF) w.r.t. x.
-fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
-    let (d1, d2, d3, d4) = signed_probit_neglog_derivatives_up_to_fourth(x, weight);
-    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(x);
-    [-weight * log_cdf, d1, d2, d3, d4]
-}
-
-/// Derivatives of log(x) through 4th order: [log(x), 1/x, -1/x^2, 2/x^3, -6/x^4].
-fn unary_derivatives_log(x: f64) -> [f64; 5] {
-    let x1 = x.max(1e-300);
-    let x2 = x1 * x1;
-    let x3 = x2 * x1;
-    let x4 = x3 * x1;
-    [x1.ln(), 1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4]
-}
-
-/// Derivatives of log(phi(x)) = -0.5*x^2 - 0.5*ln(2*pi) w.r.t. x.
-/// [f(x), f'(x), f''(x), f'''(x), f''''(x)] = [-0.5*x^2 - C, -x, -1, 0, 0]
-fn unary_derivatives_log_normal_pdf(x: f64) -> [f64; 5] {
-    let c = 0.5 * (2.0 * std::f64::consts::PI).ln();
-    [-0.5 * x * x - c, -x, -1.0, 0.0, 0.0]
-}
-
 // ── Primary-space helpers ─────────────────────────────────────────────
 
 // Primary scalar indices: 0=q0, 1=q1, 2=qd1, 3=g
@@ -338,103 +106,31 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
     out
 }
 
+// ── Eval cache ────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct RowPrimaryBase {
+    gradient: Array1<f64>,
+    hessian: Array2<f64>,
+}
+
+struct EvalCache {
+    slices: BlockSlices,
+    row_bases: Vec<RowPrimaryBase>,
+}
+
 // ── Row-level NLL computation ─────────────────────────────────────────
 
 impl SurvivalMarginalSlopeFamily {
-    /// Compute the per-row NLL and its directional derivatives through the
-    /// 4 primary scalars using MultiDirJet.
+    /// Per-row NLL and its directional derivatives through 4 primary scalars.
     ///
-    /// Primary scalars: q0, q1, qd1, g
+    /// NLL_i = w_i * [ (1-d)·neglogΦ(-η₁) − neglogΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
     ///
-    /// Model (non-flex):
-    ///   beta = exp(g)
-    ///   c = sqrt(1 + beta^2)
-    ///   a0 = q0 * c, a1 = q1 * c, ad1 = qd1 * c
-    ///   eta0 = a0 + beta * z_i, eta1 = a1 + beta * z_i
+    /// where η = a(t) + β·z, a(t) = q(t)·√(1+β²), β = exp(g).
     ///
-    /// Interval NLL:
-    ///   ell = w * [(1-d)*(-log Phi(-eta1)) - (-log Phi(-eta0)) + d*(log phi(eta1) + log(ad1))]
-    ///   neglog = -ell
-    ///   = w * [(-log Phi(-eta0)) is SUBTRACTED so we ADD log Phi(-eta0)]
-    ///
-    /// Actually, let's be precise:
-    ///   log L = w * [(1-d)*log S(t1|z) - log S(t0|z) + d*(log f(t1|z))]
-    ///   where S(t|z) = Phi(-eta), f(t|z) = phi(eta)*a'(t)/S(t|z)... wait, that's the density.
-    ///
-    /// Let me re-derive carefully:
-    ///   S(t|z) = Phi(-(a(t) + beta*z))
-    ///   F(t|z) = Phi(a(t) + beta*z)
-    ///   f(t|z) = phi(a(t) + beta*z) * a'(t)
-    ///
-    /// For interval [t0, t1] with entry t0, exit t1, event d:
-    ///   L = [S(t1|z)/S(t0|z)]^(1-d) * [f(t1|z)/S(t0|z)]^d
-    ///     = S(t1|z)^(1-d) * f(t1|z)^d / S(t0|z)
-    ///
-    /// log L = (1-d)*log S(t1|z) + d*log f(t1|z) - log S(t0|z)
-    ///       = (1-d)*log Phi(-eta1) + d*[log phi(eta1) + log a'(t1)] - log Phi(-eta0)
-    ///
-    /// NLL = -log L = -[(1-d)*log Phi(-eta1) + d*(log phi(eta1) + log ad1) - log Phi(-eta0)]
-    ///     = (-log Phi(-eta0)) is negated, so:
-    ///     = log Phi(-eta0) - (1-d)*log Phi(-eta1) - d*(log phi(eta1) + log ad1)
-    ///
-    /// Wait, let me be really careful with signs:
-    ///   NLL = -(log L)
-    ///       = -log Phi(-eta0) ... NO, that's wrong.
-    ///
-    ///   log L = (1-d)*log Phi(-eta1) + d*(log phi(eta1) + log ad1) - log Phi(-eta0)
-    ///   NLL = -log L = log Phi(-eta0) - (1-d)*log Phi(-eta1) - d*log phi(eta1) - d*log ad1
-    ///       = [-log Phi(-eta0)] is the NEGATIVE, so:
-    ///       = {-log Phi(-eta0)}*(-1) ...
-    ///
-    /// Let me use unary_derivatives_neglog_phi directly.
-    /// Define neglogphi(x) = -log Phi(x).
-    ///
-    /// NLL = neglogphi(-eta0) - (1-d)*neglogphi(-eta1) ... NO.
-    ///
-    /// NLL = -log L
-    ///     = -(1-d)*log Phi(-eta1) - d*log phi(eta1) - d*log ad1 + log Phi(-eta0)
-    ///
-    /// Hmm, log Phi(-eta0) = -neglogphi(-eta0). So:
-    ///   NLL = (1-d)*neglogphi(-eta1) + d*(-log phi(eta1)) + d*(-log ad1) - neglogphi(-eta0)
-    ///
-    /// Wait no. Let's just be careful:
-    ///   neglogphi(x) = -log Phi(x)
-    ///   log Phi(x) = -neglogphi(x)
-    ///
-    ///   NLL = -[(1-d)*log Phi(-eta1) + d*(log phi(eta1) + log ad1) - log Phi(-eta0)]
-    ///       = -(1-d)*log Phi(-eta1) - d*log phi(eta1) - d*log ad1 + log Phi(-eta0)
-    ///       = (1-d)*neglogphi(-eta1) - d*log phi(eta1) - d*log ad1 - neglogphi(-eta0)
-    ///
-    /// But we need NLL to be positive when likelihood is < 1, which is typical.
-    /// Let's verify: if no event (d=0) and S(t1) < S(t0) (some risk):
-    ///   NLL = neglogphi(-eta1) - neglogphi(-eta0)
-    ///       = -log Phi(-eta1) + log Phi(-eta0)
-    ///       = log[Phi(-eta0)/Phi(-eta1)]
-    ///       = log[S(t0)/S(t1)]
-    /// Since S(t0) >= S(t1) (CDF increases), this is >= 0. Good.
-    ///
-    /// So:
-    ///   NLL_i = w_i * [(1-d_i)*neglogphi(-eta1) - neglogphi(-eta0)
-    ///                   - d_i*log phi(eta1) - d_i*log ad1]
-    ///
-    /// Wait, that's NLL = w * [entry_surv_neglog - exit_surv_neglog - event_density_log]
-    ///   where entry_surv_neglog = neglogphi(-eta0)... no, it's SUBTRACTED.
-    ///
-    /// Let me just write it cleanly as weighted sum of jet terms:
-    ///
-    ///   NLL_i = w_i * {
-    ///       (1-d_i) * neglogphi(-eta1_i)    // exit survival (if censored)
-    ///     - neglogphi(-eta0_i)               // entry survival (always subtracted)
-    ///     - d_i * log_phi(eta1_i)            // event density (numerator)
-    ///     - d_i * log(ad1_i)                 // time derivative (numerator)
-    ///   }
-    ///
-    /// Hmm, this means NLL can be negative if -neglogphi(-eta0) dominates.
-    /// Actually no: NLL = -log(L_i) where L_i = S(t1)^(1-d) * f(t1)^d / S(t0)
-    /// and S(t0) >= S(t1) so S(t1)/S(t0) <= 1, and f(t1) is a density that can be > 1.
-    /// So NLL CAN be negative for individual rows. That's fine.
-    ///
-    /// Let me just implement it directly with jets.
+    /// block_states[0].eta is from the exit design and is NOT used here;
+    /// all 3 time-block linear predictors are recomputed from beta_time
+    /// because the time block has 3 design matrices sharing one coefficient vector.
     fn row_neglog_directional(
         &self,
         row: usize,
@@ -457,28 +153,8 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_first: Vec<f64> = dirs.iter().map(|dir| dir[2]).collect();
         let g_first: Vec<f64> = dirs.iter().map(|dir| dir[3]).collect();
 
-        let q0_val = block_states[0].eta[row] + self.offset_entry[row]
-            - self.design_entry.row(row).dot(&block_states[0].beta);
-        // Actually wait - block_states[0].eta[row] IS X_exit[row] @ beta_time + offset_exit[row]
-        // for the EXIT design. But we have 3 different designs for the time block.
-        //
-        // The time block has a single beta vector, but 3 different linear predictors:
-        //   q0 = design_entry[row,:] @ beta_time + offset_entry[row]
-        //   q1 = design_exit[row,:] @ beta_time + offset_exit[row]
-        //   qd1 = design_deriv[row,:] @ beta_time + derivative_offset_exit[row]
-        //
-        // The block_states[0].eta is computed from whichever design the block uses.
-        // But in survival_location_scale, eta for the time block is computed using
-        // a stacked design. Here we'll compute the 3 linear predictors manually.
-        //
-        // Actually, I need to think about this differently. The CustomFamily evaluate()
-        // method receives block_states where eta = design @ beta + offset for each block.
-        // But we have ONE time block with ONE beta, yet 3 different design matrices.
-        // So eta will be computed with one of them (say the exit design, since that's
-        // what we mainly use). We'll compute the others manually.
-        //
-        // Let me restructure: compute q0, q1, qd1 from beta_time directly.
-
+        // Compute q0, q1, qd1 from beta_time directly. The time block has a
+        // single beta vector but 3 different design matrices (entry, exit, derivative).
         let beta_time = &block_states[0].beta;
         let q0_val = self.design_entry.row(row).dot(beta_time) + self.offset_entry[row];
         let q1_val = self.design_exit.row(row).dot(beta_time) + self.offset_exit[row];
@@ -537,55 +213,16 @@ impl SurvivalMarginalSlopeFamily {
         };
 
         // Time derivative: -d * log(ad1)
+        // Monotonicity constraints ensure ad1 >= guard, so floor is safe.
         let time_deriv_term = if di > 0.0 {
             let ad1_val = ad1_jet.coeff(0);
-            let guard = self.derivative_guard;
-            let softness = self.derivative_softness;
-            // Softplus guard: use softplus(ad1 - guard) + guard to keep ad1 > guard
-            let effective_ad1 = if guard > 0.0 && softness > 0.0 {
-                let shifted = ad1_val - guard;
-                let soft_val = if shifted > 20.0 * softness {
-                    shifted + guard
-                } else {
-                    softness * (1.0 + (shifted / softness).exp()).ln() + guard
-                };
-                // For the jet, we apply softplus derivatives
-                let sig = 1.0 / (1.0 + (-shifted / softness).exp()); // sigmoid
-                let sig2 = sig * (1.0 - sig) / softness;
-                let sig3 = (sig2 * (1.0 - 2.0 * sig)) / softness;
-                let sig4 = ((sig2 * (1.0 - 6.0 * sig * (1.0 - sig))) / softness
-                    - 2.0 * sig3 * sig / (1.0 - sig).max(1e-30))
-                    / softness;
-                // Actually, the derivatives of softplus(x/s)*s+guard w.r.t. x:
-                // d/dx = sigmoid(x/s), d2/dx2 = sigmoid'(x/s)/s, etc.
-                // Better to just compose through the ad1_jet with softplus derivatives.
-                // Let me simplify: compose ad1 -> log(softplus_ad1) directly.
-                let log_soft = soft_val.max(1e-300).ln();
-                let d_log = sig / soft_val.max(1e-300); // d(log softplus)/d(ad1)
-                let d2_log =
-                    (sig2 * soft_val.max(1e-300) - sig * sig) / soft_val.max(1e-300).powi(2);
-                // This is getting complicated. Let me just use the raw ad1 with a floor.
-                // The monotonicity constraints already ensure ad1 >= guard, so this is safe.
-                ad1_jet.compose_unary(unary_derivatives_log(ad1_val.max(1e-300)))
-            } else {
-                ad1_jet.compose_unary(unary_derivatives_log(ad1_val.max(1e-300)))
-            };
-            effective_ad1.scale(-wi * di)
+            ad1_jet
+                .compose_unary(unary_derivatives_log(ad1_val.max(1e-300)))
+                .scale(-wi * di)
         } else {
             MultiDirJet::zero(k)
         };
 
-        // Total NLL: exit_term + entry_term + event_density + time_deriv
-        // entry_term is already negated (it's -neglogphi = +logPhi, contributing to -NLL)
-        // Actually let me re-check:
-        //   NLL = w * [(1-d)*neglogphi(-eta1) - neglogphi(-eta0) - d*log_phi(eta1) - d*log(ad1)]
-        //
-        // So: NLL = exit_term(w*(1-d)) + entry_term(-w) + event_density(-w*d) + time_deriv(-w*d)
-        //
-        // exit_term = neglogphi(-eta1) * w*(1-d)  [already computed with weight w*(1-d)]
-        // entry_term = neglogphi(-eta0) * (-w)     [computed as -1 * neglogphi(-eta0, w)]
-        // event_density = log_phi(eta1) * (-w*d)   [computed as -w*d * log_phi]
-        // time_deriv = log(ad1) * (-w*d)           [computed as -w*d * log(ad1)]
         let total = exit_term
             .add(&entry_term)
             .add(&event_density_term)
@@ -598,7 +235,7 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
-    fn compute_row_primary_gradient_hessian(
+    fn compute_row_primary_gradient_hessian_uncached(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -617,6 +254,30 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         Ok((grad, hess))
+    }
+
+    fn build_eval_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<EvalCache, String> {
+        let slices = block_slices(block_states);
+        let row_bases = (0..self.n)
+            .map(|row| {
+                let (gradient, hessian) =
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                Ok(RowPrimaryBase { gradient, hessian })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(EvalCache { slices, row_bases })
+    }
+
+    fn row_primary_gradient_hessian<'a>(
+        &self,
+        row: usize,
+        cache: &'a EvalCache,
+    ) -> (&'a Array1<f64>, &'a Array2<f64>) {
+        let base = &cache.row_bases[row];
+        (&base.gradient, &base.hessian)
     }
 
     fn row_primary_third_contracted(
@@ -779,7 +440,8 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         need_hessian: bool,
     ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-        let slices = block_slices(block_states);
+        let cache = self.build_eval_cache(block_states)?;
+        let slices = &cache.slices;
         let mut gradient = Array1::<f64>::zeros(slices.total);
         let mut hessian = need_hessian.then(|| Array2::<f64>::zeros((slices.total, slices.total)));
         let mut ll = 0.0;
@@ -787,10 +449,10 @@ impl SurvivalMarginalSlopeFamily {
             let row_neglog = self.row_neglog_directional(i, block_states, &[])?;
             ll -= row_neglog;
 
-            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(i, block_states)?;
-            gradient -= &self.pullback_primary_vector(i, &slices, &f_pi);
+            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(i, &cache);
+            gradient -= &self.pullback_primary_vector(i, slices, f_pi);
             if let Some(ref mut hmat) = hessian {
-                self.add_pullback_primary_hessian(hmat, i, &slices, &f_pipi);
+                self.add_pullback_primary_hessian(hmat, i, slices, f_pipi);
             }
         }
         Ok((ll, gradient, hessian))
@@ -839,7 +501,7 @@ impl SurvivalMarginalSlopeFamily {
         let mut out = Array1::<f64>::zeros(slices.total);
         for row in 0..self.n {
             let row_dir = self.row_primary_direction_from_flat(row, &slices, direction);
-            let (_, row_hessian) = self.compute_row_primary_gradient_hessian(row, block_states)?;
+            let (_, row_hessian) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
             let row_action = row_hessian.dot(&row_dir);
             out += &self.pullback_primary_vector(row, &slices, &row_action);
         }
@@ -853,7 +515,7 @@ impl SurvivalMarginalSlopeFamily {
         let slices = block_slices(block_states);
         let mut diagonal = Array1::<f64>::zeros(slices.total);
         for row in 0..self.n {
-            let (_, row_hessian) = self.compute_row_primary_gradient_hessian(row, block_states)?;
+            let (_, row_hessian) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
 
             // Time block contributions from entry, exit, derivative designs
             let designs = [
@@ -951,9 +613,11 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Map a psi derivative to a primary-space direction for a given row.
-    /// For the time block (block 0), a psi perturbation changes all 3 primary scalars
-    /// (q0, q1, qd1) because they share beta_time and the psi perturbation affects the design.
-    /// For the logslope block (block 1), only g is affected.
+    ///
+    /// Only the logslope block (block 1) has spatial length-scale parameters.
+    /// The time block (block 0) is a pure B-spline on time with no spatial terms,
+    /// so its derivative_blocks entry is always empty and resolve_psi_location
+    /// never maps to block 0.
     fn row_primary_psi_direction(
         &self,
         row: usize,
@@ -968,32 +632,6 @@ impl SurvivalMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(N_PRIMARY);
         match block_idx {
-            0 => {
-                // Time block: psi affects entry, exit, and derivative designs.
-                // The psi design row vector gives dX/dpsi @ beta, which is the
-                // change in the linear predictor. But we have 3 linear predictors
-                // from the same beta. For now, the psi design is for the "main" design
-                // (exit), so we approximate by using it for exit and ignoring entry/deriv.
-                // TODO: implement separate psi designs for entry/exit/deriv if needed.
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.design_exit.ncols(),
-                    "SurvivalMarginalSlope time",
-                )?;
-                let dot = x_row.dot(&block_states[0].beta);
-                // psi perturbation changes q0, q1, qd1 through the same beta
-                // For the exit design, it directly changes q1.
-                // For entry and deriv, the psi perturbation has the same structure
-                // (same spatial terms, same beta), so the change is analogous.
-                // As a simplification, assign the same dot product to q0 and q1,
-                // and 0 to qd1 (derivative design psi structure is different).
-                out[0] = dot; // q0
-                out[1] = dot; // q1
-                // qd1 psi contribution is 0 for now (derivative design structure is different)
-                out[2] = 0.0;
-            }
             1 => {
                 let x_row = self.psi_design_row_vector(
                     row,
@@ -1006,7 +644,7 @@ impl SurvivalMarginalSlopeFamily {
             }
             _ => {
                 return Err(format!(
-                    "survival marginal-slope psi direction only supports time/logslope blocks, got block {block_idx}"
+                    "survival marginal-slope psi: only logslope block (1) has spatial terms, got block {block_idx}"
                 ));
             }
         }
@@ -1028,34 +666,16 @@ impl SurvivalMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(N_PRIMARY);
         match block_idx {
-            0 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.design_exit.ncols(),
-                    "SurvivalMarginalSlope time",
-                )?;
-                let dot = x_row.dot(&d_beta_flat.slice(s![slices.time.clone()]).to_owned());
-                out[0] = dot;
-                out[1] = dot;
-                out[2] = 0.0;
-            }
             1 => {
                 let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.logslope_design.ncols(),
+                    row, deriv, self.n, self.logslope_design.ncols(),
                     "SurvivalMarginalSlope logslope",
                 )?;
                 out[3] = x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned());
             }
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi action only supports time/logslope blocks, got block {block_idx}"
-                ));
-            }
+            _ => return Err(format!(
+                "survival marginal-slope psi action: only logslope block (1) has spatial terms, got block {block_idx}"
+            )),
         }
         Ok(Some(out))
     }
@@ -1080,38 +700,16 @@ impl SurvivalMarginalSlopeFamily {
         let deriv_i = &derivative_blocks[block_i][local_i];
         let mut out = Array1::<f64>::zeros(N_PRIMARY);
         match block_i {
-            0 => {
-                let x_row = self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.design_exit.ncols(),
-                    "SurvivalMarginalSlope time",
-                )?;
-                let dot = x_row.dot(&block_states[0].beta);
-                out[0] = dot;
-                out[1] = dot;
-                out[2] = 0.0;
-            }
             1 => {
                 let x_row = self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
+                    row, deriv_i, &derivative_blocks[block_j][local_j], local_j,
+                    self.n, self.logslope_design.ncols(), "SurvivalMarginalSlope logslope",
                 )?;
                 out[3] = x_row.dot(&block_states[1].beta);
             }
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi second direction only supports time/logslope blocks, got block {block_i}"
-                ));
-            }
+            _ => return Err(format!(
+                "survival marginal-slope psi second: only logslope block (1) has spatial terms, got block {block_i}"
+            )),
         }
         Ok(Some(out))
     }
@@ -1130,29 +728,15 @@ impl SurvivalMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(slices.total);
         match block_idx {
-            0 => out
-                .slice_mut(s![slices.time.clone()])
-                .assign(&self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.design_exit.ncols(),
-                    "SurvivalMarginalSlope time",
-                )?),
-            1 => out
-                .slice_mut(s![slices.logslope.clone()])
-                .assign(&self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.logslope_design.ncols(),
+            1 => out.slice_mut(s![slices.logslope.clone()]).assign(
+                &self.psi_design_row_vector(
+                    row, deriv, self.n, self.logslope_design.ncols(),
                     "SurvivalMarginalSlope logslope",
-                )?),
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi embedding only supports time/logslope blocks, got block {block_idx}"
-                ));
-            }
+                )?,
+            ),
+            _ => return Err(format!(
+                "survival marginal-slope psi embedding: only logslope block (1) has spatial terms, got block {block_idx}"
+            )),
         }
         Ok(Some((block_idx, out)))
     }
@@ -1177,34 +761,15 @@ impl SurvivalMarginalSlopeFamily {
         let deriv_i = &derivative_blocks[block_i][local_i];
         let mut out = Array1::<f64>::zeros(slices.total);
         match block_i {
-            0 => {
-                out.slice_mut(s![slices.time.clone()])
-                    .assign(&self.psi_second_design_row_vector(
-                        row,
-                        deriv_i,
-                        &derivative_blocks[block_j][local_j],
-                        local_j,
-                        self.n,
-                        self.design_exit.ncols(),
-                        "SurvivalMarginalSlope time",
-                    )?)
-            }
             1 => out.slice_mut(s![slices.logslope.clone()]).assign(
                 &self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
+                    row, deriv_i, &derivative_blocks[block_j][local_j], local_j,
+                    self.n, self.logslope_design.ncols(), "SurvivalMarginalSlope logslope",
                 )?,
             ),
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi second embedding only supports time/logslope blocks, got block {block_i}"
-                ));
-            }
+            _ => return Err(format!(
+                "survival marginal-slope psi second embedding: only logslope block (1) has spatial terms, got block {block_i}"
+            )),
         }
         Ok(Some((block_i, out)))
     }
@@ -1223,12 +788,13 @@ impl SurvivalMarginalSlopeFamily {
         else {
             return Ok(None);
         };
-        // Map block_idx to primary index for the scalar that this psi affects
-        let idx_primary = match block_idx {
-            0 => 1usize, // time block -> primary q1 (exit, main one)
-            1 => 3usize, // logslope -> primary g
-            _ => return Err("unexpected block index in psi_terms".to_string()),
-        };
+        // Only logslope (block 1) has spatial terms → primary index is always g (3)
+        if block_idx != 1 {
+            return Err(format!(
+                "survival marginal-slope psi_terms: only logslope block (1) expected, got {block_idx}"
+            ));
+        }
+        let idx_primary = 3usize;
         let mut objective_psi = 0.0;
         let mut score_psi = Array1::<f64>::zeros(slices.total);
         let mut hessian_psi = Array2::<f64>::zeros((slices.total, slices.total));
@@ -1238,7 +804,7 @@ impl SurvivalMarginalSlopeFamily {
             else {
                 continue;
             };
-            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(row, block_states)?;
+            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
             let third = self.row_primary_third_contracted(row, block_states, &dir)?;
             let (_, left_vec) = self
                 .embedded_psi_vector(row, &slices, derivative_blocks, psi_index)?
@@ -1275,24 +841,17 @@ impl SurvivalMarginalSlopeFamily {
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = block_slices(block_states);
-        let Some((block_i, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)?
+        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)?
         else {
             return Ok(None);
         };
-        let Some((block_j, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_j)?
+        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_j)?
         else {
             return Ok(None);
         };
-        let idx_i = match block_i {
-            0 => 1,
-            1 => 3,
-            _ => return Err("bad block_i".to_string()),
-        };
-        let idx_j = match block_j {
-            0 => 1,
-            1 => 3,
-            _ => return Err("bad block_j".to_string()),
-        };
+        // Only logslope (block 1) has spatial terms → primary index is always g (3)
+        let idx_i = 3usize;
+        let idx_j = 3usize;
         let mut objective_psi_psi = 0.0;
         let mut score_psi_psi = Array1::<f64>::zeros(slices.total);
         let mut hessian_psi_psi = Array2::<f64>::zeros((slices.total, slices.total));
@@ -1316,7 +875,7 @@ impl SurvivalMarginalSlopeFamily {
                     psi_j,
                 )?
                 .unwrap_or_else(|| Array1::<f64>::zeros(N_PRIMARY));
-            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(row, block_states)?;
+            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
             let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
             let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;
             let fourth = self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
@@ -1334,15 +893,7 @@ impl SurvivalMarginalSlopeFamily {
             objective_psi_psi += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
 
             if left_ij.iter().any(|v| v.abs() > 0.0) {
-                let idx_ij = if left_ij
-                    .slice(s![slices.time.clone()])
-                    .iter()
-                    .any(|v| v.abs() > 0.0)
-                {
-                    1
-                } else {
-                    3
-                };
+                let idx_ij = 3usize; // only logslope has spatial terms
                 score_psi_psi += &(left_ij.clone() * f_pi[idx_ij]);
             }
             score_psi_psi += &(left_i.clone() * f_pipi.row(idx_i).dot(&dir_j));
@@ -1351,15 +902,7 @@ impl SurvivalMarginalSlopeFamily {
             score_psi_psi += &self.pullback_primary_vector(row, &slices, &third_i.dot(&dir_j));
 
             if left_ij.iter().any(|v| v.abs() > 0.0) {
-                let idx_ij = if left_ij
-                    .slice(s![slices.time.clone()])
-                    .iter()
-                    .any(|v| v.abs() > 0.0)
-                {
-                    1
-                } else {
-                    3
-                };
+                let idx_ij = 3usize; // only logslope has spatial terms
                 let right_ij =
                     self.pullback_primary_vector(row, &slices, &f_pipi.row(idx_ij).to_owned());
                 hessian_psi_psi += &left_ij
@@ -1425,16 +968,12 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let slices = block_slices(block_states);
-        let Some((block_idx, _)) =
+        let Some((_, _)) =
             self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
         else {
             return Ok(None);
         };
-        let idx_primary = match block_idx {
-            0 => 1,
-            1 => 3,
-            _ => return Err("bad block".to_string()),
-        };
+        let idx_primary = 3usize; // only logslope has spatial terms
         let mut out = Array2::<f64>::zeros((slices.total, slices.total));
         for row in 0..self.n {
             let row_dir = self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
@@ -1711,10 +1250,11 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 
     fn block_linear_constraints(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        let _ = (block_states, spec);
         if block_idx == 0 && self.derivative_guard > 0.0 {
             // Monotonicity constraint: design_derivative_exit @ beta_time + offset >= guard
             // i.e. design_derivative_exit @ beta_time >= guard - offset
@@ -1924,7 +1464,7 @@ pub fn fit_survival_marginal_slope_terms(
     let weights = spec.weights.clone();
     let z = spec.z.clone();
     let derivative_guard = spec.derivative_guard;
-    let derivative_softness = spec.derivative_softness;
+    let _ = spec.derivative_softness;
     let design_entry = spec.time_block.design_entry.clone();
     let design_exit = spec.time_block.design_exit.clone();
     let design_derivative_exit = spec.time_block.design_derivative_exit.clone();
@@ -1940,7 +1480,6 @@ pub fn fit_survival_marginal_slope_terms(
             weights: weights.clone(),
             z: z.clone(),
             derivative_guard,
-            derivative_softness,
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
             design_derivative_exit: design_derivative_exit.clone(),
@@ -1973,6 +1512,22 @@ pub fn fit_survival_marginal_slope_terms(
             ),
         ])
     };
+
+    // ── Pilot fit: rigid (zero-penalty) to seed coefficients ────────────
+    {
+        let rigid_rho = Array1::<f64>::zeros(time_penalties_len + logslope_design.penalties.len());
+        let rigid_blocks = build_blocks(&rigid_rho, &logslope_design)?;
+        let rigid_family = make_family(&logslope_design);
+        if let Ok(rigid_fit) = inner_fit(&rigid_family, &rigid_blocks, options) {
+            let mut hints_mut = hints.borrow_mut();
+            if let Some(block) = rigid_fit.block_states.get(0) {
+                hints_mut.0 = Some(block.beta.clone());
+            }
+            if let Some(block) = rigid_fit.block_states.get(1) {
+                hints_mut.1 = Some(block.beta.clone());
+            }
+        }
+    }
 
     // Check analytic derivatives
     let analytic_joint_derivatives_available =
@@ -2020,13 +1575,15 @@ pub fn fit_survival_marginal_slope_terms(
         &setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, _specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let _ = specs;
             let blocks = build_blocks(rho, &designs[0])?;
             let family = make_family(&designs[0]);
             let fit = inner_fit(&family, &blocks, options)?;
             Ok(fit_score(&fit))
         },
-        |rho, _specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let _ = specs;
             let blocks = build_blocks(rho, &designs[0])?;
             let family = make_family(&designs[0]);
             let fit = inner_fit(&family, &blocks, options)?;

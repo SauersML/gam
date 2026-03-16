@@ -451,7 +451,7 @@ fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
 }
 
 #[inline]
-fn erfcx_nonnegative(x: f64) -> f64 {
+pub(crate) fn erfcx_nonnegative(x: f64) -> f64 {
     if !x.is_finite() {
         return if x.is_sign_positive() {
             0.0
@@ -477,7 +477,7 @@ fn erfcx_nonnegative(x: f64) -> f64 {
 }
 
 #[inline]
-fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
+pub(crate) fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
     if x < 0.0 {
         let u = -x / std::f64::consts::SQRT_2;
         let ex = erfcx_nonnegative(u).max(1e-300);
@@ -491,7 +491,7 @@ fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
     }
 }
 
-fn signed_probit_neglog_derivatives_up_to_fourth(
+pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
     signed_margin: f64,
     weight: f64,
 ) -> (f64, f64, f64, f64) {
@@ -514,12 +514,12 @@ fn signed_probit_neglog_derivatives_up_to_fourth(
     (weight * k1, weight * k2, weight * k3, weight * k4)
 }
 
-fn unary_derivatives_exp(x: f64) -> [f64; 5] {
+pub(crate) fn unary_derivatives_exp(x: f64) -> [f64; 5] {
     let ex = x.exp();
     [ex, ex, ex, ex, ex]
 }
 
-fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
+pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     let s = x.max(1e-300).sqrt();
     let x1 = x.max(1e-300);
     let x2 = x1 * x1;
@@ -533,7 +533,7 @@ fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     ]
 }
 
-fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
+pub(crate) fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
     let phi = normal_pdf(x);
     [
         normal_cdf(x),
@@ -544,13 +544,28 @@ fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
     ]
 }
 
-fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
+pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
     let (d1, d2, d3, d4) = signed_probit_neglog_derivatives_up_to_fourth(x, weight);
     let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(x);
     [-weight * log_cdf, d1, d2, d3, d4]
 }
 
-fn subset_partition_table() -> &'static Vec<Vec<Vec<usize>>> {
+/// Derivatives of log(x) through 4th order.
+pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
+    let x1 = x.max(1e-300);
+    let x2 = x1 * x1;
+    let x3 = x2 * x1;
+    let x4 = x3 * x1;
+    [x1.ln(), 1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4]
+}
+
+/// Derivatives of log φ(x) = -½x² - ½ln(2π) through 4th order.
+pub(crate) fn unary_derivatives_log_normal_pdf(x: f64) -> [f64; 5] {
+    let c = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    [-0.5 * x * x - c, -x, -1.0, 0.0, 0.0]
+}
+
+pub(crate) fn subset_partition_table() -> &'static Vec<Vec<Vec<usize>>> {
     fn build_partitions(mask: usize) -> Vec<Vec<usize>> {
         if mask == 0 {
             return vec![Vec::new()];
@@ -584,26 +599,26 @@ fn subset_partition_table() -> &'static Vec<Vec<Vec<usize>>> {
 }
 
 #[derive(Clone, Debug)]
-struct MultiDirJet {
-    n_dirs: usize,
-    coeffs: [f64; 16],
+pub(crate) struct MultiDirJet {
+    pub n_dirs: usize,
+    pub coeffs: [f64; 16],
 }
 
 impl MultiDirJet {
-    fn zero(n_dirs: usize) -> Self {
+    pub fn zero(n_dirs: usize) -> Self {
         Self {
             n_dirs,
             coeffs: [0.0; 16],
         }
     }
 
-    fn constant(n_dirs: usize, value: f64) -> Self {
+    pub fn constant(n_dirs: usize, value: f64) -> Self {
         let mut out = Self::zero(n_dirs);
         out.coeffs[0] = value;
         out
     }
 
-    fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
+    pub fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
         let mut out = Self::constant(n_dirs, base);
         for (idx, &value) in first.iter().enumerate() {
             out.coeffs[1usize << idx] = value;
@@ -611,19 +626,19 @@ impl MultiDirJet {
         out
     }
 
-    fn full_mask(&self) -> usize {
+    pub fn full_mask(&self) -> usize {
         (1usize << self.n_dirs) - 1
     }
 
-    fn coeff(&self, mask: usize) -> f64 {
+    pub fn coeff(&self, mask: usize) -> f64 {
         self.coeffs[mask]
     }
 
-    fn set_coeff(&mut self, mask: usize, value: f64) {
+    pub fn set_coeff(&mut self, mask: usize, value: f64) {
         self.coeffs[mask] = value;
     }
 
-    fn add(&self, other: &Self) -> Self {
+    pub fn add(&self, other: &Self) -> Self {
         let mut out = Self::zero(self.n_dirs);
         for mask in 0..=self.full_mask() {
             out.coeffs[mask] = self.coeffs[mask] + other.coeffs[mask];
@@ -631,7 +646,7 @@ impl MultiDirJet {
         out
     }
 
-    fn sub(&self, other: &Self) -> Self {
+    pub fn sub(&self, other: &Self) -> Self {
         let mut out = Self::zero(self.n_dirs);
         for mask in 0..=self.full_mask() {
             out.coeffs[mask] = self.coeffs[mask] - other.coeffs[mask];
@@ -639,7 +654,7 @@ impl MultiDirJet {
         out
     }
 
-    fn scale(&self, scalar: f64) -> Self {
+    pub fn scale(&self, scalar: f64) -> Self {
         let mut out = Self::zero(self.n_dirs);
         for mask in 0..=self.full_mask() {
             out.coeffs[mask] = self.coeffs[mask] * scalar;
@@ -647,7 +662,7 @@ impl MultiDirJet {
         out
     }
 
-    fn mul(&self, other: &Self) -> Self {
+    pub fn mul(&self, other: &Self) -> Self {
         let mut out = Self::zero(self.n_dirs);
         for mask in 0..=self.full_mask() {
             let mut total = 0.0;
@@ -664,7 +679,7 @@ impl MultiDirJet {
         out
     }
 
-    fn compose_unary(&self, derivs: [f64; 5]) -> Self {
+    pub fn compose_unary(&self, derivs: [f64; 5]) -> Self {
         let mut out = Self::constant(self.n_dirs, derivs[0]);
         let partitions = subset_partition_table();
         for mask in 1..=self.full_mask() {
@@ -1891,7 +1906,7 @@ impl BernoulliMarginalSlopeFamily {
             let (chunk_ll, chunk_grad, chunk_hess) = result?;
             ll += chunk_ll;
             gradient += &chunk_grad;
-            if let (Some(ref mut hmat), Some(chunk_h)) = (&mut hessian, chunk_hess) {
+            if let (Some(hmat), Some(chunk_h)) = (&mut hessian, chunk_hess) {
                 *hmat += &chunk_h;
             }
         }
@@ -3212,13 +3227,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);
             let fit = inner_fit(&family, &blocks, options)?;
             Ok(fit_score(&fit))
         },
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);
             let fit = inner_fit(&family, &blocks, options)?;

@@ -9651,9 +9651,6 @@ struct ExactJointDesignCache<'d> {
     last_eval: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
     rho_dim: usize,
     all_dims: Vec<usize>,
-    /// For block i, the per-term dims that belong to it start at
-    /// `block_term_offsets[i]` in the `all_dims` / `dims_per_term` layout.
-    block_term_offsets: Vec<usize>,
     block_term_counts: Vec<usize>,
 }
 
@@ -9667,14 +9664,10 @@ impl<'d> ExactJointDesignCache<'d> {
         let n_blocks = blocks.len();
         let mut realizers = Vec::with_capacity(n_blocks);
         let mut block_term_indices = Vec::with_capacity(n_blocks);
-        let mut block_term_offsets = Vec::with_capacity(n_blocks);
         let mut block_term_counts = Vec::with_capacity(n_blocks);
-        let mut term_cursor = 0usize;
 
         for (spec, design, terms) in blocks {
-            block_term_offsets.push(term_cursor);
             block_term_counts.push(terms.len());
-            term_cursor += terms.len();
             block_term_indices.push(terms);
             realizers.push(FrozenTermCollectionIncrementalRealizer::new(
                 data, spec, design,
@@ -9689,7 +9682,6 @@ impl<'d> ExactJointDesignCache<'d> {
             last_eval: None,
             rho_dim,
             all_dims,
-            block_term_offsets,
             block_term_counts,
         })
     }
@@ -9781,9 +9773,6 @@ impl<'d> ExactJointDesignCache<'d> {
         self.realizers.iter().map(|r| r.design()).collect()
     }
 
-    fn n_blocks(&self) -> usize {
-        self.realizers.len()
-    }
 }
 
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, CostFn, FitFn, ExactFn>(

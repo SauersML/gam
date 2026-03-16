@@ -1362,7 +1362,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &joint_setup,
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
-                |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let fit = {
                         let blocks = builder.build_blocks(
                             rho,
@@ -1376,7 +1376,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     };
                     Ok(gamlss_fit_score(&fit))
                 },
-                |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let fit = {
                         let blocks = builder.build_blocks(
                             rho,
@@ -1452,10 +1452,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut solved = run_exact_joint_spatial!()
         .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
 
-    builder.augment_result_designs(
-        &mut solved.designs[0],
-        &mut solved.designs[1],
-    );
+    {
+        let (left, right) = solved.designs.split_at_mut(1);
+        builder.augment_result_designs(&mut left[0], &mut right[0]);
+    }
 
     BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit: solved.fit,

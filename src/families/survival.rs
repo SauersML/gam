@@ -1420,7 +1420,7 @@ impl SurvivalDerivProvider {
 }
 
 impl crate::estimate::reml::unified::HessianDerivativeProvider for SurvivalDerivProvider {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
         // The trait provides v_k = H^{-1}(A_k beta_hat) (positive).
         // The survival method expects u_k = -H^{-1} A_k beta_hat = -v_k.
         let u_k = -v_k;
@@ -1428,8 +1428,8 @@ impl crate::estimate::reml::unified::HessianDerivativeProvider for SurvivalDeriv
             .model
             .survival_hessian_derivative_correction(&self.beta, &u_k)
         {
-            Ok(correction) => Some(correction),
-            Err(_) => None,
+            Ok(correction) => Ok(Some(correction)),
+            Err(e) => Err(e.to_string()),
         }
     }
 
