@@ -200,7 +200,7 @@ gam fit train.csv 'y ~ x1 + smooth(x2) + link(type=probit)' \
   --out probit.locscale.model.json
 ```
 
-The CLI exposes this path for Gaussian and binomial families, but current runtime behavior is still uneven enough that you should treat it as experimental and verify it on your exact formula/data combination before relying on it.
+The CLI exposes this path for Gaussian and binomial families, and for `Surv(...)` formulas it routes into the survival location-scale fitter. Runtime behavior is still uneven enough that you should treat it as experimental and verify it on your exact formula/data combination before relying on it.
 
 ### 3. Survival fits
 
@@ -218,6 +218,17 @@ Current survival likelihood modes:
 - `transformation`
 - `weibull`
 - `location-scale`
+
+Distributional survival fits can use a second formula for log-sigma:
+
+```bash
+gam fit train.csv \
+  'Surv(entry_time, exit_time, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
+  --predict-noise 'Surv(entry_time, exit_time, event) ~ smooth(age)' \
+  --out survival-ls.model.json
+```
+
+When `--predict-noise` is present on a `Surv(...)` formula, the CLI uses the survival `location-scale` fit path.
 
 Current survival-specific formula/config support:
 
@@ -360,7 +371,7 @@ Prediction, reporting, sampling, and generation expect the new data to match the
 
 - `diagnose` currently only exposes `--alo`
 - `diagnose --alo` is not supported for models containing `bounded(...)` coefficients
-- `--predict-noise` is exposed in the CLI, but current Gaussian and binomial location-scale fits still have rough edges; verify behavior on your exact workload before depending on that path
+- `--predict-noise` is exposed in the CLI, but current Gaussian, binomial, and survival location-scale fits still have rough edges; verify behavior on your exact workload before depending on that path
 - `linkwiggle(...)` belongs in the mean formula, not `--predict-noise`
 - Flexible links are only supported in specific binomial and survival paths
 - Some benchmark datasets in `bench/datasets/` are meant for harness scenarios rather than copy-paste README demos

@@ -331,6 +331,7 @@ struct SurvivalArgs {
     exit: String,
     event: String,
     formula: String,
+    predict_noise: Option<String>,
     survival_likelihood: String,
     survival_distribution: String,
     link: Option<String>,
@@ -568,10 +569,7 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), S
     }
 
     if ctx.is_survival {
-        return Err(
-            "Surv(...) formulas use survival fitting mode; remove binomial/location-scale-only flags (--predict-noise, --firth)"
-                .to_string(),
-        );
+        return Err("--firth is not supported for survival models".to_string());
     }
     if ctx.predict_noise {
         return Err(
@@ -664,12 +662,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             is_survival: true,
             link_choice: None,
         })?;
-        if args.predict_noise.is_some() {
-            return Err(
-                "Surv(...) formulas use survival fitting mode; remove binomial/location-scale-only flags (--predict-noise, --firth)"
-                    .to_string(),
-            );
-        }
         let rhs = formula_rhs_text(&formula_text)?;
         let formula_surv = parsed.survivalspec.clone();
         let surv_args = SurvivalArgs {
@@ -678,6 +670,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             exit,
             event,
             formula: rhs,
+            predict_noise: args.predict_noise.clone(),
             survival_likelihood: args.survival_likelihood.clone(),
             survival_distribution: formula_surv
                 .as_ref()
@@ -882,6 +875,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .as_ref()
         .map(|c| c.link)
         .unwrap_or_else(|| family_to_link(family));
+
+    if args.predict_noise.is_some()
+        && family == LikelihoodFamily::BinomialLogit
+        && link_choice.is_none()
+    {
+        family = LikelihoodFamily::BinomialProbit;
+        effective_link = family_to_link(family);
+    }
 
     let formula_linkwiggle = parsed.linkwiggle.clone();
     if parsed.timewiggle.is_some() {
@@ -1519,12 +1520,7 @@ fn run_fitwith_predict_noise(
     let fit_total_steps = if args.out.is_some() { 5 } else { 4 };
     let (noise_formula, parsed_noise) =
         parse_matching_auxiliary_formula(noise_formula_raw, &parsed.response, "--predict-noise")?;
-    if parsed_noise.linkwiggle.is_some() {
-        return Err(
-            "linkwiggle(...) is only supported in the mean formula, not --predict-noise"
-                .to_string(),
-        );
-    }
+    validate_auxiliary_formula_controls(&parsed_noise, "--predict-noise")?;
     progress.set_stage("fit", "building mean/noise term specifications");
     progress.start_secondary_workflow("Mean/Noise Terms", 2);
     let mut noisespec = build_termspec(&parsed_noise.terms, ds, col_map, inference_notes)?;
@@ -4744,7 +4740,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Err("survival dataset has no rows".to_string());
     }
 
-    let formula = format!("__survival__ ~ {}", args.formula);
+    let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+    let formula = format!("{response_expr} ~ {}", args.formula);
     let parsed = parse_formula(&formula)?;
     let formula_surv = parsed.survivalspec.clone();
     let formula_link = parsed.linkspec.clone();
@@ -4765,6 +4762,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         effective_args.sas_init = ls.sas_init.clone();
         effective_args.beta_logistic_init = ls.beta_logistic_init.clone();
     }
+    let predict_noise_formula = effective_args
+        .predict_noise
+        .as_deref()
+        .map(|raw| parse_matching_auxiliary_formula(raw, &response_expr, "--predict-noise"))
+        .transpose()?;
+    if let Some((_, parsed_noise)) = predict_noise_formula.as_ref() {
+        validate_auxiliary_formula_controls(parsed_noise, "--predict-noise")?;
+    }
 
     let survival_link_choice = parse_link_choice(effective_args.link.as_deref(), false)?;
     let effective_linkwiggle =
@@ -4783,7 +4788,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
         other => return Err(format!("unsupported --spec '{other}'; use net")),
     };
-    let likelihood_mode = parse_survival_likelihood_mode(&effective_args.survival_likelihood)?;
+    let requested_likelihood_mode =
+        parse_survival_likelihood_mode(&effective_args.survival_likelihood)?;
+    let likelihood_mode = if predict_noise_formula.is_some() {
+        match requested_likelihood_mode {
+            SurvivalLikelihoodMode::Weibull => {
+                return Err(
+                    "--predict-noise with Surv(...) requires survival location-scale; remove --survival-likelihood weibull"
+                        .to_string(),
+                );
+            }
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::LocationScale => {
+                SurvivalLikelihoodMode::LocationScale
+            }
+        }
+    } else {
+        requested_likelihood_mode
+    };
     if matches!(
         survival_link_choice.as_ref().map(|choice| &choice.mode),
         Some(LinkMode::Flexible)
@@ -4871,6 +4892,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     if args.scale_dimensions {
         enable_scale_dimensions(&mut termspec);
     }
+    let log_sigmaspec = if let Some((_, parsed_noise)) = predict_noise_formula.as_ref() {
+        let mut spec = build_termspec(&parsed_noise.terms, &ds, &col_map, &mut inference_notes)?;
+        if args.scale_dimensions {
+            enable_scale_dimensions(&mut spec);
+        }
+        spec
+    } else {
+        termspec.clone()
+    };
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
     let frozen_termspec = freeze_term_collectionspec(&termspec, &cov_design)?;
@@ -4993,7 +5023,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_beta: None,
                 },
                 thresholdspec: termspec.clone(),
-                log_sigmaspec: termspec.clone(),
+                log_sigmaspec: log_sigmaspec.clone(),
                 threshold_template: threshold_template.clone(),
                 log_sigma_template: log_sigma_template.clone(),
                 linkwiggle_block: None,
@@ -5103,6 +5133,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
+            payload.formula_noise = predict_noise_formula
+                .as_ref()
+                .map(|(noise_formula, _)| noise_formula.clone());
             payload.survival_beta_time = Some(fit.fit.fit.beta_time().to_vec());
             payload.survival_beta_threshold = Some(fit.fit.fit.beta_threshold().to_vec());
             payload.survival_beta_log_sigma = Some(fit.fit.fit.beta_log_sigma().to_vec());
@@ -8090,12 +8123,50 @@ fn parse_matching_auxiliary_formula(
 ) -> Result<(String, ParsedFormula), String> {
     let normalized_formula = normalizenoise_formula(formula, response);
     let parsed_formula = parse_formula(&normalized_formula)?;
-    if parsed_formula.response != response {
+    let responses_match = if parsed_formula.response == response {
+        true
+    } else {
+        match (
+            parse_surv_response(response)?,
+            parse_surv_response(&parsed_formula.response)?,
+        ) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => false,
+        }
+    };
+    if !responses_match {
         return Err(format!(
-            "{flag_name} must use the same response column as the main formula"
+            "{flag_name} must use the same response expression as the main formula"
         ));
     }
     Ok((normalized_formula, parsed_formula))
+}
+
+fn validate_auxiliary_formula_controls(
+    parsed_formula: &ParsedFormula,
+    flag_name: &str,
+) -> Result<(), String> {
+    if parsed_formula.linkwiggle.is_some() {
+        return Err(format!(
+            "linkwiggle(...) is only supported in the main formula, not {flag_name}"
+        ));
+    }
+    if parsed_formula.timewiggle.is_some() {
+        return Err(format!(
+            "timewiggle(...) is only supported in the main survival formula, not {flag_name}"
+        ));
+    }
+    if parsed_formula.linkspec.is_some() {
+        return Err(format!(
+            "link(...) is only supported in the main formula, not {flag_name}"
+        ));
+    }
+    if parsed_formula.survivalspec.is_some() {
+        return Err(format!(
+            "survmodel(...) is only supported in the main survival formula, not {flag_name}"
+        ));
+    }
+    Ok(())
 }
 
 fn print_inference_summary(notes: &[String]) {
@@ -10938,6 +11009,21 @@ mod tests {
     }
 
     #[test]
+    fn cli_firth_validation_rejects_survival_models() {
+        let err = validate_cli_firth_configuration(CliFirthValidation {
+            enabled: true,
+            family: LikelihoodFamily::RoystonParmar,
+            predict_noise: false,
+            has_bounded_terms: false,
+            is_survival: true,
+            link_choice: None,
+        })
+        .expect_err("survival Firth should be rejected");
+
+        assert_eq!(err, "--firth is not supported for survival models");
+    }
+
+    #[test]
     fn cli_predict_noise_without_explicit_link_keeps_binomial_logit_base_link() {
         let td = tempdir().expect("tempdir");
         let train_path = td.path().join("train.csv");
@@ -10967,6 +11053,66 @@ mod tests {
             }
             other => panic!("expected location-scale family state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_surv_predict_noise_routes_to_survival_location_scale() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("survival_train.csv");
+        let model_path = td.path().join("survival.model.json");
+        fs::write(
+            &train_path,
+            "entry,exit,event\n\
+             10,15,1\n\
+             20,35,0\n\
+             40,60,1\n\
+             80,100,0\n\
+             120,150,1\n\
+             160,220,1\n",
+        )
+        .expect("write survival training csv");
+
+        run_fit(FitArgs {
+            data: train_path,
+            formula_positional: "Surv(entry, exit, event) ~ 1".to_string(),
+            predict_noise: Some("1".to_string()),
+            logslope_formula: None,
+            z_column: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
+            transformation_normal: false,
+            firth: false,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 2,
+            time_num_internal_knots: 4,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            adaptive_regularization: false,
+            scale_dimensions: false,
+            out: Some(model_path.clone()),
+        })
+        .expect("survival predict-noise fit should succeed");
+
+        let saved = SavedModel::load_from_path(&model_path).expect("load fitted survival model");
+        assert_eq!(saved.formula, "Surv(entry, exit, event) ~ 1");
+        assert_eq!(
+            saved.formula_noise.as_deref(),
+            Some("Surv(entry, exit, event) ~ 1")
+        );
+        assert_eq!(saved.survival_likelihood.as_deref(), Some("location-scale"));
+        assert!(saved.survival_beta_log_sigma.is_some());
+        assert!(saved.resolved_termspec_noise.is_some());
     }
 
     #[test]
@@ -12490,6 +12636,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "transformation".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: None,
@@ -12526,6 +12673,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "transformation".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: None,
@@ -13001,6 +13149,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13045,6 +13194,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13083,6 +13233,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13121,6 +13272,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13165,6 +13317,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13203,6 +13356,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13241,6 +13395,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("loglog".to_string()),
@@ -13307,6 +13462,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13344,6 +13500,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13383,6 +13540,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
@@ -13738,6 +13896,7 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
+            predict_noise: None,
             survival_likelihood: "transformation".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: None,
@@ -14187,8 +14346,21 @@ mod tests {
             .expect_err("mismatched response should fail");
         assert_eq!(
             err,
-            "--predict-noise must use the same response column as the main formula"
+            "--predict-noise must use the same response expression as the main formula"
         );
+    }
+
+    #[test]
+    fn auxiliary_formula_accepts_matching_surv_response_with_different_spacing() {
+        let response = "Surv(entry, exit, event)";
+        let (normalized, parsed) = parse_matching_auxiliary_formula(
+            "Surv(entry,exit,event) ~ s(x)",
+            response,
+            "--predict-noise",
+        )
+        .expect("matching Surv auxiliary formula");
+        assert_eq!(normalized, "Surv(entry,exit,event) ~ s(x)");
+        assert_eq!(parsed.response, "Surv(entry,exit,event)");
     }
 
     #[test]

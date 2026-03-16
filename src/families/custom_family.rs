@@ -978,29 +978,21 @@ pub fn blockwise_fit_from_parts(
     .map_err(|e| e.to_string())
 }
 
-fn finite_penalizedobjective(log_likelihood: f64, penalty_value: f64, reml_term: f64) -> f64 {
-    // The exact custom-family path can produce a finite inner mode together
-    // with a numerically non-finite REML/logdet correction when linear algebra
-    // on the determinant surface becomes ill-conditioned. The fit object should
-    // still report a finite scalar objective whenever the penalized likelihood
-    // itself is finite, because downstream callers and tests use this value as
-    // a sanity check on the returned fit state rather than as a certificate
-    // that every intermediate spectral calculation succeeded exactly.
-    //
-    // Priority:
-    // 1. full penalized objective with REML/logdet term
-    // 2. plain penalized likelihood  -loglik + penalty
-    // 3. penalty only
-    // 4. zero as an ultimate finite sentinel
+fn checked_penalizedobjective(
+    log_likelihood: f64,
+    penalty_value: f64,
+    reml_term: f64,
+    context: &str,
+) -> Result<f64, String> {
     let objective = -log_likelihood + penalty_value + reml_term;
     if objective.is_finite() {
-        objective
-    } else if (-log_likelihood + penalty_value).is_finite() {
-        -log_likelihood + penalty_value
-    } else if penalty_value.is_finite() {
-        penalty_value
+        Ok(objective)
     } else {
-        0.0
+        Err(format!(
+            "{context}: non-finite penalized objective \
+             (log_likelihood={log_likelihood}, penalty_value={penalty_value}, \
+             reml_term={reml_term}, objective={objective})"
+        ))
     }
 }
 
@@ -3647,7 +3639,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily>(
 }
 
 /// Build a closure computing dH[v] using exact Newton derivatives on synced states.
-/// The closure checks for non-finite values and replaces with zeros.
+/// Non-finite derivative output is treated as a hard error.
 fn exact_newton_dh_closure<'a, F: CustomFamily>(
     family: &'a F,
     synced_states: Arc<Vec<ParameterBlockState>>,
@@ -3667,14 +3659,14 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
         };
         match h_rho {
             Some(h) => {
-                if h.iter().all(|v| v.is_finite()) {
+                if h.iter().any(|v| !v.is_finite()) {
+                    Err("joint exact-newton dH returned non-finite values".to_string())
+                } else {
                     Ok(Some(symmetrized_square_matrix(
                         h,
                         total,
                         "joint exact-newton dH shape mismatch",
                     )?))
-                } else {
-                    Ok(Some(Array2::<f64>::zeros((total, total))))
                 }
             }
             None => {
@@ -3941,27 +3933,6 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     if let Some(h_joint_source) = exact_joint_source {
         match h_joint_source {
             JointHessianSource::Operator { apply, diagonal } => {
-                let preconditioner_diag =
-                    joint_penalty_preconditioner_diag(&diagonal, &ranges, &s_lambdas, 0.0);
-                let apply_h = Arc::clone(&apply);
-                let apply_ranges = ranges.clone();
-                let apply_s = Arc::new(s_lambdas.clone());
-                if let Ok(op) = MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
-                    let mut out = match apply_h(v) {
-                        Ok(out) => out,
-                        Err(error) => {
-                            log::warn!("joint logdet operator matvec failed: {error}");
-                            Array1::<f64>::zeros(total)
-                        }
-                    };
-                    let penalty =
-                        apply_joint_block_penalty(&apply_ranges, apply_s.as_ref(), v, 0.0);
-                    out += &penalty;
-                    out
-                }) {
-                    return Ok((op.logdet(), penalty_logdet_s_total));
-                }
-
                 let mut h = materialize_joint_hessian_source(
                     &JointHessianSource::Operator { apply, diagonal },
                     total,
@@ -4749,9 +4720,12 @@ unsafe impl Send for BorrowedJointDerivProvider<'_> {}
 unsafe impl Sync for BorrowedJointDerivProvider<'_> {}
 
 impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Option<Array2<f64>> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         let neg_v = -v_k;
-        (self.compute_dh)(&neg_v).ok().flatten()
+        (self.compute_dh)(&neg_v)
     }
 
     fn hessian_second_derivative_correction(
@@ -4759,13 +4733,19 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         v_k: &Array1<f64>,
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        let d2h = self.compute_d2h.as_ref()?;
-        let term1 = (self.compute_dh)(u_kl).ok().flatten()?;
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(d2h) = self.compute_d2h.as_ref() else {
+            return Ok(None);
+        };
+        let Some(term1) = (self.compute_dh)(u_kl)? else {
+            return Ok(None);
+        };
         let neg_v_k = -v_k;
         let neg_v_l = -v_l;
-        let term2 = d2h(&neg_v_l, &neg_v_k).ok().flatten()?;
-        Some(term1 + &term2)
+        let Some(term2) = d2h(&neg_v_l, &neg_v_k)? else {
+            return Ok(None);
+        };
+        Ok(Some(term1 + &term2))
     }
 
     fn has_corrections(&self) -> bool {
@@ -4987,52 +4967,21 @@ fn joint_outer_evaluate(
                     }
                 }
                 JointHessianSource::Operator { apply, diagonal } => {
-                    let preconditioner_diag = joint_penalty_preconditioner_diag(
-                        &diagonal,
+                    let mut j_for_traces = materialize_joint_hessian_source(
+                        &JointHessianSource::Operator { apply, diagonal },
+                        total,
+                        "joint exact-newton operator materialization",
+                    )?;
+                    add_joint_penalty_to_matrix(
+                        &mut j_for_traces,
                         &ranges_vec,
                         s_lambdas.as_ref(),
-                        trace_diagonal_ridge,
+                        joint_trace_diagonal_ridge,
                     );
-                    let apply_h = Arc::clone(&apply);
-                    let apply_ranges = ranges_vec.clone();
-                    let apply_s = Arc::clone(&s_lambdas);
-                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
-                        let mut out = match apply_h(v) {
-                            Ok(out) => out,
-                            Err(error) => {
-                                log::warn!("joint exact-newton operator matvec failed: {error}");
-                                Array1::<f64>::zeros(total)
-                            }
-                        };
-                        let penalty = apply_joint_block_penalty(
-                            &apply_ranges,
-                            apply_s.as_ref(),
-                            v,
-                            trace_diagonal_ridge,
-                        );
-                        out += &penalty;
-                        out
-                    }) {
-                        Ok(op) => Box::new(op),
-                        Err(_) => {
-                            let mut j_for_traces = materialize_joint_hessian_source(
-                                &JointHessianSource::Operator { apply, diagonal },
-                                total,
-                                "joint exact-newton operator materialization",
-                            )?;
-                            add_joint_penalty_to_matrix(
-                                &mut j_for_traces,
-                                &ranges_vec,
-                                s_lambdas.as_ref(),
-                                joint_trace_diagonal_ridge,
-                            );
-                            Box::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
-                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
-                                )?,
-                            )
-                        }
-                    }
+                    Box::new(
+                        BlockCoupledOperator::from_joint_hessian(&j_for_traces)
+                            .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
+                    )
                 }
             }
         } else {
@@ -6991,6 +6940,13 @@ pub fn fit_custom_family<F: CustomFamily>(
         };
         let no_pen = vec![Array1::zeros(0); specs.len()];
         let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen);
+        let penalized_objective = checked_penalizedobjective(
+            inner.log_likelihood,
+            inner.penalty_value,
+            reml_term,
+            "custom-family fit without smoothing parameters",
+        )
+        .map_err(CustomFamilyError::Optimization)?;
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
                 block_states: inner.block_states,
@@ -6998,11 +6954,7 @@ pub fn fit_custom_family<F: CustomFamily>(
                 log_lambdas: Array1::zeros(0),
                 lambdas: Array1::zeros(0),
                 covariance_conditional,
-                penalized_objective: finite_penalizedobjective(
-                    inner.log_likelihood,
-                    inner.penalty_value,
-                    reml_term,
-                ),
+                penalized_objective,
                 outer_iterations: 0,
                 outer_gradient_norm: 0.0,
                 inner_cycles: inner.cycles,
@@ -7197,6 +7149,21 @@ pub fn fit_custom_family<F: CustomFamily>(
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
+    let penalized_objective = checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        if include_exact_newton_logdet_h(family, options) {
+            0.5 * inner.block_logdet_h
+        } else {
+            0.0
+        } - if include_exact_newton_logdet_s(family, options) {
+            0.5 * inner.block_logdet_s
+        } else {
+            0.0
+        },
+        "custom-family fit final outer refit",
+    )
+    .map_err(CustomFamilyError::Optimization)?;
     blockwise_fit_from_parts(
         BlockwiseFitResultParts {
             block_states: inner.block_states,
@@ -7204,25 +7171,9 @@ pub fn fit_custom_family<F: CustomFamily>(
             log_lambdas: rho_star.clone(),
             lambdas: rho_star.mapv(f64::exp),
             covariance_conditional,
-            penalized_objective: finite_penalizedobjective(
-                inner.log_likelihood,
-                inner.penalty_value,
-                if include_exact_newton_logdet_h(family, options) {
-                    0.5 * inner.block_logdet_h
-                } else {
-                    0.0
-                } - if include_exact_newton_logdet_s(family, options) {
-                    0.5 * inner.block_logdet_s
-                } else {
-                    0.0
-                },
-            ),
+            penalized_objective,
             outer_iterations: outer_iters,
-            outer_gradient_norm: if outer_grad_norm.is_finite() {
-                outer_grad_norm
-            } else {
-                0.0
-            },
+            outer_gradient_norm: outer_grad_norm,
             inner_cycles: inner.cycles,
             outer_converged: outer_result.converged,
             geometry,
@@ -9321,6 +9272,81 @@ mod tests {
             "inner fit should succeed with finite Hessian: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn checked_penalizedobjective_rejects_non_finite_values() {
+        let err = checked_penalizedobjective(-1.0, 0.5, f64::NAN, "test objective")
+            .expect_err("non-finite objective should fail loudly");
+        assert!(
+            err.contains("non-finite penalized objective"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn exact_newton_dh_closure_rejects_non_finite_directional_derivative() {
+        #[derive(Clone)]
+        struct OneBlockNonFiniteJointDhFamily;
+
+        impl CustomFamily for OneBlockNonFiniteJointDhFamily {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                let beta = block_states
+                    .first()
+                    .ok_or_else(|| "missing block 0".to_string())?
+                    .beta
+                    .clone();
+                Ok(FamilyEvaluation {
+                    log_likelihood: -0.5 * beta.dot(&beta),
+                    blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                        gradient: beta.mapv(|v| -v),
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    }],
+                })
+            }
+
+            fn exact_newton_joint_hessian(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<Option<Array2<f64>>, String> {
+                let _ = block_states;
+                Ok(Some(array![[1.0]]))
+            }
+
+            fn exact_newton_joint_hessian_directional_derivative(
+                &self,
+                block_states: &[ParameterBlockState],
+                d_beta_flat: &Array1<f64>,
+            ) -> Result<Option<Array2<f64>>, String> {
+                let _ = block_states;
+                let _ = d_beta_flat;
+                Ok(Some(array![[f64::NAN]]))
+            }
+        }
+
+        let family = OneBlockNonFiniteJointDhFamily;
+        let specs = vec![ParameterBlockSpec {
+            name: "beta".to_string(),
+            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((2, 1), 1.0))),
+            offset: Array1::zeros(2),
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        }];
+        let states = vec![ParameterBlockState {
+            beta: array![0.0],
+            eta: Array1::zeros(2),
+        }];
+        let synced_states = Arc::new(
+            synchronized_states_from_flat_beta(&family, &specs, &states, &array![0.0])
+                .expect("sync states for exact_newton_dh_closure"),
+        );
+        let compute_dh = exact_newton_dh_closure(&family, synced_states, &specs, 1, None);
+        let err = compute_dh(&array![1.0]).expect_err("non-finite dH should fail loudly");
+        assert!(err.contains("non-finite"), "unexpected error: {err}");
     }
 
     #[test]

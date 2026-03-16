@@ -20,6 +20,10 @@ use crate::families::survival_location_scale::{
     fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
     select_survival_link_wiggle_basis_from_pilot,
 };
+use crate::families::survival_marginal_slope::{
+    SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec,
+    fit_survival_marginal_slope_terms,
+};
 use crate::families::transformation_normal::{
     TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
     fit_transformation_normal,
@@ -91,6 +95,13 @@ pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
+pub struct SurvivalMarginalSlopeFitRequest<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub spec: SurvivalMarginalSlopeTermSpec,
+    pub options: BlockwiseFitOptions,
+    pub kappa_options: SpatialLengthScaleOptimizationOptions,
+}
+
 pub struct TransformationNormalFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub response: Array1<f64>,
@@ -107,6 +118,7 @@ pub enum FitRequest<'a> {
     BinomialLocationScale(BinomialLocationScaleFitRequest<'a>),
     SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest<'a>),
+    SurvivalMarginalSlope(SurvivalMarginalSlopeFitRequest<'a>),
     TransformationNormal(TransformationNormalFitRequest<'a>),
 }
 
@@ -133,6 +145,7 @@ pub enum FitResult {
     BinomialLocationScale(BinomialLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitResult),
+    SurvivalMarginalSlope(SurvivalMarginalSlopeFitResult),
     TransformationNormal(TransformationNormalFitResult),
 }
 
@@ -590,6 +603,17 @@ fn fit_bernoulli_marginal_slope_model(
     )
 }
 
+fn fit_survival_marginal_slope_model(
+    request: SurvivalMarginalSlopeFitRequest<'_>,
+) -> Result<SurvivalMarginalSlopeFitResult, String> {
+    fit_survival_marginal_slope_terms(
+        request.data,
+        request.spec,
+        &request.options,
+        &request.kappa_options,
+    )
+}
+
 fn fit_transformation_normal_model(
     request: TransformationNormalFitRequest<'_>,
 ) -> Result<TransformationNormalFitResult, String> {
@@ -618,6 +642,9 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
         }
         FitRequest::BernoulliMarginalSlope(request) => {
             fit_bernoulli_marginal_slope_model(request).map(FitResult::BernoulliMarginalSlope)
+        }
+        FitRequest::SurvivalMarginalSlope(request) => {
+            fit_survival_marginal_slope_model(request).map(FitResult::SurvivalMarginalSlope)
         }
         FitRequest::TransformationNormal(request) => {
             fit_transformation_normal_model(request).map(FitResult::TransformationNormal)
