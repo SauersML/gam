@@ -309,6 +309,7 @@ fn stress_test_firthgradientvs_conditioning() {
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
         let rho = array![0.0];
         let Ok((analytic, _)) = evaluate_externalgradients(

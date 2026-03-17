@@ -7802,6 +7802,7 @@ fn external_opts_for_design(
         firth_bias_reduction: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     }
 }
 

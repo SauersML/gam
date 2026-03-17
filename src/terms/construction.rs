@@ -3179,4 +3179,141 @@ mod tests {
         assert!(s[[0, 0]] > 0.0);
         assert!(s[[1, 1]] > 0.0);
     }
+
+    #[test]
+    fn kronecker_reparam_logdet_matches_dense() {
+        // 2D tensor product: q1=3, q2=4.
+        // Marginal penalties: second-order difference matrices.
+        let q1 = 3;
+        let q2 = 4;
+        let s1 = {
+            let mut s = Array2::<f64>::zeros((q1, q1));
+            // D2' D2 for order 2 on 3 points: [[1,-2,1],[-2,4,-2],[1,-2,1]]... simplified
+            s[[0, 0]] = 1.0;
+            s[[0, 1]] = -1.0;
+            s[[1, 0]] = -1.0;
+            s[[1, 1]] = 2.0;
+            s[[1, 2]] = -1.0;
+            s[[2, 1]] = -1.0;
+            s[[2, 2]] = 1.0;
+            s
+        };
+        let s2 = {
+            let mut s = Array2::<f64>::zeros((q2, q2));
+            s[[0, 0]] = 1.0;
+            s[[0, 1]] = -1.0;
+            s[[1, 0]] = -1.0;
+            s[[1, 1]] = 2.0;
+            s[[1, 2]] = -1.0;
+            s[[2, 1]] = -1.0;
+            s[[2, 2]] = 2.0;
+            s[[2, 3]] = -1.0;
+            s[[3, 2]] = -1.0;
+            s[[3, 3]] = 1.0;
+            s
+        };
+
+        let lambdas = [2.5, 1.3];
+        let ridge = 1e-4;
+
+        // Build dense Kronecker penalty: λ1 (I⊗S1) + λ2 (S2⊗I) + ridge I
+        // Wait — convention: I_q2 ⊗ S1 + S2 ⊗ I_q1 (matches tensor product ordering).
+        let p = q1 * q2;
+        let i1 = Array2::<f64>::eye(q1);
+        let i2 = Array2::<f64>::eye(q2);
+        let s1_kron = kronecker_product(&i2, &s1); // I_q2 ⊗ S1 = (q1*q2) x (q1*q2)
+
+        // Actually the standard tensor ordering for our code is:
+        // dim 0 varies slowest: penalty_dim0 = I_{q1} ⊗ ... but let me just do it simply.
+        // For 2D: penalty_0 = S1 ⊗ I_{q2}, penalty_1 = I_{q1} ⊗ S2
+        let pen0 = kronecker_product(&s1, &i2);
+        let pen1 = kronecker_product(&i1, &s2);
+        let mut s_dense = Array2::<f64>::zeros((p, p));
+        s_dense.scaled_add(lambdas[0], &pen0);
+        s_dense.scaled_add(lambdas[1], &pen1);
+        for i in 0..p {
+            s_dense[[i, i]] += ridge;
+        }
+
+        // Dense eigendecomposition for reference logdet.
+        let (evals_dense, _) = s_dense
+            .eigh(faer::Side::Lower)
+            .unwrap();
+        let tol = 1e-12;
+        let ref_logdet: f64 = evals_dense
+            .iter()
+            .filter(|&&v| v > tol)
+            .map(|&v| v.ln())
+            .sum();
+
+        // Kronecker reparameterization engine.
+        let marginal_designs = vec![
+            Array2::<f64>::eye(q1), // dummy designs
+            Array2::<f64>::eye(q2),
+        ];
+        let kron_result = super::kronecker_reparameterization_engine(
+            &marginal_designs,
+            &[s1, s2],
+            &[q1, q2],
+            &lambdas,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let diff = (kron_result.log_det - ref_logdet).abs();
+        assert!(
+            diff < 1e-8,
+            "Kronecker logdet {:.10} vs dense {:.10}, diff={:.3e}",
+            kron_result.log_det,
+            ref_logdet,
+            diff,
+        );
+
+        // Also check derivatives via finite differences.
+        let eps = 1e-5;
+        for k in 0..2 {
+            let mut lam_plus = lambdas.to_vec();
+            lam_plus[k] *= (1.0 + eps);
+            let mut lam_minus = lambdas.to_vec();
+            lam_minus[k] *= (1.0 - eps);
+            let result_plus = super::kronecker_reparameterization_engine(
+                &marginal_designs,
+                &[s1.clone(), s2.clone()],
+                &[q1, q2],
+                &lam_plus,
+                false,
+                None,
+            )
+            .unwrap();
+            let result_minus = super::kronecker_reparameterization_engine(
+                &marginal_designs,
+                &[s1.clone(), s2.clone()],
+                &[q1, q2],
+                &lam_minus,
+                false,
+                None,
+            )
+            .unwrap();
+            // d(logdet)/d(rho_k) ≈ (logdet(λ*(1+ε)) - logdet(λ*(1-ε))) / (2ε)
+            // But rho = log(lambda), so d(logdet)/d(rho_k) = λ_k * d(logdet)/d(λ_k)
+            // FD in rho: shift rho by eps => lambda * exp(eps) ≈ lambda * (1 + eps)
+            let fd_deriv =
+                (result_plus.log_det - result_minus.log_det) / (2.0 * eps * lambdas[k]);
+            // The engine reports d/d(rho_k) = lambda_k * d/d(lambda_k)
+            let analytic_deriv = kron_result.det1[k];
+            let rel_err = if analytic_deriv.abs() > 1e-10 {
+                (fd_deriv * lambdas[k] - analytic_deriv).abs() / analytic_deriv.abs()
+            } else {
+                (fd_deriv * lambdas[k] - analytic_deriv).abs()
+            };
+            assert!(
+                rel_err < 1e-4,
+                "det1[{k}] mismatch: analytic={:.8}, fd={:.8}, rel_err={:.3e}",
+                analytic_deriv,
+                fd_deriv * lambdas[k],
+                rel_err,
+            );
+        }
+    }
 }
