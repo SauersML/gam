@@ -179,6 +179,51 @@ pub trait HessianOperator: Send + Sync {
         }
     }
 
+    /// tr(G_ε(H) · A_block) where A_block is a p_block × p_block matrix
+    /// embedded at rows/columns [start..end].
+    ///
+    /// This avoids materializing the full p×p matrix for block-structured
+    /// penalties. The default implementation builds the full matrix and
+    /// delegates to `trace_logdet_gradient`; spectral backends override
+    /// this with O(p_block × active_rank) work.
+    fn trace_logdet_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        let p = self.dim();
+        let mut full = Array2::<f64>::zeros((p, p));
+        let bs = end - start;
+        for i in 0..bs {
+            for j in 0..bs {
+                full[[start + i, start + j]] = scale * block[[i, j]];
+            }
+        }
+        self.trace_logdet_gradient(&full)
+    }
+
+    /// tr(H₊⁻¹ · A_block) where A_block is embedded at [start..end].
+    /// Same block-local optimization as `trace_logdet_block_local`.
+    fn trace_hinv_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        let p = self.dim();
+        let mut full = Array2::<f64>::zeros((p, p));
+        let bs = end - start;
+        for i in 0..bs {
+            for j in 0..bs {
+                full[[start + i, start + j]] = scale * block[[i, j]];
+            }
+        }
+        self.trace_hinv_product(&full)
+    }
+
     /// Cross-trace for the logdet Hessian:
     /// `∂²_{ij} log|R_ε(H)| = tr(G_ε Ḧ_{ij}) + spectral_cross(Ḣ_i, Ḣ_j)`.
     ///
@@ -2541,6 +2586,11 @@ pub fn reml_laml_evaluate(
             if coord.uses_operator_fast_path() {
                 let op = coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref());
                 0.5 * hop.trace_logdet_h_k_operator(&op, None)
+            } else if coord.is_block_local() && rho_corrections[idx].is_none() {
+                // Block-local penalty with no observation correction:
+                // compute trace using only the block slice of the eigenbasis.
+                let (block, start, end) = coord.scaled_block_local(1.0);
+                0.5 * hop.trace_logdet_block_local(&block, lambdas[idx], start, end)
             } else {
                 let mut a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
                 if let Some(corr) = rho_corrections[idx].as_ref() {
@@ -3134,11 +3184,18 @@ fn compute_outer_hessian(
             let h_kl_trace = if kk == ll {
                 // Diagonal: Ḧ_{kk} = Aₖ + correction(β_{kk}, vₖ, vₖ)
                 // Base is tr(G_ε Aₖ), NOT tr(G_ε Ḣₖ).
-                let base = hop.trace_logdet_gradient(&a_k_matrices[kk]);
+                let base = if solution.penalty_coords[kk].is_block_local() {
+                    let (block, start, end) =
+                        solution.penalty_coords[kk].scaled_block_local(1.0);
+                    hop.trace_logdet_block_local(&block, lambdas[kk], start, end)
+                } else {
+                    hop.trace_logdet_gradient(&a_k_matrices[kk])
+                };
                 if effective_deriv.has_corrections() {
                     // β_{kk} RHS = Ḣₖ vₖ + Aₖ vₖ − Aₖ β̂
+                    // Use scaled_matvec for block-local penalty efficiency.
                     let mut rhs = h_k_matrices[kk].dot(&v_ks[kk]);
-                    rhs += &a_k_matrices[kk].dot(&v_ks[kk]);
+                    rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[kk], lambdas[kk]);
                     rhs -= &a_k_betas[kk];
 
                     if let Some(ref z_c) = adjoint_z_c {
@@ -3168,7 +3225,7 @@ fn compute_outer_hessian(
                 // Off-diagonal: Ḧ_{kl} = correction(β_{kl}, vₖ, vₗ) only (no Aₖ base).
                 if effective_deriv.has_corrections() {
                     let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-                    rhs += &a_k_matrices[kk].dot(&v_ks[ll]);
+                    rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], lambdas[kk]);
 
                     if let Some(ref z_c) = adjoint_z_c {
                         let c_trace = rhs.dot(z_c);
@@ -3261,7 +3318,7 @@ fn compute_outer_hessian(
                         solution.ext_coords[ext_idx].drift.apply(&v_ks[rho_idx])
                     };
                     let mut rhs = ext_h_v_rho;
-                    rhs += &a_k_matrices[rho_idx].dot(&ext_v[ext_idx]);
+                    rhs += &solution.penalty_coords[rho_idx].scaled_matvec(&ext_v[ext_idx], lambdas[rho_idx]);
                     rhs -= &pair.g;
 
                     // Ḧ_{rho,ext}: second Hessian drift.
@@ -3563,6 +3620,9 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         let trace_term = if coord.uses_operator_fast_path() {
             let op = coord.scaled_operator(lambdas[idx], None);
             hop.trace_hinv_operator(&op)
+        } else if coord.is_block_local() {
+            let (block, start, end) = coord.scaled_block_local(1.0);
+            hop.trace_hinv_block_local(&block, lambdas[idx], start, end)
         } else {
             let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
             hop.trace_hinv_h_k(&a_k_matrix, None)
@@ -4550,6 +4610,41 @@ impl HessianOperator for DenseSpectralOperator {
             .zip(self.g_factor.iter())
             .map(|(&a, &g)| a * g)
             .sum()
+    }
+
+    fn trace_logdet_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        // tr(G_ε A) = Σ (A·G ⊙ G) for block-local A.
+        // Only needs G[start..end, :] — O(block² × rank) instead of O(p² × rank).
+        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
+        let ag = block.dot(&g_block);
+        scale
+            * ag.iter()
+                .zip(g_block.iter())
+                .map(|(&a, &g)| a * g)
+                .sum::<f64>()
+    }
+
+    fn trace_hinv_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        // tr(H_reg⁻¹ A) = Σ (A·W ⊙ W) for block-local A.
+        let w_block = self.w_factor.slice(ndarray::s![start..end, ..]);
+        let aw = block.dot(&w_block);
+        scale
+            * aw.iter()
+                .zip(w_block.iter())
+                .map(|(&a, &w)| a * w)
+                .sum::<f64>()
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
