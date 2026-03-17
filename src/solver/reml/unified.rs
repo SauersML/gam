@@ -809,9 +809,9 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 /// where u_kl = H⁻¹(−g_kl + Ḣ_l v_k + Ḣ_k v_l) is the second-order
 /// IFT mode response.
 ///
-/// # Relationship to Faà di Bruno
+/// # Relationship to Arbogast
 ///
-/// The five-term decomposition arises from the Faà di Bruno formula for the
+/// The five-term decomposition arises from the Arbogast formula for the
 /// second derivative of the composed map ρ → β̂(ρ) → J(β̂) → J'WJ. Each
 /// differentiation of J'WJ produces terms from:
 /// - Differentiating J (Jacobian drift, terms 2-4)
