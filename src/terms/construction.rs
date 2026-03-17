@@ -1541,8 +1541,11 @@ pub fn canonicalize_penalty_specs(
 }
 
 /// Creates a balanced penalty root from canonical penalties.
-/// Same algorithm as `create_balanced_penalty_root`, but avoids materializing
-/// individual p x p penalty matrices.
+///
+/// When all penalties have non-overlapping col_ranges, the balanced sum is
+/// block-diagonal and eigendecomposition is done per-block at O(Σ p_k³)
+/// instead of the global O(p³). Falls back to the global path when penalties
+/// overlap.
 pub fn create_balanced_penalty_root_from_canonical(
     penalties: &[CanonicalPenalty],
     p: usize,
@@ -1551,45 +1554,130 @@ pub fn create_balanced_penalty_root_from_canonical(
         return Ok(Array2::zeros((0, p)));
     }
 
-    let mut s_balanced = Array2::zeros((p, p));
-
+    // Group penalties by col_range.
+    let mut block_groups: BTreeMap<(usize, usize), Vec<&CanonicalPenalty>> = BTreeMap::new();
     for cp in penalties {
         if cp.rank() == 0 {
             continue;
         }
-        let local = cp.local_penalty();
-        let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if frob_norm > 1e-12 {
-            let r = &cp.col_range;
-            s_balanced
-                .slice_mut(s![r.start..r.end, r.start..r.end])
-                .scaled_add(1.0 / frob_norm, &local);
-        }
+        let key = (cp.col_range.start, cp.col_range.end);
+        block_groups.entry(key).or_default().push(cp);
     }
 
-    let (eigenvalues, eigenvectors) =
-        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
-
-    let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-    let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-    let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-    if penalty_rank == 0 {
+    if block_groups.is_empty() {
         return Ok(Array2::zeros((0, p)));
     }
 
-    let mut eb = Array2::zeros((p, penalty_rank));
-    let mut col_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = eigenvectors.column(i);
-            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
-            col_idx += 1;
+    // Check for overlapping ranges.
+    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
+    let mut overlapping = false;
+    for i in 1..ranges.len() {
+        if ranges[i].0 < ranges[i - 1].1 {
+            overlapping = true;
+            break;
         }
     }
 
-    Ok(eb.t().to_owned())
+    if overlapping {
+        // Fallback: accumulate into p × p and eigendecompose globally.
+        let mut s_balanced = Array2::zeros((p, p));
+        for cp in penalties {
+            if cp.rank() == 0 {
+                continue;
+            }
+            let local = cp.local_penalty();
+            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            if frob_norm > 1e-12 {
+                let r = &cp.col_range;
+                s_balanced
+                    .slice_mut(s![r.start..r.end, r.start..r.end])
+                    .scaled_add(1.0 / frob_norm, &local);
+            }
+        }
+        let (eigenvalues, eigenvectors) =
+            robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+        let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+        if penalty_rank == 0 {
+            return Ok(Array2::zeros((0, p)));
+        }
+        let mut eb = Array2::zeros((p, penalty_rank));
+        let mut col_idx = 0;
+        for (i, &eigenval) in eigenvalues.iter().enumerate() {
+            if eigenval > tolerance {
+                let sqrt_ev = eigenval.sqrt();
+                let evec = eigenvectors.column(i);
+                eb.column_mut(col_idx).assign(&(&evec * sqrt_ev));
+                col_idx += 1;
+            }
+        }
+        return Ok(eb.t().to_owned());
+    }
+
+    // Non-overlapping: eigendecompose per block at O(Σ p_k³).
+    struct BlockRoot {
+        col_range: Range<usize>,
+        root: Array2<f64>,  // rank_b × block_dim
+    }
+    let mut total_rank = 0usize;
+    let mut block_roots = Vec::with_capacity(block_groups.len());
+
+    for (&(start, end), cps) in &block_groups {
+        let block_dim = end - start;
+        let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
+
+        for cp in cps {
+            let local = cp.local_penalty();
+            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            if frob_norm > 1e-12 {
+                s_balanced_local.scaled_add(1.0 / frob_norm, &local);
+            }
+        }
+
+        let (eigenvalues, eigenvectors) =
+            robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
+        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+        let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+
+        if block_rank == 0 {
+            continue;
+        }
+
+        let mut root = Array2::zeros((block_rank, block_dim));
+        let mut row_idx = 0;
+        for (i, &eigenval) in eigenvalues.iter().enumerate() {
+            if eigenval > tolerance {
+                let sqrt_ev = eigenval.sqrt();
+                let evec = eigenvectors.column(i);
+                root.row_mut(row_idx).assign(&(&evec * sqrt_ev));
+                row_idx += 1;
+            }
+        }
+
+        total_rank += block_rank;
+        block_roots.push(BlockRoot {
+            col_range: start..end,
+            root,
+        });
+    }
+
+    if total_rank == 0 {
+        return Ok(Array2::zeros((0, p)));
+    }
+
+    // Assemble global balanced root: total_rank × p
+    let mut eb = Array2::zeros((total_rank, p));
+    let mut row_offset = 0;
+    for br in &block_roots {
+        let rank_b = br.root.nrows();
+        eb.slice_mut(s![row_offset..(row_offset + rank_b), br.col_range.start..br.col_range.end])
+            .assign(&br.root);
+        row_offset += rank_b;
+    }
+
+    Ok(eb)
 }
 
 /// Lambda-independent reparameterization invariants derived from penalty structure.
@@ -2297,6 +2385,336 @@ pub fn stable_reparameterization_engine(
         invariant,
         penalty_shrinkage_floor,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Kronecker-factored reparameterization for tensor-product smooths
+// ---------------------------------------------------------------------------
+
+/// Result of Kronecker-factored reparameterization.
+///
+/// Exploits the fact that for Kronecker-structured penalties, the joint
+/// eigenvector matrix is `U_1 ⊗ ... ⊗ U_d` and the reparameterized design
+/// is a rowwise Kronecker of `(B_k U_k)` — all remaining factored.
+#[derive(Clone)]
+pub struct KroneckerReparamResult {
+    /// Reparameterized marginal designs: `B_k · U_k` for each marginal k.
+    pub reparameterized_marginals: Vec<Array2<f64>>,
+    /// Marginal eigenvalues from each marginal penalty eigendecomposition.
+    pub marginal_eigenvalues: Vec<Array1<f64>>,
+    /// Marginal eigenvector matrices U_k.
+    pub marginal_qs: Vec<Array2<f64>>,
+    /// log|S|₊ computed from marginal eigenvalue grid.
+    pub log_det: f64,
+    /// First derivatives of log|S|₊ w.r.t. ρ_k = log(λ_k).
+    pub det1: Array1<f64>,
+    /// Second derivatives of log|S|₊ w.r.t. ρ.
+    pub det2: Array2<f64>,
+    /// Shrinkage ridge added to eigenvalues (if any).
+    pub penalty_shrinkage_ridge: f64,
+    /// Whether a double penalty (global ridge) is present.
+    pub has_double_penalty: bool,
+    /// Marginal basis dimensions.
+    pub marginal_dims: Vec<usize>,
+}
+
+impl KroneckerReparamResult {
+    /// Materialize the joint Qs matrix (U_1 ⊗ ... ⊗ U_d) as dense p×p.
+    /// Only for fallback paths — avoid in hot loops.
+    pub fn materialize_qs(&self) -> Array2<f64> {
+        let mut qs = Array2::<f64>::eye(1);
+        for u_k in &self.marginal_qs {
+            qs = kronecker_product(&qs, u_k);
+        }
+        qs
+    }
+
+    /// Materialize s_transformed (the penalty in the reparameterized basis).
+    /// In the eigenbasis, this is diagonal with entries Σ_k λ_k μ_{k,j_k}.
+    pub fn materialize_s_transformed(&self, lambdas: &[f64]) -> Array2<f64> {
+        let d = self.marginal_dims.len();
+        let p: usize = self.marginal_dims.iter().copied().product();
+        let mut s = Array2::<f64>::zeros((p, p));
+
+        let mut multi_idx = vec![0usize; d];
+        let mut flat = 0usize;
+        loop {
+            let mut sigma = self.penalty_shrinkage_ridge;
+            for k in 0..d {
+                sigma += lambdas[k] * self.marginal_eigenvalues[k][multi_idx[k]];
+            }
+            if self.has_double_penalty && lambdas.len() > d {
+                sigma += lambdas[d];
+            }
+            s[[flat, flat]] = sigma;
+            flat += 1;
+
+            let mut carry = true;
+            for dim in (0..d).rev() {
+                if carry {
+                    multi_idx[dim] += 1;
+                    if multi_idx[dim] < self.marginal_dims[dim] {
+                        carry = false;
+                    } else {
+                        multi_idx[dim] = 0;
+                    }
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+        s
+    }
+
+    /// Convert to a standard ReparamResult for compatibility with the existing
+    /// solver infrastructure.  This materializes the dense Qs and transformed
+    /// penalty — O(p²) — but allows the factored path to integrate without
+    /// modifying every downstream consumer.
+    pub fn to_standard_reparam_result(
+        &self,
+        rs_list: &[Array2<f64>],
+        lambdas: &[f64],
+        p: usize,
+    ) -> Result<ReparamResult, EstimationError> {
+        let qs = self.materialize_qs();
+        let s_transformed = self.materialize_s_transformed(lambdas);
+
+        // Transform penalty roots: R_k_transformed = R_k · Qs
+        let rs_transformed: Vec<Array2<f64>> = rs_list
+            .iter()
+            .map(|r| r.dot(&qs))
+            .collect();
+        let rs_transposed: Vec<Array2<f64>> = rs_transformed.iter().map(|r| r.t().to_owned()).collect();
+
+        // Build e_transformed: combined penalty square root in transformed coords.
+        // For Kronecker structure, the penalty is diagonal in the eigenbasis.
+        // e_transformed rows are the nonzero rows of sqrt(Σ_k λ_k S_k)^{1/2}.
+        let d = self.marginal_dims.len();
+        let diag_vals: Vec<f64> = {
+            let mut vals = Vec::with_capacity(p);
+            let mut multi_idx = vec![0usize; d];
+            loop {
+                let mut sigma = self.penalty_shrinkage_ridge;
+                for k in 0..d {
+                    sigma += lambdas[k] * self.marginal_eigenvalues[k][multi_idx[k]];
+                }
+                if self.has_double_penalty && lambdas.len() > d {
+                    sigma += lambdas[d];
+                }
+                vals.push(if sigma > 0.0 { sigma.sqrt() } else { 0.0 });
+
+                let mut carry = true;
+                for dim in (0..d).rev() {
+                    if carry {
+                        multi_idx[dim] += 1;
+                        if multi_idx[dim] < self.marginal_dims[dim] {
+                            carry = false;
+                        } else {
+                            multi_idx[dim] = 0;
+                        }
+                    }
+                }
+                if carry {
+                    break;
+                }
+            }
+            vals
+        };
+        let rank = diag_vals.iter().filter(|&&v| v > 1e-12).count();
+        let mut e_transformed = Array2::<f64>::zeros((rank, p));
+        let mut row = 0;
+        for (j, &v) in diag_vals.iter().enumerate() {
+            if v > 1e-12 {
+                e_transformed[[row, j]] = v;
+                row += 1;
+            }
+        }
+
+        // u_truncated: null-space eigenvectors (columns with zero eigenvalue).
+        let null_count = p - rank;
+        let mut u_truncated = Array2::<f64>::zeros((p, null_count));
+        let mut col = 0;
+        for (j, &v) in diag_vals.iter().enumerate() {
+            if v <= 1e-12 {
+                u_truncated[[j, col]] = 1.0; // standard basis vector in eigenbasis
+                col += 1;
+            }
+        }
+
+        Ok(ReparamResult {
+            s_transformed,
+            log_det: self.log_det,
+            det1: self.det1.clone(),
+            qs,
+            rs_transformed,
+            rs_transposed,
+            e_transformed,
+            u_truncated,
+            penalty_shrinkage_ridge: self.penalty_shrinkage_ridge,
+        })
+    }
+}
+
+/// Kronecker-factored reparameterization for tensor-product penalties.
+///
+/// Instead of eigendecomposing the full p×p balanced penalty (O(p³)), this
+/// eigendecomposes each marginal penalty separately (O(Σ q_k³)) and computes
+/// the joint eigensystem as the Kronecker product of marginal eigensystems.
+pub fn kronecker_reparameterization_engine(
+    marginal_designs: &[Array2<f64>],
+    marginal_penalties: &[Array2<f64>],
+    marginal_dims: &[usize],
+    lambdas: &[f64],
+    has_double_penalty: bool,
+    penalty_shrinkage_floor: Option<f64>,
+) -> Result<KroneckerReparamResult, EstimationError> {
+    use crate::faer_ndarray::FaerEigh;
+
+    let d = marginal_dims.len();
+    if marginal_designs.len() != d || marginal_penalties.len() != d {
+        return Err(EstimationError::LayoutError(format!(
+            "kronecker_reparameterization_engine: dimension mismatch: designs={}, penalties={}, dims={}",
+            marginal_designs.len(),
+            marginal_penalties.len(),
+            d
+        )));
+    }
+
+    // Eigendecompose each marginal penalty.
+    let mut marginal_eigenvalues = Vec::with_capacity(d);
+    let mut marginal_qs = Vec::with_capacity(d);
+    for (k, s_k) in marginal_penalties.iter().enumerate() {
+        let (evals, evecs) = s_k.eigh(Side::Lower).map_err(|e| {
+            EstimationError::LayoutError(format!(
+                "kronecker_reparameterization_engine: eigendecomp of marginal {k}: {e}"
+            ))
+        })?;
+        marginal_eigenvalues.push(evals);
+        marginal_qs.push(evecs);
+    }
+
+    // Reparameterized marginals: B_k · U_k.
+    let reparameterized_marginals: Vec<Array2<f64>> = marginal_designs
+        .iter()
+        .zip(marginal_qs.iter())
+        .map(|(b_k, u_k)| b_k.dot(u_k))
+        .collect();
+
+    // Compute shrinkage ridge from balanced penalty eigenvalue scale.
+    let penalty_shrinkage_ridge = if let Some(floor) = penalty_shrinkage_floor {
+        // Max balanced eigenvalue: for Kronecker, the balanced penalty's max
+        // eigenvalue is the max over multi-indices of Σ_k (1/||S_k||_F) μ_{k,j_k}.
+        let mut max_bal = 0.0_f64;
+        let mut multi_idx = vec![0usize; d];
+        let frob_norms: Vec<f64> = marginal_penalties
+            .iter()
+            .map(|s| s.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12))
+            .collect();
+        loop {
+            let mut sigma = 0.0;
+            for k in 0..d {
+                sigma += marginal_eigenvalues[k][multi_idx[k]] / frob_norms[k];
+            }
+            max_bal = max_bal.max(sigma);
+
+            let mut carry = true;
+            for dim in (0..d).rev() {
+                if carry {
+                    multi_idx[dim] += 1;
+                    if multi_idx[dim] < marginal_dims[dim] {
+                        carry = false;
+                    } else {
+                        multi_idx[dim] = 0;
+                    }
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+        floor * max_bal
+    } else {
+        0.0
+    };
+
+    // Compute logdet and derivatives from marginal eigenvalue grid.
+    let n_pen = d + if has_double_penalty { 1 } else { 0 };
+    let mut log_det = 0.0;
+    let mut det1 = Array1::<f64>::zeros(n_pen);
+    let mut det2 = Array2::<f64>::zeros((n_pen, n_pen));
+    let tol = 1e-12;
+
+    let mut multi_idx = vec![0usize; d];
+    loop {
+        let mut sigma = penalty_shrinkage_ridge;
+        for k in 0..d {
+            sigma += lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
+        }
+        if has_double_penalty {
+            sigma += lambdas[d];
+        }
+
+        if sigma > tol {
+            log_det += sigma.ln();
+            let inv_sigma = 1.0 / sigma;
+            let inv_sigma2 = inv_sigma * inv_sigma;
+
+            for k in 0..d {
+                let ck = lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
+                det1[k] += ck * inv_sigma;
+            }
+            if has_double_penalty {
+                det1[d] += lambdas[d] * inv_sigma;
+            }
+
+            for k in 0..n_pen {
+                let ck = if k < d {
+                    lambdas[k] * marginal_eigenvalues[k][multi_idx[k]]
+                } else {
+                    lambdas[d]
+                };
+                det2[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
+                for l in (k + 1)..n_pen {
+                    let cl = if l < d {
+                        lambdas[l] * marginal_eigenvalues[l][multi_idx[l]]
+                    } else {
+                        lambdas[d]
+                    };
+                    let off_diag = -ck * cl * inv_sigma2;
+                    det2[[k, l]] += off_diag;
+                    det2[[l, k]] += off_diag;
+                }
+            }
+        }
+
+        let mut carry = true;
+        for dim in (0..d).rev() {
+            if carry {
+                multi_idx[dim] += 1;
+                if multi_idx[dim] < marginal_dims[dim] {
+                    carry = false;
+                } else {
+                    multi_idx[dim] = 0;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+
+    Ok(KroneckerReparamResult {
+        reparameterized_marginals,
+        marginal_eigenvalues,
+        marginal_qs,
+        log_det,
+        det1,
+        det2,
+        penalty_shrinkage_ridge,
+        has_double_penalty,
+        marginal_dims: marginal_dims.to_vec(),
+    })
 }
 
 /// Calculate the 2-norm condition number of a matrix.

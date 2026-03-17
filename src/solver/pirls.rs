@@ -4357,6 +4357,10 @@ pub struct PenaltyConfig<'a> {
     /// is added to prevent barely-penalized directions from causing pathological
     /// non-Gaussianity in the posterior. Typical value: `1e-6`. `None` disables.
     pub penalty_shrinkage_floor: Option<f64>,
+    /// Block-local canonical penalties. When present, PIRLS can use these for
+    /// block-local operations. The `rs_original` field is still needed for the
+    /// reparameterization engine which operates on full-width roots.
+    pub canonical_penalties: Option<&'a [crate::construction::CanonicalPenalty]>,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly

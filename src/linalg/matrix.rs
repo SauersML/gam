@@ -1310,6 +1310,110 @@ impl DesignOperator for BlockDesignOperator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ReparamDesignOperator — right-multiply by a coefficient transform
+// ---------------------------------------------------------------------------
+
+/// Reparameterized design operator: X_new = X_inner · Q.
+///
+/// Wraps any `DesignOperator` and applies a (p_inner, p_new) right transform
+/// without materializing the transformed design.  Common uses:
+///
+///  * Identifiability constraints (sum-to-zero projections)
+///  * Shape reparameterization (cumulative-sum transforms)
+///
+///   apply(β)           = inner.apply(Q · β)
+///   apply_transpose(v) = Q' · inner.apply_transpose(v)
+///   X'WX               = Q' · inner.diag_xtw_x(w) · Q
+pub struct ReparamDesignOperator {
+    pub inner: Arc<dyn DesignOperator>,
+    pub q: Arc<Array2<f64>>,
+    n: usize,
+    p_new: usize,
+}
+
+impl ReparamDesignOperator {
+    pub fn new(inner: Arc<dyn DesignOperator>, q: Arc<Array2<f64>>) -> Result<Self, String> {
+        let p_inner = inner.ncols();
+        if q.nrows() != p_inner {
+            return Err(format!(
+                "ReparamDesignOperator: inner has {} cols but Q has {} rows",
+                p_inner,
+                q.nrows()
+            ));
+        }
+        Ok(Self {
+            n: inner.nrows(),
+            p_new: q.ncols(),
+            inner,
+            q,
+        })
+    }
+}
+
+impl DesignOperator for ReparamDesignOperator {
+    fn nrows(&self) -> usize {
+        self.n
+    }
+
+    fn ncols(&self) -> usize {
+        self.p_new
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let transformed = self.q.dot(vector);
+        self.inner.apply(&transformed)
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let inner_result = self.inner.apply_transpose(vector);
+        self.q.t().dot(&inner_result)
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        let inner_gram = self.inner.diag_xtw_x(weights)?;
+        let qt_gram = fast_atb(&self.q, &inner_gram);
+        Ok(fast_ab(&qt_gram, &self.q))
+    }
+
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let xtwx = self.diag_xtw_x(weights)?;
+        Ok(Array1::from_iter((0..self.p_new).map(|j| xtwx[[j, j]])))
+    }
+
+    fn apply_weighted_normal(
+        &self,
+        weights: &Array1<f64>,
+        vector: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        let q_beta = self.q.dot(vector);
+        let inner_result = self.inner.apply_weighted_normal(weights, &q_beta, None, 0.0);
+        let mut out = self.q.t().dot(&inner_result);
+        if let Some(pen) = penalty {
+            out += &pen.dot(vector);
+        }
+        if ridge > 0.0 {
+            out += &vector.mapv(|x| ridge * x);
+        }
+        out
+    }
+
+    fn uses_matrix_free_pcg(&self) -> bool {
+        self.inner.uses_matrix_free_pcg()
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let inner_dense = self.inner.to_dense();
+        fast_ab(&inner_dense, &self.q)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MultiChannelOperator
+// ---------------------------------------------------------------------------
+
 /// Multi-channel design operator: presents k views of shape (n, p) as a single
 /// (k*n, p) operator without materializing the stacked matrix.
 ///

@@ -9545,10 +9545,9 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         smooth_penalty_idx, term_idx
                     )
                 })?;
-            smooth_penalty.fill(0.0);
-            smooth_penalty
-                .slice_mut(s![coeff_range.clone(), coeff_range.clone()])
-                .assign(penalty_local);
+            // With per-term block-local penalties, col_range already targets
+            // this specific term, so .local is p_k × p_k.
+            smooth_penalty.local.assign(penalty_local);
 
             let full_bp = self
                 .design
@@ -9560,16 +9559,9 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         full_penalty_idx, term_idx
                     )
                 })?;
-            // Update the blockwise penalty in-place: the col_range stays the
-            // same (same smooth block in the global layout), only the local
-            // matrix changes.
-            full_bp.local.fill(0.0);
-            let local_start = coeff_range.start;
-            let local_end = coeff_range.end;
-            full_bp
-                .local
-                .slice_mut(s![local_start..local_end, local_start..local_end])
-                .assign(penalty_local);
+            // With per-term block-local penalties, col_range already targets
+            // this specific term, so .local is p_k × p_k.
+            full_bp.local.assign(penalty_local);
 
             self.design.smooth.nullspace_dims[smooth_penalty_idx] = nullspace_dim;
             self.design.nullspace_dims[full_penalty_idx] = nullspace_dim;
