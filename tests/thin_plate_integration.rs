@@ -1,5 +1,6 @@
 use gam::basis::create_thin_plate_spline_basis_with_knot_count;
-use gam::construction::compute_penalty_square_roots;
+use gam::construction::canonicalize_penalty_spec;
+use gam::estimate::PenaltySpec;
 use gam::estimate::{FitOptions, fit_gam};
 use gam::predict::predict_gam;
 use gam::types::LikelihoodFamily;
@@ -214,13 +215,16 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
         tps_train.penalty_bending.clone(),
         tps_train.penalty_ridge.clone(),
     ];
-    let rs_list = compute_penalty_square_roots(&s_list).expect("3D TPS penalty roots");
+    let p = s_list[0].nrows();
+    let cp = canonicalize_penalty_spec(&PenaltySpec::Dense(s_list[0].clone()), p, 0, "3D TPS test")
+        .expect("canonicalize penalty")
+        .expect("penalty should have positive rank");
     assert!(
-        !rs_list[0].is_empty() && rs_list[0].nrows() > 0,
+        cp.rank() > 0,
         "3D TPS bending penalty root should have positive rank"
     );
-    let root_reconstructed = rs_list[0].t().dot(&rs_list[0]);
-    let reconstruction_max_abs = (&root_reconstructed - &s_list[0])
+    let root_reconstructed = cp.root.t().dot(&cp.root);
+    let reconstruction_max_abs = (&root_reconstructed - &cp.local)
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     assert!(

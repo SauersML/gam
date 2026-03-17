@@ -155,7 +155,7 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        penalties: &[crate::construction::CanonicalPenalty],
+        penalty_roots: &[Array2<f64>],
         lambdas: &[f64],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
@@ -163,7 +163,7 @@ impl<'a> RemlState<'a> {
     ) -> Array1<f64> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
-        let k = penalties.len();
+        let k = penalty_roots.len();
         let xt = x_dense.t();
 
         // Hat leverages
@@ -274,14 +274,11 @@ impl<'a> RemlState<'a> {
             let trace_ak_p = if let Some(coords) = penalty_coords {
                 coords[idx].trace_with_dense(&p_total, lambdas[idx])
             } else {
-                // Block-local trace: tr(lambda_k * S_k * P) = lambda_k * tr(R_k P[block,block] R_k^T)
-                let cp = &penalties[idx];
-                let r = &cp.col_range;
-                let p_block = p_total.slice(s![r.start..r.end, r.start..r.end]);
-                let rk_p = cp.root.dot(&p_block);
+                let r_k = &penalty_roots[idx];
+                let rk_p = r_k.dot(&p_total);
                 lambdas[idx]
-                    * (0..cp.rank())
-                        .map(|row| rk_p.row(row).dot(&cp.root.row(row).to_owned()))
+                    * (0..r_k.nrows())
+                        .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
                         .sum::<f64>()
             };
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
