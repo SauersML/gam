@@ -26,10 +26,11 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::fast_atv;
+use crate::faer_ndarray::{FaerEigh, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix,
+    TensorProductDesignOperator,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
