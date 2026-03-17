@@ -6031,9 +6031,10 @@ fn run_sample_standard(
     let weights = Array1::ones(data.nrows());
     let offset = Array1::zeros(data.nrows());
     progress.set_stage("sample", "refitting mode for hmc");
-    let p = design.design.ncols();
+    let dense_design_hmc = design.design.to_dense();
+    let p = dense_design_hmc.ncols();
     let fit = fit_gam(
-        design.design.view(),
+        dense_design_hmc.view(),
         y.view(),
         weights.view(),
         offset.view(),
@@ -6060,7 +6061,7 @@ fn run_sample_standard(
     run_nuts_sampling_flattened_family(
         family,
         FamilyNutsInputs::Glm(GlmFlatInputs {
-            x: design.design.view(),
+            x: dense_design_hmc.view(),
             y: y.view(),
             weights: weights.view(),
             penalty_matrix: penalty.view(),
@@ -6504,10 +6505,12 @@ fn run_generate_gaussian_location_scale(
         model.noise_non_intercept_start,
     )?;
     let mean_base = design.design.dot(&betamu);
+    let dense_gen_mean = design.design.to_dense();
+    let dense_gen_noise = design_noise.design.to_dense();
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&design.design, &design_noise.design, transform)?
+        apply_scale_deviation_transform(&dense_gen_mean, &dense_gen_noise, transform)?
     } else {
-        design_noise.design.clone()
+        dense_gen_noise
     };
     let eta_noise = preparednoise_design.dot(&beta_noise);
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
