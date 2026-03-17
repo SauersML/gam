@@ -19,9 +19,9 @@ use crate::inference::formula_dsl::{
 };
 use crate::inference::model::ColumnKindTag;
 use crate::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
-    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
-    TensorBSplineSpec, TermCollectionSpec,
+    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
+    TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------

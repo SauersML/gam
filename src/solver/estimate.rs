@@ -980,21 +980,28 @@ fn compute_smoothing_correction(
     };
 
     let beta_trans = final_fit.beta_transformed.as_ref();
-    let rs_transformed = &final_fit.reparam_result.rs_transformed;
+    let ct = &final_fit.reparam_result.canonical_transformed;
 
     // Build Jacobian matrix J where column k is dβ/dρ_k
     let mut jacobian_trans = Array2::<f64>::zeros((n_coeffs_trans, n_rho));
     for k in 0..n_rho {
-        if k >= rs_transformed.len() {
+        if k >= ct.len() {
             continue;
         }
-        let r_k = &rs_transformed[k];
-        if r_k.ncols() == 0 {
+        let cp = &ct[k];
+        if cp.rank() == 0 {
             continue;
         }
-        // S_k β = R_k^T (R_k β)
-        let r_beta = r_k.dot(beta_trans);
-        let s_k_beta = r_k.t().dot(&r_beta);
+        // S_k β — block-local: R^T (R β[block]), embedded into p-vector.
+        let r = &cp.col_range;
+        let beta_block = beta_trans.slice(s![r.start..r.end]);
+        let r_beta = cp.root.dot(&beta_block);
+        let mut s_k_beta = Array1::<f64>::zeros(n_coeffs_trans);
+        for a in 0..cp.block_dim() {
+            s_k_beta[r.start + a] = (0..cp.rank())
+                .map(|row| cp.root[[row, a]] * r_beta[row])
+                .sum::<f64>();
+        }
 
         // dβ/dρ_k = -H^{-1}(λ_k S_k β)
         let rhs = s_k_beta.mapv(|v| -lambdas[k] * v);
