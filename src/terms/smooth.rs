@@ -487,7 +487,6 @@ pub fn penalties_to_global(penalties: &[BlockwisePenalty], p_total: usize) -> Ve
 /// individual global matrices.
 pub fn weighted_blockwise_penalty_sum(
     penalties: &[BlockwisePenalty],
-    nullspace_dims: vec![],
     lambdas: &[f64],
     p_total: usize,
 ) -> Array2<f64> {
@@ -6838,7 +6837,6 @@ fn trace_of_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, Strin
 
 fn exact_bounded_edf(
     penalties: &[Array2<f64>],
-    nullspace_dims: vec![],
     lambdas: &Array1<f64>,
     latent_cov: &Array2<f64>,
 ) -> Result<(Vec<f64>, f64), EstimationError> {
