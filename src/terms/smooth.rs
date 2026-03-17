@@ -463,6 +463,16 @@ impl BlockwisePenalty {
     pub fn to_global(&self, p_total: usize) -> Array2<f64> {
         let mut g = Array2::<f64>::zeros((p_total, p_total));
         let r = &self.col_range;
+        assert!(
+            r.end <= p_total && self.local.nrows() == r.len() && self.local.ncols() == r.len(),
+            "BlockwisePenalty::to_global shape invariant violated: \
+             col_range={}..{}, local={}x{}, p_total={}",
+            r.start,
+            r.end,
+            self.local.nrows(),
+            self.local.ncols(),
+            p_total,
+        );
         g.slice_mut(s![r.start..r.end, r.start..r.end])
             .assign(&self.local);
         g
@@ -1018,7 +1028,10 @@ impl Default for SpatialLengthScaleOptimizationOptions {
 #[derive(Debug, Clone)]
 struct RandomEffectBlock {
     name: String,
-    design: Array2<f64>,
+    /// O(n) group-label vector: group_ids[i] = column index in [0, num_groups).
+    /// `None` if the observation's level is not in the kept set.
+    group_ids: Vec<Option<usize>>,
+    num_groups: usize,
     kept_levels: Vec<u64>,
 }
 
@@ -1966,18 +1979,16 @@ fn build_random_effect_block(
     }
 
     let q = kept_levels.len();
-    let mut design = Array2::<f64>::zeros((n, q));
-    for (i, &v) in col.iter().enumerate() {
+    let mut group_ids = Vec::with_capacity(n);
+    for &v in col {
         let bits = v.to_bits();
-        let pos = kept_levels.binary_search(&bits).ok();
-        if let Some(j) = pos {
-            design[[i, j]] = 1.0;
-        }
+        group_ids.push(kept_levels.binary_search(&bits).ok());
     }
 
     Ok(RandomEffectBlock {
         name: spec.name.clone(),
-        design,
+        group_ids,
+        num_groups: q,
         kept_levels,
     })
 }
@@ -9255,6 +9266,20 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             let full_penalty_idx = full_penalty_range.start + offset;
             let nullspace_dim = nullspace_dims[offset];
             let penalty_info = active_penaltyinfo[offset].clone();
+
+            if penalty_local.nrows() != coeff_range.len()
+                || penalty_local.ncols() != coeff_range.len()
+            {
+                return Err(format!(
+                    "incremental realizer penalty shape mismatch for term '{}' penalty {}: \
+                     penalty is {}x{} but coeff_range has {} columns",
+                    name,
+                    offset,
+                    penalty_local.nrows(),
+                    penalty_local.ncols(),
+                    coeff_range.len()
+                ));
+            }
 
             let smooth_penalty = self
                 .design

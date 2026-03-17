@@ -650,6 +650,15 @@ fn solve_penalizedweighted_projection(
                 log_lambdas[k]
             ));
         }
+        if s.nrows() != p || s.ncols() != p {
+            return Err(format!(
+                "solve_penalizedweighted_projection penalty shape mismatch at index {k}: \
+                 penalty is {}x{} but design has {} columns",
+                s.nrows(),
+                s.ncols(),
+                p
+            ));
+        }
         penalty.scaled_add(lambda, s);
     }
     let ridge = ridge_floor.max(1e-12);
