@@ -281,7 +281,7 @@ impl SparseDesignMatrix {
         }
         let csr = self.matrix.as_ref().to_row_major().ok()?;
         let arc = Arc::new(csr);
-        let _ = self.csr_cache.set(arc.clone());
+        self.csr_cache.set(arc.clone()).ok();
         Some(arc)
     }
 }

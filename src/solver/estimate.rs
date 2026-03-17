@@ -1223,10 +1223,10 @@ fn resolved_external_config(
 
 #[inline]
 fn ensure_exact_directional_hyper_supported(
-    link: LinkFunction,
-    firth_active: bool,
-    has_design_drift: bool,
-    context: &str,
+    _: LinkFunction,
+    _: bool,
+    _: bool,
+    _: &str,
 ) -> Result<(), EstimationError> {
     // Kept as a central compatibility hook for API-level validation.
     //
@@ -1238,7 +1238,6 @@ fn ensure_exact_directional_hyper_supported(
     //   Fisher-information reduction.
     //
     // No additional API-level restrictions are needed here.
-    let _ = (link, firth_active, has_design_drift, context);
     Ok(())
 }
 
@@ -1807,7 +1806,6 @@ where
                     initial_link_kind.mixture_state().cloned(),
                     initial_link_kind.sas_state().copied(),
                 );
-                let _ = state.x();
             }),
             efs_fn: None::<
                 fn(

@@ -7204,22 +7204,6 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &designs[0],
                 &designs[1],
             )?)?;
-            Ok(if fit.reml_score.is_finite() {
-                fit.reml_score
-            } else {
-                fit.penalized_objective
-            })
-        },
-        |rho,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign]| {
-            let fit = fit_survival_location_scale(build_spec(
-                rho,
-                &specs[0],
-                &specs[1],
-                &designs[0],
-                &designs[1],
-            )?)?;
             time_beta_hint.replace(Some(fit.beta_time()));
             threshold_beta_hint.replace(Some(fit.beta_threshold()));
             log_sigma_beta_hint.replace(Some(fit.beta_log_sigma()));

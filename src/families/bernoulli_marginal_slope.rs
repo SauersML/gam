@@ -427,19 +427,6 @@ fn joint_setup(
     )
 }
 
-fn fit_score(fit: &UnifiedFitResult) -> f64 {
-    if fit.reml_score.is_finite() {
-        fit.reml_score
-    } else {
-        let score = 0.5 * fit.deviance + 0.5 * fit.stable_penalty_term;
-        if score.is_finite() {
-            score
-        } else {
-            f64::INFINITY
-        }
-    }
-}
-
 fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
     let gh = compute_gauss_hermite_n(n);
     let scale = 2.0_f64.sqrt();
@@ -3227,12 +3214,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1]);
-            let fit = inner_fit(&family, &blocks, options)?;
-            Ok(fit_score(&fit))
-        },
         |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);

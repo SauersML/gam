@@ -1684,10 +1684,9 @@ impl PredictableModel for BinomialLocationScalePredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &UnifiedFitResult,
+        _: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        let _ = fit; // not needed for binomial LS intervals
         let pred = self.predict_with_uncertainty(input)?;
         let z = standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(EstimationError::InvalidInput)?;
@@ -2148,10 +2147,9 @@ impl PredictableModel for SurvivalPredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        fit: &UnifiedFitResult,
+        _: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        let _ = fit; // not needed for survival LS intervals
         let pred = self.predict_with_uncertainty(input)?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(|e| EstimationError::InvalidInput(e))?;
@@ -2731,8 +2729,7 @@ where
                     state.rho.len()
                 ];
             }
-            let _ =
-                mixture_inverse_link_jetwith_rho_partials_into(state, eta[i], &mut mix_partials);
+            mixture_inverse_link_jetwith_rho_partials_into(state, eta[i], &mut mix_partials);
             meanvar += quadratic_form_from_jetmu(cov_theta, &mix_partials)?;
         }
         mean_standard_error[i] = meanvar.max(0.0).sqrt();

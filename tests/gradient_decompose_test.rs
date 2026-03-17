@@ -321,8 +321,7 @@ fn test_component_b1_simple_trace() {
 /// Its derivative is -0.5*λ_k*tr(S_+⁻¹ S_k).
 #[test]
 fn test_component_c_penalty_logdet() {
-    let (x, y) = test_design(60, 5);
-    let _ = y;
+    let (x, _) = test_design(60, 5);
     let p = x.ncols();
     let mut s1 = Array2::<f64>::zeros((p, p));
     for j in 1..p {
@@ -467,7 +466,7 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
     let lib_fd = fd_gradient(&lib_cost_fn, &rho, 1e-5);
 
     // Library analytic gradient
-    let (lib_analytic, lib_builtin_fd) = evaluate_externalgradients(
+    let (lib_analytic, _) = evaluate_externalgradients(
         y.view(),
         Array1::ones(n).view(),
         x.view(),
@@ -477,7 +476,6 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
         &rho,
     )
     .unwrap();
-    let _ = lib_builtin_fd;
 
     eprintln!("=== COST COMPARISON (single penalty) ===");
     eprintln!("standalone_cost  = {:.10}", standalone_base);

@@ -39,10 +39,10 @@ impl Log for ProgressLogger {
         if let Ok(guard) = active_multiprogress().lock()
             && let Some(mp) = guard.as_ref()
         {
-            let _ = mp.println(line);
+            mp.println(line).ok();
             return;
         }
-        let _ = writeln!(io::stderr(), "{line}");
+        writeln!(io::stderr(), "{line}").ok();
     }
 
     fn flush(&self) {}
@@ -170,7 +170,7 @@ impl InteractiveVisualizer {
         if !force && self.last_draw.elapsed() < INTERACTIVE_DRAW_INTERVAL {
             return;
         }
-        let _ = self.draw(model);
+        self.draw(model).ok();
         self.last_draw = Instant::now();
     }
 
@@ -429,8 +429,8 @@ impl InteractiveVisualizer {
 
     fn teardown(&mut self, model: &VisualizerModel) {
         self.maybe_draw(model, true);
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        disable_raw_mode().ok();
+        execute!(io::stdout(), LeaveAlternateScreen).ok();
     }
 }
 
@@ -495,11 +495,11 @@ impl DumbVisualizer {
         self.last_lines = lines.clone();
         if let Some(multi) = &self.multi {
             for line in lines {
-                let _ = multi.println(line);
+                multi.println(line).ok();
             }
         } else {
             for line in lines {
-                let _ = writeln!(io::stderr(), "{line}");
+                writeln!(io::stderr(), "{line}").ok();
             }
         }
     }
@@ -507,7 +507,7 @@ impl DumbVisualizer {
     fn teardown(&mut self, model: &VisualizerModel) {
         self.maybe_draw(model, true);
         if let Some(multi) = &self.multi {
-            let _ = multi.clear();
+            multi.clear().ok();
         }
         install_multiprogress(None);
     }
