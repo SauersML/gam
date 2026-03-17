@@ -623,7 +623,6 @@ fn solve_penalizedweighted_projection(
     target_eta: &Array1<f64>,
     weights: &Array1<f64>,
     penalties: &[Array2<f64>],
-    nullspace_dims: vec![],
     log_lambdas: &Array1<f64>,
     ridge_floor: f64,
 ) -> Result<Array1<f64>, String> {
