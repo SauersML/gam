@@ -55,7 +55,7 @@
 //! - U₀ (null eigenvectors) and Σ₊⁻² for the moving-nullspace correction
 
 use faer::Side;
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 
 use crate::faer_ndarray::FaerEigh;
 
@@ -146,7 +146,7 @@ impl PenaltyPseudologdet {
         }
 
         let p_dim = s_k_matrices[0].nrows();
-        debug_assert!(
+        assert!(
             s_k_matrices
                 .iter()
                 .all(|m| m.nrows() == p_dim && m.ncols() == p_dim)
@@ -214,10 +214,12 @@ impl PenaltyPseudologdet {
         };
 
         // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
+        // Eigenvalues are ascending, so the last `rank` are the positive ones.
         let value: f64 = evals
             .iter()
-            .filter(|&&e| e > threshold)
-            .map(|&e| e.ln())
+            .rev()
+            .take(rank)
+            .map(|&e| e.max(1e-300).ln())
             .sum();
 
         // W factor: p × rank, W_{:,j} = u_j / √σ_j for positive eigenvalues.
@@ -267,10 +269,6 @@ impl PenaltyPseudologdet {
         self.rank
     }
 
-    /// Dimension of the coefficient space.
-    pub fn dim(&self) -> usize {
-        self.p_dim
-    }
 
     // ── Reduced-space representations ──────────────────────────────────────
 
@@ -410,31 +408,6 @@ impl PenaltyPseudologdet {
         (det1, det2)
     }
 
-    /// Compute first derivative of log|S|₊ w.r.t. ρ only (no Hessian).
-    ///
-    /// More efficient than `rho_derivatives` when only the gradient is needed,
-    /// since it skips the O(k² rank²) trace-product computation.
-    pub fn rho_gradient(&self, s_k_matrices: &[Array2<f64>], lambdas: &[f64]) -> Array1<f64> {
-        let k = s_k_matrices.len();
-        if k == 0 || self.rank == 0 {
-            return Array1::zeros(k);
-        }
-
-        let mut det1 = Array1::<f64>::zeros(k);
-        for (idx, s_k) in s_k_matrices.iter().enumerate() {
-            // tr(S⁺ S_k) = tr(W^T S_k W) = ||W^T s_k_col||² summed cleverly,
-            // but the general form: compute W^T S_k, then dot with W.
-            let wt_sk = self.w_factor.t().dot(s_k);
-            let trace: f64 = wt_sk
-                .iter()
-                .zip(self.w_factor.t().iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
-            det1[idx] = lambdas[idx] * trace;
-        }
-        det1
-    }
-
     // ── τ/ψ-parameter derivatives (design-moving) ─────────────────────────
 
     /// First derivative of log|S|₊ w.r.t. a design-moving parameter τ_i.
@@ -545,27 +518,6 @@ impl PenaltyPseudologdet {
         lambda_k * (linear - quad)
     }
 
-    // ── Batch operations for efficiency ────────────────────────────────────
-
-    /// Compute the full {value, first, second} triple for ρ-parameterized
-    /// penalty logdet, suitable for direct use as `PenaltyLogdetDerivs`.
-    ///
-    /// This is the drop-in replacement for the ad-hoc constructions in
-    /// `runtime.rs` and `eval.rs`.
-    pub fn rho_full(
-        &self,
-        s_k_matrices: &[Array2<f64>],
-        lambdas: &[f64],
-        need_hessian: bool,
-    ) -> (f64, Array1<f64>, Option<Array2<f64>>) {
-        if need_hessian {
-            let (first, second) = self.rho_derivatives(s_k_matrices, lambdas);
-            (self.value, first, Some(second))
-        } else {
-            let first = self.rho_gradient(s_k_matrices, lambdas);
-            (self.value, first, None)
-        }
-    }
 }
 
 #[cfg(test)]

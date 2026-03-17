@@ -5,8 +5,10 @@ use crate::basis::{
     PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     applyweighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
-    build_duchon_basis_log_kappasecond_derivative, build_matern_basis,
+    build_duchon_basis_log_kappasecond_derivative, build_duchon_basiswithworkspace,
+    build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivative,
+    build_matern_basiswithworkspace,
     build_matern_basis_log_kappasecond_derivative, build_matern_collocation_operator_matrices,
     build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
     build_thin_plate_basis_log_kappasecond_derivative, estimate_penalty_nullity,
@@ -2009,6 +2011,17 @@ pub fn build_smooth_design(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
 ) -> Result<RawSmoothDesign, BasisError> {
+    let mut ws = crate::basis::BasisWorkspace::new();
+    build_smooth_design_with_workspace(data, terms, &mut ws)
+}
+
+/// Like `build_smooth_design` but reuses a persistent workspace for
+/// distance-matrix caching across repeated κ-proposal basis rebuilds.
+pub fn build_smooth_design_with_workspace(
+    data: ArrayView2<'_, f64>,
+    terms: &[SmoothTermSpec],
+    _workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<RawSmoothDesign, BasisError> {
     let n = data.nrows();
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
@@ -2118,7 +2131,7 @@ pub fn build_smooth_design(
                 } else {
                     None
                 };
-                let mut result = build_matern_basis(x.view(), spec)?;
+                let mut result = build_matern_basiswithworkspace(x.view(), spec, _workspace)?;
                 if let BasisMetadata::Matern { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
@@ -2158,7 +2171,7 @@ pub fn build_smooth_design(
                 ) {
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
-                let mut result = build_duchon_basis(x.view(), &spec_local)?;
+                let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, _workspace)?;
                 if let BasisMetadata::Duchon { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
@@ -8710,6 +8723,24 @@ fn build_single_smooth_term_realization(
     termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
     let raw = build_smooth_design(data, std::slice::from_ref(termspec))?;
+    finish_single_smooth_term_realization(raw, termspec)
+}
+
+/// Like `build_single_smooth_term_realization` but reuses a persistent
+/// `BasisWorkspace` for distance-matrix caching across κ proposals.
+fn build_single_smooth_term_realization_with_workspace(
+    data: ArrayView2<'_, f64>,
+    termspec: &SmoothTermSpec,
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<SingleSmoothTermRealization, BasisError> {
+    let raw = build_smooth_design_with_workspace(data, std::slice::from_ref(termspec), workspace)?;
+    finish_single_smooth_term_realization(raw, termspec)
+}
+
+fn finish_single_smooth_term_realization(
+    raw: RawSmoothDesign,
+    termspec: &SmoothTermSpec,
+) -> Result<SingleSmoothTermRealization, BasisError> {
     let RawSmoothDesign {
         design,
         dropped_penaltyinfo,
@@ -8971,6 +9002,10 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     smooth_penalty_ranges: Vec<Range<usize>>,
     full_penalty_ranges: Vec<Range<usize>>,
     full_smooth_start: usize,
+    /// Persistent workspace for basis cache reuse across κ proposals.
+    /// Distance matrices are cached here so they're computed once and
+    /// reused across repeated `apply_log_kappa_to_term` calls.
+    basis_workspace: crate::basis::BasisWorkspace,
 }
 
 impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
@@ -9057,6 +9092,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             smooth_penalty_ranges,
             full_penalty_ranges,
             full_smooth_start,
+            basis_workspace: crate::basis::BasisWorkspace::new(),
         })
     }
 
@@ -9125,7 +9161,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
             .clone();
         let realization =
-            build_single_smooth_term_realization(self.data, &termspec).map_err(|e| {
+            build_single_smooth_term_realization_with_workspace(
+                self.data,
+                &termspec,
+                &mut self.basis_workspace,
+            )
+            .map_err(|e| {
                 format!(
                     "failed to rebuild smooth term '{}' during incremental κ realization: {e}",
                     termspec.name

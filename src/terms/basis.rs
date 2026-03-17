@@ -7685,34 +7685,52 @@ fn build_matern_design_psi_derivatives(
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
+    let d = data.ncols();
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
     if let Some(eta) = aniso_log_scales {
-        for i in 0..n {
-            let xi = data.row(i);
-            for j in 0..k {
-                let r = aniso_distance(
-                    xi.as_slice().unwrap(),
-                    centers.row(j).as_slice().unwrap(),
-                    eta,
-                );
-                kernel_psi[[i, j]] =
-                    matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
-                kernel_psi_psi[[i, j]] =
-                    matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
-            }
-        }
+        let par_result: Result<(), BasisError> = kernel_psi
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(kernel_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
+            .enumerate()
+            .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
+                let mut data_row_buf = vec![0.0; d];
+                let mut center_buf = vec![0.0; d];
+                for a in 0..d {
+                    data_row_buf[a] = data[[i, a]];
+                }
+                for j in 0..k {
+                    for a in 0..d {
+                        center_buf[a] = centers[[j, a]];
+                    }
+                    let r = aniso_distance(&data_row_buf, &center_buf, eta);
+                    row_psi[j] =
+                        matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
+                    row_psi_psi[j] =
+                        matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
+                }
+                Ok(())
+            });
+        par_result?;
     } else {
         let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
-        for i in 0..n {
-            for j in 0..k {
-                let r = data_center_r[[i, j]];
-                kernel_psi[[i, j]] =
-                    matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
-                kernel_psi_psi[[i, j]] =
-                    matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
-            }
-        }
+        let par_result: Result<(), BasisError> = kernel_psi
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(kernel_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
+            .enumerate()
+            .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
+                for j in 0..k {
+                    let r = data_center_r[[i, j]];
+                    row_psi[j] =
+                        matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
+                    row_psi_psi[j] =
+                        matern_kernel_log_kappasecond_derivative_from_distance(r, length_scale, nu)?;
+                }
+                Ok(())
+            });
+        par_result?;
     }
     let (kernel_psi, kernel_psi_psi) = if let Some(z) = z_opt {
         (fast_ab(&kernel_psi, z), fast_ab(&kernel_psi_psi, z))
