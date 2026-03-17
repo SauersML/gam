@@ -5097,21 +5097,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_beta_time = Some(fit.fit.fit.beta_time().to_vec());
             payload.survival_beta_threshold = Some(fit.fit.fit.beta_threshold().to_vec());
             payload.survival_beta_log_sigma = Some(fit.fit.fit.beta_log_sigma().to_vec());
+            let dense_fit_threshold = fit.fit.threshold_design.design.to_dense();
+            let dense_fit_log_sigma = fit.fit.log_sigma_design.design.to_dense();
             let mut survival_primary_design = Array2::<f64>::zeros((
                 n,
-                time_design_exit.ncols() + fit.fit.threshold_design.design.ncols(),
+                time_design_exit.ncols() + dense_fit_threshold.ncols(),
             ));
             survival_primary_design
                 .slice_mut(s![.., 0..time_design_exit.ncols()])
                 .assign(&time_design_exit);
             survival_primary_design
                 .slice_mut(s![.., time_design_exit.ncols()..])
-                .assign(&fit.fit.threshold_design.design);
+                .assign(&dense_fit_threshold);
             let survival_noise_transform = build_scale_deviation_transform(
                 &survival_primary_design,
-                &fit.fit.log_sigma_design.design,
+                &dense_fit_log_sigma,
                 &weights,
-                infer_non_intercept_start(&fit.fit.log_sigma_design.design, &weights),
+                infer_non_intercept_start(&dense_fit_log_sigma, &weights),
             )
             .map_err(|e| format!("failed to encode survival noise transform: {e}"))?;
             payload.survival_noise_projection = Some(
