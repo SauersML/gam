@@ -42,8 +42,8 @@ use gam::hmc::{
     run_link_wiggle_nuts_sampling, run_nuts_sampling_flattened_family,
 };
 use gam::inference::data::{
-    EncodedDataset as Dataset, UnseenCategoryPolicy, load_csvwith_inferred_schema,
-    load_csvwith_schema,
+    EncodedDataset as Dataset, UnseenCategoryPolicy, load_dataset as load_dataset_auto,
+    load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
     CallArgSpec, FunctionCallSpec, parse_formula_dsl, parse_function_call,
@@ -8337,11 +8337,11 @@ fn print_inference_summary(notes: &[String]) {
 }
 
 fn load_dataset(path: &Path) -> Result<Dataset, String> {
-    load_csvwith_inferred_schema(path)
+    load_dataset_auto(path)
 }
 
 fn load_datasetwith_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, String> {
-    load_csvwith_schema(path, schema, UnseenCategoryPolicy::Error)
+    load_dataset_auto_with_schema(path, schema, UnseenCategoryPolicy::Error)
 }
 
 fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {

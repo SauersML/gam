@@ -386,7 +386,7 @@ impl<'a> RemlState<'a> {
         // Gradient via helper
         // ══════════════════════════════════════════════════════════════════
         let gradient = Self::tk_gradient_from_intermediates(
-            x_dense, z, c_array, d_array, penalty_roots, lambdas, &x_vks, h_inv_solve,
+            x_dense, z, c_array, d_array, penalty_roots, lambdas, &x_vks, h_inv_solve, None,
         );
 
         // ══════════════════════════════════════════════════════════════════
@@ -507,6 +507,7 @@ impl<'a> RemlState<'a> {
                     &lambdas_plus,
                     &x_vks_plus,
                     h_inv_solve,
+                    None,
                 );
                 let grad_minus = Self::tk_gradient_from_intermediates(
                     x_dense,
@@ -517,6 +518,7 @@ impl<'a> RemlState<'a> {
                     &lambdas_minus,
                     &x_vks_minus,
                     h_inv_solve,
+                    None,
                 );
 
                 let inv_2eps = 0.5 / eps;
