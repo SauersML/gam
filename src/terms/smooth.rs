@@ -2389,11 +2389,10 @@ pub fn build_smooth_design_withworkspace(
             .zip(activeinfos.into_iter())
         {
             let global_index = penalties_global.len();
-            let mut s_global = Array2::<f64>::zeros((total_p, total_p));
-            s_global
-                .slice_mut(s![col_start..col_end, col_start..col_end])
-                .assign(s_local);
-            penalties_global.push(s_global);
+            penalties_global.push(BlockwisePenalty::new(
+                col_start..col_end,
+                s_local.clone(),
+            ));
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;
@@ -3039,11 +3038,10 @@ fn apply_spatial_orthogonality_to_parametric(
             .zip(activeinfos.into_iter())
         {
             let global_index = penalties_global.len();
-            let mut s_global = Array2::<f64>::zeros((total_p, total_p));
-            s_global
-                .slice_mut(s![col_start..col_end, col_start..col_end])
-                .assign(s_local);
-            penalties_global.push(s_global);
+            penalties_global.push(BlockwisePenalty::new(
+                col_start..col_end,
+                s_local.clone(),
+            ));
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;

@@ -5281,6 +5281,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
 
+    let dense_cov_design = cov_design.design.to_dense();
     let mut model = gam::families::royston_parmar::working_model_from_time_covariateshared(
         penalties,
         monotonicity,
@@ -5294,7 +5295,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             time_entry: time_design_entry.view(),
             time_exit: time_design_exit.view(),
             time_derivative: time_design_derivative_exit.view(),
-            covariates: cov_design.design.view(),
+            covariates: dense_cov_design.view(),
             eta_offset_entry: Some(eta_offset_entry.view()),
             eta_offset_exit: Some(eta_offset_exit.view()),
             derivative_offset_exit: Some(derivative_offset_exit.view()),
@@ -5831,7 +5832,7 @@ fn run_sample_survival(
             }
         }
         for j in 0..p_cov {
-            let z = cov_design.design[[i, j]];
+            let z = cov_design.design.get(i, j);
             x_entry[[i, p_time + p_timewiggle + j]] = z;
             x_exit[[i, p_time + p_timewiggle + j]] = z;
         }

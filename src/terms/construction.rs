@@ -711,6 +711,590 @@ pub fn compute_penalty_square_roots(
 }
 
 // ---------------------------------------------------------------------------
+// Block-scale spectral decomposition
+// ---------------------------------------------------------------------------
+//
+// These functions operate at the natural block scale of each penalty
+// (p_local × p_local) instead of inflating to p_total × p_total.
+// Structure hints (Ridge, Kronecker) enable closed-form or factored
+// eigendecomposition when available.
+
+/// Compute a block-local square root and embed into global coordinates.
+/// Returns a `rank_k × p_total` matrix where nonzero entries live in `col_range`.
+fn block_local_root(
+    col_range: &Range<usize>,
+    local: &Array2<f64>,
+    p_total: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    let p_local = col_range.len();
+    debug_assert_eq!(local.nrows(), p_local);
+    debug_assert_eq!(local.ncols(), p_local);
+
+    let analysis = analyze_penalty_block(local).map_err(|err| {
+        EstimationError::InvalidInput(format!("block-local penalty analysis failed: {err}"))
+    })?;
+
+    if analysis.rank == 0 {
+        return Ok(Array2::zeros((0, p_total)));
+    }
+
+    let rank_k = analysis.rank;
+    let tolerance = analysis.tol;
+    let mut rs = Array2::zeros((rank_k, p_total));
+    let mut row_idx = 0;
+    for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
+        if eigenval > tolerance {
+            let sqrt_eigenval = eigenval.sqrt();
+            let eigenvec = analysis.eigenvectors.column(i);
+            for (j, &v) in eigenvec.iter().enumerate() {
+                rs[[row_idx, col_range.start + j]] = sqrt_eigenval * v;
+            }
+            row_idx += 1;
+        }
+    }
+
+    Ok(rs)
+}
+
+/// Ridge (scaled identity) root: trivial closed-form, no eigendecomposition.
+/// Returns a `block_size × p_total` matrix.
+fn ridge_root(
+    col_range: &Range<usize>,
+    scale: f64,
+    p_total: usize,
+) -> Array2<f64> {
+    let block_size = col_range.len();
+    if scale <= 0.0 || block_size == 0 {
+        return Array2::zeros((0, p_total));
+    }
+    let sqrt_scale = scale.sqrt();
+    let mut rs = Array2::zeros((block_size, p_total));
+    for i in 0..block_size {
+        rs[[i, col_range.start + i]] = sqrt_scale;
+    }
+    rs
+}
+
+/// Kronecker-factored root: eigendecompose each factor separately.
+///
+/// For factors `[F_0, F_1, ..., F_k]` where the product is `F_0 ⊗ F_1 ⊗ ... ⊗ F_k`,
+/// the eigendecomposition of the Kronecker product is the Kronecker product of
+/// the factor eigendecompositions. The root is `R_0 ⊗ R_1 ⊗ ... ⊗ R_k` where
+/// each `R_j` is the square root of factor `F_j`.
+///
+/// Cost: O(Σ q_j³) instead of O((Π q_j)³).
+fn kronecker_root(
+    col_range: &Range<usize>,
+    factors: &[Array2<f64>],
+    p_total: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    if factors.is_empty() {
+        return Ok(Array2::zeros((0, p_total)));
+    }
+
+    // Eigendecompose each factor and build its square root.
+    struct FactorRoot {
+        root: Array2<f64>,  // rank_j × q_j
+        rank: usize,
+        dim: usize,
+    }
+
+    let mut factor_roots = Vec::with_capacity(factors.len());
+    for (j, factor) in factors.iter().enumerate() {
+        let q_j = factor.nrows();
+        if q_j != factor.ncols() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Kronecker factor {j} must be square, got {}x{}", factor.nrows(), factor.ncols()
+            )));
+        }
+
+        // Check if this factor is an identity matrix (common: I ⊗ S_j ⊗ I).
+        let is_identity = {
+            let mut is_id = true;
+            'outer: for r in 0..q_j {
+                for c in 0..q_j {
+                    let expected = if r == c { 1.0 } else { 0.0 };
+                    if (factor[[r, c]] - expected).abs() > 1e-12 {
+                        is_id = false;
+                        break 'outer;
+                    }
+                }
+            }
+            is_id
+        };
+
+        if is_identity {
+            // Identity factor: root is identity, rank = dim.
+            factor_roots.push(FactorRoot {
+                root: Array2::eye(q_j),
+                rank: q_j,
+                dim: q_j,
+            });
+            continue;
+        }
+
+        // General PSD factor: eigendecompose at O(q_j^3).
+        let analysis = analyze_penalty_block(factor).map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "Kronecker factor {j} eigendecomposition failed: {err}"
+            ))
+        })?;
+
+        if analysis.rank == 0 {
+            // Zero factor → entire Kronecker product is zero.
+            return Ok(Array2::zeros((0, p_total)));
+        }
+
+        let mut root_j = Array2::zeros((analysis.rank, q_j));
+        let mut row_idx = 0;
+        for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
+            if eigenval > analysis.tol {
+                let sqrt_ev = eigenval.sqrt();
+                let evec = analysis.eigenvectors.column(i);
+                for (c, &v) in evec.iter().enumerate() {
+                    root_j[[row_idx, c]] = sqrt_ev * v;
+                }
+                row_idx += 1;
+            }
+        }
+
+        factor_roots.push(FactorRoot {
+            root: root_j,
+            rank: analysis.rank,
+            dim: q_j,
+        });
+    }
+
+    // Build the Kronecker product of factor roots iteratively.
+    // Start with the first factor's root, then Kronecker-multiply with each subsequent.
+    let mut kron_root = factor_roots[0].root.clone();
+    for fr in &factor_roots[1..] {
+        let (r1, c1) = kron_root.dim();
+        let (r2, c2) = (fr.rank, fr.dim);
+        let mut new_root = Array2::zeros((r1 * r2, c1 * c2));
+        for i1 in 0..r1 {
+            for i2 in 0..r2 {
+                for j1 in 0..c1 {
+                    for j2 in 0..c2 {
+                        new_root[[i1 * r2 + i2, j1 * c2 + j2]] =
+                            kron_root[[i1, j1]] * fr.root[[i2, j2]];
+                    }
+                }
+            }
+        }
+        kron_root = new_root;
+    }
+
+    // Embed into global coordinates.
+    let rank_total = kron_root.nrows();
+    let block_dim = kron_root.ncols();
+    debug_assert_eq!(block_dim, col_range.len());
+    let mut rs = Array2::zeros((rank_total, p_total));
+    rs.slice_mut(s![.., col_range.start..col_range.end])
+        .assign(&kron_root);
+
+    Ok(rs)
+}
+
+/// Compute penalty square roots from blockwise penalties at block scale.
+///
+/// This is the block-aware replacement for `compute_penalty_square_roots`.
+/// Each penalty is eigendecomposed at its natural block size (p_local × p_local)
+/// rather than the global size (p_total × p_total), with fast paths for
+/// Ridge (closed-form) and Kronecker (per-factor) structures.
+///
+/// Returns `Vec<Array2<f64>>` of `rank_k × p_total` matrices — same format
+/// as the existing `compute_penalty_square_roots`.
+pub fn compute_penalty_square_roots_blockwise(
+    penalties: &[BlockwisePenalty],
+    p_total: usize,
+) -> Result<Vec<Array2<f64>>, EstimationError> {
+    let mut rs_list = Vec::with_capacity(penalties.len());
+
+    for bp in penalties {
+        let rs = match &bp.structure_hint {
+            Some(PenaltyStructureHint::Ridge(scale)) => {
+                ridge_root(&bp.col_range, *scale, p_total)
+            }
+            Some(PenaltyStructureHint::Kronecker(factors)) => {
+                kronecker_root(&bp.col_range, factors, p_total)?
+            }
+            None => {
+                block_local_root(&bp.col_range, &bp.local, p_total)?
+            }
+        };
+        rs_list.push(rs);
+    }
+
+    Ok(rs_list)
+}
+
+/// Create a balanced penalty root from blockwise penalties at block scale.
+///
+/// When all penalties have non-overlapping col_ranges, the balanced sum is
+/// block-diagonal and eigendecomposition is done per-block.
+/// Falls back to the global path when penalties overlap.
+pub fn create_balanced_penalty_root_blockwise(
+    penalties: &[BlockwisePenalty],
+    p_total: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    if penalties.is_empty() {
+        return Ok(Array2::zeros((0, p_total)));
+    }
+
+    // Group penalties by col_range to detect block-diagonal structure.
+    // Key: (start, end), Value: list of local penalty matrices.
+    let mut block_groups: BTreeMap<(usize, usize), Vec<&Array2<f64>>> = BTreeMap::new();
+    for bp in penalties {
+        let key = (bp.col_range.start, bp.col_range.end);
+        block_groups.entry(key).or_default().push(&bp.local);
+    }
+
+    // Check for overlapping ranges. Ranges are non-overlapping if, when sorted
+    // by start, each range's start >= the previous range's end.
+    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
+    let mut overlapping = false;
+    for i in 1..ranges.len() {
+        if ranges[i].0 < ranges[i - 1].1 {
+            overlapping = true;
+            break;
+        }
+    }
+
+    if overlapping {
+        // Fall back to global path: materialize p×p matrices.
+        let s_list: Vec<Array2<f64>> = penalties.iter().map(|bp| bp.to_global(p_total)).collect();
+        return create_balanced_penalty_root(&s_list, p_total);
+    }
+
+    // Non-overlapping: process each block independently.
+    let mut total_rank = 0usize;
+    struct BlockRoot {
+        col_range: Range<usize>,
+        root: Array2<f64>,  // rank_b × block_dim
+    }
+    let mut block_roots = Vec::with_capacity(block_groups.len());
+
+    for (&(start, end), locals) in &block_groups {
+        let block_dim = end - start;
+        let mut s_balanced = Array2::zeros((block_dim, block_dim));
+
+        for local in locals {
+            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            if frob_norm > 1e-12 {
+                s_balanced.scaled_add(1.0 / frob_norm, local);
+            }
+        }
+
+        let (eigenvalues, eigenvectors) =
+            robust_eigh(&s_balanced, Side::Lower, "balanced penalty block")?;
+
+        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+        let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+
+        if block_rank == 0 {
+            continue;
+        }
+
+        let mut root = Array2::zeros((block_rank, block_dim));
+        let mut row_idx = 0;
+        for (i, &eigenval) in eigenvalues.iter().enumerate() {
+            if eigenval > tolerance {
+                let sqrt_ev = eigenval.sqrt();
+                let evec = eigenvectors.column(i);
+                root.row_mut(row_idx).assign(&(&evec * sqrt_ev));
+                row_idx += 1;
+            }
+        }
+
+        total_rank += block_rank;
+        block_roots.push(BlockRoot {
+            col_range: start..end,
+            root,
+        });
+    }
+
+    if total_rank == 0 {
+        return Ok(Array2::zeros((0, p_total)));
+    }
+
+    // Assemble global balanced root: total_rank × p_total
+    let mut eb = Array2::zeros((total_rank, p_total));
+    let mut row_offset = 0;
+    for br in &block_roots {
+        let rank_b = br.root.nrows();
+        eb.slice_mut(s![row_offset..(row_offset + rank_b), br.col_range.start..br.col_range.end])
+            .assign(&br.root);
+        row_offset += rank_b;
+    }
+
+    Ok(eb)
+}
+
+/// Precompute reparameterization invariant from blockwise penalties at block scale.
+///
+/// When all penalties have non-overlapping col_ranges, the balanced sum is
+/// block-diagonal and the Q_pen/Q_null subspace split is computed per-block.
+/// Falls back to the global path when penalties overlap.
+pub fn precompute_reparam_invariant_blockwise(
+    penalties: &[BlockwisePenalty],
+    rs_list: &[Array2<f64>],
+    p_total: usize,
+) -> Result<ReparamInvariant, EstimationError> {
+    use std::cmp::Ordering;
+
+    let m = penalties.len();
+    if m != rs_list.len() {
+        return Err(EstimationError::LayoutError(format!(
+            "penalties/rs_list length mismatch: {} vs {}",
+            m, rs_list.len()
+        )));
+    }
+
+    if m == 0 {
+        return Ok(ReparamInvariant {
+            split: SubspaceSplit::identity(p_total),
+            rs_transformed_base: Vec::new(),
+            has_nonzero: false,
+            max_balanced_eigenvalue: 0.0,
+        });
+    }
+
+    // Group penalties by col_range.
+    struct PenaltyRef {
+        global_index: usize,
+        local: Array2<f64>,
+    }
+    let mut block_groups: BTreeMap<(usize, usize), Vec<PenaltyRef>> = BTreeMap::new();
+    for (i, bp) in penalties.iter().enumerate() {
+        let key = (bp.col_range.start, bp.col_range.end);
+        block_groups.entry(key).or_default().push(PenaltyRef {
+            global_index: i,
+            local: bp.local.clone(),
+        });
+    }
+
+    // Check for overlapping ranges.
+    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
+    let mut overlapping = false;
+    for i in 1..ranges.len() {
+        if ranges[i].0 < ranges[i - 1].1 {
+            overlapping = true;
+            break;
+        }
+    }
+
+    if overlapping {
+        // Fall back to global path.
+        return precompute_reparam_invariant(rs_list, p_total);
+    }
+
+    // Non-overlapping: process each block independently.
+    // The global Q_s matrix is block-diagonal: for each block, we compute a local
+    // Q_pen / Q_null split and embed it into the global matrix.
+
+    // Columns NOT covered by any penalty range get identity treatment (unpenalized).
+    let mut covered = vec![false; p_total];
+    for bp in penalties {
+        for j in bp.col_range.clone() {
+            covered[j] = true;
+        }
+    }
+
+    // Process each block.
+    struct BlockInvariant {
+        col_range: Range<usize>,
+        q_pen_local: Array2<f64>,   // block_dim × pen_rank
+        q_null_local: Array2<f64>,  // block_dim × null_count
+        max_bal_eigenvalue: f64,
+        // For each penalty in this block: its global index and local transformed root
+        penalty_transforms: Vec<(usize, Array2<f64>)>,
+    }
+
+    let mut block_invariants = Vec::with_capacity(block_groups.len());
+    let mut has_nonzero = false;
+    let mut global_max_bal = 0.0_f64;
+
+    for (&(start, end), refs) in &block_groups {
+        let block_dim = end - start;
+
+        // Build local balanced sum.
+        let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
+        let mut block_has_nonzero = false;
+        for pref in refs {
+            let frob_norm = pref.local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            if frob_norm > 1e-12 {
+                s_balanced_local.scaled_add(1.0 / frob_norm, &pref.local);
+                block_has_nonzero = true;
+            }
+        }
+
+        if !block_has_nonzero {
+            // All penalties in this block are zero → identity split (all null).
+            let mut transforms = Vec::new();
+            for pref in refs {
+                let rs_k = &rs_list[pref.global_index];
+                // Extract the block columns and transform by identity.
+                let rs_local = rs_k.slice(s![.., start..end]).to_owned();
+                transforms.push((pref.global_index, rs_local));
+            }
+            block_invariants.push(BlockInvariant {
+                col_range: start..end,
+                q_pen_local: Array2::zeros((block_dim, 0)),
+                q_null_local: Array2::eye(block_dim),
+                max_bal_eigenvalue: 0.0,
+                penalty_transforms: transforms,
+            });
+            continue;
+        }
+
+        has_nonzero = true;
+
+        // Eigendecompose the local balanced penalty.
+        let (bal_eigenvalues, bal_eigenvectors) =
+            robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
+
+        // Sort eigenvalues descending.
+        let mut order: Vec<usize> = (0..block_dim).collect();
+        order.sort_by(|&i, &j| {
+            bal_eigenvalues[j]
+                .partial_cmp(&bal_eigenvalues[i])
+                .unwrap_or(Ordering::Equal)
+                .then(i.cmp(&j))
+        });
+
+        let max_bal = order
+            .iter()
+            .map(|&idx| bal_eigenvalues[idx].abs())
+            .fold(0.0_f64, f64::max);
+        let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
+        let penalized_rank = order
+            .iter()
+            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
+            .count();
+        let null_count = block_dim - penalized_rank;
+
+        // Build local Q_pen and Q_null.
+        let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
+        let mut q_null_local = Array2::zeros((block_dim, null_count));
+        for (col_idx, &idx) in order.iter().enumerate() {
+            if col_idx < penalized_rank {
+                for row in 0..block_dim {
+                    q_pen_local[[row, col_idx]] = bal_eigenvectors[[row, idx]];
+                }
+            } else {
+                let null_col = col_idx - penalized_rank;
+                for row in 0..block_dim {
+                    q_null_local[[row, null_col]] = bal_eigenvectors[[row, idx]];
+                }
+            }
+        }
+
+        // Build local Q_s = [Q_pen | Q_null] and transform each penalty root.
+        let mut qs_local = Array2::zeros((block_dim, block_dim));
+        for i in 0..block_dim {
+            for j in 0..penalized_rank {
+                qs_local[[i, j]] = q_pen_local[[i, j]];
+            }
+            for j in 0..null_count {
+                qs_local[[i, penalized_rank + j]] = q_null_local[[i, j]];
+            }
+        }
+
+        let mut transforms = Vec::new();
+        for pref in refs {
+            let rs_k = &rs_list[pref.global_index];
+            // Extract block columns from the global root, multiply by local Q_s.
+            let rs_local = rs_k.slice(s![.., start..end]);
+            let rs_transformed_local = rs_local.dot(&qs_local);
+            transforms.push((pref.global_index, rs_transformed_local));
+        }
+
+        global_max_bal = global_max_bal.max(max_bal);
+        block_invariants.push(BlockInvariant {
+            col_range: start..end,
+            q_pen_local,
+            q_null_local,
+            max_bal_eigenvalue: max_bal,
+            penalty_transforms: transforms,
+        });
+    }
+
+    if !has_nonzero {
+        return Ok(ReparamInvariant {
+            split: SubspaceSplit::identity(p_total),
+            rs_transformed_base: rs_list.to_vec(),
+            has_nonzero: false,
+            max_balanced_eigenvalue: 0.0,
+        });
+    }
+
+    // Assemble global Q_pen and Q_null from block-local splits.
+    // Uncovered columns (not in any penalty range) are fully unpenalized → go to Q_null.
+    let uncovered_cols: Vec<usize> = (0..p_total).filter(|j| !covered[*j]).collect();
+    let total_pen_rank: usize = block_invariants.iter().map(|bi| bi.q_pen_local.ncols()).sum();
+    let total_null: usize =
+        block_invariants.iter().map(|bi| bi.q_null_local.ncols()).sum() + uncovered_cols.len();
+
+    let mut q_pen = Array2::zeros((p_total, total_pen_rank));
+    let mut q_null = Array2::zeros((p_total, total_null));
+    let mut pen_col = 0;
+    let mut null_col = 0;
+
+    for bi in &block_invariants {
+        let start = bi.col_range.start;
+        let pen_r = bi.q_pen_local.ncols();
+        let null_r = bi.q_null_local.ncols();
+        if pen_r > 0 {
+            q_pen
+                .slice_mut(s![start..(start + bi.q_pen_local.nrows()), pen_col..(pen_col + pen_r)])
+                .assign(&bi.q_pen_local);
+            pen_col += pen_r;
+        }
+        if null_r > 0 {
+            q_null
+                .slice_mut(s![
+                    start..(start + bi.q_null_local.nrows()),
+                    null_col..(null_col + null_r)
+                ])
+                .assign(&bi.q_null_local);
+            null_col += null_r;
+        }
+    }
+    // Uncovered columns → identity columns in Q_null.
+    for &j in &uncovered_cols {
+        q_null[[j, null_col]] = 1.0;
+        null_col += 1;
+    }
+
+    let split = SubspaceSplit { q_pen, q_null };
+
+    // Assemble global transformed roots: for each penalty, embed the local
+    // transformed root into global coordinates. The root is rank_k × p_total,
+    // with nonzero entries only in the block columns, pre-multiplied by local Q_s.
+    let mut rs_transformed_base = vec![Array2::zeros((0, 0)); m];
+    for bi in &block_invariants {
+        for &(gi, ref rs_local_transformed) in &bi.penalty_transforms {
+            let rank_k = rs_local_transformed.nrows();
+            let cols = p_total;
+            let mut rs_global = Array2::zeros((rank_k, cols));
+            rs_global
+                .slice_mut(s![.., bi.col_range.start..bi.col_range.end])
+                .assign(rs_local_transformed);
+            rs_transformed_base[gi] = rs_global;
+        }
+    }
+
+    Ok(ReparamInvariant {
+        split,
+        rs_transformed_base,
+        has_nonzero,
+        max_balanced_eigenvalue: global_max_bal,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // CanonicalPenalty — block-local processed penalty for the solver
 // ---------------------------------------------------------------------------
 
