@@ -231,8 +231,6 @@ impl TransformationNormalFamily {
         // ----- 6. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
 
-        let _ = resp_penalties;
-
         Ok(Self {
             x_val: Arc::new(x_val),
             x_val_kron,
@@ -567,10 +565,9 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn exact_outer_derivative_order(
         &self,
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
+        _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        let _ = (specs, options);
         let n = self.n_obs();
         let p = self.p_total();
         // Downgrade to first-order if the Hessian directional derivative is too
@@ -584,11 +581,10 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_index: usize,
-        spec: &ParameterBlockSpec,
+        _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        let _ = (block_states, spec);
         if block_index != 0 {
             return Ok(None);
         }
@@ -642,11 +638,10 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let _ = specs;
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -1749,18 +1744,8 @@ pub fn fit_transformation_normal(
         &joint_setup,
         analytic_gradient,
         analytic_hessian,
-        // cost_fn
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let _ = (rho, specs);
-            let family = make_family(&designs[0])?;
-            let blocks = make_blocks(&family);
-            let fit = fit_custom_family(&family, &blocks, options)
-                .map_err(|e| format!("transformation cost_fn: {e}"))?;
-            Ok(transformation_fit_score(&fit))
-        },
         // fit_fn
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let _ = (rho, specs);
+        |_, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let family = make_family(&designs[0])?;
             let blocks = make_blocks(&family);
             let fit = fit_custom_family(&family, &blocks, options)
@@ -1859,21 +1844,3 @@ pub fn fit_transformation_normal(
     })
 }
 
-/// Score function for transformation model fits.
-///
-/// Returns the penalized objective (−ℓ + penalty + REML/logdet terms), which
-/// is the same quantity that `evaluate_custom_family_joint_hyper` computes as
-/// `eval.objective`.  Using a consistent objective across the cost-only and
-/// exact evaluation paths is critical: the outer optimizer compares cost_fn
-/// values with exact_fn values, and a mismatch causes zigzagging /
-/// non-convergence.
-fn transformation_fit_score(fit: &UnifiedFitResult) -> f64 {
-    // penalized_objective already incorporates the REML/logdet correction
-    // when available, and gracefully degrades to −ℓ + penalty when the
-    // log-det is non-finite (see finite_penalizedobjective in custom_family).
-    if fit.penalized_objective.is_finite() {
-        fit.penalized_objective
-    } else {
-        f64::INFINITY
-    }
-}

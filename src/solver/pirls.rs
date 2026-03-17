@@ -682,12 +682,11 @@ pub struct PirlsWorkspace {
 }
 
 impl PirlsWorkspace {
-    pub fn new(n: usize, p: usize, ebrows: usize, erows: usize) -> Self {
+    pub fn new(n: usize, p: usize, _: usize, _: usize) -> Self {
         // Stage buffers are allocated lazily: historically these were pre-sized to
-        // worst-case dimensions (p + ebrows / p + erows), which inflates memory
-        // when many PIRLS workspaces exist concurrently (e.g. parallel REML evals).
+        // worst-case dimensions, which inflates memory when many PIRLS workspaces
+        // exist concurrently (e.g. parallel REML evals).
         // The active code paths resize-on-demand where needed.
-        let _ = (ebrows, erows);
 
         PirlsWorkspace {
             sqrtw: Array1::zeros(n),
@@ -1194,8 +1193,7 @@ impl<'a> GamWorkingModel<'a> {
             WorkingCoordinateDesign::TransformedExplicit { .. } => {
                 PirlsCoordinateFrame::TransformedQs
             }
-            WorkingCoordinateDesign::TransformedImplicit { qs } => {
-                let _ = design_dot_dense_rhs(&x_original, &qs);
+            WorkingCoordinateDesign::TransformedImplicit { .. } => {
                 PirlsCoordinateFrame::TransformedQs
             }
         };

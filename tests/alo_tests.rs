@@ -157,7 +157,6 @@ fn alo_hat_diag_sane_and_bounded() {
     let (x, y, _) = generate_synthetic_binary_data(n, p, 42);
     let w = Array1::<f64>::ones(n);
     let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
-    let x_dense = fit.x_transformed.to_dense();
     let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
     let leverage = alo.leverage;
 
@@ -193,7 +192,6 @@ fn alo_hat_diag_sane_and_bounded() {
     let alozero =
         compute_alo_diagnostics_from_pirls(&fitzero, y.view(), LinkFunction::Logit).unwrap();
     assert!(alozero.leverage[10].abs() < 1e-12);
-    let _ = x_dense; // keep parity with original helper context
 }
 
 #[test]

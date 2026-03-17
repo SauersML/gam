@@ -21,10 +21,12 @@ pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;
 pub use families::survival_location_scale;
+pub use families::survival_marginal_slope;
 pub use families::transformation_normal;
 pub use solver::workflow::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
     StandardFitRequest, StandardFitResult, SurvivalLocationScaleFitRequest,
-    SurvivalLocationScaleFitResult, TransformationNormalFitRequest, fit_model,
+    SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
+    TransformationNormalFitRequest, fit_model,
 };

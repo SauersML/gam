@@ -2211,7 +2211,7 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis < self.n_axes);
         assert_eq!(v.len(), self.n);
         if self.is_streaming() {
-            let raw = self.streaming_accumulate_knot_vector(v, |q, t, sb| { let _ = t; q * sb[axis] })?;
+            let raw = self.streaming_accumulate_knot_vector(v, |q, _, sb| { q * sb[axis] })?;
             return Ok(self.project_and_pad(&raw));
         }
         let af = &self.axis_components;
@@ -2232,7 +2232,7 @@ impl ImplicitDesignPsiDerivative {
         assert_eq!(u.len(), self.p_out());
         let u_knot = self.unproject(u);
         if self.is_streaming() {
-            return self.streaming_forward_mul(&u_knot, |q, t, sb| { let _ = t; q * sb[axis] });
+            return self.streaming_forward_mul(&u_knot, |q, _, sb| { q * sb[axis] });
         }
         let n = self.n;
         let k = self.n_knots;
@@ -2313,7 +2313,7 @@ impl ImplicitDesignPsiDerivative {
         assert_ne!(axis_d, axis_e);
         assert_eq!(v.len(), self.n);
         if self.is_streaming() {
-            let raw = self.streaming_accumulate_knot_vector(v, |q, t, sb| { let _ = q; t * sb[axis_d] * sb[axis_e] })?;
+            let raw = self.streaming_accumulate_knot_vector(v, |_, t, sb| { t * sb[axis_d] * sb[axis_e] })?;
             return Ok(self.project_and_pad(&raw));
         }
         let af = &self.axis_components;
@@ -2382,7 +2382,7 @@ impl ImplicitDesignPsiDerivative {
         assert_eq!(u.len(), self.p_out());
         let u_knot = self.unproject(u);
         if self.is_streaming() {
-            return self.streaming_forward_mul(&u_knot, |q, t, sb| { let _ = q; t * sb[axis_d] * sb[axis_e] });
+            return self.streaming_forward_mul(&u_knot, |_, t, sb| { t * sb[axis_d] * sb[axis_e] });
         }
         let n = self.n;
         let k = self.n_knots;
@@ -2429,7 +2429,7 @@ impl ImplicitDesignPsiDerivative {
     pub fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(axis < self.n_axes);
         if self.is_streaming() {
-            return self.streaming_materialize(|q, t, sb| { let _ = t; q * sb[axis] });
+            return self.streaming_materialize(|q, _, sb| { q * sb[axis] });
         }
         let n = self.n;
         let k = self.n_knots;
@@ -2470,7 +2470,7 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_e < self.n_axes);
         assert_ne!(axis_d, axis_e);
         if self.is_streaming() {
-            return self.streaming_materialize(|q, t, sb| { let _ = q; t * sb[axis_d] * sb[axis_e] });
+            return self.streaming_materialize(|_, t, sb| { t * sb[axis_d] * sb[axis_e] });
         }
         let n = self.n;
         let k = self.n_knots;
@@ -13387,7 +13387,7 @@ mod tests {
             assert_abs_diff_eq!(d1[i], d1_right[i], epsilon = 1e-12);
         }
 
-        let _ = evaluate_splinessecond_derivative_sparse_into(
+        evaluate_splinessecond_derivative_sparse_into(
             -10.0,
             degree,
             knots.view(),
@@ -13395,7 +13395,7 @@ mod tests {
             &mut scratch,
         );
         assert!(d2.iter().all(|v| v.abs() < 1e-12));
-        let _ = evaluate_splinessecond_derivative_sparse_into(
+        evaluate_splinessecond_derivative_sparse_into(
             10.0,
             degree,
             knots.view(),
@@ -15185,10 +15185,8 @@ mod tests {
         let s_psi = &s1 + &(s2.mapv(|v| psi0 * v));
         let s_psi_psi = s2.clone();
 
-        let (sn, sn_psi, sn_psi_psi, c) =
+        let (_, sn_psi, sn_psi_psi, _) =
             normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
-        let _ = sn;
-        let _ = c;
 
         let h = 1e-6;
         let eval_snorm = |psi: f64| {
@@ -15551,7 +15549,7 @@ mod tests {
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+        let (_, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             0.0,
             Some(length_scale),
             p_order,
@@ -15560,7 +15558,6 @@ mod tests {
             Some(&coeffs),
         )
         .expect("radial triplet at origin");
-        let _ = phi;
         let (phi_rr_collision, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
@@ -15808,11 +15805,8 @@ mod tests {
     #[test]
     fn test_matern_safe_ratio_half_is_finitewith_floor() {
         let ls = 1.3;
-        let (phi, phi_r, phi_rr, ratio) =
+        let (_, _, _, ratio) =
             matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::Half).expect("half");
-        let _ = phi;
-        let _ = phi_r;
-        let _ = phi_rr;
         assert!(ratio.is_finite());
         assert!(ratio < 0.0);
     }

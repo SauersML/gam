@@ -81,8 +81,7 @@ where
         (self.cost_fn)(rho)
     }
 
-    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
-        let _ = rho.len();
+    fn eval(&mut self, _: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         Err(EstimationError::InvalidInput(
             "cost-only auxiliary optimization must run through the cost bridge".to_string(),
         ))

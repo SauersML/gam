@@ -145,14 +145,14 @@ fn update_stage(label: &str) {
 
     if warnings_enabled() {
         println!("cargo:warning=project build stage: {label}");
-        let _ = io::stdout().flush();
+        io::stdout().flush().ok();
     }
 }
 
 fn emit_stage_detail(detail: &str) {
     if warnings_enabled() {
         println!("cargo:warning=project build detail: {detail}");
-        let _ = io::stdout().flush();
+        io::stdout().flush().ok();
     }
 }
 
@@ -1006,27 +1006,6 @@ impl Sink for DisallowedLetCollector {
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
-
-        let trimmed = line_text.trim();
-        if matches!(trimmed, "break;" | "continue;" | "return;") {
-            return Ok(true);
-        }
-        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
-            return Ok(true);
-        }
-        if trimmed.starts_with("let ") || trimmed.contains('=') {
-            return Ok(true);
-        }
-        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
-            return Ok(true);
-        }
-        if trimmed
-            .chars()
-            .find(|c| !c.is_whitespace())
-            .is_some_and(|c| !c.is_ascii_alphabetic() && c != '_')
-        {
-            return Ok(true);
-        }
 
         self.violations.push(format!("{line_number}:{line_text}"));
 
@@ -5657,7 +5636,7 @@ fn split_top_level_boolean(expression: &str, join: BooleanJoin) -> Vec<&str> {
         match bytes[idx] {
             b'(' | b'[' | b'{' => stack.push(bytes[idx]),
             b')' | b']' | b'}' => {
-                let _ = stack.pop();
+                stack.pop();
             }
             _ => {}
         }

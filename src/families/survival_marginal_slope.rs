@@ -36,7 +36,6 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub weights: Array1<f64>,
     pub z: Array1<f64>,
     pub derivative_guard: f64,
-    pub derivative_softness: f64,
     pub time_block: TimeBlockInput,
     pub logslopespec: TermCollectionSpec,
 }
@@ -110,6 +109,7 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
 
 #[derive(Clone)]
 struct RowPrimaryBase {
+    nll: f64,
     gradient: Array1<f64>,
     hessian: Array2<f64>,
 }
@@ -213,12 +213,19 @@ impl SurvivalMarginalSlopeFamily {
         };
 
         // Time derivative: -d * log(ad1)
-        // Monotonicity constraints ensure ad1 >= guard, so floor is safe.
+        // If ad1_val is tiny/negative (before monotonicity converges), derivatives
+        // through log() are meaningless — return a constant penalty instead.
         let time_deriv_term = if di > 0.0 {
             let ad1_val = ad1_jet.coeff(0);
-            ad1_jet
-                .compose_unary(unary_derivatives_log(ad1_val.max(1e-300)))
-                .scale(-wi * di)
+            if ad1_val > 1e-300 {
+                ad1_jet
+                    .compose_unary(unary_derivatives_log(ad1_val))
+                    .scale(-wi * di)
+            } else {
+                // At the floor: log(1e-300) is a large negative constant, derivatives are zero
+                // because the constraint should push us away from here
+                MultiDirJet::constant(k, (-wi * di) * (1e-300_f64).ln())
+            }
         } else {
             MultiDirJet::zero(k)
         };
@@ -239,7 +246,8 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let nll = self.row_neglog_directional(row, block_states, &[])?;
         let mut grad = Array1::<f64>::zeros(N_PRIMARY);
         let mut hess = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
@@ -253,7 +261,7 @@ impl SurvivalMarginalSlopeFamily {
                 hess[[b, a]] = value;
             }
         }
-        Ok((grad, hess))
+        Ok((nll, grad, hess))
     }
 
     fn build_eval_cache(
@@ -263,9 +271,9 @@ impl SurvivalMarginalSlopeFamily {
         let slices = block_slices(block_states);
         let row_bases = (0..self.n)
             .map(|row| {
-                let (gradient, hessian) =
+                let (nll, gradient, hessian) =
                     self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                Ok(RowPrimaryBase { gradient, hessian })
+                Ok(RowPrimaryBase { nll, gradient, hessian })
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(EvalCache { slices, row_bases })
@@ -446,8 +454,7 @@ impl SurvivalMarginalSlopeFamily {
         let mut hessian = need_hessian.then(|| Array2::<f64>::zeros((slices.total, slices.total)));
         let mut ll = 0.0;
         for i in 0..self.n {
-            let row_neglog = self.row_neglog_directional(i, block_states, &[])?;
-            ll -= row_neglog;
+            ll -= cache.row_bases[i].nll;
 
             let (f_pi, f_pipi) = self.row_primary_gradient_hessian(i, &cache);
             gradient -= &self.pullback_primary_vector(i, slices, f_pi);
@@ -492,30 +499,30 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Some(out))
     }
 
-    fn joint_hessian_matvec(
+    fn joint_hessian_matvec_from_cache(
         &self,
-        block_states: &[ParameterBlockState],
         direction: &Array1<f64>,
+        cache: &EvalCache,
     ) -> Result<Array1<f64>, String> {
-        let slices = block_slices(block_states);
+        let slices = &cache.slices;
         let mut out = Array1::<f64>::zeros(slices.total);
         for row in 0..self.n {
-            let row_dir = self.row_primary_direction_from_flat(row, &slices, direction);
-            let (_, row_hessian) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+            let row_dir = self.row_primary_direction_from_flat(row, slices, direction);
+            let (_, row_hessian) = self.row_primary_gradient_hessian(row, cache);
             let row_action = row_hessian.dot(&row_dir);
-            out += &self.pullback_primary_vector(row, &slices, &row_action);
+            out += &self.pullback_primary_vector(row, slices, &row_action);
         }
         Ok(out)
     }
 
-    fn joint_hessian_diagonal(
+    fn joint_hessian_diagonal_from_cache(
         &self,
-        block_states: &[ParameterBlockState],
+        cache: &EvalCache,
     ) -> Result<Array1<f64>, String> {
-        let slices = block_slices(block_states);
+        let slices = &cache.slices;
         let mut diagonal = Array1::<f64>::zeros(slices.total);
         for row in 0..self.n {
-            let (_, row_hessian) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+            let (_, row_hessian) = self.row_primary_gradient_hessian(row, cache);
 
             // Time block contributions from entry, exit, derivative designs
             let designs = [
@@ -528,8 +535,6 @@ impl SurvivalMarginalSlopeFamily {
                     diagonal[slices.time.start + local_idx] +=
                         value * value * row_hessian[[pi, pi]];
                 }
-                // Cross terms between different time designs contribute to diagonal
-                // only through the same coefficient index
                 for &(pj, ref des_j) in &designs {
                     if pj <= pi {
                         continue;
@@ -543,7 +548,6 @@ impl SurvivalMarginalSlopeFamily {
                 }
             }
 
-            // Slope block
             for (local_idx, &value) in self.logslope_design.row(row).iter().enumerate() {
                 diagonal[slices.logslope.start + local_idx] += value * value * row_hessian[[3, 3]];
             }
@@ -776,11 +780,12 @@ impl SurvivalMarginalSlopeFamily {
 
     // ── Psi terms (first and second order) ────────────────────────────
 
-    fn psi_terms(
+    fn psi_terms_inner(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
+        cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let slices = block_slices(block_states);
         let Some((block_idx, _)) =
@@ -788,7 +793,6 @@ impl SurvivalMarginalSlopeFamily {
         else {
             return Ok(None);
         };
-        // Only logslope (block 1) has spatial terms → primary index is always g (3)
         if block_idx != 1 {
             return Err(format!(
                 "survival marginal-slope psi_terms: only logslope block (1) expected, got {block_idx}"
@@ -804,7 +808,12 @@ impl SurvivalMarginalSlopeFamily {
             else {
                 continue;
             };
-            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+            let (f_pi, f_pipi) = if let Some(c) = cache {
+                let (g, h) = self.row_primary_gradient_hessian(row, c);
+                (g.clone(), h.clone())
+            } else {
+                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+            };
             let third = self.row_primary_third_contracted(row, block_states, &dir)?;
             let (_, left_vec) = self
                 .embedded_psi_vector(row, &slices, derivative_blocks, psi_index)?
@@ -833,12 +842,22 @@ impl SurvivalMarginalSlopeFamily {
         }))
     }
 
-    fn psi_second_order_terms(
+    fn psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.psi_terms_inner(block_states, derivative_blocks, psi_index, None)
+    }
+
+    fn psi_second_order_terms_inner(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
+        cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = block_slices(block_states);
         let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)?
@@ -849,7 +868,6 @@ impl SurvivalMarginalSlopeFamily {
         else {
             return Ok(None);
         };
-        // Only logslope (block 1) has spatial terms → primary index is always g (3)
         let idx_i = 3usize;
         let idx_j = 3usize;
         let mut objective_psi_psi = 0.0;
@@ -875,7 +893,12 @@ impl SurvivalMarginalSlopeFamily {
                     psi_j,
                 )?
                 .unwrap_or_else(|| Array1::<f64>::zeros(N_PRIMARY));
-            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+            let (f_pi, f_pipi) = if let Some(c) = cache {
+                let (g, h) = self.row_primary_gradient_hessian(row, c);
+                (g.clone(), h.clone())
+            } else {
+                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+            };
             let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
             let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;
             let fourth = self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
@@ -960,6 +983,16 @@ impl SurvivalMarginalSlopeFamily {
         }))
     }
 
+    fn psi_second_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.psi_second_order_terms_inner(block_states, derivative_blocks, psi_i, psi_j, None)
+    }
+
     fn psi_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -1020,24 +1053,47 @@ impl SurvivalMarginalSlopeFamily {
 struct SurvivalMarginalSlopeHessianWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
+    cache: EvalCache,
 }
 
 struct SurvivalMarginalSlopePsiWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    cache: EvalCache,
+}
+
+impl SurvivalMarginalSlopeHessianWorkspace {
+    fn new(
+        family: SurvivalMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Result<Self, String> {
+        let cache = family.build_eval_cache(&block_states)?;
+        Ok(Self { family, block_states, cache })
+    }
+}
+
+impl SurvivalMarginalSlopePsiWorkspace {
+    fn new(
+        family: SurvivalMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+        derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    ) -> Result<Self, String> {
+        let cache = family.build_eval_cache(&block_states)?;
+        Ok(Self { family, block_states, derivative_blocks, cache })
+    }
 }
 
 impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeHessianWorkspace {
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         self.family
-            .joint_hessian_matvec(&self.block_states, beta_flat)
+            .joint_hessian_matvec_from_cache(beta_flat, &self.cache)
             .map(Some)
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         self.family
-            .joint_hessian_diagonal(&self.block_states)
+            .joint_hessian_diagonal_from_cache(&self.cache)
             .map(Some)
     }
 
@@ -1067,8 +1123,12 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         &self,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        self.family
-            .psi_terms(&self.block_states, &self.derivative_blocks, psi_index)
+        self.family.psi_terms_inner(
+            &self.block_states,
+            &self.derivative_blocks,
+            psi_index,
+            Some(&self.cache),
+        )
     }
 
     fn second_order_terms(
@@ -1076,11 +1136,12 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        self.family.psi_second_order_terms(
+        self.family.psi_second_order_terms_inner(
             &self.block_states,
             &self.derivative_blocks,
             psi_i,
             psi_j,
+            Some(&self.cache),
         )
     }
 
@@ -1154,8 +1215,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        self.joint_gradient_hessian(block_states, false)
-            .map(|r| r.0)
+        // Fast path: just compute NLL without gradient/Hessian.
+        // Avoids build_eval_cache which computes per-row gradient+Hessian
+        // (14 jet evaluations per row) that log_likelihood_only never uses.
+        let mut ll = 0.0;
+        for i in 0..self.n {
+            let row_neglog = self.row_neglog_directional(i, block_states, &[])?;
+            ll -= row_neglog;
+        }
+        Ok(ll)
     }
 
     fn exact_newton_joint_hessian(
@@ -1175,10 +1243,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        Ok(Some(Arc::new(SurvivalMarginalSlopeHessianWorkspace {
-            family: self.clone(),
-            block_states: block_states.to_vec(),
-        })))
+        Ok(Some(Arc::new(SurvivalMarginalSlopeHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+        )?)))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -1241,11 +1309,11 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace {
-            family: self.clone(),
-            block_states: block_states.to_vec(),
-            derivative_blocks: derivative_blocks.to_vec(),
-        })))
+        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            derivative_blocks.to_vec(),
+        )?)))
     }
 
     fn block_linear_constraints(
@@ -1303,19 +1371,6 @@ fn build_logslope_blockspec(
         penalties: design.global_penalties(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-    }
-}
-
-fn fit_score(fit: &UnifiedFitResult) -> f64 {
-    if fit.reml_score.is_finite() {
-        fit.reml_score
-    } else {
-        let score = 0.5 * fit.deviance + 0.5 * fit.stable_penalty_term;
-        if score.is_finite() {
-            score
-        } else {
-            f64::INFINITY
-        }
     }
 }
 
@@ -1384,6 +1439,22 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("survival-marginal-slope requires finite z values".to_string());
+    }
+    for i in 0..n {
+        if spec.age_exit[i] < spec.age_entry[i] {
+            return Err(format!(
+                "survival-marginal-slope row {i}: exit time ({}) < entry time ({})",
+                spec.age_exit[i], spec.age_entry[i]
+            ));
+        }
+    }
+    let p_entry = spec.time_block.design_entry.ncols();
+    let p_exit = spec.time_block.design_exit.ncols();
+    let p_deriv = spec.time_block.design_derivative_exit.ncols();
+    if p_exit != p_entry || p_deriv != p_entry {
+        return Err(format!(
+            "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
+        ));
     }
     Ok(())
 }
@@ -1464,7 +1535,6 @@ pub fn fit_survival_marginal_slope_terms(
     let weights = spec.weights.clone();
     let z = spec.z.clone();
     let derivative_guard = spec.derivative_guard;
-    let _ = spec.derivative_softness;
     let design_entry = spec.time_block.design_entry.clone();
     let design_exit = spec.time_block.design_exit.clone();
     let design_derivative_exit = spec.time_block.design_derivative_exit.clone();
@@ -1575,13 +1645,6 @@ pub fn fit_survival_marginal_slope_terms(
         &setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let _ = specs;
-            let blocks = build_blocks(rho, &designs[0])?;
-            let family = make_family(&designs[0]);
-            let fit = inner_fit(&family, &blocks, options)?;
-            Ok(fit_score(&fit))
-        },
         |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let _ = specs;
             let blocks = build_blocks(rho, &designs[0])?;

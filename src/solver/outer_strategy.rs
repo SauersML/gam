@@ -487,8 +487,7 @@ pub trait OuterObjective {
     /// Evaluate cost + EFS step vector. Only needed when the plan selects
     /// `Solver::Efs`. The default returns an error indicating EFS is not
     /// supported by this objective.
-    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
-        let _ = rho;
+    fn eval_efs(&mut self, _: &Array1<f64>) -> Result<EfsEval, EstimationError> {
         Err(EstimationError::RemlOptimizationFailed(
             "EFS evaluation not implemented for this objective".to_string(),
         ))
@@ -1504,7 +1503,7 @@ mod tests {
     #[should_panic(expected = "expected analytic Hessian")]
     fn hessian_result_unwrap_unavailable_panics() {
         let result = HessianResult::Unavailable;
-        let _ = result.unwrap_analytic();
+        result.unwrap_analytic();
     }
 
     #[test]
@@ -1546,12 +1545,10 @@ mod tests {
                 fixed_point_available: false,
                 barrier_config: None,
             },
-            cost_fn: |st: &mut i32, rho: &Array1<f64>| {
-                let _ = (*st, rho.len());
+            cost_fn: |_: &mut i32, _: &Array1<f64>| {
                 Ok(1.0)
             },
-            eval_fn: |st: &mut i32, rho: &Array1<f64>| {
-                let _ = (*st, rho.len());
+            eval_fn: |_: &mut i32, _: &Array1<f64>| {
                 Ok(OuterEval {
                     cost: 1.0,
                     gradient: Array1::zeros(1),

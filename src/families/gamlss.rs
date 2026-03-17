@@ -1216,18 +1216,6 @@ fn fit_binomial_mean_wiggle(
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
 
-fn gamlss_fit_score(fit: &UnifiedFitResult) -> f64 {
-    if fit.reml_score.is_finite() {
-        return fit.reml_score;
-    }
-    let score = 0.5 * fit.deviance + 0.5 * fit.stable_penalty_term;
-    if score.is_finite() {
-        score
-    } else {
-        f64::INFINITY
-    }
-}
-
 trait LocationScaleFamilyBuilder {
     type Family: CustomFamily + Clone + Send + Sync + 'static;
 
@@ -1362,20 +1350,6 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &joint_setup,
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
-                |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-                    let fit = {
-                        let blocks = builder.build_blocks(
-                            rho,
-                            &designs[0],
-                            &designs[1],
-                            mean_beta_hint_cell.borrow().clone(),
-                            noise_beta_hint_cell.borrow().clone(),
-                        )?;
-                        let family = builder.build_family(&designs[0], &designs[1]);
-                        fit_custom_family(&family, &blocks, options)?
-                    };
-                    Ok(gamlss_fit_score(&fit))
-                },
                 |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let fit = {
                         let blocks = builder.build_blocks(
@@ -2599,8 +2573,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         "binomial mean wiggle exact spatial hyper",
     )
     .map_err(|e| e.to_string())?;
-    let mut theta_star = outer.rho;
-    enforce_spatial_psi_sum_to_zero(&mut theta_star, rho_dim, &dims_per_term);
+    let theta_star = outer.rho;
 
     let log_kappa =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);

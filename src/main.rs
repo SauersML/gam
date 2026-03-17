@@ -70,6 +70,7 @@ use gam::survival_location_scale::{
     SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
     residual_distribution_inverse_link,
 };
+use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
@@ -78,7 +79,8 @@ use gam::types::{
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
-    StandardFitRequest, SurvivalLocationScaleFitRequest, TransformationNormalFitRequest, fit_model,
+    StandardFitRequest, SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
+    TransformationNormalFitRequest, fit_model,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -355,6 +357,8 @@ struct SurvivalArgs {
     sigma_time_degree: usize,
     scale_dimensions: bool,
     out: Option<PathBuf>,
+    logslope_formula: Option<String>,
+    z_column: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -626,10 +630,9 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    args: &FitArgs,
+    _: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    let _ = args;
     options.compute_covariance = true;
     Ok(options)
 }
@@ -697,6 +700,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sigma_time_degree: args.sigma_time_degree,
             scale_dimensions: args.scale_dimensions,
             out: args.out.clone(),
+            logslope_formula: args.logslope_formula.clone(),
+            z_column: args.z_column.clone(),
         };
         return run_survival(surv_args);
     }
@@ -3496,6 +3501,7 @@ enum SurvivalLikelihoodMode {
     Transformation,
     Weibull,
     LocationScale,
+    MarginalSlope,
 }
 
 fn parse_survival_baseline_config(
@@ -3610,8 +3616,9 @@ fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMode, S
         "transformation" => Ok(SurvivalLikelihoodMode::Transformation),
         "weibull" => Ok(SurvivalLikelihoodMode::Weibull),
         "location-scale" => Ok(SurvivalLikelihoodMode::LocationScale),
+        "marginal-slope" => Ok(SurvivalLikelihoodMode::MarginalSlope),
         other => Err(format!(
-            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale"
+            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope"
         )),
     }
 }
@@ -3621,6 +3628,7 @@ fn survival_likelihood_modename(mode: SurvivalLikelihoodMode) -> &'static str {
         SurvivalLikelihoodMode::Transformation => "transformation",
         SurvivalLikelihoodMode::Weibull => "weibull",
         SurvivalLikelihoodMode::LocationScale => "location-scale",
+        SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
     }
 }
 
@@ -4799,6 +4807,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
+            SurvivalLikelihoodMode::MarginalSlope => {
+                return Err(
+                    "--predict-noise cannot be combined with --survival-likelihood marginal-slope"
+                        .to_string(),
+                );
+            }
             SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::LocationScale => {
                 SurvivalLikelihoodMode::LocationScale
             }
@@ -4840,7 +4854,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     }
     let baseline_cfg = match likelihood_mode {
-        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::LocationScale => {
+        SurvivalLikelihoodMode::Transformation
+        | SurvivalLikelihoodMode::LocationScale
+        | SurvivalLikelihoodMode::MarginalSlope => {
             parse_survival_baseline_config(
                 &effective_args.baseline_target,
                 effective_args.baseline_scale,
@@ -4872,7 +4888,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Err("--ridge-lambda must be finite and >= 0".to_string());
     }
     let time_basis_cfg = match likelihood_mode {
-        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::LocationScale => {
+        SurvivalLikelihoodMode::Transformation
+        | SurvivalLikelihoodMode::LocationScale
+        | SurvivalLikelihoodMode::MarginalSlope => {
             if learn_timewiggle {
                 SurvivalTimeBasisConfig::None
             } else {
@@ -5179,6 +5197,113 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             progress.advance_workflow(survival_total_steps);
         }
         progress.finish_progress("survival fit complete");
+        return Ok(());
+    }
+
+    if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let logslope_formula_raw = args
+            .logslope_formula
+            .as_deref()
+            .ok_or_else(|| {
+                "--logslope-formula is required with --survival-likelihood marginal-slope"
+                    .to_string()
+            })?;
+        let z_column_name = args
+            .z_column
+            .as_ref()
+            .ok_or_else(|| {
+                "--z-column is required with --survival-likelihood marginal-slope".to_string()
+            })?;
+        let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            logslope_formula_raw,
+            &response_expr,
+            "--logslope-formula",
+        )?;
+        if parsed_logslope.linkspec.is_some() {
+            return Err(
+                "link(...) is not supported in --logslope-formula for the survival marginal-slope family"
+                    .to_string(),
+            );
+        }
+        if parsed_logslope.linkwiggle.is_some() {
+            return Err(
+                "linkwiggle(...) is not supported in --logslope-formula for the survival marginal-slope family"
+                    .to_string(),
+            );
+        }
+        let mut logslopespec =
+            build_termspec(&parsed_logslope.terms, &ds, &col_map, &mut inference_notes)?;
+        if args.scale_dimensions {
+            enable_scale_dimensions(&mut logslopespec);
+        }
+
+        let z_col = *col_map
+            .get(z_column_name)
+            .ok_or_else(|| format!("z column '{z_column_name}' not found"))?;
+        let z = ds.values.column(z_col).to_owned();
+
+        let mut time_initial_log_lambdas = None;
+        if !time_penalties.is_empty() {
+            let lambda0 = time_build.smooth_lambda.unwrap_or(1e-2).max(1e-12).ln();
+            time_initial_log_lambdas = Some(Array1::from_elem(time_penalties.len(), lambda0));
+        }
+
+        let spec = SurvivalMarginalSlopeTermSpec {
+            age_entry: age_entry.clone(),
+            age_exit: age_exit.clone(),
+            event_target: event_target.mapv(f64::from),
+            weights: weights.clone(),
+            z,
+            derivative_guard: 0.0,
+            time_block: TimeBlockInput {
+                design_entry: time_design_entry.clone(),
+                design_exit: time_design_exit.clone(),
+                design_derivative_exit: time_design_derivative_exit.clone(),
+                offset_entry: eta_offset_entry.clone(),
+                offset_exit: eta_offset_exit.clone(),
+                derivative_offset_exit: derivative_offset_exit.clone(),
+                penalties: time_penalties.clone(),
+                initial_log_lambdas: time_initial_log_lambdas,
+                initial_beta: None,
+            },
+            logslopespec,
+        };
+        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let options = gam::families::custom_family::BlockwiseFitOptions {
+            compute_covariance: true,
+            ..Default::default()
+        };
+        progress.set_stage("fit", "running survival marginal-slope optimization");
+        let fit = match fit_model(FitRequest::SurvivalMarginalSlope(
+            SurvivalMarginalSlopeFitRequest {
+                data: ds.values.view(),
+                spec,
+                options,
+                kappa_options,
+            },
+        )) {
+            Ok(FitResult::SurvivalMarginalSlope(result)) => result,
+            Ok(_) => {
+                return Err(
+                    "internal survival marginal-slope workflow returned the wrong result variant"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                return Err(format!("survival marginal-slope fit failed: {e}"));
+            }
+        };
+        println!(
+            "survival marginal-slope fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e} | baseline_logslope={:.4}",
+            fit.fit.outer_converged,
+            fit.fit.outer_iterations,
+            fit.fit.log_likelihood,
+            fit.fit.reml_score,
+            fit.baseline_logslope,
+        );
+        progress.advance_workflow(3);
+        progress.finish_progress("survival marginal-slope fit complete");
         return Ok(());
     }
 
@@ -9497,7 +9622,7 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
                     .and_then(|s| s.strip_suffix(')'))
             })
         {
-            let _ = parse_link_component_list(components_inner)?;
+            parse_link_component_list(components_inner)?;
             return Err(
                 "flexible(...) does not support blended(...)/mixture(...) links; wiggle is only supported for jointly fit standard links"
                     .to_string(),
@@ -10420,10 +10545,10 @@ fn response_sd_from_eta_for_family(
     family: LikelihoodFamily,
     eta: ArrayView1<'_, f64>,
     eta_se: ArrayView1<'_, f64>,
-    mixture_state: Option<&gam::types::MixtureLinkState>,
-    sas_params: Option<&gam::types::SasLinkState>,
-    mixture_param_covariance: Option<&Array2<f64>>,
-    sas_param_covariance: Option<&Array2<f64>>,
+    _: Option<&gam::types::MixtureLinkState>,
+    _: Option<&gam::types::SasLinkState>,
+    _: Option<&Array2<f64>>,
+    _: Option<&Array2<f64>>,
 ) -> Result<Array1<f64>, String> {
     if matches!(
         family,
@@ -10436,12 +10561,6 @@ fn response_sd_from_eta_for_family(
                 .to_string(),
         );
     }
-    let _ = (
-        mixture_state,
-        sas_params,
-        mixture_param_covariance,
-        sas_param_covariance,
-    );
     let quadctx = gam::quadrature::QuadratureContext::new();
     Ok(Array1::from_iter((0..eta.len()).map(|i| {
         let var = match family {
@@ -12513,7 +12632,7 @@ mod tests {
             "survival output schema changed unexpectedly"
         );
 
-        let _ = fs::remove_file(&path);
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -12545,7 +12664,7 @@ mod tests {
             "gaussian location-scale output schema changed unexpectedly"
         );
 
-        let _ = fs::remove_file(&path);
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -12579,7 +12698,7 @@ mod tests {
             "gaussian location-scale output bounds schema changed unexpectedly"
         );
 
-        let _ = fs::remove_file(&path);
+        fs::remove_file(&path).ok();
     }
 
     #[test]

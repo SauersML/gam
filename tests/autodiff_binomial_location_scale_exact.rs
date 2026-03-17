@@ -237,13 +237,10 @@ fn manualrow_geometry(psi: f64, p: &CombinedLocationScaleParams) -> ManualRowGeo
     let x_a = p.x_1 + p.x_2 * psi;
     let z1_ab = p.z1_2;
     let z2_ab = p.z2_2;
-    let x_ab = p.x_2;
     let a = p.beta_1 * z1 + p.beta_2 * z2;
     let a_a = p.beta_1 * z1_a + p.beta_2 * z2_a;
-    let a_ab = p.beta_1 * z1_ab + p.beta_2 * z2_ab;
     let ell = p.beta_ls * x;
     let ell_a = p.beta_ls * x_a;
-    let ell_ab = p.beta_ls * x_ab;
     let s = (-ell).exp();
     let q = -a * s;
     let h = -s * a_a - q * ell_a;
@@ -334,8 +331,6 @@ fn manualrow_geometry(psi: f64, p: &CombinedLocationScaleParams) -> ManualRowGeo
                 + (tau * alpha * h + nu * alpha_a) * b[i] * b[j];
         }
     }
-
-    let _ = (a_ab, ell_ab, x_ab); // kept in scope to emphasize the full q_ij setup.
 
     ManualRowGeometry {
         objective_psi,
