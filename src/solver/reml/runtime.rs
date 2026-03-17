@@ -2857,16 +2857,30 @@ impl<'a> RemlState<'a> {
         use super::unified::{InnerSolutionBuilder, reml_laml_evaluate};
 
         let n_observations = self.y.len();
+        let p_dim = beta.len();
+
+        // Build PenaltyCoordinates: prefer block-local from canonical_penalties
+        // to exploit O(block_p²) operations instead of O(p²).
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
+            if self.canonical_penalties.len() == penalty_roots.len() {
+                self.canonical_penalties
+                    .iter()
+                    .map(|cp| cp.to_penalty_coordinate())
+                    .collect()
+            } else {
+                penalty_roots
+                    .into_iter()
+                    .map(super::unified::PenaltyCoordinate::from_dense_root)
+                    .collect()
+            };
+
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
             beta,
             n_observations,
             hessian_op,
-            penalty_roots
-                .into_iter()
-                .map(super::unified::PenaltyCoordinate::from_dense_root)
-                .collect(),
+            penalty_coords,
             penalty_logdet,
             dispersion,
         )
