@@ -902,9 +902,7 @@ pub fn canonicalize_penalty_spec(
         return Ok(None);
     }
 
-    // Compute block-local root via eigendecomposition: O(block_dim^3)
-    let (eigenvalues, eigenvectors) =
-        robust_eigh(&analysis.sym_penalty, Side::Lower, "penalty matrix")?;
+    // Reuse eigendecomposition from analyze_penalty_block — no double eigendecomp.
     let tolerance = analysis.tol;
     let rank_k = analysis.rank;
     let block_dim = local_owned.nrows();
@@ -912,10 +910,10 @@ pub fn canonicalize_penalty_spec(
     let mut root = Array2::zeros((rank_k, block_dim));
     let mut positive_eigenvalues = Vec::with_capacity(rank_k);
     let mut row_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
+    for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
         if eigenval > tolerance {
             let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = eigenvectors.column(i);
+            let eigenvec = analysis.eigenvectors.column(i);
             root.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
             positive_eigenvalues.push(eigenval);
             row_idx += 1;

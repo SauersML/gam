@@ -3038,12 +3038,13 @@ fn run_predict_standard(
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let saved_link_kind = saved_link_kind
             .ok_or_else(|| "standard link-wiggle model is missing link metadata".to_string())?;
+        let dense_design_for_wiggle = design.design.to_dense();
         let (eta, mean, eta_se, mean_lo, mean_hi) = predict_standard_linkwiggle(
             args,
             model,
             family,
             &fit_saved,
-            &design.design,
+            &dense_design_for_wiggle,
             saved_link_kind,
             saved_mixture,
             saved_sas,
