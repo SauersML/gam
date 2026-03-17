@@ -127,91 +127,13 @@ impl<'a> RemlState<'a> {
     pub(super) fn compute_lamlhessian_analytic_fallback(
         &self,
         rho: &Array1<f64>,
-        bundle_hint: Option<&EvalShared>,
+        _bundle_hint: Option<&EvalShared>,
     ) -> Result<Array2<f64>, EstimationError> {
-        // Deterministic analytic fallback used when the full exact Hessian
-        // assembly is unavailable (e.g. active-subspace instability).
-        //
-        // We keep exact, closed-form pieces that remain robust:
-        //   1) Penalty-envelope diagonal term:
-        //      0.5 * beta' A_k beta = 0.5 * lambda_k * ||R_k beta||^2.
-        //   2) Exact structural penalty pseudo-logdet curvature:
-        //      -0.5 * d²/drho² log|S|₊.
-        //   3) Soft prior Hessian.
-        //
-        // We intentionally omit the Laplace log|H|_+ curvature block here,
-        // because that block is exactly where unstable active-set boundaries
-        // make second derivatives unreliable.
-        let bundle_owned;
-        let bundle = if let Some(b) = bundle_hint {
-            b
-        } else {
-            bundle_owned = self.obtain_eval_bundle(rho)?;
-            &bundle_owned
-        };
-        let k = rho.len();
-        let mut h = Array2::<f64>::zeros((k, k));
-        if k == 0 {
-            return Ok(h);
-        }
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let beta = pirls_result.beta_transformed.as_ref();
-        let rs = &pirls_result.reparam_result.rs_transformed;
-        let lambdas = rho.mapv(f64::exp);
-
-        for idx in 0..k {
-            if idx >= rs.len() {
-                break;
-            }
-            let r_k = &rs[idx];
-            if r_k.ncols() == 0 {
-                continue;
-            }
-            let r_beta = r_k.dot(beta);
-            let q_diag = 0.5 * lambdas[idx] * r_beta.dot(&r_beta);
-            h[[idx, idx]] += q_diag;
-        }
-
-        let (structural_rank, _) = self.fixed_subspace_penalty_rank_and_logdet(
-            &pirls_result.reparam_result.e_transformed,
-            pirls_result.ridge_passport,
-        )?;
-        let (_, det2) = self.structural_penalty_logdet_derivatives(
-            &pirls_result.reparam_result.rs_transformed,
-            &lambdas,
-            pirls_result.ridge_passport.penalty_logdet_ridge(),
-        )?;
-        h += &det2.mapv(|v| -0.5 * v);
-
-        self.add_soft_priorhessian_in_place(rho, &mut h);
-
-        // Always return a numerically strict PD matrix for downstream Newton/
-        // covariance uses in fallback regimes.
-        let scale = h
-            .diag()
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        let jitter = 1e-8 * scale;
-        for i in 0..k {
-            h[[i, i]] += jitter;
-        }
-        for i in 0..k {
-            for j in 0..i {
-                let avg = 0.5 * (h[[i, j]] + h[[j, i]]);
-                h[[i, j]] = avg;
-                h[[j, i]] = avg;
-            }
-        }
-
-        if h.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "Analytic fallback Hessian produced non-finite values".to_string(),
-            ));
-        }
-        Ok(h)
+        // The old partial analytic fallback omitted the full ½ ∂² log|H| block,
+        // so it was not the Hessian of the objective being optimized. When the
+        // exact spectral assembly is unavailable, fall back to differentiating
+        // the actual scalar objective numerically instead.
+        self.compute_lamlhessian_diagnostic_numeric(rho)
     }
 
     fn diagnostic_hessian_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {

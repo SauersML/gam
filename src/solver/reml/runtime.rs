@@ -385,11 +385,13 @@ impl<'a> RemlState<'a> {
 
             let mut rho_p = rho.clone();
             rho_p[i] += h;
-            plus[i] = self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_p)?)?;
+            plus[i] =
+                self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_p)?)?;
 
             let mut rho_m = rho.clone();
             rho_m[i] -= h;
-            minus[i] = self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_m)?)?;
+            minus[i] =
+                self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_m)?)?;
 
             gradient[i] = (plus[i] - minus[i]) / (2.0 * h);
             if let Some(ref mut tk_hess) = hessian {
@@ -406,26 +408,30 @@ impl<'a> RemlState<'a> {
                     let mut rho_pp = rho.clone();
                     rho_pp[i] += hi;
                     rho_pp[j] += hj;
-                    let f_pp =
-                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_pp)?)?;
+                    let f_pp = self.tierney_kadane_exact_value_from_bundle(
+                        &self.obtain_eval_bundle(&rho_pp)?,
+                    )?;
 
                     let mut rho_pm = rho.clone();
                     rho_pm[i] += hi;
                     rho_pm[j] -= hj;
-                    let f_pm =
-                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_pm)?)?;
+                    let f_pm = self.tierney_kadane_exact_value_from_bundle(
+                        &self.obtain_eval_bundle(&rho_pm)?,
+                    )?;
 
                     let mut rho_mp = rho.clone();
                     rho_mp[i] -= hi;
                     rho_mp[j] += hj;
-                    let f_mp =
-                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_mp)?)?;
+                    let f_mp = self.tierney_kadane_exact_value_from_bundle(
+                        &self.obtain_eval_bundle(&rho_mp)?,
+                    )?;
 
                     let mut rho_mm = rho.clone();
                     rho_mm[i] -= hi;
                     rho_mm[j] -= hj;
-                    let f_mm =
-                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_mm)?)?;
+                    let f_mm = self.tierney_kadane_exact_value_from_bundle(
+                        &self.obtain_eval_bundle(&rho_mm)?,
+                    )?;
 
                     let val = (f_pp - f_pm - f_mp + f_mm) / (4.0 * hi * hj);
                     tk_hess[[i, j]] = val;
@@ -469,7 +475,11 @@ impl<'a> RemlState<'a> {
             }
         }
         if let (Some(ref mut hess), Some(tk_hess)) = (&mut result.hessian, tk_terms.hessian) {
-            let k = rho.len().min(hess.nrows()).min(hess.ncols()).min(tk_hess.nrows());
+            let k = rho
+                .len()
+                .min(hess.nrows())
+                .min(hess.ncols())
+                .min(tk_hess.nrows());
             let mut sl = hess.slice_mut(s![..k, ..k]);
             sl += &tk_hess.slice(s![..k, ..k]);
         }
@@ -1440,11 +1450,27 @@ impl<'a> RemlState<'a> {
             h_total: Arc::new(Array2::zeros((0, 0))),
             active_subspace_rel_gap: None,
             active_subspace_unstable: false,
-            sparse_exact: Some(Arc::new(SparseExactEvalData {
-                factor: Arc::new(sparse_system.factor),
-                logdet_h: sparse_system.logdet_h,
-                logdet_s_pos,
-                det1_values: Arc::new(det1_values),
+            sparse_exact: Some(Arc::new({
+                let factor = Arc::new(sparse_system.factor);
+                // Compute Takahashi selected inverse from simplicial factorization.
+                // This precomputes H^{-1} entries on the filled pattern of L, enabling
+                // O(nnz) trace computations instead of O(p) column solves.
+                let takahashi = crate::linalg::sparse_exact::factorize_simplicial(
+                    &sparse_system.h_sparse,
+                )
+                .ok()
+                .map(|sfactor| {
+                    Arc::new(crate::linalg::sparse_exact::TakahashiInverse::compute(
+                        &sfactor,
+                    ))
+                });
+                SparseExactEvalData {
+                    factor,
+                    takahashi,
+                    logdet_h: sparse_system.logdet_h,
+                    logdet_s_pos,
+                    det1_values: Arc::new(det1_values),
+                }
             })),
             firth_dense_operator: None,
             firth_dense_operator_original,
@@ -2364,7 +2390,7 @@ impl<'a> RemlState<'a> {
             true, // include Firth derivatives in deriv_provider
         )?;
 
-        self.evaluate_unified_tail(
+        let result = self.evaluate_unified_tail(
             rho,
             mode,
             hessian_op,
@@ -2381,7 +2407,9 @@ impl<'a> RemlState<'a> {
             log_likelihood,
             pirls_result.stable_penalty_term,
             barrier_config,
-        )
+        )?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
     /// Sparse-exact bridge: builds a `SparseCholeskyOperator` from the pre-computed
@@ -2460,99 +2488,7 @@ impl<'a> RemlState<'a> {
         let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
-        // TK correction and gradient (non-Gaussian only): use sparse solves.
-        //
-        // The TK value uses the Bartlett third-order correction.
-        // The TK gradient uses the basis-invariant trace formula:
-        //   ∂V_TK/∂ρ_k ≈ -½ tr(H_pen⁻¹ A_k^obs)
-        //              = ½ Σ_i c_i · (X v_k)_i · hat_ii
-        // with H_obs⁻¹ ≈ H_pen⁻¹ (see tierney_kadane_laml_correction docs).
-        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
-        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
-            let mut d_vec = pirls_result.solve_c_array.clone();
-            for val in &mut d_vec {
-                if !val.is_finite() {
-                    *val = 0.0;
-                }
-            }
-            let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
-
-            let compute_grad = mode != super::unified::EvalMode::ValueOnly;
-            let n_obs = d_vec.len();
-
-            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
-            let hat_leverages = if compute_grad {
-                crate::linalg::sparse_exact::leverages_from_factor(&sparse.factor, self.x())?
-            } else {
-                Array1::<f64>::zeros(0)
-            };
-
-            for j in 0..p_dim {
-                let mut e_j = Array1::<f64>::zeros(p_dim);
-                e_j[j] = 1.0;
-                if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
-                {
-                    h_inv_diag[j] = f_j[j];
-                }
-            }
-
-            let correction = -h_inv_diag
-                .iter()
-                .zip(third_deriv.iter())
-                .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
-                .sum::<f64>()
-                / 6.0;
-
-            let correction = if correction.is_finite() {
-                correction
-            } else {
-                0.0
-            };
-
-            let gradient = if compute_grad {
-                let k = penalty_roots.len();
-                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-                let mut tk_grad = Array1::<f64>::zeros(k);
-
-                for kidx in 0..k {
-                    // Mode sensitivity: v_k = H_pen⁻¹(λ_k S_k β̂)
-                    let r_beta = penalty_roots[kidx].dot(&beta);
-                    let s_k_beta = fast_atv(&penalty_roots[kidx], &r_beta);
-                    let a_k_beta = &s_k_beta * lambdas[kidx];
-                    let v_k = match crate::linalg::sparse_exact::solve_sparse_spd(
-                        &sparse.factor,
-                        &a_k_beta,
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let x_v_k: Array1<f64> = self.x().matrixvectormultiply(&v_k);
-
-                    // TK gradient[k] = ½ Σ_i c_i · (X v_k)_i · hat_ii
-                    let mut acc = 0.0;
-                    for i in 0..n_obs {
-                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
-                    }
-                    tk_grad[kidx] = 0.5 * acc;
-                }
-
-                for v in tk_grad.iter_mut() {
-                    if !v.is_finite() {
-                        *v = 0.0;
-                    }
-                }
-                Some(tk_grad)
-            } else {
-                None
-            };
-
-            (correction, gradient)
-        } else {
-            (0.0, None)
-        };
-
-        self.evaluate_unified_tail(
+        let result = self.evaluate_unified_tail(
             rho,
             mode,
             hessian_op,
@@ -2560,8 +2496,8 @@ impl<'a> RemlState<'a> {
             penalty_roots,
             penalty_logdet,
             deriv_provider,
-            tk_correction,
-            tk_gradient,
+            0.0,
+            None,
             firth_logdet,
             firth_op,
             mp,
@@ -2569,7 +2505,9 @@ impl<'a> RemlState<'a> {
             log_likelihood,
             pirls_result.stable_penalty_term,
             barrier_config,
-        )
+        )?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
     /// Builds the InnerSolution from a sparse eval bundle and returns EFS steps.
@@ -2627,52 +2565,14 @@ impl<'a> RemlState<'a> {
         let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
-        // TK correction (non-Gaussian only). EFS is ValueOnly so we only need
-        // the scalar correction, not the gradient.
-        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
-        let tk_correction = if !is_gaussian_identity {
-            let mut d_vec = pirls_result.solve_c_array.clone();
-            for val in &mut d_vec {
-                if !val.is_finite() {
-                    *val = 0.0;
-                }
-            }
-            let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
-
-            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
-            for j in 0..p_dim {
-                let mut e_j = Array1::<f64>::zeros(p_dim);
-                e_j[j] = 1.0;
-                if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
-                {
-                    h_inv_diag[j] = f_j[j];
-                }
-            }
-
-            let correction = -h_inv_diag
-                .iter()
-                .zip(third_deriv.iter())
-                .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
-                .sum::<f64>()
-                / 6.0;
-
-            if correction.is_finite() {
-                correction
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        self.evaluate_unified_tail_efs(
+        let result = self.evaluate_unified_tail_efs(
             rho,
             hessian_op,
             beta,
             penalty_roots,
             penalty_logdet,
             deriv_provider,
-            tk_correction,
+            0.0,
             firth_logdet,
             firth_op,
             mp,
@@ -2680,7 +2580,10 @@ impl<'a> RemlState<'a> {
             log_likelihood,
             pirls_result.stable_penalty_term,
             barrier_config,
-        )
+        )?;
+        let tk_terms =
+            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly)?;
+        Ok(self.apply_tk_cost_to_efs(result, tk_terms.value))
     }
 
     /// Shared tail for `evaluate_unified` and `evaluate_unified_sparse`:
@@ -2873,9 +2776,6 @@ impl<'a> RemlState<'a> {
             })?,
         );
 
-        // Penalty logdet.
-        let (penalty_rank, log_det_s) =
-            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
         let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
             pirls_result
                 .reparam_result
@@ -2886,23 +2786,13 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.reparam_result.rs_transformed.clone()
         };
-        // Exact penalty logdet derivatives from the same eigendecomposition.
-        // See evaluate_unified for rationale (value/gradient consistency).
-        let lambdas = rho.mapv(f64::exp);
-        let (det1, det2) = self.structural_penalty_logdet_derivatives(
+        let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
+            rho,
+            &e_for_logdet,
             &penalty_roots,
-            &lambdas,
-            ridge_passport.penalty_logdet_ridge(),
+            ridge_passport,
+            mode,
         )?;
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: log_det_s,
-            first: det1,
-            second: if mode == super::unified::EvalMode::ValueGradientHessian {
-                Some(det2)
-            } else {
-                None
-            },
-        };
 
         // Beta.
         let beta = if let Some(z) = free_basis_opt.as_ref() {
@@ -2990,8 +2880,10 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
-            .map_err(|e| EstimationError::InvalidInput(e))
+        let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
     /// Sparse-exact bridge for unified evaluation with extended τ/ψ coordinates.
@@ -3064,82 +2956,7 @@ impl<'a> RemlState<'a> {
         let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
-        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
-        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
-            let mut d_vec = pirls_result.solve_c_array.clone();
-            for val in &mut d_vec {
-                if !val.is_finite() {
-                    *val = 0.0;
-                }
-            }
-            let third_deriv = self.third_derivative_projection_from_design(self.x(), &d_vec)?;
-            let compute_grad = mode != super::unified::EvalMode::ValueOnly;
-            let n_obs = d_vec.len();
-
-            let mut h_inv_diag = Array1::<f64>::zeros(p_dim);
-            let hat_leverages = if compute_grad {
-                crate::linalg::sparse_exact::leverages_from_factor(&sparse.factor, self.x())?
-            } else {
-                Array1::<f64>::zeros(0)
-            };
-
-            for j in 0..p_dim {
-                let mut e_j = Array1::<f64>::zeros(p_dim);
-                e_j[j] = 1.0;
-                if let Ok(f_j) = crate::linalg::sparse_exact::solve_sparse_spd(&sparse.factor, &e_j)
-                {
-                    h_inv_diag[j] = f_j[j];
-                }
-            }
-
-            let correction = -h_inv_diag
-                .iter()
-                .zip(third_deriv.iter())
-                .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
-                .sum::<f64>()
-                / 6.0;
-            let correction = if correction.is_finite() {
-                correction
-            } else {
-                0.0
-            };
-
-            let gradient = if compute_grad {
-                let k = penalty_roots.len();
-                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-                let mut tk_grad = Array1::<f64>::zeros(k);
-                for kidx in 0..k {
-                    let r_beta = penalty_roots[kidx].dot(&beta);
-                    let s_k_beta = fast_atv(&penalty_roots[kidx], &r_beta);
-                    let a_k_beta = &s_k_beta * lambdas[kidx];
-                    let v_k = match crate::linalg::sparse_exact::solve_sparse_spd(
-                        &sparse.factor,
-                        &a_k_beta,
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let x_v_k: Array1<f64> = self.x().matrixvectormultiply(&v_k);
-                    let mut acc = 0.0;
-                    for i in 0..n_obs {
-                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
-                    }
-                    tk_grad[kidx] = 0.5 * acc;
-                }
-                for v in tk_grad.iter_mut() {
-                    if !v.is_finite() {
-                        *v = 0.0;
-                    }
-                }
-                Some(tk_grad)
-            } else {
-                None
-            };
-
-            (correction, gradient)
-        } else {
-            (0.0, None)
-        };
+        let (tk_correction, tk_gradient) = (0.0, None);
 
         let n_observations = self.y.len();
         let mut builder = InnerSolutionBuilder::new(
@@ -3193,8 +3010,10 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
-            .map_err(|e| EstimationError::InvalidInput(e))
+        let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
     /// Shared tail for EFS: builds InnerSolution, computes cost (ValueOnly),
@@ -3404,19 +3223,13 @@ impl<'a> RemlState<'a> {
             pirls_result.reparam_result.rs_transformed.clone()
         };
 
-        // EFS only needs ValueOnly — no second derivatives of penalty logdet.
-        // Still use exact first derivatives for value/gradient consistency.
-        let lambdas_efs = rho.mapv(f64::exp);
-        let (det1_efs, _) = self.structural_penalty_logdet_derivatives(
+        let (_, penalty_logdet) = self.dense_penalty_logdet_derivs(
+            rho,
+            &e_for_logdet,
             &penalty_roots,
-            &lambdas_efs,
-            ridge_passport.penalty_logdet_ridge(),
+            ridge_passport,
+            super::unified::EvalMode::ValueOnly,
         )?;
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: log_det_s,
-            first: det1_efs,
-            second: None,
-        };
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
             z.t()
@@ -3450,7 +3263,7 @@ impl<'a> RemlState<'a> {
             false, // EFS: no Firth derivatives in deriv_provider
         )?;
 
-        self.evaluate_unified_tail_efs(
+        let result = self.evaluate_unified_tail_efs(
             rho,
             hessian_op,
             beta,
@@ -3465,7 +3278,9 @@ impl<'a> RemlState<'a> {
             log_likelihood,
             pirls_result.stable_penalty_term,
             barrier_config,
-        )
+        )?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly)?;
+        Ok(self.apply_tk_cost_to_efs(result, tk_terms.value))
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {

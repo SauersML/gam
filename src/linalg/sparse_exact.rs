@@ -684,6 +684,377 @@ pub fn build_sparse_penalty_blocks(
     Ok(Some(blocks))
 }
 
+// ---------------------------------------------------------------------------
+// Takahashi selected inversion via simplicial Cholesky
+// ---------------------------------------------------------------------------
+
+use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
+use faer::linalg::cholesky::llt::factor::LltRegularization;
+use faer::sparse::linalg::amd;
+use faer::sparse::linalg::cholesky::simplicial;
+use faer::sparse::SymbolicSparseColMat;
+
+/// A simplicial Cholesky factorization with raw access to L's CSC pattern and
+/// values, plus the AMD permutation.  Built using faer's low-level simplicial
+/// API so that L's sparse structure is directly available for Takahashi
+/// selected inversion.
+pub struct SimplicialFactor {
+    /// Column pointers of L (lower triangular, CSC), length n+1
+    l_col_ptr: Vec<usize>,
+    /// Row indices of L (lower triangular, CSC), length nnz(L)
+    l_row_idx: Vec<usize>,
+    /// Numeric values of L, length nnz(L)
+    l_values: Vec<f64>,
+    /// AMD forward permutation: perm_fwd[original] = permuted
+    perm_fwd: Vec<usize>,
+    /// AMD inverse permutation: perm_inv[permuted] = original
+    perm_inv: Vec<usize>,
+    /// Dimension
+    n: usize,
+    /// log|H| = 2 * sum(log(L_ii))
+    pub logdet: f64,
+}
+
+/// Build a [`SimplicialFactor`] from a symmetric CSC matrix (upper, lower, or
+/// full storage – it is canonicalized to symmetric-upper internally).
+///
+/// The factorization uses AMD fill-reducing ordering and faer's simplicial
+/// LLᵀ numeric factorization.
+pub fn factorize_simplicial(
+    h: &SparseColMat<usize, f64>,
+) -> Result<SimplicialFactor, EstimationError> {
+    let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
+    let n = h_upper.ncols();
+    if n == 0 {
+        return Ok(SimplicialFactor {
+            l_col_ptr: vec![0],
+            l_row_idx: Vec::new(),
+            l_values: Vec::new(),
+            perm_fwd: Vec::new(),
+            perm_inv: Vec::new(),
+            n: 0,
+            logdet: 0.0,
+        });
+    }
+
+    let a_nnz = h_upper.compute_nnz();
+
+    // 1. AMD ordering
+    let mut perm_fwd = vec![0usize; n];
+    let mut perm_inv = vec![0usize; n];
+    {
+        let mut mem = MemBuffer::new(amd::order_scratch::<usize>(n, a_nnz));
+        amd::order(
+            &mut perm_fwd,
+            &mut perm_inv,
+            h_upper.symbolic(),
+            amd::Control::default(),
+            MemStack::new(&mut mem),
+        )
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    }
+
+    let perm =
+        unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
+
+    // 2. Permute to P A Pᵀ (upper-triangular, unsorted)
+    let a_perm_upper = {
+        let mut col_ptrs = vec![0usize; n + 1];
+        let mut row_indices = vec![0usize; a_nnz];
+        let mut values = vec![0.0f64; a_nnz];
+        let mut mem =
+            MemBuffer::new(faer::sparse::utils::permute_self_adjoint_scratch::<usize>(n));
+        faer::sparse::utils::permute_self_adjoint_to_unsorted(
+            &mut values,
+            &mut col_ptrs,
+            &mut row_indices,
+            h_upper.as_ref(),
+            perm,
+            Side::Upper,
+            Side::Upper,
+            MemStack::new(&mut mem),
+        );
+        SparseColMat::<usize, f64>::new(
+            unsafe {
+                SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices)
+            },
+            values,
+        )
+    };
+
+    // 3. Symbolic analysis
+    let symbolic = {
+        let mut mem = MemBuffer::new(StackReq::any_of(&[
+            simplicial::prefactorize_symbolic_cholesky_scratch::<usize>(n, a_nnz),
+            simplicial::factorize_simplicial_symbolic_cholesky_scratch::<usize>(n),
+        ]));
+        let stack = MemStack::new(&mut mem);
+        let mut etree = vec![0isize; n];
+        let mut col_counts = vec![0usize; n];
+        simplicial::prefactorize_symbolic_cholesky(
+            &mut etree,
+            &mut col_counts,
+            a_perm_upper.symbolic(),
+            stack,
+        );
+        simplicial::factorize_simplicial_symbolic_cholesky(
+            a_perm_upper.symbolic(),
+            unsafe { simplicial::EliminationTreeRef::from_inner(&etree) },
+            &col_counts,
+            stack,
+        )
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?
+    };
+
+    // 4. Numeric LLᵀ factorization
+    let mut l_values = vec![0.0f64; symbolic.len_val()];
+    {
+        let mut mem = MemBuffer::new(
+            simplicial::factorize_simplicial_numeric_llt_scratch::<usize, f64>(n),
+        );
+        simplicial::factorize_simplicial_numeric_llt::<usize, f64>(
+            &mut l_values,
+            a_perm_upper.as_ref(),
+            LltRegularization::default(),
+            &symbolic,
+            MemStack::new(&mut mem),
+        )
+        .map_err(|_| EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: f64::NAN,
+        })?;
+    }
+
+    // 5. Extract col_ptr, row_idx from the symbolic structure
+    let l_col_ptr: Vec<usize> = symbolic.col_ptr().to_vec();
+    let l_row_idx: Vec<usize> = symbolic.row_idx().to_vec();
+
+    // 6. Compute logdet from L diagonal: L[j,j] = l_values[l_col_ptr[j]]
+    let mut logdet = 0.0f64;
+    for j in 0..n {
+        let diag = l_values[l_col_ptr[j]];
+        if diag <= 0.0 {
+            return Err(EstimationError::HessianNotPositiveDefinite {
+                min_eigenvalue: f64::NAN,
+            });
+        }
+        logdet += diag.ln();
+    }
+    logdet *= 2.0;
+
+    Ok(SimplicialFactor {
+        l_col_ptr,
+        l_row_idx,
+        l_values,
+        perm_fwd,
+        perm_inv,
+        n,
+        logdet,
+    })
+}
+
+/// Result of the Takahashi selected inversion.
+///
+/// Z stores entries of H⁻¹ at positions corresponding to the filled sparsity
+/// pattern of the Cholesky factor L.  Entries outside this pattern are
+/// structurally zero (or, more precisely, not computed).
+pub struct TakahashiInverse {
+    /// Z values stored in the same CSC pattern as L (lower triangular)
+    z_values: Vec<f64>,
+    /// Column pointers (owned copy from L)
+    col_ptr: Vec<usize>,
+    /// Row indices (owned copy from L)
+    row_idx: Vec<usize>,
+    /// Forward permutation
+    perm_fwd: Vec<usize>,
+    /// Inverse permutation
+    perm_inv: Vec<usize>,
+    /// Dimension
+    n: usize,
+}
+
+impl TakahashiInverse {
+    /// Binary search for entry (row, col) in lower-triangular CSC.
+    /// Returns the value-array index if the entry exists.
+    fn find_entry(
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        row: usize,
+        col: usize,
+    ) -> Option<usize> {
+        let start = col_ptr[col];
+        let end = col_ptr[col + 1];
+        let slice = &row_idx[start..end];
+        slice.binary_search(&row).ok().map(|pos| start + pos)
+    }
+
+    /// Compute the Takahashi selected inverse from a simplicial Cholesky factor.
+    ///
+    /// Given H = LLᵀ, this computes Z = H⁻¹ restricted to the sparsity pattern
+    /// of L, using the Takahashi recursion processed from right to left.
+    pub fn compute(factor: &SimplicialFactor) -> Self {
+        let n = factor.n;
+        let col_ptr = factor.l_col_ptr.clone();
+        let row_idx = factor.l_row_idx.clone();
+        let nnz = factor.l_values.len();
+        let mut z_values = vec![0.0f64; nnz];
+
+        // Process columns from right to left
+        for j in (0..n).rev() {
+            let col_start = col_ptr[j];
+            let col_end = col_ptr[j + 1];
+            let l_jj = factor.l_values[col_start]; // diagonal L[j,j]
+            let inv_ljj = 1.0 / l_jj;
+
+            // Number of subdiagonal entries in column j
+            let n_sub = col_end - col_start - 1;
+
+            // Diagonal entry:
+            // Z[j,j] = 1/L[j,j]² - (1/L[j,j]) * Σ_{i>j in col j} L[i,j] * Z[i,j]
+            let mut diag_sum = 0.0f64;
+            for idx in (col_start + 1)..col_end {
+                let l_ij = factor.l_values[idx];
+                diag_sum += l_ij * z_values[idx]; // Z[i,j] at same position
+            }
+            z_values[col_start] = inv_ljj * inv_ljj - diag_sum * inv_ljj;
+
+            // Off-diagonal entries: for each i > j in column j,
+            // Z[i,j] = -(1/L[j,j]) * Σ_{k≥i, k>j in col j} L[k,j] * Z[k,i]
+            //
+            // We iterate subdiagonal entries. For the entry at position `a`
+            // (row = i), we sum over all subdiagonal entries at position `b`
+            // (row = k) where k >= i, accumulating L[k,j] * Z[k,i].
+            // Z[k,i] is stored in lower-triangular CSC at row=k, col=i (k >= i).
+            // We also include the contribution from k = i: L[i,j] * Z[i,i].
+            for a in 0..n_sub {
+                let idx_a = col_start + 1 + a;
+                let i = row_idx[idx_a];
+                let mut off_sum = 0.0f64;
+
+                // k = i contribution: L[i,j] * Z[i,i]
+                let l_ij = factor.l_values[idx_a];
+                let z_ii_pos = col_ptr[i]; // diagonal of column i
+                off_sum += l_ij * z_values[z_ii_pos];
+
+                // k > i contributions
+                for b in (a + 1)..n_sub {
+                    let idx_b = col_start + 1 + b;
+                    let k = row_idx[idx_b];
+                    let l_kj = factor.l_values[idx_b];
+                    // Z[k,i] is at row=k, col=i in lower-triangular CSC
+                    if let Some(z_pos) = Self::find_entry(&col_ptr, &row_idx, k, i)
+                    {
+                        off_sum += l_kj * z_values[z_pos];
+                    }
+                    // If not in pattern, Z[k,i] = 0 (not in selected inverse)
+                }
+
+                z_values[idx_a] = -off_sum * inv_ljj;
+            }
+        }
+
+        TakahashiInverse {
+            z_values,
+            col_ptr,
+            row_idx,
+            perm_fwd: factor.perm_fwd.clone(),
+            perm_inv: factor.perm_inv.clone(),
+            n,
+        }
+    }
+
+    /// Get H⁻¹[i,j] in ORIGINAL (unpermuted) coordinates.
+    pub fn get(&self, i: usize, j: usize) -> f64 {
+        let pi = self.perm_fwd[i];
+        let pj = self.perm_fwd[j];
+        self.get_permuted(pi, pj)
+    }
+
+    /// Get Z[pi,pj] in permuted coordinates.
+    fn get_permuted(&self, pi: usize, pj: usize) -> f64 {
+        // Z is symmetric and stored as lower-triangular CSC.
+        // Ensure row >= col for lookup.
+        let (row, col) = if pi >= pj { (pi, pj) } else { (pj, pi) };
+        if let Some(pos) = Self::find_entry(&self.col_ptr, &self.row_idx, row, col) {
+            self.z_values[pos]
+        } else {
+            0.0 // Entry not in filled pattern = zero in selected inverse
+        }
+    }
+
+    /// Diagonal of H⁻¹ in original ordering.
+    pub fn diagonal(&self) -> Array1<f64> {
+        let mut diag = Array1::zeros(self.n);
+        for i in 0..self.n {
+            diag[i] = self.get(i, i);
+        }
+        diag
+    }
+
+    /// H⁻¹[start..end, start..end] block in original ordering.
+    pub fn block(&self, start: usize, end: usize) -> Array2<f64> {
+        let dim = end - start;
+        let mut out = Array2::zeros((dim, dim));
+        for i in 0..dim {
+            for j in 0..dim {
+                out[[i, j]] = self.get(start + i, start + j);
+            }
+        }
+        out
+    }
+
+    /// tr(H⁻¹ S) where S is given as sparse CSC (symmetric, upper or full).
+    /// Only accesses entries in the filled pattern of Z.
+    pub fn trace_product_sparse(&self, s: &SparseColMat<usize, f64>) -> f64 {
+        let mut trace = 0.0;
+        let (symbolic, values) = s.parts();
+        let s_col_ptr = symbolic.col_ptr();
+        let s_row_idx = symbolic.row_idx();
+        for col in 0..s.ncols() {
+            let col_start = s_col_ptr[col];
+            let col_end = s_col_ptr[col + 1];
+            for idx in col_start..col_end {
+                let row = s_row_idx[idx];
+                let val = values[idx];
+                let z_ij = self.get(row, col);
+                if row == col {
+                    trace += z_ij * val;
+                } else {
+                    trace += 2.0 * z_ij * val; // symmetric: count off-diagonal twice
+                }
+            }
+        }
+        trace
+    }
+}
+
+/// Compute tr(H⁻¹ Sₖ) using a precomputed Takahashi selected inverse.
+pub fn trace_hinv_sk_takahashi(
+    taka: &TakahashiInverse,
+    penalty: &SparsePenaltyBlock,
+) -> f64 {
+    if penalty.block_support_strict {
+        // Fast: block-local trace
+        let block = taka.block(penalty.p_start, penalty.p_end);
+        let mut trace = 0.0;
+        for &(row, col, val) in penalty.s_k_block_upper_entries.iter() {
+            let z_val = block[[row, col]];
+            if row == col {
+                trace += z_val * val;
+            } else {
+                trace += 2.0 * z_val * val;
+            }
+        }
+        trace
+    } else {
+        // General: sparse trace
+        taka.trace_product_sparse(&penalty.s_k_sparse)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,5 +1120,92 @@ mod tests {
                 approx_eq(first[[i, j]], second[[i, j]], 0.0);
             }
         }
+    }
+
+    #[test]
+    fn takahashi_diagonal_matches_dense_inverse() {
+        // 4x4 SPD matrix
+        let h = array![
+            [4.0, 0.2, 0.0, 0.0],
+            [0.2, 3.0, 0.1, 0.0],
+            [0.0, 0.1, 2.5, 0.3],
+            [0.0, 0.0, 0.3, 2.0]
+        ];
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+
+        // Dense inverse for reference via column solves
+        use crate::faer_ndarray::FaerCholesky;
+        let chol = h.cholesky(Side::Lower).unwrap();
+        let mut h_inv = Array2::<f64>::zeros((4, 4));
+        for j in 0..4 {
+            let mut rhs = Array1::<f64>::zeros(4);
+            rhs[j] = 1.0;
+            let col = chol.solvevec(&rhs);
+            for i in 0..4 {
+                h_inv[[i, j]] = col[i];
+            }
+        }
+
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor);
+        let diag = taka.diagonal();
+
+        // Diagonal of selected inverse should match dense inverse diagonal
+        for i in 0..4 {
+            approx_eq(diag[i], h_inv[[i, i]], 1e-10);
+        }
+    }
+
+    #[test]
+    fn takahashi_logdet_matches_dense() {
+        let h = array![
+            [4.0, 0.2, 0.0, 0.0],
+            [0.2, 3.0, 0.1, 0.0],
+            [0.0, 0.1, 2.5, 0.3],
+            [0.0, 0.0, 0.3, 2.0]
+        ];
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+
+        // Dense logdet
+        use crate::faer_ndarray::FaerCholesky;
+        let chol = h.cholesky(Side::Lower).unwrap();
+        let logdet_dense = 2.0 * chol.diag().mapv(f64::ln).sum();
+
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        approx_eq(sfactor.logdet, logdet_dense, 1e-10);
+    }
+
+    #[test]
+    fn takahashi_trace_hinv_sk_matches_column_solve() {
+        let h = array![
+            [4.0, 0.2, 0.0, 0.0],
+            [0.2, 3.0, 0.1, 0.0],
+            [0.0, 0.1, 2.5, 0.3],
+            [0.0, 0.0, 0.3, 2.0]
+        ];
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&h_sparse).unwrap();
+
+        let mut s = Array2::<f64>::zeros((4, 4));
+        s[[1, 1]] = 2.0;
+        s[[2, 2]] = 3.0;
+        let mut r = Array2::<f64>::zeros((4, 4));
+        r[[1, 1]] = 2.0_f64.sqrt();
+        r[[2, 2]] = 3.0_f64.sqrt();
+
+        let blocks = build_sparse_penalty_blocks(&[s], &[r])
+            .unwrap()
+            .expect("single local block expected");
+
+        // Column-solve reference
+        let mut ws = SparseTraceWorkspace::default();
+        let reference = trace_hinv_sk(&factor, &mut ws, &blocks[0]).unwrap();
+
+        // Takahashi
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor);
+        let taka_result = trace_hinv_sk_takahashi(&taka, &blocks[0]);
+
+        approx_eq(taka_result, reference, 1e-10);
     }
 }

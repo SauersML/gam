@@ -200,7 +200,6 @@ impl PenaltyPseudologdet {
     }
 
     /// Dimension of the coefficient space.
-    #[allow(dead_code)]
     pub fn dim(&self) -> usize {
         self.p_dim
     }
@@ -451,7 +450,6 @@ impl PenaltyPseudologdet {
     /// ```
     ///
     /// `ds_k_dtau_i` is ∂S_k/∂τ_i; pass `None` if S_k does not depend on τ_i.
-    #[allow(dead_code)]
     pub fn rho_tau_hessian_component(
         &self,
         s_k: &Array2<f64>,
