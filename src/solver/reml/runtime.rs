@@ -758,7 +758,9 @@ impl<'a> RemlState<'a> {
                 &c_array,
                 &d_array,
             )?;
-            // For sparse, fall back to FD gradient for now.
+            // Sparse FD gradient: analytic path uses dense Z = H^{-1} X^T which
+            // is not available from the sparse Cholesky factor in observation-level
+            // form. The FD approach re-evaluates the scalar TK at perturbed rho.
             if !compute_gradient {
                 return Ok(TkCorrectionTerms {
                     value,
