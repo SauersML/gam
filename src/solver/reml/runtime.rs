@@ -823,17 +823,15 @@ impl<'a> RemlState<'a> {
         zt_m.dot(z)
     }
 
-    /// Compute the structural penalty rank and smooth pseudo-logdet L_δ(S).
+    /// Compute the structural penalty rank and exact pseudo-logdet log|S|₊.
     ///
-    /// Uses the smooth δ-regularized pseudo-logdet:
-    ///   L_δ(S) = log det(S + δI) − m₀ log δ
-    /// where m₀ is the total penalty nullity from `self.nullspace_dims`.
+    /// Uses the exact pseudo-logdet on the positive eigenspace:
+    ///   L(S) = Σ_{σ_i > ε} log σ_i
+    /// where ε is a relative threshold identifying the structural nullspace
+    /// directly from the eigenspectrum. No δ-regularization or nullity metadata.
     ///
-    /// This replaces the hard ε-threshold truncation, making the objective C∞
-    /// in outer parameters θ and eliminating artificial kinks when eigenvalues
-    /// of S(ρ) cross the threshold.
-    ///
-    /// Reference: response.md Section 7.
+    /// For S(ρ) = Σ exp(ρ_k) S_k with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k)
+    /// is structurally fixed, so this is C∞ in ρ.
     pub(super) fn fixed_subspace_penalty_rank_and_logdet(
         &self,
         e_transformed: &Array2<f64>,
@@ -855,34 +853,21 @@ impl<'a> RemlState<'a> {
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        // Total penalty nullity m₀ from the known structural nullspace dimensions.
-        // This is the number of eigenvalues that are structurally zero (e.g.,
-        // polynomial nullspace for Duchon/TPS, differencing order for B-splines).
-        let total_nullity: usize = self.nullspace_dims.iter().copied().max().unwrap_or(0);
-        // Effective nullity: p_dim − structural_rank gives the count of truncated
-        // directions from the reparameterization. Use the larger of structural
-        // nullity and the known family nullity.
-        let p_dim = evals.len();
-        let reparam_nullity = p_dim.saturating_sub(structural_rank);
-        let m0 = total_nullity.max(reparam_nullity);
-
-        // Choose δ proportional to machine epsilon × spectral scale.
-        let delta = super::unified::smooth_logdet_delta(evals.as_slice().unwrap());
-
-        // L_δ(S) = log det(S + δI) − m₀ log δ
-        let log_det = super::unified::smooth_pseudo_logdet(evals.as_slice().unwrap(), m0, delta);
+        // Exact pseudo-logdet on the positive eigenspace: L = Σ_{σ_i > ε} log σ_i.
+        // The structural nullspace is identified directly from the eigenspectrum.
+        let threshold =
+            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let log_det = super::unified::exact_pseudo_logdet(evals.as_slice().unwrap(), threshold);
 
         Ok((structural_rank, log_det))
     }
 
-    /// Compute tr((S + δI)⁻¹ S_direction) — the first derivative of L_δ(S)
+    /// Compute tr(S⁺ S_direction) — the first derivative of log|S|₊
     /// in the direction S_direction.
     ///
-    /// Uses the smooth δ-regularized inverse (S + δI)⁻¹ instead of the
-    /// hard-truncated pseudoinverse S₊⁻¹. Because (S + δI) is always full rank,
-    /// all eigenvectors participate and no eigenspace partitioning is needed.
-    ///
-    /// Reference: response.md Section 7.
+    /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
+    /// Only eigenvectors with eigenvalues above the structural threshold
+    /// participate.
     pub(super) fn fixed_subspace_penalty_trace(
         &self,
         e_transformed: &Array2<f64>,
@@ -907,18 +892,18 @@ impl<'a> RemlState<'a> {
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        // δ-regularized trace: tr((S + δI)⁻¹ S_direction).
-        //
-        // Every eigenvalue is shifted by δ, making (S + δI) full rank.
-        // No eigenspace partitioning, no nullspace/positive split.
-        let delta = super::unified::smooth_logdet_delta(evals.as_slice().unwrap());
+        // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
+        let threshold =
+            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
 
         let mut trace = 0.0;
         for idx in 0..p_dim {
             let ev = evals[idx];
-            let u = evecs.column(idx).to_owned();
-            let spsi_u = s_direction.dot(&u);
-            trace += u.dot(&spsi_u) / (ev + delta);
+            if ev > threshold {
+                let u = evecs.column(idx).to_owned();
+                let spsi_u = s_direction.dot(&u);
+                trace += u.dot(&spsi_u) / ev;
+            }
         }
         Ok(trace)
     }
@@ -1016,21 +1001,15 @@ impl<'a> RemlState<'a> {
         &self.balanced_penalty_root
     }
 
-    /// Compute the smooth δ-regularized pseudo-logdet for the sparse penalty path.
+    /// Compute the exact pseudo-logdet for the sparse penalty path.
     ///
-    /// For each sparse penalty block k with eigenvalues {σ_1, ..., σ_r, 0, ..., 0},
-    /// the smooth logdet of λ_k S_k is:
+    /// For each sparse penalty block k with precomputed positive eigenvalues
+    /// {σ_1, ..., σ_r}, the exact pseudo-logdet of λ_k S_k is:
     ///
-    ///   L_δ(λ_k S_k) = Σ_i log(λ_k σ_i + δ) − m₀ log δ
-    ///
-    /// where m₀ = p_block − rank (the known nullity).
+    ///   L(λ_k S_k) = Σ_i log(λ_k σ_i) = r ρ_k + Σ_i log σ_i
     ///
     /// The first derivative is:
-    ///   ∂/∂ρ_k L_δ = Σ_i λ_k σ_i / (λ_k σ_i + δ)
-    ///
-    /// As δ → 0, this recovers the exact formula: rank * rho_k + Σ log(σ_i).
-    ///
-    /// Reference: response.md Section 7.
+    ///   ∂/∂ρ_k L = r  (the rank, i.e. number of positive eigenvalues)
     pub(super) fn sparse_penalty_logdet_runtime(
         &self,
         rho: &Array1<f64>,
@@ -1041,36 +1020,15 @@ impl<'a> RemlState<'a> {
         for block in blocks {
             let lambda_k = rho[block.term_index].exp();
 
-            // Choose δ based on the spectral scale of λ_k S_k.
-            let max_ev = block
-                .positive_eigenvalues
-                .iter()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                * lambda_k;
-            let delta = super::unified::SMOOTH_LOGDET_DELTA_SCALE * max_ev.max(1.0);
-
-            // L_δ(λ_k S_k) = Σ_i log(λ_k σ_i + δ) + m₀ log(δ) − m₀ log δ
-            //               = Σ_i log(λ_k σ_i + δ) [null eigenvalues cancel]
-            //
-            // For the positive eigenvalues: log(λ_k σ_i + δ)
-            // For the null eigenvalues: log(0 + δ) = log(δ), and the −m₀ log δ cancels.
+            // L(λ_k S_k) = Σ_{positive} log(λ_k σ_i).
             for &eig in block.positive_eigenvalues.iter() {
-                logdet += (lambda_k * eig + delta).ln();
+                logdet += (lambda_k * eig).ln();
             }
-            // Null eigenvalues contribute log(δ) each, cancelled by −m₀ log δ.
-            // Net contribution from null eigenvalues: 0.
 
-            // First derivative: ∂/∂ρ_k L_δ = Σ_i λ_k σ_i / (λ_k σ_i + δ).
-            // (Since ∂/∂ρ_k (λ_k σ_i) = λ_k σ_i.)
+            // ∂/∂ρ_k L = rank (number of positive eigenvalues).
+            // Since ∂/∂ρ_k log(λ_k σ_i) = ∂/∂ρ_k (ρ_k + log σ_i) = 1.
             if block.term_index < det1.len() {
-                let mut d1 = 0.0_f64;
-                for &eig in block.positive_eigenvalues.iter() {
-                    let shifted = lambda_k * eig + delta;
-                    d1 += lambda_k * eig / shifted;
-                }
-                // Null eigenvalues contribute λ_k * 0 / δ = 0.
-                det1[block.term_index] = d1;
+                det1[block.term_index] = block.positive_eigenvalues.len() as f64;
             }
         }
         (logdet, det1)
@@ -2196,7 +2154,6 @@ impl<'a> RemlState<'a> {
             let (_, det2) = self.structural_penalty_logdet_derivatives(
                 &penalty_roots,
                 &lambdas,
-                penalty_rank,
                 ridge_passport.penalty_logdet_ridge(),
             )?;
             Some(det2)
@@ -2315,13 +2272,11 @@ impl<'a> RemlState<'a> {
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
 
         // Penalty logdet second derivatives (for outer Hessian).
-        let structural_rank = (p_dim as f64 - mp) as usize;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
             let (_, det2) = self.structural_penalty_logdet_derivatives(
                 &penalty_roots,
                 &lambdas,
-                structural_rank,
                 bundle.ridge_passport.penalty_logdet_ridge(),
             )?;
             Some(det2)
@@ -2588,7 +2543,6 @@ impl<'a> RemlState<'a> {
         use super::unified::{InnerSolutionBuilder, reml_laml_evaluate};
 
         let n_observations = self.y.len();
-        let _ = nullspace_dim;
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
@@ -2773,7 +2727,6 @@ impl<'a> RemlState<'a> {
             let (_, det2) = self.structural_penalty_logdet_derivatives(
                 &penalty_roots,
                 &lambdas,
-                penalty_rank,
                 ridge_passport.penalty_logdet_ridge(),
             )?;
             Some(det2)
@@ -2926,13 +2879,11 @@ impl<'a> RemlState<'a> {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
-        let structural_rank = (p_dim as f64 - mp) as usize;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
             let (_, det2) = self.structural_penalty_logdet_derivatives(
                 &penalty_roots,
                 &lambdas,
-                structural_rank,
                 bundle.ridge_passport.penalty_logdet_ridge(),
             )?;
             Some(det2)

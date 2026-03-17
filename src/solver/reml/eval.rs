@@ -7,31 +7,20 @@ const DIAGNOSTIC_HESSIAN_FD_ABS_STEP: f64 = 1e-5;
 const DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD: f64 = 1e-8;
 
 impl<'a> RemlState<'a> {
-    /// Compute first and second derivatives of the smooth δ-regularized
-    /// pseudo-logdet L_δ(S) with respect to ρ.
+    /// Compute first and second derivatives of the exact pseudo-logdet
+    /// log|S|₊ with respect to ρ.
     ///
-    /// # Smooth δ-regularization (response.md Section 7)
+    /// Uses eigendecomposition to identify the positive eigenspace, then
+    /// computes exact derivatives on that subspace:
     ///
-    /// Instead of the hard ε-threshold truncation that creates non-smooth
-    /// derivatives at eigenvalue crossings, we use:
+    ///   ∂_k L = tr(S⁺ Aₖ)
+    ///   ∂²_kl L = δ_{kl} ∂_k L − λₖ λₗ tr(S⁺ Sₖ S⁺ Sₗ)
     ///
-    ///   L_δ(S) = log det(S + δI) − m₀ log δ
-    ///
-    /// The derivatives are:
-    ///
-    ///   ∂_k L_δ = tr((S + δI)⁻¹ Aₖ)
-    ///   ∂²_kl L_δ = δ_{kl} ∂_k L_δ − λₖ λₗ tr((S+δI)⁻¹ Sₖ (S+δI)⁻¹ Sₗ)
-    ///
-    /// where Aₖ = λₖ Sₖ.
-    ///
-    /// Because (S + δI) is always full rank, no eigenspace partitioning is
-    /// needed and the leakage/moving-nullspace correction is automatically
-    /// captured by the full-rank inverse.
+    /// where Aₖ = λₖ Sₖ and S⁺ is the pseudoinverse on the positive eigenspace.
     pub(super) fn structural_penalty_logdet_derivatives(
         &self,
         rs_transformed: &[Array2<f64>],
         lambdas: &Array1<f64>,
-        structural_rank: usize,
         ridge: f64,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
         let k_count = lambdas.len();
@@ -58,12 +47,7 @@ impl<'a> RemlState<'a> {
                 )));
             }
         }
-        if p_dim == 0 || structural_rank == 0 {
-            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
-        }
-
-        let rank = structural_rank.min(p_dim);
-        if rank == 0 {
+        if p_dim == 0 {
             return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
         }
 
@@ -83,47 +67,53 @@ impl<'a> RemlState<'a> {
         }
 
         // Eigendecomposition of S(ρ).
-        let (evals, _) = s_lambda
+        let (evals, evecs) = s_lambda
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        // Choose δ proportional to machine epsilon × spectral scale.
-        let delta = super::unified::smooth_logdet_delta(evals.as_slice().unwrap());
-
-        // Add δI to S_lambda to form (S + δI) — full rank, always invertible.
-        for i in 0..p_dim {
-            s_lambda[[i, i]] += delta;
+        // Identify structurally positive eigenvalues. For S(ρ) = Σ λ_k S_k with
+        // S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k) is independent of ρ.
+        let threshold =
+            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let pos_rank = evals.iter().filter(|&&e| e > threshold).count();
+        if pos_rank == 0 {
+            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
         }
 
-        // Factorize (S + δI) for solve-based trace computation.
-        // No eigenspace partitioning — the full p_dim × p_dim matrix is used.
-        let s_reg_factor = self.factorize_faer(&s_lambda);
+        // S⁺ factor on positive eigenspace: W (p_dim × pos_rank) with W Wᵀ = S⁺.
+        let mut w_factor = Array2::<f64>::zeros((p_dim, pos_rank));
+        let mut col = 0;
+        for (idx, &ev) in evals.iter().enumerate() {
+            if ev > threshold {
+                let scale = 1.0 / ev.sqrt();
+                for row in 0..p_dim {
+                    w_factor[[row, col]] = evecs[[row, idx]] * scale;
+                }
+                col += 1;
+            }
+        }
 
-        // First derivatives: ∂_k L_δ = tr((S + δI)⁻¹ Aₖ) = λₖ tr((S + δI)⁻¹ Sₖ).
-        //
-        // Compute Y_k = (S + δI)⁻¹ S_k via solve, then det1[k] = λ_k tr(Y_k).
-        let mut y_k_mats = Vec::with_capacity(k_count);
+        // First derivatives: ∂_k L = tr(S⁺ Aₖ) = λₖ tr(S⁺ Sₖ).
+        // Y_k = S⁺ S_k in reduced space: Y_k_r = Wᵀ S_k W, shape (pos_rank, pos_rank).
+        let mut y_k_reduced = Vec::with_capacity(k_count);
         let mut det1 = Array1::<f64>::zeros(k_count);
         for k in 0..k_count {
-            let mut y_k = s_k_full[k].clone();
-            let mut y_kview = array2_to_matmut(&mut y_k);
-            s_reg_factor.solve_in_place(y_kview.as_mut());
-            let tr = kahan_sum((0..p_dim).map(|i| y_k[[i, i]]));
+            let wt_sk = w_factor.t().dot(&s_k_full[k]);
+            let y_kr = wt_sk.dot(&w_factor);
+            let tr = kahan_sum((0..pos_rank).map(|i| y_kr[[i, i]]));
             det1[k] = lambdas[k] * tr;
-            y_k_mats.push(y_k);
+            y_k_reduced.push(y_kr);
         }
 
-        // Second derivatives:
-        //   ∂²_kl L_δ = δ_{kl} ∂_k L_δ − λₖ λₗ tr((S+δI)⁻¹ Sₖ (S+δI)⁻¹ Sₗ)
-        //             = δ_{kl} det1[k] − λₖ λₗ tr(Yₖ Yₗ)
-        //
-        // No leakage correction needed: (S + δI) is full rank, so the
-        // moving-nullspace terms that were previously required for the hard
-        // ε-threshold are automatically captured.
+        // Second derivatives: ∂²_kl L = δ_{kl} ∂_k L − λₖ λₗ tr(S⁺ Sₖ S⁺ Sₗ).
         let mut det2 = Array2::<f64>::zeros((k_count, k_count));
         for k in 0..k_count {
             for l in 0..=k {
-                let tr_ab = Self::trace_product(&y_k_mats[k], &y_k_mats[l]);
+                let tr_ab: f64 = y_k_reduced[k]
+                    .iter()
+                    .zip(y_k_reduced[l].t().iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
                 let mut val = -lambdas[k] * lambdas[l] * tr_ab;
                 if k == l {
                     val += det1[k];
@@ -146,8 +136,8 @@ impl<'a> RemlState<'a> {
         // We keep exact, closed-form pieces that remain robust:
         //   1) Penalty-envelope diagonal term:
         //      0.5 * beta' A_k beta = 0.5 * lambda_k * ||R_k beta||^2.
-        //   2) Exact structural penalty smooth pseudo-logdet curvature:
-        //      -0.5 * d²/drho² L_δ(S).
+        //   2) Exact structural penalty pseudo-logdet curvature:
+        //      -0.5 * d²/drho² log|S|₊.
         //   3) Soft prior Hessian.
         //
         // We intentionally omit the Laplace log|H|_+ curvature block here,
@@ -191,7 +181,6 @@ impl<'a> RemlState<'a> {
         let (_, det2) = self.structural_penalty_logdet_derivatives(
             &pirls_result.reparam_result.rs_transformed,
             &lambdas,
-            structural_rank,
             pirls_result.ridge_passport.penalty_logdet_ridge(),
         )?;
         h += &det2.mapv(|v| -0.5 * v);
@@ -623,8 +612,7 @@ impl<'a> RemlState<'a> {
 }
 
 impl<'a> RemlState<'a> {
-    pub(super) fn usesobjective_consistentfdgradient(&self, rho: &Array1<f64>) -> bool {
-        let _ = rho;
+    pub(super) fn usesobjective_consistentfdgradient(&self, _: &Array1<f64>) -> bool {
         self.config.link_function() != LinkFunction::Identity
             && self.config.objective_consistentfdgradient
     }
